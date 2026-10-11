@@ -91,7 +91,13 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     if metadata.oldest_retained_height != oldest_retained_height {
         repairs.insert(RecoveryRepair::RetentionMetadata);
     }
-    if metadata.alarms.header_best_body_unavailable != body_unavailable_alarm {
+    let alarm_at = body_unavailable_alarm
+        .as_ref()
+        .map(|(frontier, _)| *frontier);
+    let alarm = body_unavailable_alarm.map(|(_, summary)| summary);
+    if metadata.alarms.header_best_body_unavailable != alarm
+        || metadata.alarms.header_best_body_unavailable_at != alarm_at
+    {
         repairs.insert(RecoveryRepair::BodyAvailabilityAlarm);
     }
 
@@ -110,7 +116,8 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
         metadata.frontiers.header_best = selected_tip;
         metadata.header_best_score = selected_score;
         metadata.oldest_retained_height = oldest_retained_height;
-        metadata.alarms.header_best_body_unavailable = body_unavailable_alarm;
+        metadata.alarms.header_best_body_unavailable = alarm;
+        metadata.alarms.header_best_body_unavailable_at = alarm_at;
     }
 
     Ok(RecoveryPlan {

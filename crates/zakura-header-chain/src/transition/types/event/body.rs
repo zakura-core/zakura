@@ -68,7 +68,7 @@ pub enum TransientBodyFailureKind {
 }
 
 /// Retryable body failure evidence.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransientBodyFailure {
     /// Exact affected header.
     pub hash: block::Hash,
@@ -81,7 +81,7 @@ pub struct TransientBodyFailure {
 }
 
 /// Authenticated discovery of a changed eligible body-supplier set.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodySupplierDiscovered {
     /// Exact selected header whose persistent retry episode gains a supplier.
     pub hash: block::Hash,
@@ -92,7 +92,7 @@ pub struct BodySupplierDiscovered {
 }
 
 /// Authenticated operator request to restart one persistent body retry episode.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperatorBodyRetry {
     /// Exact selected header whose retry episode restarts.
     pub hash: block::Hash,

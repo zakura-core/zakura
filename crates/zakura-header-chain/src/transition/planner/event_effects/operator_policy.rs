@@ -13,7 +13,8 @@ pub(super) fn project_operator_body_retry(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::OperatorBodyRetry,
 ) -> Result<(), TransitionFailure> {
-    if event.hash != projected.graph().view_select_best_header_chain()?.0.hash
+    if !super::body_availability::selected_body(projected, event.hash)?
+        || !event.availability.has_consistent_supplier_ids()
         || event.availability.attempts != 0
         || event.availability.suppliers == 0
         || event.availability.alarmed
@@ -34,7 +35,10 @@ pub(super) fn project_operator_body_retry(
     }
     projected.set_body_validation_state(
         event.hash,
-        BodyValidationState::Unavailable(event.availability),
+        BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+            episode_id: Some(event.evidence),
+            ..event.availability.clone()
+        }),
     )?;
     Ok(())
 }

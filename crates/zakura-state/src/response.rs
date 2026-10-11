@@ -454,6 +454,10 @@ pub struct BlockSyncBodyMetadata {
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the fixed 432-byte snapshot preserves the public response API without another allocation; supplier collections remain shared and bounded"
+)]
 pub enum ReadResponse {
     /// Response to [`ReadRequest::UsageInfo`] with a recent disk space usage estimate.
     UsageInfo(u64),
@@ -561,6 +565,9 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::HeaderChainSnapshot`], absent before semantic handoff.
     HeaderChainSnapshot(Option<zakura_header_chain::EngineSnapshot>),
+
+    /// Response to [`ReadRequest::HeaderChainBodyState`], absent for an unretained header.
+    HeaderChainBodyState(Option<crate::HeaderChainBodyState>),
 
     /// Response to [`ReadRequest::HeaderLocator`], absent before semantic handoff.
     HeaderLocator(Option<zakura_header_chain::HeaderLocator>),
@@ -809,6 +816,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
             | ReadResponse::HeaderChainSnapshot(_)
+            | ReadResponse::HeaderChainBodyState(_)
             | ReadResponse::HeaderLocator(_)
             | ReadResponse::HeaderValidationLease(_)
             | ReadResponse::VctRepairContext(_)

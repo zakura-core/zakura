@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     sync::Arc,
     time::Instant,
@@ -111,6 +111,14 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut checkpoint_in_flight = 0usize;
     let mut full_in_flight = 0usize;
     let mut deferred_actions = VecDeque::new();
+    // Bound retained evidence by the existing action-channel capacity. Repeated
+    // failures for one hash coalesce while unrelated actions can still make progress.
+    let body_evidence_capacity = actions.max_capacity();
+    let mut body_evidence = HashMap::new();
+    let mut body_evidence_order = VecDeque::new();
+    let mut deferred_body_evidence = None;
+    let mut pending_body_evidence: FuturesUnordered<BoxFuture<'static, PendingBodyEvidence>> =
+        FuturesUnordered::new();
     let mut shutting_down = false;
     let mut apply_phase = block_sync_handoff.subscribe_apply_phase();
 
@@ -143,10 +151,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             block_sync_handoff.request_apply_shutdown();
             release_pending_applies(&block_sync, &mut pending_applies, &trace);
             release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-            deferred_actions.clear();
         }
 
         if shutting_down {
+            report_unpersisted_body_evidence(
+                body_evidence.len() + usize::from(deferred_body_evidence.is_some()),
+                &deferred_actions,
+                &mut actions,
+            );
+            pending_body_evidence.clear();
+            body_evidence.clear();
+            deferred_body_evidence = None;
+            deferred_actions.clear();
             if let Some(completed) = in_flight_applies.next().await {
                 handle_completed_block_apply(
                     &block_sync_handoff,
@@ -196,11 +212,50 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             }
         }
 
-        let action = if let Some(action) =
+        if let Some(Some(completed)) = pending_body_evidence.next().now_or_never() {
+            finish_body_evidence(completed, &mut body_evidence, &mut body_evidence_order);
+        }
+        if body_evidence.len() < body_evidence_capacity {
+            if let Some(pending) = deferred_body_evidence.take() {
+                enqueue_body_evidence(pending, &mut body_evidence, &mut body_evidence_order);
+            }
+        }
+        if pending_body_evidence.is_empty() {
+            if let Some(pending) = body_evidence_order
+                .front()
+                .and_then(|hash| body_evidence.get(hash))
+                .cloned()
+            {
+                let writer = header_chain_write
+                    .as_ref()
+                    .expect("queued evidence has a writer")
+                    .clone();
+                let authority = body_evidence_authority
+                    .as_ref()
+                    .expect("queued evidence has authority")
+                    .clone();
+                let reader = read_state.clone();
+                pending_body_evidence.push(Box::pin(async move {
+                    persist_body_unavailable(
+                        writer,
+                        reader,
+                        authority,
+                        pending.expected_version,
+                        pending.body_work_epoch,
+                        pending.failure.clone(),
+                    )
+                    .await;
+                    pending
+                }));
+            }
+        }
+        let ready_action = if deferred_body_evidence.is_none() {
             coalesce_ready_needed_block_queries(&mut actions, &mut deferred_actions)
-        {
-            action
-        } else if let Some(action) = deferred_actions.pop_front() {
+                .or_else(|| deferred_actions.pop_front())
+        } else {
+            None
+        };
+        let action = if let Some(action) = ready_action {
             action
         } else {
             select! {
@@ -209,7 +264,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync_handoff.request_apply_shutdown();
                     release_pending_applies(&block_sync, &mut pending_applies, &trace);
                     release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-                    deferred_actions.clear();
+
                     continue;
                 },
                 _ = block_sync_handoff.wait_for_zakura_ownership(),
@@ -249,7 +304,13 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     );
                     continue;
                 }
-                action = actions.recv() => {
+                completed = pending_body_evidence.next(), if !pending_body_evidence.is_empty() => {
+                    if let Some(completed) = completed {
+                        finish_body_evidence(completed, &mut body_evidence, &mut body_evidence_order);
+                    }
+                    continue;
+                }
+                action = actions.recv(), if deferred_body_evidence.is_none() => {
                     let Some(action) = action else {
                         shutting_down = true;
                         block_sync_handoff.request_apply_shutdown();
@@ -271,43 +332,30 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         trace.trace_block_action_received(&action);
         match action {
             BlockSyncAction::RecordBodyUnavailable {
+                body_work_epoch,
                 expected_version,
                 failure,
             } => {
-                let Some(writer) = header_chain_write.as_ref() else {
+                if header_chain_write.is_none() || body_evidence_authority.is_none() {
                     debug!(
                         ?failure,
                         "header-chain body retry persistence is not wired in this harness"
                     );
                     continue;
+                }
+                let pending = PendingBodyEvidence {
+                    expected_version,
+                    body_work_epoch,
+                    failure,
                 };
-                let Some(authority) = body_evidence_authority.as_ref() else {
-                    debug!(
-                        ?failure,
-                        "header-chain body evidence authority is not wired"
-                    );
-                    continue;
-                };
-                match tokio::time::timeout(
-                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-                    writer.clone().oneshot(
-                        zakura_state::Request::RecordHeaderChainBodyUnavailable {
-                            prepared: authority.from_registered_attempt(expected_version, failure),
-                        },
-                    ),
-                )
-                .await
+                if body_evidence.contains_key(&pending.failure.hash)
+                    || body_evidence.len() < body_evidence_capacity
                 {
-                    Ok(Ok(zakura_state::Response::HeaderChainBodyUnavailableRecorded(_))) => {}
-                    Ok(Ok(response)) => warn!(
-                        ?response,
-                        "unexpected header-chain body retry persistence response"
-                    ),
-                    Ok(Err(error)) => debug!(
-                        ?error,
-                        "header-chain body retry persistence was stale or unavailable"
-                    ),
-                    Err(_) => warn!("timed out persisting header-chain body retry evidence"),
+                    enqueue_body_evidence(pending, &mut body_evidence, &mut body_evidence_order);
+                } else {
+                    // One bounded overflow slot preserves the action already received.
+                    // At distinct-hash saturation, apply backpressure rather than lose evidence.
+                    deferred_body_evidence = Some(pending);
                 }
             }
             BlockSyncAction::RecordBodyInvalid {
@@ -355,7 +403,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             &mut pending_probe_applies,
                             &trace,
                         );
-                        deferred_actions.clear();
                     }
                 }
             }
@@ -746,6 +793,184 @@ fn abandoned_pending_apply_finished_events(
         }
     }
     events
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingBodyEvidence {
+    expected_version: zakura_header_chain::StateVersion,
+    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
+    failure: zakura_header_chain::TransientBodyFailure,
+}
+
+fn enqueue_body_evidence(
+    pending: PendingBodyEvidence,
+    retained: &mut HashMap<block::Hash, PendingBodyEvidence>,
+    order: &mut VecDeque<block::Hash>,
+) {
+    let hash = pending.failure.hash;
+    if let Some(current) = retained.get_mut(&hash) {
+        // Actions arrive in sequencer order. Keep the latest equal-attempt supplier
+        // update, but never replace a newer attempt with older evidence.
+        let same_episode = current.body_work_epoch == pending.body_work_epoch
+            && current.failure.availability.episode_id == pending.failure.availability.episode_id;
+        let replace = if same_episode {
+            pending.failure.availability.attempts > current.failure.availability.attempts
+                || (pending.failure.availability.attempts == current.failure.availability.attempts
+                    && pending.expected_version >= current.expected_version)
+        } else {
+            pending.expected_version > current.expected_version
+        };
+        if replace {
+            *current = pending;
+        }
+    } else {
+        retained.insert(hash, pending);
+        order.push_back(hash);
+    }
+}
+
+fn finish_body_evidence(
+    completed: PendingBodyEvidence,
+    retained: &mut HashMap<block::Hash, PendingBodyEvidence>,
+    order: &mut VecDeque<block::Hash>,
+) {
+    let hash = completed.failure.hash;
+    let head = order.pop_front();
+    debug_assert_eq!(head, Some(hash));
+    if retained.get(&hash) == Some(&completed) {
+        retained.remove(&hash);
+    } else {
+        // A coalesced update still needs its own durable outcome; rotate fairly.
+        order.push_back(hash);
+    }
+}
+
+/// Shutdown keeps the existing bounded lifetime; uncommitted in-memory evidence is explicit.
+fn report_unpersisted_body_evidence(
+    pending: usize,
+    deferred: &VecDeque<BlockSyncAction>,
+    actions: &mut mpsc::Receiver<BlockSyncAction>,
+) {
+    let mut count = pending
+        + deferred
+            .iter()
+            .filter(|action| matches!(action, BlockSyncAction::RecordBodyUnavailable { .. }))
+            .count();
+    // Do not close the action channel before owned applies finish: their reactor
+    // completion may still send actions. Bound this drain despite concurrent senders.
+    for _ in 0..actions.len() {
+        let Ok(action) = actions.try_recv() else {
+            break;
+        };
+        count += usize::from(matches!(
+            action,
+            BlockSyncAction::RecordBodyUnavailable { .. }
+        ));
+    }
+    if count > 0 {
+        error!(count, "shutdown with unconfirmed body availability persistence; pending evidence is not crash durable");
+    }
+}
+
+/// Keep one completion-owned episode until a durable write or exact obsolescence proof.
+/// Ordinary actions continue while distinct pending hashes remain within the channel bound.
+async fn persist_body_unavailable<ReadState>(
+    writer: BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>,
+    read_state: ReadState,
+    authority: zakura_state::HeaderChainBodyEvidenceAuthority,
+    mut expected_version: zakura_header_chain::StateVersion,
+    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
+    failure: zakura_header_chain::TransientBodyFailure,
+) where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let mut refresh = false;
+    let mut retry_delay = std::time::Duration::from_millis(100);
+    loop {
+        if refresh {
+            // Space retries even when the state service is immediately unavailable.
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+            match tokio::time::timeout(
+                ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+                read_state
+                    .clone()
+                    .oneshot(zakura_state::ReadRequest::HeaderChainBodyState {
+                        hash: failure.hash,
+                    }),
+            )
+            .await
+            {
+                Ok(Ok(zakura_state::ReadResponse::HeaderChainBodyState(Some(current)))) => {
+                    if current.body_work_epoch != body_work_epoch
+                        || !current.selected
+                        || matches!(
+                            current.validation,
+                            zakura_header_chain::BodyValidationState::Verified { .. }
+                                | zakura_header_chain::BodyValidationState::ConsensusInvalid { .. }
+                        )
+                    {
+                        debug!(hash = ?failure.hash, "retired obsolete body availability evidence");
+                        return;
+                    }
+                    if let zakura_header_chain::BodyValidationState::Unavailable(summary) =
+                        &current.validation
+                    {
+                        if summary.episode_id != failure.availability.episode_id {
+                            debug!(hash = ?failure.hash, "retired superseded body availability episode");
+                            return;
+                        }
+                        // A later failed attempt is a subsequent full episode snapshot;
+                        // supplier identities describe that attempt's current set. Equal
+                        // attempt counts cannot subsume changed suppliers or probe times.
+                        if summary == &failure.availability
+                            || (summary.started_at == failure.availability.started_at
+                                && summary.attempts > failure.availability.attempts
+                                && (!failure.availability.alarmed || summary.alarmed))
+                        {
+                            return;
+                        }
+                    }
+                    // Unknown is not obsolete: this can be the first failed write of the episode.
+                    expected_version = current.state_version;
+                }
+                Ok(Ok(zakura_state::ReadResponse::HeaderChainBodyState(None))) => {
+                    debug!(hash = ?failure.hash, "retired evidence for a header no longer retained");
+                    return;
+                }
+                result => {
+                    warn!(hash = ?failure.hash, ?result, "retaining body availability evidence until exact state can be read");
+                    continue;
+                }
+            }
+        }
+        match tokio::time::timeout(
+            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+            writer
+                .clone()
+                .oneshot(zakura_state::Request::RecordHeaderChainBodyUnavailable {
+                    prepared: authority.from_registered_attempt(expected_version, failure.clone()),
+                }),
+        )
+        .await
+        {
+            Ok(Ok(zakura_state::Response::HeaderChainBodyUnavailableRecorded(
+                zakura_header_chain::ApplyResult::Committed
+                | zakura_header_chain::ApplyResult::NoChange(_),
+            ))) => return,
+            result => {
+                warn!(hash = ?failure.hash, ?result, "retaining body availability evidence after unsuccessful persistence");
+                refresh = true;
+            }
+        }
+    }
 }
 
 /// Bound on refreshing a stale expected version while persisting consensus-invalid body evidence.
@@ -1909,6 +2134,25 @@ mod tests {
         BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
         BlockVerifier::Future: Send + 'static,
     {
+        spawn_checkpoint_driver_with_evidence(block_verifier, handoff, trace, None, None, None)
+    }
+
+    fn spawn_checkpoint_driver_with_evidence<BlockVerifier>(
+        block_verifier: BlockVerifier,
+        handoff: Arc<SyncCoordinator>,
+        trace: ZakuraTrace,
+        writer: Option<
+            BoxCloneService<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>,
+        >,
+        authority: Option<zakura_state::HeaderChainBodyEvidenceAuthority>,
+        body_state: Option<zakura_state::HeaderChainBodyState>,
+    ) -> TestDriver
+    where
+        BlockVerifier:
+            Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+        BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+        BlockVerifier::Future: Send + 'static,
+    {
         let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
         drop(tip_tx);
         let startup = zakura_network::zakura::BlockSyncStartup::new(
@@ -1923,10 +2167,22 @@ mod tests {
         );
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
-            panic!("unexpected read request: {request:?}");
-            #[allow(unreachable_code)]
-            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::Tip(None))
+        let read_state = service_fn(move |request: zakura_state::ReadRequest| {
+            let body_state = body_state.clone();
+            async move {
+                match request {
+                    zakura_state::ReadRequest::HeaderChainBodyState { hash } => {
+                        assert_eq!(
+                            body_state.as_ref().map(|state| state.frontier.hash),
+                            Some(hash)
+                        );
+                        Ok::<_, zakura_state::BoxError>(
+                            zakura_state::ReadResponse::HeaderChainBodyState(body_state),
+                        )
+                    }
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
         });
         let (actions, action_rx) = mpsc::channel(8);
         let (shutdown, shutdown_rx) = oneshot::channel();
@@ -1937,8 +2193,8 @@ mod tests {
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
             read_state,
-            None,
-            None,
+            writer,
+            authority,
             block_verifier,
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
@@ -1958,6 +2214,368 @@ mod tests {
             driver_task,
             reactor_task,
         }
+    }
+
+    #[tokio::test]
+    async fn body_unavailable_write_retries_stale_version_without_losing_evidence() {
+        let (_state, _read, _tip, _change, authority) =
+            zakura_state::init_with_header_chain_body_evidence(
+                zakura_state::Config::ephemeral(),
+                &zakura_chain::parameters::Network::Mainnet,
+                block::Height(0),
+                2,
+            )
+            .await
+            .expect("ephemeral state issues the evidence capability");
+        let now = chrono::Utc::now();
+        let hash = block::Hash([0xe1; 32]);
+        let failure = zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xe2; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+            availability: zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
+                started_at: now,
+                attempts: 1,
+                suppliers: 1,
+                supplier_set_digest: [0xe3; 32],
+                alarmed: false,
+                next_probe_at: now + chrono::Duration::seconds(1),
+            },
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let writer_calls = calls.clone();
+        let writer_authority = authority.clone();
+        let writer_failure = failure.clone();
+        let writer = BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+            let calls = writer_calls.clone();
+            let authority = writer_authority.clone();
+            let failure = writer_failure.clone();
+            async move {
+                let index = calls.fetch_add(1, Ordering::SeqCst);
+                let zakura_state::Request::RecordHeaderChainBodyUnavailable { prepared } = request
+                else {
+                    panic!("only unavailable evidence should be written");
+                };
+                assert_eq!(
+                    prepared,
+                    authority.from_registered_attempt(
+                        zakura_header_chain::StateVersion::new(if index == 0 { 1 } else { 2 }),
+                        failure,
+                    )
+                );
+                Ok::<_, zakura_state::BoxError>(
+                    zakura_state::Response::HeaderChainBodyUnavailableRecorded(if index == 0 {
+                        zakura_header_chain::ApplyResult::Stale(zakura_header_chain::StaleReceipt {
+                            current_version: zakura_header_chain::StateVersion::new(2),
+                            branch: None,
+                        })
+                    } else {
+                        zakura_header_chain::ApplyResult::Committed
+                    }),
+                )
+            }
+        }));
+        let verifier = service_fn(|_: zakura_consensus::Request| async {
+            panic!("retry evidence must never submit a body");
+            #[allow(unreachable_code)]
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let driver = spawn_checkpoint_driver_with_evidence(
+            verifier,
+            SyncCoordinator::new(),
+            ZakuraTrace::noop(),
+            Some(writer),
+            Some(authority),
+            Some(zakura_state::HeaderChainBodyState {
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+                state_version: zakura_header_chain::StateVersion::new(2),
+                frontier: zakura_header_chain::Frontier::new(block::Height(1), hash),
+                selected: true,
+                validation: zakura_header_chain::BodyValidationState::Unknown,
+            }),
+        );
+        driver
+            .actions
+            .send(BlockSyncAction::RecordBodyUnavailable {
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+                expected_version: zakura_header_chain::StateVersion::new(1),
+                failure,
+            })
+            .await
+            .unwrap();
+        wait_for_count(
+            &calls,
+            2,
+            "retrying stale body evidence with its refreshed version",
+        )
+        .await;
+        driver.shutdown().await;
+    }
+
+    /// Exercise failures below the driver while retaining its exact action-owned episode.
+    async fn check_unavailable_persistence(first_result: &'static str, obsolete: &'static str) {
+        let authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let now = chrono::Utc::now();
+        let hash = block::Hash([0xe4; 32]);
+        let failure = zakura_header_chain::TransientBodyFailure {
+            hash,
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xe5; 32]),
+            kind: zakura_header_chain::TransientBodyFailureKind::Storage,
+            availability: zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: Some(zakura_header_chain::EvidenceId::from_digest([0xe6; 32])),
+                started_at: now,
+                next_probe_at: now + chrono::Duration::seconds(1),
+                attempts: 2,
+                suppliers: 1,
+                ..Default::default()
+            },
+        };
+        let mut current_summary = failure.availability.clone();
+        if obsolete == "operator_reset" {
+            // An explicit reset may share the wall-clock timestamp with pending work.
+            current_summary.episode_id =
+                Some(zakura_header_chain::EvidenceId::from_digest([0xe7; 32]));
+            current_summary.attempts = 0;
+        } else if obsolete == "subsumed" {
+            current_summary.attempts += 1;
+        }
+        if first_result == "equal_supplier_update" {
+            current_summary.supplier_set_digest[0] ^= 1;
+        } else if first_result == "equal_probe_update" {
+            current_summary.next_probe_at += chrono::Duration::seconds(1);
+        }
+        let current = zakura_state::HeaderChainBodyState {
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::new(u64::from(
+                obsolete == "epoch",
+            )),
+            state_version: zakura_header_chain::StateVersion::new(2),
+            frontier: zakura_header_chain::Frontier::new(block::Height(1), hash),
+            selected: obsolete != "unselected",
+            validation: match obsolete {
+                _ if first_result.starts_with("equal_") => {
+                    zakura_header_chain::BodyValidationState::Unavailable(current_summary.clone())
+                }
+                "operator_reset" | "subsumed" => {
+                    zakura_header_chain::BodyValidationState::Unavailable(current_summary)
+                }
+                "verified" => zakura_header_chain::BodyValidationState::Verified {
+                    evidence: failure.evidence,
+                },
+                _ => zakura_header_chain::BodyValidationState::Unknown,
+            },
+        };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_calls = reads.clone();
+        let read_state = service_fn(move |request: zakura_state::ReadRequest| {
+            assert!(
+                matches!(request, zakura_state::ReadRequest::HeaderChainBodyState { hash: queried } if queried == hash)
+            );
+            let index = read_calls.fetch_add(1, Ordering::SeqCst);
+            let current = current.clone();
+            async move {
+                if first_result == "read_error" && index == 0 {
+                    return Err::<_, zakura_state::BoxError>(
+                        "temporary exact-state read failure".into(),
+                    );
+                }
+                Ok(zakura_state::ReadResponse::HeaderChainBodyState(
+                    (obsolete != "pruned").then_some(current),
+                ))
+            }
+        });
+        let writes = Arc::new(AtomicUsize::new(0));
+        let write_calls = writes.clone();
+        let writer_authority = authority.clone();
+        let writer_failure = failure.clone();
+        let writer = BoxCloneService::new(service_fn(move |request: zakura_state::Request| {
+            let index = write_calls.fetch_add(1, Ordering::SeqCst);
+            let zakura_state::Request::RecordHeaderChainBodyUnavailable { prepared } = request
+            else {
+                panic!("only episode writes are expected")
+            };
+            assert_eq!(
+                prepared,
+                writer_authority.from_registered_attempt(
+                    zakura_header_chain::StateVersion::new(if index == 0 { 1 } else { 2 }),
+                    writer_failure.clone()
+                )
+            );
+            async move {
+                if index > 0 {
+                    assert!(
+                        obsolete.is_empty(),
+                        "obsolete evidence must not be retried: {obsolete}"
+                    );
+                    return Ok::<_, zakura_state::BoxError>(
+                        zakura_state::Response::HeaderChainBodyUnavailableRecorded(
+                            zakura_header_chain::ApplyResult::Committed,
+                        ),
+                    );
+                }
+                let result = match first_result {
+                    "error" => return Err("temporary storage error".into()),
+                    "timeout" => {
+                        tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT * 2).await;
+                        unreachable!("the write attempt must time out")
+                    }
+                    "resource" => zakura_header_chain::ApplyResult::ResourceStalled(
+                        zakura_header_chain::CommittedStallReceipt {
+                            state_version: zakura_header_chain::StateVersion::new(2),
+                            alarm_changed: true,
+                            attempted_branch: None,
+                        },
+                    ),
+                    _ => {
+                        zakura_header_chain::ApplyResult::Stale(zakura_header_chain::StaleReceipt {
+                            current_version: zakura_header_chain::StateVersion::new(2),
+                            branch: None,
+                        })
+                    }
+                };
+                Ok(zakura_state::Response::HeaderChainBodyUnavailableRecorded(
+                    result,
+                ))
+            }
+        }));
+        tokio::time::timeout(
+            ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT + std::time::Duration::from_secs(2),
+            persist_body_unavailable(
+                writer,
+                read_state,
+                authority,
+                zakura_header_chain::StateVersion::new(1),
+                zakura_header_chain::BodyWorkEpoch::default(),
+                failure,
+            ),
+        )
+        .await
+        .expect("persistence must commit or prove this exact episode obsolete");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            if obsolete.is_empty() { 2 } else { 1 }
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            if first_result == "read_error" { 2 } else { 1 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_unavailable_write_retries_resource_error_timeout_and_read_error() {
+        for result in [
+            "resource",
+            "error",
+            "timeout",
+            "read_error",
+            "equal_supplier_update",
+            "equal_probe_update",
+        ] {
+            check_unavailable_persistence(result, "").await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_unavailable_write_retires_only_proven_obsolete_evidence() {
+        for obsolete in [
+            "operator_reset",
+            "epoch",
+            "unselected",
+            "verified",
+            "pruned",
+            "subsumed",
+        ] {
+            check_unavailable_persistence("stale", obsolete).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn body_unavailable_write_applies_backpressure_and_does_not_hang_shutdown() {
+        let authority = zakura_state::HeaderChainBodyEvidenceAuthority::new_test();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let writer_calls = calls.clone();
+        let writer = BoxCloneService::new(service_fn(move |_: zakura_state::Request| {
+            writer_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<zakura_state::Response, zakura_state::BoxError>>()
+        }));
+        let applied = Arc::new(AtomicUsize::new(0));
+        let applied_calls = applied.clone();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let applied = applied_calls.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("checkpoint commit expected")
+                };
+                applied.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, zakura_consensus::BoxError>(block.hash())
+            }
+        });
+        let driver = spawn_checkpoint_driver_with_evidence(
+            verifier,
+            SyncCoordinator::new(),
+            ZakuraTrace::noop(),
+            Some(writer),
+            Some(authority),
+            None,
+        );
+        let action = |id: u8| BlockSyncAction::RecordBodyUnavailable {
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+            expected_version: zakura_header_chain::StateVersion::new(1),
+            failure: zakura_header_chain::TransientBodyFailure {
+                hash: block::Hash([id; 32]),
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xf2; 32]),
+                kind: zakura_header_chain::TransientBodyFailureKind::Storage,
+                availability: zakura_header_chain::BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
+                    attempts: 1,
+                    suppliers: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        driver.actions.send(action(0)).await.unwrap();
+        wait_for_count(&calls, 1, "starting the held evidence write").await;
+        // Repeated evidence cannot head-of-line block a body that may make it obsolete.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..100 {
+                driver.actions.send(action(0)).await.unwrap();
+            }
+            submit_checkpoint(&driver, 7).await;
+        })
+        .await
+        .expect("coalesced evidence must not block a new body submission");
+        wait_for_count(
+            &applied,
+            1,
+            "applying a new body while evidence persistence is stalled",
+        )
+        .await;
+        // Distinct hashes are bounded by the channel's capacity plus one overflow slot.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for id in 1..=(driver.actions.max_capacity() * 2) {
+                driver.actions.send(action(id as u8)).await.unwrap();
+            }
+        })
+        .await
+        .expect("the documented evidence and action capacity must remain available");
+        assert!(matches!(
+            driver.actions.try_send(action(99)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver.shutdown())
+            .await
+            .expect("an unavailable writer must not extend the existing shutdown lifetime");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the driver may own only one write at a time"
+        );
     }
 
     async fn submit_checkpoint(driver: &TestDriver, token: BlockApplyToken) {

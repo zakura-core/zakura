@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_header_chain::{
-    BodyUnavailableSummary, BranchId, Clock, Frontier, HeaderGeneration, SourceId,
+    BodyUnavailableSummary, BranchId, Clock, EvidenceId, Frontier, HeaderGeneration, SourceId,
 };
 
 const ALARM_ATTEMPTS: u32 = 10;
@@ -81,6 +81,8 @@ pub struct BodyRetryEpisode {
     pub header: Frontier,
     /// Authoritative local start time.
     pub started_at: DateTime<Utc>,
+    /// Stable identity distinguishing explicit operator resets.
+    pub episode_id: Option<EvidenceId>,
     /// Failed delivery attempts in this episode.
     pub attempts: u32,
     /// Suppliers already tried in this episode.
@@ -107,6 +109,7 @@ impl BodyRetryEpisode {
             generation,
             header,
             started_at: now,
+            episode_id: None,
             attempts: 0,
             tried_suppliers: BTreeSet::new(),
             next_probe_at: now,
@@ -126,13 +129,25 @@ impl BodyRetryEpisode {
         let tried_suppliers = if summary.alarmed {
             eligible_suppliers.clone()
         } else {
-            BTreeSet::new()
+            summary.tried_supplier_ids.as_ref().map_or_else(
+                // Legacy records cannot identify which suppliers were tried.
+                // Preserve their deadline conservatively, just like admission.
+                || eligible_suppliers.clone(),
+                |tried| {
+                    tried
+                        .iter()
+                        .copied()
+                        .filter(|source| eligible_suppliers.contains(source))
+                        .collect()
+                },
+            )
         };
         Self {
             branch,
             generation,
             header,
             started_at: summary.started_at,
+            episode_id: summary.episode_id,
             attempts: summary.attempts,
             tried_suppliers,
             next_probe_at: summary.next_probe_at,
@@ -215,6 +230,21 @@ impl BodyRetryEpisode {
     /// Return the bounded durable alarm summary for state admission.
     pub fn summary(&self) -> BodyUnavailableSummary {
         BodyUnavailableSummary {
+            supplier_ids: Some(
+                self.eligible_suppliers
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            tried_supplier_ids: Some(
+                self.tried_suppliers
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            episode_id: self.episode_id,
             started_at: self.started_at,
             attempts: self.attempts,
             suppliers: u32::try_from(self.eligible_suppliers.len()).unwrap_or(u32::MAX),
@@ -443,6 +473,9 @@ mod tests {
         assert_eq!(
             episode.summary(),
             BodyUnavailableSummary {
+                supplier_ids: Some(vec![supplier].into()),
+                tried_supplier_ids: Some(vec![supplier].into()),
+                episode_id: None,
                 started_at: episode.started_at,
                 attempts: 11,
                 suppliers: 1,
@@ -548,6 +581,9 @@ mod tests {
         let started_at = clock.now() - Duration::minutes(12);
         let next_probe_at = clock.now() + Duration::minutes(4);
         let summary = BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             started_at,
             attempts: 14,
             suppliers: 2,
@@ -560,10 +596,17 @@ mod tests {
             HeaderGeneration::new(3),
             Frontier::new(block::Height(20), hash(2)),
             suppliers,
-            summary,
+            summary.clone(),
         );
 
-        assert_eq!(episode.summary(), summary);
+        assert_eq!(
+            episode.summary(),
+            BodyUnavailableSummary {
+                supplier_ids: Some(vec![first, second].into()),
+                tried_supplier_ids: Some(vec![first, second].into()),
+                ..summary
+            }
+        );
         assert!(!episode.is_due(&clock));
         assert_eq!(
             episode.record_failure(first, &clock, &FixedJitter(0)),
@@ -577,6 +620,63 @@ mod tests {
         assert_eq!(episode.started_at, started_at);
         assert_eq!(episode.attempts, 15);
         assert!(episode.alarmed);
+    }
+
+    #[test]
+    fn restored_legacy_prealarm_conservatively_preserves_deadline() {
+        let clock = clock();
+        let (first, second) = (source(3), source(4));
+        let mut original = episode(&clock, &[first, second]);
+        original.record_failure(first, &clock, &FixedJitter(0));
+        let mut legacy = original.summary();
+        legacy.supplier_ids = None;
+        legacy.tried_supplier_ids = None;
+        let mut restored = BodyRetryEpisode::restore(
+            original.branch,
+            original.generation,
+            original.header,
+            [first, second].into_iter().collect(),
+            legacy,
+        );
+        assert_eq!(
+            restored.record_failure(second, &clock, &FixedJitter(0)),
+            RetryUpdate::TooEarly
+        );
+        assert_eq!(restored.attempts, original.attempts);
+        clock.advance(Duration::seconds(2));
+        assert!(matches!(
+            restored.record_failure(second, &clock, &FixedJitter(0)),
+            RetryUpdate::RetryAt(_)
+        ));
+    }
+
+    #[test]
+    fn restored_prealarm_preserves_already_tried_suppliers() {
+        let clock = clock();
+        let first = source(3);
+        let second = source(4);
+        let mut original = episode(&clock, &[first, second]);
+        original.record_failure(first, &clock, &FixedJitter(0));
+        let mut restored = BodyRetryEpisode::restore(
+            original.branch,
+            original.generation,
+            original.header,
+            original.eligible_suppliers.clone(),
+            original.summary(),
+        );
+        assert_eq!(restored.tried_suppliers, original.tried_suppliers);
+        assert_eq!(
+            restored.record_failure(first, &clock, &FixedJitter(0)),
+            RetryUpdate::TooEarly
+        );
+        assert_eq!(restored.attempts, original.attempts);
+        assert!(
+            matches!(
+                restored.record_failure(second, &clock, &FixedJitter(0)),
+                RetryUpdate::RetryAt(_)
+            ),
+            "an exact new-schema subset still allows an untried supplier"
+        );
     }
 
     #[test]

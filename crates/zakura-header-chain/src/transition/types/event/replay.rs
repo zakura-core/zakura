@@ -243,18 +243,18 @@ pub(super) fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEve
                 TransientBodyFailureKind::ResourceExhausted => 5,
                 TransientBodyFailureKind::NoBindingBody => 6,
             }]);
-            hash_availability(hasher, event.availability);
+            hash_availability(hasher, &event.availability);
         }
         TransitionEvent::BodyEvidence(BodyEvidence::Verified(event)) => {
             hasher.update(event.hash.0);
         }
         TransitionEvent::BodySupplierDiscovered(event) => {
             hasher.update(event.hash.0);
-            hash_availability(hasher, event.availability);
+            hash_availability(hasher, &event.availability);
         }
         TransitionEvent::OperatorBodyRetry(event) => {
             hasher.update(event.hash.0);
-            hash_availability(hasher, event.availability);
+            hash_availability(hasher, &event.availability);
         }
         TransitionEvent::OperatorInvalidate(event) => {
             hasher.update(event.target.0);
@@ -356,13 +356,43 @@ fn hash_sync_owner(hasher: &mut Sha256, owner: HeaderSyncWorkOwner) {
     }
 }
 
-fn hash_availability(hasher: &mut Sha256, availability: BodyUnavailableSummary) {
+fn hash_availability(hasher: &mut Sha256, availability: &BodyUnavailableSummary) {
     hash_time(hasher, availability.started_at);
     hasher.update(availability.attempts.to_le_bytes());
     hasher.update(availability.suppliers.to_le_bytes());
     hasher.update(availability.supplier_set_digest);
     hasher.update([u8::from(availability.alarmed)]);
     hash_time(hasher, availability.next_probe_at);
+    // Keep legacy fingerprints byte-for-byte stable when no identity extension is present.
+    if availability.supplier_ids.is_some()
+        || availability.tried_supplier_ids.is_some()
+        || availability.episode_id.is_some()
+    {
+        hasher.update(b"zakura-body-availability-identities-v1");
+        for identities in [&availability.supplier_ids, &availability.tried_supplier_ids] {
+            match identities {
+                None => hasher.update([0]),
+                Some(identities) => {
+                    hasher.update([1]);
+                    hasher.update(
+                        u64::try_from(identities.len())
+                            .expect("supplier identities are bounded by session admission")
+                            .to_le_bytes(),
+                    );
+                    for identity in identities.iter() {
+                        hasher.update(identity.digest());
+                    }
+                }
+            }
+        }
+        match availability.episode_id {
+            None => hasher.update([0]),
+            Some(episode) => {
+                hasher.update([1]);
+                hasher.update(episode.digest());
+            }
+        }
+    }
 }
 
 fn hash_verified_path(hasher: &mut Sha256, path: &[VerifiedHeaderRef]) {

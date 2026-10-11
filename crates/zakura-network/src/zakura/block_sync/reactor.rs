@@ -85,23 +85,59 @@ struct PendingNeededQuery {
     hint_revision: Option<u64>,
 }
 
-fn synchronize_persisted_body_alarm(
+/// Publish durable gates only when their authoritative episode data changes.
+/// Admission still expires each gate against its deadline without a new view.
+pub(super) fn synchronize_persisted_body_alarm(
     registry: &PeerRegistry,
+    previous: Option<&zakura_header_chain::CommittedHeaderChainView>,
     view: Option<&zakura_header_chain::CommittedHeaderChainView>,
-) {
-    let alarm = view.and_then(|view| {
-        view.alarms
-            .header_best_body_unavailable
-            .filter(|summary| summary.alarmed)
-            .map(|summary| {
-                (
-                    zakura_header_chain::BodyWorkAuthority::for_view(view),
-                    view.frontiers.header_best.hash,
-                    retry_deadline_instant(summary.next_probe_at),
-                )
+) -> bool {
+    if let (Some(previous), Some(view)) = (previous, view) {
+        let alarm_target = |view: &zakura_header_chain::CommittedHeaderChainView| {
+            view.alarms.header_best_body_unavailable.as_ref().map(|_| {
+                view.alarms
+                    .header_best_body_unavailable_at
+                    .unwrap_or(view.frontiers.header_best)
             })
-    });
-    registry.set_persisted_body_alarm(alarm);
+        };
+        if previous.body_work_epoch == view.body_work_epoch
+            && Arc::ptr_eq(&previous.body_unavailable, &view.body_unavailable)
+            && previous.alarms.header_best_body_unavailable
+                == view.alarms.header_best_body_unavailable
+            && alarm_target(previous) == alarm_target(view)
+        {
+            return false;
+        }
+    }
+    let mut episodes = Vec::new();
+    if let Some(view) = view {
+        for (hash, (_, summary)) in view.body_unavailable.iter() {
+            let tried = if summary.alarmed {
+                None
+            } else {
+                summary.tried_supplier_ids.as_ref().map(|ids| ids.to_vec())
+            };
+            episodes.push((*hash, tried, retry_deadline_instant(summary.next_probe_at)));
+        }
+        // Legacy/manual views carried only one tip alarm.
+        if episodes.is_empty() {
+            if let Some(summary) = view.alarms.header_best_body_unavailable.as_ref() {
+                episodes.push((
+                    view.alarms
+                        .header_best_body_unavailable_at
+                        .unwrap_or(view.frontiers.header_best)
+                        .hash,
+                    None,
+                    retry_deadline_instant(summary.next_probe_at),
+                ));
+            }
+        }
+    }
+    registry.set_persisted_body_retries(
+        view.map(zakura_header_chain::BodyWorkAuthority::for_view),
+        episodes,
+    );
+    true
 }
 
 fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> BlockSyncFrontiers {
@@ -201,7 +237,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
-    synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
+    synchronize_persisted_body_alarm(&registry, None, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
 
@@ -886,11 +922,15 @@ impl BlockSyncReactor {
         let previous_body_alarm = previous.as_ref().and_then(|old| {
             old.alarms
                 .header_best_body_unavailable
+                .as_ref()
                 .filter(|summary| summary.alarmed)
                 .map(|_| {
                     (
                         zakura_header_chain::BodyWorkAuthority::for_view(old),
-                        old.frontiers.header_best.hash,
+                        old.alarms
+                            .header_best_body_unavailable_at
+                            .unwrap_or(old.frontiers.header_best)
+                            .hash,
                     )
                 })
         });
@@ -899,19 +939,42 @@ impl BlockSyncReactor {
         self.committed_view = Some(view.clone());
         self.pending_body_supplier_restart = None;
         self.pending_operator_body_retry = None;
-        synchronize_persisted_body_alarm(&self.registry, Some(&view));
+        let availability_changed =
+            synchronize_persisted_body_alarm(&self.registry, previous.as_ref(), Some(&view));
 
         let current_alarm_hash = view
             .alarms
             .header_best_body_unavailable
+            .as_ref()
             .filter(|summary| summary.alarmed)
-            .map(|_| header_best.hash);
+            .map(|_| {
+                view.alarms
+                    .header_best_body_unavailable_at
+                    .unwrap_or(header_best)
+                    .hash
+            });
         if let Some((scope, hash)) =
             previous_body_alarm.filter(|(_, hash)| Some(*hash) != current_alarm_hash)
         {
             let _ = self
                 .sequencer_control
                 .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
+        }
+
+        if let Some(old) = previous.as_ref().filter(|_| availability_changed) {
+            for (hash, (_, summary)) in old.body_unavailable.iter() {
+                if view
+                    .body_unavailable_for(*hash)
+                    .is_none_or(|new| new.episode_id != summary.episode_id)
+                {
+                    let _ = self
+                        .sequencer_control
+                        .send(SequencerControlInput::BodyAlarmCleared {
+                            scope: zakura_header_chain::BodyWorkAuthority::for_view(old),
+                            hash: *hash,
+                        });
+                }
+            }
         }
 
         let current_scope = self.body_work_scope();
@@ -1443,27 +1506,24 @@ impl BlockSyncReactor {
         let Some(previous) = snapshot
             .alarms
             .header_best_body_unavailable
+            .as_ref()
             .filter(|summary| summary.alarmed)
         else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
+        let header = snapshot
+            .alarms
+            .header_best_body_unavailable_at
+            .unwrap_or(snapshot.frontiers.header_best);
         let eligible_sources = self.registry.eligible_sources(header.height);
         let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
         let supplier_set_digest =
             zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
-        let has_new_supplier = suppliers > previous.suppliers
-            || (suppliers == previous.suppliers
-                && supplier_set_digest != previous.supplier_set_digest);
-        if !has_new_supplier
-            || self.pending_body_supplier_restart
-                == Some((snapshot.state_version, header.hash, supplier_set_digest))
-        {
-            return;
-        }
-
         let now = chrono::Utc::now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
+            supplier_ids: Some(eligible_sources.iter().copied().collect::<Vec<_>>().into()),
+            tried_supplier_ids: None,
+            episode_id: previous.episode_id,
             started_at: previous.started_at,
             attempts: previous.attempts,
             suppliers,
@@ -1471,6 +1531,13 @@ impl BlockSyncReactor {
             alarmed: true,
             next_probe_at: now,
         };
+        if !availability.has_new_supplier_since(previous)
+            || self.pending_body_supplier_restart
+                == Some((snapshot.state_version, header.hash, supplier_set_digest))
+        {
+            return;
+        }
+
         let mut hasher = blake2b_simd::Params::new()
             .hash_length(32)
             .personal(b"ZkBodyDiscover1_")
@@ -1504,11 +1571,15 @@ impl BlockSyncReactor {
         let Some(snapshot) = self.committed_view.as_ref() else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
+        let header = snapshot
+            .alarms
+            .header_best_body_unavailable_at
+            .unwrap_or(snapshot.frontiers.header_best);
         if header.hash != hash
             || !snapshot
                 .alarms
                 .header_best_body_unavailable
+                .as_ref()
                 .is_some_and(|summary| summary.alarmed)
         {
             return;
@@ -1528,6 +1599,9 @@ impl BlockSyncReactor {
 
         let now = chrono::Utc::now();
         let availability = zakura_header_chain::BodyUnavailableSummary {
+            supplier_ids: Some(eligible_sources.iter().copied().collect::<Vec<_>>().into()),
+            tried_supplier_ids: Some(Vec::new().into()),
+            episode_id: None,
             started_at: now,
             attempts: 0,
             suppliers,
@@ -1543,7 +1617,7 @@ impl BlockSyncReactor {
         hasher.update(&header.height.0.to_le_bytes());
         hasher.update(&header.hash.0);
         hasher.update(&supplier_set_digest);
-        let retry = zakura_header_chain::OperatorBodyRetry {
+        let mut retry = zakura_header_chain::OperatorBodyRetry {
             hash: header.hash,
             evidence: zakura_header_chain::EvidenceId::from_digest(
                 hasher
@@ -1554,6 +1628,7 @@ impl BlockSyncReactor {
             ),
             availability,
         };
+        retry.availability.episode_id = Some(retry.evidence);
         if !self.dispatch_action(BlockSyncAction::RetryBodyAvailability {
             expected_version: snapshot.state_version,
             retry,
@@ -1729,11 +1804,10 @@ impl BlockSyncReactor {
             outcome.result(),
             self.state.budget.reserved(),
         );
-        let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
-            (snapshot.frontiers.header_best.hash == hash)
-                .then_some(snapshot.alarms.header_best_body_unavailable)
-                .flatten()
-        });
+        let persisted_availability = self
+            .committed_view
+            .as_ref()
+            .and_then(|snapshot| snapshot.body_unavailable_for(hash).cloned().map(Box::new));
         let capacity = self.sequencer_input.capacity();
         let max_capacity = self.sequencer_input.max_capacity();
         let started = Instant::now();
@@ -2370,8 +2444,17 @@ impl BlockSyncReactor {
             snapshot
                 .alarms
                 .header_best_body_unavailable
+                .as_ref()
                 .filter(|summary| summary.alarmed)
-                .map(|summary| (snapshot.frontiers.header_best, summary))
+                .map(|summary| {
+                    (
+                        snapshot
+                            .alarms
+                            .header_best_body_unavailable_at
+                            .unwrap_or(snapshot.frontiers.header_best),
+                        summary,
+                    )
+                })
         });
         let current_frontier = current.map(|(frontier, _)| frontier);
         if self.published_body_alarm != current_frontier {

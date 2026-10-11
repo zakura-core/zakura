@@ -3271,6 +3271,17 @@ impl Service<ReadRequest> for ReadStateService {
                 state.header_chain_snapshot_receiver.borrow().clone(),
             )),
 
+            ReadRequest::HeaderChainBodyState { hash } => {
+                let reader = state.header_chain_reader_receiver.borrow().clone();
+                Ok(ReadResponse::HeaderChainBodyState(
+                    reader
+                        .as_ref()
+                        .map(|reader| reader.body_state(hash))
+                        .transpose()?
+                        .flatten(),
+                ))
+            }
+
             ReadRequest::MissingBlockBodyMetadata { from, limit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 Ok(ReadResponse::MissingBlockBodyMetadata(

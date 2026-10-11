@@ -196,6 +196,7 @@ pub(super) struct PeerRegistry {
     floor_ranking_changed: Notify,
     session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
     body_retry_avoid: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
+    body_retry_persisted: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
     body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
@@ -214,6 +215,7 @@ impl PeerRegistry {
             floor_ranking_changed: Notify::new(),
             session_parks: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(HashMap::new()),
+            body_retry_persisted: StdMutex::new(HashMap::new()),
             body_retry_all: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
@@ -254,6 +256,41 @@ impl PeerRegistry {
         }
     }
 
+    /// Replace durable retry gates without dropping newer process-local failures.
+    pub(super) fn set_persisted_body_retries(
+        &self,
+        scope: Option<zakura_header_chain::BodyWorkAuthority>,
+        episodes: impl IntoIterator<
+            Item = (
+                block::Hash,
+                Option<Vec<zakura_header_chain::SourceId>>,
+                Instant,
+            ),
+        >,
+    ) {
+        let mut all = self.body_retry_all_lock();
+        let mut sources = self
+            .body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned");
+        all.clear();
+        sources.clear();
+        let Some(scope) = scope else {
+            return;
+        };
+        for (hash, tried, until) in episodes {
+            let key = BodyRetryKey::new(scope, hash);
+            if let Some(tried) = tried {
+                for source in tried {
+                    sources.insert((source, key), until);
+                }
+            } else {
+                all.insert(key, until);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn set_persisted_body_alarm(
         &self,
         alarm: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash, Instant)>,
@@ -274,6 +311,10 @@ impl PeerRegistry {
         self.body_retry_lock()
             .retain(|(_, candidate), _| *candidate != key);
         self.body_retry_all_lock().remove(&key);
+        self.body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned")
+            .retain(|(_, candidate), _| *candidate != key);
     }
 
     pub(super) fn retain_body_retry_scope(
@@ -283,6 +324,12 @@ impl PeerRegistry {
         self.body_retry_lock().retain(|(_, key), _| {
             current.is_some_and(|scope| key.body_work_epoch == scope.body_work_epoch)
         });
+        self.body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned")
+            .retain(|(_, key), _| {
+                current.is_some_and(|scope| key.body_work_epoch == scope.body_work_epoch)
+            });
         self.body_retry_all_lock().retain(|key, _| {
             current.is_some_and(|scope| key.body_work_epoch == scope.body_work_epoch)
         });
@@ -301,6 +348,19 @@ impl PeerRegistry {
         all_retries.retain(|_, until| *until > now);
         if all_retries.get(&key).is_some_and(|until| *until > now) {
             return true;
+        }
+        {
+            let mut persisted = self
+                .body_retry_persisted
+                .lock()
+                .expect("persisted retry mutex is never poisoned");
+            persisted.retain(|_, until| *until > now);
+            if persisted
+                .get(&(source, key))
+                .is_some_and(|until| *until > now)
+            {
+                return true;
+            }
         }
         let mut retries = self.body_retry_lock();
         retries.retain(|_, until| *until > now);
@@ -326,7 +386,22 @@ impl PeerRegistry {
             .iter()
             .filter_map(|((candidate, _), until)| (*candidate == source).then_some(*until))
             .min();
-        all_deadline.into_iter().chain(source_deadline).min()
+        let persisted_deadline = {
+            let mut persisted = self
+                .body_retry_persisted
+                .lock()
+                .expect("persisted retry mutex is never poisoned");
+            persisted.retain(|_, until| *until > now);
+            persisted
+                .iter()
+                .filter_map(|((candidate, _), until)| (*candidate == source).then_some(*until))
+                .min()
+        };
+        all_deadline
+            .into_iter()
+            .chain(source_deadline)
+            .chain(persisted_deadline)
+            .min()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
@@ -1094,6 +1169,34 @@ mod floor_bias_tests {
         available: usize,
     ) {
         register_with_rtprop(reg, config, peer, low, high, available, None);
+    }
+
+    #[test]
+    fn restored_prealarm_gates_exact_tried_supplier_and_preserves_new_local_failure() {
+        let reg = PeerRegistry::new();
+        let scope = super::super::test_work_scope();
+        let (failed, alternate) = (peer(1), peer(2));
+        let hash = block::Hash([8; 32]);
+        let other = block::Hash([9; 32]);
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(60);
+        let failed_source = zakura_header_chain::SourceId::from_digest(failed.digest());
+        let alternate_source = zakura_header_chain::SourceId::from_digest(alternate.digest());
+        reg.set_persisted_body_retries(
+            Some(scope),
+            [
+                (hash, Some(vec![failed_source]), until),
+                (other, None, until),
+            ],
+        );
+        assert!(reg.is_body_retry_avoided(&failed, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&alternate, scope, hash, now));
+        assert!(reg.is_body_retry_avoided(&alternate, scope, other, now));
+        reg.defer_body_retry([alternate_source], scope, hash, until);
+        reg.set_persisted_body_retries(Some(scope), [(hash, Some(vec![failed_source]), until)]);
+        assert!(reg.is_body_retry_avoided(&alternate, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&alternate, scope, other, now));
+        assert_eq!(reg.next_body_retry_deadline(&failed, now), Some(until));
     }
 
     #[test]

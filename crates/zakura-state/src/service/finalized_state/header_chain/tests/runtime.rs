@@ -505,9 +505,20 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
 
 #[test]
 fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
-    let (_, _, metadata) = fixture();
+    let (engine_config, anchor, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
+    store
+        .initialize(metadata, anchor)
+        .expect("publisher fixture initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("publisher fixture audits");
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("fixture engine lock");
+    let publisher = Publisher::new(initial.clone(), &engine);
     let (mirror_sender, mirror_receiver) = watch::channel(None);
 
     assert_eq!(*mirror_receiver.borrow(), None);
@@ -517,7 +528,7 @@ fn publisher_mirror_stays_absent_until_attachment_then_tracks_commits() {
 
     let mut committed = initial;
     committed.state_version = StateVersion::new(2);
-    publisher.publish(committed.clone(), TransitionEffect::none());
+    publisher.publish(committed.clone(), TransitionEffect::none(), &[], &engine);
     assert_eq!(*mirror_receiver.borrow(), Some(committed));
 }
 
@@ -3380,4 +3391,31 @@ fn retained_checkpoint_still_rejects_mismatched_header_identity() {
         .apply_combined(request, &context, DiskWriteBatch::new(), || {})
         .is_err());
     assert_eq!(runtime.publisher().snapshot(), before);
+}
+
+#[test]
+fn exact_body_state_reads_one_retained_node_with_its_version() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    HeaderChainStore::reset_header_node_disk_reads();
+    let state = reader
+        .body_state(path[4].hash)
+        .unwrap()
+        .expect("the selected node is retained");
+    assert_eq!(state.frontier, Frontier::new(path[4].height, path[4].hash));
+    assert!(state.selected);
+    assert_eq!(
+        state.state_version,
+        runtime.publisher().snapshot().state_version
+    );
+    assert_eq!(
+        state.body_work_epoch,
+        runtime.publisher().view().body_work_epoch
+    );
+    assert_eq!(
+        HeaderChainStore::header_node_disk_reads(),
+        1,
+        "an exact body read must not scan the selected path"
+    );
+    assert_eq!(reader.body_state(block::Hash([0xfa; 32])).unwrap(), None);
 }

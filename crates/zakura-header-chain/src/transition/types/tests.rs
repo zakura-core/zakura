@@ -295,7 +295,7 @@ fn event_cases() -> Vec<EventCase> {
                 hash: block::Hash([25; 32]),
                 evidence: body_evidence,
                 kind: TransientBodyFailureKind::Timeout,
-                availability,
+                availability: availability.clone(),
             })),
             domain: TransitionDomain::TransientBodyFailure,
             admission: EventAdmission::IntegratedFullState,
@@ -320,7 +320,7 @@ fn event_cases() -> Vec<EventCase> {
             event: TransitionEvent::BodySupplierDiscovered(BodySupplierDiscovered {
                 hash: block::Hash([27; 32]),
                 evidence: body_evidence,
-                availability,
+                availability: availability.clone(),
             }),
             domain: TransitionDomain::BodySupplierDiscovered,
             admission: EventAdmission::IntegratedFullState,
@@ -333,7 +333,7 @@ fn event_cases() -> Vec<EventCase> {
             event: TransitionEvent::OperatorBodyRetry(OperatorBodyRetry {
                 hash: block::Hash([28; 32]),
                 evidence: operator_evidence,
-                availability,
+                availability: availability.clone(),
             }),
             domain: TransitionDomain::OperatorBodyRetry,
             admission: EventAdmission::RegisteredScheduler,
@@ -723,6 +723,9 @@ fn body_verification_outcomes_preserve_distinct_transition_effects() {
             evidence,
             kind: TransientBodyFailureKind::MissingContext,
             availability: BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
                 attempts: 1,
                 suppliers: 1,
                 alarmed: false,
@@ -817,4 +820,49 @@ fn advertised_body_size_prefers_authenticated_known_sizes_and_skips_rejected() {
         std::num::NonZeroU32::new(30),
         "an authenticated delivery wins even with a larger delivery id"
     );
+}
+
+#[test]
+fn availability_fingerprint_binds_supplier_history_and_reset_identity() {
+    let summary = BodyUnavailableSummary::default();
+    let fingerprint = |availability| {
+        TransitionEvent::BodyEvidence(BodyEvidence::Transient(TransientBodyFailure {
+            hash: block::Hash([0x41; 32]),
+            evidence: EvidenceId::from_digest([0x42; 32]),
+            kind: TransientBodyFailureKind::Timeout,
+            availability,
+        }))
+        .fingerprint()
+        .expect("transient evidence is replay-protected")
+    };
+    let original = fingerprint(summary.clone());
+    let source = SourceId::from_digest([0x43; 32]);
+    let variants = [
+        BodyUnavailableSummary {
+            supplier_ids: Some(vec![source].into()),
+            ..summary.clone()
+        },
+        BodyUnavailableSummary {
+            tried_supplier_ids: Some(vec![source].into()),
+            ..summary.clone()
+        },
+        BodyUnavailableSummary {
+            episode_id: Some(EvidenceId::from_digest([0x44; 32])),
+            ..summary
+        },
+    ];
+    for summary in variants {
+        let changed = fingerprint(summary);
+        assert_eq!(
+            changed.domain(),
+            original.domain(),
+            "replay discriminants remain stable"
+        );
+        assert_eq!(changed.evidence(), original.evidence());
+        assert_ne!(
+            changed.payload_digest(),
+            original.payload_digest(),
+            "reusing evidence with changed supplier history or reset identity must conflict"
+        );
+    }
 }

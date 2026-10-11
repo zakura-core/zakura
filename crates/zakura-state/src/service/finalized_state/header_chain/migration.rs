@@ -23,8 +23,9 @@ use crate::service::finalized_state::{
             decode_v1_aux_delivery, decode_v1_consensus_invalid_body_tombstone,
             decode_v1_engine_metadata, decode_v1_full_state_body_validation_evidence_authority,
             decode_v2_engine_metadata, decode_v3_engine_metadata, decode_v4_engine_metadata,
-            FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
-            HeaderFinalityWitnessDisk, HeaderRowCountDisk, HeaderValidationContextDisk,
+            decode_v5_engine_metadata, FullStateBodyValidationEvidenceAuthorityDisk,
+            HeaderChainValueError, HeaderFinalityWitnessDisk, HeaderRowCountDisk,
+            HeaderValidationContextDisk,
         },
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
@@ -68,6 +69,7 @@ impl HeaderChainStore {
             2 => decode_v2_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
             3 => decode_v3_engine_metadata(&metadata_bytes)?,
             4 => decode_v4_engine_metadata(&metadata_bytes)?,
+            5 => decode_v5_engine_metadata(&metadata_bytes)?,
             _ => return Err(HeaderChainValueError::UnsupportedDiskFormat(version).into()),
         };
         if metadata.network_id != config.network().kind() {
@@ -94,8 +96,10 @@ impl HeaderChainStore {
                 "legacy metadata does not match the configured engine policy",
             ));
         }
-        if version == 4 {
-            // Version five only widens the retained validation context, which
+        if version >= 4 {
+            // Version six reads legacy fixed-size body episodes without identities;
+            // rows are rewritten lazily with the new discriminant. Recovery derives
+            // the exact alarm frontier. Version five widens context, which
             // [`Self::resize_validation_context`] backfills next. Recording the new
             // format first means a release that reads 27 context rows never opens a
             // wider context: it rejects the format marker instead.

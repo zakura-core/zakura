@@ -15,6 +15,21 @@ pub use zakura_header_chain::{
     VerifiedGeneration as HeaderChainVerifiedGeneration,
 };
 
+/// Exact retained body state and selected-path membership from one committed version.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeaderChainBodyState {
+    /// Process-local body epoch serialized with this durable state.
+    pub body_work_epoch: zakura_header_chain::BodyWorkEpoch,
+    /// Durable version shared by every field in this response.
+    pub state_version: zakura_header_chain::StateVersion,
+    /// Exact retained header queried by hash.
+    pub frontier: Frontier,
+    /// Whether the header belongs to the current selected projection.
+    pub selected: bool,
+    /// Durable body conclusion, including any in-progress availability episode.
+    pub validation: zakura_header_chain::BodyValidationState,
+}
+
 /// Maximum simultaneous retained target-path leases.
 pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;
 

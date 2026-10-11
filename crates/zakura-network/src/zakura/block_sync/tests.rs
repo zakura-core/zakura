@@ -179,6 +179,9 @@ fn alarmed_committed_snapshot(
         block::Hash([0x50; 32]),
     );
     let alarm = zakura_header_chain::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now - chrono::Duration::minutes(12),
         attempts: 10,
         suppliers: 1,
@@ -658,8 +661,7 @@ fn state_is_only_frontier_publisher() {
 
     assert!(
         STATE_PUBLISHER.contains("pub struct Publisher")
-            && STATE_PUBLISHER
-                .contains("fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect)"),
+            && STATE_PUBLISHER.split_whitespace().collect::<String>().contains("fnpublish(&self,snapshot:EngineSnapshot,effect:TransitionEffect,availability:&[AvailabilityChange],engine:&HeaderChainEngine,)"),
         "state must retain the sole committed-snapshot publisher"
     );
 }
@@ -797,7 +799,11 @@ async fn availability_regression_supplier_discovery_retries_after_backpressure()
             .expect("trace capture initializes");
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
     let snapshot = alarmed_committed_snapshot(header);
-    let previous = snapshot.alarms.header_best_body_unavailable.unwrap();
+    let previous = snapshot
+        .alarms
+        .header_best_body_unavailable
+        .clone()
+        .unwrap();
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig {
         request_timeout: Duration::from_millis(50),
@@ -879,6 +885,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     let previous = snapshot
         .alarms
         .header_best_body_unavailable
+        .clone()
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
@@ -8435,6 +8442,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                             BlockSyncAction::RecordBodyUnavailable {
                                 expected_version,
                                 failure,
+                    ..
                             } => {
                                 assert_eq!(expected_version, zakura_header_chain::StateVersion::default());
                                 assert_eq!(failure.hash, block.hash());
@@ -8485,6 +8493,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
                     BlockSyncAction::RecordBodyUnavailable {
                         expected_version,
                         failure,
+                    ..
                     } => {
                         assert_eq!(expected_version, zakura_header_chain::StateVersion::default());
                         assert_eq!(failure.hash, block.hash());
@@ -16172,4 +16181,102 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         .iter()
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
+}
+
+#[test]
+fn unchanged_episode_view_keeps_live_gates_without_rebuilding() {
+    use super::reactor::synchronize_persisted_body_alarm;
+    use zakura_header_chain::{
+        BodyWorkAuthority, EvidenceId, Frontier, HeaderGeneration, StateVersion,
+    };
+    let registry = PeerRegistry::new();
+    let supplier = peer(1);
+    let header = Frontier::new(block::Height(10), block::Hash([0x61; 32]));
+    let mut first = committed_view(alarmed_committed_snapshot(header), 4);
+    first.snapshot.alarms.header_best_body_unavailable_at = Some(header);
+    let summary = first.alarms.header_best_body_unavailable.clone().unwrap();
+    first.body_unavailable = Arc::new(std::collections::HashMap::from([(
+        header.hash,
+        (header, summary),
+    )]));
+    let scope = BodyWorkAuthority::for_view(&first);
+    let now = Instant::now();
+    assert!(synchronize_persisted_body_alarm(
+        &registry,
+        None,
+        Some(&first)
+    ));
+    assert!(registry.is_body_retry_avoided(&supplier, scope, header.hash, now));
+
+    let mut extended = first.clone();
+    extended.snapshot.state_version = StateVersion::new(8);
+    extended.snapshot.header_generation = HeaderGeneration::new(9);
+    extended.snapshot.frontiers.header_best =
+        Frontier::new(block::Height(11), block::Hash([0x62; 32]));
+    extended.snapshot.header_best_score = zakura_header_chain::ChainScore::new(
+        zakura_header_chain::SuffixWork::zero(),
+        extended.frontiers.header_best.hash,
+    );
+    assert!(
+        !synchronize_persisted_body_alarm(&registry, Some(&first), Some(&extended)),
+        "compatible header extension must reuse live gates"
+    );
+    assert!(registry.is_body_retry_avoided(
+        &supplier,
+        BodyWorkAuthority::for_view(&extended),
+        header.hash,
+        now
+    ));
+
+    let mut invalidated = extended.clone();
+    invalidated.body_work_epoch = invalidated.body_work_epoch.checked_next().unwrap();
+    assert!(synchronize_persisted_body_alarm(
+        &registry,
+        Some(&extended),
+        Some(&invalidated)
+    ));
+    let new_scope = BodyWorkAuthority::for_view(&invalidated);
+    assert!(!registry.is_body_retry_avoided(&supplier, scope, header.hash, now));
+    assert!(registry.is_body_retry_avoided(&supplier, new_scope, header.hash, now));
+
+    let mut reset = invalidated.clone();
+    let episode = &mut Arc::make_mut(&mut reset.body_unavailable)
+        .get_mut(&header.hash)
+        .unwrap()
+        .1;
+    episode.episode_id = Some(EvidenceId::from_digest([0x63; 32]));
+    episode.attempts = 0;
+    episode.alarmed = false;
+    episode.started_at = chrono::Utc::now();
+    episode.next_probe_at = episode.started_at;
+    let sources = std::collections::BTreeSet::from([zakura_header_chain::SourceId::from_digest(
+        supplier.digest(),
+    )]);
+    episode.supplier_set_digest =
+        zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&sources);
+    episode.supplier_ids = Some(sources.into_iter().collect::<Vec<_>>().into());
+    episode.tried_supplier_ids = Some(Vec::new().into());
+    reset.snapshot.alarms.header_best_body_unavailable = None;
+    reset.snapshot.alarms.header_best_body_unavailable_at = None;
+    assert!(synchronize_persisted_body_alarm(
+        &registry,
+        Some(&invalidated),
+        Some(&reset)
+    ));
+    assert!(!registry.is_body_retry_avoided(&supplier, new_scope, header.hash, now));
+    assert!(synchronize_persisted_body_alarm(
+        &registry,
+        Some(&reset),
+        Some(&invalidated)
+    ));
+    assert!(registry.is_body_retry_avoided(&supplier, new_scope, header.hash, now));
+    assert!(
+        !registry.is_body_retry_avoided(
+            &supplier,
+            new_scope,
+            header.hash,
+            now + Duration::from_secs(11 * 60)
+        ),
+        "deadline expiry needs no committed-view update"
+    );
 }

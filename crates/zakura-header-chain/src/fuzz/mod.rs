@@ -754,6 +754,9 @@ pub fn replay_fork_transition_bytes(bytes: &[u8]) -> ForkReplaySummary {
                             evidence: evidence(operation, branch),
                             kind: TransientBodyFailureKind::VerifierUnavailable,
                             availability: BodyUnavailableSummary {
+                                supplier_ids: None,
+                                tried_supplier_ids: None,
+                                episode_id: None,
                                 started_at: clock.now(),
                                 attempts: u32::from(branch).saturating_add(1),
                                 suppliers: 1,
@@ -1508,6 +1511,9 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
     for (index, kind) in transient_kinds.into_iter().enumerate() {
         let marker = u8::try_from(index).expect("the transient matrix fits in u8");
         let availability = BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             attempts: u32::try_from(index + 1).expect("the transient matrix fits in u32"),
             suppliers: 1,
             supplier_set_digest: [marker.wrapping_add(0x30); 32],
@@ -1520,7 +1526,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
                     hash: invalid.hash,
                     evidence: evidence(0xe200 + index, marker),
                     kind,
-                    availability,
+                    availability: availability.clone(),
                 },
             )),
         };
@@ -1536,7 +1542,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
             .expect("the transient target remains retained");
         assert_eq!(
             node.body_validation_state,
-            BodyValidationState::Unavailable(availability)
+            BodyValidationState::Unavailable(availability.clone())
         );
         assert!(node.eligibility.direct_reasons.is_empty());
         assert_eq!(node.eligibility.inherited_from, None);

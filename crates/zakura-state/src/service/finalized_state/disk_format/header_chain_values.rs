@@ -93,6 +93,9 @@ pub enum HeaderChainValueError {
     /// A nonzero field contained zero.
     #[error("zero in nonzero field {0}")]
     Zero(&'static str),
+    /// Persisted supplier identities are not canonical or disagree with the summary.
+    #[error("invalid body supplier identity evidence")]
+    SupplierEvidence,
     /// A canonical Zcash header failed decoding or had trailing bytes.
     #[error("invalid canonical Zcash header")]
     Header,
@@ -879,7 +882,7 @@ impl HeaderNodeDisk {
                 }
             }
             BodyValidationState::Unavailable(summary) => {
-                HeaderBodyValidationStateDisk::Unavailable(*summary)
+                HeaderBodyValidationStateDisk::Unavailable(summary.clone())
             }
         };
         Self {
@@ -1044,8 +1047,9 @@ fn put_body_validation_state(
             encoder.bounded("body_rule", rule.as_bytes(), MAX_RULE_ID_BYTES)?;
         }
         HeaderBodyValidationStateDisk::Unavailable(summary) => {
-            encoder.u8(4);
-            put_unavailable(encoder, *summary);
+            // Discriminant four remains the released fixed-size legacy summary.
+            encoder.u8(5);
+            put_unavailable(encoder, summary)?;
         }
     }
     Ok(())
@@ -1066,7 +1070,10 @@ fn get_body_validation_state(
                 .map_err(|_| HeaderChainValueError::RuleId)?
                 .to_owned(),
         }),
-        4 => Ok(HeaderBodyValidationStateDisk::Unavailable(get_unavailable(
+        4 => Ok(HeaderBodyValidationStateDisk::Unavailable(
+            get_legacy_unavailable(decoder)?,
+        )),
+        5 => Ok(HeaderBodyValidationStateDisk::Unavailable(get_unavailable(
             decoder,
         )?)),
         value => Err(HeaderChainValueError::UnknownDiscriminant {
@@ -1076,7 +1083,7 @@ fn get_body_validation_state(
     }
 }
 
-fn put_unavailable(encoder: &mut Encoder, summary: BodyUnavailableSummary) {
+fn put_legacy_unavailable(encoder: &mut Encoder, summary: &BodyUnavailableSummary) {
     put_time(encoder, summary.started_at);
     encoder.u32(summary.attempts);
     encoder.u32(summary.suppliers);
@@ -1085,7 +1092,31 @@ fn put_unavailable(encoder: &mut Encoder, summary: BodyUnavailableSummary) {
     put_time(encoder, summary.next_probe_at);
 }
 
-fn get_unavailable(
+fn put_unavailable(
+    encoder: &mut Encoder,
+    summary: &BodyUnavailableSummary,
+) -> Result<(), HeaderChainValueError> {
+    put_legacy_unavailable(encoder, summary);
+    for ids in [&summary.supplier_ids, &summary.tried_supplier_ids] {
+        encoder.bool(ids.is_some());
+        if let Some(ids) = ids {
+            let count = u32::try_from(ids.len()).map_err(|_| HeaderChainValueError::Oversized {
+                field: "body_suppliers",
+                length: ids.len(),
+            })?;
+            encoder.u32(count);
+            for id in ids.iter() {
+                encoder.fixed(&id.digest());
+            }
+        }
+    }
+    encoder.optional(summary.episode_id, |encoder, id| {
+        encoder.fixed(&id.digest())
+    });
+    Ok(())
+}
+
+fn get_legacy_unavailable(
     decoder: &mut Decoder<'_>,
 ) -> Result<BodyUnavailableSummary, HeaderChainValueError> {
     Ok(BodyUnavailableSummary {
@@ -1093,9 +1124,45 @@ fn get_unavailable(
         attempts: decoder.u32()?,
         suppliers: decoder.u32()?,
         supplier_set_digest: decoder.array()?,
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         alarmed: decoder.bool()?,
         next_probe_at: get_time(decoder)?,
     })
+}
+
+fn get_unavailable(
+    decoder: &mut Decoder<'_>,
+) -> Result<BodyUnavailableSummary, HeaderChainValueError> {
+    let mut summary = get_legacy_unavailable(decoder)?;
+    for target in [&mut summary.supplier_ids, &mut summary.tried_supplier_ids] {
+        if decoder.bool()? {
+            let count =
+                usize::try_from(decoder.u32()?).map_err(|_| HeaderChainValueError::Oversized {
+                    field: "body_suppliers",
+                    length: usize::MAX,
+                })?;
+            // Check actual row capacity before allocation, not a sender's count.
+            if count > decoder.remaining.len() / 32 {
+                return Err(HeaderChainValueError::Oversized {
+                    field: "body_suppliers",
+                    length: count,
+                });
+            }
+            let mut ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                ids.push(SourceId::from_digest(decoder.array()?));
+            }
+            *target = Some(ids.into());
+        }
+    }
+    summary.episode_id =
+        decoder.optional(|decoder| decoder.array().map(EvidenceId::from_digest))?;
+    if !summary.has_consistent_supplier_ids() {
+        return Err(HeaderChainValueError::SupplierEvidence);
+    }
+    Ok(summary)
 }
 
 impl FallibleDiskValue for BodySizeHint {
@@ -1646,13 +1713,23 @@ impl FallibleDiskValue for EngineMetadata {
         encoder.fixed(&value.header_best_score.tip_hash.0);
         encoder.u32(value.oldest_retained_height.0);
         encoder.bool(value.alarms.resource_stalled);
-        encoder.optional(value.alarms.header_best_body_unavailable, put_unavailable);
+        encoder.bool(value.alarms.header_best_body_unavailable.is_some());
+        if let Some(summary) = &value.alarms.header_best_body_unavailable {
+            if value.disk_format.0 >= 6 {
+                put_unavailable(&mut encoder, summary)?;
+            } else {
+                put_legacy_unavailable(&mut encoder, summary);
+            }
+        }
         encoder.optional(value.last_transition, |encoder, fingerprint| {
             encoder.u8(fingerprint.domain().code());
             encoder.fixed(&fingerprint.evidence().digest());
             encoder.fixed(&fingerprint.payload_digest());
         });
         encoder.optional(value.alarms.migrated_pin_refuted, put_frontier);
+        if value.disk_format.0 >= 6 {
+            encoder.optional(value.alarms.header_best_body_unavailable_at, put_frontier);
+        }
         Ok(encoder.0)
     }
 
@@ -1700,12 +1777,19 @@ pub(crate) fn decode_v3_engine_metadata(
 
 /// Decode released version-four metadata.
 ///
-/// Version four used the current layout. Version five only widened the retained validation
+/// Version four used the fixed-summary layout. Version five only widened the retained validation
 /// context, so the format marker is the one difference.
 pub(crate) fn decode_v4_engine_metadata(
     bytes: &[u8],
 ) -> Result<EngineMetadata, HeaderChainValueError> {
     decode_engine_metadata(bytes, HeaderChainDiskVersion(4), None)
+}
+
+/// Decode released version-five metadata before the supplier-identity migration.
+pub(crate) fn decode_v5_engine_metadata(
+    bytes: &[u8],
+) -> Result<EngineMetadata, HeaderChainValueError> {
+    decode_engine_metadata(bytes, HeaderChainDiskVersion(5), None)
 }
 
 /// Decode metadata, reading the network policy digest unless the caller supplies a legacy one.
@@ -1764,7 +1848,11 @@ fn decode_engine_metadata(
     );
     let oldest_retained_height = block::Height(decoder.u32()?);
     let resource_stalled = decoder.bool()?;
-    let header_best_body_unavailable = decoder.optional(get_unavailable)?;
+    let header_best_body_unavailable = if disk_format.0 >= 6 {
+        decoder.optional(get_unavailable)?
+    } else {
+        decoder.optional(get_legacy_unavailable)?
+    };
     let last_transition = decoder.optional(|decoder| {
         let code = decoder.u8()?;
         let domain = TransitionDomain::from_code(code).ok_or(
@@ -1780,6 +1868,11 @@ fn decode_engine_metadata(
         ))
     })?;
     let migrated_pin_refuted = decoder.optional(get_frontier)?;
+    let header_best_body_unavailable_at = if disk_format.0 >= 6 {
+        decoder.optional(get_frontier)?
+    } else {
+        None
+    };
     decoder.finish()?;
     Ok(EngineMetadata {
         disk_format,
@@ -1799,10 +1892,48 @@ fn decode_engine_metadata(
         alarms: AlarmSet {
             resource_stalled,
             header_best_body_unavailable,
+            header_best_body_unavailable_at,
             migrated_pin_refuted,
         },
         last_transition,
     })
+}
+
+#[cfg(test)]
+impl HeaderNodeDisk {
+    pub(crate) fn encode_legacy_v5(&self) -> Result<Vec<u8>, HeaderChainValueError> {
+        let mut encoder = Encoder::default();
+        let header = self
+            .header
+            .zcash_serialize_to_vec()
+            .map_err(|_| HeaderChainValueError::Header)?;
+        encoder.bounded("header", &header, MAX_HEADER_BYTES)?;
+        encoder.fixed(&self.hash.0);
+        encoder.fixed(&self.parent_hash.0);
+        encoder.u32(self.height.0);
+        encoder.fixed(&self.block_work.to_big_endian());
+        encoder.fixed(&self.work_origin.0);
+        encoder.fixed(&self.cumulative_work.to_big_endian());
+        encoder.optional(self.deferred_until, put_time);
+        encoder.optional(self.inherited_from, |encoder, hash| {
+            encoder.fixed(&hash.0);
+        });
+        if let HeaderBodyValidationStateDisk::Unavailable(summary) = &self.body_validation_state {
+            encoder.u8(4);
+            put_legacy_unavailable(&mut encoder, summary);
+        } else {
+            put_body_validation_state(&mut encoder, &self.body_validation_state)?;
+        }
+        encoder.counted(
+            "aux_delivery_ids",
+            &self.aux_delivery_ids,
+            MAX_AUX_DELIVERY_IDS,
+            |encoder, id| {
+                encoder.fixed(&id.digest());
+            },
+        )?;
+        Ok(encoder.0)
+    }
 }
 
 #[cfg(test)]
@@ -1819,6 +1950,49 @@ mod tests {
 
     fn digest(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn supplier_episode_codec_preserves_legacy_and_bounds_new_identities() {
+        let source = SourceId::from_digest([3; 32]);
+        let ids = [source].into_iter().collect();
+        let mut summary = BodyUnavailableSummary {
+            started_at: chrono::DateTime::from_timestamp(10, 0).unwrap(),
+            attempts: 3,
+            suppliers: 1,
+            supplier_set_digest: BodyUnavailableSummary::supplier_set_digest(&ids),
+            next_probe_at: chrono::DateTime::from_timestamp(20, 0).unwrap(),
+            ..Default::default()
+        };
+        let mut legacy = Encoder::default();
+        put_legacy_unavailable(&mut legacy, &summary);
+        assert_eq!(
+            get_legacy_unavailable(&mut Decoder::new(&legacy.0)).unwrap(),
+            summary
+        );
+        summary.supplier_ids = Some(vec![source].into());
+        summary.tried_supplier_ids = Some(vec![source].into());
+        summary.episode_id = Some(EvidenceId::from_digest([9; 32]));
+        let mut current = Encoder::default();
+        put_unavailable(&mut current, &summary).unwrap();
+        assert_eq!(
+            get_unavailable(&mut Decoder::new(&current.0)).unwrap(),
+            summary
+        );
+        let mut forged = legacy.0;
+        forged.push(1);
+        forged.extend(u32::MAX.to_le_bytes());
+        assert!(matches!(
+            get_unavailable(&mut Decoder::new(&forged)),
+            Err(HeaderChainValueError::Oversized {
+                field: "body_suppliers",
+                ..
+            })
+        ));
+        summary.tried_supplier_ids = Some(vec![SourceId::from_digest([4; 32])].into());
+        let mut invalid = Encoder::default();
+        put_unavailable(&mut invalid, &summary).unwrap();
+        assert!(get_unavailable(&mut Decoder::new(&invalid.0)).is_err());
     }
 
     #[test]
@@ -1873,6 +2047,9 @@ mod tests {
             inherited_from: Some(block::Hash([3; 32])),
             body_validation_state: HeaderBodyValidationStateDisk::Unavailable(
                 BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     started_at: Utc
                         .timestamp_opt(30, 40)
                         .single()
@@ -1953,7 +2130,7 @@ mod tests {
                 digest(&context.encode().expect("context encodes"))
             ],
             [
-                "a10768fc091c74d250189203381578212a7b3eb7ea3e759ee85584015bf04f89",
+                "fef6a747548e2ae0493c04ae9c06363dffe5b9621d86b5953fb8a47ad84736f1",
                 "095c753ad1f2a99c1a29f14db8f4e36c528c159c7e436957ac0f18a46dde7049",
                 "dcb21b5799e73e2ca54fd1448f50dd56d5d7994cb173e5279d28942350534863",
             ]
@@ -2138,8 +2315,12 @@ mod tests {
             ),
             oldest_retained_height: block::Height(1),
             alarms: AlarmSet {
+                header_best_body_unavailable_at: None,
                 resource_stalled: true,
                 header_best_body_unavailable: Some(BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     started_at: Utc
                         .timestamp_opt(70, 80)
                         .single()
@@ -2162,11 +2343,15 @@ mod tests {
             )),
         };
         let bytes = metadata.encode().expect("metadata encodes");
-        assert_eq!(&bytes[..6], &[0, 0, 0, 5, 1, 2]);
+        assert_eq!(&bytes[..6], &[0, 0, 0, 6, 1, 2]);
         assert_eq!(EngineMetadata::decode(&bytes), Ok(metadata.clone()));
-        // Version four used the current layout with an older format marker.
-        let mut version_four_bytes = bytes.clone();
-        version_four_bytes[..4].copy_from_slice(&4_u32.to_be_bytes());
+        // Legacy layouts have fixed-size summaries and no exact alarm frontier.
+        let version_four_bytes = EngineMetadata {
+            disk_format: HeaderChainDiskVersion(4),
+            ..metadata.clone()
+        }
+        .encode()
+        .expect("legacy metadata encodes");
         assert_eq!(
             EngineMetadata::decode(&version_four_bytes),
             Err(HeaderChainValueError::UnsupportedDiskFormat(4))
@@ -2179,8 +2364,8 @@ mod tests {
             })
         );
         // Version one wrote no network policy digest, so its row is the current row with the
-        // marker rolled back and that field removed.
-        let mut version_one_bytes = bytes.clone();
+        // legacy marker rolled back and that field removed.
+        let mut version_one_bytes = version_four_bytes.clone();
         version_one_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
         version_one_bytes.drain(6..38);
         assert_eq!(
@@ -2195,7 +2380,7 @@ mod tests {
             })
         );
         // Version two used the same layout as version one with a different format marker.
-        let mut version_two_bytes = bytes.clone();
+        let mut version_two_bytes = version_four_bytes.clone();
         version_two_bytes[..4].copy_from_slice(&2_u32.to_be_bytes());
         version_two_bytes.drain(6..38);
         assert_eq!(
@@ -2223,7 +2408,7 @@ mod tests {
         // These digests pin the on-disk encodings. Regenerate a digest only together with a
         // deliberate encoding change; an unexplained change means a value's layout drifted.
         // The finality and metadata digests moved with the version-four migration provenance,
-        // and the metadata digest moved again with the version-five format marker.
+        // and metadata changed again with the version-six identity and alarm-frontier fields.
         assert_eq!(
             [
                 digest(&aux.encode().expect("aux encodes")),
@@ -2233,7 +2418,7 @@ mod tests {
             [
                 "c041fc819cc43fcd28dd3ba7fe296271ae0c7225c9bbcdf1dd38152dc313346a",
                 "37c583dc11b5fb0d06484330fe75a5b022249099fd00b3e4d06c267babcbff33",
-                "e12da354e079f8070f3f3b4cf75af93e41ec1f7f52cc31ed380e28a48c10b3e2",
+                "910b45f1d2359327bcf3277d97470f2cf16f93b4d7ddd0b74999c158f390b70d",
             ]
         );
     }
@@ -2310,13 +2495,17 @@ mod tests {
                 ..
             })
         ));
-        let mut metadata = vec![0, 0, 0, 6];
+        let mut metadata = (HeaderChainDiskVersion::CURRENT.0 + 1)
+            .to_be_bytes()
+            .to_vec();
         metadata.resize(512, 0);
         assert_eq!(
             EngineMetadata::decode(&metadata),
-            Err(HeaderChainValueError::UnsupportedDiskFormat(6))
+            Err(HeaderChainValueError::UnsupportedDiskFormat(
+                HeaderChainDiskVersion::CURRENT.0 + 1
+            ))
         );
-        metadata[3] = 5;
+        metadata[..4].copy_from_slice(&HeaderChainDiskVersion::CURRENT.0.to_be_bytes());
         metadata[4] = 9;
         assert!(matches!(
             EngineMetadata::decode(&metadata),

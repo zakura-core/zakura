@@ -7,6 +7,9 @@ fn transient_body_evidence_rejects_each_malformed_episode_shape() {
     let now = Utc::now();
     let clock = ManualClock(now);
     let baseline = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now,
         attempts: 1,
         suppliers: 1,
@@ -18,6 +21,9 @@ fn transient_body_evidence_rejects_each_malformed_episode_shape() {
         (
             "zero attempts",
             crate::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 0,
                 ..baseline
             },
@@ -25,6 +31,9 @@ fn transient_body_evidence_rejects_each_malformed_episode_shape() {
         (
             "zero suppliers",
             crate::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 suppliers: 0,
                 ..baseline
             },
@@ -32,6 +41,9 @@ fn transient_body_evidence_rejects_each_malformed_episode_shape() {
         (
             "probe before episode start",
             crate::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 next_probe_at: now - chrono::Duration::seconds(1),
                 ..baseline
             },
@@ -48,7 +60,7 @@ fn transient_body_evidence_rejects_each_malformed_episode_shape() {
                         hash: store.metadata.frontiers.header_best.hash,
                         evidence: EvidenceId::from_digest([0x22; 32]),
                         kind: crate::TransientBodyFailureKind::Timeout,
-                        availability,
+                        availability: availability.clone(),
                     },
                 )),
             },
@@ -185,6 +197,9 @@ fn transient_body_evidence_cannot_regress_a_verified_body() {
                 evidence: EvidenceId::from_digest([0xc0; 32]),
                 kind: crate::TransientBodyFailureKind::Timeout,
                 availability: crate::BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,
@@ -213,6 +228,9 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
     let clock = ManualClock(now);
     let selected = store.metadata.frontiers.header_best;
     let old = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now - chrono::Duration::minutes(12),
         attempts: 10,
         suppliers: 2,
@@ -222,10 +240,13 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
     };
     store
         .graph
-        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old.clone()))
         .expect("the selected fixture body exists");
-    store.metadata.alarms.header_best_body_unavailable = Some(old);
+    store.metadata.alarms.header_best_body_unavailable = Some(old.clone());
     let updated = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: old.started_at,
         attempts: old.attempts,
         suppliers: 2,
@@ -239,7 +260,7 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
         event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
             hash: selected.hash,
             evidence,
-            availability: updated,
+            availability: updated.clone(),
         }),
     };
 
@@ -256,7 +277,7 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
             .header_node(selected.hash)
             .expect("the selected node remains retained")
             .body_validation_state,
-        BodyValidationState::Unavailable(updated)
+        BodyValidationState::Unavailable(updated.clone())
     );
     assert_eq!(
         projected_graph
@@ -271,7 +292,7 @@ fn new_body_supplier_preserves_only_the_selected_persistent_alarm() {
     );
     assert_eq!(
         plan.change_set.metadata.alarms.header_best_body_unavailable,
-        Some(updated)
+        Some(updated.clone())
     );
     store.commit(&plan);
     let replay = apply_transition(
@@ -293,6 +314,9 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     let clock = ManualClock(now);
     let selected = store.metadata.frontiers.header_best;
     let old = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now - chrono::Duration::minutes(12),
         attempts: 10,
         suppliers: 2,
@@ -302,10 +326,10 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     };
     store
         .graph
-        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old.clone()))
         .expect("the selected fixture body exists");
-    store.metadata.alarms.header_best_body_unavailable = Some(old);
-    let apply = |availability| {
+    store.metadata.alarms.header_best_body_unavailable = Some(old.clone());
+    let apply = |availability: crate::BodyUnavailableSummary| {
         apply_transition(
             &store,
             TransitionRequest {
@@ -313,7 +337,7 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
                 event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
                     hash: selected.hash,
                     evidence: EvidenceId::from_digest([0xc2; 32]),
-                    availability,
+                    availability: availability.clone(),
                 }),
             },
             &context(&config, &clock, Some(&Authority)),
@@ -322,6 +346,9 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
 
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             started_at: old.started_at,
             attempts: old.attempts,
             suppliers: 2,
@@ -335,6 +362,9 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     ));
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             started_at: now,
             attempts: old.attempts,
             suppliers: 3,
@@ -348,6 +378,9 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     ));
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             started_at: old.started_at,
             attempts: old.attempts,
             suppliers: 3,
@@ -361,6 +394,9 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
     ));
     assert!(matches!(
         apply(crate::BodyUnavailableSummary {
+            supplier_ids: None,
+            tried_supplier_ids: None,
+            episode_id: None,
             started_at: old.started_at,
             attempts: old.attempts,
             suppliers: 1,
@@ -372,4 +408,290 @@ fn body_supplier_discovery_rejects_reset_or_nonexpanding_evidence() {
             InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier)
         ))
     ));
+}
+
+#[test]
+fn intermediate_selected_body_alarm_is_externally_visible() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let now = Utc::now();
+    let clock = ManualClock(now);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .unwrap()
+        .header
+        .difficulty_threshold;
+    let tip = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x51);
+    let stalled = store
+        .graph
+        .header_ancestor(tip.hash, block::Height(1))
+        .unwrap()
+        .unwrap();
+    for header in [stalled, tip] {
+        store
+            .graph
+            .set_body_validation_state(header.hash, BodyValidationState::Unknown)
+            .unwrap();
+    }
+    synchronize_fixture(&mut store, anchor);
+    let availability = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
+        started_at: now - chrono::Duration::minutes(12),
+        attempts: 10,
+        suppliers: 1,
+        supplier_set_digest: [0x53; 32],
+        alarmed: true,
+        next_probe_at: now + chrono::Duration::minutes(10),
+    };
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                crate::TransientBodyFailure {
+                    hash: stalled.hash,
+                    evidence: EvidenceId::from_digest([0x52; 32]),
+                    kind: crate::TransientBodyFailureKind::Timeout,
+                    availability: availability.clone(),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .unwrap();
+    assert_eq!(plan.change_set.metadata.frontiers.header_best, tip);
+    assert_eq!(
+        plan.change_set
+            .metadata
+            .alarms
+            .header_best_body_unavailable_at,
+        Some(stalled)
+    );
+    assert_eq!(
+        plan.change_set.metadata.alarms.header_best_body_unavailable,
+        Some(availability.clone()),
+        "the stalled intermediate body must raise the selected-chain alarm"
+    );
+    store.commit(&plan);
+    let later = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                crate::TransientBodyFailure {
+                    hash: tip.hash,
+                    evidence: EvidenceId::from_digest([0x54; 32]),
+                    kind: crate::TransientBodyFailureKind::Timeout,
+                    availability: availability.clone(),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .unwrap();
+    store.commit(&later);
+    assert_eq!(
+        store.metadata.alarms.header_best_body_unavailable_at,
+        Some(stalled)
+    );
+    let cleared = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Verified(
+                crate::VerifiedBodyEvidence {
+                    hash: stalled.hash,
+                    evidence: EvidenceId::from_digest([0x55; 32]),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .unwrap();
+    assert_eq!(
+        cleared
+            .change_set
+            .metadata
+            .alarms
+            .header_best_body_unavailable_at,
+        Some(tip),
+        "clearing the first alarm must reveal the later unchanged episode"
+    );
+}
+
+#[test]
+fn smaller_supplier_set_with_a_new_identity_preserves_alarm() {
+    for newcomer in [true, false] {
+        let identities: std::collections::BTreeSet<_> = [1, 2, 3]
+            .into_iter()
+            .map(|n| SourceId::from_digest([n; 32]))
+            .collect();
+        let replacement: std::collections::BTreeSet<_> =
+            [SourceId::from_digest([if newcomer { 4 } else { 1 }; 32])]
+                .into_iter()
+                .collect();
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let now = Utc::now();
+        let clock = ManualClock(now);
+        let selected = store.metadata.frontiers.header_best;
+        let old = crate::BodyUnavailableSummary {
+            supplier_ids: Some(identities.iter().copied().collect::<Vec<_>>().into()),
+            tried_supplier_ids: None,
+            episode_id: None,
+            started_at: now - chrono::Duration::minutes(12),
+            attempts: 10,
+            suppliers: 3,
+            supplier_set_digest: crate::BodyUnavailableSummary::supplier_set_digest(&identities),
+            alarmed: true,
+            next_probe_at: now + chrono::Duration::minutes(8),
+        };
+        store
+            .graph
+            .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old.clone()))
+            .expect("the selected fixture body exists");
+        store.metadata.alarms.header_best_body_unavailable = Some(old.clone());
+        let updated = crate::BodyUnavailableSummary {
+            supplier_ids: Some(replacement.iter().copied().collect::<Vec<_>>().into()),
+            tried_supplier_ids: None,
+            episode_id: None,
+            started_at: old.started_at,
+            attempts: old.attempts,
+            suppliers: 1,
+            supplier_set_digest: crate::BodyUnavailableSummary::supplier_set_digest(&replacement),
+            alarmed: true,
+            next_probe_at: now,
+        };
+        let evidence = EvidenceId::from_digest([0xc1; 32]);
+        let request = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodySupplierDiscovered(crate::BodySupplierDiscovered {
+                hash: selected.hash,
+                evidence,
+                availability: updated.clone(),
+            }),
+        };
+
+        let plan = apply_transition(
+            &store,
+            request.clone(),
+            &context(&config, &clock, Some(&Authority)),
+        );
+        if !newcomer {
+            assert!(
+                matches!(
+                    plan,
+                    Err(TransitionFailure::InvalidEvidence(
+                        InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier)
+                    ))
+                ),
+                "departures alone must not rearm a probe"
+            );
+            continue;
+        }
+        let plan = plan.expect("a new identity makes the persistent episode probeable even when the supplier count falls");
+        let projected_graph = projected_graph(&store.graph, &plan);
+        assert_eq!(plan.change_set.metadata.frontiers, store.metadata.frontiers);
+        assert_eq!(
+            projected_graph
+                .header_node(selected.hash)
+                .expect("the selected node remains retained")
+                .body_validation_state,
+            BodyValidationState::Unavailable(updated.clone())
+        );
+        assert_eq!(
+            projected_graph
+                .header_node(selected.hash)
+                .expect("the selected node remains retained")
+                .eligibility,
+            store
+                .graph
+                .header_node(selected.hash)
+                .expect("the selected fixture node exists")
+                .eligibility
+        );
+        assert_eq!(
+            plan.change_set.metadata.alarms.header_best_body_unavailable,
+            Some(updated.clone())
+        );
+        store.commit(&plan);
+        let replay = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                ..request
+            },
+            &context(&config, &clock, Some(&Authority)),
+        )
+        .expect("the exact supplier-discovery evidence replays idempotently");
+        assert!(replay.is_no_change());
+    }
+}
+
+#[test]
+fn same_clock_operator_reset_rejects_old_episode_with_current_version() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let now = Utc::now();
+    let clock = ManualClock(now);
+    let hash = store.metadata.frontiers.header_best.hash;
+    let old = crate::BodyUnavailableSummary {
+        started_at: now,
+        next_probe_at: now,
+        attempts: 10,
+        suppliers: 1,
+        alarmed: true,
+        episode_id: Some(EvidenceId::from_digest([0x71; 32])),
+        ..Default::default()
+    };
+    store
+        .graph
+        .set_body_validation_state(hash, BodyValidationState::Unavailable(old.clone()))
+        .unwrap();
+    let reset = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
+                hash,
+                evidence: EvidenceId::from_digest([0x72; 32]),
+                availability: crate::BodyUnavailableSummary {
+                    attempts: 0,
+                    alarmed: false,
+                    ..old.clone()
+                },
+            }),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("operator reset at the same clock instant");
+    store.commit(&reset);
+    let result = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                crate::TransientBodyFailure {
+                    hash,
+                    evidence: EvidenceId::from_digest([0x73; 32]),
+                    kind: crate::TransientBodyFailureKind::Timeout,
+                    availability: crate::BodyUnavailableSummary {
+                        attempts: 11,
+                        ..old
+                    },
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TransitionFailure::InvalidEvidence(
+                InvalidTransitionEvidence::Body(BodyViolation::InvalidTransientEpisode)
+            ))
+        ),
+        "old episode must not overwrite reset even at current CAS: {result:?}"
+    );
 }

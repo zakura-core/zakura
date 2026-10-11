@@ -302,6 +302,9 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
     let evidence = EvidenceId::from_digest([7; 32]);
     let authority = Authority(evidence);
     let availability = BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: Utc
             .timestamp_opt(1_000, 0)
             .single()
@@ -327,7 +330,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
             hash: anchor.hash,
             evidence,
             kind: TransientBodyFailureKind::Storage,
-            availability,
+            availability: availability.clone(),
         })),
     };
     let result = runtime
@@ -342,7 +345,7 @@ fn serialized_apply_commits_before_receipt_and_reopens_exactly() {
     assert_eq!(*subscriber.borrow_and_update(), committed);
     assert_eq!(
         committed.alarms.header_best_body_unavailable,
-        Some(availability)
+        Some(availability.clone())
     );
     assert!(matches!(
         runtime.store.header_node(anchor.hash).expect("the node row decodes").expect("the anchor remains").body_validation_state,
@@ -720,6 +723,9 @@ fn prepared_full_state_swaps_only_after_combined_commit() {
             evidence,
             kind: TransientBodyFailureKind::Storage,
             availability: BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 1,
                 suppliers: 1,
                 alarmed: false,
@@ -854,6 +860,9 @@ fn unrelated_body_commit_cannot_stale_current_header_generation_work() {
                             evidence,
                             kind: TransientBodyFailureKind::Storage,
                             availability: BodyUnavailableSummary {
+                                supplier_ids: None,
+                                tried_supplier_ids: None,
+                                episode_id: None,
                                 attempts: 1,
                                 suppliers: 1,
                                 ..Default::default()
@@ -1187,6 +1196,9 @@ fn stale_prepared_full_state_transition_is_a_hard_error() {
                 evidence,
                 kind: TransientBodyFailureKind::Storage,
                 availability: BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,
@@ -1475,9 +1487,20 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
 
 #[test]
 fn coalesced_replacement_cannot_hide_body_work_epoch() {
-    let (_, _, metadata) = fixture();
+    let (engine_config, anchor, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
+    store
+        .initialize(metadata, anchor)
+        .expect("publisher fixture initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("publisher fixture audits");
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("fixture engine lock");
+    let publisher = Publisher::new(initial.clone(), &engine);
     let subscriber = publisher.subscribe_views();
     assert_eq!(
         subscriber.borrow().body_work_epoch,
@@ -1486,7 +1509,7 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
 
     let mut compatible = initial.clone();
     compatible.state_version = StateVersion::new(initial.state_version.get() + 1);
-    publisher.publish(compatible.clone(), TransitionEffect::none());
+    publisher.publish(compatible.clone(), TransitionEffect::none(), &[], &engine);
     assert_eq!(
         publisher.view().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::default()
@@ -1496,11 +1519,11 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
     invalidated.state_version = StateVersion::new(compatible.state_version.get() + 1);
     let mut invalidating_effect = TransitionEffect::none();
     invalidating_effect.body_work = zakura_header_chain::BodyWorkEffect::Invalidated;
-    publisher.publish(invalidated.clone(), invalidating_effect);
+    publisher.publish(invalidated.clone(), invalidating_effect, &[], &engine);
 
     let mut later_extension = invalidated;
     later_extension.state_version = StateVersion::new(later_extension.state_version.get() + 1);
-    publisher.publish(later_extension, TransitionEffect::none());
+    publisher.publish(later_extension, TransitionEffect::none(), &[], &engine);
     assert_eq!(
         subscriber.borrow().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::new(1),
@@ -1508,23 +1531,44 @@ fn coalesced_replacement_cannot_hide_body_work_epoch() {
     );
 
     let before_resource_stall = publisher.view().body_work_epoch;
-    publisher.publish(publisher.snapshot(), TransitionEffect::resource_stalled());
+    publisher.publish(
+        publisher.snapshot(),
+        TransitionEffect::resource_stalled(),
+        &[],
+        &engine,
+    );
     assert_eq!(publisher.view().body_work_epoch, before_resource_stall);
 }
 
 #[test]
 fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
-    let (_, _, metadata) = fixture();
+    let (engine_config, anchor, metadata) = fixture();
     let initial = metadata.snapshot();
-    let publisher = Publisher::new(initial.clone());
+    let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
+    store
+        .initialize(metadata, anchor)
+        .expect("publisher fixture initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("publisher fixture audits");
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("fixture engine lock");
+    let publisher = Publisher::new(initial.clone(), &engine);
 
     let mut first_checkpoint = initial;
     first_checkpoint.state_version = StateVersion::new(first_checkpoint.state_version.get() + 1);
-    publisher.publish(first_checkpoint.clone(), TransitionEffect::none());
+    publisher.publish(
+        first_checkpoint.clone(),
+        TransitionEffect::none(),
+        &[],
+        &engine,
+    );
 
     let mut second_checkpoint = first_checkpoint;
     second_checkpoint.state_version = StateVersion::new(second_checkpoint.state_version.get() + 1);
-    publisher.publish(second_checkpoint, TransitionEffect::none());
+    publisher.publish(second_checkpoint, TransitionEffect::none(), &[], &engine);
 
     assert_eq!(
         publisher.view().body_work_epoch,
@@ -1804,4 +1848,321 @@ fn checkpoint_grow_provenance_is_bound_to_one_state_version() {
         ),
         "checkpoint evidence must not validate against a version the state writer never read"
     );
+}
+
+#[test]
+fn selected_availability_projection_survives_restart_before_and_after_alarm() {
+    for (alarmed, legacy) in [(false, false), (true, false), (false, true), (true, true)] {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network().clone();
+        let db = open(&db_config, &network);
+        let store = HeaderChainStore::new(db.clone());
+        store
+            .initialize(metadata, anchor.clone())
+            .expect("the test store initializes");
+        let (runtime, _) = store
+            .startup(&engine_config)
+            .expect("the initial store audits");
+        let initial = runtime.publisher().snapshot();
+        let lease = runtime
+            .reader()
+            .validation_context(anchor.hash)
+            .expect("the anchor context is readable")
+            .expect("the anchor remains retained");
+        let rules = HeaderRules::for_validation_lease(&lease).expect("the regtest policy is valid");
+        let mut child_header = *anchor.header;
+        child_header.previous_block_hash = anchor.hash;
+        child_header.time += chrono::Duration::seconds(1);
+        child_header.nonce.0[0] = 0x81;
+        let child_header = Arc::new(child_header);
+        let mut successor_header = *child_header;
+        successor_header.previous_block_hash = child_header.hash();
+        successor_header.time += chrono::Duration::seconds(1);
+        successor_header.nonce.0[0] = 0x85;
+        let successor_header = Arc::new(successor_header);
+        let headers = [child_header.clone(), successor_header.clone()];
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(&headers),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the two selected headers pass production validation");
+        let stalled = Frontier::new(block::Height(1), child_header.hash());
+        let tip = Frontier::new(block::Height(2), successor_header.hash());
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: initial.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&initial, tip.hash, 63, 64),
+                        source: SourceId::from_digest([0x82; 32]),
+                        parent_hash: anchor.hash,
+                        target_tip_hash: tip.hash,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: initial.frontiers.finalized,
+                        },
+                        batch,
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the selected path extends beyond the stalled body");
+        let evidence = EvidenceId::from_digest([0x61; 32]);
+        let authority = Authority(evidence);
+        let context = TransitionContext {
+            config: &engine_config,
+            clock: &SystemClock,
+            full_state_authority: Some(&authority),
+            retention_references: &[],
+        };
+        let availability = BodyUnavailableSummary {
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(12),
+            next_probe_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            attempts: if alarmed { 10 } else { 1 },
+            suppliers: 1,
+            alarmed,
+            ..Default::default()
+        };
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: runtime.publisher().snapshot().state_version,
+                    event: TransitionEvent::BodyEvidence(BodyEvidence::Transient(
+                        TransientBodyFailure {
+                            hash: stalled.hash,
+                            evidence,
+                            kind: TransientBodyFailureKind::Timeout,
+                            availability: availability.clone(),
+                        },
+                    )),
+                },
+                &context,
+            )
+            .expect("the availability episode commits");
+        let frontier = stalled;
+        let before_restart = runtime.publisher().view();
+        assert_eq!(before_restart.frontiers.header_best, tip);
+        assert_eq!(
+            before_restart.body_unavailable.get(&stalled.hash),
+            Some(&(frontier, availability.clone()))
+        );
+        assert_eq!(
+            before_restart.alarms.header_best_body_unavailable_at,
+            alarmed.then_some(frontier)
+        );
+        let lease = runtime
+            .reader()
+            .validation_context(tip.hash)
+            .expect("the selected tip context is readable")
+            .expect("the tip remains retained");
+        let rules =
+            HeaderRules::for_validation_lease(&lease).expect("the tip validation policy is valid");
+        let mut extension = *successor_header;
+        extension.previous_block_hash = tip.hash;
+        extension.time += chrono::Duration::seconds(1);
+        extension.nonce.0[0] = 0x86;
+        let extension = Arc::new(extension);
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(std::slice::from_ref(&extension)),
+            lease.parent(),
+            &rules,
+            &SystemClock,
+        )
+        .expect("the compatible extension passes production validation");
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: before_restart.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&before_restart, extension.hash(), 65, 66),
+                        source: SourceId::from_digest([0x82; 32]),
+                        parent_hash: tip.hash,
+                        target_tip_hash: extension.hash(),
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: tip,
+                        },
+                        batch,
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &engine_config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the compatible selected tip extension commits");
+        let extended = runtime.publisher().view();
+        assert!(
+            Arc::ptr_eq(&before_restart.body_unavailable, &extended.body_unavailable),
+            "compatible extension must preserve the shared episode map"
+        );
+        assert_eq!(extended.alarms, before_restart.alarms);
+        let before_restart = extended;
+        if legacy {
+            let mut metadata = runtime
+                .store
+                .metadata()
+                .expect("current metadata is readable");
+            metadata.disk_format = HeaderChainDiskVersion(5);
+            // Version five only persisted a tip alarm, so an intermediate alarm
+            // must be reconstructed from its durable body episode on upgrade.
+            metadata.alarms.header_best_body_unavailable = None;
+            metadata.alarms.header_best_body_unavailable_at = None;
+            let node = runtime
+                .store
+                .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, stalled.hash.0)
+                .expect("the stalled node is readable")
+                .expect("the stalled node is retained");
+            let mut batch = DiskWriteBatch::new();
+            runtime
+                .store
+                .put_value(&mut batch, HEADER_ENGINE_META, METADATA_KEY, &metadata)
+                .expect("actual version-five metadata encodes");
+            runtime
+                .store
+                .put_raw(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    stalled.hash.0,
+                    node.encode_legacy_v5()
+                        .expect("the actual legacy tag-four node encodes"),
+                )
+                .expect("the version-five node stages");
+            db.write(batch)
+                .expect("the legacy fixture persists atomically");
+        }
+        drop(runtime);
+        drop(db);
+        let reopened_store = HeaderChainStore::new(open(&db_config, &network));
+        if legacy {
+            assert!(reopened_store
+                .migrate_to_current(&engine_config)
+                .expect("schema five migrates"));
+            assert_eq!(
+                reopened_store.metadata().unwrap().disk_format,
+                HeaderChainDiskVersion::CURRENT
+            );
+            assert!(!reopened_store
+                .migrate_to_current(&engine_config)
+                .expect("migration is idempotent"));
+        }
+        let (reopened, _) = reopened_store
+            .startup(&engine_config)
+            .expect("the committed episode survives restart");
+        // Reopen once more after the upgrade has committed the current layout.
+        let reopened = if legacy {
+            drop(reopened);
+            HeaderChainStore::new(open(&db_config, &network))
+                .startup(&engine_config)
+                .expect("the migrated current schema reopens")
+                .0
+        } else {
+            reopened
+        };
+        let recovered = reopened.publisher().view();
+        assert_eq!(recovered.body_unavailable, before_restart.body_unavailable);
+        assert_eq!(recovered.alarms, before_restart.alarms);
+        assert_eq!(
+            recovered.body_unavailable_for(stalled.hash),
+            Some(&availability)
+        );
+        assert!(recovered
+            .body_unavailable_for(block::Hash([0xff; 32]))
+            .is_none());
+
+        let invalidation_id = OperatorInvalidationId::new([0x64; 16]);
+        let operator_reason_digest = {
+            use sha2::Digest as _;
+            let mut digest = sha2::Sha256::new();
+            digest.update(b"zakura-operator-invalidation-v1");
+            digest.update(stalled.hash.0);
+            digest.update(invalidation_id.bytes());
+            digest.finalize().into()
+        };
+        let invalidation_evidence = EvidenceId::from_digest([0x65; 32]);
+        for reconsider in [false, true] {
+            let operator_evidence = if reconsider {
+                EvidenceId::from_digest([0x66; 32])
+            } else {
+                invalidation_evidence
+            };
+            let operator_authority = Authority(operator_evidence);
+            let event = if reconsider {
+                TransitionEvent::OperatorReconsider(OperatorReconsider {
+                    target: stalled.hash,
+                    id: invalidation_id,
+                    invalidation_evidence: Some(invalidation_evidence),
+                    evidence: operator_evidence,
+                })
+            } else {
+                TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+                    target: stalled.hash,
+                    id: invalidation_id,
+                    operator_reason_digest,
+                    evidence: operator_evidence,
+                })
+            };
+            reopened
+                .apply(
+                    TransitionRequest {
+                        expected_version: reopened.publisher().snapshot().state_version,
+                        event,
+                    },
+                    &TransitionContext {
+                        full_state_authority: Some(&operator_authority),
+                        ..context
+                    },
+                )
+                .expect("the selected path changes coherently");
+            let changed = reopened.publisher().view();
+            assert_eq!(
+                changed.body_unavailable_for(stalled.hash),
+                reconsider.then_some(&availability)
+            );
+            assert_eq!(
+                changed.alarms.header_best_body_unavailable_at,
+                (reconsider && alarmed).then_some(stalled)
+            );
+        }
+
+        let verified_evidence = EvidenceId::from_digest([0x62; 32]);
+        let verified_authority = Authority(verified_evidence);
+        let verified_context = TransitionContext {
+            full_state_authority: Some(&verified_authority),
+            ..context
+        };
+        reopened
+            .apply(
+                TransitionRequest {
+                    expected_version: reopened.publisher().snapshot().state_version,
+                    event: TransitionEvent::BodyEvidence(BodyEvidence::Verified(
+                        VerifiedBodyEvidence {
+                            hash: stalled.hash,
+                            evidence: verified_evidence,
+                        },
+                    )),
+                },
+                &verified_context,
+            )
+            .expect("verification ends the unavailable episode");
+        let verified = reopened.publisher().view();
+        assert!(verified.body_unavailable.is_empty());
+        assert!(verified.alarms.header_best_body_unavailable_at.is_none());
+    }
 }

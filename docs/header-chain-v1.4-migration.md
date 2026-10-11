@@ -24,3 +24,17 @@ upgrade of the predecessor header overlay.
 The supported headers-only-to-integrated engine-mode migration remains
 non-rollback and preserves migrated pins. It is separate from predecessor
 overlay compatibility.
+
+## Persisted body retry episodes
+
+Header-chain storage format 6 preserves the retry episode's age, attempts,
+current supplier identities, already-tried identities, and operator-reset
+identity. Format 5 metadata upgrades atomically with its format marker. Existing
+body rows remain readable and are rewritten lazily; this upgrade does not require
+a resynchronization.
+
+Older summaries contain a supplier count and digest, but no recoverable identity
+list. Their age, attempts, alarm, and next-probe deadline are preserved. Until
+that deadline, restored pre-alarm episodes conservatively defer suppliers whose
+previous participation cannot be determined. A new delivery records the exact
+bounded identity sets for subsequent restarts.

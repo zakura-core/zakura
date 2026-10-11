@@ -1028,7 +1028,11 @@ impl MemHeaderStore {
         Ok(store)
     }
 
-    pub(crate) fn header_nodes(&self) -> impl Iterator<Item = &HeaderNode> {
+    /// Iterate the retained nodes without allocating or granting mutation access.
+    ///
+    /// Startup publishers can use one visit to seed derived indexes; ordinary
+    /// publications should apply transition deltas instead of scanning this iterator.
+    pub fn header_nodes(&self) -> impl Iterator<Item = &HeaderNode> {
         self.nodes.values()
     }
 
@@ -2419,6 +2423,9 @@ mod tests {
             .set_body_validation_state(
                 unknown_tip.hash,
                 BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     attempts: 10,
                     suppliers: 0,
                     alarmed: true,
@@ -2449,6 +2456,9 @@ mod tests {
                 .expect("retained")
                 .body_validation_state,
             BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 10,
                 suppliers: 0,
                 alarmed: true,

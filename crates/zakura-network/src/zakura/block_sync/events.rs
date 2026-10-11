@@ -291,6 +291,8 @@ pub enum BlockSyncAction {
     },
     /// Persist one completion-gated transient body result.
     RecordBodyUnavailable {
+        /// Process-local epoch that owns this availability episode.
+        body_work_epoch: zakura_header_chain::BodyWorkEpoch,
         /// Durable version that owned the attempt.
         expected_version: zakura_header_chain::StateVersion,
         /// Typed retry result with its bounded episode summary.

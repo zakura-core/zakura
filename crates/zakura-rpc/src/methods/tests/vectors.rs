@@ -124,6 +124,9 @@ fn header_chain_info_exposes_mode_frontiers_and_persistent_alarms() {
         alarms: zakura_state::HeaderChainAlarmSet {
             resource_stalled: true,
             header_best_body_unavailable: Some(zakura_state::HeaderChainBodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 started_at: now - chrono::Duration::seconds(12),
                 attempts: 10,
                 suppliers: 3,
@@ -218,6 +221,9 @@ fn integrated_header_chain_info_omits_headers_only_warning_and_inactive_alarm() 
         oldest_retained_height: frontier.height,
         alarms: zakura_state::HeaderChainAlarmSet {
             header_best_body_unavailable: Some(zakura_state::HeaderChainBodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 alarmed: false,
                 ..Default::default()
             }),

@@ -324,9 +324,27 @@ async fn interface_change_notifies_connections_and_keeps_them() {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(client.network_changes(), 0, "no change, no notice");
+        let retired = |conn: &Conn| {
+            let conn = conn.clone();
+            async move {
+                conn.stats()
+                    .await
+                    .unwrap()
+                    .connection
+                    .frame_tx
+                    .retire_connection_id
+            }
+        };
+        assert_eq!(retired(&conn).await, 0);
 
         ips.lock().unwrap().push(IpAddr::from([198, 51, 100, 1]));
         while client.network_changes() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // quinn-proto answers `local_address_changed` by moving to a fresh
+        // remote connection ID, so a retired ID shows the connection got the
+        // notice.
+        while retired(&conn).await == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(echo(&conn, b"after").await, b"after");
@@ -1700,6 +1718,53 @@ async fn hooktest_socket_failure_rebinds_once_then_stops() {
             "{reason:?}"
         );
         assert_eq!(server.endpoint.socket_stats()[0].rebinds, 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// Records the endpoint's pending-handshake count when `handle` runs.
+struct PendingProbe {
+    pending: crate::endpoint::PendingTable,
+    seen: mpsc::UnboundedSender<usize>,
+}
+
+impl Acceptor for PendingProbe {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        let _ = self.seen.send(self.pending.total());
+        Box::pin(async move {
+            conn.closed().await;
+        })
+    }
+}
+
+/// ADM-7: `handle` runs while the attempt still counts as pending, so an
+/// acceptor can take over the accounting with no window in which the IP
+/// counts nowhere.
+#[tokio::test]
+async fn handle_runs_before_the_pending_count_drops() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+        let (seen, mut pending_at_handle) = mpsc::unbounded_channel();
+        server
+            .serve(PendingProbe {
+                pending: server.shared().pending.clone(),
+                seen,
+            })
+            .unwrap();
+        let client = client();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let _conn = client.connect(addr, &[ALPN]).await.unwrap();
+        assert_eq!(pending_at_handle.recv().await, Some(1));
     })
     .await
     .unwrap();

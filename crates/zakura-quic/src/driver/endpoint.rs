@@ -100,6 +100,13 @@ pub(crate) struct EndpointTask {
     counters: RecvCounters,
 }
 
+impl Drop for EndpointTask {
+    /// Releases the socket even when `shutdown` aborts the task (API-7).
+    fn drop(&mut self) {
+        self.socket.close();
+    }
+}
+
 impl EndpointTask {
     pub(crate) fn new(
         shared: Arc<Shared>,
@@ -173,20 +180,24 @@ impl EndpointTask {
                         self.begin_close();
                     }
                 },
-                ready = async { io.as_ref()?.readable().await.ok() }, if io.is_some() && !more_to_recv => {
-                    if ready.is_some() {
-                        self.receive(io).await;
-                    }
-                }
-                () = std::future::ready(()), if io.is_some() && more_to_recv => {
-                    self.receive(io).await;
-                }
+                // Housekeeping goes before receive, so peer traffic can't
+                // starve task reaping, the close deadline or the counters.
                 Some(_) = self.tasks.join_next(), if !self.tasks.is_empty() => {}
                 () = &mut deadline, if self.close_deadline.is_some() => {
                     tracing::debug!(target: "zakura_quic", "connections didn't drain within 3 s");
                     break;
                 }
                 _ = flush.tick() => self.flush_counters(),
+                ready = async { io.as_ref()?.readable().await.ok() }, if io.is_some() && !more_to_recv => {
+                    if ready.is_some() {
+                        self.receive(io).await;
+                    }
+                }
+                // Yield to the runtime between receive batches, so a busy
+                // socket can't hold this worker thread.
+                () = tokio::task::yield_now(), if io.is_some() && more_to_recv => {
+                    self.receive(io).await;
+                }
             }
         }
         self.flush_counters();

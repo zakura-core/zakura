@@ -191,6 +191,8 @@ struct Inner {
 struct SocketHandle {
     cmds: mpsc::UnboundedSender<EndpointCmd>,
     slot: Arc<SocketSlot>,
+    /// The endpoint task, so `shutdown` can abort one that doesn't stop.
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for QuicEndpoint {
@@ -258,13 +260,18 @@ impl QuicEndpoint {
                 stopped: std::sync::atomic::AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
-            tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
+            let task =
+                tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
             #[cfg(target_os = "linux")]
             tokio::spawn(kernel_drop_poller(
                 Arc::downgrade(&slot),
                 config.kernel_drop_poll_interval(),
             ));
-            sockets.push(SocketHandle { cmds, slot });
+            sockets.push(SocketHandle {
+                cmds,
+                slot,
+                task: std::sync::Mutex::new(Some(task)),
+            });
         }
         // SOCK-12: a socket bound to a specific address keeps sending from it,
         // so only a wildcard bind needs to follow interface changes.
@@ -496,7 +503,26 @@ impl QuicEndpoint {
         // The endpoint tasks enforce the 3 s drain; the extra second covers
         // their exit.
         let all = futures::future::join_all(done);
-        let _ = tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all).await;
+        if tokio::time::timeout(SHUTDOWN_DRAIN + Duration::from_secs(1), all)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // A task that missed the bound is aborted. Dropping it closes its
+        // socket, so `shutdown` never returns with the socket still bound.
+        tracing::warn!(target: "zakura_quic", "an endpoint task didn't stop within the drain bound; aborting it");
+        for socket in &self.inner.sockets {
+            let task = socket
+                .task
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(task) = task {
+                task.abort();
+                let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+            }
+        }
     }
 
     /// Dials `target` with a hand-built client crypto config (SEC-2 tests).
@@ -590,10 +616,14 @@ pub(crate) async fn inbound_handshake(
 ) {
     let started = Instant::now();
     let remote = connecting.remote;
+    let shared = connecting.conn.shared.clone();
     let result = establish(connecting, deadline).await;
-    drop(pending);
     record_handshake(&result, started);
     let Ok((conn, handshake)) = result else {
+        // A failed or timed-out attempt keeps its pending slot until the
+        // connection task has closed it, so a peer that keeps the task busy
+        // can't free the slot early (ADM-7).
+        wait_closed(&shared).await;
         return;
     };
     let (Some(remote_id), Some(alpn)) = (handshake.remote_id, handshake.alpn) else {
@@ -601,11 +631,22 @@ pub(crate) async fn inbound_handshake(
             code: VarInt::from_u32(0),
             reason: bytes::Bytes::from_static(b"identity"),
         });
+        drop(conn);
+        wait_closed(&shared).await;
         return;
     };
-    acceptor
-        .handle(Conn::new(conn, remote_id, remote, alpn))
-        .await;
+    // `handle` runs before the pending count drops, so an acceptor that moves
+    // the connection into its own accounting there leaves no gap (ADM-7).
+    let handled = acceptor.handle(Conn::new(conn, remote_id, remote, alpn));
+    drop(pending);
+    handled.await;
+}
+
+/// Waits until the connection task closes the connection, for at most the
+/// shutdown drain bound in case the task is gone.
+async fn wait_closed(shared: &crate::driver::ConnShared) {
+    let mut closed = shared.closed.subscribe();
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, closed.wait_for(Option::is_some)).await;
 }
 
 /// Applies the acceptor's rules, then this crate's optional limits (ADM-3).

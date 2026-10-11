@@ -317,7 +317,9 @@ pub(crate) async fn run(params: ConnTaskParams) {
                 }
             },
             _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
-            () = std::future::ready(()), if more_to_send => {}
+            // Yield between transmit batches, so a busy connection can't hold
+            // the worker thread.
+            () = tokio::task::yield_now(), if more_to_send => {}
         }
     }
 }

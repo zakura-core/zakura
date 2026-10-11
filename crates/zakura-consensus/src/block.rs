@@ -191,7 +191,13 @@ impl VerifyBlockError {
             Self::MissingParentContext(_) | Self::Depth { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
-            Self::BodyCommitment(error) => error.body_verification_class(),
+            Self::BodyCommitment(error) => match error.body_verification_class() {
+                // The early commitment check authenticates the delivered authorization data.
+                BodyVerificationClass::PayloadMismatch(_) => {
+                    BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+                }
+                class => class,
+            },
             Self::ParentHeightMismatch { .. } => {
                 BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::Other("coinbase_height"))
             }

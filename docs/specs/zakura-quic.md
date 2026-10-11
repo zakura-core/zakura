@@ -604,6 +604,38 @@ older release reach each other only over the legacy protocol, and
   fails within the handshake bound with an ALPN error, and DIAL-5 backs off.
   `p2p_stack = "zakura"` nodes lose peers on the other ALPN until they upgrade.
 
+### 13.1 Extensibility
+
+The `p2p-v2/3` cohort is the last native hard break that every later change
+has to ride. These rules let a later release make a soft change, one that
+this release tolerates, and keep each hard change explicit.
+
+- **COMPAT-8.** A hard break MUST bump the Zakura protocol version and the
+  ALPN (COMPAT-4). A hard break is a change this release can't parse or would
+  misread under the rules below.
+- **COMPAT-9.** A per-stream protocol MUST change through a new stream
+  version with its own capability bit. Peers select the highest stream version
+  whose bit both sides accepted in the control exchange, so the selection is
+  negotiated per hop. A stream decoder MAY therefore reject unknown message
+  types and trailing bytes; a new message type comes with a new stream version.
+- **COMPAT-10.** A node record (discovery `Hello` and `Peers`) is relayed
+  third-party data that no hop can negotiate. The record body ends in an
+  opaque extension area, signed with the body and kept verbatim, so a node
+  verifies and relays a record whose extensions it doesn't understand. New
+  record contents, new address kinds included, MUST go in that area as TLVs
+  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV. A
+  relayed record whose body doesn't decode MUST be skipped and counted in
+  `zakura.p2p.discovery.records.undecodable`, without failing the message or
+  penalizing the relaying peer. A framing error (a truncated record, an
+  oversize body length or a count over the cap) still fails the message.
+  The record format version in the signature pre-image changes only when the
+  fixed fields change, which is a hard break.
+- **COMPAT-11.** Control hello and ack fields are append-only. A later release
+  appends fields after the ones this release knows and raises
+  `control_version`. This release accepts a `control_version` at or above its
+  own, parses its known prefix and ignores the rest, up to the control payload
+  cap. The legacy TCP upgrade prelude stays strict.
+
 ## 14. Security
 
 - **SEC-1.** The TLS and key code MUST pass these known-answer tests:
@@ -789,6 +821,10 @@ Added:
   drained event.
 - **OBS-12.** Controller, driver and socket stats.
 - **QP-1 to QP-4.** The `quinn-proto` dependency policy.
+- **COMPAT-8 to COMPAT-11.** The extensibility rules (§13.1): hard breaks
+  bump the ALPN, stream versions are negotiated, node records carry a signed
+  extension area and skip undecodable bodies, and control fields are
+  append-only.
 
 Changed:
 

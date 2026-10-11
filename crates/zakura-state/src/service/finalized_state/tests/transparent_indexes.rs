@@ -7,7 +7,7 @@
 //! partial answers, and that released code, which only knows the indexed directory, can't open it.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -788,6 +788,43 @@ async fn transparent_queries_fail_even_with_stale_index_entries() {
             state.db.spending_tx_loc(&chain.spent_coinbase),
             Err(TransparentIndexesUnavailable),
             "a stale spender entry is not served"
+        );
+
+        // An empty address set is not answered with an empty result either.
+        let no_addresses = HashSet::new();
+        assert_eq!(
+            state
+                .db
+                .partial_finalized_transparent_balance(&no_addresses),
+            Err(TransparentIndexesUnavailable)
+        );
+        assert_eq!(
+            state.db.partial_finalized_address_utxos(&no_addresses),
+            Err(TransparentIndexesUnavailable)
+        );
+        assert_eq!(
+            state
+                .db
+                .partial_finalized_transparent_tx_ids(&no_addresses, Height(0)..=Height(4)),
+            Err(TransparentIndexesUnavailable)
+        );
+
+        // Indexed databases still answer an empty address set with empty results.
+        assert_eq!(
+            indexed
+                .db
+                .partial_finalized_transparent_balance(&no_addresses),
+            Ok((Amount::zero(), 0))
+        );
+        assert_eq!(
+            indexed.db.partial_finalized_address_utxos(&no_addresses),
+            Ok(BTreeMap::new())
+        );
+        assert_eq!(
+            indexed
+                .db
+                .partial_finalized_transparent_tx_ids(&no_addresses, Height(0)..=Height(4)),
+            Ok(BTreeMap::new())
         );
 
         // Outpoint UTXO and Ironwood nullifier queries still work.

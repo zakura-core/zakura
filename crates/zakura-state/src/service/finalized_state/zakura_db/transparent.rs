@@ -489,6 +489,8 @@ impl ZakuraDb {
         &self,
         addresses: &HashSet<transparent::Address>,
     ) -> Result<BTreeMap<OutputLocation, transparent::Output>, TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
         let mut utxos = BTreeMap::new();
 
         for address in addresses {
@@ -529,6 +531,8 @@ impl ZakuraDb {
         query_height_range: RangeInclusive<Height>,
     ) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, TransparentIndexesUnavailable>
     {
+        self.check_transparent_indexes_available()?;
+
         let mut tx_ids = BTreeMap::new();
 
         for address in addresses {

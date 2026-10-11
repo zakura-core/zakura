@@ -42,7 +42,7 @@ mod tests;
 pub use config::{
     check_and_delete_old_databases, check_and_delete_old_state_databases,
     database_format_version_on_disk, state_database_format_version_on_disk, Config, PruningConfig,
-    StorageMode,
+    StateDatabaseKind, StorageMode,
 };
 pub use constants::{
     state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
@@ -52,7 +52,7 @@ pub use error::{
     AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    PreciousError, StateInitError, ValidateContextError,
+    PreciousError, StateInitError, TransparentIndexesUnavailable, ValidateContextError,
 };
 pub use header_chain::*;
 pub use request::{

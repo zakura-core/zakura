@@ -269,7 +269,55 @@ pub enum StateInitError {
          Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
     VctSproutHistoryUnrepairable,
+
+    /// The cache directory holds both an indexed state database and one without transparent
+    /// indexes for the same network and format.
+    ///
+    /// Picking either one silently could resume a node on the wrong chain state, so startup
+    /// refuses until the operator removes one of them.
+    #[error(
+        "cannot open state: found both an indexed state database at {indexed:?} and a state \
+         database without transparent indexes at {without_transparent_indexes:?}. \
+         Hint: move the database you do not want out of the cache directory"
+    )]
+    AmbiguousStateDatabases {
+        /// The legacy indexed database directory.
+        indexed: PathBuf,
+        /// The database directory without transparent indexes.
+        without_transparent_indexes: PathBuf,
+    },
+
+    /// A database that never built transparent address indexes was opened in archive storage mode.
+    ///
+    /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot
+    /// answer completely.
+    #[error(
+        "cannot open state in archive storage mode: the database at {path:?} was created by a \
+         pruned checkpoint-syncing node and never built transparent address indexes. \
+         Hint: configure `storage_mode.pruned`, or sync an archive node into a fresh cache directory"
+    )]
+    TransparentIndexesMissingInArchiveMode {
+        /// The database directory without transparent indexes.
+        path: PathBuf,
+    },
 }
+
+/// A transparent address or transparent spender query was sent to a state database that does not
+/// build those indexes.
+///
+/// A pruned node that checkpoint-syncs into a fresh cache skips finalized transparent address
+/// balances, address UTXO and transaction indexes, and transparent spender indexes. Answering from
+/// whatever partial data exists would return balances, UTXO lists, histories, or spenders that look
+/// authoritative but are incomplete, so these queries fail instead.
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "transparent address and spender indexes are unavailable: this node's state database was \
+     created in pruned storage mode with checkpoint sync, which does not build them. \
+     getaddressbalance, getaddressutxos, getaddresstxids, and transparent spending transaction \
+     lookups need an archive node, or a pruned node that synced into a fresh cache directory with \
+     consensus.checkpoint_sync = false"
+)]
+pub struct TransparentIndexesUnavailable;
 
 /// An error describing why a block could not be queued to be committed to the state.
 #[derive(Debug, Error, Clone, PartialEq, Eq, new)]

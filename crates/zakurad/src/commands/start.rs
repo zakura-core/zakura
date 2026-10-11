@@ -439,12 +439,7 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
-        let mut state_config = config.state.clone();
-        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p();
-        // State owns the VCT commit path, but users configure its checkpoint-sync controls
-        // together under `[consensus]`.
-        state_config.checkpoint_sync = config.consensus.checkpoint_sync;
-        state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
+        let state_config = config.mirrored_state_config();
 
         let (
             mut state_service,

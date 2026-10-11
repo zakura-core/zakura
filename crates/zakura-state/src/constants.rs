@@ -29,6 +29,17 @@ pub const AWAIT_BLOCK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
 
+/// The directory name for state databases that never build transparent address indexes.
+///
+/// A pruned node that checkpoint-syncs into a fresh cache creates this kind of database. It keeps
+/// every consensus-critical column family, but omits finalized transparent address balances,
+/// address UTXO and transaction indexes, and transparent spender indexes.
+///
+/// Released Zakura versions only open [`STATE_DATABASE_KIND`] directories, so they can never open
+/// one of these databases and serve its missing indexes as if they were complete.
+pub const STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND: &str =
+    "state_without_transparent_indexes";
+
 /// The minimum retention window allowed in pruned storage mode.
 ///
 /// Pruned mode deletes historical raw transaction data at `tip - retention`. The

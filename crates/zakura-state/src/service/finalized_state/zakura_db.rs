@@ -25,7 +25,7 @@ use crate::{
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
     },
-    write_database_format_version_to_disk, BoxError, Config, StateInitError,
+    write_database_format_version_to_disk, BoxError, Config, StateDatabaseKind, StateInitError,
 };
 
 use super::disk_format::upgrade::restorable_db_versions;
@@ -295,6 +295,12 @@ impl ZakuraDb {
         self.db.db_kind()
     }
 
+    /// Returns the [`StateDatabaseKind`] of this state database.
+    pub fn state_database_kind(&self) -> StateDatabaseKind {
+        StateDatabaseKind::from_dir_name(&self.db_kind())
+            .expect("state databases are only opened with a StateDatabaseKind directory name")
+    }
+
     /// Returns the format version of the running code that created this `ZakuraDb` instance in memory.
     pub fn format_version_in_code(&self) -> Version {
         self.db.format_version_in_code()
@@ -492,6 +498,44 @@ impl ZakuraDb {
     /// Returns the most recently cached disk space estimate.
     pub(crate) fn cached_size(&self) -> u64 {
         self.db.cached_size()
+    }
+}
+
+#[cfg(test)]
+impl ZakuraDb {
+    /// Returns every raw key and value in the column family named `cf_name`, in key order.
+    pub(crate) fn raw_column_family_entries_for_test(
+        &self,
+        cf_name: &str,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("tests only read column families opened from the running schema");
+
+        self.db
+            .raw_range_cf(&cf, &[], None)
+            .expect("reading a test database succeeds")
+    }
+
+    /// Writes a raw key and value to the column family named `cf_name`, bypassing every format
+    /// invariant. Tests use this to plant stale or corrupt entries.
+    pub(crate) fn insert_raw_entry_for_test(&self, cf_name: &str, key: &[u8], value: &[u8]) {
+        use super::disk_db::WriteDisk;
+        use super::RawBytes;
+
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("tests only write column families opened from the running schema");
+        let mut batch = super::DiskWriteBatch::new();
+        batch.zs_insert(
+            &cf,
+            RawBytes::new_raw_bytes(key.to_vec()),
+            RawBytes::new_raw_bytes(value.to_vec()),
+        );
+        self.write_batch(batch)
+            .expect("writing a test database succeeds");
     }
 }
 

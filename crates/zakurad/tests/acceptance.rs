@@ -2868,6 +2868,16 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
     Ok(())
 }
 
+/// Mines, validates proposals, and spends mature coinbase outputs on a pruned checkpoint-syncing
+/// Regtest node, whose state database skips transparent address and spender indexes.
+///
+/// It mines more than two reorg windows of blocks and restarts the node, so it runs in the
+/// `zakura-pruned-storage` nextest profile.
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_checkpoint_sync_mines_without_transparent_indexes() -> Result<()> {
+    common::regtest::pruned_checkpoint_sync_mining_without_transparent_indexes_test().await
+}
+
 #[tokio::test]
 async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await

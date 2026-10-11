@@ -5,12 +5,12 @@ use zakura_chain::{block, parameters::Network};
 
 use crate::{
     config::{database_format_version_on_disk, PruningConfig, StorageMode},
-    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+    constants::state_database_format_version_in_code,
     service::finalized_state::{
         disk_db::DiskWriteBatch, disk_format::TransactionLocation, zakura_db::ZakuraDb,
         STATE_COLUMN_FAMILIES_IN_CODE,
     },
-    BoxError, Config,
+    BoxError, Config, StateDatabaseKind, StateInitError,
 };
 
 /// Options for pruning finalized raw transaction data.
@@ -51,6 +51,10 @@ pub enum PruneFinalizedStateError {
     /// The configured pruning retention is invalid.
     #[error("invalid pruning configuration")]
     InvalidConfig(#[source] BoxError),
+
+    /// The state database to prune could not be selected for this configuration.
+    #[error("cannot select the state database to prune: {0}")]
+    DatabaseKind(#[from] StateInitError),
 
     /// The on-disk state database format does not match the running code.
     #[error(
@@ -97,9 +101,10 @@ pub fn preview_prune_finalized_state(
     options: PruneFinalizedStateOptions,
 ) -> Result<PruneFinalizedStateSummary, PruneFinalizedStateError> {
     let config = pruning_config(config, network, options.tx_retention)?;
-    check_format_version(&config, network)?;
+    let db_kind = config.state_database_kind(network)?;
+    check_format_version(&config, db_kind, network)?;
 
-    let db = open_pruning_db(&config, network, true);
+    let db = open_pruning_db(&config, db_kind, network, true);
     pruning_summary(&db, &options)
 }
 
@@ -110,9 +115,10 @@ pub fn prune_finalized_state(
     options: PruneFinalizedStateOptions,
 ) -> Result<PruneFinalizedStateSummary, PruneFinalizedStateError> {
     let config = pruning_config(config, network, options.tx_retention)?;
-    check_format_version(&config, network)?;
+    let db_kind = config.state_database_kind(network)?;
+    check_format_version(&config, db_kind, network)?;
 
-    let db = open_pruning_db(&config, network, false);
+    let db = open_pruning_db(&config, db_kind, network, false);
     let summary = pruning_summary(&db, &options)?;
 
     let needs_marker_update =
@@ -153,12 +159,12 @@ fn pruning_config(
 
 fn check_format_version(
     config: &Config,
+    db_kind: StateDatabaseKind,
     network: &Network,
 ) -> Result<(), PruneFinalizedStateError> {
     let in_code = state_database_format_version_in_code();
-    let on_disk =
-        database_format_version_on_disk(config, STATE_DATABASE_KIND, in_code.major, network)
-            .map_err(PruneFinalizedStateError::UnreadableFormatVersion)?;
+    let on_disk = database_format_version_on_disk(config, db_kind, in_code.major, network)
+        .map_err(PruneFinalizedStateError::UnreadableFormatVersion)?;
 
     if on_disk.as_ref() != Some(&in_code) {
         return Err(PruneFinalizedStateError::FormatMismatch { on_disk, in_code });
@@ -167,10 +173,15 @@ fn check_format_version(
     Ok(())
 }
 
-fn open_pruning_db(config: &Config, network: &Network, read_only: bool) -> ZakuraDb {
+fn open_pruning_db(
+    config: &Config,
+    db_kind: StateDatabaseKind,
+    network: &Network,
+    read_only: bool,
+) -> ZakuraDb {
     ZakuraDb::new(
         config,
-        STATE_DATABASE_KIND,
+        db_kind,
         &state_database_format_version_in_code(),
         network,
         // This utility requires the current format and should not run upgrades while pruning.

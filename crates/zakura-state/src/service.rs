@@ -438,7 +438,11 @@ impl StateService {
                     .unwrap_or_else(|error| match error {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
+                        error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::AmbiguousStateDatabases { .. }
+                        | StateInitError::TransparentIndexesMissingInArchiveMode {
+                            ..
+                        }) => {
                             panic!("{error}")
                         }
                         error => panic!(
@@ -482,7 +486,8 @@ impl StateService {
         } else {
             false
         };
-        let backup_dir_path = config.non_finalized_state_backup_dir(network);
+        let backup_dir_path = config
+            .non_finalized_state_backup_dir(finalized_state.db.state_database_kind(), network);
         let skip_backup_task = config.debug_skip_non_finalized_state_backup_task;
         let (non_finalized_state, non_finalized_state_sender, non_finalized_state_receiver) =
             NonFinalizedState::new(network)
@@ -3038,7 +3043,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
+                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend)?,
             )),
 
             ReadRequest::CheckParentInputs { parent, outpoints } => {

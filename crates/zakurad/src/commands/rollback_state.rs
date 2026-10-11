@@ -50,7 +50,9 @@ impl Runnable for RollbackStateCmd {
     fn run(&self) {
         let config = APPLICATION.config();
 
-        if let Err(error) = self.run_with_config(config.state.clone(), config.consensus.clone()) {
+        if let Err(error) =
+            self.run_with_config(config.mirrored_state_config(), config.consensus.clone())
+        {
             tracing::error!("Failed to roll back finalized state: {error}");
             // Exit non-zero so the subcommand matches the standalone `zakura-rollback-state` binary
             // and scripts can detect the failure (abscissa would otherwise exit 0).
@@ -64,6 +66,7 @@ impl RollbackStateCmd {
     ///
     /// `consensus_config` supplies `checkpoint_sync`, which sets the max checkpoint height used to
     /// guard `--keep-rolled-back-blocks`: blocks kept below it would be discarded on the next start.
+    /// Its checkpoint-sync settings are also mirrored into `state_config`, as `start` does.
     #[allow(clippy::print_stdout)]
     pub fn run_with_config(
         &self,
@@ -73,6 +76,9 @@ impl RollbackStateCmd {
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
         }
+
+        state_config.checkpoint_sync = consensus_config.checkpoint_sync;
+        state_config.vct_fast_sync = consensus_config.vct_fast_sync_enabled();
 
         let (_, max_checkpoint_height) =
             zakura_consensus::router::init_checkpoint_list(consensus_config, &self.network);

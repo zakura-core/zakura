@@ -11,7 +11,10 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
+        PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR,
+    },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
     AddressBook,
@@ -152,6 +155,112 @@ fn misbehavior_ban_removes_all_addresses_for_ip() {
         address_metrics.borrow_and_update().num_addresses,
         1,
         "published metrics should exclude all addresses on the banned IP"
+    );
+}
+
+/// Gossiped peers without `NODE_NETWORK` are kept and gossiped, but are not
+/// attempted or cached, because they may not serve historical blocks.
+#[test]
+fn pruned_peers_are_gossiped_but_not_attempted_or_cached() {
+    let full_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let pruned_addr: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+    address_book.update(gossiped_change(
+        full_addr,
+        PeerServices::NODE_NETWORK,
+        DateTime32::now(),
+    ));
+    address_book.update(gossiped_change(
+        pruned_addr,
+        PeerServices::empty(),
+        DateTime32::now(),
+    ));
+
+    let pruned = address_book
+        .get(pruned_addr)
+        .expect("gossiped pruned peers are kept in the address book");
+    assert!(!pruned.is_full_node());
+
+    let reconnection_peers: Vec<_> = address_book
+        .reconnection_peers(Instant::now(), Utc::now())
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(reconnection_peers, vec![full_addr]);
+
+    let cacheable: Vec<_> = address_book
+        .cacheable(Utc::now())
+        .into_iter()
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(cacheable, vec![full_addr]);
+
+    let sanitized = address_book.sanitized(Utc::now());
+    let sanitized_pruned = sanitized
+        .iter()
+        .find(|peer| peer.addr() == pruned_addr)
+        .expect("pruned peers are gossiped");
+    assert_eq!(sanitized_pruned.services, Some(PeerServices::empty()));
+}
+
+/// A pruned node gossips its own listener address with its real services.
+#[test]
+fn pruned_local_listener_is_gossiped() {
+    let local_listener: std::net::SocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let address_book = AddressBook::new(
+        local_listener,
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    )
+    .with_local_listener_services(PeerServices::empty());
+
+    let gossiped = address_book.fresh_get_addr_response();
+
+    assert_eq!(gossiped.len(), 1);
+    assert_eq!(gossiped[0].addr(), local_listener.into());
+    assert_eq!(gossiped[0].services, Some(PeerServices::empty()));
+}
+
+/// Pruned peers fill at most a bounded share of each `GetAddr` response.
+#[test]
+fn get_addr_response_bounds_pruned_share() {
+    const PEERS_PER_KIND: u8 = 16;
+
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+    for index in 0..PEERS_PER_KIND {
+        address_book.update(gossiped_change(
+            format!("127.0.1.{index}:8233").parse().unwrap(),
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        ));
+        address_book.update(gossiped_change(
+            format!("127.0.2.{index}:8233").parse().unwrap(),
+            PeerServices::empty(),
+            DateTime32::now(),
+        ));
+    }
+
+    let gossiped = address_book.fresh_get_addr_response();
+    let gossiped_pruned = gossiped.iter().filter(|peer| !peer.is_full_node()).count();
+
+    // Half of the 32 active addresses are gossiped, and at most a quarter of those are pruned.
+    assert_eq!(gossiped.len(), usize::from(PEERS_PER_KIND));
+    assert!(
+        gossiped_pruned
+            <= gossiped
+                .len()
+                .div_ceil(PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR)
     );
 }
 

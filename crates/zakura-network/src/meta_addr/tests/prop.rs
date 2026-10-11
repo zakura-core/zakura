@@ -20,7 +20,7 @@ use crate::{
         PeerAddrState::*,
     },
     peer_set::candidate_set::CandidateSet,
-    protocol::{external::canonical_peer_addr, types::PeerServices},
+    protocol::external::canonical_peer_addr,
     AddressBook, PeerSocketAddr,
 };
 
@@ -44,18 +44,20 @@ proptest! {
 
         if let Some(sanitized) = addr.sanitize(&Mainnet) {
             // check that all sanitized addresses are valid for outbound
-            prop_assert!(sanitized.last_known_info_is_valid_for_outbound(&Mainnet));
+            prop_assert!(sanitized.address_is_valid_for_outbound(&Mainnet));
             // also check the address, port, and services individually
             prop_assert!(!sanitized.addr.ip().is_unspecified());
             prop_assert_ne!(sanitized.addr.port(), 0);
             prop_assert_eq!(sanitized.misbehavior(), 0);
             prop_assert!(!sanitized.is_inbound());
 
-            if let Some(services) = sanitized.services {
-                prop_assert!(services.contains(PeerServices::NODE_NETWORK));
-            } else {
-                prop_assert!(false, "sanitized services must be Some(PeerServices) and contain NODE_NETWORK");
-            }
+            // Pruned peers keep their services, so receivers can avoid
+            // dialing them for historical blocks.
+            prop_assert!(
+                sanitized.services.is_some(),
+                "sanitized services must be Some(PeerServices)",
+            );
+            prop_assert_eq!(sanitized.is_full_node(), addr.is_full_node());
 
             check::sanitize_avoids_leaks(&addr, &sanitized);
         }
@@ -232,11 +234,9 @@ proptest! {
             let book_result = address_book.update(change);
             let book_contents: Vec<MetaAddr> = address_book.peers().collect();
 
-            // Ignore the same addresses that the address book ignores
-            let expected_result = if !expected_result.address_is_valid_for_outbound(&Mainnet)
-                || ( !expected_result.last_known_info_is_valid_for_outbound(&Mainnet)
-                      && expected_result.last_connection_state.is_never_attempted())
-            {
+            // Ignore the same addresses that the address book ignores.
+            // Peers without `NODE_NETWORK` are kept, so they can be gossiped.
+            let expected_result = if !expected_result.address_is_valid_for_outbound(&Mainnet) {
                None
             } else {
                 Some(expected_result)

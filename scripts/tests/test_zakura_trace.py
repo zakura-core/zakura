@@ -2,6 +2,8 @@ import csv
 import importlib.util
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -25,6 +27,32 @@ def row(event, index, process="p", **fields):
 
 
 class TraceTests(unittest.TestCase):
+    def test_reorg_wait_reads_new_csv_reset_events(self):
+        harness = ROOT / "docker/zakura-regtest-e2e/run.sh"
+        source = harness.read_text()
+        functions = "\n".join(
+            re.search(rf"^{name}\(\) \{{\n.*?^\}}", source, re.MULTILINE | re.DOTALL).group()
+            for name in ("trace_line_count", "trace_rows_after", "wait_for_block_sync_reset")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "node1/block_sync.csv"
+            oracle.write_csv(path, [
+                dict(event="block_chain_tip_reset", verified_block_tip=161),
+                dict(event="block_chain_tip_reset", verified_block_tip=162),
+            ])
+            result = subprocess.run(
+                ["bash", "-c", functions + "\n" + r'''
+set -euo pipefail
+fail() { printf '%s\n' "$*" >&2; return 1; }
+[[ $(trace_line_count "$ZAKURA_E2E_TRACE_DIR/node1/block_sync.csv") == 2 ]]
+wait_for_block_sync_reset node1 162 1 1
+'''],
+                env={**os.environ, "SCRIPT_DIR": str(harness.parent),
+                     "ZAKURA_E2E_TRACE_DIR": temporary},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_shared_csv_contract(self):
         cases = json.loads((ROOT / "crates/zakura-jsonl-trace/tests/fixtures/csv.json").read_text())
         with tempfile.TemporaryDirectory() as temporary:

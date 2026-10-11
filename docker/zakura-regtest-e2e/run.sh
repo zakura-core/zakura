@@ -593,7 +593,7 @@ trace_rows_after() {
 # `sync.block.reorg.reset`, which then counts only a reset at process startup.
 wait_for_block_sync_reset() {
   local node="$1" height="$2" lines_before="$3" timeout="${4:-${READY_TIMEOUT}}"
-  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.jsonl"
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.csv"
   local deadline=$((SECONDS + timeout)) resets
 
   while (( SECONDS < deadline )); do
@@ -1704,8 +1704,8 @@ fi
 log "asserting non-finalized reorg survival with no block-sync budget leak"
 old_tip_hash=$(block_hash 18232 "${target}")
 [[ -n "${old_tip_hash}" ]] || fail "could not read old tip hash at height ${target}"
-node1_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node1/block_sync.jsonl")
-node2_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl")
+node1_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node1/block_sync.csv")
+node2_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.csv")
 invalidate_block_if_present 18232 "${target}" "${old_tip_hash}" node1
 invalidate_block_if_present 18332 "${target}" "${old_tip_hash}" node2
 invalidate_block_if_present 18432 "${target}" "${old_tip_hash}" node3

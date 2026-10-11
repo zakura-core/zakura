@@ -258,10 +258,16 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   `poll_endpoint_events`, and sends its own datagrams. Pacing comes from
   `quinn-proto` through `poll_timeout`.
 - **DRV-3.** The endpoint task routes each datagram to its connection over a
-  queue bounded at 1,024 datagrams. When the queue is full, the endpoint task
-  MUST drop the datagram and count it (`zakura.quic.endpoint.queue_drops`). The
-  peer retransmits. Control events from `quinn-proto` use a separate queue that
-  never drops.
+  queue bounded at 16 MiB of datagram bytes. When the queue is full, the
+  endpoint task MUST drop the datagram and count it, per socket
+  (`zakura.quic.endpoint.queue_drops`) and per connection (`ConnLoad`,
+  `DriverStats`). The peer retransmits, but each drop costs it a congestion
+  event, so the budget covers what one endpoint wakeup can route at 10 Gbit/s.
+  A byte budget, not a datagram count, also bounds memory against 64 KiB
+  datagrams. The endpoint MUST give each datagram of a GRO batch its own
+  allocation: `quinn-proto` keeps received stream data as slices of its
+  datagram, so a shared batch would let one buffered chunk pin up to 64 KiB.
+  Control events from `quinn-proto` use a separate queue that never drops.
 - **DRV-4.** Handles reach a connection task over one ordered command channel
   per connection. Each read or write is a request with a one-shot reply.
   - A `RecvStream` has at most one read in flight.
@@ -280,6 +286,20 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
 - **DRV-7.** Dropping the last `Conn` handle closes the connection with code 0.
   Stream handles hold the connection open. Dropping the last `QuicEndpoint`
   handle closes the endpoint (API-7).
+- **DRV-8.** The connection task MUST serve its local inputs (commands,
+  shutdown, timers, the sampler) before the datagram queue. Local inputs are
+  bounded (DRV-4) and wait on network progress, while a peer can keep the
+  queue full; serving datagrams first would let a flood starve `close`,
+  `set_limits` and PATH-3.
+- **DRV-9.** When the peer sends STOP_SENDING, the connection task MUST fail
+  the stream's pending writes and send RESET_STREAM with the peer's code
+  (RFC 9000 §3.5). `quinn-proto` leaves the reset to the application. Without
+  it the peer never learns the final size and never frees the stream, so each
+  stop would cost the sender one stream credit for the connection's life.
+- **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
+  the call after the connection task replied, the stream goes to the next
+  caller. A lost stream ID would hold its stream open, and its credit, for the
+  connection's life.
 
 ## 7. Admission
 
@@ -446,8 +466,10 @@ These are not configurable. Changing one needs a spec change.
 - **PATH-3.** A connection has one path. When the peer migrates to a new
   address (WIRE-11), the endpoint MUST check the new IP against
   `Acceptor::is_banned`. `quinn-proto` emits no migration event, so the
-  connection task compares `remote_address()` with the last seen value at each
-  10 s sample (OBS-3). If the new IP is banned, it MUST close the connection
+  connection task compares `remote_address()` with the last seen value after
+  each batch of input, before it transmits. While the address differs from the
+  admitted one, it re-checks at each 10 s sample (OBS-3), so a ban that lands
+  after the move still applies. If the new IP is banned, it MUST close the connection
   with application code 0 and reason `banned path`, and count
   `zakura.quic.paths.closed_banned`. Only a peer that holds the connection's
   keys can migrate, so PATH-3 guards against ban evasion, not against
@@ -493,7 +515,10 @@ These are not configurable. Changing one needs a spec change.
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
   `closed`), `peer`, `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
-  `bytes_in_flight`, `send_blocked_micros` and `close_reason`. `peer` is the
+  `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
+  node made, `close_reason` names the cause: the application's code and
+  reason, `banned path`, `endpoint shutdown`, `all handles dropped` or
+  `handshake abandoned`. `peer` is the
   hashed peer label the other tables use, so rows join with `conn.jsonl`.
   `admitted_ip` follows `expose_peer_addresses`: it is `v4redacted` or
   `v6redacted` unless that is set.
@@ -552,12 +577,15 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `open_bi()`, `accept_bi()`, `close(code, reason)`, `closed()` and
     `close_reason()`;
   - `async stats() -> Option<ConnStats>`, `None` once the connection task has
-    exited.
+    exited;
+  - `load()` and `set_limits(ConnLimits)` (API-9).
   Dropping the last `Conn` handle closes the connection (DRV-7).
 - **API-5.** Streams are `zakura-quic`'s own `SendStream` and `RecvStream`
   (DRV-4, DRV-5). A `SendStream` write may return before `quinn-proto` accepts
   its data, so a write error can belong to an earlier write (DRV-4):
-  - `SendStream`: `write_all`, `write_chunk` (no copy), `finish` and `reset`;
+  - `SendStream`: `write_all`, `write_chunk` (no copy), `set_priority`,
+    `finish` and `reset`. `set_priority` maps to `quinn-proto`'s stream
+    priority (higher first) and is ordered with the stream's writes;
   - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end` and `stop`.
   The crate defines `WriteError`, `ReadError`, `ReadExactError`,
   `ReadToEndError` and `ClosedStream`. It re-exports `quinn-proto`'s `VarInt`,
@@ -584,6 +612,25 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-8.** The testkit's `LocalEndpointFactory` MUST build `zakura-quic`
   endpoints bound to `127.0.0.1:0` with production settings, except where a test
   overrides a `QuicConfig` field.
+- **API-9.** DoS controls. The application decides policy; the transport gives
+  it the state and the levers, without per-packet calls:
+  - `Conn::set_limits(ConnLimits)` changes the connection-level receive
+    window, send window and the peer's bidirectional stream limit at runtime.
+    The connection task applies it in order with the connection's other
+    commands. Raised limits reach the peer at once; lowered limits take effect
+    as the peer spends credit it already holds, because QUIC never revokes
+    granted credit.
+  - `Conn::load() -> ConnLoad` reads a snapshot the connection task publishes
+    at most every `LOAD_INTERVAL` (50 ms) while active, and once more when it
+    goes idle. It never waits on the connection task. It holds the peer's
+    current address, delivered and queued stream bytes, blocked send streams,
+    queued datagram bytes and queue drops (DRV-3), the peer's open streams,
+    the current limits, received UDP and frame counters (ACK, PING, STREAM,
+    `DATA_BLOCKED`, `STREAM_DATA_BLOCKED`, `RESET_STREAM` and the rest) and
+    send errors.
+  - `quinn-proto` 0.11 exposes neither the unread bytes in its receive
+    buffers nor a runtime per-stream receive window. The receive windows bound
+    both: a peer holds at most `receive_window` of unread data per connection.
 
 ## 13. Compatibility
 
@@ -700,9 +747,12 @@ this release tolerates, and keep each hard change explicit.
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
+| GRO segments don't share an allocation | DRV-3 |
+| A stopped stream returns its credit; a cancelled `accept_bi` hands its stream to the next call | DRV-9, DRV-10 |
+| Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
-| A relay that rebinds like a NAT: migration to a banned IP closes the connection, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
+| A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
 | Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-25 |
 | Congestion controller is Cubic when unset | CTRL-3 |
 | Stats report the controller, driver and socket counters | OBS-4, OBS-12 |
@@ -813,10 +863,14 @@ Added:
 - **WIRE-14.** No NEW_TOKEN frames.
 - **SOCK-13.** The Linux fast path: GSO, GRO, packet info and the
   don't-fragment probe option.
-- **§6a, DRV-1 to DRV-7.** The driver: an endpoint task per socket, a
-  connection task per connection, a bounded datagram queue, ordered
-  request-and-reply stream operations with 64 KiB of write-ahead per stream,
-  cancellation safety, read-driven flow control and drop-closes.
+- **§6a, DRV-1 to DRV-10.** The driver: an endpoint task per socket, a
+  connection task per connection, a byte-bounded datagram queue with one
+  allocation per datagram, ordered request-and-reply stream operations with
+  64 KiB of write-ahead per stream, cancellation safety (including
+  `open_bi` and `accept_bi`), read-driven flow control, drop-closes, local
+  inputs ahead of datagrams, and RESET_STREAM in answer to STOP_SENDING.
+- **API-9.** Runtime connection limits and the load snapshot, for DoS
+  policies in the application.
 - **ADM-11.** The connection table frees an entry only on `quinn-proto`'s
   drained event.
 - **OBS-12.** Controller, driver and socket stats.
@@ -847,7 +901,9 @@ Changed:
 - **CTRL-0, CTRL-1–CTRL-4, CTRL-11, CTRL-12, CTRL-14, CTRL-18–CTRL-20,
   CTRL-25, CTRL-31, CTRL-32, CTRL-40.** Name `quinn-proto` mappings. CTRL-3
   drops `bbr3`, because `quinn-proto`'s BBR is an older, experimental BBRv1.
-- **PATH-3, PATH-4.** Rewritten for a single path.
+- **PATH-3, PATH-4.** Rewritten for a single path. PATH-3 checks after each
+  batch of input instead of only at the 10 s sample, and re-checks a moved
+  path at each sample.
 - **OBS-1.** Drops `zakura.quic.paths.peer_opened` and adds the socket, GSO,
   GRO and queue counters.
 - **OBS-3.** Replaces `paths_open` with `bytes_in_flight` and

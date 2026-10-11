@@ -284,3 +284,45 @@ fn pruned_block_not_found_peer_ips_canonicalize_mapped_ipv6() {
         IpAddr::V4(ipv4)
     );
 }
+
+/// The completion task must not keep the downloader alive after its service is dropped.
+#[tokio::test]
+async fn dropping_gossip_driver_releases_downloads() {
+    use tower::{buffer::Buffer, timeout::Timeout, util::BoxService};
+    use zakura_chain::parameters::Network;
+    use zakura_test::mock_service::MockService;
+
+    use super::{
+        BlockDownloads, GossipedBlockDownloadDriver, BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT,
+    };
+
+    let network = Network::Mainnet;
+    let (_tip_sender, tip, _tip_change) = zakura_state::ChainTipSender::new(None, &network);
+    let downloads = Box::pin(BlockDownloads::new(
+        super::downloads::MAX_INBOUND_CONCURRENCY,
+        false,
+        Timeout::new(
+            Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+            BLOCK_DOWNLOAD_TIMEOUT,
+        ),
+        Timeout::new(
+            Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+            BLOCK_VERIFY_TIMEOUT,
+        ),
+        Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+        tip,
+        network,
+    ));
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let driver = GossipedBlockDownloadDriver::new(downloads, sender);
+    let downloads = std::sync::Arc::downgrade(&driver.downloads);
+    tokio::task::yield_now().await;
+    drop(driver);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while downloads.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the driver cancels its task and releases the download queue");
+}

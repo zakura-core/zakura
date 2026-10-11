@@ -9,6 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod component;
+mod non_blocking;
 
 #[cfg(feature = "opentelemetry")]
 mod otel;

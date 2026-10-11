@@ -138,7 +138,7 @@ class FleetDeployTests(DeployToolCase):
         ctx = self.context("fleet-deploy")
         recorder = Recorder(ctx)
         with mock.patch.object(tool, "lane_enabled", return_value=lane_enabled), \
-                mock.patch.dict(tool.os.environ, {"SLACK_WEB_HOOK": WEBHOOK}), \
+                mock.patch.dict(tool.os.environ, {"SLACK_WEB_HOOK": WEBHOOK, "PAGERDUTY_ROUTING_KEY": "fixture-pd-key"}), \
                 mock.patch.object(tool, "install_compat") as compat:
             tool.stage_fleet_deploy(ctx)
         return recorder, compat
@@ -155,7 +155,9 @@ class FleetDeployTests(DeployToolCase):
                     and args[0] in ("restart", "enable")]
         self.assertTrue(all(args[1] == tool.FLEET_UNIT for args in restarts))
         env_call = next(call for call in recorder.calls if call[1][0] == "fleet-env")
-        self.assertEqual(env_call[2], WEBHOOK.encode())
+        self.assertEqual(json.loads(env_call[2]), {"SLACK_WEB_HOOK": WEBHOOK,
+                                                 "PAGERDUTY_ROUTING_KEY": "fixture-pd-key"})
+        self.assertNotIn("fixture-pd-key", str(env_call[1]))
         self.assertNotIn("s3cr3t", json.dumps([list(map(str, c[1])) for c in recorder.calls]))
         compat.assert_not_called()
 

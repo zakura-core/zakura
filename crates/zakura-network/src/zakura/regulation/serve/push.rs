@@ -80,21 +80,33 @@ impl Push {
     }
 }
 
+/// A page's output grants and reserved transport slot. Dropping it sends nothing.
+#[derive(Debug)]
+pub(crate) struct PushSend<'a> {
+    grants: ResponseGrants,
+    slot: crate::zakura::transport::ResponseFrameSlot<'a>,
+}
+
 impl PushPermit {
-    /// Queue `frame` on `send`. Execution slots return now; the output
-    /// returns when the frame's transport write finishes.
-    ///
-    /// Returns false if the stream is closed.
-    pub(crate) async fn send(self, send: &FramedSend, frame: Frame) -> bool {
+    /// Wait for a response slot before spending subscription credit.
+    /// Cancellation releases these grants and any partially acquired slot.
+    /// Recheck the subscription after this wait, then commit and send without awaiting.
+    pub(crate) async fn reserve_send(
+        self,
+        send: &FramedSend,
+    ) -> Result<PushSend<'_>, crate::zakura::transport::GuardedReserveError> {
         let Self { grants, execution } = self;
         drop(execution);
-        match send.reserve_guarded().await {
-            Ok(slot) => {
-                slot.send(frame, FrameGuard::new(Arc::new(grants)));
-                true
-            }
-            Err(_) => false,
-        }
+        let slot = send.reserve_response_guarded().await?;
+        Ok(PushSend { grants, slot })
+    }
+}
+
+impl PushSend<'_> {
+    /// Queue the page immediately after its subscription credit is committed.
+    pub(crate) fn send(self, frame: Frame) {
+        self.slot
+            .send(frame, FrameGuard::new(Arc::new(self.grants)));
     }
 }
 

@@ -82,7 +82,7 @@ impl AuxiliaryRequirementEpisode {
         Self(hasher.finalize().into())
     }
 
-    /// Derive one episode for a contiguous selected range with no durable auxiliary rows.
+    /// Derive one episode for a contiguous selected range with no constraining auxiliary rows.
     fn for_empty_selected_range(
         state_version: crate::StateVersion,
         selected_range: &[Frontier],
@@ -105,7 +105,8 @@ impl AuxiliaryRequirementEpisode {
                 }
                 None => hasher.update([0]),
             }
-            // The range builder admits a target only after it proves that no durable row exists.
+            // The range builder admits a target only after it proves that no durable row
+            // constrains a replacement. The state version binds any rootless rows.
             hasher.update([0]);
         }
         Self(hasher.finalize().into())
@@ -131,8 +132,8 @@ struct SelectedRepairRange {
     frontiers: Box<[Frontier]>,
     /// Selected successor after the range, when one exists.
     terminal_boundary_hash: Option<block::Hash>,
-    /// Whether the blocking target has any durable auxiliary row.
-    has_durable_rows: bool,
+    /// Whether the blocking target has a durable row that constrains its replacement.
+    has_constraining_rows: bool,
     /// Sources with a retained rooted payload at each header of an ambiguous boundary, in range
     /// order. Other ranges leave this empty.
     header_retained_sources: Box<[Box<[SourceId]>]>,
@@ -183,7 +184,7 @@ impl VctRepairContext {
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
-                has_durable_rows: false,
+                has_constraining_rows: false,
                 header_retained_sources: Box::new([]),
             }),
         }
@@ -244,23 +245,23 @@ impl VctRepairContext {
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
-                has_durable_rows: !rows.is_empty(),
+                has_constraining_rows: Self::rows_constrain_repair(rows),
                 header_retained_sources: Box::new([]),
             }),
         })
     }
 
-    /// Convert an unconstrained exact repair into a selected range with no rows.
+    /// Convert an unconstrained exact repair into a selected range with no constraining rows.
     ///
     /// `suffix` begins with the selected successor of [`Self::target`]. An empty suffix represents
-    /// a range context that negotiation shortened to one header. The caller must prove that every
-    /// target in the resulting range has no durable auxiliary row.
+    /// a range context that negotiation shortened to one header. The caller must prove that no
+    /// target in the resulting range has a row that [`Self::rows_constrain_repair`] reports.
     pub fn extend_empty_selected_range(
         mut self,
         suffix: &[Frontier],
         terminal_boundary_hash: Option<block::Hash>,
     ) -> Result<Self, StoreError> {
-        if self.selected_range.has_durable_rows || !self.admission_capacity_available {
+        if self.selected_range.has_constraining_rows || !self.admission_capacity_available {
             return Err(StoreError::Incoherent(
                 "a constrained VCT repair context cannot become a range",
             ));
@@ -289,7 +290,7 @@ impl VctRepairContext {
         self.selected_range = Box::new(SelectedRepairRange {
             frontiers: selected_range.into_boxed_slice(),
             terminal_boundary_hash,
-            has_durable_rows: false,
+            has_constraining_rows: false,
             header_retained_sources: Box::new([]),
         });
         Ok(self)
@@ -387,7 +388,7 @@ impl VctRepairContext {
         self.selected_range = Box::new(SelectedRepairRange {
             frontiers: Box::new([self.target, successor]),
             terminal_boundary_hash,
-            has_durable_rows: true,
+            has_constraining_rows: true,
             header_retained_sources,
         });
         Ok(Some(self))
@@ -415,7 +416,7 @@ impl VctRepairContext {
     /// Shorten this context to at most `max_headers` selected headers.
     ///
     /// The returned episode binds the selected prefix, its authentication boundaries, the state
-    /// version, and the absence of durable auxiliary rows. Exact constrained repairs can only
+    /// version, and the absence of constraining auxiliary rows. Exact constrained repairs can only
     /// return their one-header context.
     ///
     /// An ambiguous boundary repair binds both of its headers, so it returns `None` for a shorter
@@ -428,14 +429,14 @@ impl VctRepairContext {
         if prefix_len == self.selected_range.frontiers.len() {
             return Some(self.clone());
         }
-        if self.selected_range.has_durable_rows {
+        if self.selected_range.has_constraining_rows {
             return None;
         }
         let mut prefix = self.clone();
         prefix.selected_range = Box::new(SelectedRepairRange {
             frontiers: self.selected_range.frontiers[..prefix_len].into(),
             terminal_boundary_hash: Some(self.selected_range.frontiers[prefix_len].hash),
-            has_durable_rows: false,
+            has_constraining_rows: false,
             header_retained_sources: Box::new([]),
         });
         prefix.episode = AuxiliaryRequirementEpisode::for_empty_selected_range(
@@ -444,6 +445,17 @@ impl VctRepairContext {
             prefix.selected_range.terminal_boundary_hash,
         );
         Some(prefix)
+    }
+
+    /// Return whether durable rows constrain a replacement for their target.
+    ///
+    /// Suppliers attach roots only to their finalized prefix, so headers received near the network
+    /// tip keep rootless rows with no outcome. Those rows exclude no input and retain no payload or
+    /// rooted source, so a selected range can cover them. A rooted or judged row limits its target
+    /// to an exact one-header repair.
+    pub fn rows_constrain_repair(rows: &[UntrustedAuxDeliveryRow]) -> bool {
+        rows.iter()
+            .any(|row| row.delivery().tree_aux.is_some() || row.outcome_status_code() != 0)
     }
 
     /// Check one input against durable rejection or dispute evidence without transport identity.
@@ -1053,5 +1065,63 @@ mod tests {
             )
             .episode
         );
+    }
+
+    #[test]
+    fn rootless_rows_leave_a_repair_range_open_but_rooted_rows_do_not() {
+        let target = Frontier::new(block::Height(1), block::Hash([0x31; 32]));
+        let successor = Frontier::new(block::Height(2), block::Hash([0x32; 32]));
+        let locator = HeaderLocator::for_continuation(snapshot(2, 0).frontiers.finalized);
+        let owner = BodyWorkAuthority::for_snapshot(&snapshot(2, 0))
+            .bind(5, NonZeroU64::new(6).expect("six is nonzero"));
+        let record = TreeAuxRecordV1 {
+            height: target.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 2,
+            ironwood_tx_count: 3,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([4; 32]),
+        };
+        let row = |identity: u8, tree_aux| {
+            UntrustedAuxDeliveryRow::new(
+                AuxDelivery::new(
+                    EvidenceId::from_digest([identity; 32]),
+                    target.hash,
+                    SourceId::from_digest([identity.wrapping_add(1); 32]),
+                    owner.into(),
+                    BodySizeHint::Unknown,
+                    tree_aux,
+                ),
+                0,
+                [None, None],
+                None,
+            )
+        };
+        let rootless = row(0x33, None);
+        let rooted = row(0x35, Some(record));
+        assert!(!VctRepairContext::rows_constrain_repair(&[rootless]));
+        assert!(VctRepairContext::rows_constrain_repair(&[rootless, rooted]));
+
+        let context = |rows: &[UntrustedAuxDeliveryRow]| {
+            VctRepairContext::from_durable_rows(
+                target,
+                locator.clone(),
+                StateVersion::new(1),
+                Some(successor.hash),
+                true,
+                rows,
+            )
+            .expect("the unauthenticated rows are coherent")
+        };
+        let range = context(&[rootless])
+            .extend_empty_selected_range(&[successor], None)
+            .expect("rootless input leaves the selected range open");
+        assert_eq!(range.selected_header_count(), 2);
+        assert!(!range.retains_source(rootless.delivery().source));
+        assert!(context(&[rootless, rooted])
+            .extend_empty_selected_range(&[successor], None)
+            .is_err());
     }
 }

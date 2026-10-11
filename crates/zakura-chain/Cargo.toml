@@ -62,7 +62,6 @@ equihash = { workspace = true }
 group = { workspace = true }
 incrementalmerkletree.workspace = true
 jubjub = { workspace = true }
-dirs-sys = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 rand_chacha_10 = { workspace = true, optional = true }
 rand_core_10 = { workspace = true, optional = true }
@@ -172,3 +171,6 @@ workspace = true
 # version solely to remove its Cargo feature name.
 [package.metadata.cargo-semver-checks.lints]
 feature_missing = "warn"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Globalization", "Win32_System_Com"] }

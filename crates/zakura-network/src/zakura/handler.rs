@@ -1011,7 +1011,17 @@ impl IpSlots {
             .unwrap_or_default()
     }
 
+    /// Control handshakes in progress from `ip`.
+    fn handshaking(&self, ip: IpAddr) -> usize {
+        self.counts()
+            .handshaking
+            .get(&ip)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Registered connections and control handshakes from `ip`.
+    #[cfg(test)]
     fn charged(&self, ip: IpAddr) -> usize {
         let counts = self.counts();
         let registered = counts.registered.get(&ip).copied().unwrap_or_default();
@@ -1296,11 +1306,31 @@ impl ZakuraSupervisorHandle {
 
     /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
     /// QUIC handshakes and its control handshakes are counted. Never awaits.
-    fn ip_at_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
-        self.ip_slots
-            .charged(canonical_ip(remote_ip))
-            .saturating_add(pending)
-            >= self.max_connections_per_ip
+    /// Decides whether `remote_ip` may start another handshake (zakura-quic
+    /// ADM-3 rule 2), given the transport's `pending` handshakes from it.
+    fn ip_admission(
+        &self,
+        remote_ip: IpAddr,
+        pending: usize,
+        max_handshakes_per_ip: usize,
+    ) -> IpAdmission {
+        let ip = canonical_ip(remote_ip);
+        let registered = self.ip_slots.registered(ip);
+        let in_flight = self.ip_slots.handshaking(ip).saturating_add(pending);
+        if in_flight >= max_handshakes_per_ip {
+            return IpAdmission::Full;
+        }
+        if registered.saturating_add(in_flight) < self.max_connections_per_ip {
+            return IpAdmission::Open;
+        }
+        // A full IP still gets one handshake at a time: it may be a node
+        // redialing to replace its own stale connection, which `register`
+        // allows from the same IP. `register` enforces the exact cap for
+        // everyone else, so this costs at most one handshake per full IP.
+        if registered >= self.max_connections_per_ip && in_flight == 0 {
+            return IpAdmission::Open;
+        }
+        IpAdmission::Full
     }
 
     /// Counts an inbound control handshake against `remote_ip` until the guard
@@ -3569,6 +3599,18 @@ impl ZakuraProtocolHandler {
     }
 }
 
+/// One IP may hold at most this fraction of the pending-handshake budget, so
+/// a few addresses can't refuse every other inbound peer. With the default
+/// budget of 32, an IP gets 4 handshakes at a time.
+const PENDING_HANDSHAKE_SHARES_PER_IP: usize = 8;
+
+/// Whether an IP may start another handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IpAdmission {
+    Open,
+    Full,
+}
+
 impl Acceptor for ZakuraProtocolHandler {
     /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap before
     /// any handshake work. The endpoint applies rules 3 and 5 itself, and
@@ -3577,10 +3619,21 @@ impl Acceptor for ZakuraProtocolHandler {
         if self.shutdown.is_cancelled() {
             return Admit::Ignore;
         }
-        if self
-            .supervisor
-            .ip_at_capacity(incoming.remote.ip(), incoming.pending_from_ip)
+        let max_handshakes_per_ip =
+            (self.limits.max_pending_handshakes / PENDING_HANDSHAKE_SHARES_PER_IP).max(1);
+        if self.supervisor.ip_admission(
+            incoming.remote.ip(),
+            incoming.pending_from_ip,
+            max_handshakes_per_ip,
+        ) == IpAdmission::Full
         {
+            // An unvalidated source address may be spoofed, so a full IP is
+            // ambiguous: Retry costs a real peer one round trip and a spoofer
+            // its slot, and refuses no one.
+            if !incoming.validated {
+                metrics::counter!("zakura.p2p.conn.retried.per_ip").increment(1);
+                return Admit::Retry;
+            }
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
             return Admit::Refuse;
         }
@@ -10891,8 +10944,8 @@ mod tests {
     // distinct authenticated identities dial from the same source IP
     // (127.0.0.1). The per-IP cap is 1 while global admission keeps its default
     // (well above 1), so the second identity can only be turned away by the
-    // per-IP cap, not the global gate. It is refused before its handshake,
-    // leaving exactly one registered peer.
+    // per-IP cap, not the global gate. It never registers, leaving exactly one
+    // registered peer.
     #[tokio::test]
     async fn inbound_accept_enforces_per_ip_cap() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -11011,25 +11064,28 @@ mod tests {
              resolved from the endpoint and counted against the per-IP cap)",
         );
 
-        // Second distinct identity from the same source IP: the acceptor refuses
-        // it before the handshake, so it never reaches registration. (Before the
-        // fix the accept passed remote_ip = None, so this identity registered and
-        // one source IP could exhaust the global budget.)
-        let second = connect_native(&server_addr, 882, &limits).await;
-        let refused = matches!(
-            second
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<zakura_quic::ConnectError>()),
-            Some(zakura_quic::ConnectError::Refused)
-        );
+        // Second distinct identity from the same source IP. A full IP still
+        // gets one handshake, in case it is the first node redialing, so the
+        // QUIC handshake may complete; registration then rejects the new
+        // identity. (Before the fix the accept passed remote_ip = None, so
+        // this identity registered and one source IP could exhaust the global
+        // budget.)
+        let rejected = match connect_native(&server_addr, 882, &limits).await {
+            Ok((endpoint, connection)) => run_handshake(&endpoint, &connection, &limits)
+                .await
+                .is_err(),
+            Err(error) => matches!(
+                error.downcast_ref::<zakura_quic::ConnectError>(),
+                Some(zakura_quic::ConnectError::Refused)
+            ),
+        };
         let registered = supervisor.registered_ids().await.len();
         assert!(
-            refused && registered == 1,
-            "a second distinct identity from the same source IP must be refused by the per-IP \
-             cap (refused={refused}, registered={registered}); before the fix the inbound accept \
-             passed remote_ip = None, so both identities registered and one source IP could \
-             exhaust the connection budget",
+            rejected && registered == 1,
+            "a second distinct identity from the same source IP must be turned away by the \
+             per-IP cap (rejected={rejected}, registered={registered}); before the fix the \
+             inbound accept passed remote_ip = None, so both identities registered and one \
+             source IP could exhaust the connection budget",
         );
 
         server_ep.shutdown().await;
@@ -11062,6 +11118,67 @@ mod tests {
             native_dial_timeout(&QuicConfig::default(), 1, control_timeout),
             control_timeout
         );
+    }
+
+    /// ADM-3 rule 2 before TLS: a full IP gets one handshake at a time for a
+    /// possible same-node redial; more are refused when the source is
+    /// validated and retried when it may be spoofed; and one IP can't take
+    /// more than its share of the pending-handshake budget.
+    #[tokio::test]
+    async fn per_ip_admission_retries_unvalidated_and_allows_one_redial() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let ip: IpAddr = "203.0.113.9".parse().expect("test ip parses");
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let peer = test_peer(1);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let registered = supervisor
+            .register(
+                test_conn_id(),
+                peer.clone(),
+                Some(ip),
+                [1; TRANSCRIPT_HASH_BYTES],
+                ZakuraPeerHandle::new_for_tests(peer, outbound_tx),
+                CancellationToken::new(),
+                ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await;
+        assert!(matches!(registered, ZakuraRegistration::Registered { .. }));
+
+        let attempt = |validated: bool, pending_from_ip: usize| IncomingInfo {
+            remote: SocketAddr::new(ip, 8234),
+            validated,
+            pending_total: pending_from_ip,
+            pending_from_ip,
+        };
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
+        assert_eq!(handler.admit(&attempt(true, 1)), Admit::Refuse);
+        assert_eq!(handler.admit(&attempt(false, 1)), Admit::Retry);
+
+        let other: IpAddr = "198.51.100.3".parse().expect("test ip parses");
+        let share = limits.max_pending_handshakes / PENDING_HANDSHAKE_SHARES_PER_IP;
+        let busy = |pending_from_ip: usize| IncomingInfo {
+            remote: SocketAddr::new(other, 8234),
+            validated: true,
+            pending_total: pending_from_ip,
+            pending_from_ip,
+        };
+        let open = ZakuraSupervisorHandle::new(64);
+        let handler = ZakuraProtocolHandler::new(
+            open,
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits,
+        );
+        assert_eq!(handler.admit(&busy(share - 1)), Admit::Accept);
+        assert_eq!(handler.admit(&busy(share)), Admit::Refuse);
+        Ok(())
     }
 
     // V12 F-305585: the transport stops counting an inbound connection when TLS

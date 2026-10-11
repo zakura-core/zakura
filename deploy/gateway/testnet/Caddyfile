@@ -13,6 +13,12 @@
 	}
 }
 
+# Site blocks owned by other repositories that co-locate on this host (for
+# example valargroup/valar-testnet-faucet installs valar-faucet.caddy). Each repo
+# manages only its own file; a glob that matches nothing is a warning, not an
+# error, so this is inert on hosts without extra sites.
+import /etc/caddy/conf.d/*.caddy
+
 ironwood.zakura.valargroup.dev {
 	reverse_proxy 127.0.0.1:8091
 }

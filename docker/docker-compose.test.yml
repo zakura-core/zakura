@@ -7,13 +7,9 @@ services:
       target: tests
     volumes:
       - zakurad-cache:/home/zebra/.cache/zakura
-      - lwd-cache:/home/zebra/.cache/lwd
     env_file:
       - test.env
 
 volumes:
   zakurad-cache:
-    driver: local
-
-  lwd-cache:
     driver: local

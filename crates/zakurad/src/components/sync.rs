@@ -241,16 +241,6 @@ const MIN_UNREQUESTED_HASHES_BEFORE_EXTEND: usize = MAX_TIPS_RESPONSE_HASH_COUNT
 /// failure loop.
 pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Controls how long we wait between gossiping successive blocks or transactions.
-///
-/// ## Correctness
-///
-/// If this timeout is set too high, blocks and transactions won't propagate through
-/// the network efficiently.
-///
-/// If this timeout is set too low, the peer set and remote peers can get overloaded.
-pub const PEER_GOSSIP_DELAY: Duration = Duration::from_secs(7);
-
 /// Controls how long we wait for a block download request to complete.
 ///
 /// This timeout makes sure that the syncer doesn't hang when:
@@ -2687,6 +2677,13 @@ where
                 advertiser_addr,
                 ..
             } if Self::is_poisoned_body(error) => Some((*hash, *advertiser_addr)),
+            // The state dropped this block because its ancestor's body was forged. The peer
+            // that served this block is not at fault, so requeue it without scoring.
+            BlockDownloadVerifyError::Invalid { error, hash, .. }
+                if error.is_descendant_of_auth_commitment_mismatch() =>
+            {
+                Some((*hash, None))
+            }
             _ => None,
         }) {
             let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
@@ -2707,7 +2704,8 @@ where
                     ?hash,
                     retry_attempt = *retry_count,
                     retry_limit = POISONED_BLOCK_RETRY_LIMIT,
-                    "sync block body failed height or transaction commitment checks, retrying required block"
+                    "sync block body failed a header commitment check, or descends from one that \
+                     did, retrying required block"
                 );
                 metrics::counter!("sync.poisoned.block.requeued.count").increment(1);
 
@@ -2961,7 +2959,7 @@ where
         );
     }
 
-    /// Identifies a body that disagrees with its transaction commitments.
+    /// Identifies a body that disagrees with its transaction or authorizing data commitments.
     fn is_poisoned_body(error: &RouterError) -> bool {
         use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
 
@@ -2970,6 +2968,7 @@ where
             BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
         ) || matches!(error, RouterError::Block { source }
                 if matches!(**source, VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight { .. })))
+            || error.is_auth_commitment_mismatch()
     }
 
     /// Identifies a duplicate whose original commit has no known outcome yet.

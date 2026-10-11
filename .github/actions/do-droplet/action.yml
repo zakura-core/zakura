@@ -11,10 +11,10 @@ inputs:
     description: "Ordered regions; each must contain all requested artifacts"
     default: nyc1,sfo3,nyc3
   snapshot_mode:
-    description: "tip, sandblast, genesis, or pre-checkpoint"
+    description: "tip, sandblast, genesis, pre-checkpoint, or vct-handoff"
     default: tip
   max_checkpoint:
-    description: "Exclusive upper state height for pre-checkpoint selection"
+    description: "Exclusive upper state height for pre-checkpoint or vct-handoff selection"
     default: ""
   name:
     description: "Droplet name"

@@ -285,11 +285,19 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Request fresh context after committed state supersedes a resource refusal.
+    /// Request fresh context after committed state supersedes a resource refusal or a range
+    /// context that has not gone on wire.
+    ///
+    /// A range episode binds the state version, so state would reject a response to a range
+    /// context that a newer state already superseded. An exact episode omits the version.
     pub fn observe_state_change(&mut self, current: zakura_header_chain::StateVersion) {
         if matches!(
-            self.state,
-            RepairPolicyState::StateBlocked { state_version, .. } if current > state_version
+            &self.state,
+            RepairPolicyState::StateBlocked { state_version, .. } if current > *state_version
+        ) || matches!(
+            &self.state,
+            RepairPolicyState::Ready { context }
+                if context.selected_header_count() > 1 && current > context.state_version
         ) {
             self.state = RepairPolicyState::NeedsContext;
         }
@@ -661,6 +669,50 @@ mod tests {
 
         task.observe_state_change(StateVersion::new(4));
         assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
+    fn superseded_range_context_is_read_again_before_assignment() {
+        let exact = context();
+        let read_at = StateVersion::new(3);
+        let range = VctRepairContext::from_durable_rows(
+            exact.target,
+            exact.locator.clone(),
+            read_at,
+            Some(hash(6)),
+            true,
+            &[],
+        )
+        .expect("an empty durable input set is coherent")
+        .extend_empty_selected_range(&[Frontier::new(block::Height(20), hash(6))], None)
+        .expect("the selected range is contiguous");
+        let newer = StateVersion::new(4);
+
+        let mut exact_task = task(&snapshot());
+        mark_context_requested(&mut exact_task);
+        exact_task
+            .resolve(exact.clone())
+            .expect("the exact context resolves");
+        exact_task.observe_state_change(newer);
+        assert_eq!(
+            exact_task.state,
+            RepairPolicyState::Ready { context: exact },
+            "an exact episode does not bind the state version"
+        );
+
+        let mut range_task = task(&snapshot());
+        mark_context_requested(&mut range_task);
+        range_task
+            .resolve(range.clone())
+            .expect("the range context resolves");
+        range_task.observe_state_change(read_at);
+        assert_eq!(
+            range_task.state,
+            RepairPolicyState::Ready { context: range }
+        );
+        range_task.observe_state_change(newer);
+        assert_eq!(range_task.state, RepairPolicyState::NeedsContext);
+        assert_eq!(range_task.attempts, 0);
     }
 
     #[test]

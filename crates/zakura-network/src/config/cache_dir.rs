@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use zakura_chain::{common::default_cache_dir, parameters::Network};
+use zakura_chain::{
+    common::{default_cache_dir, home_dir},
+    parameters::Network,
+};
 
 /// The directory, relative to the user's home directory, where Zebra stores
 /// long-term network identity secrets.
@@ -94,7 +97,7 @@ impl Default for CacheDir {
 
 /// Returns the default directory for network identity secrets.
 pub(crate) fn default_network_identity_dir() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(DEFAULT_NETWORK_IDENTITY_DIR)
 }

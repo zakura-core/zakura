@@ -50,6 +50,16 @@ impl StatusPublisher {
         self.pending_at = Some(floor.max(committed_at).min(committed_at + MAX_CHANGE_DELAY));
     }
 
+    /// Schedule an unchanged status after confirmed serving capacity recovery.
+    pub(in crate::zakura::header_sync) fn request_refresh(&mut self, now: Instant) {
+        let earliest = self
+            .last_sent_at
+            .map_or(now, |sent| sent + MIN_PUBLICATION_INTERVAL)
+            .max(now);
+        // An existing publication covers this release, including after a failed send.
+        self.pending_at.get_or_insert(earliest);
+    }
+
     pub(in crate::zakura::header_sync) fn next_deadline(&self) -> Instant {
         if let Some(pending_at) = self.pending_at {
             pending_at
@@ -127,6 +137,27 @@ mod tests {
             publisher.next_deadline(),
             refresh_at + PUBLICATION_RETRY_DELAY
         );
+    }
+
+    #[test]
+    fn capacity_refresh_coalesces_and_survives_backpressure() {
+        let now = Instant::now();
+        let mut publisher = StatusPublisher::new(status(1), Duration::from_secs(30), now);
+        publisher.record_sent(status(1), now);
+        publisher.request_refresh(now + Duration::from_millis(100));
+        publisher.request_refresh(now + Duration::from_millis(900));
+        assert_eq!(publisher.next_deadline(), now + MIN_PUBLICATION_INTERVAL);
+        publisher.observe(status(1), now + Duration::from_millis(950));
+        assert_eq!(publisher.desired(), status(1));
+        publisher.record_failed(now + MIN_PUBLICATION_INTERVAL);
+        let retry = now + MIN_PUBLICATION_INTERVAL + PUBLICATION_RETRY_DELAY;
+        assert_eq!(publisher.next_deadline(), retry);
+        publisher.request_refresh(now + MIN_PUBLICATION_INTERVAL + Duration::from_millis(1));
+        assert_eq!(publisher.next_deadline(), retry);
+        publisher.request_refresh(retry + Duration::from_millis(50));
+        assert_eq!(publisher.next_deadline(), retry);
+        publisher.record_sent(status(1), retry);
+        assert_eq!(publisher.next_deadline(), retry + Duration::from_secs(30));
     }
 
     #[test]

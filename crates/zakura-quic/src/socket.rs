@@ -242,9 +242,7 @@ impl UdpIo {
             let port = test_hooks::SEND_WOULD_BLOCK_PORT.load(Ordering::Relaxed);
             if port != 0
                 && self.socket.local_addr().map(|a| a.port()).ok() == Some(port)
-                && test_hooks::SEND_WOULD_BLOCK
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                    .is_ok()
+                && test_hooks::take_one(&test_hooks::SEND_WOULD_BLOCK)
             {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -783,11 +781,23 @@ mod linux {
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
-    use std::sync::atomic::{AtomicU16, AtomicUsize};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
     /// The local port whose sends fail with `WouldBlock` (0: none).
     pub(crate) static SEND_WOULD_BLOCK_PORT: AtomicU16 = AtomicU16::new(0);
     /// How many of that port's sends fail before the socket is tried.
     pub(crate) static SEND_WOULD_BLOCK: AtomicUsize = AtomicUsize::new(0);
     /// The local port whose next receive fails fatally (0: none).
     pub(crate) static RECV_FAIL_PORT: AtomicU16 = AtomicU16::new(0);
+
+    /// Takes one from `counter` unless it is 0, and reports whether it did.
+    pub(crate) fn take_one(counter: &AtomicUsize) -> bool {
+        let mut n = counter.load(Ordering::Relaxed);
+        while n > 0 {
+            match counter.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(current) => n = current,
+            }
+        }
+        false
+    }
 }

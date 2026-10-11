@@ -34,6 +34,8 @@ use crate::BoxError;
 
 use super::{sapling_prover, Authorized, Bundle, CacheKey, Cached, CachedItem, Item, ZatBalance};
 
+mod prepared_keys;
+
 /// The `verifier` label the test caches report their metrics under.
 ///
 /// Test caches use their own label so their counts never land in the series the production

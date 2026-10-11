@@ -1,0 +1,91 @@
+//! Zcash chain history Merkle mountain range trees for Zakura.
+//!
+//! Imported from `zcash_history` 0.5.0; see the crate README for provenance.
+
+// Catch documentation errors caused by code changes.
+#![deny(rustdoc::broken_intra_doc_links)]
+#![warn(missing_docs)]
+
+mod entry;
+mod node_data;
+mod tree;
+mod u256;
+mod version;
+
+#[cfg(test)]
+mod test_vectors;
+
+pub use entry::{Entry, MAX_ENTRY_SIZE};
+pub use node_data::{NodeData, MAX_NODE_DATA_SIZE, V2 as NodeDataV2, V3 as NodeDataV3};
+pub use tree::Tree;
+pub use u256::U256;
+pub use version::{Version, V1, V2, V3};
+
+/// Crate-level error type
+#[derive(Debug)]
+pub enum Error {
+    /// Entry expected to be presented in the tree view while it was not.
+    ExpectedInMemory(EntryLink),
+    /// Entry expected to be a node (specifying for which link this is not
+    /// true).
+    ExpectedNode(Option<EntryLink>),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::ExpectedInMemory(l) => write!(f, "Node/leaf expected to be in memory: {l}"),
+            Self::ExpectedNode(None) => write!(f, "Node expected"),
+            Self::ExpectedNode(Some(l)) => write!(f, "Node expected, not leaf: {l}"),
+        }
+    }
+}
+
+/// Reference to the tree node.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub enum EntryLink {
+    /// Reference to the stored (in the array representation) leaf/node.
+    Stored(u32),
+    /// Reference to the generated leaf/node.
+    Generated(u32),
+}
+
+impl std::fmt::Display for EntryLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Stored(v) => write!(f, "stored({v})"),
+            Self::Generated(v) => write!(f, "generated({v})"),
+        }
+    }
+}
+
+/// The kind of an MMR entry, with child links for internal nodes.
+#[repr(C)]
+#[derive(Debug)]
+pub enum EntryKind {
+    /// Leaf entry.
+    Leaf,
+    /// Node entry with children links.
+    Node(EntryLink, EntryLink),
+}
+
+impl Error {
+    /// Entry expected to be a node (specifying for which link this is not
+    /// true).
+    pub fn link_node_expected(link: EntryLink) -> Self {
+        Self::ExpectedNode(Some(link))
+    }
+
+    /// Some entry is expected to be node
+    pub fn node_expected() -> Self {
+        Self::ExpectedNode(None)
+    }
+
+    pub(crate) fn augment(self, link: EntryLink) -> Self {
+        match self {
+            Error::ExpectedNode(_) => Error::ExpectedNode(Some(link)),
+            val => val,
+        }
+    }
+}

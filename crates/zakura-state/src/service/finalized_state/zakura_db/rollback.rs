@@ -287,7 +287,16 @@ pub fn rollback_finalized_state(
     check_format_version(&config, network)?;
 
     let db = open_rollback_db(&config, network, false);
-    let prepared = prepare_rollback(&db, network, &options)?;
+    rollback_open_db(&db, network, options)
+}
+
+fn rollback_open_db(
+    db: &ZakuraDb,
+    network: &Network,
+    options: RollbackFinalizedStateOptions,
+) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+    let config = db.config();
+    let prepared = prepare_rollback(db, network, &options)?;
 
     let backup = if options.keep_rolled_back_blocks {
         let backup_dir = config
@@ -317,6 +326,19 @@ pub fn rollback_finalized_state(
     db.write_batch(prepared.batch)?;
 
     Ok(summary)
+}
+
+#[cfg(test)]
+impl ZakuraDb {
+    /// Run the rollback implementation without reopening a test-owned database.
+    pub(in crate::service::finalized_state) fn rollback_for_test(
+        &self,
+        network: &Network,
+        options: RollbackFinalizedStateOptions,
+    ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+        check_format_version(self.config(), network)?;
+        rollback_open_db(self, network, options)
+    }
 }
 
 fn check_format_version(

@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use color_eyre::eyre::Result;
+use tracing::instrument::WithSubscriber;
+
+#[path = "end_of_support/log_capture.rs"]
+mod log_capture;
 
 use zakura_chain::{
     block::Height,
@@ -29,28 +33,23 @@ fn end_of_support_panic() {
 
 /// Test that the `end_of_support` function is working as expected.
 #[test]
-#[tracing_test::traced_test]
 fn end_of_support_function() {
+    let (logs, dispatch) = log_capture::capture_logs();
+    let _log_guard = tracing::dispatcher::set_default(&dispatch);
     // We are away from warn or panic
     let no_warn = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY)
         - (30 * ESTIMATED_BLOCKS_PER_DAY);
 
     end_of_support::check(Height(no_warn), &Network::Mainnet);
-    assert!(logs_contain(
-        "Checking if Zakura release is inside support range ..."
-    ));
-    assert!(logs_contain("Zakura release is supported"));
+    assert!(logs.contains("Checking if Zakura release is inside support range ..."));
+    assert!(logs.contains("Zakura release is supported"));
 
     // We are in warn range
     let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
 
     end_of_support::check(Height(warn), &Network::Mainnet);
-    assert!(logs_contain(
-        "Checking if Zakura release is inside support range ..."
-    ));
-    assert!(logs_contain(
-        "Your Zakura release is too old and it will stop running at block"
-    ));
+    assert!(logs.contains("Checking if Zakura release is inside support range ..."));
+    assert!(logs.contains("Your Zakura release is too old and it will stop running at block"));
 
     // Panic is tested in `end_of_support_panic`
 }
@@ -111,8 +110,9 @@ fn end_of_support_remaining_blocks() {
 
 /// Test that we are never in end of support warning or panic.
 #[test]
-#[tracing_test::traced_test]
 fn end_of_support_date() {
+    let (logs, dispatch) = log_capture::capture_logs();
+    let _log_guard = tracing::dispatcher::set_default(&dispatch);
     // Get the list of checkpoints.
     let list = Network::Mainnet.checkpoint_list();
 
@@ -120,10 +120,8 @@ fn end_of_support_date() {
     let higher_checkpoint = list.max_height();
 
     end_of_support::check(higher_checkpoint, &Network::Mainnet);
-    assert!(logs_contain(
-        "Checking if Zakura release is inside support range ..."
-    ));
-    assert!(!logs_contain(EOS_WARN_MESSAGE_HEADER));
+    assert!(logs.contains("Checking if Zakura release is inside support range ..."));
+    assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
 
 /// Keep Mainnet EOS before November 2, 2026 until NU7 is scheduled there.
@@ -170,12 +168,13 @@ fn mainnet_end_of_support_precedes_november_2_without_nu7() {
 
 /// Check that the end of support task is working.
 #[tokio::test(start_paused = true)]
-#[tracing_test::traced_test]
 async fn end_of_support_task() -> Result<()> {
+    let (logs, dispatch) = log_capture::capture_logs();
     let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
     latest_chain_tip_sender.send_best_tip_height(Height(10));
 
-    let eos_future = end_of_support::start(Network::Mainnet, latest_chain_tip);
+    let eos_future =
+        end_of_support::start(Network::Mainnet, latest_chain_tip).with_subscriber(dispatch);
 
     tokio::time::timeout(Duration::from_secs(15), eos_future)
         .await
@@ -183,11 +182,9 @@ async fn end_of_support_task() -> Result<()> {
             "end of support task unexpectedly exited: it should keep running until Zakura exits",
         );
 
-    assert!(logs_contain(
-        "Checking if Zakura release is inside support range ..."
-    ));
+    assert!(logs.contains("Checking if Zakura release is inside support range ..."));
 
-    assert!(logs_contain("Zakura release is supported"));
+    assert!(logs.contains("Zakura release is supported"));
 
     Ok(())
 }

@@ -32,6 +32,9 @@ pub type OtelError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Returns `(None, None)` with ZERO overhead when endpoint is `None` -
 /// no SDK objects are created, no background tasks are spawned.
 ///
+/// When enabled, preserves any installed Rustls crypto provider, or installs
+/// `ring` as the process default before creating the HTTP client.
+///
 /// # Arguments
 ///
 /// * `endpoint` - OTLP HTTP endpoint URL (e.g., "http://localhost:4318")
@@ -55,13 +58,11 @@ where
         None => return Ok((None, None)), // No SDK objects created
     };
 
-    // HTTP transport requires the /v1/traces path suffix.
-    // Append it if not already present.
-    let endpoint = if endpoint.ends_with("/v1/traces") {
-        endpoint.to_string()
-    } else {
-        format!("{}/v1/traces", endpoint.trim_end_matches('/'))
-    };
+    // Iroh enables Reqwest's rustls-no-provider feature for the shared dependency.
+    // An install error only means another provider is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let endpoint = traces_endpoint(endpoint)?;
 
     let service_name = service_name.unwrap_or("zakura");
     // Convert percentage (0-100) to rate (0.0-1.0), clamped to valid range
@@ -74,7 +75,7 @@ where
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(&endpoint)
+        .with_endpoint(endpoint.as_str())
         .build()?;
 
     // Use ratio-based sampling for production flexibility
@@ -103,4 +104,77 @@ where
     let layer = OpenTelemetryLayer::new(tracer);
 
     Ok((Some(layer), Some(provider)))
+}
+
+/// Append the traces path to a base URL, preserving queries and already-suffixed paths.
+/// Fragments are discarded because they are not part of an HTTP request target.
+fn traces_endpoint(endpoint: &str) -> Result<reqwest::Url, OtelError> {
+    let mut endpoint = reqwest::Url::parse(endpoint)?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        return Err("OpenTelemetry endpoint must be an HTTP(S) URL with a host".into());
+    }
+
+    let path = endpoint.path().trim_end_matches('/');
+    let path = if path.ends_with("/v1/traces") {
+        path.to_owned()
+    } else {
+        format!("{path}/v1/traces")
+    };
+    endpoint.set_path(&path);
+    endpoint.set_fragment(None);
+    Ok(endpoint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::traces_endpoint;
+
+    #[test]
+    fn normalize_traces_endpoint() {
+        for (input, expected) in [
+            ("http://localhost:4318", "http://localhost:4318/v1/traces"),
+            ("https://collector.example/", "https://collector.example/v1/traces"),
+            ("http://localhost:4318///", "http://localhost:4318/v1/traces"),
+            ("https://collector.example/prefix", "https://collector.example/prefix/v1/traces"),
+            ("https://collector.example/prefix///", "https://collector.example/prefix/v1/traces"),
+            ("http://localhost:4318/v1/traces", "http://localhost:4318/v1/traces"),
+            ("http://localhost:4318/v1/traces/", "http://localhost:4318/v1/traces"),
+            ("https://collector.example/prefix/v1/traces///", "https://collector.example/prefix/v1/traces"),
+            ("http://localhost:4318?sig=example", "http://localhost:4318/v1/traces?sig=example"),
+            ("http://localhost:4318/?", "http://localhost:4318/v1/traces?"),
+            ("https://collector.example/prefix/?a=one%2Ftwo&a=three+four&empty=", "https://collector.example/prefix/v1/traces?a=one%2Ftwo&a=three+four&empty="),
+            ("http://localhost:4318?route=/v1/traces", "http://localhost:4318/v1/traces?route=/v1/traces"),
+            ("http://localhost:4318#fragment", "http://localhost:4318/v1/traces"),
+            ("http://localhost:4318/prefix#/v1/traces", "http://localhost:4318/prefix/v1/traces"),
+            ("http://localhost:4318/v1/traces/?sig=example#fragment", "http://localhost:4318/v1/traces?sig=example"),
+            ("https://collector.example/prefix/v1/traces?sig=example#fragment", "https://collector.example/prefix/v1/traces?sig=example"),
+            ("https://collector.example/tenant%2Fname/", "https://collector.example/tenant%2Fname/v1/traces"),
+            ("https://collector.example/v1/traces-other", "https://collector.example/v1/traces-other/v1/traces"),
+            ("http://[::1]:4318/prefix/", "http://[::1]:4318/prefix/v1/traces"),
+            ("HTTPS://COLLECTOR.EXAMPLE:443/prefix", "https://collector.example/prefix/v1/traces"),
+            ("https://collector.example?value='example'", "https://collector.example/v1/traces?value=%27example%27"),
+            ("https://test-user:test-password@collector.example/test-path?token=test-token#test-fragment", "https://test-user:test-password@collector.example/test-path/v1/traces?token=test-token"),
+        ] {
+            let normalized = traces_endpoint(input).expect("valid HTTP endpoint");
+            assert_eq!(normalized.as_str(), expected, "input: {input}");
+            assert_eq!(traces_endpoint(normalized.as_str()).unwrap(), normalized);
+        }
+    }
+
+    #[test]
+    fn reject_invalid_traces_endpoints_without_echoing_them() {
+        for input in [
+            "",
+            "test-secret",
+            "/test-secret",
+            "http://[test-secret",
+            "ftp://collector.example/test-secret",
+            "file:///test-secret",
+            "mailto:test-secret@collector.example",
+        ] {
+            let error = traces_endpoint(input).expect_err("invalid HTTP endpoint");
+            assert!(!format!("{error:?}").contains("test-secret"));
+            assert!(!error.to_string().contains("test-secret"));
+        }
+    }
 }

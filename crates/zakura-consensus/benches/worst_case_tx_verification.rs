@@ -36,6 +36,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     future::Future,
+    hint::black_box,
     io::Cursor,
     pin::Pin,
     sync::{Arc, Once},
@@ -44,7 +45,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::sync::oneshot;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};

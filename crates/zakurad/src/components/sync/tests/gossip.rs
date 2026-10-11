@@ -269,12 +269,8 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .respond(Response::Nil);
 }
 
-/// An early broadcast advertises a hash whose body the node cannot serve yet, so it must not
-/// suppress the committed-tip fallback.
-///
-/// A peer can follow the early inventory, exhaust `PENDING_BLOCK_WAIT` waiting for the body, and
-/// give up. If the later committed broadcast then fails, the committed-tip gossip is the only
-/// thing left that prompts that peer to ask again.
+/// An early announcement must not suppress the committed-tip fallback when the later
+/// committed broadcast fails. Its body was still subject to contextual validation.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     let (
@@ -298,6 +294,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
             hash,
             height,
             submitted_at: tokio::time::Instant::now().into_std(),
+            submission: zakura_rpc::MinedBlockSubmission::FullBlock,
             pending: PendingBlockSignal::valid_for_tests(),
         })
         .expect("the early mined block notification is accepted");

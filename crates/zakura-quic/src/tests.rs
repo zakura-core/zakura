@@ -980,3 +980,102 @@ fn gro_segments_do_not_share_an_allocation() {
     );
     drop(segments);
 }
+
+/// Hands each connection over without accepting any stream, so a test drives
+/// `accept_bi` itself.
+struct HoldAcceptor {
+    handled: mpsc::UnboundedSender<Conn>,
+}
+
+impl Acceptor for HoldAcceptor {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        let handled = self.handled.clone();
+        Box::pin(async move {
+            let _ = handled.send(conn.clone());
+            conn.closed().await;
+        })
+    }
+}
+
+/// A connected pair whose server allows `max_bidi_streams` client streams and
+/// accepts none on its own.
+async fn held_pair(max_bidi_streams: u32) -> (QuicEndpoint, QuicEndpoint, Conn, Conn) {
+    let bind = QuicBindConfig {
+        max_bidi_streams,
+        ..loopback()
+    };
+    let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+    let (handled, mut inbound) = mpsc::unbounded_channel();
+    server.serve(HoldAcceptor { handled }).unwrap();
+    let client = client();
+    let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+    let conn = client.connect(addr, ALPN).await.unwrap();
+    let inbound = inbound.recv().await.unwrap();
+    (server, client, conn, inbound)
+}
+
+/// API-5: an `accept_bi` dropped after the stream arrived (a losing
+/// `select!` arm) hands the stream to the next call instead of losing it and
+/// its stream credit.
+#[tokio::test]
+async fn cancelled_accept_hands_the_stream_to_the_next_call() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(2).await;
+        for round in 0..3u8 {
+            let mut accept = Box::pin(inbound.accept_bi());
+            assert!(futures::poll!(&mut accept).is_pending());
+            let (mut send, _recv) = conn.open_bi().await.unwrap();
+            send.write_all(&[round]).await.unwrap();
+            send.finish().unwrap();
+            // Let the reply reach the dropped call's channel.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(accept);
+            let (_send, mut recv) =
+                tokio::time::timeout(Duration::from_secs(2), inbound.accept_bi())
+                    .await
+                    .expect("the stream reaches the next accept")
+                    .unwrap();
+            // Reading to the end frees the stream, so with two streams
+            // allowed a third round only runs if the credit came back.
+            assert_eq!(recv.read_to_end(8).await.unwrap(), [round]);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// RFC 9000 §3.5: a sender answers STOP_SENDING with RESET_STREAM, even when
+/// it later finishes or drops the stream. Without the reset the receiver never
+/// frees the stream and the sender runs out of stream credit.
+#[tokio::test]
+async fn a_stopped_stream_returns_its_credit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(2).await;
+        for round in 0..4u8 {
+            let (mut send, recv) = tokio::time::timeout(Duration::from_secs(2), conn.open_bi())
+                .await
+                .expect("stream credit came back")
+                .unwrap();
+            send.write_all(&[round]).await.unwrap();
+            // The server drops both halves: STOP_SENDING plus a FIN.
+            drop(inbound.accept_bi().await.unwrap());
+            // Wait until the stop arrives, then finish as an unaware sender
+            // would.
+            while send.write_all(&[round]).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = send.finish();
+            drop(recv);
+        }
+    })
+    .await
+    .unwrap();
+}

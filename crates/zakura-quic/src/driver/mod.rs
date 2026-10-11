@@ -51,6 +51,11 @@ pub(crate) enum ConnCmd {
     AcceptBi {
         reply: oneshot::Sender<Result<StreamId, ConnectionError>>,
     },
+    /// An open or accept caller dropped its request after the task replied.
+    Unclaimed {
+        id: StreamId,
+        accepted: bool,
+    },
     Write {
         id: StreamId,
         data: Bytes,

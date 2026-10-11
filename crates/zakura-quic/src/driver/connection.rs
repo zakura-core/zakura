@@ -357,6 +357,11 @@ impl ConnTask {
                 Event::Stream(StreamEvent::Finished { .. }) => {}
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                     self.fail_writes(id, WriteError::Stopped(error_code));
+                    // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM.
+                    // quinn-proto leaves this to the application, and without
+                    // it the peer never learns the final size, so it never
+                    // frees the stream or returns its stream credit.
+                    let _ = self.conn.send_stream(id).reset(error_code);
                 }
             }
         }
@@ -459,6 +464,17 @@ impl ConnTask {
             ConnCmd::Reset { id, code } => {
                 self.fail_writes(id, WriteError::ClosedStream);
                 let _ = self.conn.send_stream(id).reset(code);
+            }
+            ConnCmd::Unclaimed { id, accepted } => {
+                // The caller gave up after the reply was sent. Queue the
+                // stream for the next caller so no stream ID is lost.
+                if accepted {
+                    self.accepted_spare.push_front(id);
+                    self.serve_acceptors();
+                } else {
+                    self.opened_spare.push_front(id);
+                    self.serve_openers();
+                }
             }
             ConnCmd::Read { id, reply } => {
                 self.reads.insert(id, reply);
@@ -762,6 +778,7 @@ fn reply_closed(cmd: ConnCmd, error: &ConnectionError) {
             let _ = reply.send(Err(ReadError::ConnectionLost(error.clone())));
         }
         ConnCmd::Finish { .. }
+        | ConnCmd::Unclaimed { .. }
         | ConnCmd::Reset { .. }
         | ConnCmd::Stop { .. }
         | ConnCmd::DropSend { .. }

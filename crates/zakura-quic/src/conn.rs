@@ -200,14 +200,22 @@ impl Conn {
     ///
     /// Waits while the peer's stream limit is reached. The peer learns of the
     /// stream when the first byte arrives.
+    ///
+    /// Cancel safe: a stream opened for a dropped call goes to the next call.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let id = self.request(|reply| ConnCmd::OpenBi { reply }).await?;
+        let id = self
+            .request(false, |reply| ConnCmd::OpenBi { reply })
+            .await?;
         Ok(self.streams(id))
     }
 
     /// Accepts the peer's next bidirectional stream.
+    ///
+    /// Cancel safe: a stream accepted for a dropped call goes to the next call.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let id = self.request(|reply| ConnCmd::AcceptBi { reply }).await?;
+        let id = self
+            .request(true, |reply| ConnCmd::AcceptBi { reply })
+            .await?;
         Ok(self.streams(id))
     }
 
@@ -253,13 +261,23 @@ impl Conn {
 
     async fn request(
         &self,
+        accepted: bool,
         cmd: impl FnOnce(oneshot::Sender<Result<StreamId, ConnectionError>>) -> ConnCmd,
     ) -> Result<StreamId, ConnectionError> {
         let (reply, result) = oneshot::channel();
         self.inner.send(cmd(reply))?;
-        result
-            .await
-            .unwrap_or_else(|_| Err(self.inner.shared.close_reason()))
+        let mut request = StreamRequest {
+            conn: &self.inner,
+            accepted,
+            reply: Some(result),
+        };
+        let reply = request
+            .reply
+            .as_mut()
+            .expect("the reply is taken only below or on drop");
+        let result = reply.await;
+        request.reply = None;
+        result.unwrap_or_else(|_| Err(self.inner.shared.close_reason()))
     }
 
     fn streams(&self, id: StreamId) -> (SendStream, RecvStream) {
@@ -267,5 +285,30 @@ impl Conn {
             SendStream::new(self.inner.clone(), id),
             RecvStream::new(self.inner.clone(), id),
         )
+    }
+}
+
+/// An open or accept request in flight. If the caller drops it after the
+/// connection task replied, it hands the stream back instead of losing it,
+/// which would also lose the stream's credit for good.
+struct StreamRequest<'a> {
+    conn: &'a ConnRef,
+    accepted: bool,
+    reply: Option<oneshot::Receiver<Result<StreamId, ConnectionError>>>,
+}
+
+impl Drop for StreamRequest<'_> {
+    fn drop(&mut self) {
+        let Some(mut reply) = self.reply.take() else {
+            return;
+        };
+        // After close, the task can't send; a reply is either here or never.
+        reply.close();
+        if let Ok(Ok(id)) = reply.try_recv() {
+            let _ = self.conn.send(ConnCmd::Unclaimed {
+                id,
+                accepted: self.accepted,
+            });
+        }
     }
 }

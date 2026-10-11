@@ -5673,6 +5673,38 @@ mod tests {
         ));
     }
 
+    /// A record whose protocol range shares one version with ours imports,
+    /// so nodes on either side of a protocol break still discover each other.
+    /// A disjoint range on either side never reaches the dialer.
+    #[test]
+    fn record_protocol_range_must_overlap_ours() {
+        let secret_key = secret_key();
+        let mut local = context();
+        local.supported_protocol_min = 3;
+        local.supported_protocol_max = 5;
+        let range = |min, max| {
+            let mut body = body(&secret_key);
+            body.zakura_protocol_min = min;
+            body.zakura_protocol_max = max;
+            ZakuraNodeRecord::sign(body, &secret_key)
+                .expect("test record signs")
+                .verify(&local)
+        };
+
+        for (min, max) in [(1, 3), (5, 9), (4, 4), (1, 9)] {
+            assert!(range(min, max).is_ok(), "{min}..={max} overlaps 3..=5");
+        }
+        for (min, max) in [(1, 2), (6, 9)] {
+            assert!(
+                matches!(
+                    range(min, max),
+                    Err(DiscoveryRecordError::IncompatibleProtocol)
+                ),
+                "{min}..={max} must not import"
+            );
+        }
+    }
+
     #[test]
     fn record_bounds_reject_too_many_addresses_and_services() {
         let secret_key = secret_key();

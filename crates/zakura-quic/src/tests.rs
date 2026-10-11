@@ -256,25 +256,38 @@ async fn cancelled_reads_lose_no_data() {
     .unwrap();
 }
 
-/// API-5: a cancelled write keeps its place. The next write waits for it, so
-/// the peer receives both, in order.
+/// API-5 and DRV-5: a write cancelled while flow control blocks it keeps
+/// its place. The next write waits for it, so the peer receives both, in
+/// order. The transfer is larger than both the stream and the connection
+/// receive windows, so it completes only through window updates (DRV-6).
 #[tokio::test]
 async fn cancelled_writes_keep_their_order() {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let server = server();
-        let client = client();
-        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-        let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        // Far more than the flow-control windows, so the write blocks until
-        // the echo reads.
-        let first = vec![1u8; 32 * 1024 * 1024];
-        let _ = tokio::time::timeout(Duration::from_millis(1), send.write_all(&first)).await;
+        let (_server, _client, conn, inbound) = held_pair_with(&small_windows(), 8).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        // 1 MiB against a 64 KiB stream window: the peer isn't reading yet,
+        // so this write blocks and the timeout cancels it.
+        // Truncation gives a repeating pattern, so a reorder changes bytes.
+        let first: Vec<u8> = (0..1 << 20).map(|i: u32| i as u8).collect();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), send.write_all(&first))
+                .await
+                .is_err(),
+            "the write must block on flow control"
+        );
+        // The tail write waits for the cancelled one, which needs the peer
+        // to read, so the peer reads on its own task.
+        let (_peer_send, mut recv) = inbound.accept_bi().await.unwrap();
+        let reader = tokio::spawn(async move { recv.read_to_end(2 << 20).await.unwrap() });
         send.write_all(b"tail").await.unwrap();
         send.finish().unwrap();
-        let echoed = recv.read_to_end(64 * 1024 * 1024).await.unwrap();
-        assert!(echoed.ends_with(b"tail"));
-        let body = &echoed[..echoed.len() - 4];
-        assert!(body.is_empty() || body == first, "partial first write");
+        let echoed = reader.await.unwrap();
+        assert_eq!(echoed.len(), first.len() + 4);
+        assert!(
+            echoed[..first.len()] == first[..],
+            "first write reordered or lost"
+        );
+        assert_eq!(&echoed[first.len()..], b"tail");
     })
     .await
     .unwrap();

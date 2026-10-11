@@ -52,7 +52,7 @@ pub use error::{
     AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    StateInitError, ValidateContextError,
+    PreciousError, StateInitError, ValidateContextError,
 };
 pub use header_chain::*;
 pub use request::{

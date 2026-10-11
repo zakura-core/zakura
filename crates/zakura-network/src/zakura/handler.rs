@@ -163,6 +163,14 @@ pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Consecutive failed dials after which a legacy->Zakura upgrade dial gives up.
+///
+/// The upgrade dial targets a peer-supplied address, so it must not redial
+/// forever. Six attempts back off 1 + 2 + 4 + 8 + 16 = 31 s between dials, and
+/// each dial can wait up to [`DEFAULT_ZAKURA_CONTROL_TIMEOUT`] to connect, so
+/// the dial ends within about 90 s after the peer stops answering. The legacy
+/// crawler then re-upgrades the peer if it is still reachable.
+const ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS: usize = 6;
 const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
 const STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET: usize = STREAM_PRELUDE_FIXED_BYTES - 1;
@@ -764,7 +772,9 @@ impl ZakuraEndpoint {
     /// The legacy crawler can retry the same peer while a short-lived upgraded
     /// connection is still settling. Deduplicate those retries so repeated
     /// legacy upgrades do not create a swarm of independent maintained QUIC
-    /// dial loops to the same peer.
+    /// dial loops to the same peer. The dial gives up after
+    /// [`ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS`] consecutive failures because the
+    /// peer chose the address.
     pub(crate) fn start_upgrade_native_dial(
         &self,
         node_addr: EndpointAddr,
@@ -788,9 +798,10 @@ impl ZakuraEndpoint {
 
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
-        let policy = RedialPolicy::maintain(
+        let policy = RedialPolicy::maintain_bounded(
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+            ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS,
         );
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
@@ -817,6 +828,15 @@ impl ZakuraEndpoint {
         ZakuraUpgradeDialStart::Started
     }
 
+    /// Returns how many maintained upgrade dials this endpoint owns.
+    #[cfg(test)]
+    pub(crate) fn upgrade_dial_count(&self) -> usize {
+        self.upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned")
+            .len()
+    }
+
     /// Return a token that is canceled when this endpoint stops owning the
     /// maintained native dial for `peer_id`.
     pub(crate) fn upgrade_dial_lifetime(
@@ -833,14 +853,12 @@ impl ZakuraEndpoint {
     /// Cancel and forget the maintained native dial started by the legacy
     /// upgrade hand-off for `peer_id`, if this node still owns one.
     ///
-    /// Called when the upgrade hand-off wait times out without the peer
-    /// registering: the maintained dial uses [`RedialPolicy::maintain`], so it
-    /// would otherwise redial a peer-supplied, possibly unreachable address
-    /// forever and keep its `upgrade_dials` entry. Repeating the failed upgrade
-    /// with distinct node ids would then grow maintained dial tasks and
-    /// outbound QUIC traffic without bound. A no-op if the peer already
-    /// registered (its entry is reclaimed only when the maintained dial ends on
-    /// shutdown) or if another upgrade owns the dedup slot.
+    /// Called when the upgrade hand-off ends without the peer registering,
+    /// including when the outer handshake timeout drops the hand-off. The
+    /// maintained dial would otherwise keep redialing a peer-supplied, possibly
+    /// unreachable address until its attempt limit, and repeating the failed
+    /// upgrade with distinct node ids would grow dial tasks and outbound QUIC
+    /// traffic. A no-op if the dial already ended.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
         let ownership = self
             .upgrade_dials
@@ -5201,16 +5219,13 @@ impl LegacyResponseReadState {
         &self,
         kind: LegacyResponseKind,
     ) -> Result<(), OutboundRequestError> {
+        let mut remaining = self.active_chunk.as_slice();
         match kind {
             LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -5218,6 +5233,14 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::Pong
             | LegacyResponseKind::Nil => unreachable!("non-chunk legacy response kind"),
         }
+        .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?;
+        // A valid item padded with junk must not pass as a completed item.
+        if !remaining.is_empty() {
+            return Err(OutboundRequestError::Fatal(
+                "legacy response item has trailing bytes".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_missing(
@@ -5814,6 +5837,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
     use super::*;
@@ -10182,6 +10206,46 @@ mod tests {
                 state.validate_frame(1, &frame).unwrap();
             }
         }
+    }
+
+    /// F-37: the transport-level check rejects a valid transaction padded with
+    /// junk bytes as a fatal peer fault.
+    #[test]
+    fn legacy_completed_item_rejects_trailing_bytes() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let request_id = 99;
+        let transaction = transaction::UnminedTx::from(empty_v5_transaction(24));
+        let request_frame =
+            LegacyRequestFrame::TransactionsById(vec![transaction.id()]).encode_frame()?;
+        let budget = LegacyResponseBudget::from_request(
+            request_frame.message_type,
+            &request_frame.payload,
+            limits,
+        )
+        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        let mut frames = LegacyResponseCodec::encode_response(
+            request_id,
+            Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        let [frame] = frames.as_mut_slice() else {
+            panic!("a small transaction encodes as one frame");
+        };
+
+        let mut state = LegacyResponseReadState::new(budget);
+        state
+            .validate_frame(request_id, frame)
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+
+        frame.payload.extend_from_slice(&[0; 16]);
+        let mut state = LegacyResponseReadState::new(budget);
+        assert!(matches!(
+            state.validate_frame(request_id, frame),
+            Err(OutboundRequestError::Fatal(_)),
+        ));
+
+        Ok(())
     }
 
     fn assert_codec_frames_validate_at_transport(

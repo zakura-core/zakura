@@ -450,7 +450,7 @@ impl Drop for ZcashdPauseGuard {
     }
 }
 
-async fn restart_zcashd_and_wait_for_tips(setup: &ZcashdCompatSetup) -> Result<()> {
+pub(super) async fn restart_zcashd_and_wait_for_tips(setup: &ZcashdCompatSetup) -> Result<()> {
     let old_pid = setup.zcashd_pid()?;
 
     let _: serde_json::Value = setup
@@ -500,7 +500,7 @@ async fn wait_for_restarted_zcashd_rpc(
 /// Paused reorgs avoid observable intermediate shorter-chain states during test
 /// orchestration. Unpaused depth >1 reorgs can leave zcashd holding its chain
 /// until Zebra's replacement branch takes the work lead.
-async fn force_zakura_reorg(
+pub(super) async fn force_zakura_reorg(
     setup: &ZcashdCompatSetup,
     fork_height: u64,
     new_branch_len: u32,
@@ -533,7 +533,10 @@ async fn force_unpaused_depth1_reorg(setup: &ZcashdCompatSetup) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_tips_match(setup: &ZcashdCompatSetup, timeout: Duration) -> Result<()> {
+pub(super) async fn wait_for_tips_match(
+    setup: &ZcashdCompatSetup,
+    timeout: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_seen;
 

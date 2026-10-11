@@ -1,8 +1,8 @@
 //! Encrypted parts of Orchard notes.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
-
-use serde_big_array::BigArray;
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
@@ -10,7 +10,9 @@ use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize}
 ///
 /// Corresponds to the Orchard 'encCiphertext's
 #[derive(Deserialize, Serialize)]
-pub struct EncryptedNote(#[serde(with = "BigArray")] pub(crate) [u8; 580]);
+pub struct EncryptedNote(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub(crate) [u8; 580],
+);
 
 // These impls all only exist because of array length restrictions.
 // TODO: use const generics https://github.com/ZcashFoundation/zebra/issues/2042
@@ -59,7 +61,9 @@ impl ZcashSerialize for EncryptedNote {
 }
 
 impl ZcashDeserialize for EncryptedNote {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 580];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))
@@ -70,7 +74,9 @@ impl ZcashDeserialize for EncryptedNote {
 ///
 /// Corresponds to Orchard's 'outCiphertext'
 #[derive(Deserialize, Serialize)]
-pub struct WrappedNoteKey(#[serde(with = "BigArray")] pub(crate) [u8; 80]);
+pub struct WrappedNoteKey(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub(crate) [u8; 80],
+);
 
 impl fmt::Debug for WrappedNoteKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -118,7 +124,9 @@ impl ZcashSerialize for WrappedNoteKey {
 }
 
 impl ZcashDeserialize for WrappedNoteKey {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 80];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

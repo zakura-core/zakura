@@ -763,12 +763,15 @@ peer that serves no blocks for heights inside its advertised servable range.
   - count = 1..=128
   - exact consumption
 - **Reservation**
-  - live `GetBlocks` range with this `start_height` and requested count
+  - live `GetBlocks` range with this `start_height`
   - no block has been consumed from the range
-  - `count` equals the requested count
+  - `count` does not exceed the requested count
   - consumes the terminal part and closes the reservation
 
-The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
+Version 2 senders can report a smaller count after clamping a request to their available heights.
+The ending closes the entire original range. The handler MUST requeue every unreceived height in
+that original range, not just the reported count. A retry policy MAY avoid this peer for the
+immediate retry.
 
 ### Block sync successor (planned)
 

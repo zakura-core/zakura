@@ -3,6 +3,7 @@
 
 Polls one or more `zakura-cluster-status.py` `/data` endpoints, tracks sustained
 node failures in a small JSON state file, and posts transition alerts to Slack.
+Critical mainnet incidents also open and resolve PagerDuty pages.
 
 Only the Python stdlib is used.
 """
@@ -15,6 +16,8 @@ import json
 import math
 import os
 import sys
+import subprocess
+import signal
 import time
 import tomllib
 import urllib.error
@@ -25,35 +28,44 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+# Installed releases are reached through symlinks; import the package that
+# shipped with this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from zakura_monitoring import monitor, slack  # noqa: E402,F401 - tests patch slack limits
+from zakura_monitoring.delivery import deliver_pending, queue_transitions  # noqa: E402
+from zakura_monitoring.slack import (  # noqa: E402
+    bounded_text,
+    post_slack,
+    slack_dashboard_url,
+    slack_identity,
+    slack_plain_text,
+)
+from zakura_monitoring.state import load_state, save_state  # noqa: E402
+# Re-exported so tests and operators keep using this script as the facade.
+from zakura_monitoring.slack import (  # noqa: E402,F401
+    MAX_SLACK_MESSAGE_CHARS,
+    SLACK_TRUNCATION_MARKER,
+    post_slack_webhook,
+)
+from zakura_monitoring.state import STATE_VERSION  # noqa: E402,F401
+from zakura_monitoring.suppression import suppression_until  # noqa: E402
+
 
 DOWN_HEALTH = {"down", "rpc_error"}
-STATE_VERSION = 1
+MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
-BATCH_SEPARATOR = "\n\n---\n\n"
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
 MAX_NODE_DETAIL_CHARS = 512
 MAX_ALERT_NAME_CHARS = 128
 MAX_ALERT_STATUS_CHARS = 64
 MAX_BLOCK_HASH_CHARS = 64
-MAX_DASHBOARD_URL_CHARS = 2_048
 MAX_ALERT_ERROR_CHARS = 2_048
-MAX_SLACK_MESSAGE_CHARS = 35_000
-SLACK_ESSENTIAL_PREFIX_LINES = 3
-SLACK_TRUNCATION_MARKER = "[alert truncated]"
-SLACK_PLAIN_TEXT_TRANSLATION = str.maketrans(
-    {
-        "&": "＆",
-        "<": "‹",
-        ">": "›",
-        "*": "∗",
-        "_": "＿",
-        "~": "～",
-        "`": "ˋ",
-        "@": "＠",
-    }
-)
+PAGERDUTY_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
+MAX_PAGERDUTY_SUMMARY_CHARS = 1_024
+MAINNET_DASHBOARD_URL = "https://status.mainnet.zakura.valargroup.dev/"
 STALL_PIPELINE_METRICS = (
     ("network tip", "sync_estimated_network_tip_height"),
     ("distance", "sync_estimated_distance_to_tip"),
@@ -138,6 +150,42 @@ class ReleaseState:
     required_files: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PagedIncident:
+    """One watchdog incident that also pages through PagerDuty.
+
+    `conditions` are the alerting conditions that open a page (empty means any).
+    With `resolve_on_ok_only`, a page closes only once the incident is back to
+    `ok`, so a divergence that turns into lost visibility keeps its page open.
+    """
+
+    bucket: str
+    key: str
+    conditions: frozenset[str]
+    resolve_on_ok_only: bool
+    dedup_key: str
+    component: str
+
+
+PAGED_INCIDENTS = (
+    PagedIncident(
+        "mac_comparison", "mainnet",
+        frozenset({"tree_mismatch", "chain_disagreement"}), True,
+        "zakura/mainnet/mac-comparison", "mac-cranelift-comparison",
+    ),
+    PagedIncident(
+        "mac_forks", "mainnet", frozenset({"fork"}), True,
+        "zakura/mainnet/mac-fork", MAC_NODE_NAME,
+    ),
+    # A shared stall entry stays `stalled` while a majority shares a tip, so only
+    # `alerting` marks the incident; Slack's recovery also resolves the page.
+    PagedIncident(
+        "shared_stalls", "mainnet", frozenset(), False,
+        "zakura/mainnet/shared-stall", "fleet",
+    ),
+)
+
+
 def load_release_state(config_path: Path) -> list[ReleaseState]:
     with config_path.open("rb") as config_file:
         data = tomllib.load(config_file)
@@ -207,40 +255,9 @@ def load_fleets(config_path: Path) -> list[Fleet]:
     return fleets
 
 
-def load_state(state_path: Path) -> dict[str, Any]:
-    if not state_path.exists():
-        return {
-            "version": STATE_VERSION,
-            "nodes": {},
-            "fleets": {},
-            "shared_stalls": {},
-        }
-
-    with state_path.open(encoding="utf-8") as state_file:
-        state = json.load(state_file)
-
-    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
-        return {
-            "version": STATE_VERSION,
-            "nodes": {},
-            "fleets": {},
-            "shared_stalls": {},
-        }
-
-    state.setdefault("nodes", {})
-    state.setdefault("fleets", {})
-    state.setdefault("shared_stalls", {})
-    state.setdefault("release_state", {})
-    return state
-
-
-def save_state(state_path: Path, state: dict[str, Any]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as state_file:
-        json.dump(state, state_file, indent=2, sort_keys=True)
-        state_file.write("\n")
-    tmp_path.replace(state_path)
+def node_state_key(fleet_name: str, node_name: str) -> str:
+    """Return the canonical fleet/node incident identity."""
+    return f"{fleet_name}/{node_name}"
 
 
 def fetch_json(url: str, timeout: float) -> dict[str, Any]:
@@ -314,22 +331,6 @@ def named_metrics(
     return " | ".join(values)
 
 
-def bounded_text(value: object, limit: int) -> str:
-    return " ".join(str(value or "").split())[:limit]
-
-
-def slack_plain_text(value: object, limit: int) -> str:
-    return bounded_text(value, limit).translate(SLACK_PLAIN_TEXT_TRANSLATION)
-
-
-def slack_identity(value: object, limit: int, fallback: str) -> str:
-    return slack_plain_text(value or fallback, limit) or fallback
-
-
-def slack_dashboard_url(value: object) -> str:
-    return bounded_text(value, MAX_DASHBOARD_URL_CHARS)
-
-
 def slack_block_hash(value: object) -> str:
     block_hash = validated_block_hash(value)
     if block_hash is not None:
@@ -337,49 +338,6 @@ def slack_block_hash(value: object) -> str:
 
     preview = slack_plain_text(normalized_block_hash(value), MAX_BLOCK_HASH_CHARS)
     return f"invalid ({preview or 'missing'})"
-
-
-def bounded_slack_message(text: str) -> str:
-    if len(text) <= MAX_SLACK_MESSAGE_CHARS:
-        return text
-
-    lines = text.splitlines()
-    if len(lines) < 2:
-        keep = MAX_SLACK_MESSAGE_CHARS - len(SLACK_TRUNCATION_MARKER)
-        return text[:keep] + SLACK_TRUNCATION_MARKER
-
-    prefix_count = min(SLACK_ESSENTIAL_PREFIX_LINES, len(lines) - 1)
-    prefix = lines[:prefix_count]
-    middle = lines[prefix_count:-1]
-    suffix = lines[-1]
-    protected = [*prefix, SLACK_TRUNCATION_MARKER, suffix]
-    protected_length = sum(map(len, protected)) + len(protected) - 1
-    if protected_length > MAX_SLACK_MESSAGE_CHARS:
-        # Alert formatters bound protected fields before they reach this fallback.
-        # Keep both ends for direct callers that do not use an alert formatter.
-        available = MAX_SLACK_MESSAGE_CHARS - len(SLACK_TRUNCATION_MARKER) - 2
-        prefix_budget = max(0, available // 2)
-        suffix_budget = max(0, available - prefix_budget)
-        return "\n".join(
-            (
-                "\n".join(prefix)[:prefix_budget],
-                SLACK_TRUNCATION_MARKER,
-                suffix[:suffix_budget],
-            )
-        )
-
-    remaining = MAX_SLACK_MESSAGE_CHARS - protected_length
-    kept_middle = []
-    for line in middle:
-        added = len(line) + 1
-        if added > remaining:
-            break
-        kept_middle.append(line)
-        remaining -= added
-
-    return "\n".join(
-        (*prefix, *kept_middle, SLACK_TRUNCATION_MARKER, suffix)
-    )
 
 
 def alert_metrics(row: dict[str, Any]) -> tuple[dict[str, Any], bool | None]:
@@ -445,79 +403,129 @@ def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
     return lines
 
 
-def suppression_until(path: Path) -> float | None:
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        print(f"warning: could not read suppression file {path}: {error}", file=sys.stderr)
-        return None
-
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"warning: invalid suppression timestamp in {path}: {raw}", file=sys.stderr)
-        return None
-
-
-def slack_webhook_url() -> str:
-    """Return the configured incoming webhook URL for #zakura-alerts.
-
-    Bot tokens are intentionally unsupported: a token without channel
-    membership fails with `not_in_channel` and previously masked webhook
-    misconfiguration.
-    """
-    return (
-        os.environ.get("SLACK_WEB_HOOK", "")
-        or os.environ.get("SLACK_WEBHOOK_URL", "")
-        or os.environ.get("SLACK_WEBHOOK", "")
-    )
+def mac_recovery_ready(entry, now, good):
+    """Require three distinct fresh good samples spanning a minute."""
+    if not good:
+        entry.pop("mac_recovery", None)
+        return False
+    sample = entry.setdefault("mac_recovery", {"since": now, "last": now, "count": 0})
+    if now - sample["last"] > 90:
+        sample.update(since=now, count=0)
+    if sample["count"] and now <= sample["last"]:
+        return False
+    sample["last"] = now
+    sample["count"] += 1
+    return sample["count"] >= 3 and now - sample["since"] >= 60
 
 
-def post_slack(text: str, args: argparse.Namespace) -> bool:
-    text = bounded_slack_message(text)
-    webhook = slack_webhook_url()
+def pagerduty_routing_key() -> str:
+    """Return the Events API v2 integration key for the Zakura mainnet service."""
+    return os.environ.get("PAGERDUTY_ROUTING_KEY", "")
+
+
+def post_pagerduty(event: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Enqueue one Events API v2 event; the dedup key makes resends idempotent."""
     if args.dry_run:
-        print(f"dry-run Slack message:\n{text}\n")
+        print(f"dry-run PagerDuty event:\n{json.dumps(event, indent=2, sort_keys=True)}\n")
         return True
 
-    if not webhook:
-        print(
-            "SLACK_WEB_HOOK (or SLACK_WEBHOOK_URL / SLACK_WEBHOOK) is not set; "
-            f"cannot post:\n{text}\n",
-            file=sys.stderr,
-        )
+    routing_key = pagerduty_routing_key()
+    if not routing_key:
         return False
 
-    return post_slack_webhook(webhook, text, args)
-
-
-def post_slack_webhook(webhook: str, text: str, args: argparse.Namespace) -> bool:
-    text = bounded_slack_message(text)
-    payload = json.dumps({"text": text}).encode("utf-8")
+    payload = json.dumps({**event, "routing_key": routing_key}).encode("utf-8")
     request = urllib.request.Request(
-        webhook,
+        PAGERDUTY_EVENTS_URL,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-
     try:
         with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
-            body = response.read().decode("utf-8", errors="replace").strip()
-    except (OSError, urllib.error.URLError) as error:
-        print(f"Slack webhook post failed: {error}", file=sys.stderr)
+            response.read(4096)
+    except (OSError, urllib.error.URLError):
+        print("PagerDuty event post failed: transport error", file=sys.stderr)
         return False
 
-    if response.status < 200 or response.status >= 300 or body != "ok":
+    if response.status != 202:
         print(
-            f"Slack webhook post failed: status={response.status} body={body}",
+            f"PagerDuty event post failed: status={response.status} "
+            "response rejected",
             file=sys.stderr,
         )
         return False
 
     return True
+
+
+def incident_entry(state: dict[str, Any], bucket: str, key: str) -> dict[str, Any] | None:
+    """Prefer a fleet's undelivered candidate so a Slack outage cannot block a page."""
+    pending = state.get("pending_delivery", {}).get(key)
+    if isinstance(pending, dict):
+        candidate = pending.get("state", {})
+        if isinstance(candidate, dict) and bucket in candidate:
+            entry = candidate[bucket].get(key)
+            return entry if isinstance(entry, dict) else None
+    entry = state.get(bucket, {}).get(key)
+    return entry if isinstance(entry, dict) else None
+
+
+def pagerduty_decision(incident: PagedIncident, entry: dict[str, Any] | None) -> str | None:
+    """Return `trigger`, `resolve`, or None to leave the page as it is."""
+    if entry is None:
+        # No evidence either way, e.g. after a state reset; a human can resolve.
+        return None
+    condition = entry.get("condition")
+    if entry.get("alerting"):
+        if not incident.conditions or condition in incident.conditions:
+            return "trigger"
+        return None
+    if incident.resolve_on_ok_only and condition != "ok":
+        return None
+    return "resolve"
+
+
+def pagerduty_trigger_event(incident: PagedIncident, entry: dict[str, Any]) -> dict[str, Any]:
+    condition = bounded_text(entry.get("condition"), MAX_ALERT_STATUS_CHARS)
+    height = coerce_height(entry.get("event_height", entry.get("alert_height")))
+    nodes = entry.get("node_names")
+    if incident.bucket == "mac_comparison":
+        summary = f"Zakura mainnet: Mac/Linux compiler comparison {condition}"
+    elif incident.bucket == "mac_forks":
+        summary = f"Zakura mainnet: {MAC_NODE_NAME} forked more than 10 blocks from the fleet"
+    else:
+        summary = (
+            f"Zakura mainnet: fleet-wide stall at height "
+            f"{height if height is not None else '-'} "
+            f"({len(nodes) if isinstance(nodes, list) else '?'} nodes)"
+        )
+
+    details: dict[str, Any] = {"condition": condition}
+    bad_since = coerce_float(entry.get("bad_since"))
+    if bad_since is not None:
+        details["bad_since"] = datetime.datetime.fromtimestamp(
+            bad_since, datetime.timezone.utc
+        ).isoformat()
+    if height is not None:
+        details["height"] = height
+    if isinstance(nodes, list):
+        details["nodes"] = [
+            bounded_text(name, MAX_ALERT_NAME_CHARS)
+            for name in nodes[:MAX_DECISION_ROWS]
+        ]
+    return {
+        "event_action": "trigger",
+        "dedup_key": incident.dedup_key,
+        "payload": {
+            "summary": bounded_text(summary, MAX_PAGERDUTY_SUMMARY_CHARS),
+            "source": "zakura-fleet-watchdog",
+            "severity": "critical",
+            "component": incident.component,
+            "group": "zakura-mainnet",
+            "custom_details": details,
+        },
+        "links": [{"href": MAINNET_DASHBOARD_URL, "text": "Zakura mainnet dashboard"}],
+    }
 
 
 def node_condition(
@@ -533,7 +541,7 @@ def node_condition(
         return ("ok", now, 0)
 
     if health in DOWN_HEALTH:
-        return ("down", now, args.down_after)
+        return ("down", now, 180.0 if row.get("name") == MAC_NODE_NAME else args.down_after)
 
     if (
         seconds_since_advanced is not None
@@ -571,6 +579,21 @@ def tip_is_verifiable(row: dict[str, Any]) -> bool:
         and validated_block_hash(row.get("block_hash")) is not None
         and coerce_float(row.get("seconds_since_advanced")) is not None
     )
+
+
+def ancestor_at(row: dict[str, Any], height: int) -> str | None:
+    """Return a depth-keyed ancestor; None is unsampled, an empty string invalid."""
+    tip = coerce_height(row.get("height"))
+    if tip is None or tip < height:
+        return None
+    distance = tip - height
+    if distance == 0:
+        return validated_block_hash(row.get("block_hash"))
+    ancestors = row.get("ancestor_hashes")
+    value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
+    if distance == 1:
+        value = row.get("previous_hash") or value
+    return None if value is None else validated_block_hash(value) or ""
 
 
 def shared_stall_candidate(
@@ -1006,51 +1029,6 @@ def release_state_recovery_text(target: ReleaseState, previous: dict[str, Any]) 
     )
 
 
-def batch_messages(messages: list[str], now: float) -> list[str]:
-    """Pack transitions without dropping incident summaries or exceeding Slack's cap."""
-    if not messages:
-        return []
-    observed_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
-    prefix = f"*Fleet status updates* — observed {observed_at}\n\n"
-    # Keep detailed diagnostics for a single incident; a batch shows the essential
-    # lines for every event and links to the dashboard for the full node details.
-    events = []
-    for message in messages:
-        if len(messages) == 1:
-            events.append(message)
-            continue
-        lines = message.splitlines()
-        summary = lines[:SLACK_ESSENTIAL_PREFIX_LINES]
-        link = next(
-            (line for line in reversed(lines) if line.startswith(("dashboard:", "endpoint:"))),
-            "",
-        )
-        if link and link not in summary:
-            summary.append(link)
-        events.append("\n".join(summary))
-    chunks: list[str] = []
-    chunk = prefix
-    for event in events:
-        event = bounded_slack_message(event)
-        # An individual legacy message may already fill the limit. Keep it intact
-        # as a separate payload rather than cutting off another incident.
-        if len(prefix) + len(event) > MAX_SLACK_MESSAGE_CHARS:
-            if chunk != prefix:
-                chunks.append(chunk)
-                chunk = prefix
-            chunks.append(event)
-            continue
-        separator = BATCH_SEPARATOR if chunk != prefix else ""
-        if len(chunk) + len(separator) + len(event) > MAX_SLACK_MESSAGE_CHARS:
-            chunks.append(chunk)
-            chunk = prefix
-            separator = ""
-        chunk += separator + event
-    if chunk != prefix:
-        chunks.append(chunk)
-    return chunks
-
-
 def record_decision(
     state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]],
     common: SharedTip | None, grace: set[str], now: float,
@@ -1102,6 +1080,42 @@ def record_decision(
     del history[:-MAX_DECISION_HISTORY]
 
 
+def run_comparison(command):
+    """Bound and reap both the comparison process and its SSH child."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          user="zakura-mac-verifier", start_new_session=True) as process:
+        failure = None
+        try:
+            code = process.wait(timeout=15)
+        except subprocess.TimeoutExpired as error:
+            failure = error
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            code = process.wait()
+        raw = process.stdout.read(4097)
+        try:
+            if len(raw) > 4096:
+                raise ValueError("oversized comparison outcome")
+            outcome = json.loads(raw)
+            if not isinstance(outcome, dict):
+                raise ValueError("malformed comparison outcome")
+        except (ValueError, TypeError):
+            if failure is not None:
+                raise failure
+            raise ValueError("comparison outcome unavailable") from None
+        # A confirmed result emitted before persistence remains actionable even
+        # when a later write fails or the bounded child has to be killed.
+        if outcome.get("condition") == "tree_mismatch":
+            return outcome
+        if failure is not None:
+            raise failure
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+        return outcome
+
+
 class Watchdog:
     def __init__(
         self,
@@ -1109,14 +1123,17 @@ class Watchdog:
         args: argparse.Namespace,
         release_state: list[ReleaseState] | None = None,
         checkpoint: Callable[[dict[str, Any]], None] | None = None,
+        compatibility: list[monitor.ProbeWorker] | None = None,
     ):
         self.notify = lambda text, args: post_slack(text, args)
         self.checkpoint = checkpoint or (lambda state: None)
         self.fleets = fleets
         self.release_state = release_state or []
+        self.compatibility = compatibility or []
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
+        self.pagerduty_key_warned = False
 
     def run_once(self, state: dict[str, Any]) -> None:
         now = time.time()
@@ -1136,9 +1153,9 @@ class Watchdog:
             finally:
                 self.notify = lambda text, args: post_slack(text, args)
             if messages or fleet.name in pending:
-                delivery = pending.setdefault(fleet.name, {"messages": [], "state": {}})
-                delivery["messages"].extend(batch_messages(messages, now))
-                delivery["state"] = candidate
+                queue_transitions(
+                    state, "pending_delivery", fleet.name, messages, candidate, now
+                )
                 if not suppressed:
                     self.deliver_batch(state, fleet)
             else:
@@ -1147,11 +1164,240 @@ class Watchdog:
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
 
+        if getattr(self.args, "mac_comparison", None):
+            self.handle_mac_comparison(state, now, suppressed)
+
+        # Fleet-wide deploy suppression deliberately does not reach this lane:
+        # only a zakurad-compat restart, reported by the probe, mutes it.
+        for worker in self.compatibility:
+            self.handle_compatibility(state, worker)
+
+        self.reconcile_pagerduty(state, now, suppressed)
+
+    def handle_compatibility(
+        self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float | None = None
+    ) -> None:
+        """Apply a completed compatibility probe through the durable delivery queue.
+
+        The probe itself runs on the worker thread; this never waits for it.
+        Suppression pauses queued delivery as well as new transitions. Keep
+        honoring the last bounded window during missing or unavailable probes.
+        """
+        result = worker.poll()
+        # Sample after collection: a result may finish while poll is running.
+        if now is None:
+            now = time.time()
+        name = worker.target.name
+        pending = state.setdefault(monitor.COMPAT_QUEUE, {})
+        if result is None and name not in pending:
+            return
+        bucket = {
+            name: copy.deepcopy(
+                pending[name]["state"] if name in pending
+                else state.get(monitor.COMPAT_STATE, {}).get(name, {})
+            )
+        }
+        messages: list[str] = []
+        if result is not None:
+            self.observe_compatibility(
+                state, bucket, worker.target, result, now,
+                lambda text, _args: (messages.append(text), True)[1],
+            )
+        if not messages and name not in pending:
+            state.setdefault(monitor.COMPAT_STATE, {})[name] = bucket[name]
+            return
+        queue_transitions(
+            state, monitor.COMPAT_QUEUE, name, messages, bucket[name], now,
+            title=None,
+        )
+        record = state.get(monitor.COMPAT_PROBES, {}).get(name, {})
+        suppressed_until = coerce_float(record.get("suppressed_until"))
+        if suppressed_until is not None and suppressed_until > now:
+            self.checkpoint(state)
+            return
+        deliver_pending(
+            state,
+            monitor.COMPAT_QUEUE,
+            name,
+            post=lambda text: post_slack(text, self.args),
+            commit=lambda entry: state.setdefault(monitor.COMPAT_STATE, {}).__setitem__(
+                name, entry
+            ),
+            checkpoint=self.checkpoint,
+        )
+
+    def observe_compatibility(
+        self,
+        state: dict[str, Any],
+        bucket: dict[str, Any],
+        target: monitor.CompatTarget,
+        result: monitor.ProbeResult,
+        now: float,
+        notify: Callable[[str, argparse.Namespace], bool],
+    ) -> None:
+        """Advance the compatibility incident from one completed probe.
+
+        The first completed failure alerts at once; a persistent failure,
+        whatever its predicate, stays one incident; only a complete, valid pass
+        recovers it. While the host reports an active deployment marker, probes
+        keep running but no transition is planned, so a failure that outlives
+        the marker alerts on the first unsuppressed probe.
+        """
+        result = monitor.fresh_result(result, now, target.timeout)
+        name = target.name
+        probes = state.setdefault(monitor.COMPAT_PROBES, {})
+        record = probes.setdefault(name, {})
+        record["last"] = monitor.probe_record(result)
+        record["completed"] = int(record.get("completed", 0)) + 1
+        if result.passed:
+            record["passed"] = int(record.get("passed", 0)) + 1
+            record["last_pass"] = record["last"]
+        if not result.valid:
+            record["unavailable"] = int(record.get("unavailable", 0)) + 1
+        if result.valid:
+            if result.suppressed_until is None:
+                record.pop("suppressed_until", None)
+            else:
+                record["suppressed_until"] = result.suppressed_until
+        # An unavailable probe cannot read the marker; keep honoring the last
+        # bounded window a valid probe reported, never extending it.
+        suppressed_until = coerce_float(record.get("suppressed_until"))
+        if suppressed_until is not None and suppressed_until > now:
+            print(
+                f"suppressed compatibility transition for {name}: "
+                f"{result.status} {result.predicate} until "
+                f"{monitor.iso_time(suppressed_until)}"
+            )
+            return
+        record.pop("suppressed_until", None)
+
+        previous = dict(bucket.get(name, {}))
+        condition = "ok" if result.passed else "failing"
+        bad_since = now
+        if condition == "failing" and previous.get("condition") == "failing":
+            bad_since = coerce_float(previous.get("bad_since")) or now
+        update_alert_state(
+            bucket,
+            name,
+            condition,
+            bad_since,
+            0.0,
+            monitor.alert_text(target, result),
+            monitor.recovery_text(target, result, previous),
+            now,
+            False,
+            self.args,
+            notify=notify,
+        )
+        entry = bucket[name]
+        if condition == "failing":
+            entry["predicate"] = (
+                previous.get("predicate")
+                if previous.get("condition") == "failing" and previous.get("predicate")
+                else result.predicate
+            )
+            entry["last_predicate"] = result.predicate
+
+    def reconcile_pagerduty(self, state: dict[str, Any], now: float, suppressed: bool = False) -> None:
+        """Open or resolve pages from the incident state the alert lanes keep.
+
+        Thresholds, deploy suppression, mutes and latching therefore apply
+        unchanged. A failed send records nothing and is retried next poll;
+        PagerDuty owns re-notification while a page stays open.
+        """
+        if not self.args.dry_run and not pagerduty_routing_key():
+            if not self.pagerduty_key_warned:
+                print("PAGERDUTY_ROUTING_KEY is not set; paging disabled", file=sys.stderr)
+                self.pagerduty_key_warned = True
+            return
+
+        if suppressed:
+            return
+        pages = state.setdefault("pagerduty", {})
+        for incident in PAGED_INCIDENTS:
+            if (incident.bucket == "mac_comparison"
+                    and not getattr(self.args, "mac_comparison_alerts", True)):
+                continue
+            bucket = ("mac_comparison_paging" if incident.bucket == "mac_comparison"
+                      and "mac_comparison_paging" in state else incident.bucket)
+            entry = incident_entry(state, bucket, incident.key)
+            decision = pagerduty_decision(incident, entry)
+            if decision == "trigger" and incident.dedup_key not in pages:
+                if post_pagerduty(pagerduty_trigger_event(incident, entry), self.args):
+                    pages[incident.dedup_key] = {
+                        "condition": entry.get("condition"),
+                        "triggered_at": now,
+                    }
+            elif decision == "resolve" and incident.dedup_key in pages:
+                if post_pagerduty(
+                    {"event_action": "resolve", "dedup_key": incident.dedup_key},
+                    self.args,
+                ):
+                    del pages[incident.dedup_key]
+
+    def handle_mac_comparison(self, state, now, suppressed):
+        """One bounded child isolates comparison I/O from the other alert lanes."""
+        started = time.time()
+        condition = "unavailable"
+        muted = not self.args.mac_comparison_alerts
+        command = [sys.executable, str(self.args.mac_comparison),
+                   "--directory", str(self.args.mac_comparison_state),
+                   "--receipt", str(self.args.mac_comparison_receipt),
+                   "--identity", str(self.args.mac_comparison_identity),
+                   "--public-status", str(self.args.mac_comparison_public_status)]
+        if not muted:
+            command.append("--alerts-enabled")
+        try:
+            sample = run_comparison(command)
+            if (not isinstance(sample, dict)
+                    or type(sample.get("sample_time")) not in (int, float)
+                    or not started <= sample["sample_time"] <= time.time() + 10):
+                raise ValueError("stale comparison outcome")
+            if sample.get("condition") in {"matching", "catching_up", "chain_disagreement",
+                                           "tree_mismatch", "coverage_gap", "unavailable"}:
+                condition = sample["condition"]
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            pass
+        # Paging latches independently of Slack acceptance, with the same samples,
+        # thresholds and mute/suppression rules as the Slack lane.
+        self.observe_mac_comparison(state.setdefault("mac_comparison_paging", {}),
+                                    condition, now, suppressed or muted, lambda *_: True)
+        self.observe_mac_comparison(state.setdefault("mac_comparison", {}),
+                                    condition, now, suppressed or muted, self.notify)
+
+    def observe_mac_comparison(self, bucket, condition, now, suppressed, notify):
+        entry = bucket.get("mainnet", {})
+        alert_condition = "ok" if condition == "matching" else condition
+        since = entry.get("bad_since", now) if entry.get("condition", "ok") != "ok" else now
+        # All bad reasons belong to one continuous incident. Escalation to a
+        # confirmed mismatch gets its own immediate notification, once accepted.
+        previously_delivered = bool(entry.get("alerting"))
+        mismatch_notified = entry.get("mismatch_notified", entry.get("condition") == "tree_mismatch"
+                                      and entry.get("alerting", False))
+        if alert_condition != "ok":
+            entry["condition"] = alert_condition
+            if condition == "tree_mismatch" and not mismatch_notified:
+                entry["alerting"] = False
+            bucket["mainnet"] = entry
+        update_alert_state(bucket, "mainnet", alert_condition, since,
+                           0 if condition == "tree_mismatch" else 180,
+                           "Zakura compiler comparison: " + condition,
+                           "Zakura compiler comparison recovered: matching blocks and commitment trees",
+                           now, suppressed, self.args,
+                           notify=(lambda *_: False) if suppressed else notify)
+        updated = bucket["mainnet"]
+        if updated.get("condition") != "ok":
+            updated["mismatch_notified"] = bool(mismatch_notified or (
+                condition == "tree_mismatch" and updated.get("alerting")))
+            # A failed or muted escalation must retain the earlier delivered
+            # incident so matching still sends the owed recovery.
+            updated["alerting"] = bool(updated.get("alerting") or previously_delivered)
+
     @staticmethod
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
         result = {}
-        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions"):
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks"):
             entries = state.get(bucket, {})
             result[bucket] = copy.deepcopy({
                 key: value for key, value in entries.items()
@@ -1171,21 +1417,15 @@ class Watchdog:
             target.update(entries)
 
     def deliver_batch(self, state: dict[str, Any], fleet: Fleet) -> None:
-        """Send at most one payload per fleet per poll; commit after all chunks succeed.
-
-        Checkpoint the pending payload before sending, then checkpoint each
-        acknowledgement. A crash after Slack accepts a message but
-        before that checkpoint can still repeat it (webhooks have no receipt ID).
-        """
-        pending = state["pending_delivery"][fleet.name]
-        self.checkpoint(state)
-        if not post_slack(pending["messages"][0], self.args):
-            return
-        pending["messages"].pop(0)
-        if not pending["messages"]:
-            self.commit_fleet_state(state, fleet, pending["state"])
-            del state["pending_delivery"][fleet.name]
-        self.checkpoint(state)
+        """Send at most one payload per fleet per poll; commit after all chunks succeed."""
+        deliver_pending(
+            state,
+            "pending_delivery",
+            fleet.name,
+            post=lambda text: post_slack(text, self.args),
+            commit=lambda candidate: self.commit_fleet_state(state, fleet, candidate),
+            checkpoint=self.checkpoint,
+        )
 
     def observe_fleet(
         self, state: dict[str, Any], fleet: Fleet, now: float, suppressed: bool
@@ -1219,6 +1459,9 @@ class Watchdog:
 
         if not self.handle_fleet_recovered(state, fleet, now):
             return
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            node_rows = [row for row in node_rows if row.get("name") != MAC_NODE_NAME]
+        self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
             self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
         )
@@ -1259,6 +1502,64 @@ class Watchdog:
                 and observation.name in (shared_nodes | propagation_nodes),
             )
 
+    def handle_mac_fork(self, state, fleet, rows, now, suppressed):
+        """Alert on proven >10-block divergence against 70% of all other nodes.
+
+        Missing or racing samples cannot prove a fork or clear an existing one.
+        Offline peers remain in the denominator, preventing a reduced quorum.
+        """
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            return
+        if fleet.name != "mainnet":
+            return
+        previous = state.get("mac_forks", {}).get(fleet.name, {})
+        mac = next((row for row in rows if row.get("name") == MAC_NODE_NAME), None)
+        if mac is None or not tip_is_verifiable(mac):
+            mac_recovery_ready(previous, now, False)
+            return
+        tip = coerce_height(mac.get("height"))
+        if tip is None or tip < 10:
+            mac_recovery_ready(previous, now, False)
+            return
+        height = tip - 10
+        block_hash = ancestor_at(mac, height)
+        if not block_hash:
+            mac_recovery_ready(previous, now, False)
+            return
+        others = [row for row in rows if row.get("name") != MAC_NODE_NAME]
+        if not others:
+            mac_recovery_ready(previous, now, False)
+            return
+        groups = {}
+        for row in others:
+            if not tip_is_verifiable(row):
+                continue
+            value = ancestor_at(row, height)
+            if value:
+                groups[value] = groups.get(value, 0) + 1
+        quorum = (7 * len(others) + 9) // 10
+        agreed = next((value for value, count in groups.items() if count >= quorum), None)
+        if agreed is None:
+            previous = state.get("mac_forks", {}).get(fleet.name, {})
+            mac_recovery_ready(previous, now, False)
+            return
+        bucket = state.setdefault("mac_forks", {})
+        previous = bucket.get(fleet.name, {})
+        if previous.get("alerting") and agreed == block_hash:
+            if not mac_recovery_ready(previous, now, True):
+                return
+        elif previous:
+            mac_recovery_ready(previous, now, False)
+        update_alert_state(
+            bucket, fleet.name, "fork" if agreed != block_hash else "ok", now, 0,
+            f":rotating_light: *Zakura mainnet* - `{MAC_NODE_NAME}` forked for more than 10 blocks\n"
+            f"{groups[agreed]}/{len(others)} other nodes agree at height {height}\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            f":white_check_mark: *Zakura mainnet* - `{MAC_NODE_NAME}` fork recovered\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            now, suppressed, self.args, tip, notify=self.notify,
+        )
+
     def propagation_grace(
         self, state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]], now: float
     ) -> set[str]:
@@ -1295,17 +1596,6 @@ class Watchdog:
             and 0 <= now - last_seen <= PROPAGATION_GRACE_SECONDS
             and height is not None and bool(block_hash)
         )
-
-        def ancestor_at(row: dict[str, Any], ancestor_height: int) -> str | None:
-            distance = coerce_height(row["height"]) - ancestor_height
-            if distance == 0:
-                return validated_block_hash(row["block_hash"])
-            ancestors = row.get("ancestor_hashes")
-            value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
-            if distance == 1:
-                value = row.get("previous_hash") or value
-            # Distinguish an unsampled depth from a malformed/conflicting hash.
-            return None if value is None else validated_block_hash(value) or ""
 
         def extension_references(
             anchor_height: int, anchor_hash: str, known: dict[str, Any]
@@ -1369,7 +1659,7 @@ class Watchdog:
         if references is not None:
             for name in previous.get("node_names", []):
                 row = current.get(name)
-                old_alert = state.get("nodes", {}).get(f"{fleet.name}/{name}", {})
+                old_alert = state.get("nodes", {}).get(node_state_key(fleet.name, name), {})
                 if (
                     row and not old_alert.get("alerting")
                     and coerce_height(row["height"]) == height
@@ -1446,6 +1736,9 @@ class Watchdog:
         bad_since: float | None = None,
     ) -> None:
         key = fleet.name
+        if fleet.name == "mainnet":
+            mac_recovery_ready(state.get("nodes", {}).get(node_state_key("mainnet", MAC_NODE_NAME), {}), now, False)
+            mac_recovery_ready(state.get("mac_forks", {}).get("mainnet", {}), now, False)
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
         previous_bad_since = coerce_float(entry.get("bad_since"))
@@ -1530,7 +1823,9 @@ class Watchdog:
     ) -> bool:
         bucket = state.setdefault("nodes", {})
         for observation in observations:
-            key = f"{fleet.name}/{observation.name}"
+            if observation.name == MAC_NODE_NAME:
+                continue
+            key = node_state_key(fleet.name, observation.name)
             previous = dict(bucket.get(key, {}))
             if not previous.get("alerting"):
                 continue
@@ -1584,7 +1879,7 @@ class Watchdog:
         bucket = state.setdefault("nodes", {})
         owners = []
         for observation in observations:
-            entry = bucket.get(f"{fleet.name}/{observation.name}", {})
+            entry = bucket.get(node_state_key(fleet.name, observation.name), {})
             alert_height = cls.node_event_height(entry)
             if (
                 entry.get("condition") == "stalled"
@@ -1657,7 +1952,7 @@ class Watchdog:
             )
             if not self.notify(text, self.args):
                 return False
-            bucket[f"{fleet.name}/{duplicate.name}"] = {
+            bucket[node_state_key(fleet.name, duplicate.name)] = {
                 "condition": "ok",
                 "alerting": False,
             }
@@ -1842,9 +2137,17 @@ class Watchdog:
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
-        key = f"{fleet.name}/{observation.name}"
+        if observation.name == MAC_NODE_NAME and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            return
+        key = node_state_key(fleet.name, observation.name)
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
+        if observation.name == MAC_NODE_NAME and previous.get("alerting"):
+            good = observation.condition == "ok" and tip_is_verifiable(observation.row)
+            ready = mac_recovery_ready(previous, now, good)
+            bucket[key] = previous
+            if observation.condition == "ok" and not ready:
+                return
         previous_height = self.node_event_height(previous)
         same_stall_event = (
             observation.condition == "stalled"
@@ -1954,6 +2257,26 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="Slack webhook request timeout seconds",
     )
+    parser.add_argument("--mac-comparison", type=Path,
+                        default=(Path("/opt/zakura-mac-verifier/comparison.py")
+                                 if os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON") == "1" else None))
+    parser.add_argument("--mac-comparison-state", type=Path,
+                        default=Path("/var/lib/zakura-mac-verifier"))
+    parser.add_argument("--mac-comparison-receipt", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/receipt.json"))
+    parser.add_argument("--mac-comparison-identity", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/dashboard.json"))
+    parser.add_argument("--mac-comparison-public-status", type=Path,
+                        default=Path("/var/lib/zakura-mac-cranelift-public/status.json"))
+    parser.add_argument("--mac-comparison-alerts", action="store_true",
+                        default=os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS") == "1")
+    parser.add_argument(
+        "--compat-monitoring",
+        action="store_true",
+        default=os.environ.get(monitor.ENABLE_ENV) == "1",
+        help="probe the [[compatibility]] target over SSH (cutover sets "
+        f"{monitor.ENABLE_ENV}=1 through a systemd drop-in)",
+    )
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
     return parser.parse_args()
@@ -1962,13 +2285,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     fleets = load_fleets(args.config)
+    compatibility = [
+        monitor.ProbeWorker(target)
+        for target in monitor.load_compatibility_targets(args.config)
+    ] if args.compat_monitoring else []
     watchdog = Watchdog(
         fleets, args, load_release_state(args.config),
         checkpoint=lambda state: save_state(args.state_file, state),
+        compatibility=compatibility,
     )
 
     while True:
         state = load_state(args.state_file)
+        if args.once:
+            # A one-shot run waits for its probe so the result is observable.
+            for worker in compatibility:
+                worker.wait(
+                    worker.target.timeout + monitor.OVERRUN_GRACE_SECONDS, keep=True
+                )
         watchdog.run_once(state)
         save_state(args.state_file, state)
 

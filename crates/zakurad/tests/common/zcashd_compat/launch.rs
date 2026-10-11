@@ -14,7 +14,8 @@ use zakura_test::{args, command::TestChild};
 
 use super::{
     config::{
-        build_zcashd_compat_config, ZcashdCompatConfig, ZCASHD_TEST_RPC_PASS, ZCASHD_TEST_RPC_USER,
+        build_zcashd_compat_config_for, RegtestProfile, ZcashdCompatConfig, ZCASHD_TEST_RPC_PASS,
+        ZCASHD_TEST_RPC_USER,
     },
     ZcashdRpcClient, TEST_ZAKURAD_RPC_ADDR, TEST_ZCASHD_COOKIE_FILE, TEST_ZCASHD_RPC_ADDR,
     TEST_ZCASHD_RPC_PASSWORD, TEST_ZCASHD_RPC_USER,
@@ -134,12 +135,21 @@ pub async fn spawn_zakurad_with_zcashd_compat() -> Result<ZcashdCompatSetup> {
 pub async fn spawn_zakurad_with_zcashd_compat_config(
     configure: impl FnOnce(&mut zakurad::config::ZakuradConfig),
 ) -> Result<ZcashdCompatSetup> {
+    spawn_zakurad_with_zcashd_compat_profile(RegtestProfile::Nu5AtOne, configure).await
+}
+
+/// Spawns a managed regtest setup with the network upgrade schedule of `profile`, after
+/// applying `configure` to zakurad's config.
+pub async fn spawn_zakurad_with_zcashd_compat_profile(
+    profile: RegtestProfile,
+    configure: impl FnOnce(&mut zakurad::config::ZakuradConfig),
+) -> Result<ZcashdCompatSetup> {
     let _init_guard = zakura_test::init();
 
     let dir = testdir()?;
     let work_dir = dir.path().to_path_buf();
 
-    let compat_cfg: ZcashdCompatConfig = build_zcashd_compat_config(work_dir)?;
+    let compat_cfg: ZcashdCompatConfig = build_zcashd_compat_config_for(work_dir, profile)?;
     let mut zakurad_config = compat_cfg.zakurad_config;
     configure(&mut zakurad_config);
 
@@ -170,7 +180,7 @@ pub async fn spawn_zakurad_with_zcashd_compat_config(
         zcashd_datadir: Some(compat_cfg.zcashd_datadir),
         zakura_client,
         zcashd_client,
-        network: Network::new_regtest(Default::default()),
+        network: compat_cfg.network,
         zakura_rpc_addr,
     })
 }

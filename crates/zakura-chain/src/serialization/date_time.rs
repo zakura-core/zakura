@@ -1,5 +1,6 @@
 //! DateTime types with specific serialization invariants.
 
+use crate::serialization::ZcashReader;
 use std::{
     fmt,
     num::{ParseIntError, TryFromIntError},
@@ -369,7 +370,9 @@ impl ZcashSerialize for DateTime32 {
 }
 
 impl ZcashDeserialize for DateTime32 {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(DateTime32 {
             timestamp: reader.read_u32::<LittleEndian>()?,
         })

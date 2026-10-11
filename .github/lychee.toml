@@ -3,6 +3,8 @@
 
 # Exclude patterns
 exclude = [
+    # The coverage dashboard repeatedly fails TLS handshakes from CI.
+    "^https://codecov\\.io/gh/zakura-core/zakura/?$",
     # GitHub compare links (often temporary)
     "^https://github.com/.*/compare/",
     # Local development URLs

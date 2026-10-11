@@ -1,15 +1,18 @@
 //! BCTV14 proofs for Zebra.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
 /// An encoding of a BCTV14 proof, as used in Zcash.
 #[derive(Serialize, Deserialize)]
-pub struct Bctv14Proof(#[serde(with = "BigArray")] pub [u8; 296]);
+pub struct Bctv14Proof(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub [u8; 296],
+);
 
 impl fmt::Debug for Bctv14Proof {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -45,7 +48,9 @@ impl ZcashSerialize for Bctv14Proof {
 }
 
 impl ZcashDeserialize for Bctv14Proof {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 296];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

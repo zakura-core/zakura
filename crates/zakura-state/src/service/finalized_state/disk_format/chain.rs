@@ -8,7 +8,6 @@
 use std::collections::BTreeMap;
 
 use bincode::Options;
-use serde_big_array::BigArray;
 use thiserror::Error;
 
 use zakura_chain::{
@@ -164,7 +163,7 @@ struct LegacyHistoryTreeParts {
 /// A history-tree entry serialized at the pre-NU6.3 [`LEGACY_MAX_ENTRY_SIZE`] width.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LegacyEntry {
-    #[serde(with = "BigArray")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::bytes")]
     inner: [u8; LEGACY_MAX_ENTRY_SIZE],
 }
 

@@ -1,7 +1,7 @@
 //! Response type for the `z_validateaddress` RPC.
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use jsonrpsee::core::RpcResult;
 
 use zakura_chain::{
@@ -11,22 +11,33 @@ use zakura_chain::{
 
 /// `z_validateaddress` response
 #[derive(
-    Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, new,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    CopyGetters,
+    new,
 )]
 pub struct ZValidateAddressResponse {
     /// Whether the address is valid.
     ///
     /// If not, this is the only property returned.
     #[serde(rename = "isvalid")]
+    #[getset(get_copy = "pub")]
     pub(crate) is_valid: bool,
 
     /// The zcash address that has been validated.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) address: Option<String>,
 
     /// The type of the address.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) address_type: Option<ZValidateAddressType>,
 
     /// Whether the address is yours or not.
@@ -34,7 +45,7 @@ pub struct ZValidateAddressResponse {
     /// Always false for now since Zebra doesn't have a wallet yet.
     #[serde(rename = "ismine")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) is_mine: Option<bool>,
 }
 

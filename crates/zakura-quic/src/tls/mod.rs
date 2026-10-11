@@ -61,6 +61,10 @@ impl TlsConfig {
         &self,
         alpns: Vec<Vec<u8>>,
     ) -> Result<QuicServerConfig, TlsConfigError> {
+        Ok(QuicServerConfig::try_from(self.rustls_server(alpns)?)?)
+    }
+
+    fn rustls_server(&self, alpns: Vec<Vec<u8>>) -> Result<rustls::ServerConfig, TlsConfigError> {
         let mut crypto = rustls::ServerConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
             .with_client_cert_verifier(self.client_verifier.clone())
@@ -69,7 +73,7 @@ impl TlsConfig {
         // TLS-10: refuse 0-RTT. Without tickets, no client can resume either.
         crypto.max_early_data_size = 0;
         crypto.send_tls13_tickets = 0;
-        Ok(QuicServerConfig::try_from(crypto)?)
+        Ok(crypto)
     }
 
     /// Builds a client config that accepts only `expected` as the server
@@ -79,6 +83,16 @@ impl TlsConfig {
         expected: NodeId,
         alpns: &[&[u8]],
     ) -> Result<QuicClientConfig, TlsConfigError> {
+        Ok(QuicClientConfig::try_from(
+            self.rustls_client(expected, alpns)?,
+        )?)
+    }
+
+    fn rustls_client(
+        &self,
+        expected: NodeId,
+        alpns: &[&[u8]],
+    ) -> Result<rustls::ClientConfig, TlsConfigError> {
         let mut crypto = rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
             .dangerous()
@@ -90,7 +104,7 @@ impl TlsConfig {
         crypto.enable_sni = false;
         crypto.enable_early_data = false;
         crypto.resumption = rustls::client::Resumption::disabled();
-        Ok(QuicClientConfig::try_from(crypto)?)
+        Ok(crypto)
     }
 }
 
@@ -154,5 +168,24 @@ mod tests {
         spki[8] = 0x71; // Ed448's OID byte.
         assert_eq!(node_id_from_spki(&spki), None);
         assert_eq!(node_id_from_spki(id.as_bytes()), None);
+    }
+
+    /// TLS-10, TLS-11, WIRE-2: no 0-RTT, no tickets, no SNI, and the ALPNs in
+    /// the caller's order.
+    #[test]
+    fn tls_profile_refuses_early_data_tickets_and_sni() {
+        let tls = TlsConfig::new(&NodeSecretKey::generate());
+        let server = tls
+            .rustls_server(vec![b"b".to_vec(), b"a".to_vec()])
+            .unwrap();
+        assert_eq!(server.max_early_data_size, 0);
+        assert_eq!(server.send_tls13_tickets, 0);
+        assert_eq!(server.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);
+
+        let peer = NodeSecretKey::generate().public();
+        let client = tls.rustls_client(peer, &[b"b", b"a"]).unwrap();
+        assert!(!client.enable_sni);
+        assert!(!client.enable_early_data);
+        assert_eq!(client.alpn_protocols, [b"b".to_vec(), b"a".to_vec()]);
     }
 }

@@ -345,6 +345,72 @@ pub struct QuicBindConfig {
 mod tests {
     use super::*;
 
+    /// The transport profile, field by field (WIRE-5 to WIRE-10, WIRE-14,
+    /// ADM-5). A `quinn-proto` release that changes a default changes this
+    /// snapshot, and COMPAT-4 then decides whether the ALPN must move.
+    #[test]
+    fn transport_profile_snapshot() {
+        let config = QuicConfig::default();
+        assert_eq!(
+            format!("{:?}", config.transport_config(64, true)),
+            "TransportConfig { max_concurrent_bidi_streams: 64, \
+             max_concurrent_uni_streams: 0, max_idle_timeout: Some(150000), \
+             stream_receive_window: 16777216, receive_window: 33554432, \
+             send_window: 33554432, send_fairness: true, packet_threshold: 3, \
+             time_threshold: 1.125, initial_rtt: 333ms, initial_mtu: 1200, min_mtu: 1200, \
+             mtu_discovery_config: Some(MtuDiscoveryConfig { interval: 600s, \
+             upper_bound: 1452, minimum_change: 20, black_hole_cooldown: 60s }), \
+             pad_to_mtu: false, ack_frequency_config: None, \
+             persistent_congestion_threshold: 3, keep_alive_interval: Some(10s), \
+             crypto_buffer_size: 16384, allow_spin: true, \
+             datagram_receive_buffer_size: None, datagram_send_buffer_size: 0, \
+             enable_segmentation_offload: true, .. }"
+        );
+        assert_eq!(
+            format!("{:?}", config.endpoint_config()),
+            "EndpointConfig { max_udp_payload_size: 1472, supported_versions: [1, \
+             4278190109, 4278190110, 4278190111, 4278190112, 4278190113, 4278190114], \
+             grease_quic_bit: false, rng_seed: None, .. }"
+        );
+
+        let tls = crate::tls::TlsConfig::new(&crate::NodeSecretKey::generate());
+        let mut server = quinn_proto::ServerConfig::with_crypto(Arc::new(
+            tls.server_config(vec![b"p2p-v2/3".to_vec()]).unwrap(),
+        ));
+        config.apply_server_limits(&mut server);
+        let server = format!("{server:?}");
+        for field in [
+            "sent: 0",
+            "migration: true",
+            "max_incoming: 65536",
+            "incoming_buffer_size: 10485760",
+            "incoming_buffer_size_total: 104857600",
+        ] {
+            assert!(server.contains(field), "{field} missing from {server}");
+        }
+    }
+
+    /// CTRL-3: Cubic unless the config names NewReno.
+    #[test]
+    fn congestion_controller_follows_the_config() {
+        let build = |config: &QuicConfig| {
+            config
+                .congestion_factory()
+                .build(std::time::Instant::now(), 1200)
+                .into_any()
+        };
+        assert!(build(&QuicConfig::default())
+            .downcast::<quinn_proto::congestion::Cubic>()
+            .is_ok());
+        let new_reno = QuicConfig {
+            congestion_controller: CongestionController::NewReno,
+            ..QuicConfig::default()
+        };
+        assert!(build(&new_reno)
+            .downcast::<quinn_proto::congestion::NewReno>()
+            .is_ok());
+    }
+
     #[test]
     fn defaults_are_valid_and_match_today() {
         let config = QuicConfig::default();

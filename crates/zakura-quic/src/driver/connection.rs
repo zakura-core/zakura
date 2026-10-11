@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     mem,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -18,7 +18,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
 use crate::{
     congestion::CongestionProbe,
-    conn::{CongestionStats, ConnSample, ConnStats, DriverStats, Hooks, SAMPLE_INTERVAL},
+    conn::{
+        CongestionStats, ConnLimits, ConnLoad, ConnSample, ConnStats, DriverStats, Hooks,
+        LOAD_INTERVAL, SAMPLE_INTERVAL,
+    },
     error::{ReadError, WriteError},
     key::NodeId,
     socket::SocketCell,
@@ -31,6 +34,8 @@ use crate::{
 const MAX_TRANSMITS_PER_WAKEUP: usize = 20;
 /// Inputs of one kind handled per wakeup before the task drives output.
 const MAX_INPUTS_PER_WAKEUP: usize = 64;
+/// The shortest gap between two warnings about failed sends.
+const SEND_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The current time on tokio's clock, so paused-time tests drive quinn-proto.
 pub(crate) fn now() -> Instant {
@@ -43,7 +48,9 @@ pub(crate) struct ConnTaskParams {
     pub(crate) conn: quinn_proto::Connection,
     pub(crate) shared: Arc<ConnShared>,
     pub(crate) cmds: mpsc::UnboundedReceiver<ConnCmd>,
-    pub(crate) datagrams: mpsc::Receiver<ConnectionEvent>,
+    /// Routed datagrams with their sizes, which count against the endpoint's
+    /// per-connection byte budget until handled.
+    pub(crate) datagrams: mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
     pub(crate) control: mpsc::UnboundedReceiver<ConnectionEvent>,
     pub(crate) to_endpoint: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) socket: Arc<SocketCell>,
@@ -53,6 +60,16 @@ pub(crate) struct ConnTaskParams {
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) admitted: SocketAddr,
     pub(crate) handshake: oneshot::Sender<Result<Handshake, ConnectionError>>,
+    /// The limits the transport config starts the connection with.
+    pub(crate) limits: CurrentLimits,
+}
+
+/// The connection's limits as last set (API-9).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurrentLimits {
+    pub(crate) receive_window: u64,
+    pub(crate) send_window: u64,
+    pub(crate) max_bidi_streams: u64,
 }
 
 /// How a receive stream ended, kept until its reader asks.
@@ -82,6 +99,8 @@ struct Counters {
     datagrams_sent: u64,
     datagrams_received: u64,
     send_blocked: Duration,
+    delivered_bytes: u64,
+    send_errors: u64,
 }
 
 /// Counters already exported as metric increments.
@@ -108,8 +127,16 @@ struct ConnTask {
 
     remote_id: Option<NodeId>,
     error: Option<ConnectionError>,
+    /// Why this node closed the connection, for the final sample (OBS-3).
+    local_close: Option<String>,
     drained_sent: bool,
-    sampled_ip: IpAddr,
+    /// The peer's IP as of the last path check (PATH-3).
+    path_ip: IpAddr,
+    limits: CurrentLimits,
+    /// When the load snapshot was last published, and whether it is stale.
+    load_published: Option<Instant>,
+    load_stale: bool,
+    last_send_warning: Option<Instant>,
 
     openers: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
     opened_spare: VecDeque<StreamId>,
@@ -143,6 +170,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         hooks,
         admitted,
         handshake,
+        limits,
     } = params;
     let mut socket_generation = socket.subscribe();
     let mut task = ConnTask {
@@ -157,8 +185,13 @@ pub(crate) async fn run(params: ConnTaskParams) {
         handshake: Some(handshake),
         remote_id: None,
         error: None,
+        local_close: None,
         drained_sent: false,
-        sampled_ip: canonical_ip(admitted.ip()),
+        path_ip: canonical_ip(admitted.ip()),
+        limits,
+        load_published: None,
+        load_stale: false,
+        last_send_warning: None,
         openers: VecDeque::new(),
         opened_spare: VecDeque::new(),
         acceptors: VecDeque::new(),
@@ -179,14 +212,29 @@ pub(crate) async fn run(params: ConnTaskParams) {
     let mut sampler = tokio::time::interval(SAMPLE_INTERVAL);
     sampler.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     sampler.tick().await;
+    let mut publish = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut publish_deadline: Option<Instant> = None;
     if *closing.borrow() {
-        task.close(VarInt::from_u32(0), Bytes::new());
+        task.close(
+            VarInt::from_u32(0),
+            Bytes::from_static(b"endpoint shutdown"),
+        );
     }
 
     loop {
         task.drive();
         if task.conn.is_drained() {
             break;
+        }
+        match task.publish_load() {
+            Some(deadline) if publish_deadline != Some(deadline) => {
+                publish
+                    .as_mut()
+                    .reset(tokio::time::Instant::from_std(deadline));
+                publish_deadline = Some(deadline);
+            }
+            Some(_) => {}
+            None => publish_deadline = None,
         }
         match task.conn.poll_timeout() {
             Some(deadline) if timer_deadline != Some(deadline) => {
@@ -201,25 +249,15 @@ pub(crate) async fn run(params: ConnTaskParams) {
         let blocked_io = task.blocked.as_ref().and_then(|_| task.socket.get());
         let more_to_send = task.more_to_send;
 
+        // Local inputs come before the datagram queue: they are bounded (one
+        // read in flight and 64 KiB of write-ahead per stream) and wait on
+        // network progress themselves, while a peer can keep the queue full.
+        // Datagrams first would let a flood starve close, limits, shutdown
+        // and the PATH-3 check.
         tokio::select! {
             biased;
             event = control.recv() => match event {
                 Some(event) => task.conn.handle_event(event),
-                None => {
-                    task.endpoint_gone();
-                    break;
-                }
-            },
-            event = datagrams.recv() => match event {
-                Some(event) => {
-                    task.conn.handle_event(event);
-                    task.counters.datagrams_received += 1;
-                    for _ in 1..MAX_INPUTS_PER_WAKEUP {
-                        let Ok(event) = datagrams.try_recv() else { break };
-                        task.conn.handle_event(event);
-                        task.counters.datagrams_received += 1;
-                    }
-                }
                 None => {
                     task.endpoint_gone();
                     break;
@@ -236,31 +274,135 @@ pub(crate) async fn run(params: ConnTaskParams) {
                 // API-4: the last handle dropped.
                 None => {
                     cmds_open = false;
-                    task.close(VarInt::from_u32(0), Bytes::new());
+                    let reason: &'static [u8] = if task.remote_id.is_some() {
+                        b"all handles dropped"
+                    } else {
+                        b"handshake abandoned"
+                    };
+                    task.close(VarInt::from_u32(0), Bytes::from_static(reason));
                 }
             },
+            Ok(()) = closing.changed() => {
+                if *closing.borrow() {
+                    task.close(VarInt::from_u32(0), Bytes::from_static(b"endpoint shutdown"));
+                }
+            }
             () = &mut timer, if timer_deadline.is_some() => {
                 timer_deadline = None;
                 task.conn.handle_timeout(now());
-            }
-            Ok(()) = closing.changed() => {
-                if *closing.borrow() {
-                    task.close(VarInt::from_u32(0), Bytes::new());
-                }
             }
             Ok(()) = network.changed() => {
                 // SOCK-12: forget the local address so the kernel picks one.
                 task.conn.local_address_changed();
             }
             Ok(()) = socket_generation.changed() => {}
-            _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
             _ = sampler.tick() => task.sample(),
+            () = &mut publish, if publish_deadline.is_some() => publish_deadline = None,
+            event = datagrams.recv() => match event {
+                Some(event) => {
+                    task.on_datagram(event);
+                    for _ in 1..MAX_INPUTS_PER_WAKEUP {
+                        let Ok(event) = datagrams.try_recv() else { break };
+                        task.on_datagram(event);
+                    }
+                }
+                None => {
+                    task.endpoint_gone();
+                    break;
+                }
+            },
+            _ = async { blocked_io.as_ref()?.writable().await.ok() }, if blocked_io.is_some() => {}
             () = std::future::ready(()), if more_to_send => {}
         }
     }
 }
 
 impl ConnTask {
+    fn on_datagram(&mut self, (event, bytes): (ConnectionEvent, usize)) {
+        self.shared
+            .queued_datagram_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+        self.conn.handle_event(event);
+        self.counters.datagrams_received += 1;
+    }
+
+    /// Publishes the load snapshot if it is stale and the last one is at
+    /// least [`LOAD_INTERVAL`] old. Returns when to publish otherwise.
+    fn publish_load(&mut self) -> Option<Instant> {
+        if !self.load_stale {
+            return None;
+        }
+        let now = now();
+        if let Some(due) = self
+            .load_published
+            .map(|at| at + LOAD_INTERVAL)
+            .filter(|due| *due > now)
+        {
+            return Some(due);
+        }
+        self.load_published = Some(now);
+        self.load_stale = false;
+        let load = self.load();
+        self.shared.load.send_replace(load);
+        None
+    }
+
+    fn load(&mut self) -> ConnLoad {
+        let stats = self.conn.stats();
+        let mut load = ConnLoad::new(self.conn.remote_address());
+        load.delivered_bytes = self.counters.delivered_bytes;
+        // usize always fits in u64 on supported targets.
+        load.queued_send_bytes = self.queued_send_bytes() as u64;
+        load.send_blocked_streams = self
+            .sends
+            .values()
+            .filter(|state| state.blocked_since.is_some())
+            .count() as u64;
+        load.queued_datagram_bytes =
+            self.shared.queued_datagram_bytes.load(Ordering::Relaxed) as u64;
+        load.queue_drops = self.shared.queue_drops.load(Ordering::Relaxed);
+        load.remote_open_streams = self.conn.streams().remote_open_streams(Dir::Bi);
+        load.receive_window = self.limits.receive_window;
+        load.send_window = self.limits.send_window;
+        load.max_bidi_streams = self.limits.max_bidi_streams;
+        load.udp_rx = stats.udp_rx;
+        load.frame_rx = stats.frame_rx;
+        load.send_errors = self.counters.send_errors;
+        load
+    }
+
+    fn queued_send_bytes(&self) -> usize {
+        self.sends
+            .values()
+            .flat_map(|state| state.writes.iter())
+            .map(|write| write.data.len())
+            .sum()
+    }
+
+    /// PATH-3: closes the connection if the peer's current IP is banned.
+    /// Runs when the IP changes and, while it differs from the admitted IP,
+    /// on every sample, so a ban that lands after the move still applies.
+    fn check_path(&mut self, recheck: bool) {
+        if self.remote_id.is_none() || self.error.is_some() {
+            return;
+        }
+        let ip = canonical_ip(self.conn.remote_address().ip());
+        let changed = ip != self.path_ip;
+        self.path_ip = ip;
+        let moved = ip != canonical_ip(self.admitted.ip());
+        if !(changed || (recheck && moved)) {
+            return;
+        }
+        if changed {
+            tracing::debug!(target: "zakura_quic", %ip, admitted = %self.admitted, "peer migrated");
+        }
+        if self.hooks.is_banned(ip) {
+            metrics::counter!("zakura.quic.paths.closed_banned").increment(1);
+            tracing::debug!(target: "zakura_quic", %ip, "closing a connection that migrated to a banned IP");
+            self.close(VarInt::from_u32(0), Bytes::from_static(b"banned path"));
+        }
+    }
+
     /// Moves every pending output: app events, datagrams and endpoint events.
     fn drive(&mut self) {
         if self
@@ -271,6 +413,9 @@ impl ConnTask {
             // A timer can fire late under load; handle it on the clock.
             self.conn.handle_timeout(now());
         }
+        // quinn-proto emits no event when the peer migrates: compare. This
+        // runs before transmit, so a close it causes goes out now.
+        self.check_path(false);
         self.process_events();
         self.transmit();
         self.process_events();
@@ -278,6 +423,7 @@ impl ConnTask {
             self.drained_sent |= event.is_drained();
             let _ = self.to_endpoint.send((self.handle, event));
         }
+        self.load_stale = true;
     }
 
     fn transmit(&mut self) {
@@ -337,8 +483,26 @@ impl ConnTask {
     }
 
     fn send_failed(&mut self, error: &std::io::Error) {
+        self.counters.send_errors += 1;
         metrics::counter!("zakura.quic.socket.send_errors").increment(1);
-        tracing::debug!(target: "zakura_quic", %error, "UDP send failed");
+        // The packet is lost, so a persistent error (a firewall's EPERM, say)
+        // silently stalls the connection: warn, but at most once a minute.
+        let now = now();
+        if self
+            .last_send_warning
+            .is_none_or(|at| now.saturating_duration_since(at) >= SEND_WARNING_INTERVAL)
+        {
+            self.last_send_warning = Some(now);
+            tracing::warn!(
+                target: "zakura_quic",
+                %error,
+                remote = %self.conn.remote_address(),
+                errors = self.counters.send_errors,
+                "UDP send failed",
+            );
+        } else {
+            tracing::debug!(target: "zakura_quic", %error, "UDP send failed");
+        }
     }
 
     fn process_events(&mut self) {
@@ -405,7 +569,11 @@ impl ConnTask {
         }
         if self.remote_id.is_some() {
             metrics::gauge!("zakura.quic.connections").decrement(1.0);
-            let sample = self.build_sample(Some(reason.to_string()));
+            let reason = match (&reason, self.local_close.take()) {
+                (ConnectionError::LocallyClosed, Some(local)) => local,
+                _ => reason.to_string(),
+            };
+            let sample = self.build_sample(Some(reason));
             if let Some(observer) = self.hooks.observer() {
                 observer(&sample);
             }
@@ -414,6 +582,10 @@ impl ConnTask {
 
     fn close(&mut self, code: VarInt, reason: Bytes) {
         if self.error.is_none() {
+            self.local_close = Some(format!(
+                "closed locally (code {code}): {}",
+                String::from_utf8_lossy(&reason)
+            ));
             self.conn.close(now(), code, reason);
         }
         self.terminate(ConnectionError::LocallyClosed);
@@ -486,6 +658,27 @@ impl ConnTask {
             ConnCmd::Stats { reply } => {
                 let _ = reply.send(self.stats());
             }
+            ConnCmd::SetLimits { limits } => self.set_limits(limits),
+            ConnCmd::SetPriority { id, priority } => {
+                let _ = self.conn.send_stream(id).set_priority(priority);
+            }
+        }
+    }
+
+    fn set_limits(&mut self, limits: ConnLimits) {
+        if let Some(bytes) = limits.receive_window {
+            self.conn
+                .set_receive_window(VarInt::from_u64(bytes).unwrap_or(VarInt::MAX));
+            self.limits.receive_window = bytes;
+        }
+        if let Some(bytes) = limits.send_window {
+            self.conn.set_send_window(bytes);
+            self.limits.send_window = bytes;
+        }
+        if let Some(streams) = limits.max_bidi_streams {
+            self.conn
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(streams));
+            self.limits.max_bidi_streams = u64::from(streams);
         }
     }
 
@@ -620,6 +813,8 @@ impl ConnTask {
             match chunks.next(budget) {
                 Ok(Some(chunk)) => {
                     budget = budget.saturating_sub(chunk.bytes.len());
+                    // usize always fits in u64 on supported targets.
+                    self.counters.delivered_bytes += chunk.bytes.len() as u64;
                     data.push(chunk.bytes);
                 }
                 Ok(None) => {
@@ -655,12 +850,7 @@ impl ConnTask {
 
     fn stats(&self) -> ConnStats {
         let metrics = self.conn.congestion_state().metrics();
-        let queued: usize = self
-            .sends
-            .values()
-            .flat_map(|state| state.writes.iter())
-            .map(|write| write.data.len())
-            .sum();
+        let queued = self.queued_send_bytes();
         let ongoing: Duration = self
             .sends
             .values()
@@ -684,6 +874,8 @@ impl ConnTask {
                 transmits: self.counters.transmits,
                 datagrams_sent: self.counters.datagrams_sent,
                 datagrams_received: self.counters.datagrams_received,
+                queue_drops: self.shared.queue_drops.load(Ordering::Relaxed),
+                send_errors: self.counters.send_errors,
             },
         }
     }
@@ -722,22 +914,14 @@ impl ConnTask {
         }
     }
 
-    /// The 10 s sample: PATH-3's ban check, then OBS-3.
+    /// The 10 s sample: PATH-3's re-check, then OBS-3.
     fn sample(&mut self) {
         if self.remote_id.is_none() || self.error.is_some() {
             return;
         }
-        // PATH-3: quinn-proto emits no event when the peer migrates, so
-        // compare the remote address with the last sample's.
-        let ip = canonical_ip(self.conn.remote_address().ip());
-        if ip != self.sampled_ip {
-            self.sampled_ip = ip;
-            if self.hooks.is_banned(ip) {
-                metrics::counter!("zakura.quic.paths.closed_banned").increment(1);
-                tracing::debug!(target: "zakura_quic", %ip, "closing a connection that migrated to a banned IP");
-                self.close(VarInt::from_u32(0), Bytes::from_static(b"banned path"));
-                return;
-            }
+        self.check_path(true);
+        if self.error.is_some() {
+            return;
         }
         let sample = self.build_sample(None);
         if let Some(observer) = self.hooks.observer() {
@@ -784,7 +968,9 @@ fn reply_closed(cmd: ConnCmd, error: &ConnectionError) {
         | ConnCmd::DropSend { .. }
         | ConnCmd::DropRecv { .. }
         | ConnCmd::Close { .. }
-        | ConnCmd::Stats { .. } => {}
+        | ConnCmd::Stats { .. }
+        | ConnCmd::SetLimits { .. }
+        | ConnCmd::SetPriority { .. } => {}
     }
 }
 

@@ -635,11 +635,56 @@ async fn migration_to_a_banned_ip_closes_the_connection() {
         relay
             .rebind
             .send_replace(SocketAddr::from((banned_ip, 0)));
-        // Traffic from the new address makes the server migrate.
+        // Traffic from the new address makes the server migrate, and the
+        // server checks the new IP as soon as it handles that traffic.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(b"after").await;
+        }
+        inbound.closed().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the close waited for the 10 s sample"
+        );
+        let reason = conn.closed().await;
+        assert!(
+            matches!(&reason, ConnectionError::ApplicationClosed(close) if &close.reason[..] == b"banned path"),
+            "{reason:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// PATH-3: a ban that lands after the peer moved still closes the
+/// connection, at the next 10 s sample.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ban_after_migration_closes_at_the_next_sample() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut server = server();
+        let relay = rebinder(server.endpoint.local_addrs()[0]).await;
+        let client = client();
+        let conn = client
+            .connect(
+                NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
+                ALPN,
+            )
+            .await
+            .unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        let moved_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 4));
+        relay.rebind.send_replace(SocketAddr::from((moved_ip, 0)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(echo(&conn, b"after").await, b"after");
+        // The snapshot follows the path within LOAD_INTERVAL, even with the
+        // connection idle.
+        while inbound.load().remote.ip() != moved_ip {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
-        // The next 10 s sample sees the banned IP.
+        server.banned.lock().unwrap().insert(moved_ip);
         inbound.closed().await;
         let reason = conn.closed().await;
         assert!(
@@ -1075,6 +1120,104 @@ async fn a_stopped_stream_returns_its_credit() {
             let _ = send.finish();
             drop(recv);
         }
+    })
+    .await
+    .unwrap();
+}
+
+/// API-9: raising the stream limit at runtime lets a blocked opener through,
+/// and the load snapshot reports the new limit.
+#[tokio::test]
+async fn set_limits_raises_the_stream_limit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(1).await;
+        let (mut first, _first_recv) = conn.open_bi().await.unwrap();
+        first.write_all(b"1").await.unwrap();
+        let mut second = Box::pin(conn.open_bi());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut second)
+                .await
+                .is_err(),
+            "the peer allows one stream"
+        );
+        inbound
+            .set_limits(crate::ConnLimits::default().with_max_bidi_streams(2))
+            .unwrap();
+        let (mut second, _second_recv) = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the raised limit admits a second stream")
+            .unwrap();
+        second.write_all(b"2").await.unwrap();
+        while inbound.load().max_bidi_streams != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// API-9: the load snapshot counts delivered stream bytes and the peer's
+/// open streams without a round trip to the connection task.
+#[tokio::test]
+async fn load_reports_delivered_bytes_and_open_streams() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(8).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[5; 100_000]).await.unwrap();
+        send.finish().unwrap();
+        let (_send, mut recv) = inbound.accept_bi().await.unwrap();
+        assert_eq!(recv.read_to_end(200_000).await.unwrap().len(), 100_000);
+        loop {
+            let load = inbound.load();
+            if load.delivered_bytes == 100_000 && load.remote_open_streams == 1 {
+                assert!(load.udp_rx.datagrams > 0);
+                assert!(load.frame_rx.stream > 0);
+                assert_eq!(load.queue_drops, 0);
+                assert_eq!(load.queued_datagram_bytes, 0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn set_priority_needs_an_open_stream() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, _inbound) = held_pair(8).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.set_priority(5).unwrap();
+        send.write_all(b"x").await.unwrap();
+        send.finish().unwrap();
+        assert!(send.set_priority(1).is_err());
+    })
+    .await
+    .unwrap();
+}
+
+/// OBS-3: the final sample of a connection this node closed names why, not
+/// just "closed".
+#[tokio::test]
+async fn final_sample_names_the_local_close_cause() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (server, _client, conn, inbound) = held_pair(8).await;
+        let (samples, mut sampled) = mpsc::unbounded_channel();
+        server.set_conn_observer(Arc::new(move |sample: &crate::ConnSample| {
+            let _ = samples.send(sample.close_reason.clone());
+        }));
+        inbound.close(VarInt::from_u32(3), b"too slow");
+        let reason = loop {
+            if let Some(reason) = sampled.recv().await.unwrap() {
+                break reason;
+            }
+        };
+        assert!(
+            reason.contains("code 3") && reason.contains("too slow"),
+            "{reason}"
+        );
+        drop(conn);
     })
     .await
     .unwrap();

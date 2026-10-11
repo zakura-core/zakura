@@ -19,7 +19,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -38,9 +38,12 @@ pub(crate) mod endpoint;
 
 /// Bytes one read request moves from quinn-proto to a stream handle.
 pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
-/// Datagrams the endpoint queues for one connection before it drops more
-/// (SPEC §6a). The peer retransmits anything dropped.
-pub(crate) const CONNECTION_QUEUE_DATAGRAMS: usize = 1024;
+/// Datagram bytes the endpoint queues for one connection before it drops more
+/// (SPEC §6a). The peer retransmits anything dropped, but each drop costs it a
+/// congestion event, so the budget covers the bursts one endpoint wakeup routes
+/// at 10 Gbit/s (32 receive calls of up to 64 KiB). Counting bytes rather than
+/// datagrams also bounds memory when a peer sends 64 KiB datagrams.
+pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A request from a handle to its connection task.
 #[derive(Debug)]
@@ -88,6 +91,13 @@ pub(crate) enum ConnCmd {
         code: VarInt,
         reason: Bytes,
     },
+    SetLimits {
+        limits: crate::conn::ConnLimits,
+    },
+    SetPriority {
+        id: StreamId,
+        priority: i32,
+    },
     Stats {
         reply: oneshot::Sender<crate::conn::ConnStats>,
     },
@@ -102,14 +112,23 @@ pub(crate) struct ConnShared {
     /// Set once, when the connection closes.
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
     pub(crate) stable_id: usize,
+    /// The connection task's latest load snapshot (API-9).
+    pub(crate) load: watch::Sender<crate::conn::ConnLoad>,
+    /// Datagram bytes the endpoint queued that the task hasn't handled yet.
+    pub(crate) queued_datagram_bytes: AtomicUsize,
+    /// Datagrams the endpoint dropped because the queue was full.
+    pub(crate) queue_drops: AtomicU64,
 }
 
 impl ConnShared {
-    fn new() -> Arc<Self> {
+    fn new(remote: SocketAddr) -> Arc<Self> {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
+            queued_datagram_bytes: AtomicUsize::new(0),
+            queue_drops: AtomicU64::new(0),
         })
     }
 

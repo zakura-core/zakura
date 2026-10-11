@@ -406,6 +406,8 @@ mod linux {
     ///
     /// Implementers must be plain C structs or integers without invalid bit
     /// patterns. Raw pointers count: any address is a valid raw pointer.
+    /// `write_pod` copies padding bytes too, so only use it with types that
+    /// have no padding (`msghdr` has some and goes only through `zeroed`).
     unsafe trait Pod: Copy {}
     // SAFETY: integers and C structs of integers, arrays and raw pointers.
     unsafe impl Pod for libc::c_int {}

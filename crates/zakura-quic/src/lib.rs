@@ -33,7 +33,10 @@ mod stream;
 pub mod sys;
 
 pub use config::{ConfigError, CongestionController, QuicBindConfig, QuicConfig};
-pub use conn::{BanCheck, CongestionStats, Conn, ConnObserver, ConnSample, ConnStats, DriverStats};
+pub use conn::{
+    BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,
+    DriverStats, LOAD_INTERVAL,
+};
 pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
 pub use error::{
     BindError, ClosedStream, ConnectError, ReadError, ReadExactError, ReadToEndError, WriteError,

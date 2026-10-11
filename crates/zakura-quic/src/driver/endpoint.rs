@@ -19,8 +19,9 @@ use tokio::{
 };
 
 use super::{
+    connection::CurrentLimits,
     connection::{self, now, ConnTaskParams},
-    ConnRef, ConnShared, Connecting, CONNECTION_QUEUE_DATAGRAMS,
+    ConnRef, ConnShared, Connecting, CONNECTION_QUEUE_BYTES,
 };
 use crate::{
     congestion::CongestionProbe,
@@ -58,8 +59,10 @@ pub(crate) enum EndpointCmd {
 }
 
 struct ConnEntry {
-    datagrams: mpsc::Sender<ConnectionEvent>,
+    /// Bounded by [`CONNECTION_QUEUE_BYTES`] through `shared`.
+    datagrams: mpsc::UnboundedSender<(ConnectionEvent, usize)>,
     control: mpsc::UnboundedSender<ConnectionEvent>,
+    shared: Arc<ConnShared>,
 }
 
 struct Serving {
@@ -247,17 +250,24 @@ impl EndpointTask {
         admitted: SocketAddr,
     ) -> Connecting {
         let (cmds_tx, cmds) = mpsc::unbounded_channel();
-        let (datagrams_tx, datagrams) = mpsc::channel(CONNECTION_QUEUE_DATAGRAMS);
+        let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
         let (control_tx, control) = mpsc::unbounded_channel();
         let (handshake_tx, handshake) = oneshot::channel();
-        let shared = ConnShared::new();
+        let shared = ConnShared::new(canonical_addr(admitted));
         self.conns.insert(
             handle,
             ConnEntry {
                 datagrams: datagrams_tx,
                 control: control_tx,
+                shared: shared.clone(),
             },
         );
+        let config = &self.shared.config;
+        let limits = CurrentLimits {
+            receive_window: u64::from(config.receive_window_bytes),
+            send_window: config.send_window_bytes,
+            max_bidi_streams: u64::from(self.shared.max_bidi_streams),
+        };
         tokio::spawn(connection::run(ConnTaskParams {
             handle,
             conn,
@@ -273,6 +283,7 @@ impl EndpointTask {
             hooks: self.shared.hooks.clone(),
             admitted: canonical_addr(admitted),
             handshake: handshake_tx,
+            limits,
         }));
         Connecting {
             conn: ConnRef {
@@ -357,6 +368,7 @@ impl EndpointTask {
     ) {
         let now = now();
         for datagram in split_segments(data, stride) {
+            let bytes = datagram.len();
             self.counters.datagrams += 1;
             self.response_buf.clear();
             match self
@@ -366,9 +378,17 @@ impl EndpointTask {
                 Some(DatagramEvent::NewConnection(incoming)) => self.on_incoming(incoming, io),
                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                     if let Some(entry) = self.conns.get(&handle) {
-                        if entry.datagrams.try_send(event).is_err() {
+                        let queued = &entry.shared.queued_datagram_bytes;
+                        if queued.load(Ordering::Relaxed) + bytes > CONNECTION_QUEUE_BYTES {
                             // SPEC §6a: the queue is full; the peer retransmits.
                             self.counters.queue_drops += 1;
+                            entry.shared.queue_drops.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            queued.fetch_add(bytes, Ordering::Relaxed);
+                            if entry.datagrams.send((event, bytes)).is_err() {
+                                // The connection task has ended.
+                                queued.fetch_sub(bytes, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -381,7 +401,12 @@ impl EndpointTask {
     fn send_response(&self, transmit: &Transmit, io: &UdpIo) {
         // A stateless response that can't go out now is dropped; the peer
         // retries.
-        let _ = io.try_send(transmit, &self.response_buf[..transmit.size]);
+        if let Err(error) = io.try_send(transmit, &self.response_buf[..transmit.size]) {
+            if error.kind() != io::ErrorKind::WouldBlock {
+                metrics::counter!("zakura.quic.socket.response_send_errors").increment(1);
+                tracing::debug!(target: "zakura_quic", %error, "stateless response send failed");
+            }
+        }
     }
 
     /// Admission (SPEC §7): decide before any handshake work (ADM-2).
@@ -505,6 +530,8 @@ impl EndpointTask {
 
     fn stop_socket(&mut self) {
         self.socket_failed = true;
+        self.slot.stopped.store(true, Ordering::Relaxed);
+        metrics::counter!("zakura.quic.socket.stopped").increment(1);
         self.begin_close();
     }
 

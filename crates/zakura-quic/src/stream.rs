@@ -130,6 +130,23 @@ impl SendStream {
         Ok(())
     }
 
+    /// Sets the stream's send priority. quinn-proto sends higher priorities
+    /// first; streams of equal priority share the connection round-robin.
+    ///
+    /// Ordered with this stream's writes: data written after the call gets
+    /// the new priority.
+    pub fn set_priority(&mut self, priority: i32) -> Result<(), ClosedStream> {
+        if self.state != SendState::Open {
+            return Err(ClosedStream::new());
+        }
+        self.conn
+            .send(ConnCmd::SetPriority {
+                id: self.id,
+                priority,
+            })
+            .map_err(|_| ClosedStream::new())
+    }
+
     /// Abandons the stream with an application error code.
     pub fn reset(&mut self, code: VarInt) -> Result<(), ClosedStream> {
         if self.state == SendState::Reset {

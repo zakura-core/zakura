@@ -104,6 +104,116 @@ pub struct DriverStats {
     pub datagrams_sent: u64,
     /// Datagrams the endpoint routed to this connection.
     pub datagrams_received: u64,
+    /// Datagrams the endpoint dropped because this connection's queue was
+    /// full (SPEC §6a).
+    pub queue_drops: u64,
+    /// Sends that failed with an error other than `WouldBlock`.
+    pub send_errors: u64,
+}
+
+/// Runtime limits for one connection (API-9).
+///
+/// Each `None` keeps the current value. The connection task applies the
+/// limits in order with the connection's other commands and announces raised
+/// limits to the peer at once. A lowered limit takes effect as the peer uses
+/// up the credit it already holds; quinn-proto never revokes granted credit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ConnLimits {
+    /// Connection-level receive window: stream bytes the peer may send beyond
+    /// what this node has read.
+    pub receive_window: Option<u64>,
+    /// Connection-level send window: unacknowledged stream bytes this node
+    /// keeps in flight and buffered.
+    pub send_window: Option<u64>,
+    /// Bidirectional streams the peer may have open at once.
+    pub max_bidi_streams: Option<u32>,
+}
+
+impl ConnLimits {
+    /// Sets the connection-level receive window.
+    pub fn with_receive_window(mut self, bytes: u64) -> Self {
+        self.receive_window = Some(bytes);
+        self
+    }
+
+    /// Sets the connection-level send window.
+    pub fn with_send_window(mut self, bytes: u64) -> Self {
+        self.send_window = Some(bytes);
+        self
+    }
+
+    /// Sets how many bidirectional streams the peer may have open.
+    pub fn with_max_bidi_streams(mut self, streams: u32) -> Self {
+        self.max_bidi_streams = Some(streams);
+        self
+    }
+}
+
+/// A connection's buffer and traffic state, published by its connection task
+/// (API-9).
+///
+/// [`Conn::load`] reads the latest snapshot without a round trip to the task,
+/// so a peer routine can check it on every tick. The task publishes at most
+/// every [`LOAD_INTERVAL`] while the connection is active, and once more when
+/// it goes idle, so a snapshot lags by at most that interval. Counters only
+/// grow.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct ConnLoad {
+    /// The peer's current address. It differs from [`Conn::admitted_addr`]
+    /// after the peer migrates (PATH-3).
+    pub remote: SocketAddr,
+    /// Stream bytes handed to this node's readers.
+    pub delivered_bytes: u64,
+    /// Stream bytes this node's writers queued that quinn-proto hasn't
+    /// accepted yet.
+    pub queued_send_bytes: u64,
+    /// Streams whose writes wait on flow control or the send window.
+    pub send_blocked_streams: u64,
+    /// Datagram bytes routed to this connection and not yet processed.
+    pub queued_datagram_bytes: u64,
+    /// Datagrams dropped because this connection's queue was full.
+    pub queue_drops: u64,
+    /// Bidirectional streams the peer has open, including ones not yet
+    /// accepted.
+    pub remote_open_streams: u64,
+    /// The current limits (see [`ConnLimits`]).
+    pub receive_window: u64,
+    /// The current connection-level send window.
+    pub send_window: u64,
+    /// The current limit on the peer's open bidirectional streams.
+    pub max_bidi_streams: u64,
+    /// UDP datagrams and bytes received.
+    pub udp_rx: quinn_proto::UdpStats,
+    /// Frames received, by type (for example ACK, PING, STREAM,
+    /// `DATA_BLOCKED`, `STREAM_DATA_BLOCKED`, `RESET_STREAM`).
+    pub frame_rx: quinn_proto::FrameStats,
+    /// Sends that failed with an error other than `WouldBlock`.
+    pub send_errors: u64,
+}
+
+/// The longest a [`ConnLoad`] snapshot lags while the connection is active.
+pub const LOAD_INTERVAL: Duration = Duration::from_millis(50);
+
+impl ConnLoad {
+    pub(crate) fn new(remote: SocketAddr) -> Self {
+        Self {
+            remote,
+            delivered_bytes: 0,
+            queued_send_bytes: 0,
+            send_blocked_streams: 0,
+            queued_datagram_bytes: 0,
+            queue_drops: 0,
+            remote_open_streams: 0,
+            receive_window: 0,
+            send_window: 0,
+            max_bidi_streams: 0,
+            udp_rx: quinn_proto::UdpStats::default(),
+            frame_rx: quinn_proto::FrameStats::default(),
+            send_errors: 0,
+        }
+    }
 }
 
 /// The endpoint's observer and ban check, read by connection tasks.
@@ -244,6 +354,18 @@ impl Conn {
     /// The close reason, if the connection has closed.
     pub fn close_reason(&self) -> Option<ConnectionError> {
         self.inner.shared.closed.borrow().clone()
+    }
+
+    /// The latest buffer and traffic snapshot (API-9). Reads shared state;
+    /// never waits on the connection task.
+    pub fn load(&self) -> ConnLoad {
+        *self.inner.shared.load.borrow()
+    }
+
+    /// Changes this connection's runtime limits (API-9). Returns the close
+    /// reason if the connection has closed.
+    pub fn set_limits(&self, limits: ConnLimits) -> Result<(), ConnectionError> {
+        self.inner.send(ConnCmd::SetLimits { limits })
     }
 
     /// Connection statistics (OBS-4), or `None` once the connection task has

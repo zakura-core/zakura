@@ -97,6 +97,9 @@ pub struct SocketStats {
     pub datagrams_received: u64,
     /// Datagrams dropped because their connection's queue was full (SPEC §6a).
     pub queue_drops: u64,
+    /// Whether the socket failed twice within 60 s and its endpoint task
+    /// stopped (SOCK-9). Dials from it fail from then on.
+    pub stopped: bool,
 }
 
 /// One bound socket's identity and counters, shared with its endpoint task.
@@ -110,6 +113,7 @@ pub(crate) struct SocketSlot {
     pub(crate) recv_calls: AtomicU64,
     pub(crate) datagrams_received: AtomicU64,
     pub(crate) queue_drops: AtomicU64,
+    pub(crate) stopped: std::sync::atomic::AtomicBool,
 }
 
 /// State the handles and every endpoint task share. It holds no command
@@ -251,6 +255,7 @@ impl QuicEndpoint {
                 recv_calls: AtomicU64::new(0),
                 datagrams_received: AtomicU64::new(0),
                 queue_drops: AtomicU64::new(0),
+                stopped: std::sync::atomic::AtomicBool::new(false),
             });
             let (cmds, cmds_rx) = mpsc::unbounded_channel();
             tokio::spawn(EndpointTask::new(shared.clone(), slot.clone(), io, cmds_rx).run());
@@ -307,6 +312,7 @@ impl QuicEndpoint {
                     recv_calls: slot.recv_calls.load(Ordering::Relaxed),
                     datagrams_received: slot.datagrams_received.load(Ordering::Relaxed),
                     queue_drops: slot.queue_drops.load(Ordering::Relaxed),
+                    stopped: slot.stopped.load(Ordering::Relaxed),
                 }
             })
             .collect()

@@ -23,8 +23,9 @@ pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 
 /// The ALPN for the zakura-quic transport (SPEC WIRE-2).
 ///
-/// Version 3 replaced the Iroh 1.x wire profile of `p2p-v2/2`, so nodes on
-/// different versions reach each other only over the legacy protocol.
+/// Its suffix is [`ZAKURA_PROTOCOL_VERSION_CURRENT`]. Version 3 replaced the
+/// Iroh 1.x wire profile of `p2p-v2/2`, so nodes on different versions reach
+/// each other only over the legacy protocol.
 pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/3";
 
 /// Magic bytes for Zakura legacy upgrade prelude messages.
@@ -48,8 +49,12 @@ pub const CONTROL_VERSION: u16 = 1;
 /// The first Zakura wire protocol version.
 pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
 
-/// Iroh 1.x requires a separate cohort from the incompatible Iroh 0.92 transport.
-pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 2;
+/// The current Zakura wire protocol version, which [`P2P_V2_ALPN`] carries.
+///
+/// The legacy upgrade prelude advertises it, so a node on another native
+/// transport version stays on the legacy protocol instead of dialing a QUIC
+/// profile it can't speak. Version 2 was Iroh 1.x; version 3 is zakura-quic.
+pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 3;
 
 /// Hard cap for any legacy TCP upgrade prelude payload.
 pub const MAX_PRELUDE_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -1940,6 +1945,27 @@ mod tests {
             P2pV2Upgrade::decode(&oversized),
             Err(ZakuraProtocolError::OversizedPayload { .. })
         ));
+    }
+
+    #[test]
+    fn alpn_carries_the_current_protocol_version() {
+        let expected = format!("p2p-v2/{ZAKURA_PROTOCOL_VERSION_CURRENT}");
+        assert_eq!(P2P_V2_ALPN, expected.as_bytes());
+    }
+
+    #[test]
+    fn previous_native_cohort_stays_on_legacy() {
+        // A peer on the Iroh 1.x release advertises protocol 2 only. The
+        // prelude must reject it, so the legacy connection survives instead of
+        // waiting on a native dial that fails ALPN negotiation.
+        let local = local_config();
+        let mut previous = init();
+        previous.zakura_protocol_min = ZAKURA_PROTOCOL_VERSION_CURRENT - 1;
+        previous.zakura_protocol_max = ZAKURA_PROTOCOL_VERSION_CURRENT - 1;
+        assert_eq!(
+            previous.validate(&local, nonces()),
+            Err(ZakuraRejectReason::IncompatibleZakuraProtocol)
+        );
     }
 
     #[test]

@@ -282,14 +282,21 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
 ) -> Option<(NodeAddr, Vec<IpAddr>)> {
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
+    // The endpoint starts one handshake per address, but the reservation
+    // counts one per IP. Dialing only the first address of each IP, in record
+    // order, keeps the two equal, so a record can't list many ports on one IP
+    // to multiply handshakes past the per-IP cap.
+    let mut checked_ips = Vec::new();
     for addr in &candidate.direct_addrs {
         let dial_ip = canonical_ip(addr.ip());
+        if checked_ips.contains(&dial_ip) {
+            continue;
+        }
+        checked_ips.push(dial_ip);
         if !discovery_ip_is_in_backoff(dial_backoff_by_node_ip, candidate.node_id, dial_ip, now)
             && can_accept_discovery_dial_ip(endpoint, dial_ip, in_flight_by_ip).await
         {
-            if !reserved_ips.contains(&dial_ip) {
-                reserved_ips.push(dial_ip);
-            }
+            reserved_ips.push(dial_ip);
             direct_addrs.push(*addr);
         }
     }
@@ -846,5 +853,51 @@ mod tests {
             decoy,
             now
         ));
+    }
+
+    // V12 F-71: the reservation counts one dial per IP, and the endpoint
+    // starts one handshake per address. A record that lists several ports on
+    // one IP must get one address per IP, so attempts equal reservations.
+    #[tokio::test]
+    async fn dial_keeps_the_first_address_of_each_ip() {
+        use std::net::SocketAddr;
+
+        let node = crate::zakura::testkit::ZakuraTestNode::builder(9211)
+            .spawn()
+            .await
+            .expect("dialer spawns");
+        let shared: IpAddr = IpAddr::from([93, 184, 216, 34]);
+        let other: IpAddr = IpAddr::from([198, 51, 100, 7]);
+        let mapped_shared: IpAddr = "::ffff:93.184.216.34"
+            .parse()
+            .expect("mapped test address parses");
+        let candidate = ZakuraDiscoveryDialCandidate {
+            node_id: node_id(5),
+            direct_addrs: vec![
+                SocketAddr::new(shared, 8233),
+                SocketAddr::new(shared, 8234),
+                SocketAddr::new(other, 8233),
+                SocketAddr::new(mapped_shared, 8235),
+                SocketAddr::new(other, 8234),
+            ],
+            is_static: false,
+        };
+
+        let (node_addr, reserved_ips) = discovery_node_addr_with_reserved_ip_capacity(
+            &node.endpoint(),
+            &candidate,
+            &HashMap::new(),
+            &HashMap::new(),
+            Instant::now(),
+        )
+        .await
+        .expect("both IPs have capacity");
+
+        assert_eq!(
+            node_addr.direct,
+            vec![SocketAddr::new(shared, 8233), SocketAddr::new(other, 8233)]
+        );
+        assert_eq!(reserved_ips, vec![shared, other]);
+        node.shutdown().await;
     }
 }

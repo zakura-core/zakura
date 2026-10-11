@@ -847,7 +847,9 @@ mod tests {
                             }))
                             .await;
                     }
-                    BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                    BlockSyncAction::QueryBlocksByHeightRange {
+                        peer, start, count, ..
+                    } => {
                         let _ = handle
                             .send(BlockSyncEvent::BlockRangeResponseFinished {
                                 peer,

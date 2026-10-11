@@ -2032,6 +2032,18 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns the contiguous prefix whose serialized bodies fit the byte budget.
+    ///
+    /// Stops database collection before retaining a block that exceeds the budget.
+    BoundedBlocksByHeightRange {
+        /// First height to read.
+        start: block::Height,
+        /// Maximum number of blocks to return.
+        count: u32,
+        /// Maximum total serialized bytes retained in the response.
+        max_response_bytes: u32,
+    },
+
     /// Returns contiguous committed blocks by height from the finalized state,
     /// in ascending order, as their raw Zcash consensus serializations.
     ///
@@ -2273,6 +2285,7 @@ impl ReadRequest {
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
+            ReadRequest::BoundedBlocksByHeightRange { .. } => "bounded_blocks_by_height_range",
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",

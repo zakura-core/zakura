@@ -104,7 +104,7 @@ pub(super) fn request_priority(
     start_height: block::Height,
 ) -> RequestPriority {
     // The next height above the floor can still unblock the current floor.
-    if start_height <= floor_rescue_high(download_floor) {
+    if next_height(download_floor) == Some(start_height) {
         RequestPriority::Floor
     } else {
         RequestPriority::AboveFloor
@@ -271,6 +271,7 @@ fn remaining_lookahead_wire_bytes(
 /// released at receipt), so unlike [`admit`] this never consults
 /// `budget_available`: only the commit-window exemption and the resident
 /// look-ahead gate — the two rules that bound retention — apply.
+#[cfg(test)]
 pub(super) fn admit_received_body(
     config: &ZakuraBlockSyncConfig,
     snapshot: &AdmissionSnapshot,

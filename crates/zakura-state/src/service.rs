@@ -3259,6 +3259,21 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::Blocks(blocks))
             }
 
+            ReadRequest::BoundedBlocksByHeightRange {
+                start,
+                count,
+                max_response_bytes,
+            } => {
+                let best_chain = state.latest_best_chain();
+                let blocks = block_range::collect_bounded_height_range(
+                    start,
+                    count,
+                    max_response_bytes,
+                    |height| read::block_and_size(best_chain.clone(), &state.db, height.into()),
+                );
+                Ok(ReadResponse::Blocks(blocks))
+            }
+
             // Used by the indexer gRPC server.
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { start, count } => {

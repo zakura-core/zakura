@@ -111,7 +111,7 @@ fn spawn_owned_block_range<R: Send + 'static>(
 ///
 /// The first block that does not fit can be materialized by the lookup, but is
 /// dropped immediately and never enters the returned response.
-fn collect_bounded_height_range<T>(
+pub(super) fn collect_bounded_height_range<T>(
     start: block::Height,
     count: u32,
     max_response_bytes: u32,

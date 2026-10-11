@@ -200,13 +200,14 @@ impl WorkQueue {
     /// Add scoped `(height, hash, size)` items to `pending`.
     /// Insert a height above `floor` only when no pending or in-flight item owns it.
     /// Return the number of inserted heights.
-    /// Wake waiters after inserting any height.
+    /// Wake waiters after inserting a height or changing a pending estimate.
     pub(super) fn extend(
         &self,
         scope: zakura_header_chain::BodyWorkAuthority,
         items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
     ) -> usize {
         let mut inserted = 0usize;
+        let mut changed = false;
         {
             let mut inner = self.lock();
             inner.current_authority = Some(scope);
@@ -220,7 +221,10 @@ impl WorkQueue {
                         && item.scope == scope
                         && !matches!(size, BlockSizeEstimate::Unknown)
                     {
-                        item.estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        let estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        changed |=
+                            item.estimated_bytes != estimated_bytes || item.size_hint != size;
+                        item.estimated_bytes = estimated_bytes;
                         item.size_hint = size;
                     }
                     continue;
@@ -247,7 +251,7 @@ impl WorkQueue {
                 inserted += 1;
             }
         }
-        if inserted > 0 {
+        if inserted > 0 || changed {
             self.available.notify_waiters();
         }
         inserted
@@ -326,6 +330,7 @@ impl WorkQueue {
     /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
     /// and is **NOT** clamped to the floor (the download floor is never an upper
     /// bound on the fetch). Returns empty if nothing is eligible.
+    #[cfg(test)]
     pub(super) fn take_in_range(
         &self,
         low: block::Height,
@@ -623,7 +628,8 @@ impl WorkQueue {
     /// End an active request reservation at receipt.
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
-        self.release_active_reserved_height_matching(None, height, None)
+        self.release_active_reserved_height_matching(None, None, height, None)
+            .map(|(_, bytes)| bytes)
     }
 
     /// End the receipt reservation and retire any queued request it invalidates.
@@ -634,7 +640,8 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Option<u64> {
-        self.release_active_reserved_height_matching(Some(owner), height, None)
+        self.release_active_reserved_height_matching(Some(owner), None, height, None)
+            .map(|(_, bytes)| bytes)
     }
 
     /// Train once when a hash-matched body settles its active reservation.
@@ -644,19 +651,69 @@ impl WorkQueue {
         height: block::Height,
         bytes: u64,
     ) -> Option<u64> {
-        self.release_active_reserved_height_matching(Some(owner), height, Some(bytes))
+        self.release_active_reserved_height_matching(Some(owner), None, height, Some(bytes))
+            .map(|(_, bytes)| bytes)
+    }
+
+    /// Select and settle the current hash-matched reservation under one lock.
+    /// Pending, provisional, already-received and replaced-hash work cannot be adopted.
+    pub(super) fn receive_body_for_hash(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+    ) -> Option<(zakura_header_chain::BodyWorkOwner, u64)> {
+        self.release_active_reserved_height_matching(None, Some((hash, None)), height, Some(bytes))
+            .and_then(|(owner, released)| owner.map(|owner| (owner, released)))
+    }
+
+    /// A matched late frame may be reissued within its compatible epoch only.
+    pub(super) fn receive_body_for_hash_in_epoch(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+        epoch: zakura_header_chain::BodyWorkEpoch,
+    ) -> Option<(zakura_header_chain::BodyWorkOwner, u64)> {
+        self.release_active_reserved_height_matching(
+            None,
+            Some((hash, Some(epoch))),
+            height,
+            Some(bytes),
+        )
+        .and_then(|(owner, released)| owner.map(|owner| (owner, released)))
+    }
+
+    /// Receipt ends a peer obligation even while its owner remains for the sequencer.
+    pub(super) fn has_reserved_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> bool {
+        self.lock().in_flight.get(&height).is_some_and(|item| {
+            !item.provisional && item.owner == Some(owner) && item.budget.is_reserved()
+        })
     }
 
     fn release_active_reserved_height_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
+        expected_hash: Option<(block::Hash, Option<zakura_header_chain::BodyWorkEpoch>)>,
         height: block::Height,
         observed_bytes: Option<u64>,
-    ) -> Option<u64> {
-        let (released, claim) = {
+    ) -> Option<(Option<zakura_header_chain::BodyWorkOwner>, u64)> {
+        let (received_owner, released, claim) = {
             let mut inner = self.lock();
             let (released, owner, observation) = {
                 let item = inner.in_flight.get_mut(&height)?;
+                if expected_hash.is_some_and(|(hash, epoch)| {
+                    item.hash != hash
+                        || item.provisional
+                        || item.owner.is_none()
+                        || epoch.is_some_and(|epoch| item.scope.body_work_epoch != epoch)
+                }) {
+                    return None;
+                }
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     return None;
                 }
@@ -669,8 +726,7 @@ impl WorkQueue {
                 }
                 (item.budget.release_reserved(), item.owner, observation)
             };
-            // A forward reset can retain an old reservation below the new floor.
-            // Settle it normally, but do not train the reset estimator from it.
+            // Only current above-floor work can train the estimate.
             if let Some(bytes) = observation.filter(|_| height > inner.floor) {
                 let previous = inner.unknown_estimate();
                 let sample = bytes.clamp(inner.floor_estimate_bytes, block::MAX_BLOCK_BYTES);
@@ -681,13 +737,17 @@ impl WorkQueue {
             }
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
-            (released.saturating_add(outcome.released_bytes), claim)
+            (
+                owner,
+                released.saturating_add(outcome.released_bytes),
+                claim,
+            )
         };
         drop(claim);
         if observed_bytes.is_some() {
             self.available.notify_waiters();
         }
-        Some(released)
+        Some((received_owner, released))
     }
 
     /// Claim a received height and end any request reservation it owned.
@@ -698,6 +758,7 @@ impl WorkQueue {
 
     /// Claim a received height and return its reservation plus any unsent bytes
     /// released by retiring the queued request.
+    #[cfg(test)]
     pub(super) fn claim_received_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -706,6 +767,7 @@ impl WorkQueue {
         self.claim_received_matching(Some(owner), height)
     }
 
+    #[cfg(test)]
     fn claim_received_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
@@ -963,6 +1025,12 @@ impl WorkQueue {
                 .released_bytes
                 .saturating_add(item.budget.release_reserved());
             item.owner = None;
+            if let Some(authority) = inner
+                .current_authority
+                .filter(|authority| authority.body_work_epoch == item.scope.body_work_epoch)
+            {
+                item.scope = authority;
+            }
             if let Some(estimate) = item.retry_estimated_bytes.take() {
                 item.estimated_bytes = estimate.max(item.observed_bytes);
             }
@@ -1015,9 +1083,9 @@ impl WorkQueue {
         released
     }
 
-    /// Frontier reset: pin the floor and drop every `pending`/`in_flight` entry
-    /// `> floor` (their buffers were dropped; the producer re-fills via the next
-    /// query).
+    /// Frontier reset: pin the floor and retire all old work. Entries at or below
+    /// the new floor are committed; entries above it lost their buffers and are
+    /// re-filled by the producer's next query.
     ///
     /// Returns request-estimate bytes still reserved for unreceived heights, as
     /// in [`advance_floor`](Self::advance_floor).
@@ -1030,34 +1098,19 @@ impl WorkQueue {
             .values()
             .filter_map(|registration| registration.claim.upgrade())
             .collect();
-        for claim in claims.iter().filter(|claim| claim.has_height_above(floor)) {
+        for claim in &claims {
             claim.reset();
             inner.request_writes.remove(&claim.owner());
         }
         inner.floor = floor;
         inner.observed_estimate_bytes = block::MAX_BLOCK_BYTES;
         inner.last_observation = None;
-        // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
-        // note in `advance_floor` on why a full-map `retain` is too expensive here.
+        inner.request_writes.clear();
         let mut released = 0u64;
-        while let Some((&height, _)) = inner.pending.last_key_value() {
-            if height <= floor {
-                break;
-            }
-            let (_, mut item) = inner
-                .pending
-                .pop_last()
-                .expect("last_key_value returned Some");
+        while let Some((_, mut item)) = inner.pending.pop_first() {
             released = released.saturating_add(item.budget.release_reserved());
         }
-        while let Some((&height, _)) = inner.in_flight.last_key_value() {
-            if height <= floor {
-                break;
-            }
-            let (_, mut item) = inner
-                .in_flight
-                .pop_last()
-                .expect("last_key_value returned Some");
+        while let Some((_, mut item)) = inner.in_flight.pop_first() {
             released = released.saturating_add(item.budget.release_reserved());
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
@@ -1288,14 +1341,6 @@ impl WorkQueue {
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {
         self.lock().pending.contains_key(&height)
-    }
-
-    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
-        self.lock().in_flight.get(&height).and_then(|item| {
-            item.budget
-                .is_reserved()
-                .then(|| item.budget.reserved_charge())
-        })
     }
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {

@@ -2403,7 +2403,15 @@ mod zakura_header_sync_driver_tests {
             let query_seen = query_seen.clone();
             async move {
                 match request {
-                    zakura_state::ReadRequest::BlocksByHeightRange { start, count } => {
+                    zakura_state::ReadRequest::BoundedBlocksByHeightRange {
+                        start,
+                        count,
+                        max_response_bytes,
+                    } => {
+                        assert_eq!(
+                            max_response_bytes, 1024,
+                            "the driver must forward its serving budget"
+                        );
                         if let Some(query_seen) = query_seen {
                             if let Some(query_seen) = query_seen
                                 .lock()
@@ -4246,6 +4254,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(77),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4369,6 +4378,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(78),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4443,6 +4453,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(79),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4532,6 +4543,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(80),
                 start: block::Height(1),
                 count: 2,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel handles serving work after submit storm");

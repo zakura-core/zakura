@@ -146,12 +146,6 @@ impl RequestWrite {
         self.budget.clone().release(released.released_bytes);
     }
 
-    pub(super) fn has_height_above(&self, floor: block::Height) -> bool {
-        #[cfg(test)]
-        tests::before_reset_height_check();
-        self.items.last().is_some_and(|(height, _)| *height > floor)
-    }
-
     pub(super) fn expire_unwritten(&self) {
         if self.status().expire_unwritten() {
             // A competing body can settle every byte without returning work.
@@ -161,6 +155,8 @@ impl RequestWrite {
     }
 
     pub(super) fn reset(&self) {
+        #[cfg(test)]
+        tests::before_claim_reset();
         self.expire_unwritten();
         if self.state.load(Ordering::Acquire) == STARTED {
             // The prefix already belongs to this ordered stream. Cancelling the

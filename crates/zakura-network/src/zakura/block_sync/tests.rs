@@ -3428,10 +3428,10 @@ fn work_queue_advance_floor_and_reset_above_gc_both_maps() {
     assert!(!queue.pending_contains(block::Height(3)));
     assert!(queue.pending_contains(block::Height(4)));
 
-    // reset_above drops > floor from both maps (reset dropped their buffers).
+    // reset_above retires committed work and drops the old above-floor buffers.
     queue.take_in_range(block::Height(4), block::Height(4), 1); // h4 → in flight
     queue.reset_above(block::Height(4));
-    assert!(queue.in_flight_contains(block::Height(4)));
+    assert!(!queue.in_flight_contains(block::Height(4)));
     assert!(!queue.pending_contains(block::Height(5)));
     assert!(!queue.pending_contains(block::Height(6)));
     assert_eq!(queue.pending_len(), 0);
@@ -12103,10 +12103,16 @@ async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                peer,
+                start,
+                count,
+                max_response_bytes,
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 2);
+                assert_eq!(max_response_bytes, block1_size);
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
@@ -14558,7 +14564,9 @@ async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
         .expect("GetBlocks frame queues");
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+            BlockSyncAction::QueryBlocksByHeightRange {
+                peer, start, count, ..
+            } => {
                 assert_eq!(peer, peer_id);
                 assert_eq!(start, block::Height(1));
                 assert_eq!(count, 3);
@@ -16185,11 +16193,11 @@ fn stale_body_after_forward_reset_does_not_retrain_size_estimate() {
     );
     queue.mark_reserved_for_owner(owner, [block::Height(1)]);
 
-    // A forward reset leaves the old reservation until its routine settles it.
-    queue.reset_above(block::Height(1));
+    // A forward reset retires the old reservation before a late body arrives.
+    assert_eq!(queue.reset_above(block::Height(1)), block::MAX_BLOCK_BYTES);
     assert_eq!(
         queue.receive_body_for_owner(owner, block::Height(1), 1024),
-        Some(block::MAX_BLOCK_BYTES)
+        None
     );
     queue.extend(test_work_scope(), [needed(2, BlockSizeEstimate::Unknown)]);
     assert_eq!(
@@ -16349,6 +16357,59 @@ async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() 
     assert_eq!(queue.reserved_bytes(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn pending_hint_refresh_wakes_waiters_without_inserting_work() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let wake = queue.subscribe_available().notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+    assert_eq!(
+        queue.extend(
+            test_work_scope(),
+            [needed(1, BlockSizeEstimate::Advertised(1024))],
+        ),
+        0
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(1))
+            .unwrap()
+            .estimated_bytes,
+        1024
+    );
+    tokio::time::timeout(Duration::from_millis(1), wake)
+        .await
+        .expect("a cheaper existing item must wake a scheduler waiting for work");
+}
+
+#[test]
+fn pending_hint_refresh_after_return_uses_current_authority() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let scope = test_work_scope();
+    let current = zakura_header_chain::BodyWorkAuthority {
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(9),
+        ..scope
+    };
+    let owner = scope.bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_in_range(block::Height(1), block::Height(1), 1);
+    queue.mark_reserved_for_owner(owner, [block::Height(1)]);
+    queue.refresh_authority(current);
+    assert_eq!(queue.owner_for_height(block::Height(1)), Some(owner));
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    queue.refresh_size_estimates(current, [needed(1, BlockSizeEstimate::Advertised(1024))]);
+    let retry = queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert_eq!(retry[0].1.scope, current);
+    assert!(retry[0].1.reservation_has_size_hint);
+    assert_eq!(retry[0].1.estimated_bytes, 1024);
+}
+
 #[test]
 fn hint_refresh_cannot_relabel_an_issued_unknown_reservation() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
@@ -16496,4 +16557,96 @@ fn overlapping_submission_window_retains_detached_memory_until_completion() {
         assert_eq!(seq.in_flight_submission_bytes(), 0);
         assert_eq!(seq.in_flight_submission_count_scanned(), 0);
     }
+}
+
+#[test]
+fn forward_reset_retires_committed_pending_and_reserved_work() {
+    let queue = work_queue_with(
+        0,
+        (1..=6).map(|height| needed(height, BlockSizeEstimate::Unknown)),
+    );
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    queue.mark_reserved_for_owner(owner, [block::Height(2)]);
+    assert_eq!(
+        queue.reset_above(block::Height(4)),
+        block::MAX_BLOCK_BYTES,
+        "forward reset releases obsolete reservations at or below its floor"
+    );
+    assert_eq!(queue.pending_len(), 0);
+    assert_eq!(queue.in_flight_len(), 0);
+    assert_eq!(queue.reserved_bytes(), 0);
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(2), 1024),
+        None
+    );
+}
+
+#[test]
+fn committed_heights_do_not_receive_floor_rescue_priority() {
+    for height in 0..=4 {
+        assert_eq!(
+            super::admission::request_priority(block::Height(4), block::Height(height)),
+            super::admission::RequestPriority::AboveFloor
+        );
+    }
+    assert_eq!(
+        super::admission::request_priority(block::Height(4), block::Height(5)),
+        super::admission::RequestPriority::Floor
+    );
+}
+
+#[test]
+fn atomic_late_receipt_requires_current_hash_and_active_owned_reservation() {
+    let queue = Arc::new(work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]));
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    assert_eq!(
+        queue.receive_body_for_hash(height, hash, 1024),
+        None,
+        "pending work has no owner"
+    );
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(2).unwrap());
+    let items = queue.take_for_request(height, height, 1, u64::MAX, 7, owner.request_id);
+    assert_eq!(
+        queue.receive_body_for_hash(height, hash, 1024),
+        None,
+        "an unpublished provisional owner is not a request"
+    );
+    let claim = super::work_queue::RequestWrite::new(
+        owner,
+        items,
+        Arc::clone(&queue),
+        ByteBudget::new(block::MAX_BLOCK_BYTES),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    assert!(claim.publish(|| {}));
+    assert_eq!(
+        queue.receive_body_for_hash(height, block::Hash([2; 32]), 1024),
+        None,
+        "a stale hash cannot steal a replacement claim"
+    );
+    assert_eq!(queue.reserved_bytes(), block::MAX_BLOCK_BYTES);
+    assert_eq!(
+        queue.receive_body_for_hash(height, hash, 1024),
+        Some((owner, block::MAX_BLOCK_BYTES))
+    );
+    assert_eq!(
+        queue.receive_body_for_hash(height, hash, 1024),
+        None,
+        "only one completion settles and trains"
+    );
+    assert_eq!(
+        queue.owner_for_height(height),
+        Some(owner),
+        "the sequencer retains exact ownership after receipt"
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
 }

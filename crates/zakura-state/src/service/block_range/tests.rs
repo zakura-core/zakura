@@ -373,3 +373,53 @@ fn block_range_response_includes_a_maximum_size_first_block() {
         vec![(block::Height(10), block::Height(10), maximum)]
     );
 }
+
+#[tokio::test]
+async fn bounded_tower_range_enforces_the_serialized_byte_budget() {
+    use tower::ServiceExt;
+
+    let _guard = zakura_test::init();
+    let blocks: Vec<Arc<block::Block>> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| Arc::new(bytes.zcash_deserialize_into().unwrap()))
+        .collect();
+    let sizes: Vec<_> = blocks
+        .iter()
+        .map(|block| block.zcash_serialized_size())
+        .collect();
+    let total: usize = sizes.iter().sum();
+    let (_state, read_state, _tip, _change) = timeout(
+        DEADLINE,
+        crate::populated_state(blocks.clone(), &Network::Mainnet),
+    )
+    .await
+    .unwrap();
+    for (budget, expected_count) in [(sizes[0] - 1, 0), (sizes[0], 1), (total - 1, 2), (total, 3)] {
+        let response = timeout(
+            DEADLINE,
+            read_state
+                .clone()
+                .oneshot(crate::ReadRequest::BoundedBlocksByHeightRange {
+                    start: block::Height(0),
+                    count: 128,
+                    max_response_bytes: u32::try_from(budget).unwrap(),
+                }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let crate::ReadResponse::Blocks(response) = response else {
+            panic!("bounded range must return blocks");
+        };
+        assert_eq!(
+            response.len(),
+            expected_count,
+            "only the fitting prefix may enter the response"
+        );
+        for (index, (height, block, size)) in response.iter().enumerate() {
+            assert_eq!(height.0, u32::try_from(index).unwrap());
+            assert_eq!(block, &blocks[index]);
+            assert_eq!(*size, sizes[index]);
+        }
+    }
+}

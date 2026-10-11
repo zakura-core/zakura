@@ -571,7 +571,8 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::MissingBlockBodyMetadata`].
     MissingBlockBodyMetadata(BlockSyncBodyMetadata),
 
-    /// Response to [`ReadRequest::BlocksByHeightRange`].
+    /// Response to [`ReadRequest::BlocksByHeightRange`] or
+    /// [`ReadRequest::BoundedBlocksByHeightRange`].
     Blocks(Vec<(block::Height, Arc<Block>, usize)>),
 
     /// Response to [`ReadRequest::RawBlocksByHeightRange`], with each block's

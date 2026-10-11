@@ -99,12 +99,11 @@ for the commit-window exemption, the resident-memory gate, and request sizing â€
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
 
-The one deliberate exception is `admission::admit_received_body`, the retention-only
-gate for a body that is already downloaded (the unmatched-fallthrough path). A received
-body consumes no request budget, so it applies the same commit-window exemption and
-resident gate but never consults `budget_available` â€” a wire budget saturated by
-outstanding requests must not force an already-paid-for body to be dropped and
-re-downloaded.
+A late body can settle a current active reservation for its exact header hash,
+including a reservation reissued to another peer. Selection and settlement share
+one queue lock. Pending work has no request owner and cannot accept an unowned
+completion. The ended wire reservation is released only after the body enters
+resident-memory accounting.
 
 ### The commit window
 

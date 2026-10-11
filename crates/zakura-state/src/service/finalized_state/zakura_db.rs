@@ -178,30 +178,41 @@ impl ZakuraDb {
         // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
         let version_path =
             config.version_file_path(&db_kind, format_version_in_code.major, network);
-        let read_disk_version = || {
-            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
-                .map_err(|source| StateInitError::DatabaseFormatVersion {
-                    path: version_path.clone(),
-                    source,
-                })
-        };
-        let disk_version = if read_only {
+        if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
+        }
+        let disk_version = database_format_version_on_disk(
+            config,
+            &db_kind,
+            format_version_in_code.major,
+            network,
+        )
+        .map_err(|source| StateInitError::DatabaseFormatVersion {
+            path: version_path.clone(),
+            source,
+        })?;
+        if let Some(version) = &disk_version {
+            if version.major > format_version_in_code.major {
+                return Err(StateInitError::UnsupportedDatabaseFormat {
+                    path: config.db_path(&db_kind, format_version_in_code.major, network),
+                    disk_version: version.clone(),
+                    running_version: format_version_in_code.clone(),
+                });
+            }
+        }
 
-            read_disk_version()?
+        let disk_version = if read_only {
+            disk_version
         } else {
-            match DiskDb::try_reusing_previous_db_after_major_upgrade(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
                 &restorable_db_versions(),
                 format_version_in_code,
                 config,
                 &db_kind,
                 network,
-            ) {
-                Some(version) => Some(version),
-                None => read_disk_version()?,
-            }
+            )
+            .or(disk_version)
         };
-        let disk_version_before_open = disk_version.clone();
 
         // Log any format changes before opening the database, in case opening fails.
         let format_change = DbFormatChange::open_database(format_version_in_code, disk_version);
@@ -229,12 +240,35 @@ impl ZakuraDb {
         // file can only be changed while we hold the RocksDB database lock.
         let disk_db = DiskDb::new(
             config,
-            db_kind,
+            &db_kind,
             format_version_in_code,
             network,
             column_families_in_code,
             read_only,
         )?;
+
+        // Another process can move or upgrade the database after the initial probe.
+        // Re-read its marker while this writer holds the RocksDB lock.
+        let disk_version_before_open = if version_path.exists() {
+            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
+                .map_err(|source| StateInitError::DatabaseFormatVersion {
+                    path: version_path,
+                    source,
+                })?
+        } else {
+            format_change.initial_disk_version()
+        };
+        if let Some(version) = &disk_version_before_open {
+            if version.major > format_version_in_code.major {
+                return Err(StateInitError::UnsupportedDatabaseFormat {
+                    path: disk_db.path().to_owned(),
+                    disk_version: version.clone(),
+                    running_version: format_version_in_code.clone(),
+                });
+            }
+        }
+        let format_change =
+            DbFormatChange::open_database(format_version_in_code, disk_version_before_open.clone());
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
@@ -564,7 +598,9 @@ mod tests {
 
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
-        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+        service::finalized_state::{
+            DiskWriteBatch, NODE_SOFTWARE_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
     };
 
     use super::*;
@@ -621,6 +657,120 @@ mod tests {
 
         db.update_format_version_on_disk(&disk_version)
             .expect("fixture version write succeeds");
+    }
+
+    #[test]
+    fn concurrent_major_reuse_keeps_one_startup_running() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let running = state_database_format_version_in_code();
+        for _ in 0..8 {
+            let (_cache, config) = persistent_config();
+            let previous = Version::new(running.major - 1, 0, 0);
+            let db = DiskDb::new(
+                &config,
+                STATE_DATABASE_KIND,
+                &previous,
+                &network,
+                STATE_COLUMN_FAMILIES_IN_CODE
+                    .iter()
+                    .map(ToString::to_string),
+                false,
+            )
+            .unwrap();
+            db.put_cf(
+                db.cf_handle(NODE_SOFTWARE_METADATA).unwrap(),
+                b"reuse-test",
+                b"preserved",
+            )
+            .unwrap();
+            crate::write_database_format_version_to_disk(
+                &config,
+                STATE_DATABASE_KIND,
+                previous.major,
+                &previous,
+                &network,
+            )
+            .unwrap();
+            drop(db);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let start = || {
+                    barrier.wait();
+                    open(&config, &network, false)
+                };
+                let first = scope.spawn(start);
+                let second = scope.spawn(start);
+                let first = first.join().expect("first startup must not panic");
+                let second = second.join().expect("second startup must not panic");
+                assert!(
+                    first.is_ok() || second.is_ok(),
+                    "one startup must acquire the database"
+                );
+                let db = first.as_ref().or(second.as_ref()).unwrap();
+                assert_eq!(
+                    db.db
+                        .get_cf(
+                            db.db.cf_handle(NODE_SOFTWARE_METADATA).unwrap(),
+                            b"reuse-test"
+                        )
+                        .unwrap(),
+                    Some(b"preserved".to_vec()),
+                    "the successful startup must retain the source database contents"
+                );
+            });
+            assert!(
+                !config
+                    .db_path(STATE_DATABASE_KIND, previous.major, &network)
+                    .exists(),
+                "concurrent reuse must not recreate the source directory"
+            );
+            assert_eq!(
+                crate::state_database_format_version_on_disk(&config, &network).unwrap(),
+                Some(running.clone()),
+                "the successful startup must finish the format upgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_major_format_is_rejected_without_changing_the_database() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let running_version = state_database_format_version_in_code();
+        let disk_version = Version::new(running_version.major + 1, 0, 0);
+        seed_db(&config, &network, disk_version.clone(), false);
+        let version_path =
+            config.version_file_path(STATE_DATABASE_KIND, running_version.major, &network);
+        let original_version = std::fs::read(&version_path).expect("fixture version exists");
+
+        for read_only in [false, true] {
+            let error =
+                open(&config, &network, read_only).expect_err("newer major format is incompatible");
+            assert!(
+                matches!(error, StateInitError::UnsupportedDatabaseFormat { disk_version: actual, .. } if actual == disk_version)
+            );
+            assert_eq!(
+                std::fs::read(&version_path).expect("version remains readable"),
+                original_version
+            );
+        }
+    }
+
+    #[test]
+    fn newer_minor_format_remains_openable_in_both_modes() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let running_version = state_database_format_version_in_code();
+        let disk_version = Version::new(running_version.major, running_version.minor + 1, 0);
+        for read_only in [false, true] {
+            let (_cache, config) = persistent_config();
+            seed_db(&config, &network, disk_version.clone(), false);
+            let db = open(&config, &network, read_only)
+                .expect("minor format updates remain backwards compatible");
+            drop(db);
+        }
     }
 
     /// A Mainnet database written by the original VCT fast path is missing historical Sprout

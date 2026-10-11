@@ -313,13 +313,14 @@ impl fmt::Display for Transaction {
 /// Each count saturates at [`u32::MAX`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ShieldedActionCounts {
-    /// The number of Orchard actions plus the number of Ironwood actions.
+    /// The number of Orchard actions.
+    pub orchard_actions: u32,
+    /// The number of Ironwood actions.
     ///
-    /// ZIP 218 names only Orchard actions. Zakura also counts Ironwood actions,
-    /// because NU6.3 (ZIP 258) moves new Orchard-protocol value to the Ironwood
-    /// pool. Ironwood actions therefore share the Orchard limit and add to the
-    /// global shielded budget.
-    pub orchard_and_ironwood_actions: u32,
+    /// ZIP 218 gives Ironwood its own per-block limit, equal to the Orchard
+    /// limit, because NU6.3 (ZIP 258) moves new Orchard-protocol value to the
+    /// Ironwood pool.
+    pub ironwood_actions: u32,
     /// The number of Sapling spends plus outputs.
     pub sapling_ios: u32,
     /// The number of Sprout JoinSplits.
@@ -327,12 +328,15 @@ pub struct ShieldedActionCounts {
 }
 
 impl ShieldedActionCounts {
-    /// Returns the total shielded cost:
-    /// `orchard_and_ironwood_actions + sapling_ios + 2 * sprout_joinsplits`.
+    /// Returns the total shielded cost: `orchard_actions + ironwood_actions +
+    /// sapling_ios + 2 * sprout_joinsplits`.
     ///
-    /// Sprout JoinSplits count twice because each produces two shielded outputs.
+    /// Orchard and Ironwood actions draw on the same global budget, so both
+    /// pools add to this cost. Sprout JoinSplits count twice because each
+    /// produces two shielded outputs.
     pub fn cost(&self) -> u32 {
-        self.orchard_and_ironwood_actions
+        self.orchard_actions
+            .saturating_add(self.ironwood_actions)
             .saturating_add(self.sapling_ios)
             .saturating_add(self.sprout_joinsplits.saturating_mul(2))
     }
@@ -340,9 +344,8 @@ impl ShieldedActionCounts {
     /// Returns the field-wise saturating sum of `self` and `other`.
     pub fn saturating_add(self, other: Self) -> Self {
         Self {
-            orchard_and_ironwood_actions: self
-                .orchard_and_ironwood_actions
-                .saturating_add(other.orchard_and_ironwood_actions),
+            orchard_actions: self.orchard_actions.saturating_add(other.orchard_actions),
+            ironwood_actions: self.ironwood_actions.saturating_add(other.ironwood_actions),
             sapling_ios: self.sapling_ios.saturating_add(other.sapling_ios),
             sprout_joinsplits: self
                 .sprout_joinsplits
@@ -1305,8 +1308,8 @@ impl Transaction {
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
 
         ShieldedActionCounts {
-            orchard_and_ironwood_actions: count(self.orchard_actions().count())
-                .saturating_add(count(self.ironwood_actions().count())),
+            orchard_actions: count(self.orchard_actions().count()),
+            ironwood_actions: count(self.ironwood_actions().count()),
             sapling_ios: count(self.sapling_spends_per_anchor().count())
                 .saturating_add(count(self.sapling_outputs().count())),
             sprout_joinsplits: count(self.joinsplit_count()),

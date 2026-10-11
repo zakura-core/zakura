@@ -34,6 +34,7 @@ fn check_parameters_impl() {
         zp_consensus::NetworkUpgrade::Nu6_1,
         zp_consensus::NetworkUpgrade::Nu6_2,
         zp_consensus::NetworkUpgrade::Nu6_3,
+        zp_consensus::NetworkUpgrade::Nu7,
     ];
 
     for (network, zp_network) in [
@@ -164,6 +165,115 @@ fn nu6_3_public_consensus_boundary_matches_librustzcash() {
     }
 }
 
+/// Pins the NU7 consensus branch ID to ZIP 259 and Zakura Common's parameters.
+#[test]
+fn nu7_branch_id_matches_zip_259_and_librustzcash() {
+    assert_eq!(
+        NetworkUpgrade::from(zp_consensus::NetworkUpgrade::Nu7),
+        NetworkUpgrade::Nu7,
+        "librustzcash's NU7 upgrade must map to Zakura's NU7 era",
+    );
+
+    let branch_id = NetworkUpgrade::Nu7
+        .branch_id()
+        .expect("NU7 has the consensus branch ID from ZIP 259");
+
+    assert_eq!(u32::from(branch_id), 0x77190ad9);
+    assert_eq!(u32::from(branch_id), u32::from(zp_consensus::BranchId::Nu7));
+    assert_eq!(
+        NetworkUpgrade::try_from(0x77190ad9).expect("the ZIP 259 NU7 branch ID is known to Zakura"),
+        NetworkUpgrade::Nu7,
+    );
+    assert_eq!(
+        zp_consensus::BranchId::try_from(branch_id)
+            .expect("Zakura's NU7 branch ID is known to librustzcash"),
+        zp_consensus::BranchId::Nu7,
+    );
+}
+
+/// Mainnet and default Regtest keep NU7 unscheduled.
+#[test]
+fn nu7_remains_unscheduled_on_mainnet_and_regtest() {
+    assert_eq!(
+        zp_consensus::MAIN_NETWORK.activation_height(zp_consensus::NetworkUpgrade::Nu7),
+        None,
+    );
+    for network in [
+        Network::Mainnet,
+        Network::new_regtest(RegtestParameters::default()),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+    }
+}
+
+/// Default Testnet selects NU7 and its timing rules at Common's activation height.
+#[test]
+fn nu7_default_testnet_activation_matches_common() {
+    let activation_height = zp_consensus::TEST_NETWORK
+        .activation_height(zp_consensus::NetworkUpgrade::Nu7)
+        .expect("Common schedules NU7 on Testnet");
+    let activation_height = Height(u32::from(activation_height));
+    assert_eq!(activation_height, Height(4_465_026));
+
+    for network in [
+        Network::new_default_testnet(),
+        testnet::Parameters::build()
+            .to_network()
+            .expect("default Testnet parameters are valid"),
+    ] {
+        assert_eq!(
+            NetworkUpgrade::Nu7.activation_height(&network),
+            Some(activation_height),
+        );
+        assert!(NetworkUpgrade::is_activation_height(
+            &network,
+            activation_height
+        ));
+        for (height, upgrade) in [
+            (
+                activation_height.previous().expect("NU7 is not genesis"),
+                NetworkUpgrade::Nu6_3,
+            ),
+            (activation_height, NetworkUpgrade::Nu7),
+            (
+                activation_height
+                    .next()
+                    .expect("NU7 is below the maximum height"),
+                NetworkUpgrade::Nu7,
+            ),
+        ] {
+            assert_eq!(NetworkUpgrade::current(&network, height), upgrade);
+            assert_eq!(
+                ConsensusBranchId::current(&network, height),
+                upgrade.branch_id()
+            );
+            assert_eq!(
+                NetworkUpgrade::is_nu7_active(&network, height),
+                upgrade == NetworkUpgrade::Nu7,
+            );
+            assert_eq!(
+                NetworkUpgrade::target_spacing_for_height(&network, height),
+                upgrade.target_spacing()
+            );
+            assert_eq!(
+                zp_consensus::BranchId::for_height(&network, height.0.into()),
+                zp_consensus::BranchId::for_height(&zp_consensus::TEST_NETWORK, height.0.into()),
+            );
+            assert_eq!(
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height)
+                    .expect("the Testnet minimum-difficulty rule is active by NU7")
+                    .num_seconds(),
+                450,
+            );
+        }
+        assert_eq!(
+            NetworkUpgrade::target_spacing_for_height(&network, activation_height).num_seconds(),
+            25,
+        );
+    }
+}
+
 /// NU6.3 does not change the post-Blossom timing rules used by difficulty validation.
 #[test]
 fn nu6_3_keeps_post_blossom_timing_rules() {
@@ -203,6 +313,46 @@ fn nu6_3_keeps_post_blossom_timing_rules() {
         .num_seconds(),
         6 * 75,
     );
+}
+
+/// Testnet keeps the historical gap until its configured NU7 activation, then
+/// requires 18 target spacings before minimum difficulty applies.
+#[test]
+fn nu7_testnet_minimum_difficulty_gap_starts_at_activation() {
+    const NU7: u32 = 400_000;
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let previous_time =
+        chrono::DateTime::from_timestamp(2_000_000_000, 0).expect("the test timestamp is in range");
+
+    for (height, expected_gap) in [(NU7 - 1, 6 * 75), (NU7, 18 * 25), (NU7 + 1, 18 * 25)] {
+        let height = Height(height);
+        assert_eq!(
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height)
+                .expect("the testnet rule is active at the test height")
+                .num_seconds(),
+            expected_gap,
+        );
+        for (seconds, expected_minimum_difficulty) in
+            [(expected_gap, false), (expected_gap + 1, true)]
+        {
+            assert_eq!(
+                NetworkUpgrade::is_testnet_min_difficulty_block(
+                    &network,
+                    height,
+                    previous_time + chrono::Duration::seconds(seconds),
+                    previous_time,
+                ),
+                expected_minimum_difficulty,
+                "unexpected minimum difficulty at height {height:?} and gap {seconds}",
+            );
+        }
+    }
 }
 
 /// Pins the BIP-70 network names, which appear in payment URIs and RPC
@@ -618,7 +768,7 @@ fn check_configured_funding_stream_constraints() {
     let configured_funding_streams = [
         Default::default(),
         ConfiguredFundingStreams {
-            height_range: Some(Height(2_000_000)..Height(2_200_000)),
+            height_range: Some(Height(4_000_000)..Height(4_200_000)),
             ..Default::default()
         },
         ConfiguredFundingStreams {
@@ -1024,7 +1174,6 @@ fn check_configured_funding_stream_regtest() {
     );
 
     let regtest = Network::new_regtest(RegtestParameters {
-        activation_heights: (&default_testnet.activation_list()).into(),
         funding_streams: Some(vec![
             configured_pre_nu6_funding_streams.clone(),
             configured_post_nu6_funding_streams.clone(),
@@ -1106,7 +1255,7 @@ fn lockbox_input_value(network: &Network, height: Height) -> Amount<NonNegative>
         return Amount::zero();
     };
 
-    let total_block_subsidy = block_subsidy(height, network).unwrap();
+    let total_block_subsidy = block_subsidy(height, network, None).unwrap();
     let &deferred_amount_per_block =
         funding_stream_values(nu6_activation_height, network, total_block_subsidy)
             .expect("we always expect a funding stream hashmap response even if empty")
@@ -1261,4 +1410,59 @@ fn temporary_orchard_disabling_soft_fork_heights() {
         None,
     );
     assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
+}
+
+#[test]
+fn regtest_requires_mandatory_checkpoint_coverage() {
+    use testnet::ConfiguredCheckpoints;
+
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let params = RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for checkpoints in [
+        None,
+        Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), genesis),
+            (Height(8), crate::block::Hash([1; 32])),
+        ])),
+    ] {
+        assert!(matches!(
+            testnet::Parameters::new_regtest(RegtestParameters {
+                checkpoints,
+                ..params.clone()
+            }),
+            Err(ParametersBuilderError::InsufficientCheckpointCoverage)
+        ));
+    }
+
+    let checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
+        (Height(0), genesis),
+        (Height(9), crate::block::Hash([1; 32])),
+    ]);
+    let network = Network::new_regtest(RegtestParameters {
+        checkpoints: Some(checkpoints),
+        ..params
+    });
+    assert_eq!(network.mandatory_checkpoint_height(), Height(9));
+    assert_eq!(network.checkpoint_list().max_height(), Height(9));
+}
+
+#[test]
+fn regtest_rejects_checkpoints_from_another_genesis() {
+    let checkpoints = testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![(
+        Height(0),
+        Network::Mainnet.genesis_hash(),
+    )]);
+    assert!(matches!(
+        testnet::Parameters::new_regtest(RegtestParameters {
+            checkpoints: Some(checkpoints),
+            ..Default::default()
+        }),
+        Err(ParametersBuilderError::CheckpointGenesisMismatch)
+    ));
 }

@@ -217,7 +217,7 @@ pub enum Response {
         /// will be checked during contextual validation.
         tx_id: UnminedTxId,
 
-        /// The miner fee for this transaction.
+        /// The full transaction fee before the block's aggregate NSM fee split.
         ///
         /// `None` for coinbase transactions.
         ///
@@ -379,7 +379,7 @@ impl Response {
         }
     }
 
-    /// The miner fee for the transaction in this response.
+    /// The full transaction fee before the block's aggregate NSM fee split.
     ///
     /// Coinbase transactions do not have a miner fee,
     /// and they don't need UTXOs to calculate their value balance,
@@ -1026,16 +1026,12 @@ where
         //
         // https://zips.z.cash/zip-2003
         //
-        // The `nu7` feature gates this rule until NU7 has activation heights,
-        // so default builds accept V4 at NU7.
-        //
         // `activation_height` falls back to the next upgrade's height when this
         // network omits NU7. The only later upgrade is `ZFuture`, which exists
         // only under `cfg(zcash_unstable = "zfuture")`.
-        if cfg!(feature = "nu7")
-            && NetworkUpgrade::Nu7
-                .activation_height(network)
-                .is_some_and(|nu7_height| height >= nu7_height)
+        if NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|nu7_height| height >= nu7_height)
         {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
@@ -1494,8 +1490,11 @@ impl AsyncChecks {
 
     /// Wait until all checks in the set finish.
     ///
-    /// If any of the checks fail, this method immediately returns the error and cancels all other
-    /// checks by dropping them.
+    /// Returns the first error, once every check has finished. Dropping a check does not stop the
+    /// batch work its request already dispatched, so returning early would report completion
+    /// while that work is still running. A caller that bounds its compute on this response reads
+    /// completion literally, and the wait costs nothing extra: the batches are already queued, and
+    /// the batch verifiers flush them on their own latency bound at the latest.
     async fn check(
         mut self,
         block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
@@ -1512,6 +1511,7 @@ impl AsyncChecks {
 
         // Wait for all asynchronous checks to complete
         // successfully, or fail verification if they error.
+        let mut first_error = None;
         loop {
             tokio::select! {
                 biased;
@@ -1522,11 +1522,16 @@ impl AsyncChecks {
                             block_batch_flush.await;
                         }
 
-                        return Ok(());
+                        return match first_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
                     };
 
                     tracing::trace!(?check, remaining = self.0.len());
-                    check?;
+                    if let Err(error) = check {
+                        first_error.get_or_insert(error);
+                    }
                 }
 
                 () = &mut block_batch_flush, if needs_block_batch_flush => {

@@ -146,8 +146,9 @@ fn immutable_metadata_changed(
 
 /// Independently check that `plan`'s projection obeys every transition invariant under `engine_before_commit`.
 ///
-/// Pure gate between [`PlanCandidate`] and [`EngineTransition`]: no mutation; success is required
-/// before `EngineTransition::from_verified`; failure is [`InvariantViolation`].
+/// Pure gate between [`PlanCandidate`] and [`EngineTransition`](crate::EngineTransition): no
+/// mutation; success is required before `EngineTransition::from_verified`; failure is
+/// [`InvariantViolation`].
 pub(crate) fn verify_candidate(
     engine_before_commit: &HeaderChainEngine,
     plan: &PlanCandidate,

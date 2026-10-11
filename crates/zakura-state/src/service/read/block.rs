@@ -25,7 +25,6 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
     response::{AnyTx, MinedTx, ParentInputs},
     service::{
         finalized_state::ZakuraDb,
@@ -417,49 +416,43 @@ pub fn block_info<C>(
 where
     C: AsRef<Chain>,
 {
+    any_block_info(chain.iter(), db, hash_or_height)
+}
+
+/// Returns the [`BlockInfo`] for `hash_or_height` in `non_finalized_state` or `db`.
+///
+/// A hash resolves on any non-finalized chain, because a block verifier looks up its
+/// parent, which can be on a side chain. A height resolves only on the best chain, because
+/// a taller side chain can contain heights the best chain doesn't have yet.
+pub fn block_info_by_hash_or_best_chain_height(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
+    match hash_or_height {
+        HashOrHeight::Hash(_) => {
+            any_block_info(non_finalized_state.chain_iter(), db, hash_or_height)
+        }
+        HashOrHeight::Height(_) => block_info(non_finalized_state.best_chain(), db, hash_or_height),
+    }
+}
+
+/// Returns the [`BlockInfo`] of the block with [`block::Hash`] or [`Height`], if it
+/// exists in any of the non-finalized `chains` or in the finalized `db`.
+///
+/// Heights resolve on the first chain in `chains` that has them, so use
+/// [`block_info_by_hash_or_best_chain_height`] to look up heights in the best chain.
+pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
+    mut chains: impl Iterator<Item = &'a C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
-    // check the most efficient alternative first. (`chain` is always in memory,
+    // check the most efficient alternative first. (the chains are always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
-        .as_ref()
-        .and_then(|chain| chain.as_ref().block_info(hash_or_height))
+    chains
+        .find_map(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
-}
-
-/// Returns block-size hints for a contiguous height range.
-///
-/// Confirmed committed sizes from [`BlockInfo`] win over untrusted advertised
-/// header-sync hints. Advertised hints are scheduling-only data and are never
-/// consulted by verification.
-pub fn block_size_hints<C>(
-    chain: Option<C>,
-    db: &ZakuraDb,
-    from: Height,
-    count: u32,
-) -> Vec<(Height, Option<u32>)>
-where
-    C: AsRef<Chain>,
-{
-    let count = count.min(MAX_HEADER_SYNC_HEIGHT_RANGE);
-    let mut hints = Vec::with_capacity(
-        usize::try_from(count).expect("capped block size hint count fits in usize"),
-    );
-
-    for offset in 0..count {
-        let Some(height) = from.0.checked_add(offset).map(Height) else {
-            break;
-        };
-        let confirmed_size = chain
-            .as_ref()
-            .and_then(|chain| chain.as_ref().block_info(height.into()))
-            .or_else(|| db.block_info(height.into()))
-            .map(|info| info.size());
-        let size = confirmed_size.or_else(|| db.advertised_body_size(height));
-
-        hints.push((height, size));
-    }
-
-    hints
 }

@@ -9,6 +9,7 @@ expression: empty_column_families
   "commitment_roots_by_height: no entries",
   "hash_by_height: no entries",
   "hash_by_tx_loc: no entries",
+  "header_aux_body_size_v1: no entries",
   "header_aux_delivery_v1: no entries",
   "header_body_evidence_authority_v1: no entries",
   "header_child_v1: no entries",

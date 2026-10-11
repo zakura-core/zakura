@@ -12,6 +12,12 @@
 // into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
 
+// Lets the serialization tests measure what a decoder actually reserves.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: zakura_test::allocations::TrackingAllocator =
+    zakura_test::allocations::TrackingAllocator;
+
 #[macro_use]
 extern crate bitflags;
 

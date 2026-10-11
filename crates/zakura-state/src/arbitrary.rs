@@ -5,6 +5,7 @@ use std::sync::Arc;
 use zakura_chain::{
     amount::Amount,
     block::{self, Block},
+    parameters::Network,
     transaction::Transaction,
     transparent,
     value_balance::ValueBalance,
@@ -83,8 +84,12 @@ impl ContextuallyVerifiedBlock {
             .map(|outpoint| (outpoint, zero_utxo.clone()))
             .collect();
 
-        ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, zero_spent_utxos)
-            .expect("all UTXOs are provided with zero values")
+        ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
+            block,
+            zero_spent_utxos,
+        )
+        .expect("all UTXOs are provided with zero values")
     }
 
     /// Create a [`ContextuallyVerifiedBlock`] from a [`Block`] or [`SemanticallyVerifiedBlock`],
@@ -100,6 +105,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: _,
             auth_data_root: _,
+            receipt_order,
         } = block.into();
 
         Self {
@@ -113,6 +119,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: Arc::new(new_outputs),
             transaction_hashes,
             chain_value_pool_change: ValueBalance::zero(),
+            receipt_order,
         }
     }
 }

@@ -1,5 +1,206 @@
 use super::*;
 
+#[test]
+fn saturated_store_admits_commit_window_repairs_after_reopen() {
+    for reconciled in [false, true] {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (mut engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network().clone();
+        let finalized = Frontier::new(anchor.height, anchor.hash);
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        store.initialize(metadata, anchor.clone()).unwrap();
+
+        let mut batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&store, &mut batch, finalized);
+        let mut selected = Vec::new();
+        let mut parent = anchor.clone();
+        for height in 1..=5 {
+            let mut header = *parent.header;
+            header.previous_block_hash = parent.hash;
+            header.time += chrono::Duration::seconds(1);
+            let header = Arc::new(header);
+            let node = HeaderNode::from_durable_parts(
+                header.clone(),
+                header.hash(),
+                parent.hash,
+                block::Height(height),
+                parent.block_work,
+                parent
+                    .work_coordinate()
+                    .checked_add(parent.block_work)
+                    .unwrap(),
+                HeaderValidationState::Valid,
+                Default::default(),
+                BodyValidationState::Unknown,
+                Vec::new(),
+            )
+            .unwrap();
+            store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(&node),
+                )
+                .unwrap();
+            parent = node.clone();
+            selected.push(node);
+        }
+        store.db.write(batch).unwrap();
+        let (runtime, _) = store.startup(&engine_config).unwrap();
+        let before = runtime.publisher().snapshot();
+        assert_eq!(
+            before.frontiers.header_best.hash,
+            selected.last().unwrap().hash
+        );
+
+        // An older store retained input above the commit window on the protected selected path.
+        let mut batch = DiskWriteBatch::new();
+        for (index, node) in selected.iter_mut().enumerate().skip(2) {
+            let delivery = AuxDelivery::new(
+                EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+                node.hash,
+                SourceId::from_digest([0x92; 32]),
+                body_owner(&before, 1, 1).into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            );
+            node.aux_delivery_ids.push(delivery.delivery_id);
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(node),
+                )
+                .unwrap();
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_AUX_DELIVERY,
+                    HeaderAuxDeliveryKey {
+                        header: node.hash,
+                        delivery: delivery.delivery_id,
+                    }
+                    .as_bytes(),
+                    &delivery,
+                )
+                .unwrap();
+        }
+        runtime.store.db.write(batch).unwrap();
+        drop(runtime);
+
+        // Three rows on the selected path above the commit window fill the store.
+        engine_config.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        let (runtime, report) = if reconciled {
+            store.startup_reconciled(&engine_config, finalized, Vec::new(), Vec::new())
+        } else {
+            store.startup(&engine_config)
+        }
+        .expect("a saturated store starts without settlement");
+        assert_eq!(report.current.frontiers, before.frontiers);
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 3);
+        let reader = runtime.reader();
+        let owner = body_owner(&report.current, 2, 2);
+        let context = reader
+            .vct_repair_context(owner, selected[0].height)
+            .unwrap()
+            .unwrap()
+            .bounded_prefix(1)
+            .unwrap();
+        assert!(
+            context.admission_capacity_available,
+            "the empty commit window still admits its own repair"
+        );
+        let lease = reader.validation_context(finalized.hash).unwrap().unwrap();
+        drop(reader);
+        let rules = HeaderRules::for_validation_lease(&lease).unwrap();
+        let batch = zakura_header_chain::prepare_headers(
+            HeaderBatchInput::new(&[selected[0].header.clone()]),
+            finalized,
+            &rules,
+            &SystemClock,
+        )
+        .unwrap();
+        let target = Frontier::new(selected[0].height, selected[0].hash);
+        let source = SourceId::from_digest([0x93; 32]);
+        let repair = AuxDelivery::new(
+            EvidenceId::from_digest([0x94; 32]),
+            target.hash,
+            source,
+            owner.into(),
+            zakura_header_chain::BodySizeHint::Unknown,
+            Some(zakura_header_chain::TreeAuxRecordV1 {
+                height: target.height,
+                sapling_root: Default::default(),
+                orchard_root: Default::default(),
+                ironwood_root: Default::default(),
+                sapling_tx_count: 0,
+                orchard_tx_count: 0,
+                ironwood_tx_count: 0,
+                auth_data_root: [0; 32].into(),
+            }),
+        );
+        let result = runtime.apply_combined(
+            TransitionRequest {
+                expected_version: report.current.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: owner.into(),
+                    source,
+                    parent_hash: finalized.hash,
+                    target_tip_hash: target.hash,
+                    completion: TargetCompletion::SelectedAuxiliaryRepair {
+                        common_ancestor: finalized,
+                        selected_target: target,
+                        episode: context.episode,
+                    },
+                    batch,
+                    aux: vec![repair],
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+            DiskWriteBatch::new(),
+            || {},
+        );
+        assert!(
+            matches!(result, Ok(ApplyResult::Committed)),
+            "the repair evicts speculative input: {result:?}"
+        );
+        drop(runtime);
+
+        let (runtime, _) = HeaderChainStore::new(open(&db_config, &network))
+            .startup(&engine_config)
+            .expect("the repaired store reopens");
+        let rows = runtime.store.load_aux_deliveries().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .any(|row| row.delivery().delivery_id == repair.delivery_id));
+        // The highest speculative row goes first; every header stays retained.
+        assert!(rows
+            .iter()
+            .all(|row| row.delivery().header_hash != selected[4].hash));
+        for node in &selected {
+            assert!(runtime.store.header_node(node.hash).unwrap().is_some());
+        }
+    }
+}
+
 /// Commit one deferred header at `insertion_time`, then return the closed database.
 fn commit_deferral(
     header_generation: HeaderGeneration,
@@ -932,7 +1133,7 @@ fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1085,7 +1286,7 @@ fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1311,51 +1512,60 @@ fn a_newer_header_chain_disk_format_does_not_classify_as_initialized() {
     ));
 }
 
+/// Version-three stores preserve their diagnostic digest until startup audits the rows.
 #[test]
-fn version_three_migration_rejects_a_network_policy_mismatch_atomically() {
-    let db_config = Config::ephemeral();
-    let (engine_config, anchor, mut metadata) = mainnet_fixture();
-    metadata.network_policy_digest = [0x73; 32];
-    let metadata_value = mark_metadata_as_v3(&metadata);
-    let db = open(&db_config, engine_config.network());
-    let store = HeaderChainStore::new(db);
-    store
-        .initialize(
-            EngineMetadata {
-                disk_format: HeaderChainDiskVersion::CURRENT,
-                network_policy_digest: engine_config.network_policy_digest(),
-                ..metadata.clone()
-            },
-            anchor,
-        )
-        .expect("the current fixture initializes");
-    let mut batch = DiskWriteBatch::new();
-    store
-        .put_raw(
-            &mut batch,
-            HEADER_ENGINE_META,
-            METADATA_KEY,
-            &metadata_value,
-        )
-        .expect("the mismatched version-three metadata stages");
-    store.db.write(batch).expect("the legacy fixture commits");
-
-    assert!(matches!(
-        store.migrate_to_current(&engine_config),
-        Err(HeaderChainStoreError::Incoherent(
-            "legacy network policy does not match the configured policy"
-        ))
-    ));
-    let metadata_cf = store
-        .cf(HEADER_ENGINE_META)
-        .expect("the metadata column family exists");
-    assert_eq!(
+fn version_three_migration_keeps_a_policy_change_for_startup() {
+    for (engine_config, anchor, mut metadata) in [mainnet_fixture(), fixture()] {
+        let db_config = Config::ephemeral();
+        metadata.network_policy_digest = [0x73; 32];
+        let metadata_value = mark_metadata_as_v3(&metadata);
+        let db = open(&db_config, engine_config.network());
+        let store = HeaderChainStore::new(db.clone());
         store
-            .db
-            .raw_get_cf(&metadata_cf, METADATA_KEY)
-            .expect("the metadata remains readable"),
-        Some(metadata_value)
-    );
+            .initialize(
+                EngineMetadata {
+                    disk_format: HeaderChainDiskVersion::CURRENT,
+                    ..metadata.clone()
+                },
+                anchor,
+            )
+            .expect("the current fixture initializes");
+        let mut batch = DiskWriteBatch::new();
+        store
+            .put_raw(
+                &mut batch,
+                HEADER_ENGINE_META,
+                METADATA_KEY,
+                &metadata_value,
+            )
+            .expect("the earlier release's version-three metadata stages");
+        stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
+        store.db.write(batch).expect("the legacy fixture commits");
+
+        assert!(store
+            .migrate_to_current(&engine_config)
+            .expect("migration accepts a diagnostic policy change"));
+        assert_eq!(
+            store
+                .metadata()
+                .expect("the migrated metadata is readable")
+                .network_policy_digest,
+            [0x73; 32],
+            "migration keeps the durable digest for the startup audit",
+        );
+
+        let (_, report) = HeaderChainStore::new(db.clone())
+            .startup(&engine_config)
+            .expect("startup updates the migrated policy digest");
+        assert_eq!(
+            report.repairs,
+            BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+        );
+        let (_, reopened) = HeaderChainStore::new(db)
+            .startup(&engine_config)
+            .expect("the rebound policy and its migration record pass the audit");
+        assert!(reopened.repairs.is_empty());
+    }
 }
 
 #[test]
@@ -1574,6 +1784,95 @@ fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
         .startup(&updated_config)
         .expect("the rebound manifest persists atomically");
     assert!(reopened.repairs.is_empty());
+}
+
+/// A release that sets an activation height changes the Mainnet policy digest. Startup must
+/// keep the store, audit it under the new policy, and rebind the digest.
+#[test]
+fn release_network_startup_atomically_rebinds_a_changed_network_policy() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, mut metadata) = mainnet_fixture();
+    let previous_state_version = metadata.state_version;
+    // The store was written by a release with different Mainnet parameters.
+    metadata.network_policy_digest = [0xab; 32];
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor)
+        .expect("the previous release's policy initializes the fixture");
+
+    let (runtime, report) = store
+        .startup(&engine_config)
+        .expect("startup rebinds a fully audited release policy change");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+    );
+    assert_eq!(
+        report.current.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version can advance")
+    );
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the metadata is readable")
+            .network_policy_digest,
+        engine_config.network_policy_digest()
+    );
+    drop(runtime);
+
+    let (_, reopened) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("the rebound policy persists atomically");
+    assert!(reopened.repairs.is_empty());
+}
+
+/// Startup accepts a future activation change on a configured network after auditing.
+#[test]
+fn configured_network_startup_rebinds_a_changed_network_policy() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let changed_config = EngineConfig::new(
+        engine_config.mode,
+        Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed policy accepts the same bootstrap anchor");
+    assert_ne!(
+        engine_config.network_policy_digest(),
+        changed_config.network_policy_digest()
+    );
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+
+    let (runtime, report) = store
+        .startup(&changed_config)
+        .expect("a future activation change passes the source audit");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+    );
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the audited metadata is readable")
+            .network_policy_digest,
+        changed_config.network_policy_digest()
+    );
 }
 
 #[test]

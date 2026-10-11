@@ -223,6 +223,20 @@ impl ZakuraDb {
             return Err(StateInitError::VctSproutHistoryUnrepairable);
         }
 
+        // A test build can persist NU7 history snapshots that this build cannot read.
+        // Reject that local incompatibility before format checks or state reads.
+        if let Err(
+            source @ super::disk_format::chain::HistoryTreeDecodeError::HistoryTree(
+                zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. },
+            ),
+        ) = db.try_history_tree()
+        {
+            return Err(StateInitError::DatabaseFormatUpgrade {
+                path: db.path().to_owned(),
+                source: Box::new(source),
+            });
+        }
+
         db.run_startup_format_change(format_change)?;
 
         Ok(db)

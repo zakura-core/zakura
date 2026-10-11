@@ -303,3 +303,6 @@ impl Default for TransparentTransfers {
 pub fn transaction_location(ordered_utxo: &transparent::OrderedUtxo) -> TransactionLocation {
     TransactionLocation::from_usize(ordered_utxo.utxo.height, ordered_utxo.tx_index_in_block)
 }
+
+#[cfg(test)]
+mod tests;

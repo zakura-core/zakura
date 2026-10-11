@@ -20,9 +20,14 @@ const DATA: Stream = Stream {
     version: 1,
     frame_cap: 1024 * 1024,
     capability: 1 << 16,
-    mode: StreamMode::Persistent,
+    ..Stream::PERSISTENT
 };
-const REQUESTS: Stream = Stream { kind: 65, ..DATA };
+const REQUESTS: Stream = Stream {
+    kind: 65,
+    queue_depths: Some(StreamQueueDepths { inbound: 1, outbound: 1 }),
+    write_policy: StreamWritePolicy::UntilCancelled,
+    ..DATA
+};
 const EVENTS: Stream = Stream { kind: 66, ..DATA };
 const LOOKUP: Stream = Stream {
     kind: 67,
@@ -50,14 +55,21 @@ The service does not declare membership a second time. The transport waits for
 data, requests, and events before handing their receive/send handles to the
 service. It does not wait for a lookup request.
 
-The service uses `message_types()`, `message_payload_limits()`, and
-`stream_queue_depths()` to specify each stream's traffic and bounds. The protocol
-defines message assignments; peers do not negotiate individual message types.
-The service routes outgoing messages to the appropriate sender.
+Each `Stream` constant also declares that stream's traffic and bounds:
+`messages`, `queue_depths`, and `write_policy`. A declaration lists only the
+fields that differ from `Stream::PERSISTENT` or `Stream::REQUEST_RESPONSE`. The
+protocol defines message assignments; peers do not negotiate individual message
+types. The service routes outgoing messages to the appropriate sender.
 
-`stream_write_policy()` sets each persistent stream's write deadline. The default
-is ten seconds. A service can choose another duration or `UntilCancelled`.
-A service that chooses `UntilCancelled` must enforce its own progress deadline.
+`messages` is the stream's message table. A response row may answer a request
+row on another member of the session, so the table describes a stream pair
+without pair-specific code. The
+[message regulation design](peer-message-regulation.md#message-tables) describes
+the tables and their checks.
+
+`write_policy` sets each persistent stream's write deadline. The default is ten
+seconds. A service can choose another duration or `UntilCancelled`. A service
+that chooses `UntilCancelled` must enforce its own progress deadline.
 
 ## Negotiating complete layouts
 
@@ -102,8 +114,11 @@ and unrelated services stay connected. A new offer can proceed after cleanup.
 The workers and application senders retain the shared resource owner until they
 finish or drop it. Every member also consumes a transport stream slot.
 
-Every persistent member shares a local session identity, cancellation token, and
-message-rate budget. A remote close on any member retires the session.
+Every persistent member shares a local session identity and cancellation token.
+Members without a message table also share the session's message-rate budget.
+Members with a table charge only the rows that declare a cadence, as the
+[message regulation design](peer-message-regulation.md#message-tables)
+describes. A remote close on any member retires the session.
 Cancellation resets unfinished writes before a replacement can send frames.
 A write deadline retires the session without closing unrelated services on the
 connection. Protocol violations can still close the connection.
@@ -132,16 +147,51 @@ Setup readiness does not impose ordering across streams. For example, a request
 can arrive before a status message on another stream. The service must handle
 that ordering or perform an application handshake before processing requests.
 
+## Session tools
+
+Three generic tools in `regulation` hold what every reactor with a persistent
+session needs. A reactor uses them instead of writing its own.
+
+- `SessionCapacity` returns the reservation from `reserve_session()`. It holds
+  one direction slot, inbound or outbound, until the last owner drops, and one
+  setup slot until `admitted()`. While outbound sessions are enabled, inbound
+  setup cannot take the last setup slot, so inbound peers that withhold
+  members cannot block this node's own sessions. `demand()` subscribes to
+  capacity changes before it checks, so a release in between still wakes the
+  transport.
+- `SessionTable` holds each peer's current session and coalesces changes into
+  one watch notification. `remove` takes the session's key, so a stale
+  teardown never removes a newer session. The reactor reads a snapshot and
+  reconciles its own state.
+- `WriterFence` fences a session's request writers. A session can outlive its
+  receiver, so a reactor can replace a session while an old request is still
+  queued or being written. One lock orders the fence's retirement and each
+  writer's first byte. A request whose first byte was not written is skipped.
+  A request whose first byte was written, and whose response has not ended,
+  closes the connection, because no receiver remains for the answer. The
+  close records `unfinished_exchange` and assigns the peer no fault.
+
+The table owns each session's fence and retires it under the table lock before
+it replaces or removes the entry. `Reservations::reserve_fenced` makes each
+reservation own its request's exchange. The ending ends the exchange, and the
+session's end drops the rest. A reactor that keeps its reservations in the
+session therefore needs no other fencing code.
+
+The stream conformance suite tests every layout over real QUIC. One macro line
+per layout generates it from the layout's tables; the
+[property testing design](property-testing.md#generated-suites) lists its
+properties.
+
 ## Migrating a pair consumer
 
 Remove `OrderedStreamPair` and `ordered_stream_pair()`. Declare the persistent
 members with one capability in `streams()`. Use the `Session*` policy, demand,
 and resource APIs. The transport supplies all declared members together.
 
-Move role-specific queue limits and write deadlines into the service hooks.
-For the block-sync activation following #943, the service must declare the
-one-slot request queue, the request write policy, and the 32-second data write
-deadline. The transport no longer assigns those policies by role name.
+Declare role-specific queue limits and write deadlines on each member's `Stream`
+constant. For the block-sync activation following #943, the stream constants must
+declare the one-slot request queue, the request write policy, and the 32-second
+data write deadline. The transport no longer assigns those policies by role name.
 
 Production block sync in #943 remains a single-stream protocol. This change does
 not activate the later block-sync layout.

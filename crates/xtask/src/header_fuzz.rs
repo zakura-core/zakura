@@ -43,7 +43,9 @@ pub(super) fn minimize(repo_root: &Path, artifact: &Path) -> Result<(), BoxError
             .arg(format!("+{PINNED_NIGHTLY}"))
             .arg("fuzz")
             .arg("tmin")
-            .arg("--locked")
+            // cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+            .arg("--fuzz-dir")
+            .arg(&fuzz_dir)
             .arg(target)
             .arg(&artifact)
             .current_dir(&fuzz_dir),

@@ -925,6 +925,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         .zcash_deserialize_into()
         .expect("test data deserializes");
     let contextually_verified = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &network,
         SemanticallyVerifiedBlock::from(block.clone()),
         HashMap::new(),
     )
@@ -1651,7 +1652,7 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
     let read_state = ReadStateService::new(
         &state,
         None,
-        Arc::new(std::sync::OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_state_receiver),
         vct_root_repair_receiver,
         HeaderChainSubscriptions {

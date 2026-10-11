@@ -683,14 +683,6 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
 
 #[tokio::test]
 async fn mempool_queue() -> Result<(), Report> {
-    // Test multiple times to catch intermittent bugs since eviction is randomized
-    for _ in 0..10 {
-        mempool_queue_single().await?;
-    }
-    Ok(())
-}
-
-async fn mempool_queue_single() -> Result<(), Report> {
     // Using the mainnet for now
     let network = Network::Mainnet;
 
@@ -727,8 +719,8 @@ async fn mempool_queue_single() -> Result<(), Report> {
     // This will cause the at least one transaction to be rejected, since
     // the cost limit is the sum of all costs except of the last transaction.
     for tx in transactions.iter() {
-        // Error must be ignored because a insert can trigger an eviction and
-        // an error is returned if the transaction being inserted in chosen.
+        // Error must be ignored because the full mempool either evicts a transaction or
+        // rejects the transaction being inserted.
         let _ = service.storage().insert(tx.clone(), Vec::new(), None);
     }
 
@@ -749,7 +741,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
 
     // Test `Request::Queue` with all previously inserted transactions.
     // They should all be rejected; either because they are already in the mempool,
-    // or because they are in the recently evicted list.
+    // or because the full mempool evicted or rejected them.
     let response = service
         .ready()
         .await
@@ -773,9 +765,9 @@ async fn mempool_queue_single() -> Result<(), Report> {
     let mut evicted_count = 0;
     for response in queued_responses {
         match response.unbox_mempool_error() {
-            MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::RandomlyEvicted) => {
-                evicted_count += 1
-            }
+            MempoolError::StorageExactTip(
+                ExactTipRejectionError::Evicted | ExactTipRejectionError::BelowEvictionCost,
+            ) => evicted_count += 1,
             MempoolError::InMempool => in_mempool_count += 1,
             error => panic!("transaction should not be rejected with reason {error:?}"),
         }

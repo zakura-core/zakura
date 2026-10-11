@@ -2469,3 +2469,128 @@ fn full_action_queue_retries_lease_release_on_maintenance() {
         "the retained release reaches the driver after capacity returns"
     );
 }
+
+#[tokio::test]
+async fn disconnected_preparation_retains_capacity_until_completion() {
+    let port = PendingVctLocalPort::pending(false);
+    let (_handle, mut reactor, snapshot, _fatal_events) =
+        direct_vct_reactor_with_fatal_events(port.clone());
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 401, 0);
+    let active = reactor.peer_work_queue.active_mut(&peer).unwrap();
+    active.phase = HeaderTargetPhase::Preparing;
+    active.entries.resize(401, active.entries[0].clone());
+    let operation = HeaderPortOperation::PrepareHeaderTarget {
+        purpose: HeaderTargetPurpose::Normal,
+        peer: peer.clone(),
+        source,
+        owner,
+        common_ancestor: snapshot.frontiers.finalized,
+        target: active.staged_tip().unwrap(),
+        completion: zakura_header_chain::TargetCompletion::TargetPrefix {
+            common_ancestor: snapshot.frontiers.finalized,
+        },
+        entries: std::mem::take(&mut active.entries),
+    };
+    assert!(reactor.dispatch_action(operation));
+    assert!(reactor
+        .pending_port_operations
+        .next()
+        .now_or_never()
+        .is_none());
+    assert_eq!(port.prepare_calls.load(Ordering::SeqCst), 1);
+    reactor.handle_peer_disconnected(&peer, 7, "test disconnect");
+    assert!(reactor.peer_work_queue.active(&peer).is_none());
+    assert_eq!(reactor.peer_work_queue.claimed_header_count(), 401);
+
+    port.prepare_release.notify_one();
+    let completion = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reactor.pending_port_operations.next(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reactor.peer_work_queue.claimed_header_count(), 401);
+    reactor.handle_port_completion(completion);
+    assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn supplier_capacity_release_retries_the_waiting_downloader_before_refresh() {
+    let mut downloader = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = downloader.connect(&[0x71], 7);
+    let peer = peers[0].clone();
+    downloader.schedule();
+    downloader.advertise(&peers, 7);
+    let first = downloader
+        .reactor
+        .peer_work_queue
+        .active(&peer)
+        .unwrap()
+        .clone();
+
+    let signal = port::ServingCapacitySignal::default();
+    let mut startup = startup(CancellationToken::new());
+    let (_tx, rx) = watch::channel(Some(downloader.snapshot.clone()));
+    startup.committed_snapshots = Some(rx);
+    startup.header_chain_port = Arc::new(super::capacity::CapacityPort(signal.clone()));
+    startup.port_dispatch = PortDispatch::Direct;
+    let (_handle, _actions, mut supplier) = build_header_sync_reactor(startup).unwrap();
+    let (send, mut outbound) = framed_channel(8);
+    supplier.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    let initial = supplier
+        .codec
+        .decode_frame(outbound.try_recv().unwrap(), None)
+        .unwrap();
+    supplier.handle_get_headers(
+        peer.clone(),
+        7,
+        request(
+            first.request_id.get(),
+            downloader.target.hash,
+            downloader.anchor.hash,
+        ),
+    );
+    let completion = supplier.pending_port_operations.next().await.unwrap();
+    supplier.handle_port_completion(completion);
+    let busy = supplier
+        .codec
+        .decode_frame(outbound.try_recv().unwrap(), None)
+        .unwrap();
+    downloader
+        .reactor
+        .handle_wire_response(peer.clone(), 7, first.owner.header_authority(), busy);
+    assert!(downloader.reactor.peer_work_queue.active(&peer).is_none());
+    signal.release();
+    supplier.capacity_waiters.next().await;
+    time::advance(std::time::Duration::from_secs(1)).await;
+    supplier.refresh_statuses();
+    let status = supplier
+        .codec
+        .decode_frame(outbound.try_recv().unwrap(), None)
+        .unwrap();
+    assert_eq!(status, initial);
+    downloader
+        .reactor
+        .handle_wire_message(peer.clone(), 7, status);
+    let retry = downloader
+        .reactor
+        .peer_work_queue
+        .active(&peer)
+        .expect("capacity recovery wakes the sole supplier's downloader");
+    assert_ne!(retry.request_id, first.request_id);
+}

@@ -858,10 +858,12 @@ fn reverse_transparent_block(
                 spent_output_location,
                 &spent_utxo.output,
             );
-            batch.zs_delete(
-                db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
-                spent_output_location,
-            );
+            if !skip_transparent_indexes {
+                batch.zs_delete(
+                    db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
+                    spent_output_location,
+                );
+            }
         }
     }
 

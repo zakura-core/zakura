@@ -22,6 +22,8 @@ impl BlockRangeSource for StateBlockRangeSource {
         let mut state = self.state.clone();
         Box::pin(async move {
             let mut started = false;
+            // No timeout: the blocking read keeps the execution lease until it
+            // finishes, so abandoning this wait could not free the slot.
             let result = state
                 .read_owned_block_range(
                     request.start_height,

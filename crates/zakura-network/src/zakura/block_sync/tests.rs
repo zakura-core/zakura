@@ -1766,6 +1766,15 @@ fn config_validate_rejects_degenerate_values() {
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
+
+    // Above 3,633 session slots, even one request per session exceeds the
+    // GetBlocks bookkeeping budget.
+    config = ZakuraBlockSyncConfig::default();
+    config.peer_limits.max_inbound_peers = 3_000;
+    config.peer_limits.max_outbound_peers = 633;
+    assert!(config.validate().is_ok());
+    config.peer_limits.max_outbound_peers = 634;
+    assert!(config.validate().is_err());
 }
 
 #[test]

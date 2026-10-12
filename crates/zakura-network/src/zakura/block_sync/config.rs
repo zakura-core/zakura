@@ -466,6 +466,12 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        if !super::regulated::session::serving_sessions_fit_budget(self) {
+            return Err(
+                "max_inbound_peers plus max_outbound_peers must be at most 3,633 \
+                 so GetBlocks serving fits its bookkeeping budget",
+            );
+        }
         Ok(())
     }
 

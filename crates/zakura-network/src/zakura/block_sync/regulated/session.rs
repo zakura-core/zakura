@@ -29,14 +29,20 @@ const BYTES_PER_REQUEST: u64 = 160;
 /// session slots bound every session that can hold bookkeeping, including
 /// replacements still cleaning up. Each may hold `2 × limit` commitments (see
 /// `Serve`'s margin), so the limit is the configured advertisement capped at
-/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. Above 3,633
-/// sessions even one request exceeds the budget; the limit stays at one and
-/// [`Serving::new`] warns. Local outbound sizing and older peers keep the
-/// configured value.
+/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. Config
+/// validation rejects session counts that [`serving_sessions_fit_budget`]
+/// refuses; an unvalidated config keeps a limit of one and [`Serving::new`]
+/// warns. Local outbound sizing and older peers keep the configured value.
 pub(crate) fn serving_max_inflight_requests(config: &ZakuraBlockSyncConfig) -> u32 {
     let configured = config.advertised_max_inflight_requests();
     budgeted_inflight_requests(serving_sessions(config))
         .map_or(configured, |budget| configured.min(budget.max(1)))
+}
+
+/// Whether even one request per session fits the bookkeeping budget, which
+/// holds for at most 3,633 inbound plus outbound session slots.
+pub(crate) fn serving_sessions_fit_budget(config: &ZakuraBlockSyncConfig) -> bool {
+    budgeted_inflight_requests(serving_sessions(config)) != Some(0)
 }
 
 /// Inbound plus outbound block-sync session slots.
@@ -81,7 +87,7 @@ impl Serving {
         // not a measured storage latency.
         let limits = sizing::serve_limits(largest, sizing::TARGET_RTT);
         let advertised = serving_max_inflight_requests(config);
-        if budgeted_inflight_requests(serving_sessions(config)) == Some(0) {
+        if !serving_sessions_fit_budget(config) {
             tracing::warn!(
                 max_inbound_peers = config.peer_limits.max_inbound_peers,
                 max_outbound_peers = config.peer_limits.max_outbound_peers,

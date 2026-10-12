@@ -33,6 +33,10 @@ independently.
 
 ### Changed
 
+- Verify transparent scripts with the Rust `zcash_script` interpreter and stop
+  building zcashd's C++ script interpreter
+  ([#1247](https://github.com/zakura-core/zakura/pull/1247)).
+
 - Stop maintaining transparent address and spender indexes in existing and fresh
   pruned checkpoint-sync databases, retaining validation and mining support.
   Upgrade existing state in place without resyncing, keep existing index rows,
@@ -177,6 +181,10 @@ independently.
   crate updates to keep the published dependency graph consistent.
 
 ### Removed
+
+- Removed the `comparison-interpreter` feature from `zakurad` and
+  `zakura-script`
+  ([#1247](https://github.com/zakura-core/zakura/pull/1247)).
 
 - Removed the unused ZIP-401 low-fee eviction penalty and
   `VerifiedUnminedTx::eviction_weight`

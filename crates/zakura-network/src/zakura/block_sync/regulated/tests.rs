@@ -372,7 +372,25 @@ async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
 #[test]
 fn envelope_allocations_are_bounded_by_the_payload() {
     for frame in [
+        encode_frame(&Message::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height::MAX,
+            tip_hash: block::Hash([7; 32]),
+            max_blocks_per_response: 128,
+            max_inflight_requests: 32_768,
+            max_response_bytes: 33_554_432,
+        }))
+        .unwrap(),
         encode_frame(&Message::GetBlocks(
+            Range::new(block::Height(1), 128).unwrap(),
+        ))
+        .unwrap(),
+        encode_frame(&Message::BlocksDone {
+            start: block::Height(1),
+            returned: 128,
+        })
+        .unwrap(),
+        encode_frame(&Message::RangeUnavailable(
             Range::new(block::Height(1), 128).unwrap(),
         ))
         .unwrap(),
@@ -718,9 +736,10 @@ async fn queued_getblocks_commitments_have_a_measured_memory_ceiling() {
 }
 
 #[tokio::test]
-#[ignore = "manual load measurement: retains tens of GB at the current defaults"]
+#[ignore = "manual load measurement: retains up to the 512 MiB bookkeeping budget"]
 async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
-    // Broad CI includes ignored tests. This measurement needs a dedicated large host.
+    // Broad CI includes ignored tests. At the defaults this queues 512 sessions of
+    // 5,632 requests, about 330 MB at the measured per-request cost.
     if std::env::var_os("ZAKURA_LARGE_LOAD_TEST").is_none() {
         return;
     }

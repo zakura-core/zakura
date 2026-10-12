@@ -178,6 +178,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
 }
 
 mod lifecycle;
+mod load;
 
 /// Default peer limits budget 2816 requests, so 512 sessions fill exactly 512 MiB.
 #[test]

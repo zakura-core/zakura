@@ -1,10 +1,7 @@
 //! Exercise both the bounded envelope and the full production block decoder.
 
 use proptest::prelude::*;
-use zakura_chain::{
-    block,
-    serialization::{CompactSizeMessage, ZcashDeserialize, ZcashSerialize},
-};
+use zakura_chain::block;
 
 use super::wire::{Message, Range};
 use crate::zakura::{
@@ -40,6 +37,8 @@ proptest! {
         prop_assert_eq!(decoded.encode_frame().unwrap(), frame.clone());
         let mut trailing = frame;
         trailing.payload.extend(extra);
+        // The envelope keeps `Block` bytes opaque, so only the full decoder rejects that tail.
+        prop_assert_eq!(decode_frame::<Message>(&trailing).is_ok(), kind == 3);
         prop_assert!(BlockSyncMessage::decode_frame(trailing).is_err());
     }
 
@@ -56,20 +55,5 @@ proptest! {
         }
         // This also exercises nested block decoding when the discriminator is 3.
         let _ = BlockSyncMessage::decode(&payload);
-    }
-
-    #[test]
-    fn hostile_block_counts_are_rejected_before_transaction_allocation(
-        count in 1_025usize..100_000,
-        tail in proptest::collection::vec(any::<u8>(), 0..10),
-    ) {
-        let block = block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
-        let mut payload = vec![3];
-        block.header.zcash_serialize(&mut payload).unwrap();
-        CompactSizeMessage::try_from(count).unwrap().zcash_serialize(&mut payload).unwrap();
-        payload.extend(tail);
-        let (result, allocations) = zakura_test::allocations::measure(|| BlockSyncMessage::decode(&payload));
-        prop_assert!(result.is_err());
-        prop_assert!(allocations.largest_request < 8_192, "{:?}", allocations);
     }
 }

@@ -6,32 +6,25 @@ use crate::zakura::{
 };
 use zakura_chain::serialization::ZcashDeserializeInto;
 
-fn requester_routine(
-    expected_hash: block::Hash,
-) -> (PeerRoutine, FramedRecv, ReservationPool, CancellationToken) {
-    requester_routine_with_pool(expected_hash, ReservationPool::new(2).unwrap())
-}
-
-fn requester_routine_with_pool(
-    expected_hash: block::Hash,
-    pool: ReservationPool,
-) -> (PeerRoutine, FramedRecv, ReservationPool, CancellationToken) {
-    let (routine, outbound, pool, connection, _events) =
-        requester_routine_with_events(expected_hash, pool);
-    (routine, outbound, pool, connection)
-}
-
-/// Like [`requester_routine_with_pool`], but keeps the routine's reports to the reactor.
-fn requester_routine_with_events(
-    expected_hash: block::Hash,
-    pool: ReservationPool,
-) -> (
+/// The routine, its outbound frames, its pool, its connection and its reports to the reactor.
+type RequesterRoutine = (
     PeerRoutine,
     FramedRecv,
     ReservationPool,
     CancellationToken,
     mpsc::Receiver<RoutineToReactor>,
-) {
+);
+
+/// [`requester_routine_with_pool`] with a private two-entry pool.
+fn requester_routine(expected_hash: block::Hash) -> RequesterRoutine {
+    requester_routine_with_pool(expected_hash, ReservationPool::new(2).unwrap())
+}
+
+/// Builds a live requester that can fetch height 1 with `expected_hash` from `pool`.
+fn requester_routine_with_pool(
+    expected_hash: block::Hash,
+    pool: ReservationPool,
+) -> RequesterRoutine {
     let (mut routine, outbound, events) = super::tests::status_test_routine();
     let connection = CancellationToken::new();
     let fence = WriterFence::new(connection.clone(), CloseCause::default());
@@ -56,6 +49,35 @@ fn requester_routine_with_events(
         )],
     );
     (routine, outbound, pool, connection, events)
+}
+
+/// Encodes `message` and hands it to the routine as one inbound frame.
+async fn try_deliver(
+    routine: &mut PeerRoutine,
+    message: BlockSyncMessage,
+) -> Result<(), SinkReject> {
+    let frame = message.encode_frame().expect("test messages are encodable");
+    routine.handle_frame(&mut block_sync_guard(), frame).await
+}
+
+/// [`try_deliver`] for a frame the routine must accept.
+async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
+    try_deliver(routine, message)
+        .await
+        .expect("the routine accepts the frame");
+}
+
+/// Waits up to one second for the routine's next outbound frame.
+async fn next_sent(outbound: &mut FramedRecv) -> crate::zakura::Frame {
+    time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .expect("the routine sends promptly")
+        .expect("the outbound channel stays open")
+}
+
+/// Parses a mainnet block test vector.
+fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
+    Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
 }
 
 #[tokio::test]
@@ -101,12 +123,9 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
 
 #[tokio::test]
 async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending() {
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
-    let request = tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let request = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(request).unwrap(),
         BlockSyncMessage::GetBlocks { .. }
@@ -153,28 +172,20 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
     let ending = BlockSyncMessage::RangeUnavailable {
         start_height: block::Height(1),
         count: 1,
-    }
-    .encode_frame()
-    .unwrap();
-    routine
-        .handle_frame(&mut block_sync_guard(), ending.clone())
-        .await
-        .unwrap();
+    };
+    deliver(&mut routine, ending.clone()).await;
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
     assert!(routine.check_request_liveness(retirement).is_ok());
     assert!(
-        routine
-            .handle_frame(&mut block_sync_guard(), ending)
-            .await
-            .is_err(),
+        try_deliver(&mut routine, ending).await.is_err(),
         "a second ending is unsolicited"
     );
 }
 
 #[tokio::test]
 async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
-    let (mut routine, _outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     assert_eq!(pool.held(), 1);
     let deadline = routine.window.outstanding[0].deadline;
@@ -185,7 +196,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.config.max_blocks_per_response = 3;
     routine.max_blocks_per_response = 3;
     routine.work.extend(
@@ -205,13 +216,8 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
     );
     routine.try_fill().await;
     assert_eq!(routine.window.outstanding[0].request.count, 3);
-    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
+    next_sent(&mut outbound).await;
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let mut payload = vec![MSG_BS_BLOCK];
     block.header.zcash_serialize(&mut payload).unwrap();
     // There is no transaction count. Header identity must reject this frame
@@ -273,22 +279,14 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
 
 #[tokio::test]
 async fn invalid_ending_keeps_the_written_exchange_fenced() {
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
-    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    next_sent(&mut outbound).await;
     let ending = BlockSyncMessage::BlocksDone {
         start_height: block::Height(1),
         returned: 1,
-    }
-    .encode_frame()
-    .unwrap();
-    assert!(routine
-        .handle_frame(&mut block_sync_guard(), ending)
-        .await
-        .is_err());
+    };
+    assert!(try_deliver(&mut routine, ending).await.is_err());
     assert_eq!(pool.held(), 1);
     drop(routine);
     assert!(
@@ -298,68 +296,16 @@ async fn invalid_ending_keeps_the_written_exchange_fenced() {
 }
 
 #[tokio::test]
-async fn authorized_block_and_exact_ending_complete_the_live_request() {
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
-    let (body_sender, mut bodies) = mpsc::channel(1);
-    routine.sequencer_input = body_sender;
-    routine.try_fill().await;
-    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let response = BlockSyncMessage::Block(Arc::new(block))
-        .encode_frame()
-        .unwrap();
-    routine
-        .handle_frame(&mut block_sync_guard(), response)
-        .await
-        .unwrap();
-    assert!(
-        bodies.try_recv().is_ok(),
-        "the authorized body reaches the existing sequencer"
-    );
-    assert_eq!(
-        pool.held(),
-        1,
-        "the ending still owns authorization after all bodies arrive"
-    );
-    let ending = BlockSyncMessage::BlocksDone {
-        start_height: block::Height(1),
-        returned: 1,
-    }
-    .encode_frame()
-    .unwrap();
-    routine
-        .handle_frame(&mut block_sync_guard(), ending)
-        .await
-        .unwrap();
-    assert_eq!(pool.held(), 0);
-    drop(routine);
-    assert!(
-        !connection.is_cancelled(),
-        "the completed exchange leaves its connection reusable"
-    );
-}
-
-#[tokio::test]
 async fn local_finality_or_competing_receipt_keeps_the_original_response_authorized() {
     for finalized in [true, false] {
-        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-        let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+        let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+        let (mut routine, mut outbound, pool, connection, _) = requester_routine(block.hash());
         let (body_sender, mut bodies) = mpsc::channel(1);
         routine.sequencer_input = body_sender;
         let (view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
         routine.sequencer_view = view_rx;
         routine.try_fill().await;
-        tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        next_sent(&mut outbound).await;
         if finalized {
             let released = routine.work.advance_floor(block::Height(1));
             routine.budget.release(released);
@@ -371,31 +317,19 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
             routine.budget.release(released);
         }
         assert_eq!(pool.held(), 1);
-        routine
-            .handle_frame(
-                &mut block_sync_guard(),
-                BlockSyncMessage::Block(Arc::new(block))
-                    .encode_frame()
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        deliver(&mut routine, BlockSyncMessage::Block(block)).await;
         assert!(
             bodies.try_recv().is_err(),
             "already satisfied work is not delivered twice"
         );
-        routine
-            .handle_frame(
-                &mut block_sync_guard(),
-                BlockSyncMessage::BlocksDone {
-                    start_height: block::Height(1),
-                    returned: 1,
-                }
-                .encode_frame()
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+        deliver(
+            &mut routine,
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            },
+        )
+        .await;
         assert_eq!(pool.held(), 0);
         drop(routine);
         assert!(!connection.is_cancelled());
@@ -404,18 +338,12 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
 
 #[tokio::test]
 async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let (mut routine, mut outbound, pool, connection, mut events) =
-        requester_routine_with_events(block.hash(), ReservationPool::new(2).unwrap());
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, pool, connection, mut events) = requester_routine(block.hash());
     let (body_sender, _bodies) = mpsc::channel(1);
     routine.sequencer_input = body_sender;
     routine.try_fill().await;
-    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    next_sent(&mut outbound).await;
     // A local timeout drops the window entry but keeps the written reservation.
     let deadline = routine.window.outstanding[0].deadline;
     assert!(routine.expire_due_timeouts(deadline));
@@ -428,33 +356,21 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     routine.servable_high = block::Height(0);
     while events.try_recv().is_ok() {}
 
-    routine
-        .handle_frame(
-            &mut block_sync_guard(),
-            BlockSyncMessage::Block(Arc::new(block))
-                .encode_frame()
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    deliver(&mut routine, BlockSyncMessage::Block(block)).await;
     let reported = std::iter::from_fn(|| events.try_recv().ok())
         .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. }));
     assert!(
         !reported,
         "the peer answered a request it was authorized to answer"
     );
-    routine
-        .handle_frame(
-            &mut block_sync_guard(),
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 1,
-            }
-            .encode_frame()
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     assert_eq!(pool.held(), 0);
     drop(routine);
     assert!(!connection.is_cancelled());
@@ -462,12 +378,10 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
 
 #[tokio::test]
 async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES);
     let height = block.coinbase_height().unwrap();
     let (mut routine, mut outbound, _pool, _connection, mut events) =
-        requester_routine_with_events(block.hash(), ReservationPool::new(2).unwrap());
+        requester_routine(block.hash());
     // Queue this 73 KB body behind the smallest estimate, far beyond tolerance.
     let released = routine.work.reset_above(block::Height(0));
     routine.budget.release(released);
@@ -479,21 +393,10 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
     let (body_sender, mut bodies) = mpsc::channel(1);
     routine.sequencer_input = body_sender;
     routine.try_fill().await;
-    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    next_sent(&mut outbound).await;
     while events.try_recv().is_ok() {}
 
-    routine
-        .handle_frame(
-            &mut block_sync_guard(),
-            BlockSyncMessage::Block(Arc::new(block))
-                .encode_frame()
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    deliver(&mut routine, BlockSyncMessage::Block(block)).await;
     assert!(bodies.try_recv().is_ok(), "the body is still sequenced");
     let reported = std::iter::from_fn(|| events.try_recv().ok())
         .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. }));
@@ -505,13 +408,9 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
 
 #[tokio::test]
 async fn a_partial_ending_requeues_only_the_missing_suffix() {
-    let first: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let second: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let (mut routine, mut outbound, pool, connection) = requester_routine(first.hash());
+    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(first.hash());
     routine.config.max_blocks_per_response = 2;
     routine.max_blocks_per_response = 2;
     routine.work.extend(
@@ -525,36 +424,21 @@ async fn a_partial_ending_requeues_only_the_missing_suffix() {
     let (sender, mut bodies) = mpsc::channel(2);
     routine.sequencer_input = sender;
     routine.try_fill().await;
-    let sent = tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let sent = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(sent).unwrap(),
         BlockSyncMessage::GetBlocks { count: 2, .. }
     ));
-    routine
-        .handle_frame(
-            &mut block_sync_guard(),
-            BlockSyncMessage::Block(Arc::new(first))
-                .encode_frame()
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
     assert!(bodies.try_recv().is_ok());
-    routine
-        .handle_frame(
-            &mut block_sync_guard(),
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 1,
-            }
-            .encode_frame()
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    deliver(
+        &mut routine,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     assert!(!routine.work.pending_contains(block::Height(1)));
     assert!(routine.work.pending_contains(block::Height(2)));
     assert_eq!(pool.held(), 0);
@@ -567,7 +451,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     use super::super::regulated::live_requester::SESSION_RESERVATIONS;
 
     let pool = ReservationPool::new(2 * SESSION_RESERVATIONS).unwrap();
-    let (mut first, _outbound, _, first_connection) =
+    let (mut first, _outbound, _, first_connection, _) =
         requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
     let requester = first.requester.as_ref().unwrap();
     for index in 0..SESSION_RESERVATIONS {
@@ -592,13 +476,10 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     assert!(!first.cancel.is_cancelled());
     assert!(!first_connection.is_cancelled());
 
-    let (mut second, mut outbound, _, second_connection) =
+    let (mut second, mut outbound, _, second_connection, _) =
         requester_routine_with_pool(block::Hash([2; 32]), pool.clone());
     second.try_fill().await;
-    let frame = time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let frame = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(frame).unwrap(),
         BlockSyncMessage::GetBlocks { .. }
@@ -610,13 +491,10 @@ async fn local_session_share_leaves_entries_for_another_requester() {
 #[tokio::test]
 async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let hash = block::Hash([1; 32]);
-    let (mut routine, mut outbound, pool, connection) = requester_routine(hash);
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(hash);
     let work = Arc::clone(&routine.work);
     routine.try_fill().await;
-    time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    next_sent(&mut outbound).await;
     assert!(routine.expire_due_timeouts(routine.window.outstanding[0].deadline));
     // Unrelated accepted blocks can disarm the old block-progress watchdog.
     routine
@@ -650,13 +528,10 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     drop(routine);
     assert_eq!(pool.held(), 0);
 
-    let (mut replacement, mut outbound, _, _) = requester_routine_with_pool(hash, pool);
+    let (mut replacement, mut outbound, ..) = requester_routine_with_pool(hash, pool);
     replacement.work = work;
     replacement.try_fill().await;
-    let frame = time::timeout(Duration::from_secs(1), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let frame = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(frame).unwrap(),
         BlockSyncMessage::GetBlocks {
@@ -668,28 +543,17 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
 
 #[tokio::test]
 async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let response = BlockSyncMessage::Block(Arc::new(block.clone()))
-        .encode_frame()
-        .unwrap();
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let pool = ReservationPool::new(3).unwrap();
     let mut peers = Vec::new();
     for _ in 0..3 {
-        let (mut routine, mut outbound, _, connection) =
+        let (mut routine, mut outbound, _, connection, _) =
             requester_routine_with_pool(block.hash(), pool.clone());
         let (bodies, mut received) = mpsc::channel(1);
         routine.sequencer_input = bodies;
         routine.try_fill().await;
-        tokio::time::timeout(Duration::from_secs(1), outbound.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        routine
-            .handle_frame(&mut block_sync_guard(), response.clone())
-            .await
-            .unwrap();
+        next_sent(&mut outbound).await;
+        deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
         assert!(!routine.requester.as_ref().unwrap().at_capacity());
         peers.push((routine, outbound, connection));
@@ -727,10 +591,8 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
 
 #[tokio::test(start_paused = true)]
 async fn buffered_ending_survives_a_long_local_decode_wait() {
-    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
     let held = bodies.clone().try_reserve_owned().unwrap();
     routine.sequencer_input = bodies;
@@ -748,20 +610,17 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         )
         .await
         .unwrap();
-    let mut guard = block_sync_guard();
-    let mut processing = Box::pin(
-        routine.handle_frame(
-            &mut guard,
-            BlockSyncMessage::Block(Arc::new(block))
-                .encode_frame()
-                .unwrap(),
-        ),
-    );
+    let mut processing = Box::pin(deliver(&mut routine, BlockSyncMessage::Block(block)));
     assert!(futures::poll!(&mut processing).is_pending());
     time::advance(Duration::from_secs(40)).await;
     drop(held);
-    processing.await.unwrap();
+    processing.await;
     received.try_recv().unwrap();
+    assert_eq!(
+        pool.held(),
+        1,
+        "the ending still owns authorization after all bodies arrive"
+    );
     assert!(routine
         .check_request_liveness(time::Instant::now().into_std())
         .is_ok());
@@ -776,7 +635,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
 
 #[tokio::test(start_paused = true)]
 async fn a_live_partially_returned_range_waits_without_retry_spin() {
-    let (mut routine, mut outbound, _, connection) = requester_routine(block::Hash([1; 32]));
+    let (mut routine, mut outbound, _, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.config.max_blocks_per_response = 2;
     routine.max_blocks_per_response = 2;
     routine.work.extend(
@@ -835,7 +694,7 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
 
 #[tokio::test]
 async fn a_disappeared_avoidance_timer_still_retries_immediately() {
-    let (routine, _, _, _) = requester_routine(block::Hash([1; 32]));
+    let (routine, ..) = requester_routine(block::Hash([1; 32]));
     let now = Instant::now();
     assert_eq!(routine.retry_filter_wake_deadline(now, true), Some(now));
     assert_eq!(routine.retry_filter_wake_deadline(now, false), None);
@@ -845,13 +704,9 @@ async fn a_disappeared_avoidance_timer_still_retries_immediately() {
 #[tokio::test(start_paused = true)]
 async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     time::advance(Duration::from_secs(7)).await;
-    let first: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let second: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let (mut routine, mut outbound, pool, connection) = requester_routine(first.hash());
+    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, pool, connection, _) = requester_routine(first.hash());
     routine.work.extend(
         super::super::test_work_scope(),
         [(
@@ -870,11 +725,7 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     assert!(futures::poll!(&mut running).is_pending());
     outbound.recv().await.unwrap();
     input
-        .send(
-            BlockSyncMessage::Block(Arc::new(first))
-                .encode_frame()
-                .unwrap(),
-        )
+        .send(BlockSyncMessage::Block(first).encode_frame().unwrap())
         .await
         .unwrap();
     assert!(futures::poll!(&mut running).is_pending());
@@ -884,11 +735,7 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     outbound.recv().await.unwrap();
     time::advance(Duration::from_secs(10)).await;
     input
-        .send(
-            BlockSyncMessage::Block(Arc::new(second))
-                .encode_frame()
-                .unwrap(),
-        )
+        .send(BlockSyncMessage::Block(second).encode_frame().unwrap())
         .await
         .unwrap();
     assert!(futures::poll!(&mut running).is_pending());

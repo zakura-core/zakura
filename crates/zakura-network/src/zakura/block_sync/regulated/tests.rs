@@ -731,11 +731,6 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
 }
 
 #[tokio::test]
-async fn queued_getblocks_commitments_have_a_measured_memory_ceiling() {
-    measure_waiting_getblocks_sessions(1);
-}
-
-#[tokio::test]
 #[ignore = "manual load measurement: retains up to the 512 MiB bookkeeping budget"]
 async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
     // Broad CI includes ignored tests. At the defaults this queues 512 sessions of

@@ -18,8 +18,6 @@ use crate::zakura::{
     Frame, ZakuraPeerId,
 };
 
-mod load;
-
 #[derive(Debug)]
 struct Store {
     blocks: Vec<(block::Height, Arc<block::Block>)>,
@@ -728,70 +726,4 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
         (1, 0),
         "a reconnect must find the still-running peer execution budget"
     );
-}
-
-#[tokio::test]
-#[ignore = "manual load measurement: retains up to the 512 MiB bookkeeping budget"]
-async fn maximum_admitted_getblocks_sessions_have_a_measured_memory_ceiling() {
-    // Broad CI includes ignored tests. At the defaults this queues 512 sessions of
-    // 5,632 requests, about 330 MB at the measured per-request cost.
-    if std::env::var_os("ZAKURA_LARGE_LOAD_TEST").is_none() {
-        return;
-    }
-    let peers = super::super::ZakuraBlockSyncConfig::default().peer_limits;
-    measure_waiting_getblocks_sessions(peers.max_inbound_peers + peers.max_outbound_peers);
-}
-
-#[allow(clippy::print_stderr)] // Manual load runs report measured bytes and admission time.
-fn measure_waiting_getblocks_sessions(peers: usize) {
-    measure_waiting_getblocks_capacity(peers, &super::super::ZakuraBlockSyncConfig::default());
-}
-
-#[allow(clippy::print_stderr)]
-fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::ZakuraBlockSyncConfig) {
-    let serving = super::session::Serving::new(store(&[], false), config);
-    let cancel = CancellationToken::new();
-    let count = super::session::serving_max_inflight_requests(config) * 2;
-    let started = std::time::Instant::now();
-    // No await: all requests remain queued before any worker can run. Output
-    // receivers stay alive so closed queues cannot hide the retained cost.
-    let (mut sessions, fixed) = zakura_test::allocations::measure(|| {
-        (0..peers)
-            .map(|index| {
-                let mut identity = vec![91; 32];
-                identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
-                let peer = ZakuraPeerId::new(identity).unwrap();
-                let (send, output) = framed_channel(4);
-                let session = serving.session(
-                    &peer,
-                    send,
-                    cancel.clone(),
-                    cancel.clone(),
-                    crate::zakura::CloseCause::default(),
-                );
-                (session, output)
-            })
-            .collect::<Vec<_>>()
-    });
-    let (_, allocations) = zakura_test::allocations::measure(|| {
-        for (session, _) in &mut sessions {
-            for height in 1..=count {
-                session.admit(block::Height(height), 1).unwrap();
-            }
-        }
-    });
-    eprintln!("GetBlocks fixed peers={peers} {fixed:?}");
-    // ARM64 debug measurements were about 10 KiB fixed plus 113 B per queued request.
-    // These ceilings catch bookkeeping regressions, not total node-memory use.
-    assert!(fixed.retained_bytes < peers * 16_384, "{fixed:?}");
-    assert!(
-        allocations.retained_bytes < peers * usize::try_from(count).unwrap() * 160,
-        "{allocations:?}"
-    );
-    eprintln!(
-        "GetBlocks peers={peers}, waiting per peer={count}, admission time={:?}, {allocations:?}",
-        started.elapsed()
-    );
-    cancel.cancel();
-    drop(sessions);
 }

@@ -4,6 +4,7 @@ use super::*;
 use zakura_chain::{block, serialization::ZcashDeserializeInto};
 use zakura_test::{
     allocations::{in_isolated_process, ProcessMeasurement},
+    process_stats::{cpu_seconds, memory_kib},
     vectors::BLOCK_MAINNET_1_BYTES,
 };
 
@@ -266,16 +267,38 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
     );
 }
 
-/// Serves one block per height to even peers and nothing to odd ones, without gating.
+/// What [`OpenSource`] returns for each read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeShape {
+    /// Even peers receive one block per height and odd peers empty responses.
+    Useful,
+    /// Every peer receives empty responses.
+    Unavailable,
+    /// Reads never finish, so admitted requests stay queued.
+    Stalled,
+}
+
+/// Answers reads with its [`ProbeShape`] after an optional delay, without gating.
 #[derive(Debug)]
-struct OpenSource(Arc<block::Block>);
+struct OpenSource {
+    block: Arc<block::Block>,
+    shape: ProbeShape,
+    delay: Duration,
+}
 
 impl Source for OpenSource {
     fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
         let peer = request.start_height.0 / STRIDE;
-        let block = self.0.clone();
+        let (block, shape, delay) = (self.block.clone(), self.shape, self.delay);
         Box::pin(async move {
-            let blocks = if request.lease.try_start() && peer.is_multiple_of(2) {
+            if shape == ProbeShape::Stalled {
+                futures::future::pending::<()>().await;
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let useful = shape == ProbeShape::Useful && peer.is_multiple_of(2);
+            let blocks = if request.lease.try_start() && useful {
                 (0..request.count)
                     .map(|offset| (Height(request.start_height.0 + offset), block.clone()))
                     .collect()
@@ -290,10 +313,37 @@ impl Source for OpenSource {
     }
 }
 
-/// Manual evidence at the default maximum session count: every inbound and
-/// outbound slot keeps the advertised in-flight limit outstanding while half
-/// the peers receive bodies and half receive empty responses. Reports
-/// throughput, CPU time, per-session fairness and process memory.
+/// Parse the environment variable `name`, or return `default` when it is unset.
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name).map_or(default, |value| {
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid {name}={value}"))
+    })
+}
+
+/// Manual serving evidence, by default at the maximum session count: every
+/// inbound and outbound slot keeps the advertised in-flight limit outstanding
+/// while half the peers receive bodies and half receive empty responses.
+/// Reports throughput, CPU time, per-session fairness, wire bytes per response
+/// and process memory.
+///
+/// Requires `ZAKURA_MAX_PEER_PROBE=1`. Optional overrides, with defaults:
+/// - `ZAKURA_PROBE_SECS` (20): serving time.
+/// - `ZAKURA_PROBE_SESSIONS` (inbound plus outbound peer limit).
+/// - `ZAKURA_PROBE_WINDOW` (advertised limit): requests each session keeps
+///   outstanding, at most twice the advertised limit. It also sets the
+///   configured `max_inflight_requests`, which the bookkeeping budget caps.
+/// - `ZAKURA_PROBE_BLOCKS` (1): blocks per request and per response.
+/// - `ZAKURA_PROBE_READ_DELAY_MS` (0): delay before each storage read.
+/// - `ZAKURA_PROBE_SHAPE` (`useful`): `unavailable` makes every response empty;
+///   `stalled` never finishes a read, so the probe only admits and reports.
+///
+/// For the single-session window sweep, set `ZAKURA_PROBE_SESSIONS=1` with each
+/// window and shape. For the queued-commitment memory ceiling, set
+/// `ZAKURA_PROBE_SHAPE=stalled ZAKURA_PROBE_WINDOW=5632` (twice the default
+/// advertised limit) to queue that many requests in every default session; see
+/// `admission_retained_bytes` and the admitted RSS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manual load evidence; requires ZAKURA_MAX_PEER_PROBE=1"]
 #[allow(clippy::print_stderr)]
@@ -301,15 +351,44 @@ async fn maximum_sessions_continuous_serving_probe() {
     if std::env::var_os("ZAKURA_MAX_PEER_PROBE").is_none() {
         return;
     }
-    let seconds = std::env::var("ZAKURA_PROBE_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(20);
-    let config = ZakuraBlockSyncConfig::default();
-    let peers = config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers;
-    let window = super::super::serving_max_inflight_requests(&config);
-    let block = Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap());
-    let serving = Serving::new(Arc::new(OpenSource(block)), &config);
+    let mut config = ZakuraBlockSyncConfig::default();
+    let shape_name = env_or("ZAKURA_PROBE_SHAPE", "useful".to_string());
+    let shape = match shape_name.as_str() {
+        "useful" => ProbeShape::Useful,
+        "unavailable" => ProbeShape::Unavailable,
+        "stalled" => ProbeShape::Stalled,
+        other => panic!("unknown ZAKURA_PROBE_SHAPE={other}"),
+    };
+    let seconds = if shape == ProbeShape::Stalled {
+        0
+    } else {
+        env_or("ZAKURA_PROBE_SECS", 20)
+    };
+    let peers = env_or(
+        "ZAKURA_PROBE_SESSIONS",
+        config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers,
+    );
+    let window = env_or(
+        "ZAKURA_PROBE_WINDOW",
+        super::super::serving_max_inflight_requests(&config),
+    );
+    let blocks: u32 = env_or("ZAKURA_PROBE_BLOCKS", 1);
+    let delay_ms = env_or("ZAKURA_PROBE_READ_DELAY_MS", 0);
+    assert!(
+        window
+            .checked_mul(blocks)
+            .is_some_and(|heights| heights < STRIDE),
+        "each session's outstanding heights must fit its height stride"
+    );
+    config.max_inflight_requests = window;
+    config.max_blocks_per_response = blocks;
+    let advertised = super::super::serving_max_inflight_requests(&config);
+    let source = OpenSource {
+        block: Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap()),
+        shape,
+        delay: Duration::from_millis(delay_ms),
+    };
+    let serving = Serving::new(Arc::new(source), &config);
     let baseline = memory_kib();
     let cancel = CancellationToken::new();
     let mut sessions: Vec<_> = (0..peers)
@@ -327,30 +406,38 @@ async fn maximum_sessions_continuous_serving_probe() {
             (session, output)
         })
         .collect();
-    let base = |peer: usize| u32::try_from(peer).unwrap() * STRIDE + 1;
+    let start = |peer: usize, issued: u32| {
+        Height(u32::try_from(peer).unwrap() * STRIDE + 1 + issued * blocks)
+    };
     let mut issued = vec![0_u32; peers];
-    for (peer, (session, _)) in sessions.iter_mut().enumerate() {
-        for _ in 0..window {
-            session.admit(Height(base(peer) + issued[peer]), 1).unwrap();
-            issued[peer] += 1;
+    // Only this thread's allocations count, so this is the admission bookkeeping.
+    let (_, admission) = zakura_test::allocations::measure(|| {
+        for (peer, (session, _)) in sessions.iter_mut().enumerate() {
+            for _ in 0..window {
+                session.admit(start(peer, issued[peer]), blocks).unwrap();
+                issued[peer] += 1;
+            }
         }
-    }
+    });
     let admitted = memory_kib();
     let cpu_start = cpu_seconds();
     let mut completed = vec![0_u64; peers];
+    let mut wire_bytes = 0_u64;
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     while std::time::Instant::now() < deadline {
         let mut idle = true;
         for (peer, (session, output)) in sessions.iter_mut().enumerate() {
             while let Ok(frame) = output.try_recv() {
                 idle = false;
+                wire_bytes +=
+                    u64::try_from(frame.payload.len() + crate::zakura::FRAME_HEADER_BYTES).unwrap();
                 if matches!(frame.message_type, 4 | 5) {
                     completed[peer] += 1;
                     // Reuse this peer's heights; completed ranges are drained on admission.
-                    if issued[peer] + 1 >= STRIDE {
+                    if (issued[peer] + 1) * blocks >= STRIDE {
                         issued[peer] = 0;
                     }
-                    session.admit(Height(base(peer) + issued[peer]), 1).unwrap();
+                    session.admit(start(peer, issued[peer]), blocks).unwrap();
                     issued[peer] += 1;
                 }
             }
@@ -366,37 +453,26 @@ async fn maximum_sessions_continuous_serving_probe() {
     let total: u64 = completed.iter().sum();
     let min = completed.iter().min().copied().unwrap_or(0);
     let max = completed.iter().max().copied().unwrap_or(0);
-    // Float conversion is lossy only beyond 2^53 responses, far above any run.
-    let rate = total as f64 / seconds as f64;
+    // Float conversions are lossy only beyond 2^53 responses or seconds, far above any run.
+    let rate = if seconds == 0 {
+        0.0
+    } else {
+        total as f64 / seconds as f64
+    };
+    let bytes_per_response = wire_bytes.checked_div(total).filter(|&bytes| bytes > 0);
+    let bdp_entries = bytes_per_response.map(|bytes| {
+        (2 * crate::zakura::regulation::sizing::bandwidth_delay_bytes()).div_ceil(bytes)
+    });
     eprintln!(
         "max_peer_probe sessions={peers} window={window} seconds={seconds} responses={total} \
          responses_per_s={rate:.0} per_session_min={min} per_session_max={max} cpu_s={cpu:?} \
-         rss_kib(baseline,admitted,run)={baseline:?},{admitted:?},{run:?}"
+         rss_kib(baseline,admitted,run)={baseline:?},{admitted:?},{run:?} shape={shape_name} \
+         blocks={blocks} read_delay_ms={delay_ms} advertised={advertised} \
+         admission_retained_bytes={} bytes_per_response={bytes_per_response:?} \
+         entries_for_twice_target_bdp={bdp_entries:?}",
+        admission.retained_bytes,
     );
-    assert!(min > 0, "every session progresses");
-}
-
-/// Current and peak resident memory in KiB, from `/proc` on Linux.
-fn memory_kib() -> Option<(u64, u64)> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))?
-            .trim()
-            .trim_end_matches(" kB")
-            .parse()
-            .ok()
-    };
-    Some((field("VmRSS:")?, field("VmHWM:")?))
-}
-
-/// User plus system CPU seconds for this process, from `/proc` on Linux.
-fn cpu_seconds() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // Fields after the parenthesized command name; utime and stime are 14 and 15.
-    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
-    // Linux reports these in USER_HZ, which is 100 on supported targets.
-    Some(ticks / 100.0)
+    if shape != ProbeShape::Stalled {
+        assert!(min > 0, "every session progresses");
+    }
 }

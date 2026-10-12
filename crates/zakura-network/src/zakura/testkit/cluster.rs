@@ -1295,17 +1295,6 @@ mod tests {
         }
     }
 
-    /// User plus system CPU seconds for this process, from `/proc` on Linux.
-    fn process_cpu_seconds() -> Option<f64> {
-        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-        // Fields after the parenthesized command name; utime and stime are 14 and 15.
-        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-        let ticks: f64 =
-            fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
-        // Linux reports these in USER_HZ, which is 100 on supported targets.
-        Some(ticks / 100.0)
-    }
-
     /// Manual evidence for regulated GetBlocks throughput over native QUIC.
     ///
     /// One requester pipelines GetBlocks against a production regulated server
@@ -1425,7 +1414,7 @@ mod tests {
                 let frame = frame?;
                 let counted = tokio::time::Instant::now() >= warmup;
                 if counted && cpu_start.is_none() {
-                    cpu_start = Some(process_cpu_seconds());
+                    cpu_start = Some(zakura_test::process_stats::cpu_seconds());
                 }
                 match frame.message_type {
                     3 if counted => {
@@ -1441,7 +1430,10 @@ mod tests {
             }
             stop.store(true, Ordering::Relaxed);
             window.add_permits(1);
-            let cpu = match (cpu_start.flatten(), process_cpu_seconds()) {
+            let cpu = match (
+                cpu_start.flatten(),
+                zakura_test::process_stats::cpu_seconds(),
+            ) {
                 (Some(start), Some(end)) => format!("{:.2}", end - start),
                 _ => "n/a".into(),
             };

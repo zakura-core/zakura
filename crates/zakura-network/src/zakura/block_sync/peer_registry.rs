@@ -150,6 +150,12 @@ fn collect_supplier_retries(
     })
 }
 
+/// Supplier-map size at which new incompatibility cooldowns stop being added:
+/// 64 suppliers' worth of full 128-block responses. These cooldowns outlive
+/// sessions, so peer limits do not bound them, and every lookup scans the map
+/// under the shared lock. `Unavailable` entries are bounded per body instead.
+const MAX_SUPPLIER_RETRIES: usize = 8_192;
+
 /// Authority and deadlines share a lock so stale routine snapshots cannot undo a refresh.
 #[derive(Debug, Default)]
 struct SupplierRetryState {
@@ -310,11 +316,14 @@ impl PeerRegistry {
                 BodyRetryKey::new(scope, hash),
                 BodyRetryReason::Incompatible,
             );
-            retries
-                .entries
-                .entry(key)
-                .and_modify(|deadline| *deadline = (*deadline).max(until))
-                .or_insert(until);
+            if let Some(deadline) = retries.entries.get_mut(&key) {
+                *deadline = (*deadline).max(until);
+            } else if retries.entries.len() < MAX_SUPPLIER_RETRIES {
+                retries.entries.insert(key, until);
+            } else {
+                // The cooldown is advisory. Skipping it only allows an earlier retry.
+                metrics::counter!("sync.block.body.incompatible_cooldown_skipped").increment(1);
+            }
         }
     }
 
@@ -1460,6 +1469,52 @@ mod floor_bias_tests {
             ..fresh
         }));
         assert!(!registry.is_body_retry_avoided(&peer, fresh, hash, now));
+    }
+
+    /// Identity churn cannot grow incompatibility cooldowns past their capacity.
+    #[test]
+    fn incompatible_cooldowns_stop_at_capacity_across_identities() {
+        let registry = PeerRegistry::new();
+        let scope = super::super::test_work_scope();
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        let first = peer(1);
+        let hash = |index: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            block::Hash(bytes)
+        };
+        let bodies_per_peer = 128;
+        for identity in 0..=MAX_SUPPLIER_RETRIES / bodies_per_peer {
+            let identity = identity + 1;
+            // Test identities are small and fit u8 within this loop bound.
+            let source = zakura_header_chain::SourceId::from_digest(
+                peer(u8::try_from(identity).unwrap()).digest(),
+            );
+            registry.defer_incompatible_bodies(
+                source,
+                (0..bodies_per_peer).map(|body| (scope, hash(body))),
+                until,
+            );
+        }
+        assert_eq!(
+            registry.body_retry_lock().entries.len(),
+            MAX_SUPPLIER_RETRIES
+        );
+        assert!(registry.is_body_retry_avoided(&first, scope, hash(0), now));
+
+        // An existing cooldown can still be extended at capacity.
+        registry.defer_incompatible_bodies(
+            zakura_header_chain::SourceId::from_digest(first.digest()),
+            [(scope, hash(0))],
+            now + Duration::from_secs(120),
+        );
+        assert!(registry.is_body_retry_avoided(
+            &first,
+            scope,
+            hash(0),
+            now + Duration::from_secs(90)
+        ));
     }
 
     /// Caller iteration can inspect registry state without nesting its retry mutex.

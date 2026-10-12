@@ -297,6 +297,9 @@ pub(super) struct PeerRoutine {
     inbound_status_meter: super::state::RateMeter,
     /// Allows one immediate range change without permitting an unbounded bypass.
     status_range_bypass_available: bool,
+    /// Clamped limits last published to the registry. Request issuance uses the
+    /// latest limits immediately; only publication waits for the meter.
+    published_limits: (u32, u32, u32),
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -379,6 +382,11 @@ impl PeerRoutine {
         );
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
+        let published_limits = (
+            max_blocks_per_response,
+            max_response_bytes,
+            window.max_inflight_requests,
+        );
         PeerRoutine {
             requester: None,
             request_pool_waiting: false,
@@ -399,6 +407,7 @@ impl PeerRoutine {
             status_reply_meter,
             inbound_status_meter,
             status_range_bypass_available: false,
+            published_limits,
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
@@ -727,8 +736,14 @@ impl PeerRoutine {
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
-                self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
-                    .await;
+                self.handle_body(
+                    block,
+                    body_wire_bytes,
+                    body_permit,
+                    raw_block_payload,
+                    authorized_height.is_some(),
+                )
+                .await;
             }
             BlockSyncMessage::BlocksDone {
                 start_height,
@@ -798,6 +813,18 @@ impl PeerRoutine {
         let now = time::Instant::now().into_std();
         let range_changed =
             status.servable_high != self.servable_high || status.servable_low != self.servable_low;
+        let limits = (
+            super::config::clamp_advertised_blocks(status.max_blocks_per_response),
+            super::config::clamp_advertised_response_bytes(status.max_response_bytes),
+            super::config::clamp_advertised_inflight(status.max_inflight_requests),
+        );
+        // Requests must obey the peer's latest limits even while publication waits.
+        (
+            self.max_blocks_per_response,
+            self.max_response_bytes,
+            self.window.max_inflight_requests,
+        ) = limits;
+        let limits_changed = limits != self.published_limits;
         if self.inbound_status_meter.try_take(now) {
             self.status_range_bypass_available = true;
         } else if range_changed && self.status_range_bypass_available {
@@ -805,9 +832,10 @@ impl PeerRoutine {
             // cannot flood registry/reactor work by oscillating its range.
             self.status_range_bypass_available = false;
         } else {
-            // Keep only the latest changed range. A return to the applied range
-            // cancels an older pending change without causing a status reply loop.
-            self.pending_status = range_changed.then_some(status);
+            // Keep only the latest Status that changes the published range or
+            // limits. A return to the published state cancels an older pending
+            // change without causing a status reply loop.
+            self.pending_status = (range_changed || limits_changed).then_some(status);
             return;
         }
         self.pending_status = None;
@@ -817,12 +845,7 @@ impl PeerRoutine {
         self.received_status = true;
         self.servable_low = status.servable_low;
         self.servable_high = status.servable_high;
-        self.max_blocks_per_response =
-            super::config::clamp_advertised_blocks(status.max_blocks_per_response);
-        self.max_response_bytes =
-            super::config::clamp_advertised_response_bytes(status.max_response_bytes);
-        self.window.max_inflight_requests =
-            super::config::clamp_advertised_inflight(status.max_inflight_requests);
+        self.published_limits = limits;
         // Publish the servable range / clamped caps / received_status to the
         // registry so the reactor's serving/candidate reads and `GetBlocks`
         // admission see them; generation-gated.
@@ -1781,12 +1804,15 @@ impl PeerRoutine {
 
     // ===================== inbound matched body (ports `handle_block`) ======
 
+    /// Handle a decoded body. `authorized` means a regulated reservation
+    /// already matched it, so the peer kept its side of the exchange.
     async fn handle_body(
         &mut self,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
+        authorized: bool,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -1820,6 +1846,16 @@ impl PeerRoutine {
                 return;
             }
             if self.ignore_servable_range_response(height, "body") {
+                return;
+            }
+            if authorized {
+                // Local retirement, reorgs and GC change interest, not authority.
+                metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
+                tracing::debug!(
+                    peer = ?self.peer,
+                    ?height,
+                    "ignoring an authorized block-sync body for retired local work"
+                );
                 return;
             }
             self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
@@ -1899,12 +1935,16 @@ impl PeerRoutine {
         };
         if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
-            // The body matched the requested hash, so the hint was wrong, not the body.
-            // Discarding it would let one bad advertised size stall this height on every
-            // honest delivery; report and keep going.
+            // The header matched the requested hash, so the size hint was wrong.
+            // Consensus still validates the body. Discarding it would let one bad
+            // advertised size stall this height on every honest delivery. A
+            // regulated reservation already bounds the body's bytes, so the
+            // estimate says nothing about that supplier.
             metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
-            self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
-                .await;
+            if !authorized {
+                self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
+                    .await;
+            }
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
@@ -2932,7 +2972,7 @@ mod tests {
             })
         ));
         let immediate_range = routine.registry.candidate_snapshot();
-        let immediate_caps = routine.max_response_bytes;
+        let immediate_caps = routine.published_limits;
         status.max_response_bytes /= 2;
         for (low, high) in [(1, 3), (2, 4), (0, 0), (3, 3)]
             .into_iter()
@@ -2947,7 +2987,8 @@ mod tests {
                 "range oscillation must not bypass the meter indefinitely"
             );
             assert_eq!(routine.registry.candidate_snapshot(), immediate_range);
-            assert_eq!(routine.max_response_bytes, immediate_caps);
+            assert_eq!(routine.published_limits, immediate_caps);
+            assert_eq!(routine.max_response_bytes, status.max_response_bytes);
         }
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
@@ -2983,6 +3024,74 @@ mod tests {
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
         assert_eq!(routine.servable_low, block::Height(1));
+    }
+
+    #[tokio::test]
+    async fn a_throttled_limits_only_status_applies_when_the_window_opens() {
+        let (mut routine, mut outbound, mut reactor_events) = status_test_routine();
+        let mut status = BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            tip_hash: block::Hash([3; 32]),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 8,
+            max_response_bytes: routine.config.advertised_max_response_bytes(),
+        };
+        routine.handle_status(status);
+        let _ = reactor_events
+            .try_recv()
+            .expect("initial status is published");
+        assert_eq!(routine.window.max_inflight_requests, 8);
+
+        // A second Status, buffered behind a read pause, only lowers the limit.
+        routine.inbound_status_meter.next_allowed = Instant::now() + Duration::from_secs(60);
+        status.max_inflight_requests = 1;
+        routine.handle_status(status);
+        assert_eq!(
+            routine.window.max_inflight_requests, 1,
+            "new requests obey the lowered limit before the meter opens"
+        );
+        assert!(
+            reactor_events.try_recv().is_err(),
+            "publication still waits for the meter"
+        );
+        // One-block requests for three heights: only one may be in flight.
+        routine.work.extend(
+            super::super::test_work_scope(),
+            (1..=3).map(|height| {
+                (
+                    block::Height(height),
+                    block::Hash([u8::try_from(height).unwrap(); 32]),
+                    BlockSizeEstimate::Advertised(1_000),
+                )
+            }),
+        );
+        let _ = routine.try_fill().await;
+        let issued = std::iter::from_fn(|| outbound.try_recv().ok())
+            .filter(|frame| {
+                matches!(
+                    BlockSyncMessage::decode_frame(frame.clone()),
+                    Ok(BlockSyncMessage::GetBlocks { .. })
+                )
+            })
+            .count();
+        assert_eq!(
+            issued, 1,
+            "no request is issued against the superseded limit"
+        );
+        // A repeat must not cancel the unpublished change.
+        routine.handle_status(status);
+
+        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.flush_pending_status();
+        assert_eq!(
+            routine.published_limits.2, 1,
+            "the lowered limit is published"
+        );
+        assert!(matches!(
+            reactor_events.try_recv(),
+            Ok(RoutineToReactor::StatusReceived { .. })
+        ));
     }
 
     #[tokio::test]
@@ -3051,10 +3160,11 @@ mod tests {
             ));
         }
 
-        let old_response_bytes = routine.max_response_bytes;
+        let old_limits = routine.published_limits;
         status.max_response_bytes /= 2;
         routine.handle_status(status);
-        assert_eq!(routine.max_response_bytes, old_response_bytes);
+        assert_eq!(routine.published_limits, old_limits);
+        assert_eq!(routine.max_response_bytes, status.max_response_bytes);
         assert!(
             routine_to_reactor_rx.try_recv().is_err(),
             "unchanged ranges must still be rate limited"

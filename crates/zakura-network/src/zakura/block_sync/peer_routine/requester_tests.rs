@@ -16,7 +16,23 @@ fn requester_routine_with_pool(
     expected_hash: block::Hash,
     pool: ReservationPool,
 ) -> (PeerRoutine, FramedRecv, ReservationPool, CancellationToken) {
-    let (mut routine, outbound, _events) = super::tests::status_test_routine();
+    let (routine, outbound, pool, connection, _events) =
+        requester_routine_with_events(expected_hash, pool);
+    (routine, outbound, pool, connection)
+}
+
+/// Like [`requester_routine_with_pool`], but keeps the routine's reports to the reactor.
+fn requester_routine_with_events(
+    expected_hash: block::Hash,
+    pool: ReservationPool,
+) -> (
+    PeerRoutine,
+    FramedRecv,
+    ReservationPool,
+    CancellationToken,
+    mpsc::Receiver<RoutineToReactor>,
+) {
+    let (mut routine, outbound, events) = super::tests::status_test_routine();
     let connection = CancellationToken::new();
     let fence = WriterFence::new(connection.clone(), CloseCause::default());
     routine.requester = Some(LiveRequester::new(
@@ -39,7 +55,7 @@ fn requester_routine_with_pool(
             BlockSizeEstimate::Confirmed(1000),
         )],
     );
-    (routine, outbound, pool, connection)
+    (routine, outbound, pool, connection, events)
 }
 
 #[tokio::test]
@@ -384,6 +400,107 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
         drop(routine);
         assert!(!connection.is_cancelled());
     }
+}
+
+#[tokio::test]
+async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection, mut events) =
+        requester_routine_with_events(block.hash(), ReservationPool::new(2).unwrap());
+    let (body_sender, _bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    routine.try_fill().await;
+    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // A local timeout drops the window entry but keeps the written reservation.
+    let deadline = routine.window.outstanding[0].deadline;
+    assert!(routine.expire_due_timeouts(deadline));
+    assert!(routine.window.outstanding.is_empty());
+    assert_eq!(pool.held(), 1);
+    // A local reorg drops the height, and the peer's later Status contracts its range.
+    let released = routine.work.reset_above(block::Height(0));
+    routine.budget.release(released);
+    routine.servable_low = block::Height(0);
+    routine.servable_high = block::Height(0);
+    while events.try_recv().is_ok() {}
+
+    routine
+        .handle_frame(
+            &mut block_sync_guard(),
+            BlockSyncMessage::Block(Arc::new(block))
+                .encode_frame()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let reported = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. }));
+    assert!(
+        !reported,
+        "the peer answered a request it was authorized to answer"
+    );
+    routine
+        .handle_frame(
+            &mut block_sync_guard(),
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(1),
+                returned: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pool.held(), 0);
+    drop(routine);
+    assert!(!connection.is_cancelled());
+}
+
+#[tokio::test]
+async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let height = block.coinbase_height().unwrap();
+    let (mut routine, mut outbound, _pool, _connection, mut events) =
+        requester_routine_with_events(block.hash(), ReservationPool::new(2).unwrap());
+    // Queue this 73 KB body behind the smallest estimate, far beyond tolerance.
+    let released = routine.work.reset_above(block::Height(0));
+    routine.budget.release(released);
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(height, block.hash(), BlockSizeEstimate::Confirmed(500))],
+    );
+    routine.servable_high = height;
+    let (body_sender, mut bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    routine.try_fill().await;
+    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    while events.try_recv().is_ok() {}
+
+    routine
+        .handle_frame(
+            &mut block_sync_guard(),
+            BlockSyncMessage::Block(Arc::new(block))
+                .encode_frame()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(bodies.try_recv().is_ok(), "the body is still sequenced");
+    let reported = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. }));
+    assert!(
+        !reported,
+        "a wrong local estimate is not the supplier's fault"
+    );
 }
 
 #[tokio::test]

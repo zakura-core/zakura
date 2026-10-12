@@ -202,8 +202,11 @@ unchanged messages MUST count toward cadence.
 ## Capacity admission
 
 The receiver MUST start response work only when worker capacity and bounded output capacity are
-available. When capacity is unavailable, it MUST stop draining the affected request stream.
-Capacity release MUST resume eligible processing. Local capacity exhaustion is not a peer violation.
+available. When capacity is unavailable, it MUST stop draining the affected request stream, or
+admit each request as a bounded commitment and wait for capacity outside the reader. Under the
+second option, admitted commitments MUST stay within the protocol inflight bound, and the receiver
+MUST acquire execution and output capacity before producing each response. Capacity release MUST
+resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 - Execution slots MUST bound actual running work. Protocol inflight limits bound accepted
   commitments and MAY exceed execution slots. A sender MUST obey advertised inflight limits.
@@ -702,8 +705,17 @@ plus the initial message and one message of jitter. The sender interval remains 
   - `start_height + count - 1 <= Height::MAX`
   - exact consumption
 - **Capacity**
-  - outstanding commitments <= advertised inflight limit
+  - requester: outstanding requests <= the receiver's advertised inflight limit
+  - receiver: serve up to twice the highest inflight limit advertised on the connection
   - bounded per-peer and node-wide storage execution, retained results, and queued output
+
+The receiver counts a commitment from admission until its ending enters the session's ordered
+output, before transmission. A conformant requester sends its next request only after it receives
+an ending, so it stays within the advertised limit on that tally. As a conservative margin, the
+receiver MUST serve requests above the advertised limit up to twice that limit and MUST return
+`Disconnect` only for the request after that. The margin would also cover a receiver that released
+commitments only when an ending's write completed, because at most one further request can follow
+each ending in transit. The receiver SHOULD trace requests above the advertised limit.
 
 The handler MUST bound storage work and retained results for each range. It MAY use bounded
 sequential reads rather than retaining the whole response from one contiguous read. It MUST send

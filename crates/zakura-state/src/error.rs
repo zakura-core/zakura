@@ -374,7 +374,7 @@ impl CommitBlockError {
         use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
         match self {
-            Self::Duplicate { .. } => BodyVerificationClass::Duplicate,
+            Self::Duplicate { location, .. } => location.body_verification_class(),
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
@@ -1337,6 +1337,27 @@ mod tests {
             .body_verification_class(),
             BodyVerificationClass::Duplicate
         );
+    }
+
+    #[test]
+    fn duplicate_body_class_requires_committed_state() {
+        for location in [
+            KnownBlock::Queue,
+            KnownBlock::WriteChannel,
+            KnownBlock::Finalized,
+            KnownBlock::BestChain,
+            KnownBlock::SideChain,
+        ] {
+            let expected = match location {
+                KnownBlock::Queue | KnownBlock::WriteChannel => {
+                    BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+                }
+                _ => BodyVerificationClass::Duplicate,
+            };
+            let error = CommitBlockError::new_duplicate(None, location);
+            assert_eq!(error.body_verification_class(), expected);
+            assert_eq!(error.misbehavior_score(), 0);
+        }
     }
 
     #[test]

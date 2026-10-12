@@ -2194,6 +2194,13 @@ impl ZakuraRequestClient {
             &mut OsRng,
         );
 
+        // Only block and transaction answers are bound to the request, so a peer
+        // started alongside a slow one cannot win with a made-up answer. Other
+        // kinds try peers one at a time.
+        let hedges = matches!(
+            request_kind,
+            LegacyRequestKind::Blocks | LegacyRequestKind::Transactions
+        );
         let mut remaining = candidates.iter();
         let mut attempts = FuturesUnordered::new();
         let mut hedge = None;
@@ -2203,12 +2210,15 @@ impl ZakuraRequestClient {
         loop {
             if start_next {
                 if let Some(handle) = remaining.next() {
-                    let (dispatched, dispatched_rx) = oneshot::channel();
-                    let (frames, frames_rx) = watch::channel(());
-                    let progress = Some(AttemptProgress { dispatched, frames });
-                    // Try the next peer alongside this one if it stalls,
-                    // without giving up on it.
-                    hedge = Some(Box::pin(attempt_stalled(dispatched_rx, frames_rx)));
+                    let mut progress = None;
+                    if hedges {
+                        let (dispatched, dispatched_rx) = oneshot::channel();
+                        let (frames, frames_rx) = watch::channel(());
+                        progress = Some(AttemptProgress { dispatched, frames });
+                        // Try the next peer alongside this one if it stalls,
+                        // without giving up on it.
+                        hedge = Some(Box::pin(attempt_stalled(dispatched_rx, frames_rx)));
+                    }
                     attempts.push(self.request_one(
                         handle.clone(),
                         frame.clone(),
@@ -3644,6 +3654,27 @@ mod tests {
         fn call(&mut self, _request: Request) -> Self::Future {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(Response::Nil))
+        }
+    }
+
+    /// Counts every request it accepts and never answers any.
+    #[derive(Clone, Debug)]
+    struct CountingSilentResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingSilentResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Pending<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending()
         }
     }
 
@@ -5096,6 +5127,72 @@ mod tests {
 
         silent.shutdown().await;
         honest.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// Only block and transaction requests start a peer alongside a stalled
+    /// one; a discovery request waits on one peer at a time, so a made-up
+    /// answer from a fast peer cannot cancel an honest slow one.
+    #[tokio::test]
+    async fn only_inventory_requests_start_a_second_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut responders = Vec::new();
+        for seed in [94, 95] {
+            let calls = calls.clone();
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .service_from_supervisor(move |supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(
+                            CountingSilentResponder { calls },
+                            supervisor,
+                        ))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+        let requester = ZakuraTestNode::builder(96)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        for responder in &responders {
+            requester
+                .connect_native(responder, TEST_NET_TIMEOUT)
+                .await?;
+        }
+        wait_registered_count(&requester, 2).await?;
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+
+        for (request, expected_peers) in [
+            (
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+                1,
+            ),
+            (Request::BlocksByHash(IndexSet::from([block_hash(2)])), 2),
+        ] {
+            calls.store(0, Ordering::SeqCst);
+            let pending = tokio::spawn({
+                let adapter = adapter.clone();
+                let request = request.clone();
+                async move { adapter.request_from_source(request, None).await }
+            });
+            sleep(LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(1)).await;
+            pending.abort();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_peers,
+                "peers asked for {request:?} after the hedge delay"
+            );
+        }
+
+        for responder in responders {
+            responder.shutdown().await;
+        }
         requester.shutdown().await;
         Ok(())
     }

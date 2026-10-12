@@ -137,7 +137,10 @@ impl DiscoveryPeerSession {
             flags: 0,
             payload,
         }) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                crate::smoke_trace::discovery("discovery_send", &self.peer_id, &message);
+                Ok(())
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_frame)) => {
                 Err(OrderedSendError::Full)
             }
@@ -680,7 +683,8 @@ impl DiscoverySink {
             return Ok(());
         }
 
-        match message {
+        let evidence = message.clone();
+        let result = match message {
             DiscoveryMessage::Hello { record } => self.handle_hello(record).await,
             DiscoveryMessage::GetPeers {
                 limit,
@@ -710,7 +714,10 @@ impl DiscoverySink {
                 self.send_services(services)
             }
             DiscoveryMessage::Services(services) => self.handle_services(services).await,
-        }
+        };
+        result?;
+        crate::smoke_trace::discovery("discovery_receive", self.session.peer_id(), &evidence);
+        Ok(())
     }
 
     async fn local_services_response(&self, query: GetServices) -> Result<Services, SinkReject> {

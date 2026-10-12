@@ -80,7 +80,7 @@ crossbeam-channel = "0.5.14"
 curve25519-dalek = "4.1"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
-equihash = { version = "=2.2.0", package = "zakura-equihash" }
+equihash = { path = "../common.iroh-free-smoke/crates/equihash", package = "zakura-equihash" }
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"

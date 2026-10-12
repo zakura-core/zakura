@@ -334,3 +334,8 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optiona
 name = "mempool_eviction"
 harness = false
 required-features = ["mempool-bench"]
+
+[[bin]]
+name = "zakurad-check-config"
+path = "src/bin/zakurad-check-config.rs"
+test = false

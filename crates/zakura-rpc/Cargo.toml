@@ -42,6 +42,7 @@ proptest-impl = [
 
 
 [dependencies]
+zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 chrono = { workspace = true }
 futures = { workspace = true }
 

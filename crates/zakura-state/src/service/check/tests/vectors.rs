@@ -11,7 +11,7 @@ use zakura_chain::{
     },
     sapling,
     serialization::ZcashDeserializeInto,
-    work::difficulty::{CompactDifficulty, ParameterDifficulty},
+    work::difficulty::{CompactDifficulty, ParameterDifficulty, U256},
 };
 
 use super::super::*;
@@ -475,13 +475,14 @@ fn seeded_chain_with_pow_start_and_seed_target(
 }
 
 /// The relevant chain for `blocks[index]`: its ancestors, newest first.
-fn difficulty_context(
+fn seeded_difficulty_context(
     blocks: &[Block],
     index: usize,
 ) -> impl Iterator<Item = (CompactDifficulty, DateTime<chrono::Utc>)> + '_ {
     blocks[..index]
         .iter()
         .rev()
+        .take(difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN)
         .map(|block| (block.header.difficulty_threshold, block.header.time))
 }
 
@@ -508,7 +509,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
         let adjustment = difficulty::AdjustedDifficulty::new_from_block(
             candidate,
             network,
-            difficulty_context(&generated.blocks, index),
+            seeded_difficulty_context(&generated.blocks, index),
         )
         .expect("the seeded chain supplies a full difficulty context");
 
@@ -525,7 +526,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
             let expected = difficulty::AdjustedDifficulty::new_from_block(
                 &generated.blocks[index],
                 network,
-                difficulty_context(&generated.blocks, index),
+                seeded_difficulty_context(&generated.blocks, index),
             )
             .expect("the seeded chain supplies a full difficulty context")
             .expected_difficulty_threshold();
@@ -573,13 +574,16 @@ fn first_block_at_pow_start_height_expects_the_configured_limit() {
         .last()
         .expect("the generated chain is not empty");
     let candidate_time = seeded_tip.header.time
-        + zakura_chain::parameters::NetworkUpgrade::target_spacing_for_height(network, pow_start_height);
+        + zakura_chain::parameters::NetworkUpgrade::target_spacing_for_height(
+            network,
+            pow_start_height,
+        );
 
     let expected = difficulty::AdjustedDifficulty::new_from_header_time(
         candidate_time,
         block::Height(pow_start_height.0 - 1),
         network,
-        difficulty_context(&generated.blocks, generated.blocks.len()),
+        seeded_difficulty_context(&generated.blocks, generated.blocks.len()),
     )
     .expect("the seeded chain supplies a full difficulty context")
     .expected_difficulty_threshold();
@@ -660,4 +664,58 @@ fn first_block_at_pow_start_height_expects_the_seed_target() {
         "the first live-mined block should expect the seed target, not the limit: \
          expected {expected_target:x}, seed {seed_target:x}, limit {limit:x}"
     );
+}
+
+#[test]
+fn first_live_nu7_block_uses_the_calibrated_seed_target() {
+    let _init_guard = zakura_test::init();
+    let mut seed_target = [0u8; 32];
+    seed_target[1] = 0x20;
+    let mut limit = seed_target;
+    limit[1] = 0x40;
+    let generated = zakura_chain::local_genesis::generate_local_testnet_with_funded_keys(
+        (0..80).map(|index| format!("miner-{index}")).collect(),
+        zakura_chain::local_genesis::LocalTestnetGenesisOptions {
+            latest_network_upgrade: NetworkUpgrade::Nu7,
+            disable_pow: true,
+            enforce_pow_after_seeded_tip: true,
+            target_difficulty_limit: limit,
+            seed_difficulty_target: Some(seed_target),
+            target_spacing_secs: 25,
+            maturity_padding_blocks: 125,
+            ..Default::default()
+        },
+    )
+    .expect("the private seed parameters are valid");
+    let network = &generated.network;
+    let first_live = network.pow_start_height().unwrap();
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(network),
+        Some(first_live)
+    );
+    assert!(!network.should_skip_pow_at_height(first_live));
+    assert!(generated.blocks.len() > difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+    assert_eq!(
+        NetworkUpgrade::target_spacing_for_height(network, first_live),
+        chrono::Duration::seconds(25)
+    );
+    let seeded_tip = generated.blocks.last().unwrap();
+    let expected: U256 = difficulty::AdjustedDifficulty::new_from_header_time(
+        seeded_tip.header.time + chrono::Duration::seconds(25),
+        block::Height(first_live.0 - 1),
+        network,
+        seeded_difficulty_context(&generated.blocks, generated.blocks.len()),
+    )
+    .expect("the seed supplies NU7's complete difficulty history")
+    .expected_difficulty_threshold()
+    .to_expanded()
+    .unwrap()
+    .into();
+    let seed: U256 = seeded_tip
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .unwrap()
+        .into();
+    assert!(expected <= seed && expected >= seed - seed / U256::from(1_000u64));
 }

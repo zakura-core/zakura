@@ -212,7 +212,7 @@ fn summarize(chain: &Chain) -> ChainSummary {
     ChainSummary {
         tip_hash: chain.non_finalized_tip_hash().to_string(),
         tip_height: chain.non_finalized_tip_height().0,
-        chain_work: format!("{:x}", chain.partial_cumulative_work.as_u128()),
+        chain_work: format!("{:x}", chain.partial_cumulative_work.as_u256()),
         block_count: chain.len(),
         fork_height: chain.non_finalized_root_height().0,
     }

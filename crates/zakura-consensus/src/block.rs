@@ -369,8 +369,6 @@ where
             // end. The bound on speculative preparation is set from this measurement, so it must
             // start where the work does.
             let preparation_start = std::time::Instant::now();
-            let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
-                .map_err(BlockError::from)?;
             let (mined, prepared_source) = match &request {
                 Request::CommitMined { admission, .. } => (Some(admission.clone()), None),
                 Request::Prepare { source, .. } => (None, Some(*source)),

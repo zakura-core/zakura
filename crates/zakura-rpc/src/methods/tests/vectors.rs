@@ -5026,7 +5026,7 @@ fn speculative_test_template(parent: Hash) -> BlockTemplateResponse {
 
     BlockTemplateResponse::new_internal(
         &network,
-        None,
+        &Default::default(),
         &miner_params,
         &chain_info,
         long_poll_id,

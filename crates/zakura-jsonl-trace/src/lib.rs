@@ -686,6 +686,8 @@ impl JsonlTracer {
             return JsonlTraceGuard::disabled();
         };
 
+        metrics::counter!("experiment.trace.dropped").absolute(0);
+        metrics::counter!("experiment.trace.write_failures").absolute(0);
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let writer = TraceWriter::new(trace_dir.clone(), config);
         let shutdown = CancellationToken::new();
@@ -746,8 +748,14 @@ impl JsonlTracer {
             .try_reserve_owned()
             .map(|permit| JsonlTracePermit { permit })
             .map_err(|error| match error {
-                TrySendError::Full(_) => JsonlTraceReserveError::Full,
-                TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+                TrySendError::Full(_) => {
+                    metrics::counter!("experiment.trace.dropped").increment(1);
+                    JsonlTraceReserveError::Full
+                }
+                TrySendError::Closed(_) => {
+                    metrics::counter!("experiment.trace.dropped").increment(1);
+                    JsonlTraceReserveError::Closed
+                }
             })
     }
 
@@ -758,8 +766,14 @@ impl JsonlTracer {
         };
 
         runtime.tx.try_send(event).map_err(|error| match error {
-            TrySendError::Full(event) => JsonlTraceSendError::Full(event),
-            TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
+            TrySendError::Full(event) => {
+                metrics::counter!("experiment.trace.dropped").increment(1);
+                JsonlTraceSendError::Full(event)
+            }
+            TrySendError::Closed(event) => {
+                metrics::counter!("experiment.trace.dropped").increment(1);
+                JsonlTraceSendError::Closed(event)
+            }
         })
     }
 }
@@ -922,7 +936,9 @@ impl TraceWriter {
 
     fn disable_table(&mut self, table: &'static str) {
         self.tables.remove(table);
-        self.disabled_tables.insert(table);
+        if self.disabled_tables.insert(table) {
+            metrics::counter!("experiment.trace.write_failures").increment(1);
+        }
     }
 
     async fn table_writer_mut(
@@ -944,7 +960,9 @@ impl TraceWriter {
                         trace_dir = ?self.trace_dir,
                         "failed to create trace directory, disabling trace table"
                     );
-                    self.disabled_tables.insert(table);
+                    if self.disabled_tables.insert(table) {
+                        metrics::counter!("experiment.trace.write_failures").increment(1);
+                    }
                     return None;
                 }
                 self.trace_dir_created = true;
@@ -964,7 +982,9 @@ impl TraceWriter {
                         trace_dir = ?self.trace_dir,
                         "failed to open trace table, disabling trace table"
                     );
-                    self.disabled_tables.insert(table);
+                    if self.disabled_tables.insert(table) {
+                        metrics::counter!("experiment.trace.write_failures").increment(1);
+                    }
                     return None;
                 }
             };

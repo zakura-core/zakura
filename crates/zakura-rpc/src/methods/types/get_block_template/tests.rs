@@ -772,7 +772,7 @@ fn coinbase_cache_detaches_when_miner_data_changes() {
     let net = Network::Mainnet;
     let verifier: MockService<zakura_consensus::Request, block::Hash, _, BoxError> =
         MockService::build().for_unit_tests();
-    let handler = super::GetBlockTemplateHandler::new_with_pending_blocks(
+    let handler = super::GetBlockTemplateHandler::new(
         &net,
         crate::config::mining::Config {
             miner_address: Some(
@@ -785,7 +785,6 @@ fn coinbase_cache_detaches_when_miner_data_changes() {
         verifier,
         MockSyncStatus::default(),
         None,
-        Default::default(),
     );
     let height = NetworkUpgrade::Nu5.activation_height(&net).unwrap();
     let fee = Amount::zero();

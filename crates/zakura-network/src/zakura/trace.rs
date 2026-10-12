@@ -565,6 +565,7 @@ impl ZakuraTrace {
         hash: zakura_chain::block::Hash,
         source: BlockBodySource,
     ) {
+        crate::smoke_trace::body(hash, source.as_str());
         if self.first_block_source.record(hash, source) {
             metrics::counter!(
                 "sync.block.first_received.count",

@@ -25,3 +25,6 @@ pub use methods::types::{
         PendingBlockSignal, SubmitBlockChannel,
     },
 };
+
+/// Experiment mining RPC telemetry.
+pub mod mining_trace;

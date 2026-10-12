@@ -851,16 +851,14 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .expect("prepared verification commits the block");
 
     assert_eq!(prepared_hash, full_hash);
-    assert_eq!(
-        prepared_commit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-        full_commit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-    );
+    let mut prepared = prepared_commit.lock().unwrap().take().unwrap();
+    let full = full_commit.lock().unwrap().take().unwrap();
+    assert!(prepared.receipt_order.is_some());
+    assert!(full.receipt_order.is_some());
+    // Each verifier call records a separate receipt of the same block.
+    assert!(prepared.receipt_order > full.receipt_order);
+    prepared.receipt_order = full.receipt_order;
+    assert_eq!(prepared, full);
 }
 
 #[test]
@@ -2940,7 +2938,6 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
             Request::Commit(malformed.clone()),
             Request::CommitMined {
                 block: malformed,
-                work_id: None,
                 admission: zs::BlockAdmission::pending(),
             },
         ] {
@@ -3031,7 +3028,6 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
             verifier
                 .call(Request::Prepare {
                     block: candidate.clone(),
-                    work_id: Some("receipt-test".into()),
                     source: PreparedCandidateSource::ClientProposal,
                 })
                 .await
@@ -3039,7 +3035,6 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
         }
         let request = || Request::CommitMined {
             block: candidate.clone(),
-            work_id: Some("receipt-test".into()),
             admission: zs::BlockAdmission::pending(),
         };
         let early = verifier.call(request());
@@ -3096,11 +3091,10 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
             });
             let mut verifier = SemanticBlockVerifier::new(&network, state.clone(), transaction);
             if cache_hit {
-                for (block, work_id) in [(a.clone(), "a"), (b.clone(), "b")] {
+                for block in [a.clone(), b.clone()] {
                     verifier
                         .call(Request::Prepare {
                             block,
-                            work_id: Some(work_id.into()),
                             source: PreparedCandidateSource::ClientProposal,
                         })
                         .await
@@ -3113,12 +3107,10 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
             let early_a = verifier.call(Request::Commit(a.clone()));
             let later_b = verifier.call(Request::CommitMined {
                 block: b.clone(),
-                work_id: Some("b".into()),
                 admission: zs::BlockAdmission::pending(),
             });
             let duplicate_a = verifier.call(Request::CommitMined {
                 block: Arc::new(a.as_ref().clone()),
-                work_id: Some("a".into()),
                 admission: zs::BlockAdmission::pending(),
             });
             later_b.await.unwrap();

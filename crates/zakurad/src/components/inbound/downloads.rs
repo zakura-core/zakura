@@ -31,8 +31,8 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
-    sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
     block_verify_trace::{BlockSource, BlockVerifyTrace},
+    sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

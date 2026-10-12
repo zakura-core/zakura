@@ -208,3 +208,6 @@ pub mod types {
     #[cfg(any(test, feature = "proptest-impl"))]
     pub use crate::protocol::external::InventoryHash;
 }
+
+/// Private experiment transport evidence.
+pub mod smoke_trace;

@@ -447,6 +447,8 @@ impl StartCmd {
         // Mirror the single operator-facing trace key, so enabling tracing does
         // not require remembering a second one.
         state_config.trace_dir = config.network.zakura.trace_dir.clone();
+        zakura_rpc::mining_trace::install(config.network.zakura.trace_dir.clone());
+        zakura_network::smoke_trace::install(config.network.zakura.trace_dir.clone());
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
 
         let (

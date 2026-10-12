@@ -68,7 +68,8 @@ use zakura_chain::{
         ConsensusBranchId, Network, NetworkUpgrade,
     },
     serialization::{
-        BytesInDisplayOrder, DateTime32, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        BytesInDisplayOrder, DateTime32, Duration32, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashSerialize,
     },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
@@ -750,7 +751,7 @@ pub trait Rpc {
     async fn submit_block(
         &self,
         hex_data: HexData,
-        _parameters: Option<SubmitBlockParameters>,
+        parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse>;
 
     /// Submits a solved header for a prepared mining candidate.
@@ -1967,6 +1968,7 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
+        crate::mining_trace::note_submitted_block(height, block_hash);
         let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
@@ -2085,6 +2087,7 @@ where
             // Turns BoxError into Result<VerifyChainError, BoxError>,
             // by downcasting from Any to VerifyChainError.
             Err(box_error) => {
+                crate::mining_trace::note_submit_error(box_error.as_ref());
                 let error = box_error
                     .downcast::<RouterError>()
                     .map(|boxed_chain_error| *boxed_chain_error);
@@ -3569,6 +3572,19 @@ where
         &self,
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse> {
+        let mode = if parameters
+            .as_ref()
+            .and_then(GetBlockTemplateParameters::block_proposal_data)
+            .is_some()
+        {
+            "proposal"
+        } else {
+            "template"
+        };
+        let long_poll = parameters
+            .as_ref()
+            .is_some_and(|p| p.long_poll_id.is_some());
+        crate::mining_trace::trace_template(&self.network, mode, long_poll, async move {
         use types::get_block_template::{
             check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
             validate_block_proposal, zip317::select_mempool_transactions,
@@ -3611,6 +3627,7 @@ where
 
         check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
         if let Some(template) = self.precomputed_block_template(client_long_poll_id).await {
+                crate::mining_trace::note_precomputed(true);
             return Ok(template.into());
         }
 
@@ -3852,6 +3869,7 @@ where
                     precomputed_coinbase = wait_for_new_tip => {
                         let precomputed_coinbase = precomputed_coinbase?;
                         if let Some(template) = self.precomputed_block_template(client_long_poll_id).await {
+                crate::mining_trace::note_precomputed(true);
                             return Ok(template.into());
                         }
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
@@ -3983,6 +4001,7 @@ where
             "template parent changed; retry",
             None::<()>,
         ))
+        }).await
     }
 
     async fn submit_block(
@@ -3990,8 +4009,10 @@ where
         HexData(block_bytes): HexData,
         // The work ID is accepted for BIP 22 compatibility and identifies nothing: the verifier
         // looks a prepared candidate up by its content.
-        _parameters: Option<SubmitBlockParameters>,
+        parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
+        let traced_work_id = parameters.as_ref().and_then(|p| p.work_id.clone());
+        crate::mining_trace::trace_submit("submitblock", traced_work_id, async move {
         let submitted_at = std::time::Instant::now();
         let block: Block = match block_bytes.zcash_deserialize_into() {
             Ok(block) => block,
@@ -4010,49 +4031,54 @@ where
             MinedBlockSubmission::FullBlock,
         )
         .await
+        }).await
     }
 
     async fn submit_solution(
         &self,
         SubmitSolutionParameters { work_id, header }: SubmitSolutionParameters,
     ) -> Result<SubmitSolutionResponse> {
-        let submitted_at = std::time::Instant::now();
-        let HexData(header_bytes) = header;
-        let mut remaining_header_bytes = header_bytes.as_slice();
-        let header: Header = match Header::zcash_deserialize(&mut remaining_header_bytes) {
-            Ok(header) => header,
-            Err(error) => {
-                tracing::info!(?error, "submit solution rejected a malformed block header");
+        crate::mining_trace::trace_submit("submitsolution", Some(work_id.clone()), async move {
+            let submitted_at = std::time::Instant::now();
+            let HexData(header_bytes) = header;
+            let mut remaining_header_bytes = header_bytes.as_slice();
+            let header: Header = match Header::zcash_deserialize(&mut remaining_header_bytes) {
+                Ok(header) => header,
+                Err(error) => {
+                    tracing::info!(?error, "submit solution rejected a malformed block header");
+                    return Ok(SubmitSolutionErrorResponse::Rejected.into());
+                }
+            };
+            if !remaining_header_bytes.is_empty() {
+                tracing::info!("submit solution rejected trailing block header bytes");
                 return Ok(SubmitSolutionErrorResponse::Rejected.into());
             }
-        };
-        if !remaining_header_bytes.is_empty() {
-            tracing::info!("submit solution rejected trailing block header bytes");
-            return Ok(SubmitSolutionErrorResponse::Rejected.into());
-        }
 
-        let reconstruction_start = std::time::Instant::now();
-        let block = match self.gbt.prepared_candidates().resolve(&work_id, header) {
-            Ok(block) => block,
-            Err(ResolvePreparedCandidateError::StaleWork) => {
-                metrics::counter!("mining.compact_submission.stale_work").increment(1);
-                return Ok(SubmitSolutionErrorResponse::StaleWork.into());
-            }
-            Err(ResolvePreparedCandidateError::CandidateMismatch) => {
-                metrics::counter!("mining.compact_submission.candidate_mismatches").increment(1);
-                return Ok(SubmitSolutionErrorResponse::CandidateMismatch.into());
-            }
-        };
-        metrics::histogram!("mining.compact_submission.reconstruction.duration_seconds")
-            .record(reconstruction_start.elapsed().as_secs_f64());
+            let reconstruction_start = std::time::Instant::now();
+            let block = match self.gbt.prepared_candidates().resolve(&work_id, header) {
+                Ok(block) => block,
+                Err(ResolvePreparedCandidateError::StaleWork) => {
+                    metrics::counter!("mining.compact_submission.stale_work").increment(1);
+                    return Ok(SubmitSolutionErrorResponse::StaleWork.into());
+                }
+                Err(ResolvePreparedCandidateError::CandidateMismatch) => {
+                    metrics::counter!("mining.compact_submission.candidate_mismatches")
+                        .increment(1);
+                    return Ok(SubmitSolutionErrorResponse::CandidateMismatch.into());
+                }
+            };
+            metrics::histogram!("mining.compact_submission.reconstruction.duration_seconds")
+                .record(reconstruction_start.elapsed().as_secs_f64());
 
-        let response = self
-            .run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::CompactHeader)
-            .await?;
-        if response == SubmitBlockResponse::Accepted {
-            metrics::counter!("mining.compact_submission.accepted").increment(1);
-        }
-        Ok(response.into())
+            let response = self
+                .run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::CompactHeader)
+                .await?;
+            if response == SubmitBlockResponse::Accepted {
+                metrics::counter!("mining.compact_submission.accepted").increment(1);
+            }
+            Ok(response.into())
+        })
+        .await
     }
 
     async fn get_mining_info(&self) -> Result<GetMiningInfoResponse> {

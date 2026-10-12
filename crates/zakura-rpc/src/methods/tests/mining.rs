@@ -1051,11 +1051,16 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sampled.cur_time = sampled.max_time;
         info_tx.send_replace(sampled);
         tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // The coinbase cache can finish this rebuild without entering the blocking pool.
+        let response = futures::poll!(&mut request);
         assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let response = match response {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => bounded(request).await,
+        };
+        let template = response.unwrap().try_into_template().unwrap();
         assert_eq!(template.long_poll_id, initial.long_poll_id);
         assert_eq!(template.cur_time, initial.max_time);
         assert_eq!(template.submit_old, Some(false));

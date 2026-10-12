@@ -6152,7 +6152,7 @@ dependencies = [
  "zakura-sinsemilla",
  "zakura-test",
  "zakura-transparent",
- "zakura_mmr_tree",
+ "zakura-mmr-tree",
  "zcash_note_encryption",
  "zcash_script",
 ]
@@ -6962,8 +6962,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "zakura_mmr_tree"
-version = "1.0.0"
+name = "zakura-mmr-tree"
+version = "0.0.1"
 dependencies = [
  "blake2b_simd",
  "byteorder",

@@ -51,7 +51,7 @@ incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "=2.2.0", package = "zakura-orchard" }
 sapling-crypto = { version = "=2.2.0", package = "zakura-sapling-crypto" }
 zcash_address = { version = "=2.2.0", package = "zakura-address" }
-zakura_mmr_tree = { path = "crates/zakura-mmr-tree", version = "1.0.0" }
+zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
 zcash_keys = { version = "=2.2.0", package = "zakura-keys" }
 zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
 zcash_proofs = { version = "=2.2.0", package = "zakura-proofs" }

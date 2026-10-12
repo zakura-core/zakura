@@ -2159,14 +2159,14 @@ impl ZakuraRequestClient {
         client
     }
 
+    /// Waits for this client's next request slot.
+    ///
+    /// The lock is held while sleeping, so waiters take slots in order and a
+    /// waiter that is cancelled gives up its turn without consuming a slot.
     async fn wait_for_request_slot(&self) {
-        let request_at = {
-            let mut next_request_at = self.next_request_at.lock().await;
-            let request_at = (*next_request_at).max(Instant::now());
-            *next_request_at = request_at + self.request_interval;
-            request_at
-        };
-        tokio::time::sleep_until(request_at).await;
+        let mut next_request_at = self.next_request_at.lock().await;
+        tokio::time::sleep_until(*next_request_at).await;
+        *next_request_at = Instant::now() + self.request_interval;
     }
 
     async fn request(
@@ -5831,6 +5831,34 @@ mod tests {
                 Err(LegacyGossipError::MissingResponse(_))
             ));
         }
+    }
+
+    /// A request cancelled while waiting for its slot gives the slot back
+    /// instead of pushing every later request back.
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_slot_wait_does_not_delay_later_requests() {
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            ZakuraSupervisorHandle::new(1),
+            ZakuraTrace::noop(),
+            4,
+        );
+        let started = Instant::now();
+        client.wait_for_request_slot().await;
+
+        let cancelled = tokio::spawn({
+            let client = client.clone();
+            async move { client.wait_for_request_slot().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        client.wait_for_request_slot().await;
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(500),
+            "the cancelled wait must not consume the second slot"
+        );
     }
 
     #[tokio::test(start_paused = true)]

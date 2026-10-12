@@ -421,7 +421,7 @@ fn aggregate_auxiliary_saturation_evicts_displaced_input() {
     config.limits.max_aux_deliveries_total =
         std::num::NonZeroUsize::new(1).expect("one is nonzero");
 
-    let mut request = insertion(&store, 1, EvidenceId::from_digest([0xa7; 32]));
+    let mut request = insertion(&store, 2, EvidenceId::from_digest([0xa7; 32]));
     let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
         unreachable!("the fixture constructs a header insertion")
     };
@@ -438,7 +438,8 @@ fn aggregate_auxiliary_saturation_evicts_displaced_input() {
         .record_auxiliary_evidence_delivery(retained.header_hash, retained.delivery_id)
         .expect("the selected header accepts the retained delivery identity");
     store.aux.push(retained);
-    let incoming = unauthenticated_delivery(insert, EvidenceId::from_digest([0xa9; 32]));
+    let mut incoming = unauthenticated_delivery(insert, EvidenceId::from_digest([0xa9; 32]));
+    incoming.header_hash = insert.batch.headers().last().unwrap().hash;
     insert.aux.push(incoming);
 
     // The new header wins selection, so the displaced branch's input ranks lowest.

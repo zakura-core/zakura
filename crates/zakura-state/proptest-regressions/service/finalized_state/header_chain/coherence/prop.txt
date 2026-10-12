@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fcff603dcfbb43985b6581edfd160c43a11a8941051e79e6a7082bebc8ed34cb # shrinks to operations = [Verify { source: Branch(3), index: 4 }, InsertHeaders { source: Trunk, offset: 49, len: 8, anchor: Natural }]

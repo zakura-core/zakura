@@ -20,7 +20,7 @@ use super::spawn_owned_block_range;
 const DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn block_ranges_serve_the_selected_header_fork_without_changing_mining_priority() {
+async fn block_ranges_preserve_equal_work_selection_until_a_stronger_fork_arrives() {
     let _guard = zakura_test::init();
     for header_runtime in [true, false] {
         timeout(DEADLINE, assert_block_range_selection(header_runtime))
@@ -88,7 +88,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .unwrap();
     }
     assert_eq!(tip.best_tip_hash(), Some(a.hash()));
-    let selected = if header_runtime { &b } else { &a };
+    let selected = &a;
     assert!(matches!(
         read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
         ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == selected.hash()
@@ -111,7 +111,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .map(|(_, block, _)| block.hash())
             .collect::<Vec<_>>(),
         [genesis.hash(), parent.hash(), selected.hash()],
-        "a peer must be able to download the hash-selected body even when we mine A"
+        "serving and mining preserve the first selected equal-work body"
     );
     let owned = read_state
         .read_owned_block_range(block::Height(2), 2, u32::MAX, (), |_| false)
@@ -128,7 +128,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             SystemClock, TargetCompletion,
         };
 
-        // C wins header selection, but no body for C has been committed.
+        // An equal-work header without a body must not cancel the selected download.
         let reader = read_state
             .header_chain_reader_receiver
             .borrow()
@@ -176,7 +176,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
         ));
         assert!(matches!(
             read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
-            ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == c.hash()
+            ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == a.hash()
         ));
         let ReadResponse::Blocks(blocks) = read_state
             .clone()
@@ -191,24 +191,25 @@ async fn assert_block_range_selection(header_runtime: bool) {
         };
         assert_eq!(
             blocks.len(),
-            2,
-            "a missing selected body must not be replaced by A or B"
+            3,
+            "an equal-work header must not remove the selected body from serving"
         );
         assert_eq!(blocks[1].1.hash(), parent.hash());
         let owned = read_state
             .read_owned_block_range(block::Height(2), 1, u32::MAX, (), |_| false)
             .await
             .unwrap();
-        assert!(owned.blocks.is_empty());
+        assert_eq!(owned.blocks.len(), 1);
+        assert_eq!(owned.blocks[0].1.hash(), a.hash());
     }
 
-    // More work on A switches downloads to A's branch as well.
-    let mut child = a.make_fake_child();
+    // More work on B switches both downloads and mining to B.
+    let mut child = b.make_fake_child();
     let commitment = read_state
         .latest_non_finalized_state()
-        .find_chain(|chain| chain.contains_block_hash(a.hash()))
+        .find_chain(|chain| chain.contains_block_hash(b.hash()))
         .unwrap()
-        .history_tree(a.hash().into())
+        .history_tree(b.hash().into())
         .unwrap()
         .hash()
         .unwrap();
@@ -234,7 +235,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .iter()
             .map(|(_, block, _)| block.hash())
             .collect::<Vec<_>>(),
-        [a.hash(), child.hash()]
+        [b.hash(), child.hash()]
     );
     assert_eq!(tip.best_tip_hash(), Some(child.hash()));
     assert_eq!(

@@ -1002,6 +1002,7 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
                     ),
                     new_hash,
                 )))
+                .filter(|(_, hash)| *hash != store.metadata.frontiers.header_best.hash)
                 .min_by_key(|(score, _)| *score)
                 .map(|(_, hash)| hash)
         };
@@ -1019,7 +1020,7 @@ fn assert_candidate_eviction_boundary(seed: usize) -> [u8; 32] {
                 .filter(|hash| *hash != new_hash)
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "candidate pressure seed {seed} step {index} evicts exactly the independently lowest work/hash tip"
+            "candidate pressure seed {seed} step {index} evicts the lowest unprotected work/hash tip"
         );
         store.commit(&plan);
         if let Some(evicted) = expected_evicted {
@@ -1042,17 +1043,14 @@ fn assert_same_height_permutations() -> [u8; 32] {
     let equal_forward = permutation_fixture([(40, 11, false), (41, 12, false)]);
     let equal_reverse = permutation_fixture([(41, 12, false), (40, 11, false)]);
     assert_eq!(
-        equal_forward.0, equal_reverse.0,
-        "equal-work fork choice is independent of insertion order"
+        equal_forward.1, equal_forward.2,
+        "the first equal-work tip remains selected"
     );
     assert_eq!(
-        equal_forward.1,
-        [equal_forward.2, equal_forward.3]
-            .into_iter()
-            .max_by_key(|hash| hash.0)
-            .expect("the permutation fixture has two tips"),
-        "equal work is resolved by the greatest raw internal tip hash"
+        equal_reverse.1, equal_reverse.2,
+        "reversing arrivals selects the other first tip"
     );
+    assert_ne!(equal_forward.1, equal_reverse.1);
 
     let unequal_forward = permutation_fixture([(50, 21, false), (51, 22, true)]);
     let unequal_reverse = permutation_fixture([(51, 22, true), (50, 21, false)]);
@@ -1931,11 +1929,18 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
                 Frontier::new(node.height, node.hash),
             )
         })
-        .max_by_key(|(score, _)| *score)
+        .max_by_key(|(score, tip)| {
+            (
+                score.suffix_work,
+                store.metadata.mode == EngineMode::Integrated
+                    && *tip == store.metadata.frontiers.header_best,
+                score.tip_hash.0,
+            )
+        })
         .expect("the finalized anchor is independently eligible");
     assert_eq!(
         store.metadata.frontiers.header_best, expected_header_best.1,
-        "fork choice must equal independent work/hash ordering"
+        "fork choice must have maximal eligible work and preserve the durable tie preference"
     );
     assert_eq!(
         store.metadata.header_best_score, expected_header_best.0,
@@ -2192,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn same_height_forks_are_insertion_order_independent() {
+    fn same_height_forks_preserve_first_arrival_unless_work_increases() {
         let first = replay_fork_transition_bytes(b"T");
         let second = replay_fork_transition_bytes(b"T");
         assert_eq!(first, second);

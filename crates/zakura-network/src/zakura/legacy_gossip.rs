@@ -114,6 +114,11 @@ const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
 /// inventory before a genuine re-advertisement may retry.
 const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request attempt other than the last waits for the first response
+/// frame before moving to the next peer. Most honest answers arrive well within
+/// this; a slower one only costs a fallback, and the last attempt keeps the full
+/// request timeout.
+const LEGACY_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Distinct peers a block or transaction request tries: the primary and up to
@@ -2186,9 +2191,18 @@ impl ZakuraRequestClient {
 
         let mut missing_response = None;
         let mut last_error = None;
-        for handle in &candidates {
+        for (attempt, handle) in candidates.iter().enumerate() {
+            // Every attempt but the last gives up on a peer that has not started
+            // answering, so a silent peer cannot use up the caller's deadline.
+            let first_response_timeout =
+                (attempt + 1 < candidates.len()).then_some(LEGACY_FIRST_RESPONSE_TIMEOUT);
             match self
-                .request_one(handle.clone(), frame.clone(), request_kind)
+                .request_one(
+                    handle.clone(),
+                    frame.clone(),
+                    request_kind,
+                    first_response_timeout,
+                )
                 .await
             {
                 Ok(response) if !all_inventory_missing(&response) => return Ok(response),
@@ -2223,7 +2237,7 @@ impl ZakuraRequestClient {
         for _ in 0..SOURCE_INVENTORY_MISSING_RETRIES {
             sleep(SOURCE_INVENTORY_MISSING_RETRY_DELAY).await;
             match self
-                .request_one(handle.clone(), frame.clone(), request_kind)
+                .request_one(handle.clone(), frame.clone(), request_kind, None)
                 .await
             {
                 Ok(response) if !all_inventory_missing(&response) => return Ok(response),
@@ -2253,11 +2267,16 @@ impl ZakuraRequestClient {
         .map_err(|_| -> BoxError { "no ready Zakura peer for legacy inventory request".into() })?
     }
 
+    /// Sends one request to `handle` and decodes its response.
+    ///
+    /// With `first_response_timeout`, gives up if the peer has not sent a
+    /// response frame within that time, counted after the pacing wait.
     async fn request_one(
         &self,
         handle: ZakuraPeerHandle,
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
+        first_response_timeout: Option<Duration>,
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -2283,7 +2302,8 @@ impl ZakuraRequestClient {
             )
         });
         let started_at = Instant::now();
-        let response = match timeout(
+        let (first_frame, first_frame_received) = oneshot::channel();
+        let request = timeout(
             self.request_timeout,
             handle.request(
                 ZAKURA_STREAM_LEGACY_REQUESTS,
@@ -2291,10 +2311,27 @@ impl ZakuraRequestClient {
                 frame.message_type,
                 frame.flags,
                 frame.payload,
+                Some(first_frame),
             ),
-        )
-        .await
-        {
+        );
+        tokio::pin!(request);
+        let outcome = match first_response_timeout {
+            None => (&mut request).await,
+            Some(first_response_timeout) => tokio::select! {
+                outcome = &mut request => outcome,
+                started = timeout(first_response_timeout, first_frame_received) => match started {
+                    // The peer started answering, or the request ended without frames.
+                    Ok(_) => (&mut request).await,
+                    Err(_) => Ok(Err(format!(
+                        "Zakura legacy request got no response frame from peer {:?} within \
+                         {first_response_timeout:?}",
+                        handle.peer_id()
+                    )
+                    .into())),
+                },
+            },
+        };
+        let response = match outcome {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 self.trace.emit_event(|| {
@@ -3556,6 +3593,24 @@ mod tests {
         fn call(&mut self, _request: Request) -> Self::Future {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(Response::Nil))
+        }
+    }
+
+    /// Accepts every request and never answers it.
+    #[derive(Clone, Debug)]
+    struct SilentResponder;
+
+    impl Service<Request> for SilentResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Pending<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::pending()
         }
     }
 
@@ -4870,6 +4925,111 @@ mod tests {
         for responder in responders {
             responder.shutdown().await;
         }
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// F-47: a silent peer costs a non-final attempt only the first-response
+    /// timeout, so the request reaches a working peer well inside a caller's
+    /// 20 s deadline, and the silent peer stays connected.
+    #[tokio::test]
+    async fn request_adapter_moves_past_a_silent_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let silent = ZakuraTestNode::builder(86)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(SilentResponder, supervisor))
+            })
+            .spawn()
+            .await?;
+        let honest = ZakuraTestNode::builder(87)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    SubstitutingBlockResponder { block },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let requester = ZakuraTestNode::builder(88)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
+        requester.connect_native(&honest, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&requester, 2).await?;
+        let silent_id = node_peer_id(&silent).await?;
+        let mut peer_set = requester.supervisor().subscribe();
+        peer_set.borrow_and_update();
+
+        // The silent peer is the source, so it is always tried first.
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+        let started = Instant::now();
+        let response = adapter
+            .request_from_source(
+                Request::BlocksByHash(IndexSet::from([hash])),
+                Some(PeerSource::Zakura(silent_id)),
+            )
+            .await?;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                &response,
+                Response::Blocks(blocks)
+                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+            ),
+            "the working peer must serve the block; got {response:?}"
+        );
+        assert!(
+            elapsed < LEGACY_FIRST_RESPONSE_TIMEOUT + Duration::from_secs(5),
+            "the silent peer held the request for {elapsed:?}"
+        );
+        assert!(
+            !peer_set.has_changed()?,
+            "a silent peer is skipped, not disconnected"
+        );
+
+        silent.shutdown().await;
+        honest.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// The last attempt keeps the full request timeout, so a slow but honest
+    /// peer is not cut off when no other peer is available.
+    #[tokio::test]
+    async fn last_attempt_keeps_the_full_request_timeout() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let silent = ZakuraTestNode::builder(89)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(SilentResponder, supervisor))
+            })
+            .spawn()
+            .await?;
+        let requester = ZakuraTestNode::builder(90).spawn().await?;
+        requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&requester, 1).await?;
+
+        let request_timeout = LEGACY_FIRST_RESPONSE_TIMEOUT * 2;
+        let adapter =
+            LegacyRequestAdapter::new_with_timeout(requester.supervisor(), request_timeout);
+        let started = Instant::now();
+        let result = adapter
+            .request_from_source(Request::BlocksByHash(IndexSet::from([block_hash(3)])), None)
+            .await;
+
+        assert!(result.is_err(), "a silent peer cannot answer");
+        assert!(
+            started.elapsed() >= request_timeout,
+            "the only attempt gave up after {:?}, before the request timeout",
+            started.elapsed()
+        );
+
+        silent.shutdown().await;
         requester.shutdown().await;
         Ok(())
     }

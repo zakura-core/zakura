@@ -1141,6 +1141,8 @@ impl ZakuraPeerHandle {
     }
 
     /// Open a request stream, write one frame, then return the response frames from the same stream.
+    ///
+    /// `first_frame` is described on [`ZakuraOutboundFrame::Request`].
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1148,6 +1150,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
+        first_frame: Option<oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1156,6 +1159,7 @@ impl ZakuraPeerHandle {
             message_type,
             flags,
             payload,
+            first_frame,
             completion,
         };
         self.sender
@@ -1183,6 +1187,9 @@ pub enum ZakuraOutboundFrame {
         flags: u16,
         /// Message payload bytes.
         payload: Vec<u8>,
+        /// Signalled when the first response frame arrives, so the requester can
+        /// give up on a peer that has not started answering.
+        first_frame: Option<oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },
@@ -2938,6 +2945,7 @@ impl ZakuraProtocolHandler {
                             message_type,
                             flags,
                             payload,
+                            first_frame,
                             mut completion,
                         } => {
                             let Some(stream) = self.registry.stream_for_kind(stream_kind) else {
@@ -2962,6 +2970,7 @@ impl ZakuraProtocolHandler {
                                     message_type,
                                     flags,
                                     payload,
+                                    first_frame,
                                 ) => result,
                             };
                             match result {
@@ -4842,6 +4851,7 @@ async fn write_outbound_request_frame(
     message_type: u16,
     flags: u16,
     payload: Vec<u8>,
+    first_frame: Option<oneshot::Sender<()>>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
     timeout(
         OUTBOUND_REQUEST_RESPONSE_TIMEOUT,
@@ -4853,6 +4863,7 @@ async fn write_outbound_request_frame(
             message_type,
             flags,
             payload,
+            first_frame,
         ),
     )
     .await
@@ -4868,6 +4879,7 @@ async fn write_outbound_request_frame_inner(
     message_type: u16,
     flags: u16,
     payload: Vec<u8>,
+    mut first_frame: Option<oneshot::Sender<()>>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
     // The legacy request stream validates responses with a legacy-message-specific budget.
     let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
@@ -4928,6 +4940,9 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
+                if let Some(first_frame) = first_frame.take() {
+                    let _ = first_frame.send(());
+                }
                 legacy_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }

@@ -89,6 +89,7 @@ const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60
 // Zakura requesters reject `FindBlocks` responses above their limit, so this
 // node must never answer with more.
 const _: () = assert!(
+    // A `u32` always fits `usize` on the 32- and 64-bit targets Zakura supports.
     zs::constants::MAX_FIND_BLOCK_HASHES_RESULTS as usize
         == zn::constants::MAX_FIND_BLOCKS_RESPONSE_HASHES
 );

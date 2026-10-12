@@ -851,16 +851,18 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .expect("prepared verification commits the block");
 
     assert_eq!(prepared_hash, full_hash);
-    assert_eq!(
-        prepared_commit
+
+    // Each submission takes a fresh process-wide receipt order, so compare the rest.
+    let take_commit = |commit: &Mutex<Option<zs::SemanticallyVerifiedBlock>>| {
+        let mut block = commit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-        full_commit
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref(),
-    );
+            .take()
+            .expect("the verifier committed the block");
+        assert!(block.receipt_order.take().is_some());
+        block
+    };
+    assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
 }
 
 #[test]

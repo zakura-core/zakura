@@ -915,22 +915,22 @@ impl PeerRoutine {
             // (geometry included — an exempt grant is clamped at the window top, so
             // no above-window height can ride an exempt request past the gate).
             let snapshot = self.admission_snapshot(&view);
-            // This asks the shared peer registry:
-            // "Is there another pper that should take the floor instead of this peer?"
-            // This is helpful for rescuing the floor with a peer who has better latency score and
-            // is not saturated.
-            let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
-                view.download_floor,
-                &self.peer,
-                self.window.bbr_rtprop_ms(now),
-                in_bypass,
-            );
+            let floor_start = self
+                .work
+                .first_pending_in_range(servable_low, servable_high.min(floor_high));
+            // A preferred peer must serve the missing height. A peer that only
+            // serves the committed floor cannot take this request.
+            let floor_arm_allowed = floor_start.is_some_and(|height| {
+                !self.registry.floor_has_preferred_unsaturated_server(
+                    height,
+                    &self.peer,
+                    self.window.bbr_rtprop_ms(now),
+                    in_bypass,
+                )
+            });
             let mut items = Vec::new();
             if floor_arm_allowed && servable_low <= floor_high {
-                if let Some(floor_start) = self
-                    .work
-                    .first_pending_in_range(servable_low, servable_high.min(floor_high))
-                {
+                if let Some(floor_start) = floor_start {
                     // Prioritize the lowest missing block so commit can keep moving, even if
                     // that means freeing look-ahead budget. `admit` is the single authority
                     // for the commit-window exemption, the resident-memory gate, and take
@@ -2449,6 +2449,71 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test]
+    async fn floor_provider_does_not_defer_to_a_peer_behind_the_missing_block() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        routine.received_status = true;
+        routine.servable_low = block::Height(0);
+        routine.servable_high = block::Height(1);
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = routine
+            .registry
+            .admit_session(
+                &fast_peer,
+                routine.session.direction(),
+                &routine.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        for (peer, generation, high, latency) in [
+            (&routine.peer, routine.generation, 1, 145),
+            (&fast_peer, fast_generation, 0, 5),
+        ] {
+            routine.registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(high),
+                    ..BlockSyncStatus::default()
+                },
+            );
+            routine.registry.publish_slots(
+                peer,
+                generation,
+                SlotDiagnostics {
+                    available_slots: 3,
+                    bbr_rtprop_ms: Some(latency),
+                    ..SlotDiagnostics::default()
+                },
+            );
+        }
+        routine.work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        routine.try_fill().await;
+
+        let frame = outbound
+            .try_recv()
+            .expect("the only provider must request the missing block immediately");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

@@ -761,7 +761,7 @@ async fn try_prepared_fast_path<S>(
     hash: block::Hash,
     height: block::Height,
     admission: &zs::BlockAdmission,
-    receipt_order: Option<zs::BlockReceiptOrder>,
+    receipt_order: Option<u64>,
 ) -> Result<Option<block::Hash>, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,

@@ -19,7 +19,7 @@ use indexmap::IndexSet;
 use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
     time::{sleep, timeout, Instant},
 };
 use tower::{Service, ServiceExt};
@@ -115,10 +115,14 @@ const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
 /// inventory before a genuine re-advertisement may retry.
 const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a request attempt may go without a response frame before the next
-/// peer is tried alongside it. The slower attempt keeps running with the full
+/// How long a block or transaction request attempt may go without a response
+/// frame, counted from when it is sent and then from each frame, before the
+/// next peer is tried alongside it. The slow attempt keeps running with the full
 /// request timeout, so a slow but honest peer can still answer.
 const LEGACY_REQUEST_HEDGE_DELAY: Duration = Duration::from_secs(3);
+/// How long such an attempt may run unfinished, however steadily it streams,
+/// before the next peer is tried alongside it.
+const LEGACY_REQUEST_HEDGE_LIMIT: Duration = Duration::from_secs(8);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Distinct peers a block or transaction request tries: the primary and up to
@@ -2200,24 +2204,17 @@ impl ZakuraRequestClient {
             if start_next {
                 if let Some(handle) = remaining.next() {
                     let (dispatched, dispatched_rx) = oneshot::channel();
-                    let (first_frame, first_frame_rx) = oneshot::channel();
+                    let (frames, frames_rx) = watch::channel(());
+                    let progress = Some(AttemptProgress { dispatched, frames });
+                    // Try the next peer alongside this one if it stalls,
+                    // without giving up on it.
+                    hedge = Some(Box::pin(attempt_stalled(dispatched_rx, frames_rx)));
                     attempts.push(self.request_one(
                         handle.clone(),
                         frame.clone(),
                         request_kind,
-                        Some(AttemptProgress {
-                            dispatched,
-                            first_frame,
-                        }),
+                        progress,
                     ));
-                    // Try the next peer alongside this one if it has not started
-                    // answering in time, without giving up on it.
-                    hedge = Some(Box::pin(async move {
-                        dispatched_rx.await.is_ok()
-                            && timeout(LEGACY_REQUEST_HEDGE_DELAY, first_frame_rx)
-                                .await
-                                .is_err()
-                    }));
                 }
             }
             if attempts.is_empty() {
@@ -2312,9 +2309,9 @@ impl ZakuraRequestClient {
         progress: Option<AttemptProgress>,
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
-        let first_frame = progress.map(|progress| {
+        let frames = progress.map(|progress| {
             let _ = progress.dispatched.send(());
-            progress.first_frame
+            progress.frames
         });
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
@@ -2347,7 +2344,7 @@ impl ZakuraRequestClient {
                 frame.message_type,
                 frame.flags,
                 frame.payload,
-                first_frame,
+                frames,
             ),
         )
         .await
@@ -2436,8 +2433,33 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
 struct AttemptProgress {
     /// Sent once the attempt has passed the client's pacing wait.
     dispatched: oneshot::Sender<()>,
-    /// Sent when the first response frame arrives.
-    first_frame: oneshot::Sender<()>,
+    /// Notified on every response frame.
+    frames: watch::Sender<()>,
+}
+
+/// Resolves to `true` once a dispatched attempt goes
+/// [`LEGACY_REQUEST_HEDGE_DELAY`] without a response frame, or runs past
+/// [`LEGACY_REQUEST_HEDGE_LIMIT`] unfinished; resolves to `false` if the attempt
+/// ends first.
+async fn attempt_stalled(
+    dispatched: oneshot::Receiver<()>,
+    mut frames: watch::Receiver<()>,
+) -> bool {
+    if dispatched.await.is_err() {
+        return false;
+    }
+    let stalled = async {
+        loop {
+            match timeout(LEGACY_REQUEST_HEDGE_DELAY, frames.changed()).await {
+                Err(_) => return true,
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return false,
+            }
+        }
+    };
+    timeout(LEGACY_REQUEST_HEDGE_LIMIT, stalled)
+        .await
+        .unwrap_or(true)
 }
 
 /// Orders the ready peers for one request: the preferred peer first, then the
@@ -5967,6 +5989,69 @@ mod tests {
                 Err(LegacyGossipError::MissingResponse(_))
             ));
         }
+    }
+
+    /// An attempt counts as stalled after the hedge delay without a frame,
+    /// restarting that clock at each frame, and after the hedge limit however
+    /// steadily frames arrive; an attempt that ends or is never sent does not.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_stalled_tracks_frame_gaps_and_the_limit() {
+        let dispatched_attempt = || {
+            let (dispatched, dispatched_rx) = oneshot::channel();
+            dispatched
+                .send(())
+                .expect("the receiver is held until the attempt resolves");
+            let (frames, frames_rx) = watch::channel(());
+            (frames, attempt_stalled(dispatched_rx, frames_rx))
+        };
+
+        let started = Instant::now();
+        let (_frames, stalled) = dispatched_attempt();
+        assert!(stalled.await, "no frame at all is a stall");
+        assert_eq!(started.elapsed(), LEGACY_REQUEST_HEDGE_DELAY);
+
+        let started = Instant::now();
+        let (frames, stalled) = dispatched_attempt();
+        let stalled = tokio::spawn(stalled);
+        sleep(Duration::from_secs(1)).await;
+        frames.send_replace(());
+        assert!(stalled.await.expect("the stall task does not panic"));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(1) + LEGACY_REQUEST_HEDGE_DELAY,
+            "a frame restarts the stall clock"
+        );
+
+        let started = Instant::now();
+        let (frames, stalled) = dispatched_attempt();
+        let stalled = tokio::spawn(async move { (stalled.await, started.elapsed()) });
+        while !stalled.is_finished() {
+            sleep(Duration::from_secs(2)).await;
+            frames.send_replace(());
+        }
+        let (stalled, elapsed) = stalled.await.expect("the stall task does not panic");
+        assert!(stalled);
+        assert_eq!(
+            elapsed, LEGACY_REQUEST_HEDGE_LIMIT,
+            "steady frames stall only at the limit"
+        );
+
+        let (frames, stalled) = dispatched_attempt();
+        let stalled = tokio::spawn(stalled);
+        sleep(Duration::from_secs(1)).await;
+        drop(frames);
+        assert!(
+            !stalled.await.expect("the stall task does not panic"),
+            "an attempt that ends is not a stall"
+        );
+
+        let (dispatched, dispatched_rx) = oneshot::channel::<()>();
+        let (_frames, frames_rx) = watch::channel(());
+        drop(dispatched);
+        assert!(
+            !attempt_stalled(dispatched_rx, frames_rx).await,
+            "an attempt that is never sent is not a stall"
+        );
     }
 
     /// A request cancelled while waiting for its slot gives the slot back

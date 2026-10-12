@@ -10642,7 +10642,7 @@ mod tests {
             stop: None,
         }
         .encode_frame()
-        .expect("request frame encodes");
+        .expect("a one-hash locator is within the request limits");
 
         for (count, fatal) in [
             (MAX_FIND_BLOCKS_RESPONSE_HASHES, false),
@@ -10651,7 +10651,11 @@ mod tests {
             let hashes = (0..count)
                 .map(|index| {
                     let mut hash = [0; 32];
-                    hash[..8].copy_from_slice(&u64::try_from(index).expect("small").to_le_bytes());
+                    hash[..8].copy_from_slice(
+                        &u64::try_from(index)
+                            .expect("at most 501 hashes, so the index fits u64")
+                            .to_le_bytes(),
+                    );
                     block::Hash(hash)
                 })
                 .collect();
@@ -10661,12 +10665,12 @@ mod tests {
                 limits.max_frame_bytes,
                 limits.max_message_bytes,
             )
-            .expect("hash response encodes")
+            .expect("501 hashes are within the 25,000-item encoding cap")
             .pop()
-            .expect("hash response encodes to one frame");
+            .expect("a 501-hash list fits in one frame under the test limits");
             let mut state = LegacyResponseReadState::new(
                 LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
-                    .expect("budget derives from request"),
+                    .expect("a FindBlocks request has a known response kind"),
             );
 
             let result = state.validate_frame(request_id, &frame);

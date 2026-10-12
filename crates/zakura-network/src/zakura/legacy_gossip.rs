@@ -5960,7 +5960,11 @@ mod tests {
             (0..count)
                 .map(|index| {
                     let mut hash = [0; 32];
-                    hash[..8].copy_from_slice(&u64::try_from(index).expect("small").to_le_bytes());
+                    hash[..8].copy_from_slice(
+                        &u64::try_from(index)
+                            .expect("at most 501 hashes, so the index fits u64")
+                            .to_le_bytes(),
+                    );
                     block::Hash(hash)
                 })
                 .collect()

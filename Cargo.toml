@@ -132,7 +132,7 @@ ripemd = "0.1"
 # librocksdb-sys build script panics with "a `libclang` shared library is not
 # loaded on this thread".
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
-secp256k1 = "0.29"
+secp256k1 = "0.33"
 semver = "1.0.26"
 serde = "1.0.219"
 serde_json = "1.0.140"

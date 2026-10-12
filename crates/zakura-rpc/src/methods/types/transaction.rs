@@ -417,21 +417,27 @@ impl TransactionTemplate<NegativeOrZero> {
         // no-op. Called only when a shielded reward output was actually added, so
         // transparent- and Sapling-only miners never force the expensive
         // proving-key build.
-        let arm_shielded_reward_proving_key = || {
+        let arm_shielded_reward_proving_key = || -> Result<(), TransactionError> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
             // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
             // the derivation in `Builder::build`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
-                let prepared =
-                    cached_orchard_proving_key(version.circuit_version()).prepare_proving();
+                let prepared = cached_orchard_proving_key(version.circuit_version())
+                    .map_err(|error| {
+                        TransactionError::CoinbaseConstruction(format!(
+                            "Failed to prepare shielded reward proving key: {error}"
+                        ))
+                    })?
+                    .prepare_proving();
                 tracing::debug!(
                     ?height,
                     prepared,
                     "armed the coinbase proving key's prepared commitment tables",
                 );
             }
+            Ok(())
         };
 
         match plan.miner_reward_address {
@@ -448,7 +454,7 @@ impl TransactionTemplate<NegativeOrZero> {
                             "Failed to add Ironwood output: {error}"
                         ))
                     })?;
-                arm_shielded_reward_proving_key();
+                arm_shielded_reward_proving_key()?;
             }
             MinerRewardAddress::Sapling(addr) => {
                 builder

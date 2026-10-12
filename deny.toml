@@ -89,7 +89,6 @@ deny = [
 skip = [
     # The Zakura Common libraries use Rand 0.10, while the remaining ecosystem
     # still resolves Rand 0.9. Remove these when the workspace converges.
-    { name = "chacha20", version = "=0.9.1" },
     { name = "rand", version = "=0.9.4" },
     { name = "rand_chacha", version = "=0.9.0" },
 ]
@@ -206,7 +205,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

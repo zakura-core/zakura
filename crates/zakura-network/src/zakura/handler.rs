@@ -5290,7 +5290,23 @@ impl LegacyResponseReadState {
     ) -> Result<(), OutboundRequestError> {
         let payload = self.begin_id_prefixed_response(kind, request_id, payload, "list")?;
         let count = legacy_inventory_count(payload, kind)?;
-        self.add_items(count)
+        self.add_items(count)?;
+        if kind == LegacyResponseKind::BlockHashes {
+            // An honest responder lists distinct chain hashes. Rejecting a repeat
+            // here, rather than only when decoding, also catches a peer that
+            // never finishes the stream.
+            let hashes = &payload[payload
+                .len()
+                .saturating_sub(count.saturating_mul(LEGACY_BLOCK_HASH_BYTES))..];
+            let mut seen = HashSet::with_capacity(count);
+            let (hashes, _) = hashes.as_chunks::<LEGACY_BLOCK_HASH_BYTES>();
+            if !hashes.iter().all(|hash| seen.insert(hash)) {
+                return Err(OutboundRequestError::Fatal(
+                    "legacy block hash response repeated a hash".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_headers(
@@ -10683,6 +10699,27 @@ mod tests {
                 assert!(result.is_ok(), "{count} hashes must pass; got {result:?}");
             }
         }
+
+        // A repeated hash is rejected as the frame arrives, before the stream
+        // ends, so a peer cannot avoid it by holding the stream open.
+        let frame = LegacyResponseCodec::encode_response(
+            request_id,
+            Response::BlockHashes(vec![block_hash(1), block_hash(2), block_hash(1)]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )
+        .expect("three hashes are within the 25,000-item encoding cap")
+        .pop()
+        .expect("a three-hash list fits in one frame under the test limits");
+        let mut state = LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                .expect("a FindBlocks request has a known response kind"),
+        );
+        let result = state.validate_frame(request_id, &frame);
+        assert!(
+            matches!(result, Err(OutboundRequestError::Fatal(_))),
+            "a repeated hash must be Fatal; got {result:?}"
+        );
     }
 
     #[test]

@@ -3218,10 +3218,10 @@ impl LegacyGossipError {
     /// peer violated the protocol, so its connection should be closed.
     ///
     /// The transport already rejects the structural variants as `Fatal` before
-    /// decoding; the live additions here are requested-item binding
-    /// (`UnsolicitedBlock`, `UnsolicitedTransaction`) and repeated `FindBlocks`
-    /// hashes (`DuplicateBlockHash`). Missing or unexpected responses are not
-    /// faults on their own: the caller falls back to another peer.
+    /// decoding; the live addition here is requested-item binding
+    /// (`UnsolicitedBlock`, `UnsolicitedTransaction`). Missing or unexpected
+    /// responses are not faults on their own: the caller falls back to another
+    /// peer.
     pub(crate) fn is_peer_fault(&self) -> bool {
         match self {
             Self::UnsupportedFlags(_)

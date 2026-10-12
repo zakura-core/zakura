@@ -41,10 +41,9 @@ const NEEDED_BLOCK_REFILL_LIMIT: u32 = 4_000;
 /// Delay before the reactor retries a failed body-missing metadata query.
 pub(super) const NEEDED_BLOCK_QUERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// Delay checkpoint body application until a far-ahead empty-state header bootstrap settles.
-/// Each selected-header page advances the body-work scope. Applying bodies between
-/// pages lets newer duplicate requests replace older requests before the node commits
-/// the first complete checkpoint.
+/// Give a far-ahead empty-state header bootstrap time to collect its first pages.
+/// The fixed deadline bounds the wait when new headers continue to arrive.
+/// The delay reduces duplicate checkpoint requests during initial header paging.
 pub(super) const EMPTY_STATE_HEADER_QUIET_PERIOD: Duration = Duration::from_secs(30);
 
 /// One complete maximum checkpoint gap.
@@ -282,7 +281,7 @@ pub fn spawn_block_sync_reactor(
             || startup.frontiers.verified_block_tip > block::Height(0),
         empty_state_header_quiet_until: committed_view.as_ref().and_then(|snapshot| {
             empty_state_header_quiet_required(snapshot)
-                .then(|| Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
+                .then(|| time::Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD)
         }),
         committed_view,
         startup,
@@ -392,10 +391,10 @@ pub(super) struct BlockSyncReactor {
     last_view: SequencerView,
     /// Last labeled persistent alarm exported to metrics, for exact clearing.
     published_body_alarm: Option<zakura_header_chain::Frontier>,
-    /// True once this process has observed body progress above genesis.
+    /// True once this process releases the startup wait or observes body progress.
     empty_state_body_sync_started: bool,
-    /// Earliest body-query time after the latest far-ahead header bootstrap update.
-    empty_state_header_quiet_until: Option<Instant>,
+    /// Body-query deadline set by the first far-ahead header bootstrap update.
+    empty_state_header_quiet_until: Option<time::Instant>,
 }
 
 fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnapshot) -> bool {
@@ -554,6 +553,7 @@ impl BlockSyncReactor {
                     if self.empty_state_header_quiet_until.is_some() =>
                 {
                     self.empty_state_header_quiet_until = None;
+                    self.empty_state_body_sync_started = true;
                     self.query_needed_blocks_with_options(true).await;
                 }
                 _ = &mut needed_query_retry, if self.needed_query_retry_at.is_some() => {
@@ -938,8 +938,8 @@ impl BlockSyncReactor {
             self.state.best_header_tip = header_best.height;
             self.state.best_header_hash = header_best.hash;
             if !self.empty_state_body_sync_started && empty_state_header_quiet_required(&view) {
-                self.empty_state_header_quiet_until =
-                    Some(Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
+                self.empty_state_header_quiet_until
+                    .get_or_insert_with(|| time::Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
             }
         }
 

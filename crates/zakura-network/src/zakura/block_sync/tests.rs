@@ -522,7 +522,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
+async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
     let finalized = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([1; 32]));
     let first_header = zakura_header_chain::Frontier::new(
         block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG),
@@ -564,13 +564,17 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
         )))
         .expect("the newer committed snapshot receiver is live");
     time::advance(Duration::from_millis(1)).await;
-    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD - Duration::from_secs(1)).await;
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD - Duration::from_secs(11)).await;
     if let Ok(action) = actions.try_recv() {
-        panic!("newer header page did not restart the body-work quiet period: {action:?}");
+        panic!("body work started before the initial bootstrap wait: {action:?}");
     }
 
     time::advance(Duration::from_secs(1)).await;
-    let action = next_action(&mut actions).await;
+    time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    let action = actions
+        .try_recv()
+        .expect("new headers must not extend the initial bootstrap wait");
     assert!(matches!(
         action,
         BlockSyncAction::QueryNeededBlocks {
@@ -578,6 +582,27 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
             best_header_tip,
             ..
         } if best_header_tip == second_header.height
+    ));
+
+    let third_header = zakura_header_chain::Frontier::new(
+        block::Height(second_header.height.0 + 1),
+        block::Hash([4; 32]),
+    );
+    snapshot_tx
+        .send(Some(committed_view(
+            committed_snapshot(3, 3, 1, finalized, finalized, third_header),
+            0,
+        )))
+        .expect("the committed snapshot receiver is live");
+    time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    let action = actions
+        .try_recv()
+        .expect("new headers must not rearm the wait before the first body commits");
+    assert!(matches!(
+        action,
+        BlockSyncAction::QueryNeededBlocks { best_header_tip, .. }
+            if best_header_tip == third_header.height
     ));
 
     reactor_task.abort();

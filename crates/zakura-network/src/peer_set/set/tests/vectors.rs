@@ -30,6 +30,79 @@ use crate::{
 use super::{PeerSetBuilder, PeerVersions};
 
 #[test]
+fn disconnect_request_removes_peer_without_banning() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION; 2],
+    };
+    let (discovered, _handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(2)
+            .build();
+        peers.ready().await.unwrap();
+        assert_eq!(peers.ready_services.len(), 2);
+        let addr = *peers.ready_services.keys().next().unwrap();
+        assert!(matches!(
+            peers.call(Request::DisconnectPeer(addr)).await.unwrap(),
+            Response::Nil
+        ));
+        assert!(!peers.ready_services.contains_key(&addr));
+        assert_eq!(peers.ready_services.len(), 1);
+        assert!(!peers.bans.contains(addr.ip()));
+        // Repeated removal is harmless and cannot select another peer.
+        peers
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::DisconnectPeer(addr))
+            .await
+            .unwrap();
+        assert_eq!(peers.ready_services.len(), 1);
+    });
+}
+
+#[test]
+fn disconnect_request_cancels_busy_peer_without_banning() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION; 2],
+    };
+    let (discovered, _handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(2)
+            .build();
+        peers.ready().await.unwrap();
+        assert_eq!(peers.ready_services.len(), 2);
+
+        // A `Peers` request goes to one peer, which stays busy until it answers.
+        let _busy_request = peers.call(Request::Peers);
+        let busy_addr = *peers.cancel_handles.keys().next().unwrap();
+
+        peers
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::DisconnectPeer(busy_addr))
+            .await
+            .unwrap();
+
+        assert!(!peers.cancel_handles.contains_key(&busy_addr));
+        assert!(!peers.ready_services.contains_key(&busy_addr));
+        assert!(!peers.bans.contains(busy_addr.ip()));
+    });
+}
+
+#[test]
 fn peer_set_ready_single_connection() {
     // We are going to use just one peer version in this test
     let peer_versions = PeerVersions {

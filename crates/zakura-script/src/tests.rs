@@ -1897,3 +1897,19 @@ fn legacy_sigop_count_follows_zcashd_get_op() {
         assert_eq!(legacy_sigop_count(&script), expected, "{name}");
     }
 }
+
+#[test]
+fn only_script_failures_count_as_script_failures() {
+    use crate::Error;
+
+    assert!(Error::ScriptInvalid.is_script_failure());
+    assert!(Error::Interpreter {
+        component: zcash_script::script::ComponentType::Lock,
+        error: zcash_script::script::Error::ScriptSize(None),
+    }
+    .is_script_failure());
+
+    assert!(!Error::TxIndex.is_script_failure());
+    assert!(!Error::TxCoinbase.is_script_failure());
+
+}

@@ -62,6 +62,15 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Returns true when the script failed verification.
+    ///
+    /// Returns false for transaction preparation failures that prevent verification.
+    pub fn is_script_failure(&self) -> bool {
+        matches!(self, Error::ScriptInvalid | Error::Interpreter { .. })
+    }
+}
+
 fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
     match raw_hash_type {
         0x01 => Some(HashType::ALL),

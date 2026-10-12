@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use indexmap::IndexSet;
 use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use thiserror::Error;
@@ -114,11 +115,10 @@ const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
 /// inventory before a genuine re-advertisement may retry.
 const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a request attempt other than the last waits for the first response
-/// frame before moving to the next peer. Most honest answers arrive well within
-/// this; a slower one only costs a fallback, and the last attempt keeps the full
-/// request timeout.
-const LEGACY_FIRST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a request attempt may go without a response frame before the next
+/// peer is tried alongside it. The slower attempt keeps running with the full
+/// request timeout, so a slow but honest peer can still answer.
+const LEGACY_REQUEST_HEDGE_DELAY: Duration = Duration::from_secs(3);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Distinct peers a block or transaction request tries: the primary and up to
@@ -2165,8 +2165,9 @@ impl ZakuraRequestClient {
     /// waiter that is cancelled gives up its turn without consuming a slot.
     async fn wait_for_request_slot(&self) {
         let mut next_request_at = self.next_request_at.lock().await;
-        tokio::time::sleep_until(*next_request_at).await;
-        *next_request_at = Instant::now() + self.request_interval;
+        let request_at = (*next_request_at).max(Instant::now());
+        tokio::time::sleep_until(request_at).await;
+        *next_request_at = request_at + self.request_interval;
     }
 
     async fn request(
@@ -2189,26 +2190,60 @@ impl ZakuraRequestClient {
             &mut OsRng,
         );
 
+        let mut remaining = candidates.iter();
+        let mut attempts = FuturesUnordered::new();
+        let mut hedge = None;
+        let mut start_next = true;
         let mut missing_response = None;
         let mut last_error = None;
-        for (attempt, handle) in candidates.iter().enumerate() {
-            // Every attempt but the last gives up on a peer that has not started
-            // answering, so a silent peer cannot use up the caller's deadline.
-            let first_response_timeout =
-                (attempt + 1 < candidates.len()).then_some(LEGACY_FIRST_RESPONSE_TIMEOUT);
-            match self
-                .request_one(
-                    handle.clone(),
-                    frame.clone(),
-                    request_kind,
-                    first_response_timeout,
-                )
-                .await
-            {
-                Ok(response) if !all_inventory_missing(&response) => return Ok(response),
-                Ok(response) => missing_response = Some(response),
-                Err(error) => last_error = Some(error),
+        loop {
+            if start_next {
+                if let Some(handle) = remaining.next() {
+                    let (dispatched, dispatched_rx) = oneshot::channel();
+                    let (first_frame, first_frame_rx) = oneshot::channel();
+                    attempts.push(self.request_one(
+                        handle.clone(),
+                        frame.clone(),
+                        request_kind,
+                        Some(AttemptProgress {
+                            dispatched,
+                            first_frame,
+                        }),
+                    ));
+                    // Try the next peer alongside this one if it has not started
+                    // answering in time, without giving up on it.
+                    hedge = Some(Box::pin(async move {
+                        dispatched_rx.await.is_ok()
+                            && timeout(LEGACY_REQUEST_HEDGE_DELAY, first_frame_rx)
+                                .await
+                                .is_err()
+                    }));
+                }
             }
+            if attempts.is_empty() {
+                break;
+            }
+            // Start the next peer after any attempt that ends without a usable
+            // answer, or when the latest attempt is slow to start answering.
+            start_next = tokio::select! {
+                Some(result) = attempts.next() => {
+                    match result {
+                        Ok(response) if !all_inventory_missing(&response) => return Ok(response),
+                        Ok(response) => missing_response = Some(response),
+                        Err(error) => last_error = Some(error),
+                    }
+                    true
+                }
+                no_answer_yet = async {
+                    match hedge.as_mut() {
+                        Some(hedge) => hedge.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    hedge = None;
+                    no_answer_yet
+                }
+            };
         }
 
         match (missing_response, last_error, candidates.as_slice()) {
@@ -2267,18 +2302,20 @@ impl ZakuraRequestClient {
         .map_err(|_| -> BoxError { "no ready Zakura peer for legacy inventory request".into() })?
     }
 
-    /// Sends one request to `handle` and decodes its response.
-    ///
-    /// With `first_response_timeout`, gives up if the peer has not sent a
-    /// response frame within that time, counted after the pacing wait.
+    /// Sends one request to `handle` and decodes its response, reporting
+    /// `progress` as it goes.
     async fn request_one(
         &self,
         handle: ZakuraPeerHandle,
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
-        first_response_timeout: Option<Duration>,
+        progress: Option<AttemptProgress>,
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
+        let first_frame = progress.map(|progress| {
+            let _ = progress.dispatched.send(());
+            progress.first_frame
+        });
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
         // so the response can be bound to IDs we actually asked for.
@@ -2302,8 +2339,7 @@ impl ZakuraRequestClient {
             )
         });
         let started_at = Instant::now();
-        let (first_frame, first_frame_received) = oneshot::channel();
-        let request = timeout(
+        let response = match timeout(
             self.request_timeout,
             handle.request(
                 ZAKURA_STREAM_LEGACY_REQUESTS,
@@ -2311,27 +2347,11 @@ impl ZakuraRequestClient {
                 frame.message_type,
                 frame.flags,
                 frame.payload,
-                Some(first_frame),
+                first_frame,
             ),
-        );
-        tokio::pin!(request);
-        let outcome = match first_response_timeout {
-            None => (&mut request).await,
-            Some(first_response_timeout) => tokio::select! {
-                outcome = &mut request => outcome,
-                started = timeout(first_response_timeout, first_frame_received) => match started {
-                    // The peer started answering, or the request ended without frames.
-                    Ok(_) => (&mut request).await,
-                    Err(_) => Ok(Err(format!(
-                        "Zakura legacy request got no response frame from peer {:?} within \
-                         {first_response_timeout:?}",
-                        handle.peer_id()
-                    )
-                    .into())),
-                },
-            },
-        };
-        let response = match outcome {
+        )
+        .await
+        {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 self.trace.emit_event(|| {
@@ -2409,6 +2429,15 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
     stream_open_rate_per_second
         .max(1)
         .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
+}
+
+/// Signals one request attempt sends while it runs, so `request` can decide
+/// when to try the next peer alongside it.
+struct AttemptProgress {
+    /// Sent once the attempt has passed the client's pacing wait.
+    dispatched: oneshot::Sender<()>,
+    /// Sent when the first response frame arrives.
+    first_frame: oneshot::Sender<()>,
 }
 
 /// Orders the ready peers for one request: the preferred peer first, then the
@@ -3611,6 +3640,56 @@ mod tests {
 
         fn call(&mut self, _request: Request) -> Self::Future {
             std::future::pending()
+        }
+    }
+
+    /// Answers block requests with its block after `delay`.
+    #[derive(Clone, Debug)]
+    struct DelayedBlockResponder {
+        block: Arc<Block>,
+        delay: Duration,
+    }
+
+    impl Service<Request> for DelayedBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            let (block, delay) = (self.block.clone(), self.delay);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(Response::Blocks(vec![InventoryResponse::Available((
+                    block, None,
+                ))]))
+            })
+        }
+    }
+
+    /// Reports every requested block as missing.
+    #[derive(Clone, Debug)]
+    struct MissingBlockResponder;
+
+    impl Service<Request> for MissingBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            let Request::BlocksByHash(hashes) = request else {
+                return std::future::ready(Err("only block requests are expected".into()));
+            };
+            std::future::ready(Ok(Response::Blocks(
+                hashes.into_iter().map(InventoryResponse::Missing).collect(),
+            )))
         }
     }
 
@@ -4929,9 +5008,9 @@ mod tests {
         Ok(())
     }
 
-    /// F-47: a silent peer costs a non-final attempt only the first-response
-    /// timeout, so the request reaches a working peer well inside a caller's
-    /// 20 s deadline, and the silent peer stays connected.
+    /// F-47: a silent peer delays the request only by the hedge delay, so it
+    /// reaches a working peer well inside a caller's 20 s deadline, and the
+    /// silent peer stays connected.
     #[tokio::test]
     async fn request_adapter_moves_past_a_silent_peer() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -4985,7 +5064,7 @@ mod tests {
             "the working peer must serve the block; got {response:?}"
         );
         assert!(
-            elapsed < LEGACY_FIRST_RESPONSE_TIMEOUT + Duration::from_secs(5),
+            elapsed < LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(5),
             "the silent peer held the request for {elapsed:?}"
         );
         assert!(
@@ -4999,10 +5078,67 @@ mod tests {
         Ok(())
     }
 
-    /// The last attempt keeps the full request timeout, so a slow but honest
-    /// peer is not cut off when no other peer is available.
+    /// A slow source that holds the only copy still answers when a peer tried
+    /// alongside it reports the block missing.
     #[tokio::test]
-    async fn last_attempt_keeps_the_full_request_timeout() -> Result<(), BoxError> {
+    async fn slow_source_still_answers_after_a_missing_fallback() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let delay = LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(1);
+        let slow = ZakuraTestNode::builder(91)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    DelayedBlockResponder { block, delay },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let missing = ZakuraTestNode::builder(92)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(MissingBlockResponder, supervisor))
+            })
+            .spawn()
+            .await?;
+        let requester = ZakuraTestNode::builder(93)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        requester.connect_native(&slow, TEST_NET_TIMEOUT).await?;
+        requester.connect_native(&missing, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&requester, 2).await?;
+        let slow_id = node_peer_id(&slow).await?;
+
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+        let response = adapter
+            .request_from_source(
+                Request::BlocksByHash(IndexSet::from([hash])),
+                Some(PeerSource::Zakura(slow_id)),
+            )
+            .await?;
+
+        assert!(
+            matches!(
+                &response,
+                Response::Blocks(blocks)
+                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+            ),
+            "the slow source must still deliver the block; got {response:?}"
+        );
+
+        slow.shutdown().await;
+        missing.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// A slow attempt keeps the full request timeout: trying another peer
+    /// alongside it does not cut it off, here because no other peer exists.
+    #[tokio::test]
+    async fn slow_attempt_keeps_the_full_request_timeout() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let silent = ZakuraTestNode::builder(89)
             .service_from_supervisor(|supervisor| {
@@ -5014,7 +5150,7 @@ mod tests {
         requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
         wait_registered_count(&requester, 1).await?;
 
-        let request_timeout = LEGACY_FIRST_RESPONSE_TIMEOUT * 2;
+        let request_timeout = LEGACY_REQUEST_HEDGE_DELAY * 2;
         let adapter =
             LegacyRequestAdapter::new_with_timeout(requester.supervisor(), request_timeout);
         let started = Instant::now();
@@ -5025,7 +5161,7 @@ mod tests {
         assert!(result.is_err(), "a silent peer cannot answer");
         assert!(
             started.elapsed() >= request_timeout,
-            "the only attempt gave up after {:?}, before the request timeout",
+            "the attempt gave up after {:?}, before the request timeout",
             started.elapsed()
         );
 

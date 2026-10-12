@@ -1188,7 +1188,7 @@ pub enum ZakuraOutboundFrame {
         /// Message payload bytes.
         payload: Vec<u8>,
         /// Signalled when the first response frame arrives, so the requester can
-        /// give up on a peer that has not started answering.
+        /// tell a peer that is slow to start answering from one already answering.
         first_frame: Option<oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,

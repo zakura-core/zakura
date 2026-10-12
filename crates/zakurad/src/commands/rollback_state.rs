@@ -3,13 +3,20 @@
 use std::path::PathBuf;
 
 use abscissa_core::{Application, Command, Runnable};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use color_eyre::eyre::Result;
 
 use zakura_chain::{block, parameters::Network};
-use zakura_state::{RollbackFinalizedStateOptions, RollbackFinalizedStateSummary};
+use zakura_state::{RollbackFinalizedStateOptions, RollbackFinalizedStateSummary, StorageMode};
 
 use crate::prelude::APPLICATION;
+
+/// Storage modes accepted by the rollback command.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RollbackStorageMode {
+    Archive,
+    Pruned,
+}
 
 /// Roll back Zebra's finalized state to a previous height
 #[derive(Command, Debug, Default, Parser)]
@@ -26,6 +33,14 @@ pub struct RollbackStateCmd {
     /// the wrong (or an empty) state directory.
     #[clap(long, short, help = "path to directory with the Zakura chain state")]
     cache_dir: Option<PathBuf>,
+
+    /// Override the loaded state storage mode.
+    ///
+    /// The standalone binary defaults to archive mode. Use `--storage-mode pruned` for a
+    /// database without transparent indexes. When omitted, `zakurad rollback-state` retains
+    /// the mode and pruning settings from the loaded configuration.
+    #[clap(long, value_enum)]
+    storage_mode: Option<RollbackStorageMode>,
 
     /// The network of the chain to roll back.
     #[clap(
@@ -67,6 +82,7 @@ impl RollbackStateCmd {
     /// `consensus_config` supplies `checkpoint_sync`, which sets the max checkpoint height used to
     /// guard `--keep-rolled-back-blocks`: blocks kept below it would be discarded on the next start.
     /// Its checkpoint-sync settings are also mirrored into `state_config`, as `start` does.
+    /// Storage mode is preserved unless explicitly overridden by `--storage-mode`.
     #[allow(clippy::print_stdout)]
     pub fn run_with_config(
         &self,
@@ -75,6 +91,15 @@ impl RollbackStateCmd {
     ) -> Result<()> {
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
+        }
+
+        if let Some(storage_mode) = self.storage_mode {
+            state_config.storage_mode = match storage_mode {
+                RollbackStorageMode::Archive => StorageMode::Archive,
+                RollbackStorageMode::Pruned => {
+                    StorageMode::Pruned(state_config.pruning_config().cloned().unwrap_or_default())
+                }
+            };
         }
 
         state_config.checkpoint_sync = consensus_config.checkpoint_sync;

@@ -857,6 +857,8 @@ impl Storage {
             self.transactions()
                 .get(&tx_id.mined_id())
                 .map(|tx| &tx.transaction)
+                // The verified set is keyed by mined ID, so check the auth digest too.
+                .filter(|tx| tx.id() == tx_id)
         })
     }
 

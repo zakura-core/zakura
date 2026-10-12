@@ -138,7 +138,7 @@ pub fn generate_local_testnet_with_funded_keys(
                 let mut secret_bytes = [0u8; 32];
                 rng.fill_bytes(&mut secret_bytes);
 
-                if let Ok(secret_key) = secp256k1::SecretKey::from_byte_array(secret_bytes) {
+                if let Ok(secret_key) = secp256k1::SecretKey::from_secret_bytes(secret_bytes) {
                     break secret_key;
                 }
             };
@@ -149,7 +149,7 @@ pub fn generate_local_testnet_with_funded_keys(
                 transparent::Address::from_pub_key_hash(NetworkKind::Testnet, pub_key_hash);
             FundedKey {
                 name,
-                secret_key_hex: hex::encode(secret_key.secret_bytes()),
+                secret_key_hex: hex::encode(secret_key.to_secret_bytes()),
                 public_key_hex: hex::encode(pub_key_bytes),
                 address,
             }

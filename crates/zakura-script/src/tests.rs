@@ -265,7 +265,7 @@ fn build_and_verify_zip244_p2pkh(
     };
 
     // Deterministic keypair (32 bytes, nonzero)
-    let secret_key = SecretKey::from_byte_array([0xcd; 32]).expect("valid secret key");
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
     let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize(); // 33 bytes, compressed
 
@@ -515,7 +515,7 @@ fn build_and_verify_v5_p2pkh_single_with_missing_output(
 
     assert!(signed_input_index < 2, "test fixture only has two inputs");
 
-    let secret_key = SecretKey::from_byte_array([0xcd; 32]).expect("valid secret key");
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
     let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 
@@ -686,7 +686,7 @@ fn build_and_verify_v4_p2pkh(sig_hash_type_byte: u8) -> std::result::Result<(), 
     use secp256k1::{Message, SecretKey};
     use sha2::Sha256;
 
-    let secret_key = SecretKey::from_byte_array([0xcd; 32]).expect("valid secret key");
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
     let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 
@@ -1488,7 +1488,7 @@ fn stale_sighash_buffer_v5_two_checksig_rejected() {
 
     let _init_guard = zakura_test::init();
 
-    let secret_key = SecretKey::from_byte_array([0xcd; 32]).expect("valid secret key");
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
     let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 

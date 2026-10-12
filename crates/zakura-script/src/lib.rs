@@ -5,6 +5,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
+mod encoding_tests;
+#[cfg(test)]
 mod tests;
 
 use core::fmt;

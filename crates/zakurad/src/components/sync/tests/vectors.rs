@@ -3665,6 +3665,7 @@ async fn block_download_network_readiness_times_out() {
         Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
     );
     let hash = block::Hash::from([0xCE; 32]);
 

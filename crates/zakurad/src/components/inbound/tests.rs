@@ -149,6 +149,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
     let mut inbound = Inbound::new(
         MAX_INBOUND_CONCURRENCY,
         false,
+        crate::components::block_verify_trace::BlockVerifyTrace::noop(),
         None,
         vec![sidecar.ip()],
         setup_rx,

@@ -208,4 +208,6 @@ fn collect_bounded_height_range<T>(
 }
 
 #[cfg(test)]
+mod storage_probe;
+#[cfg(test)]
 mod tests;

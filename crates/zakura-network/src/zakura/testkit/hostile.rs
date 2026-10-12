@@ -188,6 +188,26 @@ impl HostilePeer {
         Ok(())
     }
 
+    /// Open an ordered stream at `stream_version` and return both halves, so a
+    /// caller can write and read it concurrently.
+    #[cfg(test)]
+    pub(crate) async fn split_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(SendStream, RecvStream), BoxError> {
+        let (mut send, recv) = self.connection.open_bi().await?;
+        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+            .await?;
+        Ok((send, recv))
+    }
+
+    /// Largest frame this peer reads or writes.
+    #[cfg(test)]
+    pub(crate) fn max_frame_bytes(&self) -> u32 {
+        self.limits.max_frame_bytes
+    }
+
     /// Receive the next frame written by the victim on this ordered stream.
     pub async fn recv_ordered_frame(&self, stream_kind: u16) -> Result<Frame, BoxError> {
         self.recv_ordered_frame_with_version(stream_kind, Self::stream_version(stream_kind))

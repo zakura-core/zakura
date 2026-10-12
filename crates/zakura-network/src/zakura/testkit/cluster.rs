@@ -1318,6 +1318,230 @@ mod tests {
         Ok(())
     }
 
+    /// Serves the same body at every requested height, within the byte budget.
+    #[derive(Debug)]
+    struct EndlessBlockSource(Arc<block::Block>);
+
+    impl crate::zakura::BlockRangeSource for EndlessBlockSource {
+        fn read(
+            &self,
+            request: crate::zakura::BlockRangeRead,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::zakura::BlockRangeReadResult, BoxError>,
+        > {
+            let mut selected = Vec::new();
+            if request.lease.try_start() {
+                let size = block_size(&self.0);
+                let fits = request.max_body_bytes / size.max(1);
+                for offset in 0..request.count.min(fits) {
+                    let height = block::Height(request.start_height.0 + offset);
+                    selected.push((height, self.0.clone()));
+                }
+            }
+            Box::pin(async move {
+                Ok(crate::zakura::BlockRangeReadResult {
+                    blocks: selected,
+                    lease: request.lease,
+                })
+            })
+        }
+    }
+
+    /// User plus system CPU seconds for this process, from `/proc` on Linux.
+    fn process_cpu_seconds() -> Option<f64> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        // Fields after the parenthesized command name; utime and stime are 14 and 15.
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let ticks: f64 =
+            fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+        // Linux reports these in USER_HZ, which is 100 on supported targets.
+        Some(ticks / 100.0)
+    }
+
+    /// Manual evidence for regulated GetBlocks throughput over native QUIC.
+    ///
+    /// One requester pipelines GetBlocks against a production regulated server
+    /// for each body size, blocks per request and in-flight depth, and reports
+    /// body throughput. Production advertises one block per response, so small
+    /// bodies show whether the advertised in-flight limit caps throughput. Add round-trip delay outside the test, for example with
+    /// `tc qdisc add dev lo root netem delay 250ms`, and pass the resulting RTT
+    /// in `ZAKURA_PROBE_RTT_MS` so the report can show the in-flight ceiling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual throughput evidence; requires ZAKURA_RTT_PROBE=1"]
+    #[allow(clippy::print_stderr)]
+    async fn regulated_getblocks_throughput_probe() -> Result<(), BoxError> {
+        use crate::zakura::{
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        };
+        use tokio::sync::Semaphore;
+        if std::env::var_os("ZAKURA_RTT_PROBE").is_none() {
+            return Ok(());
+        }
+        let env = |name: &str, default: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let seconds = env("ZAKURA_PROBE_SECS", 15);
+        let rtt_ms = env("ZAKURA_PROBE_RTT_MS", 0);
+        let small = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let large = mainnet_block(&BLOCK_MAINNET_1046401_BYTES);
+        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let version = ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION;
+        let victim_id = LocalEndpointFactory::secret_key(60).public();
+        let seeds: Vec<u64> = (61..4061)
+            .filter(|seed| {
+                i_open_collision_winner(
+                    &LocalEndpointFactory::secret_key(*seed).public(),
+                    &victim_id,
+                )
+            })
+            .collect();
+        // `u32::MAX` means the server's advertised in-flight limit.
+        let cases = [
+            (&small, 1_u32, 64_u32),
+            (&small, 1, 512),
+            (&small, 1, u32::MAX),
+            (&small, 16, u32::MAX),
+            (&large, 1, 64),
+            (&large, 1, 512),
+            (&large, 1, u32::MAX),
+        ];
+        for (case, (body, count, depth)) in cases.into_iter().enumerate() {
+            {
+                let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+                limits.max_connections = 16;
+                let mut cluster = ZakuraTestCluster::new();
+                let victim = ZakuraTestNode::builder(60)
+                    .limits(limits)
+                    .header_sync_driver(
+                        e2e_network([3]),
+                        anchor,
+                        FullStateFrontiers {
+                            finalized_height: block::Height(0),
+                            verified_block_tip: block::Height(0),
+                            verified_block_hash: anchor.1,
+                        },
+                        None,
+                    )
+                    .block_sync_config(ZakuraBlockSyncConfig {
+                        max_blocks_per_response: 16,
+                        ..ZakuraBlockSyncConfig::default()
+                    })
+                    .block_range_source(Arc::new(EndlessBlockSource((*body).clone())))
+                    .spawn()
+                    .await?;
+                cluster.nodes.push(victim);
+                let victim = cluster.node(0);
+                let peer = HostilePeer::connect_native_with_capabilities(
+                    victim,
+                    seeds[case],
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                )
+                .await?;
+                let max_frame = peer.max_frame_bytes();
+                let (mut send, mut recv) = peer
+                    .split_ordered_stream(ZAKURA_STREAM_BLOCK_SYNC, version)
+                    .await?;
+                let advertised = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let frame = HostilePeer::read_frame(&mut recv, max_frame).await?;
+                        if let BlockSyncMessage::Status(status) =
+                            BlockSyncMessage::decode_frame(frame)?
+                        {
+                            return Ok::<_, BoxError>(status);
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| -> BoxError { "no Status from the server".into() })??;
+                let count = count.min(advertised.max_blocks_per_response);
+                let depth = depth.min(advertised.max_inflight_requests);
+                let window = Arc::new(Semaphore::new(usize::try_from(depth)?));
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writer = {
+                    let (window, stop) = (window.clone(), stop.clone());
+                    tokio::spawn(async move {
+                        let mut start = 1_u32;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            window.acquire().await?.forget();
+                            let frame = BlockSyncMessage::GetBlocks {
+                                start_height: block::Height(start),
+                                count,
+                            }
+                            .encode_frame()?;
+                            send.write_all(&frame.encode(max_frame)?).await?;
+                            start += count;
+                        }
+                        Ok::<_, BoxError>(())
+                    })
+                };
+                // Count only after a warm-up, so slow start does not dominate.
+                let warmup = tokio::time::Instant::now() + Duration::from_secs(2);
+                let deadline = warmup + Duration::from_secs(seconds);
+                let (mut bodies, mut body_bytes, mut endings) = (0_u64, 0_u64, 0_u64);
+                let mut cpu_start = None;
+                while tokio::time::Instant::now() < deadline {
+                    let Ok(frame) = tokio::time::timeout_at(
+                        deadline,
+                        HostilePeer::read_frame(&mut recv, max_frame),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    let frame = frame?;
+                    let counted = tokio::time::Instant::now() >= warmup;
+                    if counted && cpu_start.is_none() {
+                        cpu_start = Some(process_cpu_seconds());
+                    }
+                    match frame.message_type {
+                        3 if counted => {
+                            bodies += 1;
+                            body_bytes += u64::try_from(frame.payload.len())?;
+                        }
+                        4 | 5 => {
+                            window.add_permits(1);
+                            endings += u64::from(counted);
+                        }
+                        _ => {}
+                    }
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                window.add_permits(1);
+                let cpu = match (cpu_start.flatten(), process_cpu_seconds()) {
+                    (Some(start), Some(end)) => format!("{:.2}", end - start),
+                    _ => "n/a".into(),
+                };
+                // Float conversions are lossy only far beyond these counts.
+                let mb_per_second = body_bytes as f64 / 1e6 / seconds as f64;
+                // The in-flight ceiling: depth responses per round trip.
+                let ceiling = if rtt_ms == 0 || endings == 0 {
+                    "n/a".into()
+                } else {
+                    let per_response = body_bytes as f64 / endings as f64;
+                    format!(
+                        "{:.1}",
+                        f64::from(depth) * per_response / (rtt_ms as f64 / 1000.0) / 1e6
+                    )
+                };
+                eprintln!(
+                    "getblocks_probe rtt_ms={rtt_ms} body_bytes={} blocks_per_request={count} depth={depth} \
+                     advertised_inflight={} seconds={seconds} responses={endings} bodies={bodies} \
+                     body_mb_per_s={mb_per_second:.2} inflight_ceiling_mb_per_s={ceiling} cpu_s={cpu}",
+                    block_size(body),
+                    advertised.max_inflight_requests
+                );
+                writer.abort();
+                drop(peer);
+                drop(cluster);
+            }
+        }
+        Ok(())
+    }
+
     /// A regulated Status burst, including one past the receiver's cadence
     /// capacity, is recorded rather than treated as a violation. The 5 s bounds
     /// assume a local loopback connection and an otherwise idle runtime.

@@ -41,7 +41,7 @@ impl Source for LoadSource {
                 let now = node_running.fetch_add(1, Ordering::SeqCst) + 1;
                 node_peak.fetch_max(now, Ordering::SeqCst);
                 gate.acquire().await?.forget();
-                if peer % 2 == 0 {
+                if peer.is_multiple_of(2) {
                     blocks = (0..request.count)
                         .map(|offset| (Height(request.start_height.0 + offset), block.clone()))
                         .collect();
@@ -196,7 +196,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                             match frame.message_type {
                                 3 => bodies[peer] += 1,
                                 4 | 5 => {
-                                    let useful = peer % 2 == 0;
+                                    let useful = peer.is_multiple_of(2);
                                     assert_eq!(frame.message_type == 4, useful);
                                     completed[peer] += 1;
                                     if issued[peer] < TOTAL {
@@ -218,7 +218,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                 })
                 .await;
                 for (peer, count) in bodies.iter().enumerate() {
-                    assert_eq!(*count, if peer % 2 == 0 { TOTAL } else { 0 });
+                    assert_eq!(*count, if peer.is_multiple_of(2) { TOTAL } else { 0 });
                 }
                 assert!(node_peak.load(Ordering::SeqCst) <= limits.node_execution);
                 for peer in peak.iter() {
@@ -264,4 +264,139 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
             assert!(run.peak_live_bytes >= requests * 64, "{run:?}");
         },
     );
+}
+
+/// Serves one block per height to even peers and nothing to odd ones, without gating.
+#[derive(Debug)]
+struct OpenSource(Arc<block::Block>);
+
+impl Source for OpenSource {
+    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
+        let peer = request.start_height.0 / STRIDE;
+        let block = self.0.clone();
+        Box::pin(async move {
+            let blocks = if request.lease.try_start() && peer.is_multiple_of(2) {
+                (0..request.count)
+                    .map(|offset| (Height(request.start_height.0 + offset), block.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(ReadResult {
+                blocks,
+                lease: request.lease,
+            })
+        })
+    }
+}
+
+/// Manual evidence at the default maximum session count: every inbound and
+/// outbound slot keeps the advertised in-flight limit outstanding while half
+/// the peers receive bodies and half receive empty responses. Reports
+/// throughput, CPU time, per-session fairness and process memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual load evidence; requires ZAKURA_MAX_PEER_PROBE=1"]
+#[allow(clippy::print_stderr)]
+async fn maximum_sessions_continuous_serving_probe() {
+    if std::env::var_os("ZAKURA_MAX_PEER_PROBE").is_none() {
+        return;
+    }
+    let seconds = std::env::var("ZAKURA_PROBE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let config = ZakuraBlockSyncConfig::default();
+    let peers = config.peer_limits.max_inbound_peers + config.peer_limits.max_outbound_peers;
+    let window = super::super::serving_max_inflight_requests(&config);
+    let block = Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap());
+    let serving = Serving::new(Arc::new(OpenSource(block)), &config);
+    let baseline = memory_kib();
+    let cancel = CancellationToken::new();
+    let mut sessions: Vec<_> = (0..peers)
+        .map(|index| {
+            let mut identity = vec![201; 32];
+            identity[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            let (send, output) = framed_channel(64);
+            let session = serving.session(
+                &ZakuraPeerId::new(identity).unwrap(),
+                send,
+                cancel.clone(),
+                CancellationToken::new(),
+                Default::default(),
+            );
+            (session, output)
+        })
+        .collect();
+    let base = |peer: usize| u32::try_from(peer).unwrap() * STRIDE + 1;
+    let mut issued = vec![0_u32; peers];
+    for (peer, (session, _)) in sessions.iter_mut().enumerate() {
+        for _ in 0..window {
+            session.admit(Height(base(peer) + issued[peer]), 1).unwrap();
+            issued[peer] += 1;
+        }
+    }
+    let admitted = memory_kib();
+    let cpu_start = cpu_seconds();
+    let mut completed = vec![0_u64; peers];
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        let mut idle = true;
+        for (peer, (session, output)) in sessions.iter_mut().enumerate() {
+            while let Ok(frame) = output.try_recv() {
+                idle = false;
+                if matches!(frame.message_type, 4 | 5) {
+                    completed[peer] += 1;
+                    // Reuse this peer's heights; completed ranges are drained on admission.
+                    if issued[peer] + 1 >= STRIDE {
+                        issued[peer] = 0;
+                    }
+                    session.admit(Height(base(peer) + issued[peer]), 1).unwrap();
+                    issued[peer] += 1;
+                }
+            }
+        }
+        if idle {
+            tokio::task::yield_now().await;
+        }
+    }
+    let cpu = cpu_seconds().zip(cpu_start).map(|(end, start)| end - start);
+    let run = memory_kib();
+    cancel.cancel();
+    drop(sessions);
+    let total: u64 = completed.iter().sum();
+    let min = completed.iter().min().copied().unwrap_or(0);
+    let max = completed.iter().max().copied().unwrap_or(0);
+    // Float conversion is lossy only beyond 2^53 responses, far above any run.
+    let rate = total as f64 / seconds as f64;
+    eprintln!(
+        "max_peer_probe sessions={peers} window={window} seconds={seconds} responses={total} \
+         responses_per_s={rate:.0} per_session_min={min} per_session_max={max} cpu_s={cpu:?} \
+         rss_kib(baseline,admitted,run)={baseline:?},{admitted:?},{run:?}"
+    );
+    assert!(min > 0, "every session progresses");
+}
+
+/// Current and peak resident memory in KiB, from `/proc` on Linux.
+fn memory_kib() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))?
+            .trim()
+            .trim_end_matches(" kB")
+            .parse()
+            .ok()
+    };
+    Some((field("VmRSS:")?, field("VmHWM:")?))
+}
+
+/// User plus system CPU seconds for this process, from `/proc` on Linux.
+fn cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the parenthesized command name; utime and stime are 14 and 15.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
+    // Linux reports these in USER_HZ, which is 100 on supported targets.
+    Some(ticks / 100.0)
 }

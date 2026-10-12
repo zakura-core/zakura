@@ -12340,6 +12340,61 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
 }
 
 #[tokio::test]
+async fn reactor_advertises_default_serving_tip_growth_promptly() {
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(4), block::Hash([4; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        62,
+        block::Height(4),
+        block::Hash([4; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    // `connect_peer_with_status` already read the connect-time `Status`; the
+    // peer's first inbound `Status` now gets a reply as well.
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    for height in 1..=3 {
+        handle
+            .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(height),
+                verified_block_hash: block::Hash([height as u8; 32]),
+            }))
+            .await
+            .expect("serving frontier queues");
+        let frame = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("the reactor must advertise a new block within two seconds")
+            .expect("the peer stream remains open");
+        let BlockSyncMessage::Status(status) =
+            BlockSyncMessage::decode_frame(frame).expect("the status frame decodes")
+        else {
+            panic!("a serving frontier change must advertise body availability");
+        };
+        assert_eq!(status.servable_high, block::Height(height));
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_millis(100),

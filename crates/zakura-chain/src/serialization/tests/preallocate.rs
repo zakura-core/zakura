@@ -43,6 +43,47 @@ fn a_fitting_count_still_reserves_within_the_initial_cap() {
     );
 }
 
+/// Counted slice decoding rejects any nonempty collection whose element minimum is
+/// zero, so every decodable `TrustedPreallocate` type must supply one. Rust cannot
+/// enumerate trait impls, so new types must be added here; `zakura-network` checks
+/// its own types in `protocol::external::tests::preallocate`.
+#[test]
+fn every_decodable_preallocate_type_has_a_nonzero_minimum() {
+    use crate::{
+        block, orchard,
+        primitives::{reddsa, redjubjub, Bctv14Proof, Groth16Proof},
+        sapling, sprout, transaction, transparent,
+    };
+
+    macro_rules! assert_nonzero_minimum {
+        ($($ty:ty),+ $(,)?) => {$(
+            assert_ne!(
+                <$ty as TrustedPreallocate>::min_serialized_size(),
+                0,
+                concat!(stringify!($ty), " has no minimum encoded size"),
+            );
+        )+};
+    }
+
+    assert_nonzero_minimum!(
+        block::Hash,
+        block::CountedHeader,
+        transaction::Transaction,
+        transparent::Input,
+        transparent::Output,
+        sprout::JoinSplit<Bctv14Proof>,
+        sprout::JoinSplit<Groth16Proof>,
+        Groth16Proof,
+        sapling::Spend<sapling::PerSpendAnchor>,
+        sapling::SpendPrefixInTransactionV5,
+        sapling::OutputInTransactionV4,
+        sapling::OutputPrefixInTransactionV5,
+        redjubjub::Signature<redjubjub::SpendAuth>,
+        orchard::Action,
+        reddsa::Signature<reddsa::orchard::SpendAuth>,
+    );
+}
+
 impl TrustedPreallocate for u8 {
     fn min_serialized_size() -> u64 {
         1

@@ -175,6 +175,14 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("submitblock_result"),
     deprecated: false,
 }),
+("submitsolution", openrpc::RpcMethod {
+    description: "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.\n",
+    params: |_g| vec![
+        _g.param::<SubmitSolutionParameters>("parameters", crate::methods::PARAM_PARAMETERS_DESC, true),
+    ],
+    result: |g| g.result("submitsolution_result"),
+    deprecated: false,
+}),
 ("getmininginfo", openrpc::RpcMethod {
     description: "Returns mining-related information.\n\nzcashd reference: [`getmininginfo`](https://zcash.github.io/rpc/getmininginfo.html)\nmethod: post\ntags: mining\n",
     params: |_g| vec![
@@ -235,6 +243,13 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
         _g.param::<String>("address", crate::methods::PARAM_ADDRESS_DESC, true),
     ],
     result: |g| g.result("z_validateaddress_result"),
+    deprecated: false,
+}),
+("getstandardfee", openrpc::RpcMethod {
+    description: "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result("getstandardfee_result"),
     deprecated: false,
 }),
 ("getblocksubsidy", openrpc::RpcMethod {

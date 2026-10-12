@@ -1757,3 +1757,19 @@ fn poc_p2sh_1001_accurate_multisigs_should_stay_below_block_sigop_limit() -> Res
 
     Ok(())
 }
+
+#[test]
+fn only_script_failures_count_as_script_failures() {
+    use crate::Error;
+
+    assert!(Error::ScriptInvalid.is_script_failure());
+    assert!(Error::Unknown(libzcash_script::Error::Script(
+        zcash_script::script::Error::ScriptSize(None)
+    ))
+    .is_script_failure());
+
+    assert!(!Error::Unknown(libzcash_script::Error::CaughtException).is_script_failure());
+    assert!(!Error::Unknown(libzcash_script::Error::Unknown(1)).is_script_failure());
+    assert!(!Error::TxIndex.is_script_failure());
+    assert!(!Error::TxCoinbase.is_script_failure());
+}

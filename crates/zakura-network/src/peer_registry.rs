@@ -221,6 +221,16 @@ pub(crate) struct PeerRegistryUpdater {
 }
 
 impl PeerRegistryUpdater {
+    pub(crate) fn rtt(&self) -> Option<Duration> {
+        self.registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .get(&self.key)
+            .and_then(|peer| peer.rtt)
+    }
+
     pub(crate) fn record_ping_sent(&self, now: Instant) {
         self.registry
             .update_connection(&self.key, |connected_peer| {

@@ -3,11 +3,13 @@
 use std::path::PathBuf;
 
 use abscissa_core::{Application, Command, Runnable};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use color_eyre::eyre::Result;
 
 use zakura_chain::{block, parameters::Network};
-use zakura_state::{RollbackFinalizedStateOptions, RollbackFinalizedStateSummary};
+use zakura_state::{
+    PruningConfig, RollbackFinalizedStateOptions, RollbackFinalizedStateSummary, StorageMode,
+};
 
 use crate::prelude::APPLICATION;
 
@@ -35,6 +37,20 @@ pub struct RollbackStateCmd {
         help = "the network of the chain to load"
     )]
     network: Network,
+
+    /// The storage mode of the state database to roll back.
+    ///
+    /// The `zakurad rollback-state` subcommand defaults to `state.storage_mode` from the loaded
+    /// `zakura.toml`, while the standalone `zakura-rollback-state` binary defaults to archive.
+    /// A pruned checkpoint-synced database without transparent indexes can only be rolled back in
+    /// pruned mode, so pass `--storage-mode pruned` for it. The mode only selects which existing
+    /// database is opened; it never converts a database between modes.
+    #[clap(
+        long,
+        value_enum,
+        help = "storage mode of the state database, pruned for a pruned database"
+    )]
+    storage_mode: Option<RollbackStorageMode>,
 
     /// Write removed finalized blocks to the non-finalized backup cache.
     #[clap(long, help = "keep rolled-back blocks for non-finalized restore")]
@@ -64,6 +80,9 @@ impl Runnable for RollbackStateCmd {
 impl RollbackStateCmd {
     /// Runs rollback using `state_config` as the base state configuration.
     ///
+    /// `--cache-dir` and `--storage-mode` override `state_config` when they are passed, before
+    /// either the dry run or the rollback selects the state database.
+    ///
     /// `consensus_config` supplies `checkpoint_sync`, which sets the max checkpoint height used to
     /// guard `--keep-rolled-back-blocks`: blocks kept below it would be discarded on the next start.
     /// Its checkpoint-sync settings are also mirrored into `state_config`, as `start` does.
@@ -75,6 +94,16 @@ impl RollbackStateCmd {
     ) -> Result<()> {
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
+        }
+
+        match self.storage_mode {
+            None => {}
+            Some(RollbackStorageMode::Archive) => state_config.storage_mode = StorageMode::Archive,
+            // Keep a configured retention window: rollback only needs the mode to select the database.
+            Some(RollbackStorageMode::Pruned) if state_config.pruning_config().is_some() => {}
+            Some(RollbackStorageMode::Pruned) => {
+                state_config.storage_mode = StorageMode::Pruned(PruningConfig::default())
+            }
         }
 
         state_config.checkpoint_sync = consensus_config.checkpoint_sync;
@@ -104,6 +133,15 @@ impl RollbackStateCmd {
 
         Ok(())
     }
+}
+
+/// The `--storage-mode` values accepted by `rollback-state`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RollbackStorageMode {
+    /// Archive storage, which only opens a database with transparent indexes.
+    Archive,
+    /// Pruned storage, which also opens a database without transparent indexes.
+    Pruned,
 }
 
 #[allow(clippy::print_stdout)]

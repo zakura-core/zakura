@@ -16,6 +16,8 @@ fn main() {
 
     let command = RollbackStateCmd::parse();
 
+    // Without a config file, the database is opened in archive mode unless `--storage-mode`
+    // overrides it.
     if let Err(error) = command.run_with_config(
         zakura_state::Config::default(),
         zakura_consensus::Config::default(),

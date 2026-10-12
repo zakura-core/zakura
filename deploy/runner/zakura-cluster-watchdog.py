@@ -3,6 +3,7 @@
 
 Polls one or more `zakura-cluster-status.py` `/data` endpoints, tracks sustained
 node failures in a small JSON state file, and posts transition alerts to Slack.
+Critical mainnet incidents also open and resolve PagerDuty pages.
 
 Only the Python stdlib is used.
 """
@@ -62,6 +63,9 @@ MAX_ALERT_NAME_CHARS = 128
 MAX_ALERT_STATUS_CHARS = 64
 MAX_BLOCK_HASH_CHARS = 64
 MAX_ALERT_ERROR_CHARS = 2_048
+PAGERDUTY_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
+MAX_PAGERDUTY_SUMMARY_CHARS = 1_024
+MAINNET_DASHBOARD_URL = "https://status.mainnet.zakura.valargroup.dev/"
 STALL_PIPELINE_METRICS = (
     ("network tip", "sync_estimated_network_tip_height"),
     ("distance", "sync_estimated_distance_to_tip"),
@@ -144,6 +148,42 @@ class ReleaseState:
     url: str
     stale_after: float
     required_files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PagedIncident:
+    """One watchdog incident that also pages through PagerDuty.
+
+    `conditions` are the alerting conditions that open a page (empty means any).
+    With `resolve_on_ok_only`, a page closes only once the incident is back to
+    `ok`, so a divergence that turns into lost visibility keeps its page open.
+    """
+
+    bucket: str
+    key: str
+    conditions: frozenset[str]
+    resolve_on_ok_only: bool
+    dedup_key: str
+    component: str
+
+
+PAGED_INCIDENTS = (
+    PagedIncident(
+        "mac_comparison", "mainnet",
+        frozenset({"tree_mismatch", "chain_disagreement"}), True,
+        "zakura/mainnet/mac-comparison", "mac-cranelift-comparison",
+    ),
+    PagedIncident(
+        "mac_forks", "mainnet", frozenset({"fork"}), True,
+        "zakura/mainnet/mac-fork", MAC_NODE_NAME,
+    ),
+    # A shared stall entry stays `stalled` while a majority shares a tip, so only
+    # `alerting` marks the incident; Slack's recovery also resolves the page.
+    PagedIncident(
+        "shared_stalls", "mainnet", frozenset(), False,
+        "zakura/mainnet/shared-stall", "fleet",
+    ),
+)
 
 
 def load_release_state(config_path: Path) -> list[ReleaseState]:
@@ -376,6 +416,116 @@ def mac_recovery_ready(entry, now, good):
     sample["last"] = now
     sample["count"] += 1
     return sample["count"] >= 3 and now - sample["since"] >= 60
+
+
+def pagerduty_routing_key() -> str:
+    """Return the Events API v2 integration key for the Zakura mainnet service."""
+    return os.environ.get("PAGERDUTY_ROUTING_KEY", "")
+
+
+def post_pagerduty(event: dict[str, Any], args: argparse.Namespace) -> bool:
+    """Enqueue one Events API v2 event; the dedup key makes resends idempotent."""
+    if args.dry_run:
+        print(f"dry-run PagerDuty event:\n{json.dumps(event, indent=2, sort_keys=True)}\n")
+        return True
+
+    routing_key = pagerduty_routing_key()
+    if not routing_key:
+        return False
+
+    payload = json.dumps({**event, "routing_key": routing_key}).encode("utf-8")
+    request = urllib.request.Request(
+        PAGERDUTY_EVENTS_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
+            response.read(4096)
+    except (OSError, urllib.error.URLError):
+        print("PagerDuty event post failed: transport error", file=sys.stderr)
+        return False
+
+    if response.status != 202:
+        print(
+            f"PagerDuty event post failed: status={response.status} "
+            "response rejected",
+            file=sys.stderr,
+        )
+        return False
+
+    return True
+
+
+def incident_entry(state: dict[str, Any], bucket: str, key: str) -> dict[str, Any] | None:
+    """Prefer a fleet's undelivered candidate so a Slack outage cannot block a page."""
+    pending = state.get("pending_delivery", {}).get(key)
+    if isinstance(pending, dict):
+        candidate = pending.get("state", {})
+        if isinstance(candidate, dict) and bucket in candidate:
+            entry = candidate[bucket].get(key)
+            return entry if isinstance(entry, dict) else None
+    entry = state.get(bucket, {}).get(key)
+    return entry if isinstance(entry, dict) else None
+
+
+def pagerduty_decision(incident: PagedIncident, entry: dict[str, Any] | None) -> str | None:
+    """Return `trigger`, `resolve`, or None to leave the page as it is."""
+    if entry is None:
+        # No evidence either way, e.g. after a state reset; a human can resolve.
+        return None
+    condition = entry.get("condition")
+    if entry.get("alerting"):
+        if not incident.conditions or condition in incident.conditions:
+            return "trigger"
+        return None
+    if incident.resolve_on_ok_only and condition != "ok":
+        return None
+    return "resolve"
+
+
+def pagerduty_trigger_event(incident: PagedIncident, entry: dict[str, Any]) -> dict[str, Any]:
+    condition = bounded_text(entry.get("condition"), MAX_ALERT_STATUS_CHARS)
+    height = coerce_height(entry.get("event_height", entry.get("alert_height")))
+    nodes = entry.get("node_names")
+    if incident.bucket == "mac_comparison":
+        summary = f"Zakura mainnet: Mac/Linux compiler comparison {condition}"
+    elif incident.bucket == "mac_forks":
+        summary = f"Zakura mainnet: {MAC_NODE_NAME} forked more than 10 blocks from the fleet"
+    else:
+        summary = (
+            f"Zakura mainnet: fleet-wide stall at height "
+            f"{height if height is not None else '-'} "
+            f"({len(nodes) if isinstance(nodes, list) else '?'} nodes)"
+        )
+
+    details: dict[str, Any] = {"condition": condition}
+    bad_since = coerce_float(entry.get("bad_since"))
+    if bad_since is not None:
+        details["bad_since"] = datetime.datetime.fromtimestamp(
+            bad_since, datetime.timezone.utc
+        ).isoformat()
+    if height is not None:
+        details["height"] = height
+    if isinstance(nodes, list):
+        details["nodes"] = [
+            bounded_text(name, MAX_ALERT_NAME_CHARS)
+            for name in nodes[:MAX_DECISION_ROWS]
+        ]
+    return {
+        "event_action": "trigger",
+        "dedup_key": incident.dedup_key,
+        "payload": {
+            "summary": bounded_text(summary, MAX_PAGERDUTY_SUMMARY_CHARS),
+            "source": "zakura-fleet-watchdog",
+            "severity": "critical",
+            "component": incident.component,
+            "group": "zakura-mainnet",
+            "custom_details": details,
+        },
+        "links": [{"href": MAINNET_DASHBOARD_URL, "text": "Zakura mainnet dashboard"}],
+    }
 
 
 def node_condition(
@@ -983,6 +1133,7 @@ class Watchdog:
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
+        self.pagerduty_key_warned = False
 
     def run_once(self, state: dict[str, Any]) -> None:
         now = time.time()
@@ -1020,6 +1171,8 @@ class Watchdog:
         # only a zakurad-compat restart, reported by the probe, mutes it.
         for worker in self.compatibility:
             self.handle_compatibility(state, worker)
+
+        self.reconcile_pagerduty(state, now, suppressed)
 
     def handle_compatibility(
         self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float | None = None
@@ -1145,6 +1298,43 @@ class Watchdog:
             )
             entry["last_predicate"] = result.predicate
 
+    def reconcile_pagerduty(self, state: dict[str, Any], now: float, suppressed: bool = False) -> None:
+        """Open or resolve pages from the incident state the alert lanes keep.
+
+        Thresholds, deploy suppression, mutes and latching therefore apply
+        unchanged. A failed send records nothing and is retried next poll;
+        PagerDuty owns re-notification while a page stays open.
+        """
+        if not self.args.dry_run and not pagerduty_routing_key():
+            if not self.pagerduty_key_warned:
+                print("PAGERDUTY_ROUTING_KEY is not set; paging disabled", file=sys.stderr)
+                self.pagerduty_key_warned = True
+            return
+
+        if suppressed:
+            return
+        pages = state.setdefault("pagerduty", {})
+        for incident in PAGED_INCIDENTS:
+            if (incident.bucket == "mac_comparison"
+                    and not getattr(self.args, "mac_comparison_alerts", True)):
+                continue
+            bucket = ("mac_comparison_paging" if incident.bucket == "mac_comparison"
+                      and "mac_comparison_paging" in state else incident.bucket)
+            entry = incident_entry(state, bucket, incident.key)
+            decision = pagerduty_decision(incident, entry)
+            if decision == "trigger" and incident.dedup_key not in pages:
+                if post_pagerduty(pagerduty_trigger_event(incident, entry), self.args):
+                    pages[incident.dedup_key] = {
+                        "condition": entry.get("condition"),
+                        "triggered_at": now,
+                    }
+            elif decision == "resolve" and incident.dedup_key in pages:
+                if post_pagerduty(
+                    {"event_action": "resolve", "dedup_key": incident.dedup_key},
+                    self.args,
+                ):
+                    del pages[incident.dedup_key]
+
     def handle_mac_comparison(self, state, now, suppressed):
         """One bounded child isolates comparison I/O from the other alert lanes."""
         started = time.time()
@@ -1168,7 +1358,14 @@ class Watchdog:
                 condition = sample["condition"]
         except (OSError, ValueError, TypeError, subprocess.SubprocessError):
             pass
-        bucket = state.setdefault("mac_comparison", {})
+        # Paging latches independently of Slack acceptance, with the same samples,
+        # thresholds and mute/suppression rules as the Slack lane.
+        self.observe_mac_comparison(state.setdefault("mac_comparison_paging", {}),
+                                    condition, now, suppressed or muted, lambda *_: True)
+        self.observe_mac_comparison(state.setdefault("mac_comparison", {}),
+                                    condition, now, suppressed or muted, self.notify)
+
+    def observe_mac_comparison(self, bucket, condition, now, suppressed, notify):
         entry = bucket.get("mainnet", {})
         alert_condition = "ok" if condition == "matching" else condition
         since = entry.get("bad_since", now) if entry.get("condition", "ok") != "ok" else now
@@ -1186,8 +1383,8 @@ class Watchdog:
                            0 if condition == "tree_mismatch" else 180,
                            "Zakura compiler comparison: " + condition,
                            "Zakura compiler comparison recovered: matching blocks and commitment trees",
-                           now, suppressed or muted, self.args,
-                           notify=(lambda *_: False) if suppressed or muted else self.notify)
+                           now, suppressed, self.args,
+                           notify=(lambda *_: False) if suppressed else notify)
         updated = bucket["mainnet"]
         if updated.get("condition") != "ok":
             updated["mismatch_notified"] = bool(mismatch_notified or (

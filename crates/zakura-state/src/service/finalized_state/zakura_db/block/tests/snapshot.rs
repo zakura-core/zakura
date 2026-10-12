@@ -515,7 +515,10 @@ fn snapshot_transparent_address_data(state: &FinalizedState, height: u32) {
         }
 
         let mut stored_utxos = Vec::new();
-        for (utxo_loc, utxo) in state.address_utxos(&address) {
+        for (utxo_loc, utxo) in state
+            .address_utxos(&address)
+            .expect("snapshot databases build transparent indexes")
+        {
             assert!(stored_utxo_locations.contains(&utxo_loc));
 
             stored_utxos.push(utxo);

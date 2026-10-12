@@ -1232,11 +1232,15 @@ impl ZakuraSupervisorHandle {
     }
 
     /// Returns queue-backed handles for peers currently able to accept outbound work.
+    ///
+    /// A peer whose disconnect has been requested stays in `active_by_peer`
+    /// until its connection task deregisters it, so it is skipped here.
     pub async fn outbound_peer_handles(&self) -> Vec<ZakuraPeerHandle> {
         let state = self.inner.lock().await;
         state
             .active_by_peer
             .values()
+            .filter(|entry| !entry.disconnect_token.is_cancelled())
             .map(|entry| &entry.outbound_handle)
             .filter(|handle| handle.has_outbound_capacity())
             .cloned()
@@ -5067,6 +5071,8 @@ struct LegacyResponseReadState {
     items: usize,
     active_chunk_type: Option<u16>,
     active_chunk: Vec<u8>,
+    /// A NIL answered an inventory request; see `validate_nil`.
+    inventory_nil: bool,
 }
 
 impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
@@ -5094,6 +5100,7 @@ impl LegacyResponseReadState {
             items: 0,
             active_chunk_type: None,
             active_chunk: Vec::new(),
+            inventory_nil: false,
         }
     }
 
@@ -5105,6 +5112,11 @@ impl LegacyResponseReadState {
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
+            ));
+        }
+        if self.inventory_nil {
+            return Err(OutboundRequestError::Fatal(
+                "legacy response frame after inventory nil".into(),
             ));
         }
 
@@ -5156,9 +5168,20 @@ impl LegacyResponseReadState {
         }
     }
 
+    /// Checks the response once its stream has ended.
+    ///
+    /// Ending mid-item is `Local`: an honest responder resets the stream when a
+    /// frame write times out, and the requester sees that the same way as a
+    /// peer that stops early. A peer can already decline with an empty
+    /// response, so failing closed here would only disconnect slow honest peers.
     fn finish(self) -> Result<(), OutboundRequestError> {
+        if self.inventory_nil {
+            return Err(OutboundRequestError::Local(
+                "legacy nil response to inventory request".into(),
+            ));
+        }
         if self.active_chunk_type.is_some() {
-            return Err(OutboundRequestError::Fatal(
+            return Err(OutboundRequestError::Local(
                 "incomplete legacy response chunk".into(),
             ));
         }
@@ -5219,16 +5242,13 @@ impl LegacyResponseReadState {
         &self,
         kind: LegacyResponseKind,
     ) -> Result<(), OutboundRequestError> {
+        let mut remaining = self.active_chunk.as_slice();
         match kind {
             LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -5236,6 +5256,14 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::Pong
             | LegacyResponseKind::Nil => unreachable!("non-chunk legacy response kind"),
         }
+        .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?;
+        // A valid item padded with junk must not pass as a completed item.
+        if !remaining.is_empty() {
+            return Err(OutboundRequestError::Fatal(
+                "legacy response item has trailing bytes".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_missing(
@@ -5293,33 +5321,22 @@ impl LegacyResponseReadState {
 
     /// Validate a `MSG_RESPONSE_NIL` empty-result sentinel against the request kind.
     ///
-    /// NIL is the empty-result sentinel only for chain-discovery and mempool
-    /// queries: the inbound service answers an empty `FindBlocks`/`FindHeaders`/
-    /// `MempoolTransactionIds` (and a queued `PushTransaction`) with
-    /// `Response::Nil`. Inventory fetches (`BlocksByHash`/`TransactionsById`) and
-    /// `Ping` must never receive a bare NIL, so reject it as `Fatal` for those
-    /// kinds — fail closed and let the request stream worker disconnect the peer,
-    /// matching `LegacyResponseCodec::decode_response`, which rejects NIL for the
-    /// same kinds. The kind-specific empty `Response` is produced later by
-    /// `decode_response`.
+    /// NIL is the empty result for chain-discovery and mempool queries (and the
+    /// acknowledgement of a queued `PushTransaction`); `decode_response` turns it
+    /// into that kind's empty `Response`. A malformed NIL, or NIL to a `Ping`
+    /// (always answered locally), is `Fatal`.
+    ///
+    /// A lone NIL to `BlocksByHash` / `TransactionsById` is `Local`: an honest
+    /// inbound service still in setup answers every request with NIL. Failing
+    /// closed would disconnect it and buys nothing, since a peer can already
+    /// decline with an empty response. The encoder never mixes NIL with
+    /// inventory frames, so NIL is recorded here, any later frame is `Fatal`,
+    /// and `finish` reports the `Local` error only once the stream ends.
     fn validate_nil(
         &mut self,
         request_id: u64,
         payload: &[u8],
     ) -> Result<(), OutboundRequestError> {
-        match self.budget.kind {
-            LegacyResponseKind::BlockHashes
-            | LegacyResponseKind::BlockHeaders
-            | LegacyResponseKind::TransactionIds
-            | LegacyResponseKind::Nil => {}
-            LegacyResponseKind::Blocks
-            | LegacyResponseKind::Transactions
-            | LegacyResponseKind::Pong => {
-                return Err(OutboundRequestError::Fatal(
-                    "unexpected legacy nil response for inventory or ping request".into(),
-                ));
-            }
-        }
         if self.active_chunk_type.is_some() {
             return Err(OutboundRequestError::Fatal(
                 "legacy nil response interleaved with response chunk".into(),
@@ -5338,6 +5355,27 @@ impl LegacyResponseReadState {
             return Err(OutboundRequestError::Fatal(
                 "legacy nil response has trailing bytes".into(),
             ));
+        }
+        match self.budget.kind {
+            LegacyResponseKind::BlockHashes
+            | LegacyResponseKind::BlockHeaders
+            | LegacyResponseKind::TransactionIds
+            | LegacyResponseKind::Nil => {}
+            // `validate_frame` has already counted this frame.
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions if self.frames == 1 => {
+                self.inventory_nil = true;
+                return Ok(());
+            }
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                return Err(OutboundRequestError::Fatal(
+                    "legacy nil response after inventory frames".into(),
+                ));
+            }
+            LegacyResponseKind::Pong => {
+                return Err(OutboundRequestError::Fatal(
+                    "unexpected legacy nil response for ping request".into(),
+                ));
+            }
         }
         self.add_items(1)
     }
@@ -5832,6 +5870,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
     use super::*;
@@ -6417,6 +6456,33 @@ mod tests {
             supervisor_b.register_authenticated(peer, losing_key),
             AuthenticatedPeerRegistration::Duplicate
         ));
+    }
+
+    /// A disconnected peer leaves request selection at once, before its
+    /// connection task deregisters it.
+    #[tokio::test]
+    async fn disconnected_peer_leaves_outbound_selection_before_cleanup() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer = test_peer(12);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        registered_conn_id(
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    Some("203.0.113.12".parse().expect("test ip parses")),
+                    [0; TRANSCRIPT_HASH_BYTES],
+                    ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
+                    CancellationToken::new(),
+                    ZAKURA_CAP_LEGACY_GOSSIP,
+                )
+                .await,
+        );
+        assert_eq!(supervisor.outbound_peer_handles().await.len(), 1);
+
+        assert!(supervisor.disconnect_peer(&peer).await);
+        assert_eq!(supervisor.registered_ids().await, vec![peer]);
+        assert!(supervisor.outbound_peer_handles().await.is_empty());
     }
 
     #[tokio::test]
@@ -10167,6 +10233,57 @@ mod tests {
         Ok(())
     }
 
+    /// A block response whose stream ends mid-item is request-local, but a list
+    /// frame interleaved into the unfinished item stays connection-fatal.
+    #[test]
+    fn stream_ending_mid_item_is_local_and_interleaving_is_fatal() {
+        let request_id: u64 = 7;
+        let state = || {
+            LegacyResponseReadState::new(LegacyResponseBudget {
+                kind: LegacyResponseKind::Blocks,
+                max_items: 1,
+                max_frames: 4,
+                max_bytes: MAX_PROTOCOL_MESSAGE_LEN,
+                max_message_bytes: MAX_PROTOCOL_MESSAGE_LEN,
+            })
+        };
+        let mut payload = request_id.to_le_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(&[0; 16]);
+        let first_chunk = Frame {
+            message_type: LEGACY_RESPONSE_BLOCK,
+            flags: 0,
+            payload,
+        };
+
+        let mut ended = state();
+        ended
+            .validate_frame(request_id, &first_chunk)
+            .expect("a non-final chunk is accepted");
+        let finished = ended.finish();
+        assert!(
+            matches!(finished, Err(OutboundRequestError::Local(_))),
+            "a stream ending mid-item must be Local; got {finished:?}"
+        );
+
+        let mut interleaved = state();
+        interleaved
+            .validate_frame(request_id, &first_chunk)
+            .expect("a non-final chunk is accepted");
+        let mut missing = request_id.to_le_bytes().to_vec();
+        missing.push(0);
+        let missing = Frame {
+            message_type: LEGACY_RESPONSE_MISSING_BLOCKS,
+            flags: 0,
+            payload: missing,
+        };
+        let result = interleaved.validate_frame(request_id, &missing);
+        assert!(
+            matches!(result, Err(OutboundRequestError::Fatal(_))),
+            "a frame interleaved into an unfinished item must stay Fatal; got {result:?}"
+        );
+    }
+
     #[test]
     fn legacy_header_precheck_tracks_remaining_bytes_across_frames() {
         let mut state = LegacyResponseReadState::new(LegacyResponseBudget {
@@ -10200,6 +10317,46 @@ mod tests {
                 state.validate_frame(1, &frame).unwrap();
             }
         }
+    }
+
+    /// F-37: the transport-level check rejects a valid transaction padded with
+    /// junk bytes as a fatal peer fault.
+    #[test]
+    fn legacy_completed_item_rejects_trailing_bytes() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let request_id = 99;
+        let transaction = transaction::UnminedTx::from(empty_v5_transaction(24));
+        let request_frame =
+            LegacyRequestFrame::TransactionsById(vec![transaction.id()]).encode_frame()?;
+        let budget = LegacyResponseBudget::from_request(
+            request_frame.message_type,
+            &request_frame.payload,
+            limits,
+        )
+        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        let mut frames = LegacyResponseCodec::encode_response(
+            request_id,
+            Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        let [frame] = frames.as_mut_slice() else {
+            panic!("a small transaction encodes as one frame");
+        };
+
+        let mut state = LegacyResponseReadState::new(budget);
+        state
+            .validate_frame(request_id, frame)
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+
+        frame.payload.extend_from_slice(&[0; 16]);
+        let mut state = LegacyResponseReadState::new(budget);
+        assert!(matches!(
+            state.validate_frame(request_id, frame),
+            Err(OutboundRequestError::Fatal(_)),
+        ));
+
+        Ok(())
     }
 
     fn assert_codec_frames_validate_at_transport(
@@ -10465,89 +10622,102 @@ mod tests {
         );
     }
 
-    // SECURITY AUDIT (candidate claude-legacy-nil-response-nonfatal /
-    // subset-response-correlation-gossip-nil-response-nonfatal): SR-7 fail-closed.
-    //
-    // The outbound request stream worker decides connection-fatality from
-    // `LegacyResponseReadState::validate_frame`: `Fatal` => connection.close() +
-    // connection_token.cancel() (the peer is disconnected); `Ok`/`Local` => the
-    // peer stays connected and the request just returns an error. `validate_nil`
-    // accepts a `MSG_RESPONSE_NIL` sentinel for *every* request kind, so a peer
-    // that answers an inventory fetch (BlocksByHash / TransactionsById) or a Ping
-    // with a correct-id NIL passes the transport budget layer (worker returns
-    // Ok(frames)) and is NOT disconnected. Only the later `decode_response` layer
-    // rejects NIL for these kinds -- as an ordinary request-local error. The two
-    // layers disagree, so an unexpected/unsolicited response is tolerated instead
-    // of failing closed.
-    //
-    // This test asserts the SAFE behavior (the transport budget layer must reject
-    // NIL for inventory/Ping kinds as `Fatal`, so the worker disconnects). It
-    // currently FAILS, which is the reproduction. Do not weaken it to pass.
+    /// A lone, well-formed NIL answer to an inventory fetch is request-local, so
+    /// the peer stays connected and the caller falls back; NIL to a Ping, NIL
+    /// with the wrong request id, and NIL mixed with other frames in either
+    /// order stay connection-fatal.
     #[test]
-    fn nil_response_to_inventory_or_ping_request_is_not_fail_closed() {
+    fn nil_response_is_local_for_inventory_and_fatal_for_ping() {
         let limits = test_connection_limits();
         let request_id = 99;
 
-        let cases: [(LegacyRequestFrame, LegacyRequestKind); 3] = [
-            (
-                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
-                LegacyRequestKind::Blocks,
-            ),
+        let cases = [
+            (LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]), false),
             (
                 LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(2)]),
-                LegacyRequestKind::Transactions,
+                false,
             ),
-            (LegacyRequestFrame::Ping, LegacyRequestKind::Ping),
+            (LegacyRequestFrame::Ping, true),
         ];
 
-        for (request, request_kind) in cases {
+        for (request, fatal) in cases {
             let request_frame = request.encode_frame().expect("request frame encodes");
-            let budget = LegacyResponseBudget::from_request(
-                request_frame.message_type,
-                &request_frame.payload,
-                limits,
-            )
-            .expect("budget derives from request");
+            let budget = || {
+                LegacyResponseBudget::from_request(
+                    request_frame.message_type,
+                    &request_frame.payload,
+                    limits,
+                )
+                .expect("budget derives from request")
+            };
+            let nil = |id| {
+                LegacyResponseCodec::encode_response(
+                    id,
+                    Response::Nil,
+                    limits.max_frame_bytes,
+                    limits.max_message_bytes,
+                )
+                .expect("nil response encodes")
+                .pop()
+                .expect("nil encodes to one frame")
+            };
 
-            // A hostile/buggy responder serializes Response::Nil with the real
-            // codec, addressed to our request id.
-            let nil_frames = LegacyResponseCodec::encode_response(
-                request_id,
-                Response::Nil,
-                limits.max_frame_bytes,
-                limits.max_message_bytes,
-            )
-            .expect("nil response encodes");
-
-            // The higher decode layer DOES reject NIL for these kinds...
-            let decoded = LegacyResponseCodec::decode_response(
-                request_id,
-                request_kind,
-                nil_frames.clone(),
-                None,
-            );
-            assert!(
-                decoded.is_err(),
-                "decode_response must reject a bare NIL for {request_kind:?}",
-            );
-
-            // ...but the transport budget layer -- the one that drives the
-            // fail-closed disconnect in the request stream worker -- must ALSO
-            // reject it as Fatal. It currently accepts it.
-            let mut state = LegacyResponseReadState::new(budget);
-            let mut validate = Ok(());
-            for frame in &nil_frames {
-                validate = state.validate_frame(request_id, frame);
-                if validate.is_err() {
-                    break;
-                }
+            let mut lone = LegacyResponseReadState::new(budget());
+            let result = lone
+                .validate_frame(request_id, &nil(request_id))
+                .and_then(|()| lone.finish());
+            if fatal {
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "NIL to {request:?} must be Fatal; got {result:?}",
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Local(_))),
+                    "a lone NIL to {request:?} must be Local; got {result:?}",
+                );
             }
-            let validate = validate.and_then(|()| state.finish());
+
+            let wrong_id = LegacyResponseReadState::new(budget())
+                .validate_frame(request_id, &nil(request_id + 1));
             assert!(
-                matches!(validate, Err(OutboundRequestError::Fatal(_))),
-                "transport must fail closed (Fatal) on a NIL answer to {request_kind:?} so the \
-                 request stream worker disconnects the peer; got {validate:?}",
+                matches!(wrong_id, Err(OutboundRequestError::Fatal(_))),
+                "a wrong-id NIL to {request:?} must stay Fatal; got {wrong_id:?}",
             );
+
+            if let LegacyRequestFrame::BlocksByHash(hashes) = &request {
+                let missing = || {
+                    LegacyResponseCodec::encode_response(
+                        request_id,
+                        Response::Blocks(vec![InventoryResponse::Missing(hashes[0])]),
+                        limits.max_frame_bytes,
+                        limits.max_message_bytes,
+                    )
+                    .expect("missing response encodes")
+                    .pop()
+                    .expect("a missing entry encodes to one frame")
+                };
+
+                let mut after_items = LegacyResponseReadState::new(budget());
+                after_items
+                    .validate_frame(request_id, &missing())
+                    .expect("a missing entry is accepted");
+                let result = after_items.validate_frame(request_id, &nil(request_id));
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "NIL after inventory frames must stay Fatal; got {result:?}",
+                );
+
+                let mut before_items = LegacyResponseReadState::new(budget());
+                before_items
+                    .validate_frame(request_id, &nil(request_id))
+                    .expect("a first NIL is held until the stream ends");
+                let result = before_items.validate_frame(request_id, &missing());
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "inventory frames after NIL must stay Fatal; got {result:?}",
+                );
+            }
         }
     }
 

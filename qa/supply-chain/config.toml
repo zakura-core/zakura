@@ -43,6 +43,9 @@ audit-as-crates-io = false
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
 
+[policy.zakura-mmr-tree]
+audit-as-crates-io = false
+
 [policy.zakura-network]
 audit-as-crates-io = false
 
@@ -68,9 +71,6 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.zakura-utils]
-audit-as-crates-io = false
-
-[policy.zakura_mmr_tree]
 audit-as-crates-io = false
 
 [[exemptions.addchain]]

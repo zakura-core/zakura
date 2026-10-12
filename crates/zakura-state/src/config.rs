@@ -21,10 +21,10 @@ use zakura_chain::{common::default_cache_dir, parameters::Network};
 use crate::{
     constants::{
         min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION,
-        STATE_DATABASE_KIND, STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND,
+        STATE_DATABASE_KIND,
     },
     service::finalized_state::restorable_db_versions,
-    state_database_format_version_in_code, BoxError, StateInitError,
+    state_database_format_version_in_code, BoxError,
 };
 
 /// Configuration for the state service.
@@ -75,12 +75,6 @@ pub struct Config {
     ///
     /// Old state versions are automatically deleted at startup. You can also manually delete old
     /// state versions.
-    ///
-    /// A pruned node with `consensus.checkpoint_sync = true` that starts with no existing state
-    /// creates its database under `state_without_transparent_indexes/vN/<network>` instead. That
-    /// database never builds transparent address balances, address UTXO and transaction indexes,
-    /// or transparent spender indexes. See [`StateDatabaseKind`] for how an existing database is
-    /// chosen across configuration changes.
     pub cache_dir: PathBuf,
 
     /// Whether to use an ephemeral database.
@@ -186,15 +180,11 @@ pub struct Config {
     /// pruned, the database cannot be reopened in [`StorageMode::Archive`] without
     /// re-syncing from genesis.
     ///
-    /// A pruned node with `consensus.checkpoint_sync = true` that starts from a fresh
-    /// cache directory also skips the transparent address indexes: address balances,
-    /// address UTXO and transaction lists, and transparent spender lookups. Consensus
-    /// never reads them. On such a node, `getaddressbalance`, `getaddressutxos`,
-    /// `getaddresstxids`, and transparent spending transaction lookups return an error
-    /// instead of incomplete answers, and this stays true if checkpoint sync is later
-    /// disabled. An existing cache keeps its indexes, so to skip them, start from an
-    /// empty cache directory; to get them back, sync into an empty cache directory
-    /// with archive storage or with checkpoint sync disabled.
+    /// With checkpoint sync enabled, pruned storage stops maintaining transparent address
+    /// balances, address UTXO and transaction lists, and transparent spender indexes in the
+    /// existing database. Existing rows are retained but never served as complete results.
+    /// The first skipped block records this permanently, including across restart and rollback.
+    /// Restoring complete address queries requires syncing a fresh indexed database.
     pub storage_mode: StorageMode,
 
     // Debug configs
@@ -232,6 +222,11 @@ fn gen_temp_path(prefix: &str) -> PathBuf {
 }
 
 impl Config {
+    /// Whether this configuration stops optional transparent index updates.
+    pub(crate) fn skips_transparent_indexes(&self) -> bool {
+        self.pruning_config().is_some() && self.checkpoint_sync
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(
@@ -254,145 +249,18 @@ impl Config {
         }
     }
 
-    /// Returns the path for the non-finalized state backup directory, based on the finalized
-    /// database kind and the network.
+    /// Returns the path for the non-finalized state backup directory, based on the network.
     /// Non-finalized state backup files are encoded in the network protocol format and remain
     /// valid across db format upgrades.
-    ///
-    /// Each [`StateDatabaseKind`] has its own backup directory, so blocks backed up above one
-    /// finalized database are never restored on top of the other one.
-    pub fn non_finalized_state_backup_dir(
-        &self,
-        db_kind: StateDatabaseKind,
-        network: &Network,
-    ) -> Option<PathBuf> {
+    pub fn non_finalized_state_backup_dir(&self, network: &Network) -> Option<PathBuf> {
         if self.ephemeral || !self.should_backup_non_finalized_state {
             // Ephemeral databases are intended to be irrecoverable across restarts and don't
             // require a backup for the non-finalized state.
             return None;
         }
 
-        let backup_dir = match db_kind {
-            StateDatabaseKind::Indexed => "non_finalized_state",
-            StateDatabaseKind::WithoutTransparentIndexes => {
-                "non_finalized_state_without_transparent_indexes"
-            }
-        };
-
         let net_dir = network.lowercase_name();
-        Some(self.cache_dir.join(backup_dir).join(net_dir))
-    }
-
-    /// Returns `true` if a newly created state database skips transparent address indexes.
-    ///
-    /// Only a node that is both [`StorageMode::Pruned`] and checkpoint-syncing
-    /// ([`checkpoint_sync`](Config::checkpoint_sync)) skips them. Those indexes are RPC-only
-    /// state: consensus never reads them. Unlike raw transaction bodies, they are cumulative, so
-    /// starting them partway through the chain would produce balances, UTXO lists, and histories
-    /// that look complete but are not. A node that skips them therefore skips them from genesis,
-    /// in a separate [`StateDatabaseKind::WithoutTransparentIndexes`] database.
-    ///
-    /// This only decides the kind of a *new* database. An existing database keeps its kind; see
-    /// [`Config::state_database_kind`].
-    pub fn new_database_skips_transparent_indexes(&self) -> bool {
-        self.pruning_config().is_some() && self.checkpoint_sync
-    }
-
-    /// Returns the kind of state database this node opens for `network`.
-    ///
-    /// The choice is sticky across configuration changes, because an existing database always
-    /// wins over the configured preference:
-    ///
-    /// - If only an [`StateDatabaseKind::Indexed`] database exists, it is opened and keeps
-    ///   building transparent indexes, even when pruned checkpoint sync is configured. Existing
-    ///   caches are never migrated, deleted, or resynced. Index skipping needs a fresh cache.
-    /// - If only a [`StateDatabaseKind::WithoutTransparentIndexes`] database exists, it is opened
-    ///   and keeps skipping transparent indexes, even when checkpoint sync is disabled. Archive
-    ///   storage mode is rejected, because the skipped indexes can never be rebuilt in place.
-    /// - If neither exists, [`Config::new_database_skips_transparent_indexes`] picks the kind.
-    /// - If both exist, startup is refused rather than guessing.
-    ///
-    /// Ephemeral databases always start empty, so they follow the configured preference.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StateInitError::AmbiguousStateDatabases`] or
-    /// [`StateInitError::TransparentIndexesMissingInArchiveMode`].
-    pub fn state_database_kind(
-        &self,
-        network: &Network,
-    ) -> Result<StateDatabaseKind, StateInitError> {
-        let preferred = if self.new_database_skips_transparent_indexes() {
-            StateDatabaseKind::WithoutTransparentIndexes
-        } else {
-            StateDatabaseKind::Indexed
-        };
-
-        if self.ephemeral {
-            return Ok(preferred);
-        }
-
-        let major_version = state_database_format_version_in_code().major;
-        let indexed_exists =
-            self.state_database_exists(StateDatabaseKind::Indexed, major_version, network);
-        let without_indexes_exists = self.state_database_exists(
-            StateDatabaseKind::WithoutTransparentIndexes,
-            major_version,
-            network,
-        );
-
-        match (indexed_exists, without_indexes_exists) {
-            (true, true) => Err(StateInitError::AmbiguousStateDatabases {
-                indexed: self.db_path(StateDatabaseKind::Indexed, major_version, network),
-                without_transparent_indexes: self.db_path(
-                    StateDatabaseKind::WithoutTransparentIndexes,
-                    major_version,
-                    network,
-                ),
-            }),
-            (false, true) if self.pruning_config().is_none() => {
-                Err(StateInitError::TransparentIndexesMissingInArchiveMode {
-                    path: self.db_path(
-                        StateDatabaseKind::WithoutTransparentIndexes,
-                        major_version,
-                        network,
-                    ),
-                })
-            }
-            (false, true) => Ok(StateDatabaseKind::WithoutTransparentIndexes),
-            (true, false) => {
-                if preferred == StateDatabaseKind::WithoutTransparentIndexes {
-                    info!(
-                        path = ?self.db_path(StateDatabaseKind::Indexed, major_version, network),
-                        "keeping the existing indexed state database: pruned checkpoint sync only \
-                         skips transparent address indexes in a fresh cache directory"
-                    );
-                }
-
-                Ok(StateDatabaseKind::Indexed)
-            }
-            (false, false) => Ok(preferred),
-        }
-    }
-
-    /// Returns `true` if a `db_kind` state database exists for `major_version` and `network`,
-    /// including a previous major version database that startup would reuse.
-    fn state_database_exists(
-        &self,
-        db_kind: StateDatabaseKind,
-        major_version: u64,
-        network: &Network,
-    ) -> bool {
-        if self.db_path(db_kind, major_version, network).exists() {
-            return true;
-        }
-
-        // `DiskDb::try_reusing_previous_db_after_major_upgrade` renames the previous major
-        // version directory into place, so that directory is this kind's existing database.
-        restorable_db_versions().contains(&major_version)
-            && major_version
-                .checked_sub(1)
-                .is_some_and(|previous| self.db_path(db_kind, previous, network).exists())
+        Some(self.cache_dir.join("non_finalized_state").join(net_dir))
     }
 
     /// Returns the path for the database format minor/patch version file,
@@ -471,66 +339,6 @@ impl Config {
     pub fn derive_historical_trees(&self, database_was_vct_fast_synced: bool) -> bool {
         self.pruning_config().is_none()
             && ((self.checkpoint_sync && self.vct_fast_sync) || database_was_vct_fast_synced)
-    }
-}
-
-/// The kind of finalized state database, which decides whether it builds transparent indexes.
-///
-/// Each kind lives in its own cache subdirectory, so a database that skipped transparent indexes
-/// can never be opened by code that expects them to be complete, including released Zakura
-/// versions that only know the [`StateDatabaseKind::Indexed`] directory.
-///
-/// See [`Config::state_database_kind`] for how a node picks its kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum StateDatabaseKind {
-    /// A database with complete transparent address balances, address UTXO and transaction
-    /// indexes, and (with the `indexer` feature) transparent spender indexes.
-    ///
-    /// Every database created before transparent index skipping existed is this kind.
-    Indexed,
-
-    /// A database that never builds finalized transparent address or spender indexes.
-    ///
-    /// It still stores every consensus-critical column family: the UTXO set, transaction
-    /// locations, nullifiers and shielded spender indexes, note commitment trees, the history
-    /// tree, and value pools. Queries that need the skipped indexes fail with
-    /// [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable).
-    WithoutTransparentIndexes,
-}
-
-impl StateDatabaseKind {
-    /// Every state database kind.
-    pub const ALL: [StateDatabaseKind; 2] = [
-        StateDatabaseKind::Indexed,
-        StateDatabaseKind::WithoutTransparentIndexes,
-    ];
-
-    /// Returns the cache subdirectory name for this kind.
-    pub fn dir_name(self) -> &'static str {
-        match self {
-            StateDatabaseKind::Indexed => STATE_DATABASE_KIND,
-            StateDatabaseKind::WithoutTransparentIndexes => {
-                STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND
-            }
-        }
-    }
-
-    /// Returns the kind whose cache subdirectory is `dir_name`, if any.
-    pub fn from_dir_name(dir_name: &str) -> Option<StateDatabaseKind> {
-        StateDatabaseKind::ALL
-            .into_iter()
-            .find(|kind| kind.dir_name() == dir_name)
-    }
-
-    /// Returns `true` if this kind builds transparent address and spender indexes.
-    pub fn builds_transparent_indexes(self) -> bool {
-        self == StateDatabaseKind::Indexed
-    }
-}
-
-impl AsRef<str> for StateDatabaseKind {
-    fn as_ref(&self) -> &str {
-        self.dir_name()
     }
 }
 
@@ -839,29 +647,17 @@ mod tests {
 // Cleaning up old database versions
 // TODO: put this in a different module?
 
-/// Spawns a task that checks if there are old state database folders of every
-/// [`StateDatabaseKind`], and deletes them from the filesystem.
+/// Spawns a task that checks if there are old state database folders,
+/// and deletes them from the filesystem.
 ///
 /// See `check_and_delete_old_databases()` for details.
 pub fn check_and_delete_old_state_databases(config: &Config, network: &Network) -> JoinHandle<()> {
-    let current_span = Span::current();
-    let config = config.clone();
-    let network = network.clone();
-    let major_version = state_database_format_version_in_code().major;
-
-    spawn_blocking(move || {
-        current_span.in_scope(|| {
-            for db_kind in StateDatabaseKind::ALL {
-                delete_old_databases(
-                    config.clone(),
-                    db_kind.dir_name().to_string(),
-                    major_version,
-                    &network,
-                );
-            }
-            info!("finished old state database version cleanup task");
-        })
-    })
+    check_and_delete_old_databases(
+        config,
+        STATE_DATABASE_KIND,
+        state_database_format_version_in_code().major,
+        network,
+    )
 }
 
 /// Spawns a task that checks if there are old database folders,
@@ -1038,15 +834,13 @@ fn parse_major_version(dir_name: &str) -> Option<u64> {
 // TODO: move these to the format upgrade module
 
 /// Returns the full semantic version of the on-disk state database, based on its config and network.
-///
-/// The database is the one [`Config::state_database_kind`] selects.
 pub fn state_database_format_version_on_disk(
     config: &Config,
     network: &Network,
 ) -> Result<Option<Version>, BoxError> {
     database_format_version_on_disk(
         config,
-        config.state_database_kind(network)?,
+        STATE_DATABASE_KIND,
         state_database_format_version_in_code().major,
         network,
     )
@@ -1148,7 +942,7 @@ pub(crate) mod hidden {
     ) -> Result<(), BoxError> {
         write_database_format_version_to_disk(
             config,
-            config.state_database_kind(network)?,
+            STATE_DATABASE_KIND,
             state_database_format_version_in_code().major,
             changed_version,
             network,

@@ -3514,9 +3514,7 @@ fn precious_block_preference_is_cleared_by_a_restart() {
         enable_zakura_header_seed_from_committed_blocks: true,
         ..Config::default()
     };
-    assert!(config
-        .non_finalized_state_backup_dir(crate::StateDatabaseKind::Indexed, &network)
-        .is_some());
+    assert!(config.non_finalized_state_backup_dir(&network).is_some());
     // The finalized tip is at the last checkpoint, so the restart restores the backup.
     let max_checkpoint_height = Height(1);
     // Each node run has its own runtime. Shutting a runtime down drops the state's background

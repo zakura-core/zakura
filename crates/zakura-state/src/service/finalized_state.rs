@@ -35,7 +35,7 @@ use zakura_db::{
 };
 
 use crate::{
-    constants::state_database_format_version_in_code,
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
     service::{check, queued_blocks::CheckpointCommit, QueuedCheckpointVerified},
@@ -405,13 +405,9 @@ impl FinalizedState {
             }
         }
 
-        // An existing database keeps its kind across configuration changes, so this decides
-        // whether to build transparent indexes from durable state for every existing cache.
-        let db_kind = config.state_database_kind(network)?;
-
         let db = ZakuraDb::new(
             config,
-            db_kind,
+            STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
             network,
             debug_skip_format_upgrades,
@@ -448,15 +444,6 @@ impl FinalizedState {
                  configure pruned storage mode (`storage_mode.pruned`), or delete the cache \
                  directory and re-sync from genesis"
             );
-        }
-
-        // A database that skipped transparent indexes can't serve archive address queries, and
-        // the skipped history can't be indexed in place. `Config::state_database_kind` already
-        // refuses its directory in archive mode; this also covers the durable marker.
-        if config.pruning_config().is_none() && new_state.db.skips_transparent_indexes() {
-            return Err(StateInitError::TransparentIndexesMissingInArchiveMode {
-                path: new_state.db.path().to_owned(),
-            });
         }
 
         // Interrupted VCT syncs below the checkpoint handoff need the VCT root

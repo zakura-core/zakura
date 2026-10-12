@@ -29,7 +29,7 @@ use zakura_chain::{
 
 use crate::{
     config::state_database_format_version_on_disk,
-    constants::state_database_format_version_in_code,
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::{
         finalized_state::{
             disk_db::{DiskWriteBatch, WriteDisk},
@@ -53,7 +53,7 @@ use crate::{
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
-    Config, SemanticallyVerifiedBlock, StateDatabaseKind, StateInitError,
+    Config, SemanticallyVerifiedBlock, StateInitError,
 };
 
 /// Options for rolling back the finalized state.
@@ -104,9 +104,9 @@ pub struct RollbackFinalizedStateSummary {
 /// Errors returned by finalized-state rollback.
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
-    /// The state database to roll back could not be selected for this configuration.
-    #[error("cannot select the state database to roll back: {0}")]
-    DatabaseKind(#[from] StateInitError),
+    /// The state database could not be opened for this configuration.
+    #[error("cannot open the state database to roll back: {0}")]
+    Database(#[from] StateInitError),
 
     /// The on-disk state database format does not match the running code.
     #[error(
@@ -268,10 +268,9 @@ pub fn preview_rollback_finalized_state(
     network: &Network,
     options: RollbackFinalizedStateOptions,
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
-    let db_kind = config.state_database_kind(network)?;
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, db_kind, network, true);
+    let db = open_rollback_db(&config, network, true)?;
     let bounds = validate_rollback(&db, &options)?;
 
     // A dry run only reports the plan, so it deliberately skips the genesis-to-target treestate
@@ -289,10 +288,9 @@ pub fn rollback_finalized_state(
     network: &Network,
     options: RollbackFinalizedStateOptions,
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
-    let db_kind = config.state_database_kind(network)?;
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, db_kind, network, false);
+    let db = open_rollback_db(&config, network, false)?;
     rollback_open_db(&db, network, options)
 }
 
@@ -306,7 +304,7 @@ fn rollback_open_db(
 
     let backup = if options.keep_rolled_back_blocks {
         let backup_dir = config
-            .non_finalized_state_backup_dir(db.state_database_kind(), network)
+            .non_finalized_state_backup_dir(network)
             .ok_or(RollbackFinalizedStateError::BackupDisabled)?;
 
         clear_backup_dir(&backup_dir)?;
@@ -320,9 +318,7 @@ fn rollback_open_db(
             block_count: prepared.removed_blocks.len(),
         })
     } else {
-        if let Some(backup_dir) =
-            config.non_finalized_state_backup_dir(db.state_database_kind(), network)
-        {
+        if let Some(backup_dir) = config.non_finalized_state_backup_dir(network) {
             clear_backup_dir(&backup_dir)?;
         }
 
@@ -373,13 +369,12 @@ fn check_format_version(
 
 fn open_rollback_db(
     config: &Config,
-    db_kind: StateDatabaseKind,
     network: &Network,
     read_only: bool,
-) -> ZakuraDb {
+) -> Result<ZakuraDb, StateInitError> {
     ZakuraDb::new(
         config,
-        db_kind,
+        STATE_DATABASE_KIND,
         &state_database_format_version_in_code(),
         network,
         // Skip format upgrades: `check_format_version` already confirmed the on-disk format matches
@@ -391,7 +386,7 @@ fn open_rollback_db(
             .iter()
             .map(ToString::to_string),
         read_only,
-    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
+    )
 }
 
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
@@ -498,10 +493,10 @@ fn prepare_rollback(
         .value_pools()
         .to_owned();
 
-    // Durable state decides whether the rolled-back blocks built transparent indexes, so a
-    // configuration change can't make rollback reverse index entries that were never written.
-    // The database stays marked as skipping them after the rollback.
-    let skip_transparent_indexes = db.skips_transparent_indexes();
+    // Only the durable marker proves that committed index updates are incomplete. Before the
+    // first skipped commit, rollback must still reverse the complete indexes, even if the
+    // current configuration would stop updating them on the next block. Keep any marker intact.
+    let skip_transparent_indexes = db.transparent_indexes_skipped_from().is_some();
 
     let mut batch = DiskWriteBatch::new();
     let mut address_balances = HashMap::new();
@@ -1227,7 +1222,7 @@ mod tests {
         let network = Network::Mainnet;
         ZakuraDb::new(
             &Config::ephemeral(),
-            StateDatabaseKind::Indexed,
+            STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
             &network,
             true,

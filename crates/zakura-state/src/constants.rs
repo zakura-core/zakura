@@ -29,17 +29,6 @@ pub const AWAIT_BLOCK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
 
-/// The directory name for state databases that never build transparent address indexes.
-///
-/// A pruned node that checkpoint-syncs into a fresh cache creates this kind of database. It keeps
-/// every consensus-critical column family, but omits finalized transparent address balances,
-/// address UTXO and transaction indexes, and transparent spender indexes.
-///
-/// Released Zakura versions only open [`STATE_DATABASE_KIND`] directories, so they can never open
-/// one of these databases and serve its missing indexes as if they were complete.
-pub const STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND: &str =
-    "state_without_transparent_indexes";
-
 /// The minimum retention window allowed in pruned storage mode.
 ///
 /// Pruned mode deletes historical raw transaction data at `tip - retention`. The
@@ -111,7 +100,7 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 29;
+const DATABASE_FORMAT_VERSION: u64 = 30;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -120,7 +109,7 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

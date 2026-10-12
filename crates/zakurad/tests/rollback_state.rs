@@ -9,10 +9,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
     transparent::OutPoint,
 };
-use zakura_state::{
-    state_database_format_version_in_code, CheckpointVerifiedBlock, Config, FinalizedState,
-    PruningConfig, StateDatabaseKind, StorageMode,
-};
+use zakura_state::{CheckpointVerifiedBlock, Config, FinalizedState, PruningConfig, StorageMode};
 use zakurad::commands::rollback_state::RollbackStateCmd;
 
 fn config(cache_dir: &Path, pruned: bool) -> Config {
@@ -88,14 +85,7 @@ fn assert_tip_and_utxos(cache_dir: &Path, pruned: bool, blocks: &[Arc<Block>], h
     let tip_index = usize::try_from(height).expect("fixture height fits usize");
     let state = FinalizedState::new(&config(cache_dir, pruned), &Network::Mainnet)
         .expect("fixture reopens");
-    assert_eq!(
-        state.db.state_database_kind(),
-        if pruned {
-            StateDatabaseKind::WithoutTransparentIndexes
-        } else {
-            StateDatabaseKind::Indexed
-        }
-    );
+    assert_eq!(state.db.skips_transparent_indexes(), pruned);
     assert_eq!(
         state.db.tip(),
         Some((Height(height), blocks[tip_index].hash()))
@@ -181,27 +171,4 @@ fn rollback_without_override_preserves_configured_pruned_storage() {
         )
         .expect("loaded pruned configuration permits rollback without a CLI override");
     assert_tip_and_utxos(dir.path(), true, &blocks, 1);
-}
-
-#[test]
-fn standalone_pruned_rollback_refuses_ambiguous_databases() {
-    let dir = tempfile::tempdir().expect("disposable directory exists");
-    let blocks = fixture(dir.path(), true);
-    let indexed = config(dir.path(), true).db_path(
-        StateDatabaseKind::Indexed,
-        state_database_format_version_in_code().major,
-        &Network::Mainnet,
-    );
-    std::fs::create_dir_all(&indexed).expect("conflicting database directory exists");
-    for args in [
-        vec!["--storage-mode", "pruned"],
-        vec!["--storage-mode", "pruned", "--dry-run"],
-    ] {
-        let result = rollback(dir.path(), &args);
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr)
-            .contains("found both an indexed state database"));
-    }
-    std::fs::remove_dir(&indexed).expect("empty conflicting directory can be removed");
-    assert_tip_and_utxos(dir.path(), true, &blocks, 2);
 }

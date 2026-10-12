@@ -131,12 +131,11 @@ impl ZakuraDb {
     /// Returns `true` if this database does not build finalized transparent address balances,
     /// address UTXO and transaction indexes, or transparent spender indexes.
     ///
-    /// This is decided by durable state, never by the running configuration: the database kind
-    /// (its cache subdirectory), or the marker written with the first skipped block. Once either
-    /// says the indexes are skipped, they stay skipped across restarts, configuration changes,
-    /// and rollbacks, because the history they would need was never indexed.
+    /// Pruned checkpoint sync stops updates in the existing database. The first skipped block
+    /// records this durably, so changing configuration or rolling back cannot resume writes
+    /// to incomplete indexes. Existing index rows are retained but must not be served.
     pub fn skips_transparent_indexes(&self) -> bool {
-        !self.state_database_kind().builds_transparent_indexes()
+        self.config().skips_transparent_indexes()
             || self.transparent_indexes_skipped_from().is_some()
     }
 

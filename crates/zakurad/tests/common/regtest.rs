@@ -29,7 +29,7 @@ use zakura_rpc::{
 };
 use zakura_state::{
     constants::{min_pruning_retention, MAX_BLOCK_REORG_HEIGHT},
-    PruningConfig, StateDatabaseKind, StorageMode, TransparentIndexesUnavailable,
+    PruningConfig, StorageMode, TransparentIndexesUnavailable,
 };
 use zakura_test::args;
 
@@ -109,7 +109,8 @@ const TRANSPARENT_INDEXES_UNAVAILABLE: &str =
 /// Mines and spends on a pruned, checkpoint-syncing Regtest node, which creates a state database
 /// without transparent address and spender indexes.
 ///
-/// The node generates block templates, validates each one as a proposal, and commits it with
+/// An indexed node first finalizes coinbase outputs, then restarts in pruned checkpoint mode
+/// using the existing database. The node generates block templates, validates each as a proposal, and commits it with
 /// `submitblock`. A mature coinbase output is spent through the mempool and mined, while a
 /// double-spend, an immature coinbase spend, and a missing input are rejected. Every block is
 /// above the Regtest checkpoint, so these commits are fully verified, and the spending blocks
@@ -138,10 +139,7 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     });
     // Restore every non-finalized block after the restart below.
     config.state.debug_skip_non_finalized_state_backup_task = true;
-    assert!(
-        config.consensus.checkpoint_sync,
-        "checkpoint sync is the default"
-    );
+    config.consensus.checkpoint_sync = false;
 
     let mut zakurad = testdir()?
         .with_config(&mut config)?
@@ -152,11 +150,46 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     zakurad.expect_stdout_line_matches("activating mempool")?;
     let client = RpcRequestClient::new(rpc_address);
 
-    // Mine until the height 1 coinbase is mature.
+    // Start with a complete indexed database and finalize at least the height 1 coinbase.
     let mut blocks = Vec::new();
-    for _ in 0..maturity {
+    for _ in 0..maturity + MAX_BLOCK_REORG_HEIGHT {
         blocks.push(client.mine_proposed_block(&net).await?);
     }
+
+    let indexed_tip = client.blockchain_info().await?.blocks();
+    zakurad.kill(false)?;
+    let mut output = zakurad.wait_with_output()?.assert_failure()?;
+    output.assert_was_killed()?;
+    let test_dir = output.dir.take().expect("the indexed database is kept");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let first_skipped_height;
+    {
+        let state = zakura_state::FinalizedState::new(&config.mirrored_state_config(), &net)?;
+        assert!(!state.db.skips_transparent_indexes());
+        assert!(
+            state.db.address_balance(&miner)?.is_some(),
+            "the existing database has address index rows"
+        );
+        first_skipped_height = (state
+            .db
+            .finalized_tip_height()
+            .expect("the indexed database has a finalized tip")
+            + 1)
+        .expect("the short test chain is below the maximum height");
+    }
+    config.consensus.checkpoint_sync = true;
+    let mut zakurad = test_dir
+        .replace_config(&mut config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
+    zakurad.expect_stdout_line_matches("activating mempool")?;
+    let client = RpcRequestClient::new(rpc_address);
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        indexed_tip,
+        "switching index writes off keeps the synced node and its backup"
+    );
 
     let first_coinbase = op_true_coinbase_output(&blocks[0], &miner)?;
     let first_spend = spend_op_true_output(first_coinbase.0, first_coinbase.1, &miner)?;
@@ -255,21 +288,18 @@ pub(crate) async fn pruned_checkpoint_sync_mining_without_transparent_indexes_te
     state_config.cache_dir = cache_dir;
     assert!(state_config
         .db_path(
-            StateDatabaseKind::WithoutTransparentIndexes,
+            zakura_state::constants::STATE_DATABASE_KIND,
             major_version,
             &net
         )
         .exists());
-    assert!(
-        !state_config
-            .db_path(StateDatabaseKind::Indexed, major_version, &net)
-            .exists(),
-        "released code's state directory was never created"
-    );
 
     let (_read_state, db, _sender) = zakura_state::init_read_only(state_config, &net)?;
     assert!(db.skips_transparent_indexes());
-    assert_eq!(db.transparent_indexes_skipped_from(), Some(Height(0)));
+    assert_eq!(
+        db.transparent_indexes_skipped_from(),
+        Some(first_skipped_height)
+    );
     assert!(db
         .finalized_tip_height()
         .is_some_and(|height| height.0 + MAX_BLOCK_REORG_HEIGHT >= final_tip.0));

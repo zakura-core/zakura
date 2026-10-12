@@ -1,10 +1,7 @@
-//! Tests for state databases that skip transparent address and spender indexes.
+//! Tests for stopping optional transparent index writes in the existing state database.
 //!
-//! A pruned node that checkpoint-syncs into a fresh cache creates a
-//! [`StateDatabaseKind::WithoutTransparentIndexes`] database. These tests check that it keeps the
-//! same consensus state as an indexed database, that the choice is sticky across restarts and
-//! configuration changes, that queries needing the skipped indexes fail instead of returning
-//! partial answers, and that released code, which only knows the indexed directory, can't open it.
+//! Pruned checkpoint sync keeps consensus state, stops index updates in place, and rejects
+//! stale address queries. A durable marker preserves this across restarts and rollback.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -26,11 +23,8 @@ use zakura_chain::{
 };
 
 use crate::{
-    config::{check_and_delete_old_databases, Config, PruningConfig, StorageMode},
-    constants::{
-        state_database_format_version_in_code, STATE_DATABASE_KIND,
-        STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND,
-    },
+    config::{Config, PruningConfig, StorageMode},
+    constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     init_read_only,
     request::{FinalizableBlock, Treestate},
     rollback_finalized_state,
@@ -45,7 +39,7 @@ use crate::{
         non_finalized_state::CreatedUtxos,
     },
     ContextuallyVerifiedBlock, ReadRequest, ReadResponse, RollbackFinalizedStateError,
-    RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateDatabaseKind, StateInitError,
+    RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateInitError,
     TransparentIndexesUnavailable, ValidateContextError,
 };
 
@@ -86,14 +80,6 @@ fn config_at(dir: &Path, node: NodeConfig) -> Config {
         checkpoint_sync,
         ..Config::default()
     }
-}
-
-fn db_dir(dir: &Path, kind: StateDatabaseKind, network: &Network) -> std::path::PathBuf {
-    config_at(dir, NodeConfig::PrunedCheckpoint).db_path(
-        kind,
-        state_database_format_version_in_code().major,
-        network,
-    )
 }
 
 fn amount(zatoshis: i64) -> Amount<NonNegative> {
@@ -363,155 +349,20 @@ fn spend_check_results(db: &ZakuraDb, chain: &TestChain) -> Vec<String> {
 }
 
 #[test]
-fn new_database_kind_follows_pruned_checkpoint_sync() {
+fn index_writes_follow_pruned_checkpoint_sync_configuration() {
     let dir = TempDir::new().expect("temp dir");
-
     for (node, skips) in [
         (NodeConfig::PrunedCheckpoint, true),
         (NodeConfig::PrunedFullVerification, false),
         (NodeConfig::Archive, false),
     ] {
         let config = config_at(dir.path(), node);
+        assert_eq!(config.skips_transparent_indexes(), skips, "{node:?}");
         assert_eq!(
-            config.new_database_skips_transparent_indexes(),
-            skips,
-            "{node:?}"
-        );
-        assert_eq!(
-            config.state_database_kind(&Network::Mainnet).ok(),
-            Some(if skips {
-                StateDatabaseKind::WithoutTransparentIndexes
-            } else {
-                StateDatabaseKind::Indexed
-            }),
-            "{node:?} picks the configured kind for an empty cache"
+            config.non_finalized_state_backup_dir(&Network::Mainnet),
+            Some(dir.path().join("non_finalized_state").join("mainnet"))
         );
     }
-
-    let ephemeral = Config {
-        storage_mode: StorageMode::Pruned(PruningConfig::default()),
-        ..Config::ephemeral()
-    };
-    assert_eq!(
-        ephemeral.state_database_kind(&Network::Mainnet).ok(),
-        Some(StateDatabaseKind::WithoutTransparentIndexes)
-    );
-    assert_eq!(
-        Config::ephemeral()
-            .state_database_kind(&Network::Mainnet)
-            .ok(),
-        Some(StateDatabaseKind::Indexed)
-    );
-}
-
-#[test]
-fn existing_database_kind_is_sticky_across_config_changes() {
-    let network = Network::Mainnet;
-    let major = state_database_format_version_in_code().major;
-
-    // An existing indexed database wins over every configuration, including pruned checkpoint
-    // sync, and is never replaced by a new database.
-    let indexed = TempDir::new().expect("temp dir");
-    std::fs::create_dir_all(db_dir(indexed.path(), StateDatabaseKind::Indexed, &network))
-        .expect("create indexed database directory");
-    for node in [
-        NodeConfig::PrunedCheckpoint,
-        NodeConfig::PrunedFullVerification,
-        NodeConfig::Archive,
-    ] {
-        assert_eq!(
-            config_at(indexed.path(), node)
-                .state_database_kind(&network)
-                .ok(),
-            Some(StateDatabaseKind::Indexed),
-            "{node:?} keeps the existing indexed database"
-        );
-    }
-
-    // A previous major version directory that startup would reuse is also an existing database.
-    if crate::service::finalized_state::restorable_db_versions().contains(&major) {
-        let previous = TempDir::new().expect("temp dir");
-        std::fs::create_dir_all(
-            config_at(previous.path(), NodeConfig::PrunedCheckpoint).db_path(
-                StateDatabaseKind::Indexed,
-                major - 1,
-                &network,
-            ),
-        )
-        .expect("create previous major database directory");
-        assert_eq!(
-            config_at(previous.path(), NodeConfig::PrunedCheckpoint)
-                .state_database_kind(&network)
-                .ok(),
-            Some(StateDatabaseKind::Indexed),
-            "a reusable previous major indexed database is kept"
-        );
-    }
-
-    // An existing database without indexes stays that way when checkpoint sync is disabled, and
-    // archive mode is refused.
-    let skipped = TempDir::new().expect("temp dir");
-    let skipped_path = db_dir(
-        skipped.path(),
-        StateDatabaseKind::WithoutTransparentIndexes,
-        &network,
-    );
-    std::fs::create_dir_all(&skipped_path).expect("create database directory");
-    for node in [
-        NodeConfig::PrunedCheckpoint,
-        NodeConfig::PrunedFullVerification,
-    ] {
-        assert_eq!(
-            config_at(skipped.path(), node)
-                .state_database_kind(&network)
-                .ok(),
-            Some(StateDatabaseKind::WithoutTransparentIndexes),
-            "{node:?} keeps skipping transparent indexes"
-        );
-    }
-    assert!(matches!(
-        config_at(skipped.path(), NodeConfig::Archive).state_database_kind(&network),
-        Err(StateInitError::TransparentIndexesMissingInArchiveMode { path }) if path == skipped_path
-    ));
-
-    // Both kinds at once is ambiguous, whatever the configuration prefers.
-    std::fs::create_dir_all(db_dir(skipped.path(), StateDatabaseKind::Indexed, &network))
-        .expect("create indexed database directory");
-    for node in [
-        NodeConfig::PrunedCheckpoint,
-        NodeConfig::PrunedFullVerification,
-        NodeConfig::Archive,
-    ] {
-        assert!(
-            matches!(
-                config_at(skipped.path(), node).state_database_kind(&network),
-                Err(StateInitError::AmbiguousStateDatabases { .. })
-            ),
-            "{node:?} refuses parallel databases"
-        );
-    }
-}
-
-#[test]
-fn backup_directories_are_isolated_by_database_kind() {
-    let dir = TempDir::new().expect("temp dir");
-    let config = config_at(dir.path(), NodeConfig::PrunedCheckpoint);
-    let network = Network::Mainnet;
-
-    let indexed = config
-        .non_finalized_state_backup_dir(StateDatabaseKind::Indexed, &network)
-        .expect("backups are enabled");
-    let skipped = config
-        .non_finalized_state_backup_dir(StateDatabaseKind::WithoutTransparentIndexes, &network)
-        .expect("backups are enabled");
-
-    assert_eq!(
-        indexed,
-        dir.path().join("non_finalized_state").join("mainnet"),
-        "the indexed backup directory keeps the released path"
-    );
-    assert_ne!(indexed, skipped);
-    assert!(!skipped.starts_with(&indexed) && !indexed.starts_with(&skipped));
 }
 
 /// The database without transparent indexes stores exactly the same consensus state as an
@@ -531,11 +382,8 @@ fn skipped_and_indexed_databases_keep_identical_validation_state() {
     {
         let mut skipped = open(&skipped_config, &network);
         let mut indexed = open(&indexed_config, &network);
-        assert_eq!(
-            skipped.db.state_database_kind(),
-            StateDatabaseKind::WithoutTransparentIndexes
-        );
-        assert_eq!(indexed.db.state_database_kind(), StateDatabaseKind::Indexed);
+        assert!(skipped.db.skips_transparent_indexes());
+        assert!(!indexed.db.skips_transparent_indexes());
 
         commit_checkpoint(&mut skipped, &chain.blocks);
         commit_checkpoint(&mut indexed, &chain.blocks);
@@ -573,14 +421,13 @@ fn skipped_and_indexed_databases_keep_identical_validation_state() {
         ],
     );
     let restarted_config = config_at(skipped_dir.path(), NodeConfig::PrunedFullVerification);
-    assert!(!restarted_config.new_database_skips_transparent_indexes());
+    assert!(!restarted_config.skips_transparent_indexes());
 
     let mut skipped = open(&restarted_config, &network);
     let mut indexed = open(&indexed_config, &network);
-    assert_eq!(
-        skipped.db.state_database_kind(),
-        StateDatabaseKind::WithoutTransparentIndexes,
-        "restarting with checkpoint sync disabled keeps the database kind"
+    assert!(
+        skipped.db.skips_transparent_indexes(),
+        "restarting with checkpoint sync disabled keeps index writes disabled"
     );
 
     commit_contextual(&mut skipped, next.clone());
@@ -641,63 +488,132 @@ fn transparent_index_marker_precedes_raw_transaction_pruning() {
     assert_eq!(transparent_index_entry_count(&state.db), 0);
 }
 
-/// An indexed pruned database created before index skipping keeps building and serving its
-/// transparent indexes when pruned checkpoint sync is configured.
+/// An existing indexed database keeps its chain state but stops optional index writes in place.
 #[test]
-fn legacy_indexed_pruned_database_stays_indexed() {
+fn existing_indexed_database_stops_index_writes_in_place() {
     let _init_guard = zakura_test::init();
     let chain = test_chain();
-    let network = chain.network.clone();
     let dir = TempDir::new().expect("temp dir");
-
+    let initial_config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
+    let indexes_before;
+    let path_before;
     {
-        let mut state = open(
-            &config_at(dir.path(), NodeConfig::PrunedFullVerification),
-            &network,
-        );
+        let mut state = open(&initial_config, &chain.network);
         commit_checkpoint(&mut state, &chain.blocks[..3]);
+        path_before = state.db.path().to_owned();
+        indexes_before = TRANSPARENT_INDEX_COLUMN_FAMILIES
+            .map(|cf| state.db.raw_column_family_entries_for_test(cf));
+        assert!(transparent_index_entry_count(&state.db) > 0);
+        assert_eq!(state.db.transparent_indexes_skipped_from(), None);
     }
 
-    let mut state = open(
-        &config_at(dir.path(), NodeConfig::PrunedCheckpoint),
-        &network,
-    );
-    assert_eq!(state.db.state_database_kind(), StateDatabaseKind::Indexed);
-    commit_checkpoint(&mut state, &chain.blocks[3..]);
+    let config = config_at(dir.path(), NodeConfig::PrunedCheckpoint);
+    {
+        let mut state = open(&config, &chain.network);
+        assert_eq!(state.db.path(), path_before);
+        assert_eq!(state.db.finalized_tip_height(), Some(Height(2)));
+        commit_checkpoint(&mut state, &chain.blocks[3..]);
+        assert!(state.db.skips_transparent_indexes());
+        assert_eq!(state.db.transparent_indexes_skipped_from(), Some(Height(3)));
+        assert_eq!(
+            TRANSPARENT_INDEX_COLUMN_FAMILIES
+                .map(|cf| { state.db.raw_column_family_entries_for_test(cf) }),
+            indexes_before,
+            "existing index rows are retained without further writes"
+        );
+        assert!(state.db.address_balance(&chain.other).is_err());
+        assert!(state.db.address_utxos(&chain.other).is_err());
+        assert!(state
+            .db
+            .address_tx_ids(&chain.other, Height(0)..=Height(3))
+            .is_err());
+        assert!(state.db.utxo(&chain.unspent_output).is_some());
+        assert_eq!(state.db.finalized_tip_height(), Some(Height(3)));
+    }
 
-    assert!(!state.db.skips_transparent_indexes());
-    assert_eq!(state.db.transparent_indexes_skipped_from(), None);
+    // Disabling checkpoint sync must not resume updates to incomplete indexes.
+    let state = open(&initial_config, &chain.network);
+    assert!(state.db.skips_transparent_indexes());
+    assert_eq!(state.db.transparent_indexes_skipped_from(), Some(Height(3)));
+    assert_eq!(
+        TRANSPARENT_INDEX_COLUMN_FAMILIES
+            .map(|cf| { state.db.raw_column_family_entries_for_test(cf) }),
+        indexes_before
+    );
+    drop(state);
+    rollback_finalized_state(
+        initial_config.clone(),
+        &chain.network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("retained block bodies permit rollback");
+    let mut state = open(&initial_config, &chain.network);
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(1)));
+    assert_eq!(
+        state.db.transparent_indexes_skipped_from(),
+        Some(Height(3)),
+        "rolling back before the first skipped height preserves the marker"
+    );
+    assert_eq!(
+        TRANSPARENT_INDEX_COLUMN_FAMILIES.map(|cf| state.db.raw_column_family_entries_for_test(cf)),
+        indexes_before
+    );
     assert!(
-        !db_dir(
-            dir.path(),
-            StateDatabaseKind::WithoutTransparentIndexes,
-            &network
-        )
-        .exists(),
-        "no parallel database is created"
+        state.db.utxo(&chain.spent_coinbase).is_some(),
+        "rollback restores the spent canonical output"
     );
+    commit_checkpoint(&mut state, &chain.blocks[2..3]);
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(2)));
+    assert_eq!(
+        TRANSPARENT_INDEX_COLUMN_FAMILIES.map(|cf| state.db.raw_column_family_entries_for_test(cf)),
+        indexes_before
+    );
+    assert!(state.db.address_balance(&chain.other).is_err());
+}
 
-    let (balance, received) = state
-        .db
-        .address_balance(&chain.other)
-        .expect("indexed databases answer balance queries")
-        .expect("the address received funds");
-    assert_eq!(balance, amount(1_000 + 20_000));
-    assert_eq!(received, 1_000 + 40_000 + 20_000);
+/// A rollback before any skipped commit must still reverse complete index rows.
+#[test]
+fn indexed_rollback_before_first_skipped_commit_keeps_indexes_complete() {
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let indexed_config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
+    {
+        let mut state = open(&indexed_config, &chain.network);
+        commit_checkpoint(&mut state, &chain.blocks);
+        assert_eq!(state.db.transparent_indexes_skipped_from(), None);
+    }
+    rollback_finalized_state(
+        config_at(dir.path(), NodeConfig::PrunedCheckpoint),
+        &chain.network,
+        RollbackFinalizedStateOptions {
+            target_height: Height(1),
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: None,
+        },
+    )
+    .expect("complete indexes can be rolled back");
+    let state = open(&indexed_config, &chain.network);
+    assert_eq!(state.db.transparent_indexes_skipped_from(), None);
+    assert!(!state.db.skips_transparent_indexes());
     assert_eq!(
         state
             .db
-            .address_utxos(&chain.other)
-            .expect("indexed databases answer UTXO queries")
-            .len(),
-        2,
-        "the height 2 coinbase and the height 3 spend output are unspent"
+            .address_balance(&chain.address)
+            .expect("indexes remain complete")
+            .map(|(balance, _)| balance),
+        Some(amount(50_000))
     );
-    assert!(!state
+    assert!(state
         .db
-        .address_tx_ids(&chain.other, Height(0)..=Height(3))
-        .expect("indexed databases answer transaction queries")
+        .address_utxos(&chain.other)
+        .expect("indexes remain complete")
         .is_empty());
+    assert!(state.db.utxo(&chain.spent_coinbase).is_some());
 }
 
 /// Every transparent address and spender query fails on a database without transparent indexes,
@@ -892,8 +808,7 @@ async fn transparent_queries_fail_even_with_stale_index_entries() {
     }
 }
 
-/// A database without transparent indexes can't be reopened in archive mode, from its own
-/// directory or, if its marker appears in an indexed directory, from there.
+/// A database with incomplete transparent indexes can't be reopened in archive mode.
 #[test]
 fn skipped_database_is_refused_in_archive_mode() {
     let _init_guard = zakura_test::init();
@@ -938,77 +853,157 @@ fn skipped_database_is_refused_in_archive_mode() {
     assert_eq!(state.db.finalized_tip_height(), Some(Height(3)));
 }
 
-/// Released code opens only the `state` directory, through exactly this `ZakuraDb::new` call.
-/// It can never see a database without transparent indexes: it creates an empty database of its
-/// own, and its old-version cleanup never touches the other directory.
-#[tokio::test(flavor = "multi_thread")]
-async fn released_open_path_never_reuses_a_skipped_database() {
+/// The existing major-format upgrade preserves indexed chain state before writes stop.
+#[test]
+fn indexed_database_upgrades_in_place_before_index_updates_stop() {
     let _init_guard = zakura_test::init();
     let chain = test_chain();
-    let network = chain.network.clone();
     let dir = TempDir::new().expect("temp dir");
-    let config = config_at(dir.path(), NodeConfig::PrunedCheckpoint);
-
+    let initial_config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
+    let current_version = state_database_format_version_in_code();
+    let previous_version = semver::Version::new(29, 1, 0);
+    let current_path =
+        initial_config.db_path(STATE_DATABASE_KIND, current_version.major, &chain.network);
+    let previous_path =
+        initial_config.db_path(STATE_DATABASE_KIND, previous_version.major, &chain.network);
+    let consensus_before;
+    let indexes_before;
     {
-        let mut state = open(&config, &network);
-        commit_checkpoint(&mut state, &chain.blocks);
-    }
-    let skipped_path = db_dir(
-        dir.path(),
-        StateDatabaseKind::WithoutTransparentIndexes,
-        &network,
-    );
-    assert!(skipped_path.exists());
-    assert!(
-        !db_dir(dir.path(), StateDatabaseKind::Indexed, &network).exists(),
-        "the skipped database is not stored where released code looks"
-    );
-
-    // Released `FinalizedState::new` opened the database like this, with no kind selection.
-    {
-        let released = ZakuraDb::new(
-            &config,
+        let mut state = open(&initial_config, &chain.network);
+        commit_checkpoint(&mut state, &chain.blocks[..3]);
+        consensus_before = consensus_column_families(&state.db);
+        indexes_before = TRANSPARENT_INDEX_COLUMN_FAMILIES
+            .map(|cf| state.db.raw_column_family_entries_for_test(cf));
+        // These column families have unchanged encodings in the prior format. Recreate its
+        // version metadata and directory to exercise the real cache-reuse and upgrade path.
+        crate::write_database_format_version_to_disk(
+            &initial_config,
             STATE_DATABASE_KIND,
-            &state_database_format_version_in_code(),
-            &network,
-            false,
-            STATE_COLUMN_FAMILIES_IN_CODE
-                .iter()
-                .map(ToString::to_string),
-            false,
+            current_version.major,
+            &previous_version,
+            &chain.network,
         )
-        .expect("released code opens its own directory");
-        assert!(released.is_empty(), "released code starts a fresh database");
-        assert_ne!(released.path(), skipped_path.as_path());
-        assert!(!released.skips_transparent_indexes());
+        .expect("fixture version is written");
     }
-
-    // Released cleanup only scans the `state` directory.
-    check_and_delete_old_databases(
-        &config,
-        STATE_DATABASE_KIND,
-        state_database_format_version_in_code().major,
-        &network,
+    std::fs::create_dir_all(
+        previous_path
+            .parent()
+            .expect("version directory has a parent"),
     )
-    .await
-    .expect("cleanup task does not panic");
-    assert!(skipped_path.exists());
-    assert_ne!(
+    .expect("previous version directory exists");
+    std::fs::rename(&current_path, &previous_path)
+        .expect("fixture moves to the previous version path");
+    let config = config_at(dir.path(), NodeConfig::PrunedCheckpoint);
+    {
+        let mut state = open(&config, &chain.network);
+        assert!(
+            !previous_path.exists(),
+            "the existing database was moved, not copied or resynced"
+        );
+        assert_eq!(state.db.path(), current_path);
+        assert_eq!(
+            state
+                .db
+                .format_version_on_disk()
+                .expect("version is readable"),
+            Some(current_version.clone())
+        );
+        assert_eq!(consensus_column_families(&state.db), consensus_before);
+        assert_eq!(
+            TRANSPARENT_INDEX_COLUMN_FAMILIES
+                .map(|cf| state.db.raw_column_family_entries_for_test(cf)),
+            indexes_before
+        );
+        assert_eq!(state.db.transparent_indexes_skipped_from(), None);
+        commit_checkpoint(&mut state, &chain.blocks[3..]);
+        assert_eq!(state.db.transparent_indexes_skipped_from(), Some(Height(3)));
+        assert_eq!(
+            TRANSPARENT_INDEX_COLUMN_FAMILIES
+                .map(|cf| state.db.raw_column_family_entries_for_test(cf)),
+            indexes_before
+        );
+        assert_eq!(state.db.finalized_tip_height(), Some(Height(3)));
+    }
+    // A binary opening through the released format's normal path cannot see stale rows.
+    let released = ZakuraDb::new(
+        &initial_config,
         STATE_DATABASE_KIND,
-        STATE_WITHOUT_TRANSPARENT_INDEXES_DATABASE_KIND
+        &previous_version,
+        &chain.network,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        true,
     );
-
-    // The skipped database is untouched, but the cache now holds both kinds, so new code refuses
-    // to guess which one to open.
     assert!(matches!(
-        FinalizedState::new(&config, &network),
-        Err(StateInitError::AmbiguousStateDatabases { .. })
+        released,
+        Err(StateInitError::ReadOnlyDatabaseNotFound { .. })
     ));
-    std::fs::remove_dir_all(db_dir(dir.path(), StateDatabaseKind::Indexed, &network))
-        .expect("remove the released database");
-    let state = open(&config, &network);
+    let state = open(&config, &chain.network);
     assert_eq!(state.db.finalized_tip_height(), Some(Height(3)));
     assert!(state.db.skips_transparent_indexes());
+}
+
+/// Skipping a release can reuse a cache only through explicitly reusable major upgrades.
+#[test]
+fn cache_reuse_requires_every_intermediate_major_upgrade() {
+    use crate::service::finalized_state::disk_db::DiskDb;
+
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let dir = TempDir::new().expect("temp dir");
+    let config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
+    let current = state_database_format_version_in_code();
+    let previous = semver::Version::new(28, 2, 0);
+    let current_path = config.db_path(STATE_DATABASE_KIND, current.major, &chain.network);
+    let previous_path = config.db_path(STATE_DATABASE_KIND, previous.major, &chain.network);
+    {
+        let mut state = open(&config, &chain.network);
+        commit_checkpoint(&mut state, &chain.blocks[..3]);
+        crate::write_database_format_version_to_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            current.major,
+            &previous,
+            &chain.network,
+        )
+        .expect("fixture version is written");
+    }
+    std::fs::create_dir_all(
+        previous_path
+            .parent()
+            .expect("version directory has a parent"),
+    )
+    .expect("older version parent exists");
+    std::fs::rename(&current_path, &previous_path)
+        .expect("fixture moves to the older version directory");
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[30],
+            &current,
+            &config,
+            STATE_DATABASE_KIND,
+            &chain.network
+        ),
+        None,
+        "an unsupported intermediate major upgrade prevents reuse"
+    );
+    assert!(previous_path.exists());
+    assert!(!current_path.exists());
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[29, 30],
+            &current,
+            &config,
+            STATE_DATABASE_KIND,
+            &chain.network
+        ),
+        Some(previous),
+        "all intermediate upgrades explicitly permit cache reuse"
+    );
+    assert!(!previous_path.exists());
+    assert!(current_path.exists());
 }
 
 /// Offline rollback reverses the canonical UTXO set of a database without transparent indexes,

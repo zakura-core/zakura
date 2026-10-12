@@ -937,8 +937,8 @@ impl ZakuraDb {
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
 
-        // Durable state, not the running config, decides whether this database builds
-        // transparent address and spender indexes. See `ZakuraDb::skips_transparent_indexes`.
+        // Pruned checkpoint sync stops optional index writes in place. A durable marker
+        // keeps them disabled after configuration changes or rollback.
         let skip_transparent_indexes = self.skips_transparent_indexes();
 
         // Get the current address balances, before the transactions in this block

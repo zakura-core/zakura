@@ -25,7 +25,7 @@ use crate::{
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
     },
-    write_database_format_version_to_disk, BoxError, Config, StateDatabaseKind, StateInitError,
+    write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
 
 use super::disk_format::upgrade::restorable_db_versions;
@@ -215,6 +215,14 @@ impl ZakuraDb {
             db: disk_db,
         };
 
+        // Reject stale address-query state before any upgrade can modify it. This also
+        // applies to read-only and offline utility opens, which skip format upgrades.
+        if config.pruning_config().is_none() && db.transparent_indexes_skipped_from().is_some() {
+            return Err(StateInitError::TransparentIndexesMissingInArchiveMode {
+                path: db.path().to_owned(),
+            });
+        }
+
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers, so an
         // affected database silently rejects JoinSplits that spend a historical Sprout anchor.
         // The repair that used to fix this in place has been removed, so such a database can no
@@ -293,12 +301,6 @@ impl ZakuraDb {
     /// Returns the configured database kind for this database.
     pub fn db_kind(&self) -> String {
         self.db.db_kind()
-    }
-
-    /// Returns the [`StateDatabaseKind`] of this state database.
-    pub fn state_database_kind(&self) -> StateDatabaseKind {
-        StateDatabaseKind::from_dir_name(&self.db_kind())
-            .expect("state databases are only opened with a StateDatabaseKind directory name")
     }
 
     /// Returns the format version of the running code that created this `ZakuraDb` instance in memory.

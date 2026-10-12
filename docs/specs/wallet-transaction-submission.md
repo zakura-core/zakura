@@ -56,6 +56,7 @@ identifiers, and partially signed transactions are not request fields.
 
 Main uses capability bits 0, 2, 3, and 5, and retired bits 1 and 4. Main uses
 stream kinds 2 through 6. Draft zakura#961 uses bit 6 and stream kind 8.
+Regulated block sync reserves bit 8 for version 3 of stream kind 6.
 Implementation MUST register these values centrally and recheck open
 allocations before merge. Retired values MUST NOT be reused.
 

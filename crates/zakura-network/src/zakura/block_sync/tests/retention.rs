@@ -14,12 +14,18 @@ impl RetentionHarness {
     }
 
     fn with_refresh_interval(retained: u32, status_refresh_interval: Duration) -> Self {
+        Self::from_startup(
+            retained,
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig {
+                status_refresh_interval,
+                ..ZakuraBlockSyncConfig::default()
+            }),
+        )
+    }
+
+    fn from_startup(retained: u32, mut startup: BlockSyncStartup) -> Self {
         let blocks = mainnet_blocks_1_to_3();
-        let config = ZakuraBlockSyncConfig {
-            status_refresh_interval,
-            ..ZakuraBlockSyncConfig::default()
-        };
-        let mut startup = BlockSyncStartup::inert(config.clone());
+        let config = startup.config.clone();
         startup.frontiers = BlockSyncFrontiers {
             finalized_height: block::Height(3),
             verified_block_tip: block::Height(3),
@@ -334,23 +340,64 @@ async fn retention_retries_latest_status_only_for_peer_with_full_outbound_queue(
 }
 
 #[tokio::test]
-async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_queue_pressure() {
-    let harness = RetentionHarness::with_refresh_interval(1, Duration::from_secs(30));
+async fn regulated_retention_coalesces_corrections_at_the_status_deadline() {
+    use crate::zakura::{BlockRangeRead, BlockRangeReadResult, BlockRangeSource};
+
+    #[derive(Debug)]
+    struct StatusOnlySource;
+
+    impl BlockRangeSource for StatusOnlySource {
+        fn read(
+            &self,
+            _request: BlockRangeRead,
+        ) -> futures::future::BoxFuture<'static, Result<BlockRangeReadResult, crate::BoxError>>
+        {
+            panic!("Status delivery must not read blocks")
+        }
+    }
+
+    let startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+        .with_range_source(Arc::new(StatusOnlySource));
+    let harness = RetentionHarness::from_startup(1, startup);
+    let resources = harness
+        .service
+        .reserve_session(ServicePeerDirection::Outbound)
+        .unwrap()
+        .unwrap();
+    resources.admitted();
     let (inbound, receiver) = framed_channel(16);
-    let (sender, mut outbound) = framed_channel(1);
-    harness.service.add_peer(Peer::new_with_direction(
+    let (sender, mut outbound) = framed_channel(2);
+    let connected_at = time::Instant::now();
+    harness.service.add_peer(Peer::new_with_service_streams(
+        0,
         peer(0xeb),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
-        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (receiver, sender.clone()))]),
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            crate::zakura::transport::ServiceStream::new(
+                0,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                receiver,
+                sender.with_session_resources(Some(resources)),
+                CancellationToken::new(),
+            ),
+        )]),
         CancellationToken::new(),
+        crate::zakura::CloseCause::default(),
     ));
     let initial = wait_for_outbound_status(&mut outbound).await;
-    send_inbound(&inbound, BlockSyncMessage::Status(status())).await;
-    wait_for_outbound_status(&mut outbound).await;
-    let (_, _healthy_inbound, mut healthy_outbound, _) = harness.connect(0xec).await;
-    wait_for_outbound_status(&mut healthy_outbound).await;
+    assert_eq!(initial.servable_low, block::Height(1));
+    send_inbound(
+        &inbound,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(0),
+            servable_high: block::Height(0),
+            ..initial
+        }),
+    )
+    .await;
 
     harness
         .handle
@@ -361,41 +408,36 @@ async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_q
         }))
         .await
         .expect("tip growth queues");
-    assert_eq!(
-        wait_for_outbound_status(&mut outbound).await.servable_high,
-        block::Height(4)
-    );
-    wait_for_outbound_status(&mut healthy_outbound).await;
-    sender
-        .try_send(
-            BlockSyncMessage::Status(initial)
-                .encode_frame()
-                .expect("filler encodes"),
-        )
-        .expect("one peer's queue fills");
-
     let retained = harness.retained.as_ref().expect("publisher exists");
     retained.send(block::Height(2)).expect("reactor subscribes");
-    time::timeout(
-        Duration::from_millis(500),
-        status_with_low(&mut healthy_outbound, 2),
-    )
+    await_until("first correction", Duration::from_secs(1), || {
+        harness.handle.local_status().servable_low == block::Height(2)
+    })
     .await
-    .expect("pruning must not wait for the consumed 30-second growth allowance");
-
+    .unwrap();
     retained.send(block::Height(3)).expect("reactor subscribes");
-    await_until("latest local floor", Duration::from_secs(1), || {
+    await_until("latest correction", Duration::from_secs(1), || {
         harness.handle.local_status().servable_low == block::Height(3)
     })
     .await
-    .expect("local status tracks the current range even while a peer's queue is full");
-    assert_eq!(wait_for_outbound_status(&mut outbound).await, initial);
-    let latest = time::timeout(
-        Duration::from_millis(500),
-        status_with_low(&mut outbound, 3),
-    )
-    .await
-    .expect("the drained queue retries the latest range without another prune or tip event");
+    .unwrap();
+
+    // The reactor uses wall time, so exercise the real connection deadline.
+    assert!(
+        time::timeout_at(connected_at + Duration::from_secs(29), outbound.recv())
+            .await
+            .is_err(),
+        "range corrections must obey the shared Status cadence"
+    );
+    // Read directly so the helper's one-second timeout cannot race the cadence deadline.
+    let frame = time::timeout(Duration::from_secs(3), outbound.recv())
+        .await
+        .expect("the latest range is sent at the 30-second deadline")
+        .expect("the outbound stream stays open");
+    let BlockSyncMessage::Status(latest) = BlockSyncMessage::decode_frame(frame).unwrap() else {
+        panic!("the retained-range correction is a Status");
+    };
+    assert_eq!(latest.servable_low, block::Height(3));
     assert_eq!(latest.servable_high, block::Height(4));
     assert!(time::timeout(Duration::from_millis(150), outbound.recv())
         .await

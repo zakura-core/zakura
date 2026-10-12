@@ -118,7 +118,7 @@ impl PendingSessions {
             None => registry
                 .service_for_kind(kind)
                 .expect("a selected session has an owning service")
-                .reserve_session(direction),
+                .reserve_session_for_stream(layout.primary(), direction),
         }
     }
 

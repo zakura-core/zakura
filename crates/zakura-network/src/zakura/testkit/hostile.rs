@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tokio::sync::Mutex;
-use zakura_quic::{Conn as Connection, QuicEndpoint, RecvStream, SendStream, VarInt};
+use zakura_quic::{Conn as Connection, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
@@ -47,8 +47,25 @@ impl HostilePeer {
         seed: u64,
         capabilities: u64,
     ) -> Result<Self, BoxError> {
+        Self::connect_native_with_transport(
+            victim,
+            seed,
+            capabilities,
+            victim.limits().quic.clone(),
+        )
+        .await
+    }
+
+    /// Connect with explicit QUIC windows for transport backpressure tests.
+    pub(crate) async fn connect_native_with_transport(
+        victim: &ZakuraTestNode,
+        seed: u64,
+        capabilities: u64,
+        quic: QuicConfig,
+    ) -> Result<Self, BoxError> {
         let limits = victim.limits().clone();
         let endpoint = LocalEndpointFactory::with_limits(&limits)
+            .quic_config(quic)
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;

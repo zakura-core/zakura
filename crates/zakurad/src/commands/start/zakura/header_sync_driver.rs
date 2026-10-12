@@ -101,6 +101,9 @@ where
         .unwrap_or(empty_state_tip);
 
     Ok(ZakuraHeaderSyncDriverStartup {
+        block_range_source: Arc::new(super::block_range_source::StateBlockRangeSource::new(
+            read_state.clone(),
+        )),
         frontiers: FullStateFrontiers {
             finalized_height,
             verified_block_tip: verified_block_tip.0,

@@ -1,6 +1,9 @@
 //! Exact GetBlocks identity and ending checks around shared reservations.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use zakura_chain::block::{Hash, Height};
@@ -39,6 +42,7 @@ pub(super) enum ResponseError {
     Ending,
 }
 
+#[derive(Debug)]
 struct Pending {
     range: Range,
     // An exact-sized allocation avoids retaining a caller's excess Vec capacity.
@@ -46,6 +50,7 @@ struct Pending {
     received: usize,
     body_bytes: usize,
     max_body_bytes: u32,
+    retirement_started_at: Option<Instant>,
 }
 
 /// Each range owns one node pool entry and at most 128 expected hashes.
@@ -54,20 +59,93 @@ struct Pending {
 ///
 /// `next` has at most one entry per live range. It avoids an O(live requests)
 /// scan on every block without adding a generic index or allocation budget.
+#[derive(Debug)]
 pub(super) struct Requester {
     reservations: Reservations<Height>,
     ranges: BTreeMap<Height, Pending>,
     next: HashMap<Hash, Height>,
+    // Abandoned work and fully received ranges still waiting for an ending.
+    retiring: BTreeSet<(Instant, Height)>,
+    read_paused: Duration,
+    awaiting_end: usize,
+    capacity: usize,
 }
 
 impl Requester {
+    /// `capacity` is a local share of the node pool, independent of the peer's
+    /// advertisement. Abandoned and fully received ranges still consume it.
     pub(super) fn new(capacity: usize) -> Self {
         // The protocol ceiling of 32,768 fits usize on supported targets.
+        let capacity = capacity.min(MAX_BS_INFLIGHT_REQUESTS as usize);
         Self {
-            reservations: Reservations::new(RULES, capacity.min(MAX_BS_INFLIGHT_REQUESTS as usize)),
+            reservations: Reservations::new(RULES, capacity),
             ranges: BTreeMap::new(),
             next: HashMap::new(),
+            retiring: BTreeSet::new(),
+            read_paused: Duration::ZERO,
+            awaiting_end: 0,
+            capacity,
         }
+    }
+
+    /// Unreceived bodies from every live exchange share a supplier cooldown
+    /// after an incompatible header makes the whole connection unusable.
+    pub(super) fn unreceived_expected(&self) -> Vec<(Height, Hash)> {
+        self.ranges
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .expected
+                    .iter()
+                    .enumerate()
+                    .skip(pending.received)
+                    .map(|(offset, hash)| {
+                        // A validated range contains at most 128 heights without overflow.
+                        (Height(pending.range.start.0 + offset as u32), *hash)
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.reservations.len()
+    }
+
+    pub(super) fn at_capacity(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    /// Old abandoned work must not pin a height forever while other work advances.
+    pub(super) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
+        self.retiring
+            .first()
+            .map(|(at, _)| *at + grace + self.read_paused)
+    }
+
+    /// Local waits stop reading endings. Keep the timer in read-active time
+    /// without walking every pending request after each wait.
+    pub(super) fn credit_read_pause(&mut self, elapsed: Duration) {
+        self.read_paused += elapsed;
+    }
+
+    pub(super) fn endings_at_capacity(&self) -> bool {
+        self.awaiting_end >= self.capacity
+    }
+
+    /// An unended range also blocks a new request after a reorg. Arm cleanup
+    /// even if its old bodies all arrived, because the height is needed again.
+    pub(super) fn blocks_retry(&mut self, height: Height) -> bool {
+        let Some((start, pending)) = self.ranges.range_mut(..=height).next_back() else {
+            return false;
+        };
+        if u64::from(pending.range.start.0) + u64::from(pending.range.count) <= u64::from(height.0)
+        {
+            return false;
+        }
+        if let Some(at) = pending.retirement_started_at {
+            self.retiring.insert((at, *start));
+        }
+        true
     }
 
     /// Reserve before publishing the request. `expected` must come from the
@@ -121,6 +199,7 @@ impl Requester {
                 received: 0,
                 body_bytes: 0,
                 max_body_bytes,
+                retirement_started_at: None,
             },
         );
         Ok(writer)
@@ -135,7 +214,12 @@ impl Requester {
 
     /// A scheduler timeout changes local interest, never the peer's authority.
     pub(super) fn abandon(&mut self, start: Height) {
+        let now = tokio::time::Instant::now().into_std() - self.read_paused;
         self.reservations.abandon(&start);
+        if let Some(pending) = self.ranges.get_mut(&start) {
+            let at = *pending.retirement_started_at.get_or_insert(now);
+            self.retiring.insert((at, start));
+        }
     }
 
     /// Header-only gate for the transport, before allocating a frame payload.
@@ -152,6 +236,7 @@ impl Requester {
         hash: Hash,
         payload_len: usize,
     ) -> Result<(Height, Claimed), ResponseError> {
+        let now = tokio::time::Instant::now().into_std() - self.read_paused;
         let start = *self.next.get(&hash).ok_or(ResponseError::Identity)?;
         let pending = self
             .ranges
@@ -174,6 +259,12 @@ impl Requester {
                 previous.is_none(),
                 "live ranges expect distinct next hashes"
             );
+        } else {
+            self.awaiting_end += 1;
+            // The ordered response must still end. Keep an earlier abandonment
+            // deadline, or start one when the last block is claimed.
+            let at = *pending.retirement_started_at.get_or_insert(now);
+            self.retiring.insert((at, start));
         }
         Ok((height, claimed))
     }
@@ -203,6 +294,11 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
+            } else {
+                self.awaiting_end -= 1;
+            }
+            if let Some(at) = pending.retirement_started_at {
+                self.retiring.remove(&(at, start));
             }
         }
     }

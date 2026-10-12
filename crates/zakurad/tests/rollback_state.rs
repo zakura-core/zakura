@@ -55,7 +55,10 @@ fn fixture(cache_dir: &Path, pruned: bool) -> Vec<Arc<Block>> {
 }
 
 fn rollback(cache_dir: &Path, extra: &[&str]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zakura-rollback-state"))
+    // Nextest supplies the relocated binary path when running tests from an archive.
+    let executable = std::env::var("CARGO_BIN_EXE_zakura-rollback-state")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zakura-rollback-state").to_owned());
+    let mut child = Command::new(executable)
         .args(["--network", "Mainnet", "--height", "1", "--cache-dir"])
         .arg(cache_dir)
         .args(extra)

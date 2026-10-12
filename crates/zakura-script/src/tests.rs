@@ -1904,7 +1904,7 @@ fn only_script_failures_count_as_script_failures() {
 
     assert!(Error::ScriptInvalid.is_script_failure());
     assert!(Error::Interpreter {
-        component: zcash_script::script::ComponentType::Lock,
+        component: zcash_script::script::ComponentType::PubKey,
         error: zcash_script::script::Error::ScriptSize(None),
     }
     .is_script_failure());

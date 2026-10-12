@@ -812,7 +812,13 @@ impl Harness {
                     Frontier::new(node.height, *hash),
                 )
             })
-            .max_by_key(|(score, _)| *score)
+            .max_by_key(|(score, tip)| {
+                (
+                    score.suffix_work,
+                    *tip == durable.frontiers.header_best,
+                    score.tip_hash.0,
+                )
+            })
             .expect("the model always retains the finalized candidate");
         assert_eq!(durable.header_best_score, expected_score);
         assert_eq!(durable.frontiers.header_best, expected_tip);

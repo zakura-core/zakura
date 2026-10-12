@@ -52,7 +52,10 @@ use super::transport::{
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::HeaderSyncAction;
-use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_MESSAGE};
+use crate::{
+    constants::MAX_FIND_BLOCKS_RESPONSE_HASHES, peer_registry::PeerRegistry, BoxError, Config,
+    MAX_TX_INV_IN_SENT_MESSAGE,
+};
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
@@ -5022,8 +5025,10 @@ impl LegacyResponseBudget {
             LegacyResponseKind::BlockHashes => {
                 let max_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
-                    .saturating_add(max_inventory_items.saturating_mul(LEGACY_BLOCK_HASH_BYTES));
-                (max_inventory_items, 1, max_bytes)
+                    .saturating_add(
+                        MAX_FIND_BLOCKS_RESPONSE_HASHES.saturating_mul(LEGACY_BLOCK_HASH_BYTES),
+                    );
+                (MAX_FIND_BLOCKS_RESPONSE_HASHES, 1, max_bytes)
             }
             LegacyResponseKind::BlockHeaders => (
                 MAX_HEADERS_PER_MESSAGE,
@@ -10626,6 +10631,56 @@ mod tests {
     /// the peer stays connected and the caller falls back; NIL to a Ping, NIL
     /// with the wrong request id, and NIL mixed with other frames in either
     /// order stay connection-fatal.
+    /// A `FindBlocks` response may carry the responder's 500-hash limit, and
+    /// one more hash is connection-fatal.
+    #[test]
+    fn find_blocks_response_is_bounded_by_responder_limit() {
+        let limits = test_connection_limits();
+        let request_id = 5;
+        let request = LegacyRequestFrame::FindBlocks {
+            known_blocks: vec![block_hash(1)],
+            stop: None,
+        }
+        .encode_frame()
+        .expect("request frame encodes");
+
+        for (count, fatal) in [
+            (MAX_FIND_BLOCKS_RESPONSE_HASHES, false),
+            (MAX_FIND_BLOCKS_RESPONSE_HASHES + 1, true),
+        ] {
+            let hashes = (0..count)
+                .map(|index| {
+                    let mut hash = [0; 32];
+                    hash[..8].copy_from_slice(&u64::try_from(index).expect("small").to_le_bytes());
+                    block::Hash(hash)
+                })
+                .collect();
+            let frame = LegacyResponseCodec::encode_response(
+                request_id,
+                Response::BlockHashes(hashes),
+                limits.max_frame_bytes,
+                limits.max_message_bytes,
+            )
+            .expect("hash response encodes")
+            .pop()
+            .expect("hash response encodes to one frame");
+            let mut state = LegacyResponseReadState::new(
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .expect("budget derives from request"),
+            );
+
+            let result = state.validate_frame(request_id, &frame);
+            if fatal {
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "{count} hashes must be Fatal; got {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "{count} hashes must pass; got {result:?}");
+            }
+        }
+    }
+
     #[test]
     fn nil_response_is_local_for_inventory_and_fatal_for_ping() {
         let limits = test_connection_limits();

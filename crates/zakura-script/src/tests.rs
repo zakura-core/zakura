@@ -1911,5 +1911,4 @@ fn only_script_failures_count_as_script_failures() {
 
     assert!(!Error::TxIndex.is_script_failure());
     assert!(!Error::TxCoinbase.is_script_failure());
-
 }

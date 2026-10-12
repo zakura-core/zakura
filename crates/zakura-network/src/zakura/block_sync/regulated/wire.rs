@@ -1,4 +1,5 @@
-//! The existing stream-6 version-2 codec, before authorization and full block decoding.
+//! The stream-6 version 3 envelope, which keeps the version 2 byte encodings, checked before
+//! authorization and full block decoding.
 
 use std::time::Duration;
 

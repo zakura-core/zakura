@@ -1115,7 +1115,7 @@ async fn rejected_precious_header_commit_changes_nothing_and_returns_the_write_s
                 zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
         },
     );
-    let (senders, _invalid_resets, _, _, _, _, _task) = BlockWriteSender::spawn_with_header_chain(
+    let (senders, _invalid_resets, _, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
         finalized,
         live,
         chain_tip_sender,
@@ -1190,4 +1190,16 @@ async fn rejected_precious_header_commit_changes_nothing_and_returns_the_write_s
     assert!(published
         .chain_iter()
         .any(|chain| chain.non_finalized_tip_hash() == unrecorded));
+
+    // Closing the requests starts database shutdown on the writer thread. Join it before
+    // dropping the other database owners so their cleanup cannot race with that shutdown.
+    drop(senders);
+    let task = Arc::into_inner(task.expect("the writer task was spawned"))
+        .expect("the fixture owns the only writer-task handle");
+    let result = timeout(limit, tokio::task::spawn_blocking(move || task.join()))
+        .await
+        .expect("the writer shuts down after its request channels close")
+        .expect("the join task does not panic")
+        .expect("the writer does not panic");
+    assert!(matches!(result, BlockWriteTaskExit::Completed));
 }

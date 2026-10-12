@@ -33,6 +33,19 @@ independently.
 
 ### Changed
 
+- Stop maintaining transparent address and spender indexes in existing and fresh
+  pruned checkpoint-sync databases, retaining validation and mining support.
+  Upgrade existing state in place without resyncing, keep existing index rows,
+  and preserve the choice across restart and rollback. The database format
+  upgrade prevents older binaries from opening incomplete indexes
+  ([#1366](https://github.com/zakura-core/zakura/pull/1366)).
+- Return an explicit unavailable error for address balance, UTXO, transaction
+  history, and transparent spender queries when their indexes are omitted
+  ([#1366](https://github.com/zakura-core/zakura/pull/1366)).
+- Allow standalone rollback of databases without transparent indexes with
+  `zakura-rollback-state --storage-mode pruned`
+  ([#1366](https://github.com/zakura-core/zakura/pull/1366)).
+
 - Mining now prefers the valid block that first reached the full-block verifier
   when forks have equal work and no operator `preciousblock` preference applies. Native sync still uses header hash to choose between
   equal-work download paths and serves retained bodies from that branch even

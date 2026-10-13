@@ -597,7 +597,12 @@ impl DiskWriteBatch {
         let FinalizedBlock { block, height, .. } = finalized;
 
         if skip_transparent_indexes {
-            self.prepare_utxo_set_batch(db, new_outputs_by_out_loc, spent_utxos_by_out_loc);
+            self.prepare_utxo_set_batch(
+                db,
+                new_outputs_by_out_loc,
+                spent_utxos_by_out_loc,
+                omitted_outputs,
+            );
             return;
         }
 
@@ -660,10 +665,14 @@ impl DiskWriteBatch {
         db: &DiskDb,
         new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
         spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        omitted_outputs: &HashSet<OutputLocation>,
     ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
 
         for (new_output_location, utxo) in new_outputs_by_out_loc {
+            if omitted_outputs.contains(new_output_location) {
+                continue;
+            }
             self.zs_insert(&utxo_by_out_loc, new_output_location, &utxo.output);
         }
 

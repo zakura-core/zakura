@@ -730,14 +730,8 @@ impl PeerRoutine {
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
-                self.handle_body(
-                    block,
-                    body_wire_bytes,
-                    body_permit,
-                    raw_block_payload,
-                    authorized_height.is_some(),
-                )
-                .await;
+                self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
+                    .await;
             }
             BlockSyncMessage::BlocksDone {
                 start_height,
@@ -794,15 +788,6 @@ impl PeerRoutine {
     /// republish the candidate. Runs the validate / rate-meter / upsert; the
     /// servable read for want-work is this routine's own fields.
     fn handle_status(&mut self, status: BlockSyncStatus) {
-        if status.servable_low > status.servable_high {
-            let _ = self
-                .routine_to_reactor
-                .try_send(RoutineToReactor::Misbehavior {
-                    peer: self.peer.clone(),
-                    reason: BlockSyncMisbehavior::InvalidStatus,
-                });
-            return;
-        }
         self.session.record_received_status(status);
         let now = time::Instant::now().into_std();
         let range_changed =
@@ -1794,15 +1779,13 @@ impl PeerRoutine {
 
     // ===================== inbound matched body (ports `handle_block`) ======
 
-    /// Handle a decoded body. `authorized` means a regulated reservation
-    /// already matched it, so the peer kept its side of the exchange.
+    /// Handle a decoded body that a live reservation already authorized.
     async fn handle_body(
         &mut self,
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
         raw_block_payload: Option<Arc<[u8]>>,
-        authorized: bool,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -1826,30 +1809,13 @@ impl PeerRoutine {
             {
                 return;
             }
-            if self.ignore_stale_response(height, "body").await {
-                return;
-            }
-            if self.ignore_unmatched_needed_response(height, "body") {
-                return;
-            }
-            if self.ignore_unmatched_active_body_response(height, hash) {
-                return;
-            }
-            if self.ignore_servable_range_response(height, "body") {
-                return;
-            }
-            if authorized {
-                // Local retirement, reorgs and GC change interest, not authority.
-                metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
-                tracing::debug!(
-                    peer = ?self.peer,
-                    ?height,
-                    "ignoring an authorized block-sync body for retired local work"
-                );
-                return;
-            }
-            self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
-                .await;
+            // Local retirement, reorgs and GC change interest, not authority.
+            metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
+            tracing::debug!(
+                peer = ?self.peer,
+                ?height,
+                "ignoring an authorized block-sync body for retired local work"
+            );
             return;
         };
         let outstanding = &self.window.outstanding[index];
@@ -1931,10 +1897,6 @@ impl PeerRoutine {
             // regulated reservation already bounds the body's bytes, so the
             // estimate says nothing about that supplier.
             metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
-            if !authorized {
-                self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
-                    .await;
-            }
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
@@ -2223,105 +2185,10 @@ impl PeerRoutine {
         true
     }
 
-    fn ignore_unmatched_needed_response(&self, height: block::Height, response_kind: &str) -> bool {
-        // The reactor-local `needed_heights` is gone from the routine; the
-        // structural equivalent is "the height is still wanted" = pending or
-        // in-flight in the WorkQueue.
-        if !(self.work.pending_contains(height) || self.work.in_flight_contains(height)) {
-            return false;
-        }
-        metrics::counter!("sync.block.response.unmatched_needed_ignored").increment(1);
-        tracing::debug!(
-            peer = ?self.peer,
-            ?height,
-            response_kind,
-            "ignoring unmatched block-sync response for currently needed height"
-        );
-        true
-    }
-
-    fn ignore_unmatched_active_body_response(
-        &self,
-        height: block::Height,
-        hash: block::Hash,
-    ) -> bool {
-        if !self.registry.has_outstanding_request(height, hash) {
-            return false;
-        }
-        metrics::counter!("sync.block.response.unmatched_active_ignored").increment(1);
-        tracing::debug!(
-            peer = ?self.peer,
-            ?height,
-            "ignoring unmatched block-sync body for height active on another request"
-        );
-        true
-    }
-
-    fn ignore_unmatched_active_terminator_response(&self, start_height: block::Height) -> bool {
-        // We reach this only when *this* peer has no outstanding request starting
-        // at `start_height`; the registry answers whether another peer is actively
-        // requesting a range covering it (cross-peer fanout/retry race), in which
-        // case the terminator is dropped quietly rather than scored.
-        if !self.registry.has_outstanding_height(start_height) {
-            return false;
-        }
-        metrics::counter!("sync.block.response.unmatched_active_done_ignored").increment(1);
-        tracing::debug!(
-            peer = ?self.peer,
-            ?start_height,
-            "ignoring unmatched block-sync terminator for range active on another request"
-        );
-        true
-    }
-
-    /// An unmatched response for a height the peer *claims to serve*
-    /// (`download_floor < height <= servable_high`) that no other fallthrough
-    /// claimed. The common cause is an honest, in-flight body/terminator for a
-    /// height we requested before a destructive reset (reorg) then dropped from
-    /// our `outstanding` and from `work` (`reset_above`), or one that simply
-    /// raced ahead of the producer's asynchronous `work.extend`. The peer asked
-    /// for and served this range honestly, so scoring it the *hard*
-    /// `UnsolicitedBlock`/`UnsolicitedDone` (immediate, thresholdless disconnect)
-    /// would churn honest peers on every reorg. The reset that drops outstanding
-    /// runs on the Sequencer task asynchronously, so an honest in-flight response
-    /// can arrive after its `outstanding` entry is gone — drop it quietly to keep
-    /// the no-churn property. A response *outside* the peer's advertised range is
-    /// still scored.
-    fn ignore_servable_range_response(&self, height: block::Height, response_kind: &str) -> bool {
-        if !self.received_status || height <= self.download_floor() || height > self.servable_high {
-            return false;
-        }
-        metrics::counter!("sync.block.response.unmatched_servable_ignored").increment(1);
-        tracing::debug!(
-            peer = ?self.peer,
-            ?height,
-            response_kind,
-            "ignoring unmatched block-sync response within the peer's servable range"
-        );
-        true
-    }
-
     // ===================== terminators (ports `handle_blocks_done` etc.) =====
 
     async fn handle_blocks_done(&mut self, start_height: block::Height) {
         let Some(index) = self.window.outstanding_index_for_start(start_height) else {
-            if self.ignore_stale_response(start_height, "terminator").await {
-                return;
-            }
-            if self.ignore_unmatched_needed_response(start_height, "terminator") {
-                return;
-            }
-            if self.ignore_unmatched_active_terminator_response(start_height) {
-                return;
-            }
-            if self.ignore_servable_range_response(start_height, "terminator") {
-                return;
-            }
-            // A known, active peer sent a terminator correlating to no outstanding
-            // range, outside the range it claims to serve. Fail closed:
-            // `UnsolicitedDone` (a hard misbehavior).
-            self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedDone)
-                .await;
             return;
         };
         let disposition = self.stale_adjusted_disposition(index, Disposition::RetryMissing);
@@ -4467,7 +4334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_body_against_an_advertised_hint_is_reported_but_still_sequenced() {
+    async fn oversized_body_against_an_advertised_hint_is_still_sequenced() {
         use zakura_chain::serialization::ZcashDeserializeInto;
 
         use crate::zakura::transport::OrderedStreamFailureCause;
@@ -4574,16 +4441,12 @@ mod tests {
             sequenced.is_some(),
             "a hash-matched body is sequenced even though it exceeds its size hint"
         );
-        let reported = std::iter::from_fn(|| reactor_recv.try_recv().ok()).any(|message| {
-            matches!(
-                message,
-                RoutineToReactor::Misbehavior {
-                    reason: super::BlockSyncMisbehavior::SizeMismatch,
-                    ..
-                }
-            )
-        });
-        assert!(reported, "the mismatch is still reported to the reactor");
+        let reported = std::iter::from_fn(|| reactor_recv.try_recv().ok())
+            .any(|message| matches!(message, RoutineToReactor::Misbehavior { .. }));
+        assert!(
+            !reported,
+            "a wrong size hint does not implicate the supplier"
+        );
 
         cancel.cancel();
         let result = timeout(Duration::from_secs(1), running).await.unwrap();

@@ -3947,7 +3947,7 @@ mod zakura_header_sync_driver_tests {
         action_tx
             .send(BlockSyncAction::Misbehavior {
                 peer,
-                reason: zakura_network::zakura::BlockSyncMisbehavior::SizeMismatch,
+                reason: zakura_network::zakura::BlockSyncMisbehavior::InvalidBlock,
             })
             .await
             .expect("driver action channel stays open");

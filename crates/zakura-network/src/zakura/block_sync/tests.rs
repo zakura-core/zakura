@@ -3381,7 +3381,7 @@ fn work_queue_take_does_not_clamp_high_to_floor() {
 
 #[test]
 fn work_queue_preserves_work_item_estimate_through_take_and_return() {
-    // The size estimate (feeds the SizeMismatch tolerance check) is preserved as
+    // The size estimate (feeds the size-hint tolerance check) is preserved as
     // a height moves pending → in_flight → pending. Estimator overridden so the
     // clamp is wide enough to keep the hinted size.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
@@ -7385,13 +7385,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
         loop {
             match next_action(&mut actions).await {
                 BlockSyncAction::SubmitBlock { block, .. } => break block.hash(),
-                // The preserved size-deviation check reports the hint mismatch but
-                // must not drop the body.
-                BlockSyncAction::Misbehavior {
-                    reason: BlockSyncMisbehavior::SizeMismatch,
-                    ..
-                }
-                | BlockSyncAction::QueryNeededBlocks { .. } => {}
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
                 action => panic!("unexpected action before submit: {action:?}"),
             }
         }
@@ -7809,10 +7803,6 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
                 submitted_second = true;
                 break;
             }
-            BlockSyncAction::Misbehavior {
-                peer,
-                reason: BlockSyncMisbehavior::UnsolicitedBlock,
-            } if peer == peer_id => panic!("in-flight body was misclassified as unsolicited"),
             BlockSyncAction::QueryNeededBlocks { .. } | BlockSyncAction::SubmitBlock { .. } => {}
             action => panic!("unexpected action after second block: {action:?}"),
         }
@@ -9370,9 +9360,8 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         } = action
         {
             assert_ne!(
-                (action_peer, reason),
-                (peer.clone(), BlockSyncMisbehavior::UnsolicitedDone),
-                "a valid terminator after a completed block response must not be scored"
+                action_peer, peer,
+                "a valid terminator after a completed block response must not be scored as {reason:?}"
             );
         }
     }
@@ -10018,7 +10007,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         72,
@@ -10073,12 +10062,8 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
                 assert_eq!(block.hash(), blocks[2].hash());
                 break;
             }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_ne!(
-                    (peer, reason),
-                    (peer_id.clone(), BlockSyncMisbehavior::UnsolicitedBlock),
-                    "forward reset must not drop a still-active successor request"
-                );
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                panic!("forward reset must not drop a still-active successor request: {reason:?}")
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             BlockSyncAction::RecordBodyUnavailable { .. }
@@ -10113,7 +10098,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     // One-block ranges let height 3 arrive while height 2 is still missing.
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
         &mut actions,
         73,
@@ -10184,12 +10169,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
                 );
                 break;
             }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_ne!(
-                    (peer, reason),
-                    (peer_id.clone(), BlockSyncMisbehavior::UnsolicitedBlock),
-                    "forward reset must not drop a buffered successor body"
-                );
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                panic!("forward reset must not drop a buffered successor body: {reason:?}")
             }
             BlockSyncAction::QueryNeededBlocks { .. }
             | BlockSyncAction::RecordBodyUnavailable { .. }

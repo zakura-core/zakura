@@ -373,15 +373,9 @@ fn result_label(result: BlockApplyResult) -> &'static str {
 fn misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
-        BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
-        BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
         BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
-        BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
-        BlockSyncMisbehavior::InvalidStatus => "invalid_status",
-        BlockSyncMisbehavior::UnsolicitedDone => "unsolicited_done",
         BlockSyncMisbehavior::RangeUnavailable => "range_unavailable",
         BlockSyncMisbehavior::StatusSpam => "status_spam",
     }

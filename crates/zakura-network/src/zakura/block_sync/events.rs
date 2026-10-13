@@ -315,24 +315,12 @@ impl BlockSyncAction {
 pub enum BlockSyncMisbehavior {
     /// A stream-6 payload was malformed before semantic handling.
     MalformedMessage,
-    /// A peer sent blocks that were not requested.
-    UnsolicitedBlock,
-    /// A peer requested more blocks than this node advertised it can serve.
-    GetBlocksTooLong,
-    /// A peer exceeded this node's inbound `GetBlocks` serving budget.
-    GetBlocksSpam,
     /// A peer supplied a body whose payload does not match its requested header.
     BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
     /// A commitment-matching body deterministically failed consensus.
     ConsensusBodyInvalid(zakura_header_chain::ConsensusBodyInvalid),
     /// A peer supplied another invalid block payload.
     InvalidBlock,
-    /// A body exceeded its advertised size hint by more than the tolerance. Advisory: the hash-matched body is still accepted. The report names the body's supplier even though the hint may have come from a different header supplier.
-    SizeMismatch,
-    /// Peer status is internally impossible.
-    InvalidStatus,
-    /// A response terminator arrived without an outstanding range.
-    UnsolicitedDone,
     /// A peer reported a requested range unavailable.
     RangeUnavailable,
     /// A peer sent too many status frames.

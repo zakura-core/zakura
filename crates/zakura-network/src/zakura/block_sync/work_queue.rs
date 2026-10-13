@@ -19,7 +19,7 @@
 //! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
 //! on a [`WorkItem`] is the block's size *estimate* (not its worst-case
 //! reservation); it feeds the request budget reservation and the advisory
-//! receive-path `SizeMismatch` report, which never discards a hash-matched body.
+//! receive-path size-hint mismatch metric, which never discards a hash-matched body.
 
 use std::{
     num::NonZeroU64,
@@ -49,7 +49,7 @@ pub(super) struct WorkItem {
     provisional: bool,
     /// Expected hash of the block at this height (drives the response match).
     pub(super) hash: block::Hash,
-    /// The block's size estimate. Used for request budget reservation and the advisory receive-path `SizeMismatch` report.
+    /// The block's size estimate. Used for request budget reservation and the receive-path size-hint mismatch metric.
     pub(super) estimated_bytes: u64,
     /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
     observed_bytes: u64,

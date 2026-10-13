@@ -816,8 +816,7 @@ impl PeerRegistry {
     }
 
     /// Whether any connected peer has an outstanding request for `height`
-    /// expecting `hash` (the producer's `!has_outstanding_request` filter and the
-    /// `ignore_unmatched_active` fallthrough).
+    /// expecting `hash` (the producer's `!has_outstanding_request` filter).
     pub(super) fn has_outstanding_request(&self, height: block::Height, hash: block::Hash) -> bool {
         let peers = self.lock();
         peers.values().any(|entry| {
@@ -826,17 +825,6 @@ impl PeerRegistry {
                 .get(&height)
                 .is_some_and(|meta| meta.hash == hash)
         })
-    }
-
-    /// Whether any connected peer has an outstanding request covering `height`
-    /// (regardless of hash). Used by the routine's terminator-dedup fallthrough
-    /// (`ignore_unmatched_active_terminator_response`): a `BlocksDone` for a range
-    /// another peer is actively requesting is dropped quietly, not scored.
-    pub(super) fn has_outstanding_height(&self, height: block::Height) -> bool {
-        let peers = self.lock();
-        peers
-            .values()
-            .any(|entry| entry.outstanding.contains_key(&height))
     }
 
     /// Whether this exact peer still owns an outstanding claim for `height`.

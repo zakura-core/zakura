@@ -421,7 +421,7 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-SELECT-03"
 name = "Stable integrated header selection"
 status = "implemented"
-owner = "zakura_header_chain::ChainScore::cmp"
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
 tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes", "DF-01::integrated_header_selection_preserves_the_first_selected_equal_work_tip"]
 networks = ["mainnet", "testnet", "custom"]
 

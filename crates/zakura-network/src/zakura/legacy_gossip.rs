@@ -3623,10 +3623,10 @@ mod tests {
         }
 
         fn call(&mut self, _request: Request) -> Self::Future {
-            std::future::ready(Ok(Response::BlockHashes(vec![
-                block_hash(1),
-                block_hash(1),
-            ])))
+            std::future::ready(Ok(Response::BlockHashes {
+                hashes: vec![block_hash(1), block_hash(1)],
+                feedback: None,
+            }))
         }
     }
 
@@ -6035,7 +6035,10 @@ mod tests {
         let decode = |hashes: Vec<block::Hash>| -> Result<Response, LegacyGossipError> {
             let frames = LegacyResponseCodec::encode_response(
                 7,
-                Response::BlockHashes(hashes),
+                Response::BlockHashes {
+                    hashes,
+                    feedback: None,
+                },
                 frame_cap,
                 frame_cap,
             )?;
@@ -6057,7 +6060,7 @@ mod tests {
 
         assert!(matches!(
             decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES))?,
-            Response::BlockHashes(hashes) if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
+            Response::BlockHashes { hashes, .. } if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
         ));
 
         let oversized = decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES + 1));

@@ -61,6 +61,7 @@ impl Acceptor for TestAcceptor {
 struct Server {
     endpoint: QuicEndpoint,
     seen: Arc<Mutex<Vec<IncomingInfo>>>,
+    #[cfg(target_os = "linux")]
     banned: Arc<Mutex<HashSet<IpAddr>>>,
     handled: mpsc::UnboundedReceiver<Conn>,
 }
@@ -117,6 +118,7 @@ fn server_with(
     Server {
         endpoint,
         seen,
+        #[cfg(target_os = "linux")]
         banned,
         handled,
     }
@@ -646,18 +648,22 @@ async fn happy_eyeballs_skips_a_black_hole() {
 
 /// A UDP relay that rebinds its server-facing socket on demand, the way a NAT
 /// does. The server then sees the client migrate to the relay's new address.
+#[cfg(target_os = "linux")]
 struct Rebinder {
     addr: SocketAddr,
     rebind: tokio::sync::watch::Sender<SocketAddr>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Rebinder {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
+/// Starts a relay whose server-facing address can change during migration tests.
+#[cfg(target_os = "linux")]
 async fn rebinder(server: SocketAddr) -> Rebinder {
     let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = front.local_addr().unwrap();
@@ -1103,8 +1109,11 @@ async fn the_endpoint_counts_oversized_datagrams_as_dropped() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Exceed the endpoint limit without exceeding the platform's UDP send limit.
+        let max_payload = test_config().endpoint_config().get_max_udp_payload_size();
+        let oversized_len = usize::try_from(max_payload).unwrap() + 1;
         sender
-            .send_to(&vec![0x40; 65_000], server.endpoint.local_addrs()[0])
+            .send_to(&vec![0x40; oversized_len], server.endpoint.local_addrs()[0])
             .unwrap();
         while server.endpoint.socket_stats()[0].oversize_drops == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;

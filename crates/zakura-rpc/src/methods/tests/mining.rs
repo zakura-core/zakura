@@ -447,6 +447,9 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                 .unwrap()
                 .try_into_template()
                 .unwrap();
+            // Requests for the same parent reuse the initial coinbase. Forget it, so each path
+            // below constructs one.
+            rpc.gbt.coinbase_cache().clear();
             let gate = BlockingPoolGate::new().await;
             tokio::time::pause();
 
@@ -900,14 +903,21 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(minimum.clone());
         tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
             "the time-limit timer must fetch fresh state before the mempool timer"
         );
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.previous_block_hash, standard.tip_hash);
         assert_eq!(template.cur_time, minimum.cur_time);
         assert!(template.cur_time > standard.max_time);
@@ -962,7 +972,8 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
             Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
         )
         .await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
             "a deadline that passed during the mempool fetch must refresh right away"
@@ -970,7 +981,13 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
 
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.cur_time, minimum.cur_time);
         assert_eq!(template.bits, minimum.expected_difficulty);
         assert_ne!(template.long_poll_id, old_id);
@@ -1051,11 +1068,18 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sampled.cur_time = sampled.max_time;
         info_tx.send_replace(sampled);
         tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.long_poll_id, initial.long_poll_id);
         assert_eq!(template.cur_time, initial.max_time);
         assert_eq!(template.submit_old, Some(false));
@@ -1081,6 +1105,8 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
             .unwrap()
             .try_into_template()
             .unwrap();
+        // The deadline build reuses the initial coinbase unless the test forgets it.
+        rpc.gbt.coinbase_cache().clear();
         let gate = BlockingPoolGate::new().await;
         tokio::time::pause();
 
@@ -1246,6 +1272,8 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             ))
             .await
             .unwrap();
+            // Recovery reuses this template's coinbase unless the test forgets it.
+            rpc.gbt.coinbase_cache().clear();
             rpc.gbt.template_rejections.send_modify(|state| {
                 state.set_parent(chain.tip_hash);
                 state.reject(chain.tip_hash, "rejected-work");

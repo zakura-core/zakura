@@ -32,6 +32,10 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `NEW_TIP_TIMEOUT` | `crates/zakura-rpc/.../get_block_template/precompute.rs` | new → `1 s` | [#1058](https://github.com/zakura-core/zakura/pull/1058) | Bound transparent miners' wait for a cached template before an on-demand build. |
+| `SHIELDED_NEW_TIP_TIMEOUT` | `crates/zakura-rpc/.../get_block_template/precompute.rs` | new → `10 s` | [#1058](https://github.com/zakura-core/zakura/pull/1058) | Allow the shared shielded proof to finish before requests start their own builds. |
+| `RETRY_DELAY` | `crates/zakura-rpc/.../get_block_template/precompute.rs` | new → `1 s` | [#1058](https://github.com/zakura-core/zakura/pull/1058) | Back off updater retries when sync, state, or mempool data prevents a template build. |
+| `COINBASE_CACHE_CAPACITY` | `crates/zakura-rpc/.../get_block_template.rs` | new → `4` entries | [#1058](https://github.com/zakura-core/zakura/pull/1058) | Bound fee-cache growth while retaining the zero-fee coinbase for empty templates. |
 | RPC `SERVER_MAX_ENTRIES` / `PROPOSAL_MAX_ENTRIES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `24` / `8` canonical candidates | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound work-ID reconstruction independently of content-keyed consensus verification; share decoded block allocations through `Arc` where possible. |
 | RPC `SERVER_MAX_BYTES` / `PROPOSAL_MAX_BYTES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `48 MiB` / `16 MiB` | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound RPC candidate and alias retention separately from the unchanged consensus cache budgets; do not retain serialized block copies. |
 | `SERVER_MAX_WORK_IDS` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `3,072` aliases | [#754](https://github.com/zakura-core/zakura/pull/754) | Retain aliases from the single-flight server preparation lane without letting client proposals evict them. |

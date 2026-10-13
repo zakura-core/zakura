@@ -1191,6 +1191,7 @@ mod tests {
             BLOCK_SYNC_TABLE,
             COMMIT_STATE_TABLE,
             QUEUE_SEND_TABLE,
+            QUIC_CONN_TABLE,
         ] {
             assert_eq!(table.file_name(), format!("{}.csv", table.table()));
             let columns: Vec<_> = schema["tables"][table.table()]

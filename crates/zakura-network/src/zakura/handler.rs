@@ -1314,6 +1314,7 @@ impl ZakuraSupervisorHandle {
         remote_ip: IpAddr,
         pending: usize,
         max_handshakes_per_ip: usize,
+        validated: bool,
     ) -> IpAdmission {
         let ip = canonical_ip(remote_ip);
         let registered = self.ip_slots.registered(ip);
@@ -1322,14 +1323,25 @@ impl ZakuraSupervisorHandle {
             return IpAdmission::Full;
         }
         if registered.saturating_add(in_flight) < self.max_connections_per_ip {
-            return IpAdmission::Open;
+            let last_slot = in_flight.saturating_add(1) >= max_handshakes_per_ip
+                || registered.saturating_add(in_flight).saturating_add(1)
+                    >= self.max_connections_per_ip;
+            return if last_slot && !validated {
+                IpAdmission::ValidationRequired
+            } else {
+                IpAdmission::Open
+            };
         }
         // A full IP still gets one handshake at a time: it may be a node
         // redialing to replace its own stale connection, which `register`
         // allows from the same IP. `register` enforces the exact cap for
         // everyone else, so this costs at most one handshake per full IP.
         if registered >= self.max_connections_per_ip && in_flight == 0 {
-            return IpAdmission::Open;
+            return if validated {
+                IpAdmission::Open
+            } else {
+                IpAdmission::ValidationRequired
+            };
         }
         IpAdmission::Full
     }
@@ -3629,6 +3641,7 @@ const PENDING_HANDSHAKE_SHARES_PER_IP: usize = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IpAdmission {
     Open,
+    ValidationRequired,
     Full,
 }
 
@@ -3646,11 +3659,11 @@ impl Acceptor for ZakuraProtocolHandler {
             incoming.remote.ip(),
             incoming.pending_from_ip,
             max_handshakes_per_ip,
-        ) == IpAdmission::Full
+            incoming.validated,
+        ) != IpAdmission::Open
         {
-            // An unvalidated source address may be spoofed, so a full IP is
-            // ambiguous: Retry costs a real peer one round trip and a spoofer
-            // its slot, and refuses no one.
+            // Require validation before consuming the last slot, including
+            // the redial slot, so spoofed Initials cannot fill an IP's budget.
             if !incoming.validated {
                 metrics::counter!("zakura.p2p.conn.retried.per_ip").increment(1);
                 return Admit::Retry;
@@ -11266,6 +11279,7 @@ mod tests {
             pending_total: pending_from_ip,
             pending_from_ip,
         };
+        assert_eq!(handler.admit(&attempt(false, 0)), Admit::Retry);
         assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
         assert_eq!(handler.admit(&attempt(true, 1)), Admit::Refuse);
         assert_eq!(handler.admit(&attempt(false, 1)), Admit::Retry);
@@ -11285,9 +11299,59 @@ mod tests {
             ZakuraHandshakeConfig::for_network(&Network::Mainnet),
             limits,
         );
+        assert_eq!(
+            handler.admit(&IncomingInfo {
+                validated: false,
+                ..busy(share - 2)
+            }),
+            Admit::Accept
+        );
+        assert_eq!(
+            handler.admit(&IncomingInfo {
+                validated: false,
+                ..busy(share - 1)
+            }),
+            Admit::Retry
+        );
         assert_eq!(handler.admit(&busy(share - 1)), Admit::Accept);
         assert_eq!(handler.admit(&busy(share)), Admit::Refuse);
         Ok(())
+    }
+
+    #[test]
+    fn last_per_ip_slot_requires_validation() {
+        let ip = "203.0.113.9".parse().unwrap();
+        for cap in [1, 2, 16] {
+            let supervisor = ZakuraSupervisorHandle::new(cap);
+            let limits = ZakuraLocalLimits::from_config(&Config::default());
+            let share = (limits.max_pending_handshakes / PENDING_HANDSHAKE_SHARES_PER_IP).max(1);
+            let handler = ZakuraProtocolHandler::new(
+                supervisor.clone(),
+                Network::Mainnet,
+                ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+                limits,
+            );
+            let slots = cap.min(share);
+            for controls in 0..slots {
+                let _guards: Vec<_> = (0..controls)
+                    .map(|_| supervisor.enter_control_handshake(ip))
+                    .collect();
+                let incoming = IncomingInfo {
+                    remote: SocketAddr::new(ip, 8234),
+                    validated: false,
+                    pending_total: slots - controls - 1,
+                    pending_from_ip: slots - controls - 1,
+                };
+                assert_eq!(handler.admit(&incoming), Admit::Retry);
+                assert_eq!(
+                    handler.admit(&IncomingInfo {
+                        validated: true,
+                        ..incoming
+                    }),
+                    Admit::Accept
+                );
+            }
+        }
     }
 
     // V12 F-67: the handler refused every attempt at the global pending cap,

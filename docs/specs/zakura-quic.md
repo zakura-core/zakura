@@ -358,6 +358,16 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
   rule 1 never fires.
 
+  Rule 2 reserves the last available per-IP slot for a validated source.
+  An unvalidated attempt MUST receive `Retry` before it consumes that slot.
+  This applies to both the connection cap and the IP's share of the pending
+  handshake budget. An IP at its established connection cap may start one
+  validated handshake to replace a stale connection. An unvalidated attempt
+  MUST receive `Retry` before it consumes that redial slot. Registration still
+  enforces the established connection cap. When rule 2 or rule 4 is full,
+  the acceptor returns `Retry` for an unvalidated source and `Refuse` for a
+  validated source.
+
   A control handshake is an inbound connection past TLS that hasn't
   registered yet. The transport stops counting a connection when TLS
   finishes, so Zakura counts it against its IP from then until registration.

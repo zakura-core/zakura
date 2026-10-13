@@ -1,7 +1,7 @@
 //! The connection task: the peer routine that owns one QUIC connection.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     mem,
     net::{IpAddr, SocketAddr},
     sync::{atomic::Ordering, Arc},
@@ -147,6 +147,8 @@ struct ConnTask {
     /// answer, until the handle finishes, resets or drops it. A later write
     /// gets `Stopped(code)` instead of the reset stream's `ClosedStream`.
     stopped: HashMap<StreamId, VarInt>,
+    /// Streams whose send handles can still issue writes.
+    writable_handles: HashSet<StreamId>,
     /// Each stream's waiting read and the most bytes it asked for.
     reads: HashMap<StreamId, (oneshot::Sender<ReadReply>, usize)>,
     recv_ends: HashMap<StreamId, RecvEnd>,
@@ -203,6 +205,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         accepted_spare: VecDeque::new(),
         sends: HashMap::new(),
         stopped: HashMap::new(),
+        writable_handles: HashSet::new(),
         reads: HashMap::new(),
         recv_ends: HashMap::new(),
         send_buf: Vec::new(),
@@ -323,16 +326,32 @@ pub(crate) async fn run(params: ConnTaskParams) {
             () = tokio::task::yield_now(), if more_to_send => {}
         }
     }
+    task.drain_datagrams(&mut datagrams).await;
 }
 
 impl ConnTask {
-    fn on_datagram(&mut self, (event, bytes): (ConnectionEvent, usize)) {
+    async fn drain_datagrams(
+        &self,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+    ) {
+        // Close first so concurrent endpoint sends fail and refund their own charge.
+        datagrams.close();
+        while let Some((_, bytes)) = datagrams.recv().await {
+            self.refund_datagram(bytes);
+        }
+    }
+
+    fn refund_datagram(&self, bytes: usize) {
         self.shared
             .queued_datagram_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
         self.shared
             .socket_queued_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn on_datagram(&mut self, (event, bytes): (ConnectionEvent, usize)) {
+        self.refund_datagram(bytes);
         self.conn.handle_event(event);
         self.counters.datagrams_received += 1;
     }
@@ -531,8 +550,7 @@ impl ConnTask {
                 Event::Stream(StreamEvent::Writable { id }) => self.serve_writer(id),
                 Event::Stream(StreamEvent::Finished { .. }) => {}
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
-                    self.fail_writes(id, WriteError::Stopped(error_code));
-                    self.stopped.insert(id, error_code);
+                    self.on_stopped(id, error_code);
                     // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM.
                     // quinn-proto leaves this to the application, and without
                     // it the peer never learns the final size, so it never
@@ -643,15 +661,19 @@ impl ConnTask {
                     });
                 self.serve_writer(id);
             }
-            ConnCmd::Finish { id } | ConnCmd::DropSend { id }
-                if self.stopped.remove(&id).is_some() => {}
-            ConnCmd::Finish { id } | ConnCmd::DropSend { id } => match self.sends.get_mut(&id) {
-                Some(state) if !state.writes.is_empty() => state.finish_after = true,
-                _ => {
-                    let _ = self.conn.send_stream(id).finish();
+            ConnCmd::Finish { id } | ConnCmd::DropSend { id } => {
+                self.writable_handles.remove(&id);
+                if self.stopped.remove(&id).is_none() {
+                    match self.sends.get_mut(&id) {
+                        Some(state) if !state.writes.is_empty() => state.finish_after = true,
+                        _ => {
+                            let _ = self.conn.send_stream(id).finish();
+                        }
+                    }
                 }
-            },
+            }
             ConnCmd::Reset { id, code } => {
+                self.writable_handles.remove(&id);
                 self.stopped.remove(&id);
                 self.fail_writes(id, WriteError::ClosedStream);
                 let _ = self.conn.send_stream(id).reset(code);
@@ -721,6 +743,7 @@ impl ConnTask {
                 self.openers.push_front(reply);
                 return;
             };
+            self.writable_handles.insert(id);
             if let Err(Ok(id)) = reply.send(Ok(id)) {
                 // The opener gave up; the peer hasn't seen the stream yet, so
                 // the next opener can use it.
@@ -742,6 +765,7 @@ impl ConnTask {
                 self.acceptors.push_front(reply);
                 return;
             };
+            self.writable_handles.insert(id);
             if let Err(Ok(id)) = reply.send(Ok(id)) {
                 self.accepted_spare.push_front(id);
             }
@@ -790,6 +814,13 @@ impl ConnTask {
             let _ = self.conn.send_stream(id).finish();
         }
         self.sends.remove(&id);
+    }
+
+    fn on_stopped(&mut self, id: StreamId, error_code: VarInt) {
+        self.fail_writes(id, WriteError::Stopped(error_code));
+        if self.writable_handles.contains(&id) {
+            self.stopped.insert(id, error_code);
+        }
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -1011,4 +1042,155 @@ fn export_delta(previous: &Exported, next: &Exported) {
         .increment(next.transmits.saturating_sub(previous.transmits));
     metrics::counter!("zakura.quic.socket.datagrams_sent")
         .increment(next.datagrams_sent.saturating_sub(previous.datagrams_sent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{socket::UdpIo, NodeSecretKey};
+    use std::sync::atomic::AtomicUsize;
+
+    fn task() -> ConnTask {
+        let key = NodeSecretKey::from_bytes(&[1; 32]);
+        let crypto = tls::TlsConfig::new(&key)
+            .client_config(key.public(), &[b"test"])
+            .unwrap();
+        let mut endpoint = quinn_proto::Endpoint::new(Arc::default(), None, true, None);
+        let admitted = "127.0.0.1:12345".parse().unwrap();
+        let (handle, conn) = endpoint
+            .connect(
+                now(),
+                quinn_proto::ClientConfig::new(Arc::new(crypto)),
+                admitted,
+                tls::UNSENT_SERVER_NAME,
+            )
+            .unwrap();
+        let shared = ConnShared::new(admitted, Arc::new(AtomicUsize::new(0)));
+        let to_endpoint = mpsc::unbounded_channel().0;
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_nonblocking(true).unwrap();
+        let socket = Arc::new(SocketCell::new(UdpIo::new(udp, false).unwrap()));
+        let probe = Arc::default();
+        let hooks = Arc::default();
+        let handshake = oneshot::channel().0;
+        let limits = CurrentLimits {
+            receive_window: 1024,
+            send_window: 1024,
+            max_bidi_streams: 16,
+        };
+        ConnTask {
+            handle,
+            conn,
+            shared,
+            to_endpoint,
+            socket,
+            probe,
+            hooks,
+            admitted,
+            handshake: Some(handshake),
+            remote_id: None,
+            error: None,
+            local_close: None,
+            drained_sent: false,
+            path_ip: canonical_ip(admitted.ip()),
+            limits,
+            load_published: None,
+            load_stale: false,
+            last_send_warning: None,
+            openers: VecDeque::new(),
+            opened_spare: VecDeque::new(),
+            acceptors: VecDeque::new(),
+            accepted_spare: VecDeque::new(),
+            sends: HashMap::new(),
+            stopped: HashMap::new(),
+            writable_handles: HashSet::new(),
+            reads: HashMap::new(),
+            recv_ends: HashMap::new(),
+            send_buf: Vec::new(),
+            blocked: None,
+            more_to_send: false,
+            counters: Counters::default(),
+            exported: Exported::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_datagrams_refunds_only_this_connections_socket_bytes() {
+        let mut task = task();
+        let key = NodeSecretKey::from_bytes(&[1; 32]);
+        let crypto = tls::TlsConfig::new(&key)
+            .server_config(vec![b"test".to_vec()])
+            .unwrap();
+        let config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        let mut server =
+            quinn_proto::Endpoint::new(Arc::default(), Some(Arc::new(config)), true, None);
+        let remote = "127.0.0.1:54321".parse().unwrap();
+        let mut packet = Vec::new();
+        let transmit = task.conn.poll_transmit(now(), 1, &mut packet).unwrap();
+        let data = bytes::BytesMut::from(&packet[..transmit.size]);
+        let mut response = Vec::new();
+        let Some(quinn_proto::DatagramEvent::NewConnection(incoming)) =
+            server.handle(now(), remote, None, None, data.clone(), &mut response)
+        else {
+            panic!("client Initial must create an incoming connection")
+        };
+        let _connection = server.accept(incoming, now(), &mut response, None).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let other_connection_bytes = 73;
+        task.shared
+            .socket_queued_bytes
+            .store(other_connection_bytes, Ordering::Relaxed);
+        for _ in 0..3 {
+            let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, event)) =
+                server.handle(now(), remote, None, None, data.clone(), &mut response)
+            else {
+                panic!("duplicate Initial must route to the accepted connection")
+            };
+            task.shared
+                .queued_datagram_bytes
+                .fetch_add(data.len(), Ordering::Relaxed);
+            task.shared
+                .socket_queued_bytes
+                .fetch_add(data.len(), Ordering::Relaxed);
+            tx.send((event, data.len())).unwrap();
+        }
+        task.drain_datagrams(&mut rx).await;
+        assert!(tx.is_closed());
+        assert_eq!(task.shared.queued_datagram_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            task.shared.socket_queued_bytes.load(Ordering::Relaxed),
+            other_connection_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_codes_live_only_until_send_handle_closes() {
+        for close_kind in 0..3 {
+            let mut task = task();
+            let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+            let code = VarInt::from_u32(9);
+            task.writable_handles.insert(id);
+            task.on_stopped(id, code);
+            let (reply, result) = oneshot::channel();
+            task.handle_cmd(ConnCmd::Write {
+                id,
+                data: Bytes::from_static(b"x"),
+                reply,
+            });
+            assert_eq!(result.await.unwrap(), Err(WriteError::Stopped(code)));
+            let close = match close_kind {
+                0 => ConnCmd::Finish { id },
+                1 => ConnCmd::DropSend { id },
+                _ => ConnCmd::Reset { id, code },
+            };
+            task.handle_cmd(close);
+            assert!(!task.writable_handles.contains(&id));
+            assert!(task.stopped.is_empty());
+            task.on_stopped(id, code);
+            assert!(
+                task.stopped.is_empty(),
+                "late STOP_SENDING must not retain a code"
+            );
+        }
+    }
 }

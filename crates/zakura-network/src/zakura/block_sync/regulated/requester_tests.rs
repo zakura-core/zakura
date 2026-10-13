@@ -349,11 +349,9 @@ fn unfinished_ranges_keep_capacity_and_do_not_extend_their_retirement_deadline()
     book.claim_block(hash(2), 2).unwrap();
     assert_eq!(book.retirement_deadline(grace), Some(deadline));
     assert!(book.at_capacity());
-    assert!(!book.endings_at_capacity());
 
     book.claim_block(hash(1), 2).unwrap();
     assert_eq!(book.retirement_deadline(grace), Some(deadline));
-    assert!(book.endings_at_capacity());
     assert!(book.blocks_retry(Height(1)));
     assert_eq!(book.retirement_deadline(grace), Some(deadline));
     book.finish(&Message::BlocksDone {
@@ -362,7 +360,6 @@ fn unfinished_ranges_keep_capacity_and_do_not_extend_their_retirement_deadline()
     })
     .unwrap();
     assert!(!book.at_capacity());
-    assert!(!book.endings_at_capacity());
     assert!(book.retirement_deadline(grace).is_some());
     assert!(!book.blocks_retry(Height(1)));
     book.finish(&Message::BlocksDone {

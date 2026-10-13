@@ -67,7 +67,6 @@ pub(super) struct Requester {
     // Abandoned work and fully received ranges still waiting for an ending.
     retiring: BTreeSet<(Instant, Height)>,
     read_paused: Duration,
-    awaiting_end: usize,
     capacity: usize,
 }
 
@@ -83,7 +82,6 @@ impl Requester {
             next: HashMap::new(),
             retiring: BTreeSet::new(),
             read_paused: Duration::ZERO,
-            awaiting_end: 0,
             capacity,
         }
     }
@@ -129,10 +127,6 @@ impl Requester {
     /// without walking every pending request after each wait.
     pub(super) fn credit_read_pause(&mut self, elapsed: Duration) {
         self.read_paused += elapsed;
-    }
-
-    pub(super) fn endings_at_capacity(&self) -> bool {
-        self.awaiting_end >= self.capacity
     }
 
     /// An unended range also blocks a new request after a reorg. Arm cleanup
@@ -263,7 +257,6 @@ impl Requester {
                 "live ranges expect distinct next hashes"
             );
         } else {
-            self.awaiting_end += 1;
             // The ordered response must still end. Keep an earlier abandonment
             // deadline, or start one when the last block is claimed.
             let at = *pending.retirement_started_at.get_or_insert(now);
@@ -297,8 +290,6 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
-            } else {
-                self.awaiting_end -= 1;
             }
             if let Some(at) = pending.retirement_started_at {
                 self.retiring.remove(&(at, start));

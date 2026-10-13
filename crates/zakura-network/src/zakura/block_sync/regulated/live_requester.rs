@@ -126,10 +126,9 @@ impl LiveRequester {
     /// End this connection locally before releasing any unanswered authorization.
     pub(crate) fn check_liveness(&self, now: Instant, grace: Duration) -> Result<(), SinkReject> {
         let requester = self.shared.lock();
-        if requester.endings_at_capacity()
-            || requester
-                .retirement_deadline(grace)
-                .is_some_and(|deadline| now >= deadline)
+        if requester
+            .retirement_deadline(grace)
+            .is_some_and(|deadline| now >= deadline)
         {
             self.fence.retire();
             return Err(SinkReject::local("GetBlocks exchanges did not finish"));
@@ -279,8 +278,15 @@ mod tests {
             requester.shared.lock().claim_block(hash, 2).unwrap();
             requester.retire(block::Height(start), false);
         }
+        // A full session waiting only for endings may still have them queued.
+        assert!(requester
+            .check_liveness(Instant::now(), Duration::from_secs(32))
+            .is_ok());
         assert!(matches!(
-            requester.check_liveness(Instant::now(), Duration::from_secs(32)),
+            requester.check_liveness(
+                Instant::now() + Duration::from_secs(33),
+                Duration::from_secs(32)
+            ),
             Err(SinkReject::Local(_))
         ));
         assert!(connection.is_cancelled());

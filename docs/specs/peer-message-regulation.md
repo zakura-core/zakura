@@ -633,20 +633,21 @@ Negotiation MUST select the complete behavior together: the frame table and cade
 commitments, response reservations, ending checks, and Status handling. The selected stream
 MUST have at least two outbound queue slots after the negotiated connection budget is split.
 
-Implementations MUST retain version 2 under capability bit 3 for peers without the new capability.
-That compatibility path MUST retain the old message-rate bucket and retry/ending behavior, without
-installing the regulated frame table or reservations. Replacing a version 2 session MUST send a
-fresh Status. Version 3 carries received Status across replacement on the same connection. Embedders
-without a bounded range source MUST advertise only version 2.
+Version 3 replaces version 2 without a compatibility path. Capability bit 3, which identified
+version 2, is retired and MUST NOT be reused. A peer that offers only version 2 negotiates no block
+sync stream. Version 3 carries received Status across replacement on the same connection. Embedders
+without a storage-backed range source still negotiate version 3 and MUST end every request with
+`RangeUnavailable`.
 
-Version 2 requests bodies by height range. The requester still reserves the expected header hash for
-each height, but the wire request does not identify that hash. Competing branches can occupy the
-same height, so regulated version 3 forbids overlapping live ranges on one connection. A future
-version must make request and body correlation explicit.
+The version 2 encoding requests bodies by height range. The requester still reserves the expected
+header hash for each height, but the wire request does not identify that hash. Competing branches
+can occupy the same height, so regulated version 3 forbids overlapping live ranges on one
+connection. A future version must make request and body correlation explicit.
 
-Block sync MUST allow discriminators `1..=5` in the frame header. Version 2 also carries the same
-one-byte discriminator at the start of each payload. The decoder MUST require both copies to match.
-Removing the payload copy requires a new stream version. The following limits apply:
+Block sync MUST allow discriminators `1..=5` in the frame header. The version 2 encoding also
+carries the same one-byte discriminator at the start of each payload. The decoder MUST require both
+copies to match. Removing the payload copy requires a new stream version. The following limits
+apply:
 
 ```text
 MAX_BLOCKS_PER_RESPONSE  = 128
@@ -804,7 +805,7 @@ peer that serves no blocks for heights inside its advertised servable range.
   - `count` does not exceed the requested count
   - consumes the terminal part and closes the reservation
 
-Version 2 senders can report a smaller count after clamping a request to their available heights.
+A sender can report a smaller count after clamping a request to its available heights.
 The ending closes the entire original range. The handler MUST requeue every unreceived height in
 that original range, not just the reported count. A retry policy MAY avoid this peer for the
 immediate retry.

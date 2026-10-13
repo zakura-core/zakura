@@ -1,6 +1,6 @@
 # GetBlocks regulation tests
 
-> **Status: first draft.** This plan covers regulated block-sync version 3 and version 2 compatibility under the
+> **Status: first draft.** This plan covers regulated block-sync version 3 under the
 > [testing design](property-testing.md). The
 > [specification](../specs/peer-message-regulation.md) defines behavior.
 
@@ -13,7 +13,7 @@ control capacity, storage completion, and response delivery.
 This work introduces no Work bucket, refund, mandatory Delay verdict, or serving query-result timer.
 It does not require a generic framework or exhaustive explorer. Header subscriptions have separate
 tests. Version 3 retains height-range correlation and forbids overlapping live ranges per connection.
-Version 2 keeps the legacy behavior for peers that have not negotiated regulation.
+Version 2 is retired, so every block-sync session is regulated.
 
 ## Existing infrastructure
 
@@ -112,8 +112,8 @@ correspondence, and completion status.
 
 The serving limit advertised to version 3 peers comes from a 512 MiB budget for queued serving
 bookkeeping. `serving_max_inflight_requests` in `block_sync/regulated/session.rs` documents the
-derivation; the default 512 session slots give 2,816 requests per peer. Version 2 peers and local
-download sizing keep the configured 32,000.
+derivation; the default 512 session slots give 2,816 requests per peer. Local download sizing keeps
+the configured 32,000.
 
 These tests run automatically:
 
@@ -168,7 +168,6 @@ advertisement must keep capacity for its highest outstanding promise, because lo
 value does not release old commitments.
 
 The stream-6 conformance adapter covers the production layout over QUIC, including simultaneous
-serving and exhausted credit. A real-QUIC test with five old peers and one upgraded peer covers the
-version 2 fallback, retries without endings and prompt Status corrections. Requester tests cover
+serving and exhausted credit. Requester tests cover
 local incompatibility, supplier cooldowns across reconnects, and endings that survive local read
 pauses.

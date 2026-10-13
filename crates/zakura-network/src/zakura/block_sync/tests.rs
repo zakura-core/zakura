@@ -14337,7 +14337,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         62,
@@ -14359,6 +14359,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     )
     .await
     .expect("the valid serving peer becomes ready");
+    wait_for_outbound_status(&mut outbound_rx).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     while wiring.actions.capacity() > 0 {
         wiring
@@ -14406,7 +14407,24 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let frame = outbound_rx
+                .recv()
+                .await
+                .expect("the peer remains connected");
+            match BlockSyncMessage::decode_frame(frame).unwrap() {
+                BlockSyncMessage::Status(_) => continue,
+                BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(1),
+                    count: 1,
+                } => break,
+                message => panic!("expected overload response, got {message:?}"),
+            }
+        }
+    })
+    .await
+    .expect("action queue pressure must release the requester's reservation promptly");
 
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

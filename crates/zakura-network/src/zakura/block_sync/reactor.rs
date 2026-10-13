@@ -1604,6 +1604,7 @@ impl BlockSyncReactor {
             count: requested_count,
         }) {
             self.finish_serving_blocks(&peer, start_height);
+            self.send_range_unavailable(&peer, start_height, requested_count);
         }
     }
 

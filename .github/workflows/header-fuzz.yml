@@ -9,7 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
   cancel-in-progress: true
 
 permissions:

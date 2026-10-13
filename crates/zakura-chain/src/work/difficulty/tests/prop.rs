@@ -107,10 +107,7 @@ proptest! {
 
     /// Check that two random CompactDifficulty values compare and round-trip correctly.
     #[test]
-    #[allow(clippy::double_comparisons)]
     fn prop_compact_roundtrip(compact1 in any::<CompactDifficulty>(), compact2 in any::<CompactDifficulty>()) {
-        prop_assert!(compact1 != compact2 || compact1 == compact2);
-
         let expanded1 = compact1.to_expanded().expect("arbitrary compact values are valid");
         let expanded2 = compact2.to_expanded().expect("arbitrary compact values are valid");
 

@@ -46,6 +46,11 @@ Criterion remains a development dependency. The feature-gated storage runner
 uses standard timing types and passes named samples to the benchmark binary.
 Every selection sample uses an `Instant` timer; its overhead is included.
 
+The `ancestor_chain/admission` cases add a child to a two-transaction chain in
+an otherwise full pool at both sizes. They measure successful admission and
+rejection when the child outbids a victim but its ancestor-inclusive rate does
+not. These cases include the maximum two protected ancestors.
+
 Criterion writes reports beneath `target/criterion`. The shared benchmark
 workflow includes this target, including PR comparisons with the `C-benchmark`
 label. Compare the 1,000- and 8,000-entry results to detect a return to full-pool
@@ -67,3 +72,15 @@ These are warm storage measurements, excluding cryptographic verification.
 Admission includes committing the eviction and inserting the newcomer; heap
 and indexed selection timings cover victim planning only. Machine-dependent
 latencies are evidence for this change, not fixed performance requirements.
+
+With ancestor-inclusive admission pricing, the same machine produced these
+warm timings for a child with two protected ancestors (microseconds, rounded):
+
+| Pool entries | Rejected child | Admitted child |
+| ---: | ---: | ---: |
+| 1,000 | 0.55 | 3.14 |
+| 8,000 | 0.56 | 3.09 |
+
+These cases include policy checks and, on success, victim removal, cache
+updates, and insertion. Their similar timings at both sizes exercise the
+bounded ancestor calculation and indexed selection without a full-pool scan.

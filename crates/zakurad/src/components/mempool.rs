@@ -22,8 +22,10 @@ use std::{
     collections::HashSet,
     future::Future,
     iter,
+    net::IpAddr,
     pin::{pin, Pin},
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use futures::{future::FutureExt, stream::Stream};
@@ -32,13 +34,14 @@ use tower::{
     buffer::Buffer,
     timeout::Timeout,
     util::{BoxCloneService, BoxService},
-    Service,
+    Service, ServiceExt,
 };
 
 use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
+    parameters::NetworkUpgrade,
     transaction::UnminedTxId,
 };
 use zakura_consensus::{error::TransactionError, transaction};
@@ -57,6 +60,7 @@ mod crawler;
 pub mod downloads;
 mod error;
 pub mod gossip;
+mod peer_cooldown;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
@@ -129,8 +133,8 @@ type TxVerifier = Buffer<
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
 /// The maximum estimated distance to the network tip, in blocks, at which the
-/// mempool and its crawler activate, and at which the mempool scores peer
-/// misbehavior.
+/// mempool and its crawler activate, and at which the mempool starts peer
+/// transaction cooldowns.
 ///
 /// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
@@ -150,37 +154,301 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
         .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
 }
 
-fn transaction_misbehavior(
-    error: &TransactionDownloadVerifyError,
-    best_tip_height: Option<block::Height>,
-) -> Option<(PeerSocketAddr, u32)> {
+/// Returns the peer to ban for `error`, if the failure does not depend on this
+/// node's chain tip.
+///
+/// [`peer_action`] decides which failures ban.
+fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
         advertiser_addr: Some(advertiser_addr),
-        tip_height,
+        transaction_version,
+        ..
     } = error
     else {
         return None;
     };
 
-    if tip_height.is_none() || *tip_height != best_tip_height {
-        return None;
-    }
+    let bans = match peer_action(error) {
+        PeerAction::Ban => true,
+        PeerAction::BanV5AndLater => *transaction_version >= 5,
+        PeerAction::Cooldown | PeerAction::Ignore => false,
+    };
 
-    // Tip timestamps only estimate freshness. Honest peers can use a different
-    // branch or lock context even when this node passes the distance gate.
-    if matches!(
+    bans.then_some(*advertiser_addr)
+}
+
+/// Returns the peer to put in a transaction cooldown for `error`, if any.
+///
+/// [`peer_action`] decides which failures start a cooldown. Failures without a
+/// legacy advertiser address do not, and neither do failures verified against
+/// a tip other than `best_tip_height`. `tip_upgrade` is the network upgrade of
+/// the block after `best_tip_height`.
+fn transaction_cooldown_peer(
+    error: &TransactionDownloadVerifyError,
+    best_tip_height: Option<block::Height>,
+    tip_upgrade: NetworkUpgrade,
+) -> Option<PeerSocketAddr> {
+    let TransactionDownloadVerifyError::Invalid {
         error,
-        TransactionError::WrongConsensusBranchId
-            | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
-            | TransactionError::LockedUntilAfterBlockHeight(_)
-            | TransactionError::LockedUntilAfterBlockTime(_)
-    ) {
+        advertiser_addr: Some(advertiser_addr),
+        tip_height,
+        transaction_version,
+        transaction_network_upgrade,
+        retried_after_tip_reset,
+    } = error
+    else {
+        return None;
+    };
+
+    // A reset can activate an upgrade, so a retried transaction can fail
+    // where it was valid when the peer relayed it.
+    if *retried_after_tip_reset {
         return None;
     }
 
-    let score = error.mempool_misbehavior_score();
-    (score != 0).then_some((*advertiser_addr, score))
+    let cools_down = match peer_action(error) {
+        PeerAction::Cooldown => true,
+        PeerAction::BanV5AndLater => *transaction_version < 5,
+        PeerAction::Ban | PeerAction::Ignore => false,
+    };
+
+    if !cools_down || tip_height.is_none() || *tip_height != best_tip_height {
+        return None;
+    }
+
+    // Tip timestamps can be up to two hours in the future, so this node can
+    // pass the tip distance check while its tip is before an upgrade that the
+    // network has activated. A transaction that declares a later upgrade than
+    // the tip's shows that this node can be behind, so it starts no cooldown.
+    // Below NU5, the verifier does not check branch IDs, so such a transaction
+    // can fail with other errors.
+    if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
+        return None;
+    }
+
+    Some(*advertiser_addr)
+}
+
+/// What the mempool does to the peer that relayed a transaction that failed
+/// verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAction {
+    /// Ban the peer. The failure only depends on the transaction and the
+    /// outputs it spends.
+    Ban,
+
+    /// Ban the peer for a v5 or later transaction, and start a cooldown for a
+    /// v4 transaction.
+    ///
+    /// The failure depends on the network upgrade that this node verifies the
+    /// transaction under. A v4 transaction does not encode a consensus branch
+    /// ID. A node whose tip lags the network at an upgrade activation verifies
+    /// it under the wrong upgrade, so these failures can reject a valid v4
+    /// transaction.
+    ///
+    /// A v5 or later transaction encodes its branch ID. The verifier rejects a
+    /// branch ID that differs from this node's upgrade, or a transaction
+    /// version that the upgrade does not support, before it runs these checks.
+    /// So these failures only reach a v5 or later transaction that this node
+    /// verifies under the upgrade the transaction declares.
+    BanV5AndLater,
+
+    /// Start a transaction cooldown. The failure depends on this node's tip,
+    /// which can differ from the relaying peer's tip.
+    Cooldown,
+
+    /// Do nothing. The failure does not show that the relaying peer
+    /// misbehaved.
+    Ignore,
+}
+
+/// Returns what the mempool does to the peer that relayed a transaction that
+/// failed with `error`.
+///
+/// The match lists every error, so each new verification failure needs a
+/// decision.
+fn peer_action(error: &TransactionError) -> PeerAction {
+    use PeerAction::*;
+    use TransactionError::*;
+
+    match error {
+        // The transaction's structure, encodings, Sprout proofs, proof sizes,
+        // and value balance. An outpoint fixes the value of the output it
+        // spends, so the fee does not depend on the tip either.
+        WrongVersion
+        | NoInputs
+        | NoOutputs
+        | BadBalance
+        | IncorrectFee
+        | SmallOrder
+        | Groth16(_)
+        | MalformedGroth16(_)
+        | BothVPubsNonZero
+        | NotEnoughFlags
+        | NotEnoughIronwoodFlags
+        | OrchardHasEnableCrossAddress
+        | OrchardProofSize
+        | IronwoodProofSize
+        | CoinbaseInMempool
+        | NonCoinbaseHasCoinbaseInput => Ban,
+
+        // Spends that repeat inside one transaction, and an expiry height above
+        // the maximum. Spends that conflict with the chain or the mempool fail
+        // with other errors. zcashd scores these failures 100.
+        DuplicateTransparentSpend(_)
+        | DuplicateSproutNullifier(_)
+        | DuplicateSaplingNullifier(_)
+        | DuplicateOrchardNullifier(_)
+        | DuplicateIronwoodNullifier(_)
+        | MaximumExpiryHeight { .. } => Ban,
+
+        // A transaction that spends a transparent coinbase output must only
+        // have shielded outputs. The outpoint fixes whether the spent output
+        // is a coinbase output, so the rule does not depend on the tip.
+        // zcashd does not score this failure.
+        UnshieldedTransparentCoinbaseSpend { .. } => Ban,
+        ValidateContextError(error) => match **error {
+            zs::ValidateContextError::UnshieldedTransparentCoinbaseSpend { .. } => Ban,
+
+            // Spends and anchors in the chain, and coinbase maturity, depend
+            // on the tip. zcashd does not score spent inputs or unknown
+            // anchors, so that an attacker cannot make honest nodes
+            // disconnect each other.
+            _ => Ignore,
+        },
+
+        // Signature hashes commit to the verifying upgrade's branch ID, and
+        // Halo2 proofs use that upgrade's verifying key. The Sapling verifier
+        // checks proofs and signatures together. Only v4 transactions have
+        // Sprout signatures, so Ed25519 failures never ban.
+        Script(script_error) if script_error.is_script_failure() => BanV5AndLater,
+        SaplingVerificationFailed
+        | Halo2VerificationFailed
+        | Ed25519(_)
+        | RedJubjub(_)
+        | RedPallas(_) => BanV5AndLater,
+
+        // Only v5 and later transactions contain Orchard actions.
+        DisabledAddToOrchardPool => BanV5AndLater,
+
+        // ZIP 218 limits apply from NU7. A v5 or later transaction declares
+        // its upgrade, and a branch ID mismatch fails first. A v4 transaction
+        // declares none, so a peer behind NU7 can relay one that exceeds a
+        // limit.
+        OrchardActionsExceedBlockLimit { .. }
+        | IronwoodActionsExceedBlockLimit { .. }
+        | SaplingIOsExceedBlockLimit { .. }
+        | SproutJoinSplitsExceedBlockLimit { .. }
+        | ShieldedCostExceedsBlockBudget { .. } => BanV5AndLater,
+
+        // Canopy forbids Sprout deposits. Replace the previous ban with a
+        // cooldown because an honest peer can still be before activation.
+        DisabledAddToSproutPool => Cooldown,
+
+        // These failures already received no mempool penalty. Preserve that
+        // policy when peers disagree about the tip or network upgrade.
+        WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | ExpiredTransaction { .. } => {
+            Ignore
+        }
+
+        // Honest peers relay these transactions near the tip. zcashd does not
+        // score non-final transactions. A branch ID that this node does not
+        // know can belong to an upgrade that this node's software predates.
+        WrongConsensusBranchIdNu6_3GracePeriod
+        | MissingConsensusBranchId
+        | LockedUntilAfterBlockHeight(_)
+        | LockedUntilAfterBlockTime(_)
+        | ImmatureTransparentCoinbaseSpend { .. } => Ignore,
+
+        // Parents can arrive late or never, and this node's own state lookup
+        // can fail.
+        TransparentInputNotFound | ValidateMempoolLockTimeError(_) => Ignore,
+
+        // Policy rejections: blocks can contain these transactions.
+        Zip317(_)
+        | NonStandardScriptSigSize { .. }
+        | NonStandardScriptSigNotPushOnly { .. }
+        | NonStandardInputs => Ignore,
+
+        // Only block verification returns these. The mempool rejects coinbase
+        // transactions before their coinbase checks.
+        CoinbasePosition
+        | CoinbaseAfterFirst
+        | CoinbaseHasJoinSplit
+        | CoinbaseHasSpend
+        | CoinbaseHasOutputPreHeartwood
+        | CoinbaseHasEnableSpendsOrchard
+        | CoinbaseHasEnableSpendsIronwood
+        | CoinbaseHasOrchardShieldedData
+        | CoinbaseOutputsNotDecryptable
+        | NotCoinbase
+        | CoinbaseExpiryBlockHeight { .. }
+        | CoinbaseConstruction(_)
+        | Subsidy(_) => Ignore,
+
+        // The verifier failed, or the error does not name the rule that failed.
+        Script(_)
+        | InternalDowncastError(_)
+        | Io(_)
+        | TryFromSlice(_)
+        | Amount(_)
+        | Balance(_)
+        | Other(_) => Ignore,
+    }
+}
+
+/// Returns true if `peer` is a zcashd-compat sidecar in `zcashd_compat_peer_ips`.
+///
+/// A sidecar syncs from this node, so its tip trails this node's tip. It
+/// relays transactions that its wallet built for that older tip.
+fn is_zcashd_compat_peer(zcashd_compat_peer_ips: &HashSet<IpAddr>, peer: PeerSocketAddr) -> bool {
+    zcashd_compat_peer_ips.contains(&peer.ip().to_canonical())
+}
+
+/// The longest time the mempool waits for the peer set to accept a disconnect.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts a transaction cooldown for `peer`.
+///
+/// Also disconnects `peer`, without banning it, when this is not its first
+/// cooldown. The first cooldown can come from transactions that were already
+/// queued when the first failure arrived. A later cooldown only starts after an
+/// earlier one ends, so the peer kept relaying invalid transactions.
+fn start_peer_cooldown(
+    peer_cooldowns: &peer_cooldown::PeerCooldowns,
+    outbound: &Outbound,
+    peer: PeerSocketAddr,
+    tx_id: UnminedTxId,
+    expose_peer_addresses: bool,
+) {
+    let Some(cooldown) = peer_cooldowns.record_invalid_transaction(peer.ip(), Instant::now())
+    else {
+        return;
+    };
+
+    tracing::debug!(
+        ?tx_id,
+        peer = %legacy_peer_log_label(peer, expose_peer_addresses),
+        ?cooldown,
+        "ignoring peer transaction advertisements after an invalid transaction"
+    );
+    metrics::counter!("mempool.peer_cooldown.started.total").increment(1);
+
+    if cooldown > peer_cooldown::BASE_COOLDOWN {
+        // Boxing works around a compiler limitation: without it, `tokio::spawn`
+        // cannot prove that the buffer's error conversion holds for every lifetime.
+        let disconnect = outbound
+            .clone()
+            .oneshot(zn::Request::DisconnectPeer(peer))
+            .boxed();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
+            if !matches!(result, Ok(Ok(_))) {
+                tracing::debug!("could not disconnect a peer after repeated transaction failures");
+            }
+        });
+    }
 }
 
 /// The state of the mempool.
@@ -230,7 +498,7 @@ impl ActiveState {
     }
 
     /// Returns a list of requests that will retry every stored and pending transaction.
-    fn transaction_retry_requests(&self) -> Vec<Gossip> {
+    fn transaction_retry_requests(&self) -> Vec<(Gossip, Option<QueueSource>)> {
         match self {
             ActiveState::Disabled => Vec::new(),
             ActiveState::Enabled {
@@ -243,65 +511,16 @@ impl ActiveState {
                 let storage = storage
                     .transactions()
                     .values()
-                    .map(|tx| tx.transaction.clone().into());
+                    .map(|tx| (tx.transaction.clone().into(), None));
                 transactions.extend(storage);
 
-                let pending = tx_downloads.transaction_requests().cloned();
+                let pending = tx_downloads
+                    .transaction_requests()
+                    .map(|(tx, source)| (tx.clone(), source.clone()));
                 transactions.extend(pending);
 
                 transactions
             }
-        }
-    }
-
-    /// Returns the number of pending transactions waiting for download or verify,
-    /// or zero if the mempool is disabled.
-    #[cfg(feature = "progress-bar")]
-    fn queued_transaction_count(&self) -> usize {
-        match self {
-            ActiveState::Disabled => 0,
-            ActiveState::Enabled { tx_downloads, .. } => tx_downloads.in_flight(),
-        }
-    }
-
-    /// Returns the number of transactions in storage, or zero if the mempool is disabled.
-    #[cfg(feature = "progress-bar")]
-    fn transaction_count(&self) -> usize {
-        match self {
-            ActiveState::Disabled => 0,
-            ActiveState::Enabled { storage, .. } => storage.transaction_count(),
-        }
-    }
-
-    /// Returns the cost of the transactions in the mempool, according to ZIP-401.
-    /// Returns zero if the mempool is disabled.
-    #[cfg(feature = "progress-bar")]
-    fn total_cost(&self) -> u64 {
-        match self {
-            ActiveState::Disabled => 0,
-            ActiveState::Enabled { storage, .. } => storage.total_cost(),
-        }
-    }
-
-    /// Returns the total serialized size of the verified transactions in the set,
-    /// or zero if the mempool is disabled.
-    ///
-    /// See [`Storage::total_serialized_size()`] for details.
-    #[cfg(feature = "progress-bar")]
-    pub fn total_serialized_size(&self) -> usize {
-        match self {
-            ActiveState::Disabled => 0,
-            ActiveState::Enabled { storage, .. } => storage.total_serialized_size(),
-        }
-    }
-
-    /// Returns the number of rejected transaction hashes in storage,
-    /// or zero if the mempool is disabled.
-    #[cfg(feature = "progress-bar")]
-    fn rejected_transaction_count(&mut self) -> usize {
-        match self {
-            ActiveState::Disabled => 0,
-            ActiveState::Enabled { storage, .. } => storage.rejected_transaction_count(),
         }
     }
 }
@@ -354,30 +573,18 @@ pub struct Mempool {
     /// Used to broadcast transaction ids to peers.
     transaction_sender: broadcast::Sender<MempoolChange>,
 
-    /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
+    /// Peers whose transactions are ignored after they relayed invalid
+    /// transactions. Shared with the download tasks, and kept across mempool
+    /// resets and deactivations.
+    peer_cooldowns: peer_cooldown::PeerCooldowns,
+
+    /// Bans peers that relay transactions whose verification failures do not
+    /// depend on this node's tip.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
 
-    // Diagnostics
-    //
-    /// Queued transactions pending download or verification transmitter.
-    /// Only displayed after the mempool's first activation.
-    #[cfg(feature = "progress-bar")]
-    queued_count_bar: Option<howudoin::Tx>,
-
-    /// Number of mempool transactions transmitter.
-    /// Only displayed after the mempool's first activation.
-    #[cfg(feature = "progress-bar")]
-    transaction_count_bar: Option<howudoin::Tx>,
-
-    /// Mempool transaction cost transmitter.
-    /// Only displayed after the mempool's first activation.
-    #[cfg(feature = "progress-bar")]
-    transaction_cost_bar: Option<howudoin::Tx>,
-
-    /// Rejected transactions transmitter.
-    /// Only displayed after the mempool's first activation.
-    #[cfg(feature = "progress-bar")]
-    rejected_count_bar: Option<howudoin::Tx>,
+    /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
+    /// cools down, or disconnects these peers.
+    zcashd_compat_peer_ips: HashSet<IpAddr>,
 }
 
 impl Mempool {
@@ -393,6 +600,7 @@ impl Mempool {
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -411,15 +619,12 @@ impl Mempool {
             _state_guard: state,
             tx_verifier,
             transaction_sender,
+            peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
-            #[cfg(feature = "progress-bar")]
-            queued_count_bar: None,
-            #[cfg(feature = "progress-bar")]
-            transaction_count_bar: None,
-            #[cfg(feature = "progress-bar")]
-            transaction_cost_bar: None,
-            #[cfg(feature = "progress-bar")]
-            rejected_count_bar: None,
+            zcashd_compat_peer_ips: zcashd_compat_peer_ips
+                .into_iter()
+                .map(|ip| ip.to_canonical())
+                .collect(),
         };
 
         // Make sure `is_enabled` is accurate.
@@ -503,6 +708,7 @@ impl Mempool {
             self.read_state.clone(),
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
+            self.peer_cooldowns.clone(),
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -581,115 +787,6 @@ impl Mempool {
             ActiveState::Enabled { .. } => true,
         }
     }
-
-    /// Update metrics for the mempool.
-    fn update_metrics(&mut self) {
-        // Shutdown if needed
-        #[cfg(feature = "progress-bar")]
-        if matches!(howudoin::cancelled(), Some(true)) {
-            self.disable_metrics();
-            return;
-        }
-
-        // Initialize if just activated
-        #[cfg(feature = "progress-bar")]
-        if self.is_enabled()
-            && (self.queued_count_bar.is_none()
-                || self.transaction_count_bar.is_none()
-                || self.transaction_cost_bar.is_none()
-                || self.rejected_count_bar.is_none())
-        {
-            let _max_transaction_count = self.config.tx_cost_limit
-                / zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
-
-            let transaction_count_bar = *howudoin::new_root()
-                .label("Mempool Transactions")
-                .set_pos(0u64);
-            // .set_len(max_transaction_count);
-
-            let transaction_cost_bar = howudoin::new_with_parent(transaction_count_bar.id())
-                .label("Mempool Cost")
-                .set_pos(0u64)
-                // .set_len(self.config.tx_cost_limit)
-                .fmt_as_bytes(true);
-
-            let queued_count_bar = *howudoin::new_with_parent(transaction_cost_bar.id())
-                .label("Mempool Queue")
-                .set_pos(0u64);
-            // .set_len(
-            //     u64::try_from(downloads::MAX_INBOUND_CONCURRENCY).expect("fits in u64"),
-            // );
-
-            let rejected_count_bar = *howudoin::new_with_parent(queued_count_bar.id())
-                .label("Mempool Rejects")
-                .set_pos(0u64);
-            // .set_len(
-            //     u64::try_from(storage::MAX_EVICTION_MEMORY_ENTRIES).expect("fits in u64"),
-            // );
-
-            self.transaction_count_bar = Some(transaction_count_bar);
-            self.transaction_cost_bar = Some(transaction_cost_bar);
-            self.queued_count_bar = Some(queued_count_bar);
-            self.rejected_count_bar = Some(rejected_count_bar);
-        }
-
-        // Update if the mempool has ever been active
-        #[cfg(feature = "progress-bar")]
-        if let (
-            Some(queued_count_bar),
-            Some(transaction_count_bar),
-            Some(transaction_cost_bar),
-            Some(rejected_count_bar),
-        ) = (
-            self.queued_count_bar,
-            self.transaction_count_bar,
-            self.transaction_cost_bar,
-            self.rejected_count_bar,
-        ) {
-            let queued_count = self.active_state.queued_transaction_count();
-            let transaction_count = self.active_state.transaction_count();
-
-            let transaction_cost = self.active_state.total_cost();
-            let transaction_size = self.active_state.total_serialized_size();
-            let transaction_size =
-                indicatif::HumanBytes(transaction_size.try_into().expect("fits in u64"));
-
-            let rejected_count = self.active_state.rejected_transaction_count();
-
-            queued_count_bar.set_pos(u64::try_from(queued_count).expect("fits in u64"));
-
-            transaction_count_bar.set_pos(u64::try_from(transaction_count).expect("fits in u64"));
-
-            // Display the cost and cost limit, with the actual size as a description.
-            //
-            // Costs can be much higher than the transaction size due to the
-            // MEMPOOL_TRANSACTION_COST_THRESHOLD minimum cost.
-            transaction_cost_bar
-                .set_pos(transaction_cost)
-                .desc(format!("Actual size {transaction_size}"));
-
-            rejected_count_bar.set_pos(u64::try_from(rejected_count).expect("fits in u64"));
-        }
-    }
-
-    /// Disable metrics for the mempool.
-    fn disable_metrics(&self) {
-        #[cfg(feature = "progress-bar")]
-        {
-            if let Some(bar) = self.queued_count_bar {
-                bar.close()
-            }
-            if let Some(bar) = self.transaction_count_bar {
-                bar.close()
-            }
-            if let Some(bar) = self.transaction_cost_bar {
-                bar.close()
-            }
-            if let Some(bar) = self.rejected_count_bar {
-                bar.close()
-            }
-        }
-    }
 }
 
 impl Service<Request> for Mempool {
@@ -712,8 +809,6 @@ impl Service<Request> for Mempool {
         // When the mempool is disabled we still return that the service is ready.
         // Otherwise, callers could block waiting for the mempool to be enabled.
         if !self.is_enabled() {
-            self.update_metrics();
-
             return Poll::Ready(Ok(()));
         }
 
@@ -756,14 +851,12 @@ impl Service<Request> for Mempool {
                     "re-verifying mempool transactions after a chain fork"
                 );
 
-                for tx in tx_retries {
+                for (tx, source) in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, None, None);
+                    let _result = tx_downloads.retry_after_tip_reset(tx, source);
                 }
             }
-
-            self.update_metrics();
 
             return Poll::Ready(Ok(()));
         }
@@ -783,6 +876,12 @@ impl Service<Request> for Mempool {
             let mut mined_mempool_ids = HashSet::<_>::new();
 
             let best_tip_height = self.latest_chain_tip.best_tip_height();
+            let tip_upgrade = NetworkUpgrade::current(
+                self.chain_tip_change.network(),
+                best_tip_height
+                    .and_then(|height| height + 1)
+                    .unwrap_or(Height(0)),
+            );
 
             // Clean up completed download tasks and add to mempool if successful.
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
@@ -840,12 +939,31 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if is_current_enough_for_mempool {
-                            if let Some((advertiser_addr, score)) =
-                                transaction_misbehavior(&error, best_tip_height)
-                            {
-                                let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
-                            }
+                        let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
+                        let ban_peer = transaction_ban_peer(&error)
+                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        if let Some(peer) = ban_peer {
+                            let _ = self
+                                .misbehavior_sender
+                                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                        }
+
+                        // Only start cooldowns while this node's validation context is
+                        // current. A stale node verifies transactions against old rules.
+                        let cooldown_peer = is_current_enough_for_mempool
+                            .then(|| {
+                                transaction_cooldown_peer(&error, best_tip_height, tip_upgrade)
+                            })
+                            .flatten()
+                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        if let Some(peer) = cooldown_peer {
+                            start_peer_cooldown(
+                                &self.peer_cooldowns,
+                                &self.outbound,
+                                peer,
+                                tx_id,
+                                self.expose_peer_addresses,
+                            );
                         }
 
                         let peer_label =
@@ -866,6 +984,10 @@ impl Service<Request> for Mempool {
                             ) => metrics::counter!(
                                 "mempool.rejected.transactions.total",
                                 "reason" => "transaction_too_large"
+                            )
+                            .increment(1),
+                            TransactionDownloadVerifyError::PeerCoolingDown => metrics::counter!(
+                                "mempool.peer_cooldown.ignored.transactions.total"
                             )
                             .increment(1),
                             _ => metrics::counter!(
@@ -978,8 +1100,6 @@ impl Service<Request> for Mempool {
                     .send(MempoolChange::mined(mined_mempool_ids))?;
             }
         }
-
-        self.update_metrics();
 
         Poll::Ready(Ok(()))
     }
@@ -1153,9 +1273,6 @@ impl Service<Request> for Mempool {
                             .map(|result| result.map_err(BoxError::from))
                             .collect();
 
-                    // We've added transactions to the queue
-                    self.update_metrics();
-
                     async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 
@@ -1172,18 +1289,32 @@ impl Service<Request> for Mempool {
                         "got mempool QueueFromPeer request"
                     );
 
-                    for gossiped_tx in transactions {
-                        if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
-                            continue;
-                        }
-                        let _ = tx_downloads.download_if_needed_and_verify(
-                            gossiped_tx,
-                            Some(source.clone()),
-                            None,
-                        );
-                    }
+                    let is_cooling_down = match &source {
+                        QueueSource::LegacySocket(addr) => self
+                            .peer_cooldowns
+                            .is_cooling_down(addr.ip(), Instant::now()),
+                        QueueSource::Zakura(_) => false,
+                    };
 
-                    self.update_metrics();
+                    if is_cooling_down {
+                        trace!(
+                            req_count = ?transactions.len(),
+                            "ignored transactions from a peer in a transaction cooldown"
+                        );
+                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+                            .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+                    } else {
+                        for gossiped_tx in transactions {
+                            if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
+                                continue;
+                            }
+                            let _ = tx_downloads.download_if_needed_and_verify(
+                                gossiped_tx,
+                                Some(source.clone()),
+                                None,
+                            );
+                        }
+                    }
 
                     async move { Ok(Response::Queued(Vec::new())) }.boxed()
                 }
@@ -1326,11 +1457,5 @@ impl Service<Request> for Mempool {
                 async move { Ok(resp) }.boxed()
             }
         }
-    }
-}
-
-impl Drop for Mempool {
-    fn drop(&mut self) {
-        self.disable_metrics();
     }
 }

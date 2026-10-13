@@ -162,6 +162,45 @@ impl PartialEq for RetainedHeaderPath {
 
 impl Eq for RetainedHeaderPath {}
 
+/// A sticky notification for one occupied serving resource.
+///
+/// State registers the signal while it holds the capacity lock. A release remains
+/// observable even when the reactor receives the refusal after the release.
+#[derive(Clone, Debug)]
+pub struct ServingCapacitySignal(tokio::sync::watch::Sender<bool>);
+
+impl Default for ServingCapacitySignal {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl PartialEq for ServingCapacitySignal {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+}
+
+impl Eq for ServingCapacitySignal {}
+
+impl ServingCapacitySignal {
+    /// Record a confirmed release of this resource.
+    pub fn release(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Return whether state has released this resource.
+    pub fn is_released(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Wait for release, including a release before this call.
+    pub async fn released(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|released| *released).await;
+    }
+}
+
 /// Result of acquiring an immutable retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AcquirePathReply {
@@ -173,8 +212,10 @@ pub enum AcquirePathReply {
     NoLocatorIntersection,
     /// Pruning removed the required target history.
     HistoryPruned,
-    /// State cannot currently retain another path.
+    /// State cannot currently retain another path for a non-capacity reason.
     Busy,
+    /// An occupied resource refused the request.
+    CapacityBusy(ServingCapacitySignal),
 }
 
 /// A bounded read from an already acquired retained path.
@@ -581,67 +622,6 @@ impl Port for InertHeaderChainPort {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Debug)]
-    struct MinimalMock;
-
-    impl Port for MinimalMock {
-        fn continuation_locator(
-            &self,
-        ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn vct_repair_context(
-            &self,
-            _owner: BodyWorkOwner,
-            _height: block::Height,
-        ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
-            Box::pin(async { Ok(VctRepairContextReply::Stale) })
-        }
-
-        fn acquire_header_path(
-            &self,
-            _request: AcquirePath,
-        ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-            Box::pin(async { Ok(AcquirePathReply::Busy) })
-        }
-
-        fn read_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-            _request: ReadPath,
-        ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-            Box::pin(async { Ok(ReadPathReply::Unavailable) })
-        }
-
-        fn release_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn prepare_header_target(
-            &self,
-            _request: PrepareHeaderTarget,
-        ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-
-        fn apply_header_target(
-            &self,
-            _target: PreparedHeaderTarget,
-        ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-    }
-
-    #[tokio::test]
-    async fn port_is_object_safe_and_mockable_without_state_services() {
-        let port: Arc<dyn Port> = Arc::new(MinimalMock);
-        assert!(port.continuation_locator().await.unwrap().is_none());
-    }
 
     #[test]
     fn retained_path_identity_requires_the_issuing_adapter_key() {

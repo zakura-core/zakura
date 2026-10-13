@@ -697,6 +697,10 @@ sequential reads rather than retaining the whole response from one contiguous re
 no more than one `Block` for each requested height. It MUST finish with exactly one `BlocksDone`
 or `RangeUnavailable`.
 
+Body ranges follow one snapshot of the selected header branch, including retained side-fork
+bodies when first-received mining chooses a different equal-work tip. The response stops at the
+first unavailable selected body rather than substituting a body from another branch at that height.
+
 Repeated unavailable-range requests still consume lookup work. The receiver MUST bound that work
 even when responses are small and output backpressure does not engage. Continuous requests MUST
 yield shared execution so another runnable peer can progress. Prioritization policy remains
@@ -763,12 +767,15 @@ peer that serves no blocks for heights inside its advertised servable range.
   - count = 1..=128
   - exact consumption
 - **Reservation**
-  - live `GetBlocks` range with this `start_height` and requested count
+  - live `GetBlocks` range with this `start_height`
   - no block has been consumed from the range
-  - `count` equals the requested count
+  - `count` does not exceed the requested count
   - consumes the terminal part and closes the reservation
 
-The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
+Version 2 senders can report a smaller count after clamping a request to their available heights.
+The ending closes the entire original range. The handler MUST requeue every unreceived height in
+that original range, not just the reported count. A retry policy MAY avoid this peer for the
+immediate retry.
 
 ### Block sync successor (planned)
 

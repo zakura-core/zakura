@@ -2,9 +2,9 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use iroh::{protocol::Router, Endpoint, EndpointAddr};
 use tokio_util::task::AbortOnDropHandle;
 use zakura_chain::parameters::Network;
+use zakura_quic::{NodeAddr, QuicEndpoint};
 
 use super::{
     service::LayoutShared, LayoutService, LayoutSession, SiblingService, StreamConformance,
@@ -14,7 +14,7 @@ use crate::{
     zakura::{
         handler::serve_native_dial_connection, testkit::LocalEndpointFactory, Service,
         ServiceRegistry, Stream, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle, P2P_V2_ALPN,
+        ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle,
     },
     BoxError, Config,
 };
@@ -22,7 +22,7 @@ use crate::{
 /// A node with the layout service and two siblings.
 #[derive(Debug)]
 pub(crate) struct LayoutNode<A: StreamConformance> {
-    endpoint: Endpoint,
+    endpoint: QuicEndpoint,
     zakura: ZakuraEndpoint,
     pub(crate) service: Arc<LayoutService<A>>,
     pub(crate) siblings: [Arc<SiblingService>; 2],
@@ -47,7 +47,7 @@ impl<A: StreamConformance> LayoutNode<A> {
         layout: &'static [Stream],
         limits: ZakuraLocalLimits,
     ) -> Result<Self, BoxError> {
-        let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        let endpoint = LocalEndpointFactory::with_limits(&limits)
             .endpoint(seed)
             .await?;
         let supervisor = ZakuraSupervisorHandle::new(16);
@@ -62,13 +62,11 @@ impl<A: StreamConformance> LayoutNode<A> {
             limits.clone(),
             Arc::new(ServiceRegistry::new(services)?),
         )
-        .with_endpoint(endpoint.clone());
-        let router = Router::builder(endpoint.clone())
-            .accept(P2P_V2_ALPN, handler.clone())
-            .spawn();
+        .with_local_node_id(endpoint.local_id());
+        endpoint.serve(handler.clone())?;
         Ok(Self {
-            endpoint,
-            zakura: ZakuraEndpoint::from_parts(router, supervisor, handler),
+            endpoint: endpoint.clone(),
+            zakura: ZakuraEndpoint::from_parts(endpoint, supervisor, handler),
             service,
             siblings,
             limits,
@@ -78,12 +76,12 @@ impl<A: StreamConformance> LayoutNode<A> {
 
     /// This node's identity.
     pub(crate) fn id(&self) -> ZakuraPeerId {
-        ZakuraPeerId::new(self.endpoint.id().as_bytes().to_vec())
+        ZakuraPeerId::new(self.endpoint.local_id().as_bytes().to_vec())
             .expect("an endpoint id is a valid peer id")
     }
 
     /// This node's address.
-    pub(crate) async fn addr(&self) -> EndpointAddr {
+    pub(crate) async fn addr(&self) -> NodeAddr {
         LocalEndpointFactory::node_addr(&self.endpoint).await
     }
 

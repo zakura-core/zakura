@@ -279,7 +279,8 @@ fn newcomer_never_evicts_its_ancestors() {
     let other = insert(&mut storage, &factory.tx(20_000), vec![]);
     insert(&mut storage, &factory.tx(30_000), vec![]);
 
-    let newcomer = factory.tx(20_000 + MARGINAL_FEE);
+    // The child brings both itself and its parent above the victim plus increment.
+    let newcomer = factory.tx(2 * (20_000 + MARGINAL_FEE) - 10_000);
     let (result, evicted) =
         storage.insert_with_evicted_ids(newcomer.clone(), vec![first_output(&parent)], None);
 
@@ -548,6 +549,204 @@ fn higher_fee_conflicting_transaction_does_not_replace_or_evict() {
     }
 }
 
+/// Supported ways to connect a newcomer to an existing two-member group.
+#[derive(Clone, Copy)]
+enum AdmissionShape {
+    Chain,
+    Branch,
+    Join,
+    Triangle,
+}
+
+/// Fills a pool with the two-member group and one independent eviction victim.
+fn ancestor_admission_fixture(
+    factory: &mut TxFactory,
+    shape: AdmissionShape,
+    capacity: u64,
+) -> (Storage, Vec<OutPoint>, UnminedTxId, u64) {
+    let mut storage = storage_for(capacity);
+    let parent = factory.tx_with(COST, 2, 0);
+    insert(&mut storage, &parent, vec![]);
+    let child_fee = match shape {
+        AdmissionShape::Branch => 10 * COST,
+        _ => COST,
+    };
+    let child = factory.tx_with(child_fee, 1, 0);
+    let spent = match shape {
+        AdmissionShape::Join => vec![],
+        _ => vec![first_output(&parent)],
+    };
+    insert(&mut storage, &child, spent);
+    let victim = insert(&mut storage, &factory.tx(COST + 2 * MARGINAL_FEE), vec![]);
+    let spent = match shape {
+        AdmissionShape::Chain => vec![first_output(&child)],
+        AdmissionShape::Branch => vec![output(&parent, 1)],
+        AdmissionShape::Join => vec![first_output(&parent), first_output(&child)],
+        AdmissionShape::Triangle => vec![output(&parent, 1), first_output(&child)],
+    };
+    let ancestor_count = match shape {
+        AdmissionShape::Branch => 1,
+        _ => 2,
+    };
+    let package_fee = (ancestor_count + 1) * (COST + 3 * MARGINAL_FEE);
+    let required_fee = package_fee - ancestor_count * COST;
+    (storage, spent, victim, required_fee)
+}
+
+#[test]
+fn ancestor_package_rate_must_outbid_victims_for_every_group_shape() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    for shape in [
+        AdmissionShape::Chain,
+        AdmissionShape::Branch,
+        AdmissionShape::Join,
+        AdmissionShape::Triangle,
+    ] {
+        let (mut storage, spent, victim, required_fee) =
+            ancestor_admission_fixture(&mut factory, shape, 3);
+        let before = ids(&storage);
+        let before_cost = storage.total_cost();
+        // Both rejected children pass the old child-only admission check.
+        for fee in [COST + 3 * MARGINAL_FEE, required_fee - 1] {
+            let child = factory.tx(fee);
+            assert!(VerifiedSet::eviction_cost(&child)
+                .exceeds_by_increment(EvictionCost::new(COST + 2 * MARGINAL_FEE, COST)));
+            let (result, evicted) = storage.insert_with_evicted_ids(child, spent.clone(), None);
+            assert_eq!(
+                result,
+                Err(ExactTipRejectionError::BelowEvictionCost.into())
+            );
+            assert!(evicted.is_empty());
+            assert_eq!(ids(&storage), before);
+            assert_eq!(storage.total_cost(), before_cost);
+            storage.verified.assert_dependency_groups_are_bounded();
+        }
+        let child = factory.tx(required_fee);
+        let (result, evicted) = storage.insert_with_evicted_ids(child.clone(), spent, None);
+        assert_eq!(result, Ok(child.transaction.id()));
+        assert_eq!(evicted, [victim].into());
+        storage.verified.assert_dependency_groups_are_bounded();
+    }
+}
+
+#[test]
+fn ancestor_package_pricing_does_not_apply_with_spare_capacity() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    for shape in [
+        AdmissionShape::Chain,
+        AdmissionShape::Branch,
+        AdmissionShape::Join,
+        AdmissionShape::Triangle,
+    ] {
+        let (mut storage, spent, _, _) = ancestor_admission_fixture(&mut factory, shape, 4);
+        let before = ids(&storage);
+        let child = factory.tx(COST);
+        let (result, evicted) = storage.insert_with_evicted_ids(child.clone(), spent, None);
+        assert_eq!(result, Ok(child.transaction.id()));
+        assert!(evicted.is_empty());
+        assert!(ids(&storage).is_superset(&before));
+        storage.verified.assert_dependency_groups_are_bounded();
+    }
+}
+
+#[test]
+fn rich_ancestors_do_not_subsidize_an_underpaying_child() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(3);
+    let tail = insert_chain(&mut storage, &mut factory, 2, |_| 10 * COST);
+    let victim = insert(&mut storage, &factory.tx(COST), vec![]);
+    let before = ids(&storage);
+    let child = factory.tx(COST + MARGINAL_FEE - 1);
+    let (result, evicted) = storage.insert_with_evicted_ids(child, vec![first_output(&tail)], None);
+    assert_eq!(
+        result,
+        Err(ExactTipRejectionError::BelowEvictionCost.into())
+    );
+    assert!(evicted.is_empty());
+    assert_eq!(ids(&storage), before);
+    let child = factory.tx(COST + MARGINAL_FEE);
+    let (result, evicted) =
+        storage.insert_with_evicted_ids(child.clone(), vec![first_output(&tail)], None);
+    assert_eq!(result, Ok(child.transaction.id()));
+    assert_eq!(evicted, [victim].into());
+}
+
+#[test]
+fn ancestor_package_must_outbid_every_victim_before_any_eviction() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(3);
+    let parent = factory.tx_with(COST, 1, 0);
+    insert(&mut storage, &parent, vec![]);
+    let cheap = insert(&mut storage, &factory.tx(COST), vec![]);
+    let expensive = insert(&mut storage, &factory.tx(2 * COST), vec![]);
+    let probe = factory.tx_with(10 * COST, 0, 9_000);
+    assert!(probe.cost() > COST && probe.cost() <= 2 * COST);
+    let victim_rate = 2 * COST + MARGINAL_FEE;
+    let own_fee = (victim_rate * probe.cost()).div_ceil(COST);
+    let package_fee = (victim_rate * (probe.cost() + parent.cost())).div_ceil(COST);
+    let required_fee = package_fee - u64::from(parent.miner_fee);
+    let before = ids(&storage);
+    for fee in [own_fee, required_fee - 1] {
+        let child = factory.tx_with(fee, 0, 9_000);
+        let (result, evicted) =
+            storage.insert_with_evicted_ids(child, vec![first_output(&parent)], None);
+        assert_eq!(
+            result,
+            Err(ExactTipRejectionError::BelowEvictionCost.into())
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(ids(&storage), before);
+        storage.verified.assert_dependency_groups_are_bounded();
+    }
+    let child = factory.tx_with(required_fee, 0, 9_000);
+    let (result, evicted) =
+        storage.insert_with_evicted_ids(child.clone(), vec![first_output(&parent)], None);
+    assert_eq!(result, Ok(child.transaction.id()));
+    assert_eq!(evicted, [cheap, expensive].into());
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn rebuilding_an_evicted_chain_requires_a_higher_package_rate() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(3);
+    let mut standalone_fee = COST + 2 * MARGINAL_FEE;
+    insert(&mut storage, &factory.tx(standalone_fee), vec![]);
+    for _ in 0..5 {
+        let tail = insert_chain(&mut storage, &mut factory, 2, |_| COST);
+        let package_rate = standalone_fee + MARGINAL_FEE;
+        let required_fee = 3 * package_rate - 2 * COST;
+        let insufficient = factory.tx(required_fee - 1);
+        let before = ids(&storage);
+        let (result, evicted) =
+            storage.insert_with_evicted_ids(insufficient, vec![first_output(&tail)], None);
+        assert_eq!(
+            result,
+            Err(ExactTipRejectionError::BelowEvictionCost.into())
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(ids(&storage), before);
+        let child = factory.tx(required_fee);
+        assert!(storage
+            .insert(child, vec![first_output(&tail)], None)
+            .is_ok());
+        let old_fee = standalone_fee;
+        standalone_fee = package_rate + MARGINAL_FEE;
+        assert!(standalone_fee > old_fee);
+        let (result, evicted) =
+            storage.insert_with_evicted_ids(factory.tx(standalone_fee), vec![], None);
+        assert!(result.is_ok());
+        assert_eq!(evicted.len(), MAX_MEMPOOL_PACKAGE_TRANSACTIONS);
+        assert_eq!(storage.transaction_count(), 1);
+        storage.verified.assert_dependency_groups_are_bounded();
+    }
+}
+
 /// Returns `tx` with `padding` more bytes of authorizing data.
 ///
 /// The padded transaction has the same mined ID and fee, but a different witnessed ID and a
@@ -649,7 +848,13 @@ fn reference_eviction(
     }
 
     let needed = (storage.total_cost() + incoming.cost()).saturating_sub(storage.tx_cost_limit);
-    let incoming = VerifiedSet::eviction_cost(incoming);
+    let own_fee = u64::from(incoming.miner_fee);
+    let own_cost = incoming.cost();
+    let ancestor_fee: u64 = unavailable
+        .iter()
+        .map(|id| u64::from(transactions[id].miner_fee))
+        .sum();
+    let ancestor_cost: u64 = unavailable.iter().map(|id| transactions[id].cost()).sum();
     let mut evicted = HashSet::new();
     let mut freed = 0;
 
@@ -671,7 +876,11 @@ fn reference_eviction(
             .min_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
             .ok_or(ExactTipRejectionError::BelowEvictionCost)?;
 
-        if !incoming.exceeds_by_increment(score) {
+        // Independently check both rates without production combine/min helpers.
+        let outbids =
+            |fee: u64, cost: u64| EvictionCost::new(fee, cost).exceeds_by_increment(score);
+        if !outbids(own_fee, own_cost) || !outbids(own_fee + ancestor_fee, own_cost + ancestor_cost)
+        {
             return Err(ExactTipRejectionError::BelowEvictionCost.into());
         }
 

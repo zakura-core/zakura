@@ -2,62 +2,23 @@
 
 use std::{
     fmt::Debug,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 use color_eyre::{
-    eyre::{eyre, Report, WrapErr},
-    section::Section,
-    section::SectionExt,
+    eyre::{eyre, Report},
+    section::{Section, SectionExt},
 };
 use futures::future::{ready, Ready};
 use tower::{Service, ServiceExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// An error-checking function: is the value an expected error?
-///
-/// If the checked error is the expected error, the function should return `Ok(())`.
-/// Otherwise, it should just return the checked error, wrapped inside `Err`.
-pub type ErrorChecker = fn(Option<BoxError>) -> Result<(), BoxError>;
-
 /// An expected error in a transcript.
 #[derive(Debug, Clone)]
 pub enum ExpectedTranscriptError {
-    /// Match any error
+    /// Match any error.
     Any,
-    /// Use a validator function to check for matching errors
-    Exact(Arc<ErrorChecker>),
-}
-
-impl ExpectedTranscriptError {
-    /// Convert the `verifier` function into an exact error checker
-    pub fn exact(verifier: ErrorChecker) -> Self {
-        ExpectedTranscriptError::Exact(verifier.into())
-    }
-
-    /// Check the actual error `e` against this expected error.
-    #[track_caller]
-    fn check(&self, e: BoxError) -> Result<(), Report> {
-        match self {
-            ExpectedTranscriptError::Any => Ok(()),
-            ExpectedTranscriptError::Exact(checker) => checker(Some(e)),
-        }
-        .map_err(ErrorCheckerError)
-        .wrap_err("service returned an error but it didn't match the expected error")
-    }
-
-    fn mock(&self) -> Report {
-        match self {
-            ExpectedTranscriptError::Any => eyre!("mock error"),
-            ExpectedTranscriptError::Exact(checker) => {
-                checker(None).map_err(|e| eyre!(e)).expect_err(
-                    "transcript should correctly produce the expected mock error when passed None",
-                )
-            }
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,37 +79,16 @@ where
                         .with_section(|| format!("{rsp:?}").header("Found Response:"))?;
                     }
                 }
-                (Ok(rsp), Err(error_checker)) => {
-                    let error = Err(eyre!("received a response when an error was expected"))
+                (Ok(rsp), Err(_)) => {
+                    return Err(eyre!("received a response when an error was expected"))
                         .with_section(|| format!("{rsp:?}").header("Found Response:"));
-
-                    let error = match std::panic::catch_unwind(|| error_checker.mock()) {
-                        Ok(expected_err) => error
-                            .with_section(|| format!("{expected_err:?}").header("Expected Error:")),
-                        Err(pi) => {
-                            let payload = pi
-                                .downcast_ref::<String>()
-                                .cloned()
-                                .or_else(|| pi.downcast_ref::<&str>().map(ToString::to_string))
-                                .unwrap_or_else(|| "<non string panic payload>".into());
-
-                            error
-                                .section(payload.header("Panic:"))
-                                .wrap_err("ErrorChecker panicked when producing expected response")
-                        }
-                    };
-
-                    error?;
                 }
                 (Err(e), Ok(expected_rsp)) => {
                     Err(eyre!("received an error when a response was expected"))
                         .with_error(|| ErrorCheckerError(e.into()))
                         .with_section(|| format!("{expected_rsp:?}").header("Expected Response:"))?
                 }
-                (Err(e), Err(error_checker)) => {
-                    error_checker.check(e.into())?;
-                    continue;
-                }
+                (Err(_), Err(_)) => continue,
             }
         }
         Ok(())
@@ -185,7 +125,7 @@ where
                         )
                     }
                 }
-                Err(check_fn) => ready(Err(check_fn.mock())),
+                Err(_) => ready(Err(eyre!("mock error"))),
             }
         } else {
             ready(Err(eyre!("Got request after transcript ended")))

@@ -297,13 +297,18 @@ async fn retention_retries_latest_status_only_for_peer_with_full_outbound_queue(
     let (_, _healthy_inbound, mut healthy_outbound, _) = harness.connect(0xe9).await;
     wait_for_outbound_status(&mut healthy_outbound).await;
 
-    sender
-        .try_send(
+    // The requester may temporarily own a queue permit after a receive.
+    time::timeout(
+        Duration::from_secs(1),
+        sender.send(
             BlockSyncMessage::Status(initial_status)
                 .encode_frame()
                 .expect("filler status encodes"),
-        )
-        .expect("the established peer's outbound queue fills");
+        ),
+    )
+    .await
+    .expect("the requester releases an unused permit")
+    .expect("the established peer's outbound queue fills");
     for low in [2, 3] {
         harness
             .retained
@@ -366,13 +371,18 @@ async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_q
         block::Height(4)
     );
     wait_for_outbound_status(&mut healthy_outbound).await;
-    sender
-        .try_send(
+    // The requester may temporarily own a queue permit after a receive.
+    time::timeout(
+        Duration::from_secs(1),
+        sender.send(
             BlockSyncMessage::Status(initial)
                 .encode_frame()
-                .expect("filler encodes"),
-        )
-        .expect("one peer's queue fills");
+                .expect("filler status encodes"),
+        ),
+    )
+    .await
+    .expect("the requester releases an unused permit")
+    .expect("one peer's queue fills");
 
     let retained = harness.retained.as_ref().expect("publisher exists");
     retained.send(block::Height(2)).expect("reactor subscribes");

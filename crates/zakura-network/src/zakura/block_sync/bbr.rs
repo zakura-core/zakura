@@ -81,6 +81,28 @@ impl WindowedSamples {
             .is_none_or(|cutoff| newest_at >= cutoff)
     }
 
+    fn next_min_expiry(&self, now: Instant) -> Option<Instant> {
+        let minimum = self.min(now)?;
+        // Equal minima keep the score unchanged until the newest one expires.
+        let at = self
+            .samples
+            .iter()
+            .filter(|(_, value)| *value == minimum)
+            .map(|(at, _)| *at)
+            .max()?;
+        Self::expiry(at, self.horizon)
+    }
+
+    fn last_expiry(&self, now: Instant) -> Option<Instant> {
+        Self::expiry(self.newest_at?, self.horizon).filter(|deadline| *deadline > now)
+    }
+
+    fn expiry(at: Instant, horizon: Duration) -> Option<Instant> {
+        // Samples remain fresh at the inclusive horizon boundary.
+        at.checked_add(horizon)?
+            .checked_add(Duration::from_nanos(1))
+    }
+
     fn fresh_values(&self, now: Instant) -> impl Iterator<Item = f64> + '_ {
         let cutoff = now.checked_sub(self.horizon);
         self.samples
@@ -561,6 +583,16 @@ impl BbrState {
         self.btlbw_per_sec.has_fresh_sample(now) && self.rtprop_secs.has_fresh_sample(now)
     }
 
+    pub(super) fn next_expiry(&self, now: Instant) -> Option<Instant> {
+        [
+            self.rtprop_secs.next_min_expiry(now),
+            self.btlbw_per_sec.last_expiry(now),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     pub(super) fn rtprop_ms(&self, now: Instant) -> Option<u64> {
         self.rtprop_secs.min(now).map(secs_to_ms)
     }
@@ -657,6 +689,41 @@ mod bbr_tests {
         };
         // Blocks unit: the in-flight measure is the request count.
         bbr.record_delivery(now, elapsed, blocks, 0, inflight as u64, snapshot);
+    }
+
+    #[test]
+    fn equal_minima_share_one_expiry_wakeup() {
+        let now = Instant::now();
+        let mut samples = WindowedSamples::new(Duration::from_secs(10));
+        samples.observe(now, 1.0);
+        samples.observe(now + Duration::from_secs(1), 1.0);
+        samples.observe(now + Duration::from_secs(2), 2.0);
+        assert_eq!(
+            samples.next_min_expiry(now + Duration::from_secs(2)),
+            Some(now + Duration::from_secs(11) + Duration::from_nanos(1))
+        );
+        assert_eq!(
+            samples.last_expiry(now),
+            Some(now + Duration::from_secs(12) + Duration::from_nanos(1))
+        );
+    }
+
+    #[test]
+    fn model_expiry_deadline_tracks_the_inclusive_sample_window() {
+        let now = Instant::now();
+        let horizon = Duration::from_secs(10);
+        let mut samples = WindowedSamples::new(horizon);
+        assert_eq!(samples.next_min_expiry(now), None);
+        samples.observe(now, 1.0);
+        samples.observe(now + Duration::from_secs(1), 2.0);
+        let first = now + horizon + Duration::from_nanos(1);
+        assert_eq!(samples.next_min_expiry(now), Some(first));
+        assert_eq!(samples.min(first - Duration::from_nanos(1)), Some(1.0));
+        assert_eq!(samples.min(first), Some(2.0));
+        let last = first + Duration::from_secs(1);
+        assert_eq!(samples.next_min_expiry(first), Some(last));
+        assert_eq!(samples.next_min_expiry(last), None);
+        assert_eq!(samples.min(last), None);
     }
 
     #[test]

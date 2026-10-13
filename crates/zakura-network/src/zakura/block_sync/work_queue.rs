@@ -136,6 +136,7 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     available: Notify,
+    refill: Notify,
 }
 
 impl WorkQueue {
@@ -151,6 +152,7 @@ impl WorkQueue {
                 request_writes: std::collections::HashMap::new(),
             }),
             available: Notify::new(),
+            refill: Notify::new(),
         }
     }
 
@@ -169,13 +171,14 @@ impl WorkQueue {
     /// Add scoped `(height, hash, size)` items to `pending`.
     /// Insert a height above `floor` only when no pending or in-flight item owns it.
     /// Return the number of inserted heights.
-    /// Wake waiters after inserting any height.
+    /// Wake waiters after inserting a height or changing a pending size estimate.
     pub(super) fn extend(
         &self,
         scope: zakura_header_chain::BodyWorkAuthority,
         items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
     ) -> usize {
         let mut inserted = 0usize;
+        let mut estimate_changed = false;
         {
             let mut inner = self.lock();
             inner.current_authority = Some(scope);
@@ -189,7 +192,9 @@ impl WorkQueue {
                         && item.scope == scope
                         && !matches!(size, BlockSizeEstimate::Unknown)
                     {
-                        item.estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        let estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        estimate_changed |= item.estimated_bytes != estimated_bytes;
+                        item.estimated_bytes = estimated_bytes;
                     }
                     continue;
                 }
@@ -213,7 +218,7 @@ impl WorkQueue {
                 inserted += 1;
             }
         }
-        if inserted > 0 {
+        if inserted > 0 || estimate_changed {
             self.available.notify_waiters();
         }
         inserted
@@ -960,8 +965,16 @@ impl WorkQueue {
         released
     }
 
-    /// The "work added" notifier (per-peer routines wake source).
-    #[allow(dead_code)]
+    /// One producer consumes refill requests. Notify retains a permit until it waits.
+    pub(super) fn request_refill(&self) {
+        self.refill.notify_one();
+    }
+
+    pub(super) fn subscribe_refill(&self) -> &Notify {
+        &self.refill
+    }
+
+    /// Workers register before checking the queue to avoid missed publications.
     pub(super) fn subscribe_available(&self) -> &Notify {
         &self.available
     }
@@ -1033,6 +1046,10 @@ impl WorkQueue {
 
     pub(super) fn min_pending(&self) -> Option<block::Height> {
         self.lock().pending.keys().next().copied()
+    }
+
+    pub(super) fn pending_item(&self, height: block::Height) -> Option<WorkItem> {
+        self.lock().pending.get(&height).copied()
     }
 
     pub(super) fn first_pending_in_range(

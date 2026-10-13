@@ -401,9 +401,6 @@ pub(super) enum RoutineToReactor {
         /// Requested block count.
         count: u32,
     },
-    /// A routine drained its pending work; the producer should re-query (it
-    /// self-gates on low-water, so the ping is idempotent/cheap).
-    RequeryNeeded,
     /// A routine scored a peer offense that needs the reactor-side
     /// disconnect/scoring action (serving-side malformed frames report via this
     /// path; download-side offenses score directly through the `actions`

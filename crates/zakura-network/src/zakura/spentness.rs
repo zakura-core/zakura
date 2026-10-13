@@ -205,7 +205,8 @@ mod tests {
         .ok_or("server endpoint missing")?;
         let server_addr = server.node_addr().await;
         let direct = server_addr
-            .ip_addrs()
+            .direct
+            .iter()
             .copied()
             .find(|addr| addr.ip().is_loopback())
             .ok_or("server has no loopback address")?;

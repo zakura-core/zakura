@@ -573,7 +573,7 @@ impl BlockSyncReactor {
 
     fn empty_state_header_quiet_sleep(&self) -> time::Sleep {
         match self.empty_state_header_quiet_until {
-            Some(deadline) => time::sleep_until(deadline.into()),
+            Some(deadline) => time::sleep_until(deadline),
             None => time::sleep(Duration::from_secs(3600)),
         }
     }

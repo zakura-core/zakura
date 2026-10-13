@@ -107,8 +107,8 @@ impl LiveRequester {
     }
 
     /// Snapshot every unclaimed body in all live exchanges, including later positions.
-    pub(crate) fn unreceived_expected(&self) -> Vec<(block::Height, block::Hash)> {
-        self.shared.lock().unreceived_expected()
+    pub(crate) fn unreceived_expected(&self, limit: usize) -> Vec<(block::Height, block::Hash)> {
+        self.shared.lock().unreceived_expected(limit)
     }
 
     pub(crate) fn len(&self) -> usize {

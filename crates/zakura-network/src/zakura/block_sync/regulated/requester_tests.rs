@@ -265,6 +265,31 @@ fn pool_and_session_counts_bound_bookkeeping_without_byte_funding() {
 }
 
 #[test]
+fn unreceived_snapshot_stops_at_its_limit_in_height_order() {
+    let (fence, _connection) = fence();
+    let pool = ReservationPool::new(2).unwrap();
+    let mut book = Requester::new(2);
+    for (start, hashes) in [(20, [hash(4), hash(5)]), (10, [hash(1), hash(2)])] {
+        book.reserve(
+            range(start, 2),
+            &hashes,
+            100,
+            pool.try_entry().unwrap(),
+            fence.open().unwrap(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        book.unreceived_expected(3),
+        [
+            (Height(10), hash(1)),
+            (Height(11), hash(2)),
+            (Height(20), hash(4)),
+        ]
+    );
+}
+
+#[test]
 fn shortened_unavailable_ends_the_whole_requested_range() {
     let (fence, connection) = fence();
     let pool = ReservationPool::new(1).unwrap();

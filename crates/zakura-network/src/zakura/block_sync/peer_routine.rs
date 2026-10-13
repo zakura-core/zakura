@@ -634,16 +634,15 @@ impl PeerRoutine {
                     // Height-only requests cannot identify which live range the
                     // unexpected header belongs to. Defer each still-wanted
                     // body for this supplier without delaying other suppliers.
-                    let bodies =
-                        requester
-                            .unreceived_expected()
-                            .into_iter()
-                            .filter_map(|(height, hash)| {
-                                self.work
-                                    .item_for_height(height)
-                                    .filter(|item| item.hash == hash)
-                                    .map(|item| (item.scope, hash))
-                            });
+                    let bodies = requester
+                        .unreceived_expected(super::peer_registry::MAX_SUPPLIER_RETRIES)
+                        .into_iter()
+                        .filter_map(|(height, hash)| {
+                            self.work
+                                .item_for_height(height)
+                                .filter(|item| item.hash == hash)
+                                .map(|item| (item.scope, hash))
+                        });
                     self.registry.defer_incompatible_bodies(
                         self.source,
                         bodies,

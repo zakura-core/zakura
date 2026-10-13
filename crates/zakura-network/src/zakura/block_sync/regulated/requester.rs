@@ -90,7 +90,9 @@ impl Requester {
 
     /// Unreceived bodies from every live exchange share a supplier cooldown
     /// after an incompatible header makes the whole connection unusable.
-    pub(super) fn unreceived_expected(&self) -> Vec<(Height, Hash)> {
+    /// Returns at most `limit`, lowest ranges first, so the snapshot never
+    /// outgrows the cooldown map that receives it.
+    pub(super) fn unreceived_expected(&self, limit: usize) -> Vec<(Height, Hash)> {
         self.ranges
             .values()
             .flat_map(|pending| {
@@ -104,6 +106,7 @@ impl Requester {
                         (Height(pending.range.start.0 + offset as u32), *hash)
                     })
             })
+            .take(limit)
             .collect()
     }
 

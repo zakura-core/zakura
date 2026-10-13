@@ -154,7 +154,7 @@ fn collect_supplier_retries(
 /// 64 suppliers' worth of full 128-block responses. These cooldowns outlive
 /// sessions, so peer limits do not bound them, and every lookup scans the map
 /// under the shared lock. `Unavailable` entries are bounded per body instead.
-const MAX_SUPPLIER_RETRIES: usize = 8_192;
+pub(super) const MAX_SUPPLIER_RETRIES: usize = 8_192;
 
 /// Authority and deadlines share a lock so stale routine snapshots cannot undo a refresh.
 #[derive(Debug, Default)]

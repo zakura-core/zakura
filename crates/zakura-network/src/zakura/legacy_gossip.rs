@@ -33,6 +33,7 @@ use zakura_chain::{
 };
 
 use crate::{
+    constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
     protocol::{
         external::{InventoryHash, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
@@ -811,7 +812,17 @@ impl LegacyResponseCodec {
                 Err(LegacyGossipError::MissingResponse(request_kind.command()))
             }
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
-            LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
+            LegacyRequestKind::FindBlocks => {
+                if block_hashes.len() > MAX_FIND_BLOCKS_RESPONSE_HASHES {
+                    return Err(LegacyGossipError::TooManyInventoryItems(block_hashes.len()));
+                }
+                // An honest responder lists distinct consecutive chain hashes.
+                let mut seen = HashSet::with_capacity(block_hashes.len());
+                if let Some(hash) = block_hashes.iter().find(|hash| !seen.insert(**hash)) {
+                    return Err(LegacyGossipError::DuplicateBlockHash(*hash));
+                }
+                Ok(Response::BlockHashes(block_hashes))
+            }
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
             LegacyRequestKind::MempoolTransactionIds => {
                 Ok(Response::TransactionIds(transaction_ids))
@@ -3180,6 +3191,9 @@ pub enum LegacyGossipError {
     /// A request that requires an acknowledgement received none.
     #[error("missing legacy response: {0}")]
     MissingResponse(&'static str),
+    /// A `FindBlocks` response listed the same block hash more than once.
+    #[error("legacy block hash response repeated a hash: {0:?}")]
+    DuplicateBlockHash(block::Hash),
     /// The peer returned a block we did not request, so the response is not bound
     /// to the requested hash. Treated as a peer fault.
     #[error("legacy block response contained an unrequested block: {0:?}")]
@@ -3224,6 +3238,7 @@ impl LegacyGossipError {
             | Self::OversizedResponse(_)
             | Self::UnsolicitedBlock(_)
             | Self::UnsolicitedTransaction(_)
+            | Self::DuplicateBlockHash(_)
             | Self::Serialization(_) => true,
             Self::UnsupportedRequest(_)
             | Self::ResponseAggregateBudget(_)
@@ -3556,6 +3571,27 @@ mod tests {
         fn call(&mut self, _request: Request) -> Self::Future {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(Response::Nil))
+        }
+    }
+
+    /// Answers every request with a block-hash list that repeats a hash.
+    #[derive(Clone, Debug)]
+    struct RepeatingHashResponder;
+
+    impl Service<Request> for RepeatingHashResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Ok(Response::BlockHashes(vec![
+                block_hash(1),
+                block_hash(1),
+            ])))
         }
     }
 
@@ -4144,6 +4180,41 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-45: a `FindBlocks` answer that repeats a hash is a peer fault, so the
+    /// requester disconnects the responder instead of keeping it eligible.
+    #[tokio::test]
+    async fn request_adapter_disconnects_peer_on_repeated_find_blocks_hash() -> Result<(), BoxError>
+    {
+        let _guard = zakura_test::init();
+        let node_a = ZakuraTestNode::builder(84)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(RepeatingHashResponder, supervisor))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(85).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let result = adapter
+            .request_from_source(
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(9)],
+                    stop: None,
+                },
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "a repeated hash must not be returned");
+        wait_registered_count(&node_b, 0).await?;
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -5871,6 +5942,53 @@ mod tests {
     /// without binding, a peer can substitute any other valid block for the one
     /// requested. The decoder must reject a delivered block whose hash is not in
     /// the requested set, and accept it when it is.
+    /// A `FindBlocks` answer above the responder limit, or one that repeats a
+    /// hash, is a peer fault.
+    #[test]
+    fn decode_response_rejects_oversized_or_repeated_find_blocks_answers() -> Result<(), BoxError> {
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let decode = |hashes: Vec<block::Hash>| -> Result<Response, LegacyGossipError> {
+            let frames = LegacyResponseCodec::encode_response(
+                7,
+                Response::BlockHashes(hashes),
+                frame_cap,
+                frame_cap,
+            )?;
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::FindBlocks, frames, None)
+        };
+        let distinct = |count: usize| -> Vec<block::Hash> {
+            (0..count)
+                .map(|index| {
+                    let mut hash = [0; 32];
+                    hash[..8].copy_from_slice(
+                        &u64::try_from(index)
+                            .expect("at most 501 hashes, so the index fits u64")
+                            .to_le_bytes(),
+                    );
+                    block::Hash(hash)
+                })
+                .collect()
+        };
+
+        assert!(matches!(
+            decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES))?,
+            Response::BlockHashes(hashes) if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
+        ));
+
+        let oversized = decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES + 1));
+        assert!(
+            matches!(&oversized, Err(error @ LegacyGossipError::TooManyInventoryItems(_)) if error.is_peer_fault()),
+            "got {oversized:?}"
+        );
+
+        let repeated = decode(vec![block_hash(1), block_hash(2), block_hash(1)]);
+        assert!(
+            matches!(&repeated, Err(error @ LegacyGossipError::DuplicateBlockHash(hash)) if *hash == block_hash(1) && error.is_peer_fault()),
+            "got {repeated:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn decode_response_binds_blocks_to_requested_hashes() -> Result<(), BoxError> {
         let block = Arc::new(Block::zcash_deserialize(

@@ -28,6 +28,11 @@ pub fn run(
         return Err(CancelFormatChange);
     }
 
+    // A database without transparent indexes never gets transparent spender entries, because
+    // it never indexed the history they belong to. Shielded nullifier spenders, including
+    // Ironwood, are still indexed.
+    let skip_transparent_indexes = zakura_db.skips_transparent_indexes();
+
     (0..=initial_finalized_tip_height.0)
         .into_par_iter()
         .try_for_each(|height| {
@@ -49,6 +54,7 @@ pub fn run(
                     if let Some(spend) = tx
                         .inputs()
                         .iter()
+                        .filter(|_| !skip_transparent_indexes)
                         .filter_map(|input| Some(input.outpoint()?.into()))
                         .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                         .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
@@ -57,6 +63,7 @@ pub fn run(
                         .next()
                     {
                         if read::spending_transaction_hash::<Arc<Chain>>(None, zakura_db, spend)
+                            .expect("transparent spends are only checked when indexes are built")
                             .is_some()
                         {
                             // Skip transactions in blocks with existing indexes
@@ -69,7 +76,7 @@ pub fn run(
                     };
                 }
 
-                for input in tx.inputs() {
+                for input in tx.inputs().iter().filter(|_| !skip_transparent_indexes) {
                     if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
                         return Err(CancelFormatChange);
                     }

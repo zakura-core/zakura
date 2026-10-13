@@ -129,7 +129,7 @@ impl Runnable for AuditHistoricalTreestatesCmd {
     /// `audit-historical-treestates` sub-command entrypoint.
     #[allow(clippy::print_stderr)]
     fn run(&self) {
-        if let Err(error) = self.run_with_config(APPLICATION.config().state.clone()) {
+        if let Err(error) = self.run_with_config(APPLICATION.config().mirrored_state_config()) {
             eprintln!("Failed to audit historical treestates: {error:#}");
             std::process::exit(1);
         }

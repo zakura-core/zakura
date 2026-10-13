@@ -41,6 +41,7 @@ pub type QueuedSemanticallyVerified = (
     oneshot::Sender<Result<block::Hash, CommitSemanticallyVerifiedError>>,
     Option<BlockAdmission>,
     u64,
+    Option<crate::CommitCancellation>,
 );
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
@@ -95,6 +96,48 @@ impl QueuedBlocks {
             .insert(new_hash);
 
         tracing::trace!(%parent_hash, queued = %self.blocks.len(), "queued block");
+        self.update_metrics();
+    }
+
+    /// Removes cancelled requests before duplicate replacement or parent admission.
+    pub fn prune_cancelled(&mut self) {
+        let cancelled: Vec<_> = self
+            .blocks
+            .iter()
+            .filter_map(|(hash, queued)| {
+                queued
+                    .4
+                    .as_ref()
+                    .is_some_and(crate::CommitCancellation::is_cancelled)
+                    .then_some(*hash)
+            })
+            .collect();
+        for hash in cancelled {
+            let (block, sender, admission, _, _) = self
+                .blocks
+                .remove(&hash)
+                .expect("cancelled block is queued");
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let _ = sender.send(Err(CommitBlockError::Cancelled.into()));
+            let parent = block.block.header.previous_block_hash;
+            if let Some(hashes) = self.by_parent.get_mut(&parent) {
+                hashes.remove(&hash);
+                if hashes.is_empty() {
+                    self.by_parent.remove(&parent);
+                }
+            }
+            if let Some(hashes) = self.by_height.get_mut(&block.height) {
+                hashes.remove(&hash);
+                if hashes.is_empty() {
+                    self.by_height.remove(&block.height);
+                }
+            }
+            for outpoint in block.new_outputs.keys() {
+                self.known_utxos.remove(outpoint);
+            }
+        }
         self.update_metrics();
     }
 
@@ -158,7 +201,7 @@ impl QueuedBlocks {
         let mut descendants = Vec::new();
         while let Some(parent) = parents.pop() {
             let children = self.dequeue_children(parent);
-            parents.extend(children.iter().map(|(block, _, _, _)| block.hash));
+            parents.extend(children.iter().map(|(block, _, _, _, _)| block.hash));
             descendants.extend(children);
         }
         descendants
@@ -172,7 +215,7 @@ impl QueuedBlocks {
     ) -> Vec<block::Hash> {
         let descendants = self.dequeue_descendants(failed_parent);
         let mut failed_hashes = Vec::with_capacity(descendants.len());
-        for (block, response, admission, _) in descendants {
+        for (block, response, admission, _, _) in descendants {
             failed_hashes.push(block.hash);
             if let Some(admission) = admission {
                 admission.reject();
@@ -198,7 +241,7 @@ impl QueuedBlocks {
         mem::swap(&mut self.by_height, &mut by_height);
 
         for hash in by_height.into_values().flatten() {
-            let (expired_block, expired_sender, admission, _) =
+            let (expired_block, expired_sender, admission, _, _) =
                 self.blocks.remove(&hash).expect("block is present");
             let parent_hash = &expired_block.block.header.previous_block_hash;
 

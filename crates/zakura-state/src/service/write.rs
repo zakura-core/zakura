@@ -2935,8 +2935,11 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some(((queued_child, rsp_tx, admission, attempt), queued_at, _write_slot)) =
-                queued_child_and_rsp_tx
+            let Some((
+                (queued_child, rsp_tx, admission, attempt, _cancellation),
+                queued_at,
+                _write_slot,
+            )) = queued_child_and_rsp_tx
             else {
                 continue;
             };

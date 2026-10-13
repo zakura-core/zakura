@@ -31,8 +31,10 @@ mod header_chain;
 #[cfg(any(test, feature = "proptest-impl"))]
 pub mod arbitrary;
 
+mod commit_cancellation;
 mod error;
 mod request;
+pub use commit_cancellation::CommitCancellation;
 mod response;
 mod service;
 

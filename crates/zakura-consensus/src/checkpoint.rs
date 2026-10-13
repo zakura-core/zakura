@@ -25,7 +25,6 @@ use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tower::{Service, ServiceExt};
-use tracing::instrument;
 
 use zakura_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
@@ -66,6 +65,7 @@ struct QueuedBlock {
     block: CheckpointVerifiedBlock,
     /// The transmitting end of the oneshot channel for this block's result.
     tx: oneshot::Sender<QueuedBlockResult>,
+    cancellation: Option<zs::CommitCancellation>,
 }
 
 /// The verification result and generation assigned when a queued block resolves.
@@ -747,7 +747,11 @@ where
     /// If the block does not pass basic validity checks,
     /// returns an error immediately.
     #[allow(clippy::unwrap_in_result)]
-    fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
+    fn queue_block_cancellable(
+        &mut self,
+        block: Arc<Block>,
+        cancellation: Option<zs::CommitCancellation>,
+    ) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -760,6 +764,7 @@ where
         let new_qblock = QueuedBlock {
             block: block.clone(),
             tx,
+            cancellation,
         };
         let req_block = RequestBlock { block, rx };
 
@@ -875,6 +880,25 @@ where
         }
 
         valid_qblock
+    }
+
+    /// Removes cancelled blocks before admitting another request at their heights.
+    fn prune_cancelled(&mut self) {
+        let generation = self.reset_generation;
+        self.queued.retain(|_, blocks| {
+            for block in blocks.extract_if(.., |block| {
+                block
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(zs::CommitCancellation::is_cancelled)
+            }) {
+                let _ = block.tx.send(QueuedBlockResult {
+                    result: Err(VerifyCheckpointError::Cancelled),
+                    reset_generation: generation,
+                });
+            }
+            !blocks.is_empty()
+        });
     }
 
     /// Try to verify from the previous checkpoint to a target checkpoint.
@@ -996,6 +1020,21 @@ where
             "the previous checkpoint should match: bad checkpoint list, Zakura bug, or bad chain"
         );
 
+        let cancellations: Vec<_> = rev_valid_blocks
+            .iter()
+            .filter_map(|block| block.cancellation.clone())
+            .collect();
+        if !zs::CommitCancellation::try_start_batch(&cancellations) {
+            for block in rev_valid_blocks {
+                self.queued
+                    .entry(block.block.height)
+                    .or_default()
+                    .push(block);
+            }
+            self.prune_cancelled();
+            return;
+        }
+
         let block_count = rev_valid_blocks.len();
         tracing::info!(?block_count, ?current_range, "verified checkpoint range");
         metrics::counter!("checkpoint.verified.block.count").increment(block_count as u64);
@@ -1078,6 +1117,9 @@ where
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
 pub enum VerifyCheckpointError {
+    /// The owner cancelled before the checkpoint range became complete.
+    #[error("checkpoint commit cancelled before range admission")]
+    Cancelled,
     #[error("checkpoint request after the final checkpoint has been verified")]
     Finished,
     #[error("block at {height:?} is higher than the maximum checkpoint {max_height:?}")]
@@ -1180,7 +1222,8 @@ impl VerifyCheckpointError {
                 .unwrap_or(BodyVerificationClass::Retryable(
                     TransientBodyFailureKind::Storage,
                 )),
-            Self::Finished
+            Self::Cancelled
+            | Self::Finished
             | Self::TooHigh { .. }
             | Self::UnexpectedSideChain { .. }
             | Self::ShuttingDown => {
@@ -1257,8 +1300,29 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: Arc<Block>) -> Self::Future {
+        self.call_cancellable(block, None)
+    }
+}
+
+impl<S> CheckpointVerifier<S>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    /// Verifies a block with cancellation fenced at complete-range admission.
+    #[tracing::instrument(name = "checkpoint", skip(self, block, cancellation))]
+    pub fn call_cancellable(
+        &mut self,
+        block: Arc<Block>,
+        cancellation: Option<zs::CommitCancellation>,
+    ) -> futures::future::BoxFuture<'static, Result<block::Hash, VerifyCheckpointError>> {
+        if cancellation
+            .as_ref()
+            .is_some_and(zs::CommitCancellation::is_cancelled)
+        {
+            return async { Err(VerifyCheckpointError::Cancelled) }.boxed();
+        }
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
@@ -1282,7 +1346,11 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let mut req_block = match self.queue_block(block) {
+        self.prune_cancelled();
+        if let Some(cancellation) = &cancellation {
+            cancellation.waiting_for_checkpoint_range();
+        }
+        let mut req_block = match self.queue_block_cancellable(block, cancellation.clone()) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };
@@ -1322,12 +1390,18 @@ where
         let reset_sender = self.reset_sender.clone();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
-            let queued_result = req_block
-                .rx
-                .await
-                .map_err(Into::into)
-                .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                .expect("CheckpointVerifier does not leave dangling receivers");
+            let queued_result = tokio::select! {
+                result = &mut req_block.rx => result,
+                _ = async {
+                    match &cancellation {
+                        Some(cancellation) => cancellation.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => return Err(VerifyCheckpointError::Cancelled),
+            }
+            .map_err(Into::into)
+            .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+            .expect("CheckpointVerifier does not leave dangling receivers");
             let reset_generation = queued_result.reset_generation;
 
             let result: Result<block::Hash, VerifyCheckpointError> = async move {

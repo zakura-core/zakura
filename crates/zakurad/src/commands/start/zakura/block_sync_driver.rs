@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -113,6 +113,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut deferred_actions = VecDeque::new();
     let mut shutting_down = false;
     let mut apply_phase = block_sync_handoff.subscribe_apply_phase();
+    let mut operation_metrics = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         if block_sync_handoff.is_yielded_to_legacy() {
@@ -204,6 +205,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             action
         } else {
             select! {
+                _ = operation_metrics.tick() => {
+                    block_sync_handoff.publish_operation_metrics();
+                    continue;
+                }
                 _ = &mut shutdown => {
                     shutting_down = true;
                     block_sync_handoff.request_apply_shutdown();
@@ -638,6 +643,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     abandon_block_apply(&block_sync, owner, source, token, block.as_ref(), &trace);
                     continue;
                 };
+                operation.describe(block.as_ref());
                 debug!(operation_id = ?operation.id(), token, "queued native block apply operation");
                 pending_applies.push_back(PendingBlockApply {
                     owner,
@@ -1116,13 +1122,6 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             continue;
         };
         debug!(operation_id = ?accepted.id(), token = pending.token, "accepted native block apply operation");
-        let transfer_handoff = handoff.clone();
-        let transfer_block = pending.block.clone();
-        let transfer_owner = pending.owner;
-        let transfer_source = pending.source;
-        let transfer_token = pending.token;
-        let transfer_block_sync = block_sync.clone();
-        let transfer_trace = trace.clone();
         let apply = apply_block_sync_body(
             block_verifier.clone(),
             latest_chain_tip.clone(),
@@ -1136,55 +1135,25 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             class,
             trace.clone(),
             throughput_probe.clone(),
+            Some(accepted.cancellation()),
         );
         in_flight_applies.push(
             async move {
-                tokio::pin!(apply);
-                let mut accepted = Some(accepted);
-                tokio::select! {
-                    biased;
-                    completed = &mut apply => {
-                        let terminal = match completed.result {
-                            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
-                                super::BlockApplyTerminal::Committed
-                            }
-                            BlockApplyResult::Rejected
-                            | BlockApplyResult::Unavailable
-                            | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
-                        };
-                        accepted
-                            .take()
-                            .expect("accepted operation has one terminal result")
-                            .complete(terminal);
-                        completed
+                let completed = apply.await;
+                let terminal = if accepted.cancellation().is_cancelled() {
+                    super::BlockApplyTerminal::Cancelled
+                } else {
+                    match completed.result {
+                        BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
+                            super::BlockApplyTerminal::Committed
+                        }
+                        BlockApplyResult::Rejected
+                        | BlockApplyResult::Unavailable
+                        | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
                     }
-                    _ = transfer_handoff.wait_for_legacy_yield(),
-                        if class == BlockApplyClass::Checkpoint =>
-                    {
-                        // The checkpoint verifier owns transactional range commits after it
-                        // accepts a request. A partial range cannot commit until another request
-                        // supplies every missing body. Legacy fallback uses the same verifier, so
-                        // it can complete the range after this driver transfers completion
-                        // responsibility.
-                        let result = abandon_block_apply(
-                            &transfer_block_sync,
-                            transfer_owner,
-                            transfer_source,
-                            transfer_token,
-                            transfer_block.as_ref(),
-                            &transfer_trace,
-                        );
-                        accepted
-                            .take()
-                            .expect("accepted operation has one terminal result")
-                            .complete(super::BlockApplyTerminal::TransferredToLegacy);
-                        metrics::counter!(
-                            "sync.zakura.apply.checkpoint_transferred_to_legacy"
-                        )
-                        .increment(1);
-                        BlockApplyCompletion { class, result }
-                    }
-                }
+                };
+                accepted.complete(terminal);
+                completed
             }
             .boxed(),
         );
@@ -1322,6 +1291,7 @@ where
         pending.class,
         trace,
         Some(throughput_probe),
+        None,
     )
     .await
 }
@@ -1354,6 +1324,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     class: BlockApplyClass,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    cancellation: Option<zakura_state::CommitCancellation>,
 ) -> BlockApplyCompletion
 where
     BlockVerifier:
@@ -1401,6 +1372,7 @@ where
                 token,
                 height,
                 expected_hash,
+                cancellation,
             )
             .await
         }
@@ -1453,6 +1425,7 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
+    cancellation: Option<zakura_state::CommitCancellation>,
 ) -> BlockApplyOutcome
 where
     BlockVerifier:
@@ -1460,9 +1433,14 @@ where
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    let commit = block_verifier
-        .clone()
-        .oneshot(zakura_consensus::Request::Commit(block));
+    let request = match cancellation {
+        Some(cancellation) => zakura_consensus::Request::CommitCancellable {
+            block,
+            cancellation,
+        },
+        None => zakura_consensus::Request::Commit(block),
+    };
+    let commit = block_verifier.clone().oneshot(request);
 
     tokio::pin!(commit);
     tokio::select! {

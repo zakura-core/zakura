@@ -274,6 +274,9 @@ pub enum StateInitError {
 /// An error describing why a block could not be queued to be committed to the state.
 #[derive(Debug, Error, Clone, PartialEq, Eq, new)]
 pub enum CommitBlockError {
+    /// The owner cancelled the commit before write admission.
+    #[error("block commit cancelled before write admission")]
+    Cancelled,
     #[error("block hash is a duplicate: already in {location}")]
     /// The block is a duplicate: it is already queued or committed in the state.
     Duplicate {
@@ -362,6 +365,7 @@ impl CommitBlockError {
         use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
 
         match self {
+            Self::Cancelled => BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled),
             Self::Duplicate { .. } => BodyVerificationClass::Duplicate,
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {

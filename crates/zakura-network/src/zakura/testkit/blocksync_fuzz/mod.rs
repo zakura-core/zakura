@@ -284,21 +284,6 @@ fn spawn_action_driver(
                         break;
                     }
                 }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    let blocks = corpus.blocks_in_range(start, count, target);
-                    if handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
                 BlockSyncAction::SubmitBlock {
                     owner,
                     source,

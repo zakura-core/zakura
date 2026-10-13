@@ -38,7 +38,7 @@ pub(super) struct NeededBlocksQueryFailure {
 #[derive(Clone, Debug)]
 pub struct BlockSyncStartup {
     pub(super) body_retention: Option<BodyRetention>,
-    pub(super) range_source: Option<Arc<dyn BlockRangeSource>>,
+    pub(super) range_source: Arc<dyn BlockRangeSource>,
     /// Cached state frontiers at startup.
     pub frontiers: BlockSyncFrontiers,
     /// Durable best header tip at startup.
@@ -70,7 +70,7 @@ impl BlockSyncStartup {
     ) -> Self {
         Self {
             body_retention: None,
-            range_source: None,
+            range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
             header_tip: Some(header_tip),
@@ -93,7 +93,7 @@ impl BlockSyncStartup {
     ) -> Self {
         Self {
             body_retention: None,
-            range_source: None,
+            range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
             header_tip: None,
@@ -122,16 +122,17 @@ impl BlockSyncStartup {
         self
     }
 
-    /// Use shared regulation for storage reads and response output on live peers.
+    /// Serve GetBlocks from `source`. Without one, every request ends with
+    /// `RangeUnavailable`.
     pub fn with_range_source(mut self, source: Arc<dyn BlockRangeSource>) -> Self {
-        self.range_source = Some(source);
+        self.range_source = source;
         self
     }
 
     pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
         Self {
             body_retention: None,
-            range_source: None,
+            range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
                 verified_block_tip: block::Height::MIN,
@@ -194,7 +195,7 @@ pub struct BlockSyncHandle {
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
-    pub(super) serving: Option<Arc<super::regulated::session::Serving>>,
+    pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
     pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
@@ -890,8 +891,6 @@ pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
     pub(super) status_delivery: super::status::StatusDelivery,
-    pub(super) served_blocks_inflight: u32,
-    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
 }
 
 impl PeerBlockState {
@@ -901,44 +900,9 @@ impl PeerBlockState {
             status_delivery: super::status::StatusDelivery::new(
                 config.status_refresh_interval,
                 Instant::now(),
-                session.is_regulated(),
             ),
             session,
-            served_blocks_inflight: 0,
-            served_block_requests: VecDeque::new(),
         }
-    }
-
-    pub(super) fn try_start_serving_blocks(
-        &mut self,
-        local_inflight_cap: u32,
-        start_height: block::Height,
-    ) -> bool {
-        if self.served_blocks_inflight >= local_inflight_cap {
-            return false;
-        }
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
-        self.served_block_requests
-            .push_back((start_height, Instant::now()));
-        true
-    }
-
-    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
-        self.served_block_requests
-            .iter()
-            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
-    }
-
-    pub(super) fn finish_serving_blocks(
-        &mut self,
-        start_height: block::Height,
-    ) -> Option<Duration> {
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
-        self.served_block_requests
-            .iter()
-            .position(|(start, _)| *start == start_height)
-            .and_then(|index| self.served_block_requests.remove(index))
-            .map(|(_, started)| started.elapsed())
     }
 }
 

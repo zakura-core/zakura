@@ -1042,7 +1042,7 @@ mod tests {
         BlockSyncStartup, FullStateFrontiers, HeaderSyncAction, HeaderSyncStartup, PeerSession,
         ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraDiscoveryConfig,
         ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraHeaderSyncConfig,
-        LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC,
+        LOCAL_MAX_MESSAGE_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
         ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
     };
@@ -1350,7 +1350,7 @@ mod tests {
         service.add_peer(Peer::new(
             peer_id,
             None,
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             streams,
             CancellationToken::new(),
         ));
@@ -2300,7 +2300,7 @@ mod tests {
         service.add_peer(Peer::new(
             peer_id.clone(),
             None,
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             streams,
             connection_cancel.clone(),
         ));
@@ -2317,7 +2317,7 @@ mod tests {
             service.session_demand(
                 0,
                 &peer_id,
-                ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
+                ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ServicePeerDirection::Inbound,
             ),
             SessionDemand::Retire,
@@ -2431,7 +2431,7 @@ mod tests {
         block_sync.add_peer(Peer::new(
             peer_id.clone(),
             None,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             HashMap::from([(
                 crate::zakura::ZAKURA_STREAM_BLOCK_SYNC,
                 (service_block_recv, service_block_send),
@@ -2444,7 +2444,7 @@ mod tests {
         service.add_peer(Peer::new(
             peer_id,
             None,
-            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]),
             connection_cancel.clone(),
         ));

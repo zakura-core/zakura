@@ -889,7 +889,7 @@ impl PeerRegistry {
         })
     }
 
-    /// Whether the peer has sent a `Status` (the reactor's serving-admission and
+    /// Whether the peer has sent a `Status` (the reactor's candidate and
     /// disconnect-trace read). The routine owns the rest of the serving caps
     /// locally now (inverted inbound flow); only `received_status` is read reactor-side.
     pub(super) fn has_received_status(&self, peer: &ZakuraPeerId) -> bool {

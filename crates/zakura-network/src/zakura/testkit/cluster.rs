@@ -133,7 +133,10 @@ mod tests {
         zakura::handler::i_open_collision_winner,
         zakura::trace::block_sync_trace as bs_trace,
         zakura::{
-            block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
+            block_sync::{
+                MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+            },
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
             DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
@@ -853,27 +856,6 @@ mod tests {
                             }))
                             .await;
                     }
-                    BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                        let selected = by_height
-                            .range(start..)
-                            .take(usize::try_from(count).unwrap())
-                            .map(|(height, block)| {
-                                (
-                                    *height,
-                                    block.clone(),
-                                    usize::try_from(block_size(block)).unwrap(),
-                                )
-                            })
-                            .collect();
-                        let _ = handle
-                            .send(BlockSyncEvent::BlockRangeResponseReady {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                blocks: selected,
-                            })
-                            .await;
-                    }
                     BlockSyncAction::RecordBodyUnavailable { .. }
                     | BlockSyncAction::RecordBodyInvalid { .. }
                     | BlockSyncAction::RestartBodyAvailability { .. }
@@ -995,8 +977,12 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        let hostile =
-            HostilePeer::connect_native_with_capabilities(victim, 2, ZAKURA_CAP_BLOCK_SYNC).await?;
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            2,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        )
+        .await?;
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
 
@@ -1055,8 +1041,12 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let victim_idx = cluster.spawn_traced_node(1, &mut capture).await?;
         let victim = cluster.node(victim_idx);
-        let hostile =
-            HostilePeer::connect_native_with_capabilities(victim, 2, ZAKURA_CAP_BLOCK_SYNC).await?;
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            2,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        )
+        .await?;
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
 
@@ -1113,20 +1103,14 @@ mod tests {
     #[tokio::test]
     async fn native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies(
     ) -> Result<(), BoxError> {
-        native_getblocks_exchange(false, false, false).await
+        native_getblocks_exchange(false).await
     }
 
     /// A remotely opened regulated session can consume the last available slot.
     #[tokio::test]
     async fn regulated_getblocks_admits_the_first_remote_session_at_a_limit_of_one(
     ) -> Result<(), BoxError> {
-        native_getblocks_exchange(true, false, true).await
-    }
-
-    #[tokio::test]
-    async fn upgraded_node_downloads_from_a_mostly_old_peer_set_without_endings(
-    ) -> Result<(), BoxError> {
-        native_getblocks_exchange(true, true, false).await
+        native_getblocks_exchange(true).await
     }
 
     /// A requester that stops reading stalls the served response at its QUIC
@@ -1676,34 +1660,11 @@ mod tests {
         .map_err(|_| -> BoxError { format!("timed out reading {label}").into() })?
     }
 
-    async fn native_getblocks_exchange(
-        regulated: bool,
-        mostly_old: bool,
-        one_session_slot: bool,
-    ) -> Result<(), BoxError> {
-        use crate::zakura::{
-            ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-        };
-        let regulated_peer = regulated && !mostly_old;
-        let version = if regulated_peer {
-            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
-        } else {
-            crate::zakura::ZAKURA_BLOCK_SYNC_STREAM_VERSION
-        };
-        let capabilities = if regulated_peer {
-            ZAKURA_CAP_BLOCK_SYNC_REGULATED
-        } else {
-            ZAKURA_CAP_BLOCK_SYNC
-        };
+    async fn native_getblocks_exchange(one_session_slot: bool) -> Result<(), BoxError> {
+        let version = ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION;
         let _guard = zakura_test::init();
-        let mut capture = TraceCapture::for_test_with_keep_override(
-            if regulated {
-                "regulated_native_getblocks_exchange"
-            } else {
-                "native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies"
-            },
-            false,
-        )?;
+        let mut capture =
+            TraceCapture::for_test_with_keep_override("native_getblocks_exchange", false)?;
         let blocks = vec![
             mainnet_block(&BLOCK_MAINNET_1_BYTES),
             mainnet_block(&BLOCK_MAINNET_2_BYTES),
@@ -1727,11 +1688,7 @@ mod tests {
         let block_sync_config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 3,
             max_inflight_block_bytes: u64::MAX,
-            request_timeout: if mostly_old {
-                Duration::from_millis(500)
-            } else {
-                Duration::from_secs(300)
-            },
+            request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: if one_session_slot {
                     1
@@ -1753,17 +1710,12 @@ mod tests {
         let mut cluster = ZakuraTestCluster::new();
         let builder = getblocks_victim(limits.clone(), Some((block::Height(3), blocks[2].hash())))
             .tracer(capture.tracer_for_node(60))
-            .block_sync_config(block_sync_config);
-        let builder = if regulated {
-            builder
-                .block_range_source(Arc::new(FixtureBlockSource::new(served_blocks)))
-                .quic_config(QuicConfig {
-                    send_window_bytes: 64 * 1024,
-                    ..limits.quic.clone()
-                })
-        } else {
-            builder
-        };
+            .block_sync_config(block_sync_config)
+            .block_range_source(Arc::new(FixtureBlockSource::new(served_blocks)))
+            .quic_config(QuicConfig {
+                send_window_bytes: 64 * 1024,
+                ..limits.quic.clone()
+            });
         let victim = cluster.spawn_node_with_builder(builder).await?;
         let victim = cluster.node(victim);
         assert!(
@@ -1778,58 +1730,27 @@ mod tests {
         // needs a collision-winning seed.
         let seeds = collision_winning_seeds(6);
         let hostile_seed = seeds[0];
-        let hostile = if regulated_peer {
-            // Each served block exceeds this receive window. Leaving the response
-            // unread must stall the serving writer while downloads still progress.
-            let quic = QuicConfig {
-                stream_receive_window_bytes: 64 * 1024,
-                receive_window_bytes: 128 * 1024,
-                ..victim.limits().quic.clone()
-            };
-            assert!(block_size(&large) > quic.stream_receive_window_bytes);
-            HostilePeer::connect_native_with_transport(victim, hostile_seed, capabilities, quic)
-                .await?
-        } else {
-            HostilePeer::connect_native_with_capabilities(victim, hostile_seed, capabilities)
-                .await?
+        // Each served block exceeds this receive window. Leaving the response
+        // unread must stall the serving writer while downloads still progress.
+        let quic = QuicConfig {
+            stream_receive_window_bytes: 64 * 1024,
+            receive_window_bytes: 128 * 1024,
+            ..victim.limits().quic.clone()
         };
-        let mut bystanders = Vec::new();
-        if mostly_old {
-            // Five old peers (including the body supplier), one upgraded peer.
-            for (caps, seed) in [
-                ZAKURA_CAP_BLOCK_SYNC,
-                ZAKURA_CAP_BLOCK_SYNC,
-                ZAKURA_CAP_BLOCK_SYNC,
-                ZAKURA_CAP_BLOCK_SYNC,
-                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-            ]
-            .into_iter()
-            .zip(&seeds[1..])
-            {
-                bystanders.push(
-                    HostilePeer::connect_native_with_capabilities(victim, *seed, caps).await?,
-                );
-            }
-        }
+        assert!(block_size(&large) > quic.stream_receive_window_bytes);
+        let hostile = HostilePeer::connect_native_with_transport(
+            victim,
+            hostile_seed,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            quic,
+        )
+        .await?;
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
         await_until("block-sync peer registered", Duration::from_secs(5), || {
             peer_set.borrow().contains(&hostile_peer)
         })
         .await?;
-        if mostly_old {
-            let ids = bystanders
-                .iter()
-                .map(HostilePeer::id)
-                .collect::<Result<Vec<_>, _>>()?;
-            await_until(
-                "mostly old peer set registered",
-                Duration::from_secs(5),
-                || ids.iter().all(|id| peer_set.borrow().contains(id)),
-            )
-            .await?;
-        }
-
         hostile
             .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_BLOCK_SYNC,
@@ -1881,167 +1802,25 @@ mod tests {
              physically read GetBlocks from stream 6"
         );
 
-        if regulated_peer {
-            // Keep both directions active with bounded application queues.
-            // Do not consume the served response until our own bodies reach the driver.
-            hostile
-                .send_ordered_raw_frame_with_version(
-                    ZAKURA_STREAM_BLOCK_SYNC,
-                    version,
-                    BlockSyncMessage::GetBlocks {
-                        start_height,
-                        count,
-                    }
-                    .encode_frame()?,
-                )
-                .await?;
-        }
-
-        if mostly_old {
-            let upgraded = bystanders.last().unwrap();
-            for message in [
-                BlockSyncMessage::Status(BlockSyncStatus::default()),
+        // Keep both directions active with bounded application queues.
+        // Do not consume the served response until our own bodies reach the driver.
+        hostile
+            .send_ordered_raw_frame_with_version(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                version,
                 BlockSyncMessage::GetBlocks {
                     start_height,
                     count,
-                },
-            ] {
-                upgraded
-                    .send_ordered_raw_frame_with_version(
-                        ZAKURA_STREAM_BLOCK_SYNC,
-                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-                        message.encode_frame()?,
-                    )
-                    .await?;
-            }
-            // Give one body as progress, then withhold the rest until our v2
-            // requester retries the still-live range without a BlocksDone.
-            hostile
-                .send_ordered_raw_frame_with_version(
-                    ZAKURA_STREAM_BLOCK_SYNC,
-                    version,
-                    BlockSyncMessage::Block(blocks[0].clone()).encode_frame()?,
-                )
-                .await?;
-            // A committed body changes the v2 serving range. Its correction must
-            // arrive promptly, without inheriting the v3 thirty-second cadence.
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    let frame = hostile.recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version).await?;
-                    if matches!(BlockSyncMessage::decode_frame(frame)?, BlockSyncMessage::Status(status) if status.servable_high >= block::Height(1)) {
-                        return Ok::<_, BoxError>(());
-                    }
                 }
-            }).await.map_err(|_| -> BoxError { "v2 range correction missed one second".into() })??;
-            // Old requesters can repeat a range before its ending. Both requests
-            // must stay on the v2 serving path even though this node supports v3.
-            for _ in 0..2 {
-                hostile
-                    .send_ordered_raw_frame_with_version(
-                        ZAKURA_STREAM_BLOCK_SYNC,
-                        version,
-                        BlockSyncMessage::GetBlocks {
-                            start_height,
-                            count: 1,
-                        }
-                        .encode_frame()?,
-                    )
-                    .await?;
-            }
-            // Every old peer actively requests bodies while the upgraded peer
-            // serves its range and the original old supplier withholds endings.
-            for old in &bystanders[..4] {
-                for message in [
-                    BlockSyncMessage::Status(BlockSyncStatus::default()),
-                    BlockSyncMessage::GetBlocks {
-                        start_height,
-                        count: 1,
-                    },
-                ] {
-                    old.send_ordered_raw_frame_with_version(
-                        ZAKURA_STREAM_BLOCK_SYNC,
-                        version,
-                        message.encode_frame()?,
-                    )
-                    .await?;
-                }
-            }
-            let (upgraded_hashes, ending) = read_getblocks_response(
-                upgraded,
-                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
-                "v3 serving alongside the old peer's retries",
+                .encode_frame()?,
             )
             .await?;
-            assert_eq!(upgraded_hashes, served_hashes);
-            assert_eq!(
-                ending,
-                BlockSyncMessage::BlocksDone {
-                    start_height,
-                    returned: count,
-                }
-            );
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let mut retried = false;
-                let mut served = 0;
-                let mut served_bodies = 0;
-                while !retried || served < 2 {
-                    let frame = hostile
-                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
-                        .await?;
-                    match BlockSyncMessage::decode_frame(frame)? {
-                        BlockSyncMessage::GetBlocks {
-                            start_height: retry,
-                            count: retry_count,
-                        } => {
-                            assert!(retry > start_height);
-                            assert!(retry_count > 0 && retry.0 < start_height.0 + count);
-                            retried = true;
-                        }
-                        BlockSyncMessage::Block(block) => {
-                            assert_eq!(block.hash(), blocks[0].hash());
-                            served_bodies += 1;
-                        }
-                        BlockSyncMessage::BlocksDone {
-                            start_height: start,
-                            returned,
-                        } => {
-                            assert_eq!((start, returned), (start_height, 1));
-                            served += 1;
-                        }
-                        BlockSyncMessage::Status(_) => {}
-                        message => panic!("unexpected old serving response: {message:?}"),
-                    }
-                }
-                assert_eq!(served_bodies, 2);
-                Ok::<_, BoxError>(())
-            })
-            .await
-            .map_err(|_| -> BoxError {
-                "old peer did not receive both endings and an overlapping timeout retry".into()
-            })??;
-
-            for old in &bystanders[..4] {
-                let (hashes, ending) =
-                    read_getblocks_response(old, version, "an active old peer's body").await?;
-                assert_eq!(hashes, [blocks[0].hash()]);
-                assert_eq!(
-                    ending,
-                    BlockSyncMessage::BlocksDone {
-                        start_height,
-                        returned: 1,
-                    }
-                );
-            }
-        }
 
         let end_height = start_height
             .0
             .checked_add(count)
             .expect("test request height range fits u32");
         for height in start_height.0..end_height {
-            if mostly_old && height == start_height.0 {
-                continue;
-            }
             let block = blocks
                 .iter()
                 .find(|block| block.coinbase_height() == Some(block::Height(height)))
@@ -2055,19 +1834,17 @@ mod tests {
                 )
                 .await?;
         }
-        if !mostly_old {
-            hostile
-                .send_ordered_raw_frame_with_version(
-                    ZAKURA_STREAM_BLOCK_SYNC,
-                    version,
-                    BlockSyncMessage::BlocksDone {
-                        start_height,
-                        returned: count,
-                    }
-                    .encode_frame()?,
-                )
-                .await?;
-        }
+        hostile
+            .send_ordered_raw_frame_with_version(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                version,
+                BlockSyncMessage::BlocksDone {
+                    start_height,
+                    returned: count,
+                }
+                .encode_frame()?,
+            )
+            .await?;
 
         let expected: Vec<_> = (start_height.0..end_height).map(block::Height).collect();
         await_until(
@@ -2106,63 +1883,17 @@ mod tests {
         )
         .await?;
 
-        if regulated_peer {
-            let (served, ending) =
-                read_getblocks_response(&hostile, version, "the regulated serving response")
-                    .await?;
-            assert_eq!(served, served_hashes);
-            assert_eq!(
-                ending,
-                BlockSyncMessage::BlocksDone {
-                    start_height,
-                    returned: count,
-                }
-            );
-        }
+        let (served, ending) =
+            read_getblocks_response(&hostile, version, "the serving response").await?;
+        assert_eq!(served, served_hashes);
+        assert_eq!(
+            ending,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned: count,
+            }
+        );
 
-        if mostly_old {
-            hostile
-                .reset_ordered_stream(ZAKURA_STREAM_BLOCK_SYNC, version)
-                .await?;
-            await_until(
-                "old block-sync session retired",
-                Duration::from_secs(5),
-                || {
-                    let peers = victim.block_sync().unwrap().peer_snapshot();
-                    peers.inbound_peers + peers.outbound_peers == 5
-                },
-            )
-            .await?;
-            hostile
-                .send_ordered_raw_frame_with_version(
-                    ZAKURA_STREAM_BLOCK_SYNC,
-                    version,
-                    BlockSyncMessage::Status(BlockSyncStatus {
-                        servable_high: block::Height(3),
-                        ..Default::default()
-                    })
-                    .encode_frame()?,
-                )
-                .await?;
-            let status = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let frame = hostile
-                        .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
-                        .await?;
-                    if let BlockSyncMessage::Status(status) = BlockSyncMessage::decode_frame(frame)?
-                    {
-                        return Ok::<_, BoxError>(status);
-                    }
-                }
-            })
-            .await
-            .map_err(|_| -> BoxError { "replacement v2 stream did not receive Status".into() })??;
-            assert!(status.max_inflight_requests > 0);
-        }
-
-        for peer in bystanders {
-            peer.shutdown().await;
-        }
         driver.abort();
         hostile.shutdown().await;
         cluster.shutdown().await;

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::zakura::{
     framed_channel, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStatus,
     FramedRecv, FramedSend, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
-    ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_STREAM_BLOCK_SYNC,
 };
 
 /// A connected synthetic block-sync peer backed by in-memory stream channels.
@@ -91,7 +91,7 @@ impl SyntheticBlockSyncPeers {
         self.service.add_peer(Peer::new_with_direction(
             peer_id.clone(),
             None,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
             streams,
             cancel.clone(),

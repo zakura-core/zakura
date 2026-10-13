@@ -278,7 +278,7 @@ pub(super) struct PeerRoutine {
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
     window: DownloadWindow,
     /// Whether this peer has sent a `Status` yet (gates want-work; mirrored into
-    /// the registry for the reactor's serving/candidate reads).
+    /// the registry for the reactor's candidate reads).
     received_status: bool,
     /// This peer's advertised servable range, learned from its `Status`. The
     /// want-work upper bound; never the floor.
@@ -286,7 +286,7 @@ pub(super) struct PeerRoutine {
     servable_high: block::Height,
     /// This peer's clamped advertised serving caps, learned from its `Status`.
     /// Authoritative for the routine's own want-work decision (mirrored into the
-    /// registry for the reactor's serving-side reads).
+    /// registry for the reactor's candidate reads).
     max_blocks_per_response: u32,
     max_response_bytes: u32,
     /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
@@ -723,29 +723,10 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
-                if let Some(serving) = &mut self.serving {
-                    serving.admit(start_height, count)?;
-                } else if self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
-                        start_height,
-                        count,
-                    })
-                    .is_err()
-                {
-                    // Serving is reactor-owned (state query + driver).
-                    metrics::counter!("sync.block.serving.reactor_queue_unavailable").increment(1);
-                    self.emit("block_serve_rejected", |row| {
-                        row.peer = Some(super::trace::peer(&self.peer));
-                        row.range_start = Some(u64::from(start_height.0));
-                        row.range_count = Some(u64::from(count));
-                        row.reason = Some("reactor_queue_unavailable");
-                    });
-                    self.session
-                        .try_send_range_unavailable(start_height, count)
-                        .map_err(SinkReject::local)?;
-                }
+                let Some(serving) = &mut self.serving else {
+                    return Err(SinkReject::local("block-sync serving is not configured"));
+                };
+                serving.admit(start_height, count)?;
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -860,8 +841,7 @@ impl PeerRoutine {
         self.servable_high = status.servable_high;
         self.published_limits = limits;
         // Publish the servable range / clamped caps / received_status to the
-        // registry so the reactor's serving/candidate reads and `GetBlocks`
-        // admission see them; generation-gated.
+        // registry so the reactor's candidate reads see them; generation-gated.
         self.registry
             .upsert_status(&self.peer, self.generation, status);
         self.trace_status_received(status);
@@ -1663,10 +1643,7 @@ impl PeerRoutine {
             {
                 // Outbound full but *only just* filled (< one `request_timeout` of
                 // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. The action-driver serving path pauses inbound reads while
-                // outbound is full, so a block the peer already sent may be waiting behind
-                // our write side. Regulated serving keeps reading. Grant one short, BOUNDED
-                // grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
+                // a dead peer. Grant one short, BOUNDED grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
                 // full past `request_timeout`, falls through to the park arm, and is
                 // parked at the liveness deadline — it cannot dodge the timer.
                 self.window
@@ -1681,8 +1658,8 @@ impl PeerRoutine {
     }
 
     /// Apply the no-progress stall protocol: disconnect on a repeated stall,
-    /// otherwise park the session for the cooldown and exit locally (the
-    /// connection survives).
+    /// otherwise park the session for the cooldown and exit locally. An unended
+    /// request still closes the connection (see `WriterFence`).
     fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
         if no_progress_response(self.allow_no_progress_park) == NoProgressResponse::Disconnect {
             tracing::debug!(
@@ -2687,8 +2664,8 @@ mod tests {
         BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
         ZakuraBlockSyncConfig,
     };
+    use super::PeerRoutine;
     use super::RoutineToReactor;
-    use super::{block_sync_guard, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
@@ -2746,35 +2723,6 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
-    }
-
-    #[tokio::test]
-    async fn full_reactor_queue_returns_range_unavailable() {
-        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
-        while routine.routine_to_reactor.capacity() > 0 {
-            routine
-                .routine_to_reactor
-                .try_send(RoutineToReactor::RequeryNeeded)
-                .unwrap();
-        }
-        let request = BlockSyncMessage::GetBlocks {
-            start_height: block::Height(1),
-            count: 2,
-        }
-        .encode_frame()
-        .unwrap();
-        routine
-            .handle_frame(&mut block_sync_guard(), request)
-            .await
-            .unwrap();
-        assert!(matches!(
-            BlockSyncMessage::decode_frame(outbound.try_recv().unwrap()).unwrap(),
-            BlockSyncMessage::RangeUnavailable {
-                start_height: block::Height(1),
-                count: 2,
-            }
-        ));
-        assert!(!routine.session.cancel_token().is_cancelled());
     }
 
     #[tokio::test]

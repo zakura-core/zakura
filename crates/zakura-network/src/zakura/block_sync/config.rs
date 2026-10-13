@@ -545,10 +545,3 @@ pub fn clamp_advertised_inflight(count: u32) -> u32 {
 pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
     bytes.clamp(1, MAX_BS_RESPONSE_BYTES)
 }
-
-/// Maximum inbound `GetBlocks.count` this node will serve before looking at body sizes.
-pub fn inbound_get_blocks_count_limit(config: &ZakuraBlockSyncConfig) -> u32 {
-    config
-        .advertised_max_blocks_per_response()
-        .clamp(1, MAX_BS_BLOCKS_PER_REQUEST)
-}

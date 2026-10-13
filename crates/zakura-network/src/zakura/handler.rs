@@ -3190,7 +3190,7 @@ impl ZakuraProtocolHandler {
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
-            .reserve_session_for_stream(stream, direction)
+            .reserve_session(direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
         let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
         let mut prepared = Vec::with_capacity(layout.streams.len());
@@ -5915,11 +5915,11 @@ fn inbound_frame_cap_for_stream(limits: &ZakuraConnectionLimits, stream: Stream)
 
 fn minimum_ordered_queue_capacity(streams: &[Stream]) -> usize {
     // Regulation needs independent room for a response and requests/control.
-    // Legacy layouts retain their existing one-slot compatibility.
-    let slots = if streams.iter().any(|stream| {
-        stream.kind == crate::zakura::ZAKURA_STREAM_BLOCK_SYNC
-            && stream.version == crate::zakura::ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
-    }) {
+    // Layouts without block sync keep one slot per stream.
+    let slots = if streams
+        .iter()
+        .any(|stream| stream.kind == crate::zakura::ZAKURA_STREAM_BLOCK_SYNC)
+    {
         2
     } else {
         1
@@ -6218,9 +6218,9 @@ mod tests {
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
             LOCAL_MAX_CONTROL_FRAME_BYTES, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES,
-            MAX_HS_MESSAGE_BYTES, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            MAX_HS_MESSAGE_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_CAP_DISCOVERY,
+            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
         },
         P2pStack,
     };
@@ -8428,9 +8428,9 @@ mod tests {
         let exit = SessionExit {
             stream: Stream {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
-                version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
                 frame_cap: 1,
-                capability: ZAKURA_CAP_BLOCK_SYNC,
+                capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ..Stream::PERSISTENT
             },
             session_id: 1,
@@ -8739,9 +8739,9 @@ mod tests {
         let limits = test_connection_limits();
         let stream = Stream {
             kind: ZAKURA_STREAM_BLOCK_SYNC,
-            version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
             frame_cap: 2_000_009,
-            capability: ZAKURA_CAP_BLOCK_SYNC,
+            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ..Stream::PERSISTENT
         };
         let encoded = frame.encode(stream.frame_cap)?;
@@ -8956,7 +8956,7 @@ mod tests {
             kind: stream_kind,
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: 2_000_009,
-            capability: ZAKURA_CAP_BLOCK_SYNC,
+            capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ..Stream::PERSISTENT
         };
         let context = StreamWorkerContext {
@@ -10421,42 +10421,16 @@ mod tests {
     }
 
     #[test]
-    fn regulated_block_sync_needs_two_slots_without_changing_legacy_depths() {
-        let regulated = crate::zakura::block_sync_streams()[0];
-        let legacy = Stream {
-            version: crate::zakura::ZAKURA_BLOCK_SYNC_STREAM_VERSION,
-            capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
+    fn block_sync_needs_two_slots_per_ordered_stream() {
+        let block_sync = crate::zakura::block_sync_streams()[0];
+        let other = Stream {
+            kind: 5,
             messages: None,
-            ..regulated
+            ..block_sync
         };
-        assert_eq!(minimum_ordered_queue_capacity(&[legacy]), 1);
-        assert_eq!(minimum_ordered_queue_capacity(&[regulated]), 2);
-        assert_eq!(
-            minimum_ordered_queue_capacity(&[regulated, Stream { kind: 5, ..legacy }]),
-            4
-        );
-    }
-
-    #[test]
-    fn legacy_block_sync_keeps_its_message_bucket_when_regulation_is_not_negotiated() {
-        let regulated = crate::zakura::block_sync_streams()[0];
-        let legacy = tabled_context(None, 1);
-        let regulated = tabled_context(regulated.messages, 1);
-        let request = probe_frame(2, 9);
-        assert_eq!(
-            admit_inbound_message(&request, &legacy, 6),
-            InboundMessageAdmission::Admit
-        );
-        assert_ne!(
-            admit_inbound_message(&request, &legacy, 6),
-            InboundMessageAdmission::Admit
-        );
-        for _ in 0..4 {
-            assert_eq!(
-                admit_inbound_message(&request, &regulated, 6),
-                InboundMessageAdmission::Admit
-            );
-        }
+        assert_eq!(minimum_ordered_queue_capacity(&[other]), 1);
+        assert_eq!(minimum_ordered_queue_capacity(&[block_sync]), 2);
+        assert_eq!(minimum_ordered_queue_capacity(&[block_sync, other]), 4);
     }
 
     #[test]
@@ -10509,7 +10483,7 @@ mod tests {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: MAX_BS_FRAME_BYTES,
-                capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
+                capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ..Stream::PERSISTENT
             },
         ];

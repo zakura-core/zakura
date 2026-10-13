@@ -18,6 +18,25 @@ pub trait BlockRangeSource: Debug + Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<BlockRangeReadResult, crate::BoxError>>;
 }
 
+/// Serves no blocks, so every request ends with `RangeUnavailable`. The default
+/// for embedders that supply no storage-backed source.
+#[derive(Debug)]
+pub(super) struct EmptyBlockRangeSource;
+
+impl BlockRangeSource for EmptyBlockRangeSource {
+    fn read(
+        &self,
+        request: BlockRangeRead,
+    ) -> BoxFuture<'static, Result<BlockRangeReadResult, crate::BoxError>> {
+        Box::pin(async move {
+            Ok(BlockRangeReadResult {
+                blocks: Vec::new(),
+                lease: request.lease,
+            })
+        })
+    }
+}
+
 /// One admitted range read. The lease must follow the actual storage work.
 #[derive(Debug)]
 pub struct BlockRangeRead {

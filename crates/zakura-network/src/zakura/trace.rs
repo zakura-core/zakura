@@ -1286,21 +1286,30 @@ mod tests {
             trace.emit_quic_conn(&sample, expose_peer_addresses);
             let event = rx.try_recv().expect("one row is queued");
             assert_eq!(event.table, "quic_conn");
-            serde_json::from_slice::<Value>(&event.line).expect("the row is JSON")
+            let mut reader = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(event.line.as_slice());
+            let record = reader.records().next().unwrap().expect("the row is CSV");
+            zakura_jsonl_trace::ENVELOPE_COLUMNS
+                .iter()
+                .copied()
+                .chain(QUIC_CONN_TABLE.header().iter().copied())
+                .chain(["extra"])
+                .zip(record.iter())
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
 
         let redacted = row(false);
         assert_eq!(redacted["event"], "closed");
-        assert_eq!(redacted["conn"], 17);
+        assert_eq!(redacted["conn"], "17");
         assert_eq!(redacted["direction"], "outbound");
         assert_eq!(redacted["admitted_ip"], "v4redacted");
-        assert_eq!(redacted["rtt_micros"], 42_000);
-        assert_eq!(redacted["bytes_in_flight"], 4_800);
-        assert_eq!(redacted["send_blocked_micros"], 7_000);
+        assert_eq!(redacted["rtt_micros"], "42000");
+        assert_eq!(redacted["bytes_in_flight"], "4800");
+        assert_eq!(redacted["send_blocked_micros"], "7000");
         assert_eq!(redacted["close_reason"], "closed by peer");
-        assert!(redacted["peer"]
-            .as_str()
-            .is_some_and(|peer| peer.starts_with("peer:")));
+        assert!(redacted["peer"].starts_with("peer:"));
 
         assert_eq!(row(true)["admitted_ip"], "203.0.113.9");
     }

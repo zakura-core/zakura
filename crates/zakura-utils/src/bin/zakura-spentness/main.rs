@@ -25,7 +25,7 @@ use zakura_chain::{
     block::{self, merkle, Block, Height},
     common::atomic_write,
     parameters::{
-        spentness_hints::{release_commitments, ParsedArtifact},
+        spentness_hints::{supported_commitments, ParsedArtifact},
         Network,
     },
     transaction,
@@ -216,16 +216,16 @@ fn write(path: PathBuf, bytes: &[u8]) -> Result<()> {
 
 fn install(artifact_path: &Path, cache: &Path) -> Result<()> {
     let parsed = ParsedArtifact::read(File::open(artifact_path)?)?;
-    let commitment = release_commitments(&NETWORK)
-        .iter()
-        .find(|commitment| *commitment == parsed.commitment())
+    let commitment = supported_commitments(&NETWORK)
+        .into_iter()
+        .find(|commitment| commitment == parsed.commitment())
         .ok_or_else(|| {
             eyre!(
-                "this binary does not recognize the artifact; \
+                "this binary does not recognize the artifact, or its commitment is revoked; \
                  install a release with its reviewed commitment"
             )
         })?;
-    let verified = parsed.verify(commitment)?;
+    let verified = parsed.verify(&commitment)?;
     write(cache.join(commitment.file_name()), verified.bytes())
 }
 

@@ -58,6 +58,7 @@ pub struct SemanticBlockVerifier<S, V> {
     state_service: S,
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
+    spentness_status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
     receipt_orders: receipt::ReceiptRegistry,
 }
 
@@ -323,8 +324,17 @@ where
             state_service,
             transaction_verifier,
             prepared_candidates: Default::default(),
+            spentness_status: None,
             receipt_orders: Default::default(),
         }
+    }
+
+    pub(crate) fn with_spentness_status(
+        mut self,
+        status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
+    ) -> Self {
+        self.spentness_status = status;
+        self
     }
 }
 
@@ -358,12 +368,31 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let mut spentness_status = self.spentness_status.clone();
+
+        // Only synced blocks wait for construction. Mining requests fail fast instead.
+        let waits_for_spentness = matches!(request, Request::Commit(_));
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
+            // Semantic verification reads monetary state, so it needs completed construction.
+            if let Some(status) = &mut spentness_status {
+                let usable = if waits_for_spentness {
+                    zs::wait_for_spentness(status, |status| status == zs::SpentnessStatus::Usable)
+                        .await
+                } else if *status.borrow() == zs::SpentnessStatus::Usable {
+                    Ok(())
+                } else {
+                    Err(zs::SpentnessError::Unavailable)
+                };
+                usable.map_err(|error| VerifyBlockError::StateService {
+                    source: error.into(),
+                    hash,
+                })?;
+            }
             // Keep this receipt registered until verification finishes or is cancelled.
             let _receipt = receipt;
             // Preparing a template costs everything below, not just the contextual check at the

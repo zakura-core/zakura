@@ -19,13 +19,18 @@ use tokio::{
 };
 use zakura_chain::parameters::spentness_hints::{self, Commitment, VerifiedArtifact};
 
+use tokio_util::sync::CancellationToken;
+
 use super::{
     cache::{load, make_room_for_partial, partial_path, publish, remove_partials},
     wire::{RangeRequest, RangeResponse, GET_RANGE, RANGE_BYTES},
-    ArtifactService, CAPABILITY, STREAM_KIND,
+    ArtifactService, CAPABILITY, SERVICE_ID, STREAM_KIND,
 };
 use crate::{
-    zakura::{Frame, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle},
+    zakura::{
+        spawn_zakura_endpoint_with_services, CustomService, Frame, Peer, Service, Stream,
+        ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId, ZakuraServiceId, ZakuraSupervisorHandle,
+    },
     BoxError,
 };
 
@@ -41,6 +46,10 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the first peer that negotiated the capability.
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the temporary pre-state endpoint may take to shut down.
+const BOOTSTRAP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound startup retries so Auto mode can fall back to ordinary sync.
+const BOOTSTRAP_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Pause after the first busy reply. Each further busy reply doubles it.
 const BUSY_BACKOFF_MIN: Duration = Duration::from_millis(250);
 /// Longest pause between busy replies from one source.
@@ -141,6 +150,75 @@ pub async fn download_missing(
         _ = acquisition => {},
         _ = shutdown.cancelled() => {},
     }
+}
+
+/// The temporary pre-state endpoint runs no node services; it only seeks artifacts.
+#[derive(Debug)]
+struct NoNodeServices;
+
+impl Service for NoNodeServices {
+    fn name(&self) -> &'static str {
+        "spentness-bootstrap"
+    }
+    fn streams(&self) -> &[Stream] {
+        &[]
+    }
+    fn add_peer(&self, _peer: Peer) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn: ZakuraConnId) {}
+}
+
+/// Acquire a release-selected artifact over a temporary endpoint before writable state opens.
+///
+/// This waits a bounded time for the endpoint to shut down, so the node can start its normal
+/// endpoint. A shutdown timeout does not discard an acquired artifact.
+pub async fn acquire_before_state(
+    config: &crate::Config,
+    cache: &Path,
+    commitment: &Commitment,
+    shutdown: CancellationToken,
+) -> Result<Arc<VerifiedArtifact>, BoxError> {
+    commitment.validate()?;
+    let endpoint = spawn_zakura_endpoint_with_services(
+        config,
+        |_, _| Arc::new(NoNodeServices),
+        None,
+        vec![CustomService {
+            service: Arc::new(ArtifactService::new([])),
+            provides: Vec::new(),
+            seeks: vec![ZakuraServiceId::new(SERVICE_ID)?],
+        }],
+    )
+    .await?
+    .ok_or("peer spentness acquisition requires the Zakura transport or a local artifact file")?;
+
+    let supervisor = endpoint.supervisor();
+    let acquisition = async {
+        let mut cursor = SourceCursor::default();
+        loop {
+            let peers = cursor.order(wait_for_capable_peers(&supervisor).await);
+            match acquire_round(cache, commitment, &peers, &mut cursor).await {
+                Ok(artifact) => return Ok(artifact),
+                Err(error) => {
+                    tracing::warn!(%error, "pre-state spentness acquisition failed; retrying after delay")
+                }
+            }
+            sleep(RETRY_DELAY).await;
+        }
+    };
+    let result = tokio::select! {
+        result = timeout(BOOTSTRAP_ACQUISITION_TIMEOUT, acquisition) =>
+            result.unwrap_or_else(|_| Err("spentness startup acquisition exceeded its one-hour deadline".into())),
+        _ = shutdown.cancelled() => Err("spentness acquisition cancelled during shutdown".into()),
+    };
+    // A slow shutdown does not invalidate an acquired artifact. If the socket is still
+    // bound, starting the normal endpoint reports that failure.
+    if timeout(BOOTSTRAP_SHUTDOWN_TIMEOUT, endpoint.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!("spentness bootstrap endpoint shutdown timed out");
+    }
+    result
 }
 
 /// Return a cached artifact, or acquire it from peers in order.

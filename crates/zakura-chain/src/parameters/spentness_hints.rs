@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::Network;
+
 const HASH_LEN: usize = 32;
 const BITS_PER_BYTE: u64 = 8;
 const MAGIC: &[u8; 8] = b"ZKSHINT\0";
@@ -27,6 +29,19 @@ pub const FORMAT_VERSION: u16 = 1;
 mod commitments;
 pub use commitments::MAINNET_COMMITMENTS;
 
+/// Operator policy for initial checkpoint construction with spentness hints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Use ordinary state writes and reject unfinished hinted construction.
+    #[default]
+    Off,
+    /// Try hints on an empty database, with ordinary fallback before the first write.
+    Auto,
+    /// Require compatible hints before starting an empty database.
+    Require,
+}
+
 /// Revoked artifact digests. Recognition never overrides revocation.
 pub const REVOKED_COMMITMENTS: &[[u8; 32]] = &[];
 
@@ -34,10 +49,10 @@ pub const REVOKED_COMMITMENTS: &[[u8; 32]] = &[];
 ///
 /// Only Mainnet has reviewed artifacts. Other networks always build ordinary state.
 /// This list can include revoked commitments; see [`supported_commitments`].
-pub fn release_commitments(network: &super::Network) -> &'static [Commitment] {
+pub fn release_commitments(network: &Network) -> &'static [Commitment] {
     match network {
-        super::Network::Mainnet => MAINNET_COMMITMENTS,
-        super::Network::Testnet(_) => &[],
+        Network::Mainnet => MAINNET_COMMITMENTS,
+        Network::Testnet(_) => &[],
     }
 }
 
@@ -357,7 +372,7 @@ mod tests {
 
     #[test]
     fn release_commitments_match_checkpoint_authority() {
-        let checkpoints = crate::parameters::Network::Mainnet.checkpoint_list();
+        let checkpoints = Network::Mainnet.checkpoint_list();
         let mut previous = None;
         for pin in MAINNET_COMMITMENTS {
             pin.validate().unwrap();

@@ -165,6 +165,7 @@ mod tests {
             .get("network")
             .and_then(|network| network.get("zakura"))
             .expect("default config contains the native Zakura section");
+        assert!(config.get("spentness").is_none());
         assert!(zakura.get("block_sync").is_none());
         assert!(zakura.get("header_sync").is_none());
         assert!(zakura.get("bootstrap_peers").is_some());

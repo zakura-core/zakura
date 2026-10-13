@@ -326,6 +326,10 @@ try:
     manifest = json.loads(spentness_release.MANIFEST.read_text())
     if spentness_release.COMPILED.read_text() != spentness_release.render_commitments(manifest):
         fail("compiled spentness commitments differ from reviewed manifest")
+    if spentness_release.FRONTIER_REGISTRY.read_text() != spentness_release.render_frontiers(manifest):
+        fail("compiled spentness frontiers differ from reviewed manifest")
+    for entry in manifest["artifacts"]:
+        spentness_release.verify_retained_frontier(Path("."), entry)
     entries = manifest["artifacts"]
     if entries or "spentness_sha256" in provenance:
         if not entries:

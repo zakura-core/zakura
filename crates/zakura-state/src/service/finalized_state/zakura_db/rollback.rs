@@ -124,6 +124,23 @@ pub enum RollbackFinalizedStateError {
     #[error("state database is empty")]
     EmptyState,
 
+    /// The state database could not be opened, for example during incomplete spentness construction.
+    #[error("cannot open the state database for rollback: {0}")]
+    Open(#[source] Box<crate::StateInitError>),
+
+    /// The spentness progress record could not be read.
+    #[error(transparent)]
+    Spentness(#[from] crate::SpentnessError),
+
+    /// Rollback cannot cross a completed spentness handoff or a stricter VCT boundary.
+    #[error("target height {target:?} is below the rollback floor {floor:?}")]
+    BelowRollbackFloor {
+        /// Requested rollback height.
+        target: block::Height,
+        /// Lowest height this database can roll back to.
+        floor: block::Height,
+    },
+
     /// The requested target height is above the finalized tip.
     #[error("target height {target:?} is above finalized tip {tip:?}")]
     TargetAboveTip {
@@ -389,6 +406,28 @@ fn open_rollback_db(
     )
 }
 
+/// Reject rollback below a completed spentness handoff, or below a stricter VCT boundary.
+///
+/// Opening the database already rejects incomplete construction.
+fn check_spentness_rollback_floor(
+    db: &ZakuraDb,
+    target: block::Height,
+) -> Result<(), RollbackFinalizedStateError> {
+    let Some(super::spentness::Progress::Complete { rollback_floor, .. }) =
+        db.spentness_progress()?
+    else {
+        return Ok(());
+    };
+    let floor = block::Height(rollback_floor);
+    let floor = db
+        .vct_synced_below()
+        .map_or(floor, |vct_floor| vct_floor.max(floor));
+    if target < floor {
+        return Err(RollbackFinalizedStateError::BelowRollbackFloor { target, floor });
+    }
+    Ok(())
+}
+
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
 ///
 /// Computing these is cheap (a couple of index lookups), so the dry-run preview stops here
@@ -427,6 +466,7 @@ fn validate_rollback(
     db: &ZakuraDb,
     options: &RollbackFinalizedStateOptions,
 ) -> Result<RollbackBounds, RollbackFinalizedStateError> {
+    check_spentness_rollback_floor(db, options.target_height)?;
     let old_tip = db.tip().ok_or(RollbackFinalizedStateError::EmptyState)?;
     let (old_tip_height, _) = old_tip;
 

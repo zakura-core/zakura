@@ -156,7 +156,11 @@ fn format_upgrades(
             "allow transparent index updates to stop in place",
             Version::new(30, 0, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 13])
+        Box::new(no_migration::NoMigration::new(
+            "guard incomplete spentness construction from older binaries",
+            Version::new(31, 0, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 14])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -564,6 +568,12 @@ impl DbFormatChange {
                     "checking database format produced by new blocks in this instance is valid"
                 );
             }
+        }
+
+        // Until H, construction's UTXO set holds only survivors, while address balances
+        // count every unspent output. Checks that compare the two would fail.
+        if db.spentness_incomplete() {
+            return Ok(());
         }
 
         #[cfg(feature = "indexer")]
@@ -1124,7 +1134,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 9);
+    assert_eq!(upgrades.len(), 10);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
@@ -1134,7 +1144,11 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
     assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
     assert_eq!(upgrades[7].version(), Version::new(29, 1, 0));
     assert_eq!(upgrades[8].version(), Version::new(30, 0, 0));
+    assert_eq!(upgrades[9].version(), Version::new(31, 0, 0));
+    assert!(upgrades[9].is_reusable_major_upgrade());
+    assert!(!upgrades[9].needs_migration());
     assert!(upgrades[8].is_reusable_major_upgrade());
+    assert!(!upgrades[8].needs_migration());
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

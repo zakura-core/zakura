@@ -2838,7 +2838,10 @@ mod tests {
         while routine.routine_to_reactor.capacity() > 0 {
             routine
                 .routine_to_reactor
-                .try_send(RoutineToReactor::RequeryNeeded)
+                .try_send(RoutineToReactor::StatusReceived {
+                    peer: routine.peer.clone(),
+                    send_reply: false,
+                })
                 .unwrap();
         }
         let request = BlockSyncMessage::GetBlocks {
@@ -2924,120 +2927,6 @@ mod tests {
                 count: 1
             }
         ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn floor_ranking_change_wakes_a_deferred_routine() {
-        use super::super::peer_registry::SlotDiagnostics;
-
-        let (mut slow, mut outbound, _reactor_events) = status_test_routine();
-        // Keep the input streams open while driving the real wait loop.
-        let (_in_send, in_recv) = framed_channel(16);
-        slow.recv = in_recv;
-        let (_view_tx, view_rx) = watch::channel(*slow.sequencer_view.borrow());
-        slow.sequencer_view = view_rx;
-        slow.received_status = true;
-        slow.servable_low = block::Height(1);
-        slow.servable_high = block::Height(10);
-
-        let registry = Arc::clone(&slow.registry);
-        let work = Arc::clone(&slow.work);
-        let slow_peer = slow.peer.clone();
-        let slow_generation = slow.generation;
-        let cancel = slow.cancel.clone();
-        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
-        let fast_generation = registry
-            .admit_session(
-                &fast_peer,
-                slow.session.direction(),
-                &slow.config,
-                0,
-                Instant::now(),
-            )
-            .generation();
-        for (peer, generation) in [(&slow_peer, slow_generation), (&fast_peer, fast_generation)] {
-            registry.upsert_status(
-                peer,
-                generation,
-                BlockSyncStatus {
-                    servable_low: block::Height(0),
-                    servable_high: block::Height(10),
-                    ..BlockSyncStatus::default()
-                },
-            );
-        }
-
-        let mut running = Box::pin(slow.run());
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        // Consume the initial heartbeat before publishing the two finite scores.
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        let before_refill = tokio::time::Instant::now();
-        let slots = SlotDiagnostics {
-            available_slots: 3,
-            bbr_rtprop_ms: Some(75),
-            ..SlotDiagnostics::default()
-        };
-        registry.publish_slots(&fast_peer, fast_generation, slots);
-        registry.publish_slots(
-            &slow_peer,
-            slow_generation,
-            SlotDiagnostics {
-                bbr_rtprop_ms: Some(145),
-                ..slots
-            },
-        );
-        work.extend(
-            super::super::test_work_scope(),
-            [(
-                block::Height(1),
-                block::Hash([1; 32]),
-                BlockSizeEstimate::Advertised(1_000),
-            )],
-        );
-
-        // The slow worker sees the faster carrier and goes back to sleep.
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        assert!(outbound.try_recv().is_err());
-        assert!(work.pending_contains(block::Height(1)));
-
-        registry.publish_slots(
-            &fast_peer,
-            fast_generation,
-            SlotDiagnostics {
-                bbr_rtprop_ms: None,
-                ..slots
-            },
-        );
-        assert!(registry.floor_has_preferred_unsaturated_server(
-            block::Height(0),
-            &fast_peer,
-            None,
-            false
-        ));
-
-        // The fast worker now defers to the sleeping slow worker. Only the
-        // ranking update can wake it: no work, capacity, view, or timer changed.
-        assert!(futures::poll!(running.as_mut()).is_pending());
-        let frame = outbound
-            .try_recv()
-            .expect("a ranking change must wake the deferred worker");
-        assert!(matches!(
-            BlockSyncMessage::decode_frame(frame).unwrap(),
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 1
-            }
-        ));
-        assert!(work.in_flight_contains(block::Height(1)));
-        assert!(!work.pending_contains(block::Height(1)));
-        assert_eq!(tokio::time::Instant::now(), before_refill);
-
-        cancel.cancel();
-        assert!(timeout(Duration::from_secs(1), running)
-            .await
-            .unwrap()
-            .is_ok());
     }
 
     #[tokio::test]

@@ -612,13 +612,26 @@ impl PeerRoutine {
             } => {
                 // Serving is reactor-owned (state query + driver). Forward the
                 // request; the reactor serves via the session clone it holds.
-                let _ = self
+                if self
                     .routine_to_reactor
                     .try_send(RoutineToReactor::ServeGetBlocks {
                         peer: self.peer.clone(),
                         start_height,
                         count,
+                    })
+                    .is_err()
+                {
+                    metrics::counter!("sync.block.serving.reactor_queue_unavailable").increment(1);
+                    self.emit("block_serve_rejected", |row| {
+                        row.peer = Some(super::trace::peer(&self.peer));
+                        row.range_start = Some(u64::from(start_height.0));
+                        row.range_count = Some(u64::from(count));
+                        row.reason = Some("reactor_queue_unavailable");
                     });
+                    self.session
+                        .try_send_range_unavailable(start_height, count)
+                        .map_err(SinkReject::local)?;
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace
@@ -2388,8 +2401,8 @@ mod tests {
         BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
         ZakuraBlockSyncConfig,
     };
-    use super::PeerRoutine;
     use super::RoutineToReactor;
+    use super::{block_sync_guard, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
@@ -2447,6 +2460,35 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test]
+    async fn full_reactor_queue_returns_range_unavailable() {
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        while routine.routine_to_reactor.capacity() > 0 {
+            routine
+                .routine_to_reactor
+                .try_send(RoutineToReactor::RequeryNeeded)
+                .unwrap();
+        }
+        let request = BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 2,
+        }
+        .encode_frame()
+        .unwrap();
+        routine
+            .handle_frame(&mut block_sync_guard(), request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(outbound.try_recv().unwrap()).unwrap(),
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(1),
+                count: 2,
+            }
+        ));
+        assert!(!routine.session.cancel_token().is_cancelled());
     }
 
     #[tokio::test]

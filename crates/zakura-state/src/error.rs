@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use derive_new::new;
+use semver::Version;
 use thiserror::Error;
 
 use zakura_chain::{
@@ -212,6 +213,75 @@ pub enum StateInitError {
         path: PathBuf,
         /// The source describes the migration failure.
         source: BoxError,
+    },
+
+    /// The database format is older than the oldest format that the running code can upgrade.
+    #[error(
+        "cannot open state database at {path:?}: its format {disk_version} is older than \
+         {min_upgradable_version}, the oldest format this version can upgrade. \
+         Hint: delete the database and sync again, or restore a snapshot taken with a current release"
+    )]
+    DatabaseTooOld {
+        /// The database directory.
+        path: PathBuf,
+        /// The format version recorded on disk.
+        disk_version: Version,
+        /// The oldest format version that the running code can upgrade.
+        min_upgradable_version: Version,
+    },
+
+    /// A newer format change made the database unreadable for the running code.
+    #[error(
+        "cannot open state database at {path:?}: a newer Zakura version changed its format, and \
+         only code with format {min_reader_version} or later can read it, but this version has \
+         format {running_version}. Hint: run a newer Zakura version, or sync this version into a \
+         fresh cache directory"
+    )]
+    DatabaseTooNew {
+        /// The database directory.
+        path: PathBuf,
+        /// The oldest format version whose code may open the database.
+        min_reader_version: Version,
+        /// The format version of the running code.
+        running_version: Version,
+    },
+
+    /// Another process has the previous-major database open, so startup cannot move it.
+    #[error(
+        "cannot move the previous state database at {path:?}: another process has it open. \
+         Hint: stop the older Zakura node that uses this cache directory, then start this version"
+    )]
+    PreviousDatabaseInUse {
+        /// The previous-major database directory.
+        path: PathBuf,
+        /// The error returned while taking the database lock.
+        source: std::io::Error,
+    },
+
+    /// The previous-major database resolves to a path outside the cache directory.
+    #[error(
+        "cannot move the previous state database at {path:?}: it resolves to a path outside the \
+         cache directory. Hint: move or link the database to {current_path:?}"
+    )]
+    PreviousDatabaseOutsideCacheDir {
+        /// The previous-major database directory.
+        path: PathBuf,
+        /// The directory that the running version opens.
+        current_path: PathBuf,
+    },
+
+    /// Startup could not move the previous-major database into the current directory.
+    #[error(
+        "cannot move the previous state database from {from:?} to {to:?}. \
+         Hint: check the cache directory permissions, and remove {to:?} if it is not a database"
+    )]
+    PreviousDatabaseMove {
+        /// The previous-major database directory.
+        from: PathBuf,
+        /// The directory that the running version opens.
+        to: PathBuf,
+        /// The error returned by the move.
+        source: std::io::Error,
     },
 
     /// A read-only state was requested, but the configured cache directory is

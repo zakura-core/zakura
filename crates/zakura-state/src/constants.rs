@@ -87,16 +87,12 @@ pub fn min_pruning_retention(network: &Network) -> u32 {
 /// individual write batches small.
 pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 
-/// The database format major version, incremented each time the on-disk database format has a
-/// breaking data format change.
+/// The database format major version, which names the state database directory.
 ///
-/// Breaking changes include:
-/// - deleting a column family, or
-/// - changing a column family's data format in an incompatible way.
-///
-/// Breaking changes become minor version changes if:
-/// - we previously added compatibility code, and
-/// - it's available in all supported Zebra versions.
+/// The major version is frozen at 30. Every later format change is a minor or patch step. An
+/// incompatible step raises the database's minimum reader version instead, through
+/// `DiskFormatUpgrade::min_reader_version`. A major bump would move the database to a new
+/// directory, and every code path that locates the database would have to follow that move.
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
@@ -106,9 +102,8 @@ const DATABASE_FORMAT_VERSION: u64 = 30;
 /// significant data format change.
 ///
 /// Significant changes include:
-/// - adding new column families,
-/// - changing the format of a column family in a compatible way, or
-/// - breaking changes with compatibility code in all supported Zebra versions.
+/// - adding or deleting column families, or
+/// - changing the format of a column family.
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
@@ -132,9 +127,13 @@ pub fn state_database_format_version_in_code() -> Version {
     }
 }
 
-/// The name of the file containing the database version.
+/// The oldest database format version that the running code can upgrade.
 ///
-/// Note: This file has historically omitted the major database version.
+/// Every Zakura release wrote format 28.0.0 or later, so no Zakura database is older. Startup
+/// refuses an older database and asks the operator to resync it.
+pub const MIN_UPGRADABLE_DATABASE_FORMAT_VERSION: Version = Version::new(28, 0, 0);
+
+/// The name of the file containing the database version.
 ///
 /// Use [`Config::version_file_path()`] to get the path to this file.
 pub(crate) const DATABASE_FORMAT_VERSION_FILE_NAME: &str = "version";

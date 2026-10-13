@@ -148,7 +148,6 @@ pub use zakura_db::ZakuraDb;
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
 
-pub use disk_format::upgrade::restorable_db_versions;
 pub use zakura_db::prune::{
     preview_prune_finalized_state, prune_finalized_state, PruneFinalizedStateError,
     PruneFinalizedStateOptions, PruneFinalizedStateSummary,
@@ -225,6 +224,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
+    // Database facts
+    STATE_MANIFEST,
 ];
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
@@ -279,6 +280,13 @@ pub const VCT_SYNC_METADATA: &str = "vct_sync_metadata";
 /// This height is the first block committed by code that writes the
 /// [`COMMITMENT_ROOTS_BY_HEIGHT`] serving index.
 pub const VCT_UPGRADE_METADATA: &str = "vct_upgrade_metadata";
+
+/// The name of the column family that records facts about the database itself.
+///
+/// Each entry maps a fact's name to its value, so code skips the facts it does not know. The
+/// first fact is the minimum reader version: the oldest format version whose code may open the
+/// database. See [`ZakuraDb::min_reader_version`].
+pub const STATE_MANIFEST: &str = "state_manifest";
 
 /// The finalized part of the chain state, stored in the db.
 ///

@@ -436,12 +436,17 @@ impl StateService {
                 // guidance each `StateInitError` carries in its `Display` message.
                 let finalized_state = FinalizedState::new(&config, &network)
                     .unwrap_or_else(|error| match error {
-                        // This database cannot be repaired, and the generic hint below would
+                        // These errors carry their own hint, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
                         error @ (StateInitError::VctSproutHistoryUnrepairable
                         | StateInitError::TransparentIndexesMissingInArchiveMode {
                             ..
-                        }) => {
+                        }
+                        | StateInitError::DatabaseTooOld { .. }
+                        | StateInitError::DatabaseTooNew { .. }
+                        | StateInitError::PreviousDatabaseInUse { .. }
+                        | StateInitError::PreviousDatabaseOutsideCacheDir { .. }
+                        | StateInitError::PreviousDatabaseMove { .. }) => {
                             panic!("{error}")
                         }
                         error => panic!(

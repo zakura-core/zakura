@@ -2202,10 +2202,8 @@ async fn update_state_format() -> Result<()> {
     Ok(())
 }
 
-/// Check that newer state formats are downgraded to the current state format version,
-/// and that restarting `zakurad` doesn't change the format version.
-///
-/// Future version compatibility is a best-effort attempt, this test can be disabled if it fails.
+/// Check that `zakurad` opens a newer state format whose minimum reader version allows it,
+/// and that restarting `zakurad` doesn't change the newer format version.
 #[tokio::test]
 async fn downgrade_state_format() -> Result<()> {
     let mut fake_version = state_database_format_version_in_code();
@@ -2257,11 +2255,6 @@ async fn state_format_test(
         "unexpected format upgrade in logs:\n\
          {logs}"
     );
-    assert!(
-        !logs.contains("marked database format as downgraded"),
-        "unexpected format downgrade in logs:\n\
-         {logs}"
-    );
 
     let output = zakurad.wait_with_output()?;
     let mut output = output.assert_failure()?;
@@ -2308,9 +2301,9 @@ async fn state_format_test(
     for reopened in 0..reopen_count {
         let test_name = &format!("{base_test_name}/reopen/{reopened}");
 
+        // The first reopen upgrades an older version. A newer version stays on disk.
         if reopened > 0 {
             expect_older_version = false;
-            expect_newer_version = false;
         }
 
         let mut zakurad =
@@ -2325,7 +2318,7 @@ async fn state_format_test(
             zakurad.expect_stdout_line_matches("database is fully upgraded")?;
         } else if expect_newer_version {
             zakurad.expect_stdout_line_matches("trying to open newer database format")?;
-            zakurad.expect_stdout_line_matches("marked database format as downgraded")?;
+            zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
         } else {
             zakurad.expect_stdout_line_matches("trying to open current database format")?;
             zakurad.expect_stdout_line_matches("loaded Zakura state cache")?;
@@ -2337,14 +2330,6 @@ async fn state_format_test(
             assert!(
                 !logs.contains("marked database format as upgraded"),
                 "unexpected format upgrade in logs:\n\
-                 {logs}"
-            );
-        }
-
-        if !expect_newer_version {
-            assert!(
-                !logs.contains("marked database format as downgraded"),
-                "unexpected format downgrade in logs:\n\
                  {logs}"
             );
         }

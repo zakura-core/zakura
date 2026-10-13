@@ -35,7 +35,7 @@ use crate::{
     service::finalized_state::{
         disk_db::DiskDb,
         disk_format::{tests::KV, RawBytes},
-        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, VCT_UPGRADE_METADATA,
+        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, STATE_MANIFEST, VCT_UPGRADE_METADATA,
     },
     Config, ReadDisk,
 };
@@ -136,8 +136,8 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
             // distinguish column family names from empty column families
             empty_column_families.push(format!("{cf_name}: no entries"));
         } else if skip_raw_data_snapshot(cf_name) {
-            // These column families are covered by targeted VCT tests. Avoid duplicating
-            // opaque per-block payload bytes in the broad disk-format snapshots.
+            // Targeted VCT and manifest tests cover these column families. Avoid duplicating
+            // opaque payload bytes in the broad disk-format snapshots.
         } else {
             // The note commitment tree snapshots will change if the trees do not have cached roots.
             // But we expect them to always have cached roots,
@@ -150,5 +150,8 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
 }
 
 fn skip_raw_data_snapshot(cf_name: &str) -> bool {
-    matches!(cf_name, COMMITMENT_ROOTS_BY_HEIGHT | VCT_UPGRADE_METADATA)
+    matches!(
+        cf_name,
+        COMMITMENT_ROOTS_BY_HEIGHT | VCT_UPGRADE_METADATA | STATE_MANIFEST
+    )
 }

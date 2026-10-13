@@ -28,7 +28,7 @@ use zakura_chain::{
 
 use DbFormatChange::*;
 
-use crate::service::finalized_state::ZakuraDb;
+use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 
 pub(crate) mod add_ironwood_tree;
 pub(crate) mod add_subtrees;
@@ -99,10 +99,13 @@ pub trait DiskFormatUpgrade {
         true
     }
 
-    /// Returns whether a major upgrade can reuse the previous major version's cache.
-    fn is_reusable_major_upgrade(&self) -> bool {
-        let version = self.version();
-        version.minor == 0 && version.patch == 0
+    /// Returns the oldest format version whose code may open the database after this upgrade.
+    ///
+    /// The default returns this upgrade's own version, which keeps older code out. Override it
+    /// only when code at the returned version reads this upgrade's data correctly and writes data
+    /// that stays valid for it. Then operators can roll back to that code without a resync.
+    fn min_reader_version(&self) -> Version {
+        self.version()
     }
 }
 
@@ -112,21 +115,10 @@ fn format_upgrades(
     let min_version = move || min_version.clone().unwrap_or(Version::new(0, 0, 0));
 
     // Note: Disk format upgrades must be run in order of database version.
+    //
+    // Startup refuses databases older than `MIN_UPGRADABLE_DATABASE_FORMAT_VERSION`, so the
+    // registry only lists the upgrades after it.
     ([
-        Box::new(block_info_and_address_received::Upgrade),
-        Box::new(no_migration::NoMigration::new(
-            "add pruning metadata column family",
-            Version::new(27, 1, 0),
-        )),
-        Box::new(no_migration::NoMigration::new(
-            "add Zakura header body size hints",
-            Version::new(27, 2, 0),
-        )),
-        Box::new(no_migration::NoMigration::new(
-            "add verified-commitment-trees metadata, serving index, and history tree repair",
-            Version::new(27, 3, 0),
-        )),
-        Box::new(add_ironwood_tree::Upgrade),
         // The Sprout-history repair this version once performed has been removed. Databases that
         // still need it are rejected at startup instead; see `ZakuraDb::new_with_vct_guard`.
         Box::new(no_migration::NoMigration::new(
@@ -150,27 +142,15 @@ fn format_upgrades(
             "add Zakura header auxiliary body size corrections",
             Version::new(29, 1, 0),
         )),
-        // Reuse the existing cache, but keep binaries that do not understand incomplete
-        // transparent indexes from opening it through their older version directory.
+        // The last major version. It keeps binaries that do not understand incomplete transparent
+        // indexes from opening the database through their older version directory.
         Box::new(no_migration::NoMigration::new(
             "allow transparent index updates to stop in place",
             Version::new(30, 0, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 13])
+    ] as [Box<dyn DiskFormatUpgrade>; 8])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
-}
-
-/// Returns a list of all the major db format versions that can restored from the
-/// previous major database format.
-pub fn restorable_db_versions() -> Vec<u64> {
-    format_upgrades(None)
-        .filter_map(|upgrade| {
-            upgrade
-                .is_reusable_major_upgrade()
-                .then_some(upgrade.version().major)
-        })
-        .collect()
 }
 
 /// The kind of database format change or validity check we're performing.
@@ -194,10 +174,10 @@ pub enum DbFormatChange {
     /// It is set to the running version by the format change code.
     NewlyCreated { running_version: Version },
 
-    /// Mark the format as downgraded from `newer_disk_version` to `older_running_version`.
+    /// Open a `newer_disk_version` database with `older_running_version` code.
     ///
-    /// Until the state is upgraded to `newer_disk_version` by a Zebra version with that state
-    /// version (or greater), the format will be a mixture of both versions.
+    /// Startup only gets here when the database's minimum reader version allows the running
+    /// code, so the newer format stays valid. The version on disk does not change.
     Downgrade {
         newer_disk_version: Version,
         older_running_version: Version,
@@ -359,7 +339,7 @@ impl DbFormatChange {
                 info!(
                     %running_version,
                     %disk_version,
-                    "trying to open newer database format: data should be compatible"
+                    "trying to open newer database format: its minimum reader version allows this version"
                 );
 
                 Downgrade {
@@ -527,19 +507,14 @@ impl DbFormatChange {
                 Self::mark_as_newly_created(db);
             }
 
-            Downgrade { .. } => {
-                // # Correctness
-                //
-                // At the start of a format downgrade, the database must be marked as partially or
-                // fully downgraded. This lets newer Zebra versions know that some blocks with older
-                // formats have been added to the database.
-                Self::mark_as_downgraded(db);
-
-                // Older supported versions just assume they can read newer formats,
-                // because they can't predict all changes a newer Zebra version could make.
-                //
-                // The responsibility of staying backwards-compatible is on the newer version.
-                // We do this on a best-effort basis for versions that are still supported.
+            Downgrade {
+                older_running_version,
+                ..
+            } => {
+                // A newer version that allows this code also keeps its data valid for this code,
+                // so the version on disk stays newer, and the newer version never repeats an
+                // upgrade.
+                Self::record_missing_min_reader_version(db, older_running_version);
             }
 
             CheckOpenCurrent { running_version } => {
@@ -550,6 +525,8 @@ impl DbFormatChange {
                     "checking database format produced by a previous Zakura instance \
                      is current and valid"
                 );
+
+                Self::record_missing_min_reader_version(db, running_version);
             }
 
             CheckNewBlocksCurrent { running_version } => {
@@ -708,7 +685,7 @@ impl DbFormatChange {
                 newer_running_version = ?upgrade.version(),
                 "Zakura automatically upgraded the database format"
             );
-            Self::mark_as_upgraded_to(db, &upgrade.version());
+            Self::mark_as_upgraded_to(db, upgrade.as_ref());
         }
 
         if initial_finalized_tip_height.is_none() {
@@ -775,6 +752,11 @@ impl DbFormatChange {
         results.push(add_subtrees::detailed_check(db, cancel_receiver)?);
         results.push(cache_genesis_roots::detailed_check(db, cancel_receiver)?);
         results.push(fix_tree_key_type::detailed_check(db, cancel_receiver)?);
+        results.push(block_info_and_address_received::detailed_check(
+            db,
+            cancel_receiver,
+        )?);
+        results.push(add_ironwood_tree::detailed_check(db));
 
         for upgrade in format_upgrades(None) {
             results.push(upgrade.validate(db, cancel_receiver)?);
@@ -811,17 +793,16 @@ impl DbFormatChange {
             .format_version_on_disk()
             .expect("unable to read database format version file path");
 
-        let default_new_version = Some(Version::new(running_version.major, 0, 0));
-
-        // The database version isn't empty any more, because we've created the RocksDB database
-        // and acquired its lock. (If it is empty, we have a database locking bug.)
+        // We hold the RocksDB lock, so no other process can have written a version since startup
+        // read it. (If one did, we have a database locking bug.)
         assert_eq!(
-            disk_version, default_new_version,
+            disk_version, None,
             "can't overwrite the format version in an existing database:\n\
              disk: {disk_version:?}\n\
              running: {running_version}"
         );
 
+        Self::write_min_reader_version(db, &running_version);
         db.update_format_version_on_disk(&running_version)
             .expect("unable to write database format version file to disk");
 
@@ -853,7 +834,8 @@ impl DbFormatChange {
     /// - older or the same as the disk version
     ///   (multiple upgrades to the same version are not allowed)
     /// - greater than the running version (that's a logic bug)
-    fn mark_as_upgraded_to(db: &ZakuraDb, format_upgrade_version: &Version) {
+    fn mark_as_upgraded_to(db: &ZakuraDb, upgrade: &dyn DiskFormatUpgrade) {
+        let format_upgrade_version = &upgrade.version();
         let running_version = db.format_version_in_code();
         let disk_version = db
             .format_version_on_disk()
@@ -884,6 +866,17 @@ impl DbFormatChange {
              running: {running_version}"
         );
 
+        // Record the minimum reader version first, so a crash never leaves older code allowed to
+        // open data in the new format.
+        let min_reader_version = db
+            .min_reader_version()
+            .expect("unable to read the database minimum reader version")
+            .into_iter()
+            .chain([upgrade.min_reader_version()])
+            .max()
+            .expect("the chain has at least one version");
+        Self::write_min_reader_version(db, &min_reader_version);
+
         db.update_format_version_on_disk(format_upgrade_version)
             .expect("unable to write database format version file to disk");
 
@@ -897,43 +890,47 @@ impl DbFormatChange {
         );
     }
 
-    /// Mark the database as downgraded to the running database version.
-    /// This should be called after a newer database is opened by an older Zebra version.
+    /// Records `version` as the minimum reader version of a database that has none.
     ///
-    /// # Concurrency
-    ///
-    /// The version must only be updated while RocksDB is holding the database
-    /// directory lock. This prevents multiple Zebra instances corrupting the version
-    /// file.
-    ///
-    /// # Panics
-    ///
-    /// If the format should have been upgraded, because the running version is newer.
-    /// If the state is newly created, because the running version should be the same.
-    ///
-    /// Multiple downgrades are allowed, because they all downgrade to the same running version.
-    fn mark_as_downgraded(db: &ZakuraDb) {
-        let running_version = db.format_version_in_code();
+    /// A database that older code created or upgraded has no minimum reader version. Startup
+    /// records the older of its disk version and `version`, so the code that wrote the database
+    /// can still open it.
+    fn record_missing_min_reader_version(db: &ZakuraDb, version: &Version) {
+        let recorded = db
+            .min_reader_version()
+            .expect("unable to read the database minimum reader version");
+        if recorded.is_some() {
+            return;
+        }
+
         let disk_version = db
             .format_version_on_disk()
             .expect("unable to read database format version file")
-            .expect("can't downgrade a newly created database");
+            .expect("an existing database has a format version");
+        let min_reader_version = if disk_version.cmp_precedence(version) == Ordering::Less {
+            disk_version
+        } else {
+            version.clone()
+        };
 
-        assert!(
-            disk_version >= running_version,
-            "can't downgrade a database that is being opened by a newer Zakura version:\n\
-             disk: {disk_version}\n\
-             running: {running_version}"
-        );
-
-        db.update_format_version_on_disk(&running_version)
-            .expect("unable to write database format version file to disk");
+        Self::write_min_reader_version(db, &min_reader_version);
 
         info!(
-            %running_version,
-            %disk_version,
-            "marked database format as downgraded"
+            %min_reader_version,
+            "recorded the database minimum reader version"
         );
+    }
+
+    /// Writes `version` as the database's minimum reader version.
+    ///
+    /// # Concurrency
+    ///
+    /// Only call this while the startup format change holds the RocksDB lock.
+    fn write_min_reader_version(db: &ZakuraDb, version: &Version) {
+        let mut batch = DiskWriteBatch::new();
+        batch.update_min_reader_version(db, version);
+        db.write_batch(batch)
+            .expect("unable to write the database minimum reader version");
     }
 }
 
@@ -1027,7 +1024,7 @@ fn database_startup_waits_for_format_upgrade() {
         false,
     )
     .expect("initial database creation succeeds");
-    db.update_format_version_on_disk(&Version::new(27, 3, 0))
+    db.update_format_version_on_disk(&crate::constants::MIN_UPGRADABLE_DATABASE_FORMAT_VERSION)
         .expect("test database version is set to an older format");
     let db_path = db.path().to_owned();
     drop(db);
@@ -1096,51 +1093,60 @@ fn format_upgrades_are_in_version_order() {
     }
 }
 
+/// The format major version names the database directory, so it must never change again.
 #[test]
-fn zakura_header_body_size_cf_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 1, 0))).collect();
-    let upgrade = upgrades
-        .iter()
-        .find(|upgrade| upgrade.version() == Version::new(27, 2, 0))
-        .expect("Zakura header body size upgrade should be present");
+fn database_directory_major_version_is_frozen() {
+    use crate::constants::state_database_format_version_in_code;
 
-    assert!(!upgrade.needs_migration());
+    const FROZEN_MAJOR_VERSION: u64 = 30;
+
+    assert_eq!(
+        state_database_format_version_in_code().major,
+        FROZEN_MAJOR_VERSION,
+        "add a minor or patch format step and raise its minimum reader version instead of \
+         bumping the major version, which moves the database to a new directory"
+    );
+
+    for upgrade in format_upgrades(None) {
+        assert!(
+            upgrade.version().major <= FROZEN_MAJOR_VERSION,
+            "format upgrade {} bumps the frozen major version",
+            upgrade.version()
+        );
+    }
 }
 
+/// Startup refuses databases below the upgrade floor, so the registry starts above it.
 #[test]
-fn fast_sync_metadata_cf_upgrade_is_no_migration() {
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 2, 0))).collect();
-    let upgrade = upgrades
-        .iter()
-        .find(|upgrade| upgrade.version() == Version::new(27, 3, 0))
-        .expect("verified-commitment-trees metadata upgrade should be present");
+fn format_upgrades_start_above_the_upgrade_floor() {
+    use crate::constants::MIN_UPGRADABLE_DATABASE_FORMAT_VERSION;
 
-    assert!(!upgrade.needs_migration());
+    for upgrade in format_upgrades(None) {
+        assert!(upgrade.version() > MIN_UPGRADABLE_DATABASE_FORMAT_VERSION);
+    }
 }
 
 #[test]
 fn vct_format_changes_include_root_auth_metadata_updates() {
     use crate::constants::state_database_format_version_in_code;
 
-    let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
+    let upgrades: Vec<_> = format_upgrades(None).collect();
 
-    assert_eq!(upgrades.len(), 9);
-    assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
-    assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
-    assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
-    assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
-    assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
-    assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
-    assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
-    assert_eq!(upgrades[7].version(), Version::new(29, 1, 0));
-    assert_eq!(upgrades[8].version(), Version::new(30, 0, 0));
-    assert!(upgrades[8].is_reusable_major_upgrade());
+    assert_eq!(upgrades.len(), 8);
+    assert_eq!(upgrades[0].version(), Version::new(28, 0, 1));
+    assert_eq!(upgrades[1].version(), Version::new(28, 0, 2));
+    assert_eq!(upgrades[2].version(), Version::new(28, 1, 3));
+    assert_eq!(upgrades[3].version(), Version::new(28, 1, 4));
+    assert_eq!(upgrades[4].version(), Version::new(28, 1, 5));
+    assert_eq!(upgrades[5].version(), Version::new(29, 0, 0));
+    assert_eq!(upgrades[6].version(), Version::new(29, 1, 0));
+    assert_eq!(upgrades[7].version(), Version::new(30, 0, 0));
     assert!(
-        !upgrades[3].needs_migration(),
+        !upgrades[2].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"
     );
     assert!(
-        !upgrades[7].needs_migration(),
+        !upgrades[6].needs_migration(),
         "the sparse body size correction column family is created on open"
     );
     let mut current_schema_version = state_database_format_version_in_code();

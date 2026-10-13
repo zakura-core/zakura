@@ -88,10 +88,11 @@ monitored run itself.
 
 ## DB format-version note
 
-Snapshots store `state/v<N>/`. zakurad restores a state one major version back
-(a reusable-format upgrade runs in place); anything older is ignored and the
-node syncs from scratch — the run summary calls this out. After a DB format
-bump lands on `main`, re-run the bake so the volume snapshots catch up.
+Snapshots store `state/v<N>/`. The state directory major is frozen at `v30`.
+zakurad moves a state from an older major directory, down to `v28`, into
+`state/v30/` and upgrades it in place. It ignores anything older, and the node
+syncs from scratch — the run summary calls this out. After a DB format change
+lands on `main`, re-run the bake so the volume snapshots skip the upgrade.
 
 ## Cost note
 

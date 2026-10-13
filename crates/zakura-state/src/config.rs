@@ -1,8 +1,7 @@
 //! Cached state configuration for Zebra.
 
 use std::{
-    fmt,
-    fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
+    fmt, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
     time::Duration,
@@ -13,8 +12,6 @@ use serde::{
     de::{self, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use tokio::task::{spawn_blocking, JoinHandle};
-use tracing::Span;
 
 use zakura_chain::{common::default_cache_dir, parameters::Network};
 
@@ -23,9 +20,13 @@ use crate::{
         min_pruning_retention, DATABASE_FORMAT_VERSION_FILE_NAME, MIN_PRUNING_RETENTION,
         STATE_DATABASE_KIND,
     },
-    service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
 };
+
+mod location;
+
+pub(crate) use location::{adopt_previous_major_database, find_database};
+pub use location::{check_and_delete_old_databases, check_and_delete_old_state_databases};
 
 /// Configuration for the state service.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -644,195 +645,6 @@ mod tests {
     }
 }
 
-// Cleaning up old database versions
-// TODO: put this in a different module?
-
-/// Spawns a task that checks if there are old state database folders,
-/// and deletes them from the filesystem.
-///
-/// See `check_and_delete_old_databases()` for details.
-pub fn check_and_delete_old_state_databases(config: &Config, network: &Network) -> JoinHandle<()> {
-    check_and_delete_old_databases(
-        config,
-        STATE_DATABASE_KIND,
-        state_database_format_version_in_code().major,
-        network,
-    )
-}
-
-/// Spawns a task that checks if there are old database folders,
-/// and deletes them from the filesystem.
-///
-/// Iterate over the files and directories in the databases folder and delete if:
-/// - The `db_kind` directory exists.
-/// - The entry in `db_kind` is a directory.
-/// - The directory name has a prefix `v`.
-/// - The directory name without the prefix can be parsed as an unsigned number.
-/// - The parsed number is lower than the `major_version`.
-///
-/// The network is used to generate the path, then ignored.
-/// If `config` is an ephemeral database, no databases are deleted.
-///
-/// # Panics
-///
-/// If the path doesn't match the expected `db_kind/major_version/network` format.
-pub fn check_and_delete_old_databases(
-    config: &Config,
-    db_kind: impl AsRef<str>,
-    major_version: u64,
-    network: &Network,
-) -> JoinHandle<()> {
-    let current_span = Span::current();
-    let config = config.clone();
-    let db_kind = db_kind.as_ref().to_string();
-    let network = network.clone();
-
-    spawn_blocking(move || {
-        current_span.in_scope(|| {
-            delete_old_databases(config, db_kind, major_version, &network);
-            info!("finished old database version cleanup task");
-        })
-    })
-}
-
-/// Check if there are old database folders and delete them from the filesystem.
-///
-/// See [`check_and_delete_old_databases`] for details.
-fn delete_old_databases(config: Config, db_kind: String, major_version: u64, network: &Network) {
-    if config.ephemeral || !config.delete_old_database {
-        return;
-    }
-
-    info!(db_kind, "checking for old database versions");
-
-    let restorable_db_versions = restorable_db_versions();
-
-    let mut db_path = config.db_path(&db_kind, major_version, network);
-    // Check and remove the network path.
-    assert_eq!(
-        db_path.file_name(),
-        Some(network.lowercase_name().as_ref()),
-        "unexpected database network path structure"
-    );
-    assert!(db_path.pop());
-
-    // Check and remove the major version path, we'll iterate over them all below.
-    assert_eq!(
-        db_path.file_name(),
-        Some(format!("v{major_version}").as_ref()),
-        "unexpected database version path structure"
-    );
-    assert!(db_path.pop());
-
-    // Check for the correct database kind to iterate within.
-    assert_eq!(
-        db_path.file_name(),
-        Some(db_kind.as_ref()),
-        "unexpected database kind path structure"
-    );
-
-    if let Some(db_kind_dir) = read_dir(&db_path) {
-        for entry in db_kind_dir.flatten() {
-            let deleted_db =
-                check_and_delete_database(&config, major_version, &restorable_db_versions, &entry);
-
-            if let Some(deleted_db) = deleted_db {
-                info!(?deleted_db, "deleted outdated {db_kind} database directory");
-            }
-        }
-    }
-}
-
-/// Return a `ReadDir` for `dir`, after checking that `dir` exists and can be read.
-///
-/// Returns `None` if any operation fails.
-fn read_dir(dir: &Path) -> Option<ReadDir> {
-    if dir.exists() {
-        if let Ok(read_dir) = dir.read_dir() {
-            return Some(read_dir);
-        }
-    }
-    None
-}
-
-/// Check if `entry` is an old database directory, and delete it from the filesystem.
-/// See [`check_and_delete_old_databases`] for details.
-///
-/// If the directory was deleted, returns its path.
-fn check_and_delete_database(
-    config: &Config,
-    major_version: u64,
-    restorable_db_versions: &[u64],
-    entry: &DirEntry,
-) -> Option<PathBuf> {
-    let dir_name = parse_dir_name(entry)?;
-    let dir_major_version = parse_major_version(&dir_name)?;
-
-    if dir_major_version >= major_version {
-        return None;
-    }
-
-    // Don't delete databases that can be reused.
-    if restorable_db_versions
-        .iter()
-        .map(|v| v - 1)
-        .any(|v| v == dir_major_version)
-    {
-        return None;
-    }
-
-    let outdated_path = entry.path();
-
-    // # Correctness
-    //
-    // Check that the path we're about to delete is inside the cache directory.
-    // If the user has symlinked the outdated state directory to a non-cache directory,
-    // we don't want to delete it, because it might contain other files.
-    //
-    // We don't attempt to guard against malicious symlinks created by attackers
-    // (TOCTOU attacks). Zebra should not be run with elevated privileges.
-    let cache_path = canonicalize(&config.cache_dir).ok()?;
-    let outdated_path = canonicalize(outdated_path).ok()?;
-
-    if !outdated_path.starts_with(&cache_path) {
-        info!(
-            skipped_path = ?outdated_path,
-            ?cache_path,
-            "skipped cleanup of outdated state directory: state is outside cache directory",
-        );
-
-        return None;
-    }
-
-    remove_dir_all(&outdated_path).ok().map(|()| outdated_path)
-}
-
-/// Check if `entry` is a directory with a valid UTF-8 name.
-/// (State directory names are guaranteed to be UTF-8.)
-///
-/// Returns `None` if any operation fails.
-fn parse_dir_name(entry: &DirEntry) -> Option<String> {
-    if let Ok(file_type) = entry.file_type() {
-        if file_type.is_dir() {
-            if let Ok(dir_name) = entry.file_name().into_string() {
-                return Some(dir_name);
-            }
-        }
-    }
-    None
-}
-
-/// Parse the database major version number from `dir_name`.
-///
-/// Returns `None` if parsing fails, or the directory name is not in the expected format.
-fn parse_major_version(dir_name: &str) -> Option<u64> {
-    dir_name
-        .strip_prefix('v')
-        .and_then(|version| version.parse().ok())
-}
-
-// TODO: move these to the format upgrade module
-
 /// Returns the full semantic version of the on-disk state database, based on its config and network.
 pub fn state_database_format_version_on_disk(
     config: &Config,
@@ -846,16 +658,13 @@ pub fn state_database_format_version_on_disk(
     )
 }
 
-/// Returns the full semantic version of the on-disk database, based on its config, kind, major version,
-/// and network.
+/// Returns the full semantic version of the existing database for `major_version`, read from its
+/// version file.
 ///
-/// Typically, the version is read from a version text file.
+/// This function finds the database in the same place as startup, so it also reads a
+/// previous-major database that startup has not moved yet. It does not open RocksDB.
 ///
-/// If there is an existing on-disk database, but no version file,
-/// returns `Ok(Some(major_version.0.0))`.
-/// (This happens even if the database directory was just newly created.)
-///
-/// If there is no existing on-disk database, returns `Ok(None)`.
+/// Returns `Ok(None)` if there is no database, or the database has no version file.
 ///
 /// This is the format of the data on disk, the version
 /// implemented by the running Zebra code can be different.
@@ -865,56 +674,20 @@ pub fn database_format_version_on_disk(
     major_version: u64,
     network: &Network,
 ) -> Result<Option<Version>, BoxError> {
-    let version_path = config.version_file_path(&db_kind, major_version, network);
-    let db_path = config.db_path(db_kind, major_version, network);
-
-    database_format_version_at_path(&version_path, &db_path, major_version)
+    match location::find_database(config, db_kind.as_ref(), major_version, network) {
+        Some(db_path) => database_format_version_at_path(&db_path),
+        None => Ok(None),
+    }
 }
 
-/// Returns the full semantic version of the on-disk database at `version_path`.
+/// Returns the full semantic version in the version file of the database at `db_path`.
 ///
-/// See [`database_format_version_on_disk()`] for details.
-pub(crate) fn database_format_version_at_path(
-    version_path: &Path,
-    db_path: &Path,
-    major_version: u64,
-) -> Result<Option<Version>, BoxError> {
-    let disk_version_file = match fs::read_to_string(version_path) {
-        Ok(version) => Some(version),
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // If the version file doesn't exist, don't guess the version yet.
-            None
-        }
-        Err(e) => Err(e)?,
-    };
-
-    // The database has a version file on disk
-    if let Some(version) = disk_version_file {
-        return Ok(Some(
-            version
-                .parse()
-                // Try to parse the previous format of the disk version file if it cannot be parsed as a `Version` directly.
-                .or_else(|err| {
-                    format!("{major_version}.{version}")
-                        .parse()
-                        .map_err(|err2| format!("failed to parse format version: {err}, {err2}"))
-                })?,
-        ));
-    }
-
-    // There's no version file on disk, so we need to guess the version
-    // based on the database content
-    match fs::metadata(db_path) {
-        // But there is a database on disk, so it has the current major version with no upgrades.
-        // If the database directory was just newly created, we also return this version.
-        Ok(_metadata) => Ok(Some(Version::new(major_version, 0, 0))),
-
-        // There's no version file and no database on disk, so it's a new database.
-        // It will be created with the current version,
-        // but temporarily return the default version above until the version file is written.
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-
-        Err(e) => Err(e)?,
+/// Returns `Ok(None)` if the version file does not exist.
+pub(crate) fn database_format_version_at_path(db_path: &Path) -> Result<Option<Version>, BoxError> {
+    match fs::read_to_string(db_path.join(DATABASE_FORMAT_VERSION_FILE_NAME)) {
+        Ok(version) => Ok(Some(version.parse()?)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

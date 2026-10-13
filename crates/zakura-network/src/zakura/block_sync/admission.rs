@@ -89,6 +89,9 @@ pub(super) struct AdmissionGrant {
     /// Authoritative summed-estimate byte cap for the take and its reservation.
     /// Nothing downstream may substitute its own sizing.
     pub(super) max_request_bytes: u64,
+    /// Remaining look-ahead headroom, charged as `reserved_above` charges the
+    /// published take: unknown-size bodies at `MAX_BLOCK_BYTES`.
+    pub(super) max_exposure_bytes: u64,
 }
 
 /// Return the highest start height that can be rescued by a floor request.
@@ -101,7 +104,7 @@ pub(super) fn request_priority(
     start_height: block::Height,
 ) -> RequestPriority {
     // The next height above the floor can still unblock the current floor.
-    if start_height <= floor_rescue_high(download_floor) {
+    if next_height(download_floor) == Some(start_height) {
         RequestPriority::Floor
     } else {
         RequestPriority::AboveFloor
@@ -268,6 +271,7 @@ fn remaining_lookahead_wire_bytes(
 /// released at receipt), so unlike [`admit`] this never consults
 /// `budget_available`: only the commit-window exemption and the resident
 /// look-ahead gate — the two rules that bound retention — apply.
+#[cfg(test)]
 pub(super) fn admit_received_body(
     config: &ZakuraBlockSyncConfig,
     snapshot: &AdmissionSnapshot,
@@ -340,12 +344,13 @@ pub(super) fn admit(
     let priority = request_priority(snapshot.download_floor, start_height);
     let window_high = commit_window_high(&snapshot);
 
-    let (take_high, max_request_bytes) = if start_height <= window_high {
+    let (take_high, max_request_bytes, max_exposure_bytes) = if start_height <= window_high {
         // Exempt: liveness sizing, take clamped at the window top so the resident
         // gate's coverage of above-window heights is total.
         (
             servable_high.min(window_high),
             snapshot.budget_available.min(response_byte_cap),
+            u64::MAX,
         )
     } else {
         if lookahead_over_budget(config, &snapshot) {
@@ -361,6 +366,7 @@ pub(super) fn admit(
                 .budget_available
                 .min(remaining_wire_bytes)
                 .min(response_byte_cap),
+            remaining_wire_bytes,
         )
     };
 
@@ -376,6 +382,7 @@ pub(super) fn admit(
         priority,
         take_high,
         max_request_bytes,
+        max_exposure_bytes,
     })
 }
 

@@ -1,5 +1,4 @@
 mod group_hash;
-mod key_components;
 mod sinsemilla;
 mod tree;
 

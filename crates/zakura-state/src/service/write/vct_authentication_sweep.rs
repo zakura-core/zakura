@@ -485,6 +485,15 @@ fn attribute_verification_failure(
     failed_height: Height,
     error: &SuppliedRootsError,
 ) -> Option<(VctCommitFailure, VctAuxiliaryFailureAttribution)> {
+    // A peer cannot supply a consensus branch ID missing from this build.
+    if matches!(
+        error,
+        SuppliedRootsError::HistoryTree(error)
+            if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+    ) {
+        return None;
+    }
+
     if failed_height == delivery_height {
         // The tree folded so far is already confirmed by this header's predecessor, so the
         // only inputs left at this height come from the current delivery.

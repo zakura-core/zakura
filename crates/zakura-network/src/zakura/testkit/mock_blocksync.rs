@@ -602,7 +602,9 @@ async fn drive_mock_block_sync_actions(
                         })
                         .await;
                 }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
+                BlockSyncAction::QueryBlocksByHeightRange {
+                    peer, start, count, ..
+                } => {
                     let blocks = corpus.blocks_in_range(start, count, servable_high);
                     let response_bytes = blocks
                         .iter()
@@ -989,48 +991,6 @@ fn synthetic_block_generation_honors_target_size() {
             block.hash()
         );
     }
-}
-
-#[test]
-fn mock_apply_frontier_commits_duplicates_and_rejects_gaps() {
-    let corpus =
-        SyntheticBlockCorpus::generate(3, SYNTHETIC_CORPUS_SEED, SyntheticBlockShape::default());
-    let apply = MockApplyFrontier::new(corpus.clone());
-    let block_1 = corpus.block_at(block::Height(1)).expect("height 1 exists");
-    let block_2 = corpus.block_at(block::Height(2)).expect("height 2 exists");
-    let block_3 = corpus.block_at(block::Height(3)).expect("height 3 exists");
-
-    let gap = apply.apply(&block_2);
-    assert_eq!(gap.result, BlockApplyResult::Rejected);
-    assert_eq!(gap.frontiers.verified_block_tip, block::Height(0));
-
-    let first = apply.apply(&block_1);
-    assert_eq!(first.result, BlockApplyResult::Committed);
-    assert_eq!(first.frontiers.verified_block_tip, block::Height(1));
-
-    let duplicate = apply.apply(&block_1);
-    assert_eq!(duplicate.result, BlockApplyResult::Duplicate);
-    assert_eq!(duplicate.frontiers.verified_block_tip, block::Height(1));
-
-    let second = apply.apply(&block_2);
-    assert_eq!(second.result, BlockApplyResult::Committed);
-    assert_eq!(second.frontiers.verified_block_tip, block::Height(2));
-
-    let third = apply.apply(&block_3);
-    assert_eq!(third.result, BlockApplyResult::Committed);
-    assert_eq!(third.frontiers.verified_block_tip, block::Height(3));
-}
-
-#[test]
-fn mock_apply_frontier_can_start_past_genesis() {
-    let corpus =
-        SyntheticBlockCorpus::generate(3, SYNTHETIC_CORPUS_SEED, SyntheticBlockShape::default());
-    let apply = MockApplyFrontier::with_committed_height(corpus.clone(), block::Height(1));
-    let block_2 = corpus.block_at(block::Height(2)).expect("height 2 exists");
-
-    let outcome = apply.apply(&block_2);
-    assert_eq!(outcome.result, BlockApplyResult::Committed);
-    assert_eq!(outcome.frontiers.verified_block_tip, block::Height(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

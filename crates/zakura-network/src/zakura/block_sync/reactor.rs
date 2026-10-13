@@ -1600,6 +1600,7 @@ impl BlockSyncReactor {
             peer: peer.clone(),
             start: start_height,
             count: requested_count,
+            max_response_bytes: self.startup.config.advertised_max_response_bytes(),
         }) {
             self.finish_serving_blocks(&peer, start_height);
         }

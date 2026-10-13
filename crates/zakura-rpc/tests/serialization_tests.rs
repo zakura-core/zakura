@@ -16,6 +16,7 @@ use vectors::{
 };
 
 use zakura_rpc::client::zakura_chain::{
+    amount::Amount,
     sapling::ValueCommitment,
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -1637,6 +1638,43 @@ fn test_generate() -> Result<(), Box<dyn std::error::Error>> {
     let hash1 = obj[1].hash();
     let new_obj = vec![Hash::new(hash0), Hash::new(hash1)];
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+/// The ZIP 234 NSM counter is reported, survives a round trip, and stays out of the
+/// monetary totals.
+///
+/// It is an accounting counter that funds reissuance, not a pool of spendable value, so
+/// including it in `chainSupply` or `valuePools` would overstate the money supply.
+#[test]
+fn test_nsm_value_balance_is_reported_outside_the_monetary_totals(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let obj: GetBlockchainInfoResponse = serde_json::from_str(GET_BLOCKCHAIN_INFO_RESPONSE)?;
+
+    // A response from a node that does not report the counter is distinguishable from one
+    // reporting zero, because zero is a legitimate balance.
+    assert_eq!(obj.nsm_value_balance_zat(), None);
+
+    // The counter is signed: it carries no non-negativity guarantee before NU7.
+    let nsm = Amount::try_from(-55_768_414_957_i64)?;
+    let with_nsm = obj.clone().with_nsm_value_balance_zat(nsm);
+
+    let json: serde_json::Value = serde_json::to_value(&with_nsm)?;
+    assert_eq!(
+        json["nsmValueBalanceZat"],
+        serde_json::json!(-55_768_414_957_i64)
+    );
+
+    let round_tripped: GetBlockchainInfoResponse = serde_json::from_value(json)?;
+    assert_eq!(round_tripped.nsm_value_balance_zat(), Some(nsm));
+
+    // Setting it changes nothing else, so the reported supply is untouched.
+    assert_eq!(with_nsm.chain_supply(), obj.chain_supply());
+    assert_eq!(with_nsm.value_pools(), obj.value_pools());
+
+    // And it is not smuggled in as an extra pool.
+    assert!(with_nsm.value_pools().iter().all(|pool| pool.id() != "nsm"));
 
     Ok(())
 }

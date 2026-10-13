@@ -277,6 +277,8 @@ pub enum BlockSyncAction {
         start: block::Height,
         /// Maximum count.
         count: u32,
+        /// Maximum serialized body bytes retained by the state read.
+        max_response_bytes: u32,
     },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {

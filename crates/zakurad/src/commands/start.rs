@@ -69,7 +69,6 @@
 //! Zebra also has diagnostic support:
 //! * [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md)
 //! * [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
-//! * [progress-bar](https://docs.rs/howudoin/0.1.1/howudoin)
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
@@ -559,14 +558,16 @@ impl StartCmd {
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new_with_pending_blocks(
-                config.sync.full_verify_concurrency_limit,
-                config.network.expose_peer_addresses,
-                zcashd_compat_pruning_retention,
-                zcashd_compat_block_gossip_peer_ips.clone(),
-                setup_rx,
-                pending_blocks.clone(),
-            ));
+            .service(
+                Inbound::new(
+                    config.sync.full_verify_concurrency_limit,
+                    config.network.expose_peer_addresses,
+                    zcashd_compat_pruning_retention,
+                    zcashd_compat_block_gossip_peer_ips.clone(),
+                    setup_rx,
+                )
+                .with_pending_blocks(pending_blocks.clone()),
+            );
 
         let advertised_services = Self::advertised_services(&config);
 
@@ -702,6 +703,7 @@ impl StartCmd {
             mempool: mempool.clone(),
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            network: config.network.network.clone(),
             misbehavior_sender,
         };
         setup_tx
@@ -714,7 +716,7 @@ impl StartCmd {
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_pending_blocks(
+        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
@@ -729,12 +731,13 @@ impl StartCmd {
             address_book.clone(),
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
-            pending_blocks,
         );
         node_tasks.track(&rpc_tx_queue_handle);
-        let rpc_impl = rpc_impl.with_end_of_support_height(
-            sync::end_of_support::end_of_support_height(&config.network.network),
-        );
+        let rpc_impl = rpc_impl
+            .with_pending_blocks(pending_blocks)
+            .with_end_of_support_height(sync::end_of_support::end_of_support_height(
+                &config.network.network,
+            ));
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
             read_state: read_only_state_service.clone(),
@@ -1020,6 +1023,10 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
+        let writer_health = read_only_state_service.clone();
+        let writer_failure = writer_health.wait_for_writer_failure();
+        tokio::pin!(writer_failure);
+
         // Wait for tasks to finish
         let mut zcashd_compat_task_finished = false;
         let exit_status = {
@@ -1031,6 +1038,12 @@ impl StartCmd {
 
                 let result = select! {
                 _ = shutdown.cancelled() => Ok(()),
+
+                failure = &mut writer_failure => {
+                    tracing::error!(%failure, "block writer failed; terminating the node");
+                    shutdown.cancel();
+                    Err(eyre!(failure))
+                },
 
                 header_sync_fatal_event = async {
                     match header_sync_fatal_events.as_mut() {
@@ -1242,7 +1255,21 @@ impl StartCmd {
             "exiting Zakura: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
-        exit_status
+        Self::finish_shutdown(exit_status, writer_health.writer_failure())
+    }
+
+    fn finish_shutdown(
+        exit_status: Result<(), Report>,
+        writer_failure: Option<zakura_state::BoxError>,
+    ) -> Result<(), Report> {
+        // Another ready task can win the select after the writer publishes its failure.
+        exit_status?;
+        if let Some(failure) = writer_failure {
+            tracing::error!(%failure, "block writer failed during shutdown");
+            Err(eyre!(failure))
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
@@ -1415,6 +1442,28 @@ mod tests {
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
     use zakura_state::{PruningConfig, StorageMode};
+
+    #[tokio::test]
+    async fn shutdown_cannot_mask_a_ready_writer_failure() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let failure: zakura_state::BoxError = "terminal writer failure".into();
+        // Force the interleaving where shutdown wins even though writer failure is ready.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(()),
+            _ = std::future::ready(()) => panic!("shutdown wins this interleaving"),
+        };
+        let error = StartCmd::finish_shutdown(result, Some(failure)).unwrap_err();
+        assert!(error.to_string().contains("terminal writer failure"));
+        assert!(StartCmd::finish_shutdown(Ok(()), None).is_ok());
+        assert_eq!(
+            StartCmd::finish_shutdown(Err(eyre!("task failed")), None)
+                .unwrap_err()
+                .to_string(),
+            "task failed"
+        );
+    }
 
     #[test]
     fn zcashd_compat_advertises_node_network_when_pruned() {
@@ -2354,7 +2403,15 @@ mod zakura_header_sync_driver_tests {
             let query_seen = query_seen.clone();
             async move {
                 match request {
-                    zakura_state::ReadRequest::BlocksByHeightRange { start, count } => {
+                    zakura_state::ReadRequest::BoundedBlocksByHeightRange {
+                        start,
+                        count,
+                        max_response_bytes,
+                    } => {
+                        assert_eq!(
+                            max_response_bytes, 1024,
+                            "the driver must forward its serving budget"
+                        );
                         if let Some(query_seen) = query_seen {
                             if let Some(query_seen) = query_seen
                                 .lock()
@@ -4197,6 +4254,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(77),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4320,6 +4378,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(78),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4394,6 +4453,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(79),
                 start: block::Height(1),
                 count: 1,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel stays open");
@@ -4483,6 +4543,7 @@ mod zakura_header_sync_driver_tests {
                 peer: test_zakura_peer(80),
                 start: block::Height(1),
                 count: 2,
+                max_response_bytes: 1024,
             })
             .await
             .expect("driver action channel handles serving work after submit storm");

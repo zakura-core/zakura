@@ -99,12 +99,11 @@ for the commit-window exemption, the resident-memory gate, and request sizing â€
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
 sizing.
 
-The one deliberate exception is `admission::admit_received_body`, the retention-only
-gate for a body that is already downloaded (the unmatched-fallthrough path). A received
-body consumes no request budget, so it applies the same commit-window exemption and
-resident gate but never consults `budget_available` â€” a wire budget saturated by
-outstanding requests must not force an already-paid-for body to be dropped and
-re-downloaded.
+A late body can settle a current active reservation for its exact header hash,
+including a reservation reissued to another peer. Selection and settlement share
+one queue lock. Pending work has no request owner and cannot accept an unowned
+completion. The ended wire reservation is released only after the body enters
+resident-memory accounting.
 
 ### The commit window
 
@@ -277,8 +276,8 @@ borrowed a bypass slot.
 
 ## Size corrections
 
-A later known hint for the same header and auxiliary payload can replace an unknown
-or stale size. Unknown never erases known. State keeps the correction in a sparse
+A later known hint for the same header and auxiliary payload can fill an unknown size
+once, but never replaces a known one. State keeps the fill in a sparse
 `header_aux_body_size_v1` row beside the original delivery evidence and removes it
 when that delivery is pruned. Committed block sizes still take precedence.
 
@@ -329,3 +328,20 @@ requests. Serving and status messages cannot fill this notification path.
 The `preferred_peer` fill-stop reason distinguishes peer deferral from `no_work`.
 Wake traces identify transport capacity, registry changes, deadlines, and fill
 continuations. These changes preserve admission limits and configuration values.
+
+## Unknown sizes
+
+A peer without committed sizes sends a hint of `0`, which the queue records as
+`Unknown`. The queue schedules such a body with one shared estimate instead of
+`MAX_BLOCK_BYTES`. Each accepted body updates the estimate once with a 1/8-weight
+moving average, clamped to `[floor, MAX_BLOCK_BYTES]`. The estimate starts at
+`MAX_BLOCK_BYTES`, returns to it after 60 seconds without an accepted body, and
+resets with the frontier.
+
+Known hints always take precedence, including advertised, committed, and filled
+sizes. A local measured size remains a minimum for a retry. An issued request keeps
+its reservation and hint provenance until it settles. Memory admission still charges
+every outstanding unknown body at `MAX_BLOCK_BYTES`. A take above the commit window
+charges its unknown bodies the same way against the remaining look-ahead headroom.
+A body larger than a local estimate is not reported as a size mismatch, because no
+peer made a claim.

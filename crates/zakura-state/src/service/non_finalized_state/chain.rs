@@ -4,6 +4,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    num::NonZeroU64,
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
@@ -18,7 +19,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
     sapling,
     serialization::ZcashSerialize as _,
@@ -43,6 +44,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::{counted_set::CountedSet, index::TransparentTransfers};
+use super::{AddressTransfers, CreatedUtxos};
 
 mod counted_set;
 pub mod index;
@@ -59,22 +61,13 @@ pub struct Chain {
     /// The internal state of this chain.
     inner: ChainInner,
 
-    // Diagnostics
-    //
-    /// The last height this chain forked at. Diagnostics only.
+    /// The operator's `preciousblock` preference for this chain's tip, with its call sequence.
     ///
-    /// This field is only used for metrics. It is not consensus-critical, and it is not checked for
-    /// equality.
-    ///
-    /// We keep the same last fork height in both sides of a clone, because every new block clones a
-    /// chain, even if it's just growing that chain.
-    ///
-    /// # Note
-    ///
-    /// Most diagnostics are implemented on the `NonFinalizedState`, rather than each chain. Some
-    /// diagnostics only use the best chain, and others need to modify the Chain state, but that's
-    /// difficult with `Arc<Chain>`s.
-    pub(super) last_fork_height: Option<Height>,
+    /// Local policy, not chain state, so it is not checked by [`Chain::eq_internal_state`].
+    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, from its per-block
+    /// preferences, whenever it inserts the chain into the `chain_set`. Growing or forking the
+    /// chain keeps the stored hash, which stops matching the tip, so a stale value never applies.
+    precious: Option<(block::Hash, NonZeroU64)>,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -91,7 +84,9 @@ pub struct ChainInner {
     // Blocks, heights, hashes, and transaction locations
     //
     /// The contextually valid blocks which form this non-finalized partial chain, in height order.
-    pub(crate) blocks: BTreeMap<block::Height, ContextuallyVerifiedBlock>,
+    ///
+    /// Blocks are immutable once pushed, so chain snapshots share each block record.
+    pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
     pub height_by_hash: HashMap<block::Hash, block::Height>,
@@ -105,9 +100,12 @@ pub struct ChainInner {
     ///
     /// Note that these UTXOs may not be unspent.
     /// Outputs can be spent by later transactions or blocks in the chain.
+    ///
+    /// Share output index partitions and immutable payloads when cloning snapshots.
+    /// Membership and spend indexes remain independent for each chain.
     //
     // TODO: replace OutPoint with OutputLocation?
-    pub(crate) created_utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) created_utxos: CreatedUtxos,
     /// The spending transaction ids by [`transparent::OutPoint`]s spent by `blocks`,
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///
@@ -236,7 +234,10 @@ pub struct ChainInner {
     // TODO: move to the transparent section
     //
     /// Partial transparent address index data from `blocks`.
-    pub(super) partial_transparent_transfers: HashMap<transparent::Address, TransparentTransfers>,
+    ///
+    /// Share index partitions and each address's history across chain snapshots.
+    /// Updating a block copies only the partitions and histories it touches.
+    pub(super) partial_transparent_transfers: AddressTransfers,
 
     // Chain Work
     //
@@ -308,7 +309,7 @@ impl Chain {
         let mut chain = Self {
             network: network.clone(),
             inner,
-            last_fork_height: None,
+            precious: None,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -335,25 +336,6 @@ impl Chain {
         self.inner == other.inner
     }
 
-    /// Returns the last fork height if that height is still in the non-finalized state.
-    /// Otherwise, if that fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_height(&self) -> Option<Height> {
-        self.last_fork_height
-            .filter(|last| last >= &self.non_finalized_root_height())
-    }
-
-    /// Returns this chain fork's length, if its fork is still in the non-finalized state.
-    /// Otherwise, if the fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_length(&self) -> Option<u32> {
-        let fork_length = self.non_finalized_tip_height() - self.recent_fork_height()?;
-
-        // If the fork is above the tip, it is invalid, so just return `None`
-        // (Ignoring invalid data is ok because this is metrics-only code.)
-        fork_length.try_into().ok()
-    }
-
     /// Push a contextually valid non-finalized block into this chain as the new tip.
     ///
     /// If the block is invalid, drops this chain, and returns an error.
@@ -366,7 +348,7 @@ impl Chain {
         self.update_chain_tip_with(&block)?;
 
         tracing::debug!(block = %block.block, "adding block to chain");
-        self.blocks.insert(block.height, block);
+        self.blocks.insert(block.height, Arc::new(block));
 
         Ok(self)
     }
@@ -374,7 +356,7 @@ impl Chain {
     /// Pops the lowest height block of the non-finalized portion of a chain,
     /// and returns it with its associated treestate.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate) {
+    pub(crate) fn pop_root(&mut self) -> (Arc<ContextuallyVerifiedBlock>, Treestate) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -402,7 +384,7 @@ impl Chain {
             .expect("only called while blocks is populated");
 
         // Update cumulative data members.
-        self.revert_chain_with(&block, RevertPosition::Root);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Root);
 
         (block, treestate)
     }
@@ -411,7 +393,7 @@ impl Chain {
     pub fn child_blocks(&self, block_height: &block::Height) -> Vec<ContextuallyVerifiedBlock> {
         self.blocks
             .range(block_height..)
-            .map(|(_h, b)| b.clone())
+            .map(|(_h, b)| b.as_ref().clone())
             .collect()
     }
 
@@ -423,7 +405,6 @@ impl Chain {
         let block_height = self.height_by_hash(block_hash)?;
         let mut new_chain = self.fork(block_hash)?;
         new_chain.pop_tip();
-        new_chain.last_fork_height = self.last_fork_height.min(Some(block_height));
         Some((new_chain, self.child_blocks(&block_height)))
     }
 
@@ -448,11 +429,28 @@ impl Chain {
         // Revert blocks above the fork
         while forked.non_finalized_tip_hash() != fork_tip {
             forked.pop_tip();
-
-            forked.last_fork_height = Some(forked.non_finalized_tip_height());
         }
 
         Some(forked)
+    }
+
+    /// Returns the operator's `preciousblock` preference stored on this chain.
+    pub(super) fn precious(&self) -> Option<(block::Hash, NonZeroU64)> {
+        self.precious
+    }
+
+    /// Stores the operator's `preciousblock` preference for this chain's tip.
+    pub(super) fn set_precious(&mut self, precious: Option<(block::Hash, NonZeroU64)>) {
+        self.precious = precious;
+    }
+
+    /// Returns the `preciousblock` sequence if it applies to the current tip, or zero.
+    ///
+    /// A later call has a higher sequence and wins equal-work ties against earlier ones.
+    fn active_precedence(&self) -> u64 {
+        self.precious
+            .filter(|(hash, _)| *hash == self.non_finalized_tip_hash())
+            .map_or(0, |(_, sequence)| sequence.get())
     }
 
     /// Returns the [`Network`] for this chain.
@@ -466,7 +464,7 @@ impl Chain {
         let height =
             hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
 
-        self.blocks.get(&height)
+        self.blocks.get(&height).map(Arc::as_ref)
     }
 
     /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in this chain.
@@ -481,29 +479,6 @@ impl Chain {
                 self.blocks[&tx_loc.height].block.header.time,
             )
         })
-    }
-
-    /// Returns the [`Transaction`] at [`TransactionLocation`], if it exists in this chain.
-    #[allow(dead_code)]
-    pub fn transaction_by_loc(&self, tx_loc: TransactionLocation) -> Option<&Arc<Transaction>> {
-        self.blocks
-            .get(&tx_loc.height)?
-            .block
-            .transactions
-            .get(tx_loc.index.as_usize())
-    }
-
-    /// Returns the [`transaction::Hash`] for the transaction at [`TransactionLocation`],
-    /// if it exists in this chain.
-    #[allow(dead_code)]
-    pub fn transaction_hash_by_loc(
-        &self,
-        tx_loc: TransactionLocation,
-    ) -> Option<&transaction::Hash> {
-        self.blocks
-            .get(&tx_loc.height)?
-            .transaction_hashes
-            .get(tx_loc.index.as_usize())
     }
 
     /// Returns the [`transaction::Hash`]es in the block with `hash_or_height`,
@@ -543,20 +518,6 @@ impl Chain {
     /// Returns false otherwise.
     pub fn contains_block_height(&self, height: Height) -> bool {
         self.blocks.contains_key(&height)
-    }
-
-    /// Returns true is the chain contains the given block hash or height.
-    /// Returns false otherwise.
-    #[allow(dead_code)]
-    pub fn contains_hash_or_height(&self, hash_or_height: impl Into<HashOrHeight>) -> bool {
-        use HashOrHeight::*;
-
-        let hash_or_height = hash_or_height.into();
-
-        match hash_or_height {
-            Hash(hash) => self.contains_block_hash(hash),
-            Height(height) => self.contains_block_height(height),
-        }
     }
 
     /// Returns the non-finalized tip block height and hash.
@@ -1479,7 +1440,7 @@ impl Chain {
             "Non-finalized chains must have at least one block to be valid"
         );
 
-        self.revert_chain_with(&block, RevertPosition::Tip);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Tip);
     }
 
     /// Return the non-finalized tip height for this chain.
@@ -1502,7 +1463,7 @@ impl Chain {
     /// Return the non-finalized tip block for this chain,
     /// or `None` if `self.blocks` is empty.
     pub fn tip_block(&self) -> Option<&ContextuallyVerifiedBlock> {
-        self.blocks.values().next_back()
+        self.blocks.values().next_back().map(Arc::as_ref)
     }
 
     /// Returns true if the non-finalized part of this chain is empty.
@@ -1521,11 +1482,13 @@ impl Chain {
     /// Callers should also check the finalized state for available UTXOs.
     /// If UTXOs remain unspent when a block is finalized, they are stored in the finalized state,
     /// and removed from the relevant chain(s).
+    #[cfg(test)]
     pub fn unspent_utxos(&self) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
-        let mut unspent_utxos = self.created_utxos.clone();
-        unspent_utxos.retain(|outpoint, _utxo| !self.spent_utxos.contains_key(outpoint));
-
-        unspent_utxos
+        self.created_utxos
+            .iter()
+            .filter(|(outpoint, _)| !self.spent_utxos.contains_key(outpoint))
+            .map(|(outpoint, utxo)| (*outpoint, utxo.as_ref().clone()))
+            .collect()
     }
 
     /// Returns the [`transparent::Utxo`] pointed to by the given
@@ -1571,7 +1534,7 @@ impl Chain {
     ) -> impl Iterator<Item = &'a TransparentTransfers> {
         addresses
             .iter()
-            .flat_map(|address| self.partial_transparent_transfers.get(address))
+            .filter_map(|address| self.partial_transparent_transfers.get(address))
     }
 
     /// Returns a tuple of the transparent balance change and the total received funds for
@@ -2158,7 +2121,9 @@ impl
                 .expect("new_outputs contains all created UTXOs");
 
             // Update the chain's created UTXOs
-            let previous_entry = self.created_utxos.insert(outpoint, created_utxo.clone());
+            let previous_entry = self
+                .created_utxos
+                .insert(outpoint, Arc::new(created_utxo.clone()));
             assert_eq!(
                 previous_entry, None,
                 "unexpected created output: duplicate update or duplicate UTXO",
@@ -2166,12 +2131,9 @@ impl
 
             // Update the address index with this UTXO
             if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
-                let address_transfers = self
-                    .partial_transparent_transfers
-                    .entry(receiving_address)
-                    .or_default();
-
-                address_transfers.update_chain_tip_with(&(&outpoint, created_utxo))?;
+                self.partial_transparent_transfers
+                    .get_or_insert_mut(receiving_address)
+                    .update_chain_tip_with(&(&outpoint, created_utxo))?;
             }
         }
 
@@ -2277,16 +2239,9 @@ impl
 
             // Index the spent output for the address
             if let Some(spending_address) = spent_output.utxo.output.address(&self.network) {
-                let address_transfers = self
-                    .partial_transparent_transfers
-                    .entry(spending_address)
-                    .or_default();
-
-                address_transfers.update_chain_tip_with(&(
-                    spending_input,
-                    spending_tx_hash,
-                    spent_output,
-                ))?;
+                self.partial_transparent_transfers
+                    .get_or_insert_mut(spending_address)
+                    .update_chain_tip_with(&(spending_input, spending_tx_hash, spent_output))?;
             }
         }
 
@@ -2557,9 +2512,17 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         &mut self,
         (block_value_pool_change, height, size): &(ValueBalance<NegativeAllowed>, Height, usize),
     ) -> Result<(), ValidateContextError> {
+        check::nsm_value_balance_is_non_negative(
+            &self.network,
+            *height,
+            &self.chain_value_pools,
+            block_value_pool_change,
+        )?;
+
         match self
             .chain_value_pools
             .add_chain_value_pool_change(*block_value_pool_change)
+            .and_then(|pools| pools.seed_nsm_value_balance(*height, &self.network))
         {
             Ok(chain_value_pools) => {
                 self.chain_value_pools = chain_value_pools;
@@ -2598,6 +2561,15 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         use std::ops::Neg;
 
         if position == RevertPosition::Tip {
+            // The seed is state-derived and is not part of the block's pool delta.
+            if NetworkUpgrade::Nu7
+                .activation_height(&self.network)
+                .and_then(|activation| activation.0.checked_sub(1))
+                == Some(height.0)
+            {
+                self.chain_value_pools
+                    .set_nsm_value_balance_amount(Amount::zero());
+            }
             self.chain_value_pools = self
                 .chain_value_pools
                 .add_chain_value_pool_change(block_value_pool_change.neg())
@@ -2610,8 +2582,9 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`],
-    /// breaking ties using the tip block hash.
+    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`].
+    /// Equal-work ties prefer the operator's latest `preciousblock` tip, then
+    /// break using the tip block hash.
     ///
     /// Despite the consensus rules, Zebra uses the tip block hash as a
     /// tie-breaker. Zebra blocks are downloaded in parallel, so download
@@ -2648,7 +2621,8 @@ impl Ord for Chain {
     /// interior mutability.
     ///
     /// `cmp` returns [`Ordering::Equal`] only when both the cumulative work and
-    /// the tip hash match. The [`NonFinalizedState::chain_set`][2] is a
+    /// the tip hash match, because the non-finalized state derives the
+    /// `preciousblock` preference from the tip hash on every insert. The [`NonFinalizedState::chain_set`][2] is a
     /// `BTreeSet<Arc<Chain>>`, so an attempt to insert a chain that compares
     /// equal to an existing entry is a no-op rather than a process-fatal panic.
     /// Callers that need to replace such a chain must remove the existing entry
@@ -2669,7 +2643,12 @@ impl Ord for Chain {
                 tip,
             )
         };
-        score(self).cmp(&score(other))
+        let (self_score, other_score) = (score(self), score(other));
+        self_score
+            .suffix_work
+            .cmp(&other_score.suffix_work)
+            .then_with(|| self.active_precedence().cmp(&other.active_precedence()))
+            .then_with(|| self_score.cmp(&other_score))
     }
 }
 

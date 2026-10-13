@@ -13,14 +13,14 @@ impl RequestWriteStatus {
 }
 
 thread_local! {
-    static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static BEFORE_CLAIM_RESET: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static BEFORE_DROP_CLEANUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 
-pub(super) fn before_reset_height_check() {
-    if let Some(hook) = BEFORE_RESET_HEIGHT_CHECK.with_borrow_mut(Option::take) {
+pub(super) fn before_claim_reset() {
+    if let Some(hook) = BEFORE_CLAIM_RESET.with_borrow_mut(Option::take) {
         hook();
     }
 }
@@ -68,16 +68,18 @@ fn settlement_observes_write_status_while_last_owner_is_dropping() {
 }
 
 #[test]
-fn reset_drops_unaffected_last_claim_after_unlocking() {
+fn reset_drops_last_claim_after_unlocking() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let reset = std::thread::spawn(move || {
         let mut f = Fixture::new();
         let claim = f.take(1);
         assert!(claim.publish(|| {}));
         // Release the writer's reference after reset upgrades the weak reference,
-        // but before it rejects this claim at or below the new floor.
-        BEFORE_RESET_HEIGHT_CHECK.with_borrow_mut(|hook| *hook = Some(Box::new(|| drop(claim))));
-        assert_eq!(f.work.reset_above(block::Height(2)), 0);
+        // but before it retires this claim at or below the new floor.
+        BEFORE_CLAIM_RESET.with_borrow_mut(|hook| *hook = Some(Box::new(|| drop(claim))));
+        let released = f.work.reset_above(block::Height(2));
+        assert_eq!(released, 200);
+        f.budget.release(released);
         assert_eq!(f.budget.reserved(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
         assert_eq!(f.work.pending_len(), 0);
@@ -87,7 +89,7 @@ fn reset_drops_unaffected_last_claim_after_unlocking() {
     });
     done_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("dropping the last unaffected claim must not deadlock reset");
+        .expect("dropping the last claim must not deadlock reset");
     reset.join().unwrap();
 }
 
@@ -652,16 +654,17 @@ fn expiry_after_forward_reset_discards_committed_heights() {
                     .unwrap(),
             );
         }
-        // Reset retains heights at or below its new floor. Cleanup must discard
-        // that prefix instead of offering already-committed work to another peer.
-        f.budget.release(f.work.reset_above(block::Height(2)));
+        // Reset itself retires the committed prefix. Later cleanup is idempotent.
+        let released = f.work.reset_above(block::Height(2));
+        assert_eq!(released, if received { 100 } else { 200 });
+        f.budget.release(released);
         let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
             claim.owner(),
             [block::Height(1), block::Height(2)],
         );
-        assert_eq!(outcome.committed_count, 2);
+        assert_eq!(outcome.missing_count, 2);
         assert_eq!(outcome.returned_count, 0);
-        assert_eq!(outcome.released_bytes, if received { 100 } else { 200 });
+        assert_eq!(outcome.released_bytes, 0);
         f.budget.release(outcome.released_bytes);
         assert_eq!(f.work.pending_len(), 0);
         assert_eq!(f.work.in_flight_len(), 0);

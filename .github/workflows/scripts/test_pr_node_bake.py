@@ -91,51 +91,41 @@ class SnapshotHeight(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
-    def bake_tips(self, results):
+    def bake_tips(self, results, testnet_metadata=None):
         # Exercise the shipped restore/measure/write order for both networks.
         source = pathlib.Path(__file__).with_name("pr-node-bake.sh").read_text()
         body = source.split("  # Mainnet tip:", 1)[1].split("\nfi\n\nsync", 1)[0]
         body = "  # Mainnet tip:" + body
         body = body.replace("/root/", str(self.root) + "/")
-        (self.root / "mainnet.json").write_text(
-            json.dumps(
-                {
-                    "height": 3471916,
-                    "url": "mainnet.tar.zst",
-                    "sha256": "mainnet-sha",
-                }
-            )
-        )
-        (self.root / "testnet.json").write_text(
-            json.dumps(
-                {
-                    "snapshots": [
-                        {
-                            "enabled": True,
-                            "kind": "pruned",
-                            "published": "2026-09-04",
-                            "height": "4128095",
-                            "file": "testnet.tar.zst",
-                            "sha256": "testnet-sha",
-                        }
-                    ]
-                }
-            )
-        )
+        for network, height in (("mainnet", 3471916), ("testnet", 4406695)):
+            metadata = {
+                "network": network,
+                "snapshot_kind": "pruned",
+                "height": height,
+                "filename": f"{network}.tar.zst",
+                "url": f"https://snapshots.example/{network}.tar.zst",
+                "sha256": ("a" if network == "mainnet" else "b") * 64,
+                "db_major": 29,
+                "db_format_version": "29.0.0",
+            }
+            if network == "testnet" and testnet_metadata is not None:
+                metadata = testnet_metadata
+            (self.root / f"{network}.json").write_text(json.dumps(metadata))
         return self.run_script(
-            shell_function("read_state_height") + r"""
+            shell_function("read_state_height") + shell_function("fetch_tip_state") + r"""
 MAINNET_MNT="$PWD/mainnet"
 TESTNET_MNT="$PWD/testnet"
 TIP_MAINNET_LATEST_JSON=mainnet-latest
-TESTNET_SNAPSHOTS_BASE=testnet-site
+TIP_TESTNET_LATEST_JSON=testnet-latest
 curl() {
   case "${@: -1}" in
     mainnet-latest) cat mainnet.json ;;
-    testnet-site/snapshots.json) cat testnet.json ;;
+    testnet-latest) cat testnet.json ;;
     *) return 1 ;;
   esac
 }
 fetch_state() {
+  printf '%s %s %s\n' "$1" "$2" "$4" >> "$PWD/fetches"
   mkdir -p "$3"
   touch "$3/restored"
 }
@@ -147,13 +137,20 @@ fetch_state() {
         result = self.bake_tips(
             {
                 "Mainnet": ("3470916\n", 0),
-                "Testnet": ("4127095\n", 0),
+                "Testnet": ("4405728\n", 0),
             }
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.root / "fetches").read_text().splitlines(),
+            [
+                "https://snapshots.example/mainnet.tar.zst " + "a" * 64 + " mainnet",
+                "https://snapshots.example/testnet.tar.zst " + "b" * 64 + " testnet",
+            ],
+        )
         measured = (self.root / "mainnet-state-height").read_text().strip()
         self.assertEqual(measured, "3470916")
-        self.assertEqual((self.root / "testnet-state-height").read_text(), "4127095\n")
+        self.assertEqual((self.root / "testnet-state-height").read_text(), "4405728\n")
         # Feed the measured files through the actual workflow naming step.
         workflow = pathlib.Path(__file__).parents[1] / "zakura-pr-node-bake.yml"
         step = workflow.read_text().split("      - name: Snapshot state volumes", 1)[1]
@@ -188,7 +185,7 @@ python3() {
         self.assertEqual(result.returncode, 0, result.stderr)
         names = (self.root / "snapshot-names").read_text().splitlines()
         self.assertEqual(len(names), 2)
-        self.assertTrue(names[1].endswith("-finalized-h4127095"))
+        self.assertTrue(names[1].endswith("-finalized-h4405728"))
         states = [
             {
                 "id": "approach",
@@ -226,7 +223,7 @@ python3() {
     def test_bake_stops_without_publishing_an_unreadable_database_height(self):
         for network in ("Mainnet", "Testnet"):
             with self.subTest(network=network):
-                results = {"Mainnet": ("3470916\n", 0), "Testnet": ("4127095\n", 0)}
+                results = {"Mainnet": ("3470916\n", 0), "Testnet": ("4405728\n", 0)}
                 results[network] = ("ERROR failed to read state\n", 0)
                 result = self.bake_tips(results)
                 self.assertNotEqual(result.returncode, 0)
@@ -234,6 +231,35 @@ python3() {
                     (self.root / f"{network.lower()}-state-height").read_text(),
                     "",
                 )
+
+    def test_bake_rejects_wrong_family_and_invalid_manifest_before_download(self):
+        valid = {
+            "network": "testnet", "snapshot_kind": "pruned", "height": 4406695,
+            "filename": "testnet.tar.zst",
+            "url": "https://snapshots.example/testnet.tar.zst",
+            "sha256": "b" * 64, "db_major": 29, "db_format_version": "29.0.0",
+        }
+        invalid = [
+            {"snapshots": [{"enabled": True, "kind": "pruned"}]},
+            *[dict(valid, **change) for change in (
+                {"network": "mainnet"}, {"network": "Zakura Ironwood testnet"},
+                {"snapshot_kind": "archive"}, {"sha256": None},
+                {"sha256": "bad-checksum"}, {"url": None},
+                {"db_major": 28}, {"db_major": None},
+                {"db_format_version": "invalid"},
+            )],
+        ]
+        for metadata in invalid:
+            with self.subTest(metadata=metadata):
+                (self.root / "fetches").unlink(missing_ok=True)
+                result = self.bake_tips(
+                    {"Mainnet": ("3470916\n", 0), "Testnet": ("4405728\n", 0)},
+                    metadata,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid testnet pruned snapshot manifest", result.stderr)
+                self.assertNotIn("testnet", (self.root / "fetches").read_text())
+                self.assertFalse((self.root / "testnet-state-height").exists())
 
     def test_rebuilt_approach_requires_exact_readable_database_height(self):
         source = pathlib.Path(__file__).with_name("pr-node-bake.sh").read_text()

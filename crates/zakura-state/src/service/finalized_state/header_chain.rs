@@ -29,6 +29,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
+use zakura_node_services::header_chain::ServingCapacitySignal;
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -68,6 +69,11 @@ const FINALITY_WITNESS_LIMIT: usize = 2 * FINALITY_HISTORY_LIMIT + 1_000;
 const TOMBSTONE_LIMIT: usize = 65_536;
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HEADER_NODE_DISK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(feature = "internal-bench")]
 static BENCH_WITNESS_POINT_READS: std::sync::atomic::AtomicU64 =
@@ -268,6 +274,14 @@ struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthori
 
 #[cfg(test)]
 impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.0.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.0.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -301,6 +315,14 @@ struct StateIssuedAuthority<'a> {
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.inner.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -422,6 +444,19 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
             || (row.outcome_status_code() == authoritative_status
                 && row.observation_digests() == authoritative_observations
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
+}
+
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
 }
 
 fn auxiliary_rows_are_coherent(
@@ -900,7 +935,9 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, u64>,
+    reservations: HashMap<SourceId, (u64, Option<ServingCapacitySignal>)>,
+    general_capacity: Option<ServingCapacitySignal>,
+    fallback_capacity: Option<ServingCapacitySignal>,
     // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
     continuations: HashMap<SourceId, CanonicalHeaderPathCursor>,
 }
@@ -934,6 +971,7 @@ enum CanonicalHeaderPathPosition {
 
 #[derive(Clone, Debug)]
 struct CanonicalHeaderPathCursor {
+    capacity: Option<ServingCapacitySignal>,
     lease_id: u64,
     peer: SourceId,
     session_id: u64,
@@ -979,6 +1017,45 @@ struct CanonicalHeaderPathAdvance {
     position: CanonicalHeaderPathPosition,
     last_frontier: Frontier,
     now: Instant,
+}
+
+/// Owns a blocking acquisition until the state-service caller receives its result.
+pub(crate) struct PendingRetainedPathAcquisition {
+    reader: HeaderChainReader,
+    outcome: Option<RetainedPathLeaseOutcome>,
+}
+
+impl PendingRetainedPathAcquisition {
+    pub(crate) fn new(reader: HeaderChainReader, outcome: RetainedPathLeaseOutcome) -> Self {
+        Self {
+            reader,
+            outcome: Some(outcome),
+        }
+    }
+
+    pub(crate) fn into_outcome(mut self) -> RetainedPathLeaseOutcome {
+        self.outcome
+            .take()
+            .expect("pending acquisition owns its outcome")
+    }
+}
+
+impl Drop for PendingRetainedPathAcquisition {
+    fn drop(&mut self) {
+        if let Some(RetainedPathLeaseOutcome::Acquired(lease)) = self.outcome.take() {
+            if let Err(error) = self.reader.release_retained_path(
+                lease.peer,
+                lease.session_id,
+                lease.lease_id,
+                lease.scope,
+            ) {
+                tracing::error!(
+                    ?error,
+                    "failed to release an abandoned header path acquisition"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1028,7 +1105,26 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
-        self.by_peer.remove(&peer)
+        let mut cursor = self.by_peer.remove(&peer)?;
+        if let Some(signal) = cursor.capacity.take() {
+            signal.release();
+        }
+        self.notify_capacity();
+        Some(cursor)
+    }
+
+    fn notify_capacity(&mut self) {
+        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
+        if occupied < RetainedPathCapacity::General.limit() {
+            if let Some(signal) = self.general_capacity.take() {
+                signal.release();
+            }
+        }
+        if occupied < RetainedPathCapacity::FinalizedFallback.limit() {
+            if let Some(signal) = self.fallback_capacity.take() {
+                signal.release();
+            }
+        }
     }
 
     fn reserve(
@@ -1036,23 +1132,50 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         now: Instant,
         capacity: RetainedPathCapacity,
-    ) -> Option<u64> {
+    ) -> Result<u64, RetainedPathLeaseOutcome> {
         self.expire(now);
-        if self.by_peer.contains_key(&peer)
-            || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
-        {
-            return None;
+        if let Some(cursor) = self.by_peer.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                cursor.capacity.get_or_insert_default().clone(),
+            ));
         }
-        let reservation_id = self.next_reservation_id.checked_add(1)?;
+        if let Some((_, signal)) = self.reservations.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        if self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit() {
+            let signal = match capacity {
+                RetainedPathCapacity::General => &mut self.general_capacity,
+                RetainedPathCapacity::FinalizedFallback => &mut self.fallback_capacity,
+            };
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        let reservation_id = self
+            .next_reservation_id
+            .checked_add(1)
+            .ok_or(RetainedPathLeaseOutcome::Busy)?;
         self.next_reservation_id = reservation_id;
-        self.reservations.insert(peer, reservation_id);
-        Some(reservation_id)
+        self.reservations.insert(peer, (reservation_id, None));
+        Ok(reservation_id)
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
-        if self.reservations.get(&peer) == Some(&reservation_id) {
-            self.reservations.remove(&peer);
+        if self
+            .reservations
+            .get(&peer)
+            .is_some_and(|(id, _)| *id == reservation_id)
+        {
+            let (_, signal) = self
+                .reservations
+                .remove(&peer)
+                .expect("the reservation matches");
+            if let Some(signal) = signal {
+                signal.release();
+            }
+            self.notify_capacity();
         }
     }
 
@@ -1063,18 +1186,29 @@ impl RetainedPathLeaseRegistry {
         spec: RetainedPathLeaseSpec,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
-        if peer != spec.peer || self.reservations.get(&peer) != Some(&reservation_id) {
+        if peer != spec.peer
+            || !self
+                .reservations
+                .get(&peer)
+                .is_some_and(|(id, _)| *id == reservation_id)
+        {
             return RetainedPathLeaseOutcome::Busy;
         }
-        self.reservations.remove(&peer);
         if self.by_peer.contains_key(&peer) {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         }
         let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         };
         self.next_lease_id = lease_id;
+        let (_, capacity) = self
+            .reservations
+            .remove(&peer)
+            .expect("the reservation matches");
         let cursor = CanonicalHeaderPathCursor {
+            capacity,
             lease_id,
             peer: spec.peer,
             session_id: spec.session_id,
@@ -1768,17 +1902,14 @@ impl HeaderChainReader {
             } else {
                 None
             };
-        let deliveries = self.coherent_aux_deliveries(&target)?;
+        self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
         let engine = self
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let total_delivery_count = engine.aux_delivery_count();
-        let admission_capacity_available = deliveries.len()
-            < self.config.limits.max_aux_deliveries_per_header.get()
-            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
-            && !snapshot.alarms.resource_stalled;
+        let repair_capacity = engine.auxiliary_repair_capacity(target_hash, self.config.limits);
+        let admission_capacity_available = repair_capacity > 0 && !snapshot.alarms.resource_stalled;
         let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
             selected_target,
             HeaderLocator::for_continuation(parent),
@@ -1787,18 +1918,13 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
-        let available_aggregate_capacity = self
-            .config
-            .limits
-            .max_aux_deliveries_total
-            .get()
-            .saturating_sub(total_delivery_count);
-        let range_limit =
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        let range_limit = repair_capacity.min(self.config.limits.max_headers_per_transition.get());
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -1855,7 +1981,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -2030,8 +2158,9 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .reserve(peer, Instant::now(), capacity);
-        let Some(reservation_id) = reservation_id else {
-            return Ok(RetainedPathLeaseOutcome::Busy);
+        let reservation_id = match reservation_id {
+            Ok(id) => id,
+            Err(outcome) => return Ok(outcome),
         };
         let reservation = RetainedPathReservation {
             leases: self.leases.clone(),
@@ -2439,6 +2568,13 @@ impl HeaderChainRuntime {
         &self.publisher
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_auxiliary_limits_for_test(&mut self, per_header: usize, total: usize) {
+        self.config.limits.max_aux_deliveries_per_header =
+            std::num::NonZeroUsize::new(per_header).unwrap();
+        self.config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(total).unwrap();
+    }
+
     /// Return a read-only handle whose compound reads share the transition lock.
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
@@ -2636,13 +2772,8 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let checkpoint_headers_are_retained = match &checkpoint_request.event {
-            TransitionEvent::VerifiedChainChanged(event) => event
-                .new_path
-                .iter()
-                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
-            _ => false,
-        };
+        let checkpoint_headers_are_retained =
+            retained_checkpoint_headers(&transition_engine, &checkpoint_request.event);
         // Header sync normally admits headers before native checkpoint growth promotes them.
         // Only a missing header needs contextual validation and a validation lease.
         let validation_leases = if checkpoint_headers_are_retained {
@@ -2799,7 +2930,9 @@ impl HeaderChainRuntime {
         request: TransitionRequest,
         before: &EngineSnapshot,
         network: &Network,
+        engine: &HeaderChainEngine,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
+        let retained_checkpoint = retained_checkpoint_headers(engine, &request.event);
         let expected_version = request.expected_version;
         Ok(match request.event {
             TransitionEvent::InsertHeaders(event) => {
@@ -2844,9 +2977,11 @@ impl HeaderChainRuntime {
                     expected_version,
                     event,
                     facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(parent.hash, network)?],
+                        validation_leases: if retained_checkpoint {
+                            Vec::new()
+                        } else {
+                            vec![self.store.validation_context(parent.hash, network)?]
+                        },
                     },
                 }
             }
@@ -3071,27 +3206,29 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let aggregate_capacity_available = transition_engine
-                    .aux_delivery_count()
-                    .checked_add(repair_range.len())
-                    .is_some_and(|count| {
-                        count <= context.config.limits.max_aux_deliveries_total.get()
-                    });
+                let repair_capacity = transition_engine
+                    .auxiliary_repair_capacity(first_target.hash, context.config.limits);
+                if repair_capacity < repair_range.len() {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
                     first_boundary_hash,
-                    aggregate_capacity_available
-                        && transition_engine.aux_deliveries(first_target.hash).len()
-                            < context.config.limits.max_aux_deliveries_per_header.get()
-                        && !before.alarms.resource_stalled,
+                    !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || !aggregate_capacity_available
-                        || before.alarms.resource_stalled
+                    if durable_rows_by_target.iter().any(|rows| {
+                        zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                    }) || repair_range.iter().any(|target| {
+                        !repair_bucket_admits(
+                            &transition_engine,
+                            target.hash,
+                            context.config.limits,
+                        )
+                    }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
@@ -3100,8 +3237,9 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
+                } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                    &durable_rows_by_target[0],
+                ) && current.admission_capacity_available
                     && current.episode != episode
                 {
                     current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
@@ -3196,7 +3334,12 @@ impl HeaderChainRuntime {
                 }
             }
         }
-        let input = self.build_transition_input(request, &before, base_context.config.network())?;
+        let input = self.build_transition_input(
+            request,
+            &before,
+            base_context.config.network(),
+            &transition_engine,
+        )?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -3262,6 +3405,8 @@ impl HeaderChainRuntime {
             return Ok(ApplyResult::ResourceStalled(receipt));
         }
         if !expectation.staged.is_empty() {
+            let staged_check_start = std::time::Instant::now();
+            let staged_header_count = u32::try_from(expectation.staged.len()).unwrap_or(u32::MAX);
             let put_nodes: HashMap<_, _> = transition
                 .change_set()
                 .put_nodes
@@ -3278,9 +3423,9 @@ impl HeaderChainRuntime {
                 let projected = if deleted.contains(&expected.hash) {
                     None
                 } else if let Some(node) = put_nodes.get(&expected.hash) {
-                    Some((*node).clone())
+                    Some(*node)
                 } else {
-                    self.store.header_node(expected.hash)?
+                    transition_engine.graph().header_node(expected.hash)
                 };
                 let matches = projected.is_some_and(|node| {
                     node.height == expected.height
@@ -3293,6 +3438,10 @@ impl HeaderChainRuntime {
                     });
                 }
             }
+            metrics::histogram!("state.header.full_state_expectation.headers")
+                .record(f64::from(staged_header_count));
+            metrics::histogram!("state.header.full_state_expectation.duration_seconds")
+                .record(staged_check_start.elapsed().as_secs_f64());
         }
         if let Some(expected) = expectation.verified {
             let actual = transition.change_set().metadata.frontiers.verified_best;
@@ -3815,6 +3964,16 @@ pub struct HeaderChainStore {
 }
 
 impl HeaderChainStore {
+    #[cfg(test)]
+    fn reset_header_node_disk_reads() {
+        TEST_HEADER_NODE_DISK_READS.with(|reads| reads.set(0));
+    }
+
+    #[cfg(test)]
+    fn header_node_disk_reads() -> u64 {
+        TEST_HEADER_NODE_DISK_READS.with(std::cell::Cell::get)
+    }
+
     /// Attach the header-chain adapter to the existing finalized-state database.
     pub fn new(db: DiskDb) -> Self {
         Self {
@@ -5431,7 +5590,7 @@ impl HeaderChainStore {
             return Ok(None);
         }
 
-        let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+        let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
             .map_err(|_| {
                 HeaderChainStoreError::Incoherent("validation context bound does not fit in u32")
             })?;
@@ -5467,6 +5626,14 @@ impl HeaderChainStore {
     }
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        if plan
+            .repairs
+            .contains(&RecoveryRepair::NetworkPolicyConfiguration)
+        {
+            tracing::warn!(
+                "header-chain network policy changed; source audit passed, updating stored digest"
+            );
+        }
         let mut batch = DiskWriteBatch::new();
         if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
             for node in &plan.header_nodes {
@@ -5925,6 +6092,15 @@ impl HeaderChainStore {
     }
 
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+        #[cfg(test)]
+        TEST_HEADER_NODE_DISK_READS.with(|reads| {
+            reads.set(
+                reads
+                    .get()
+                    .checked_add(1)
+                    .expect("test header-node disk read count stays below u64::MAX"),
+            );
+        });
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
             .map_err(store_error)?;
@@ -6110,6 +6286,16 @@ impl HeaderChainStore {
     }
 }
 
+// Retained checkpoint headers already carry contextual validation. The planner still
+// checks their exact identity, continuity, and eligibility before advancing finality.
+// Assumes checkpoint commits carry no retention references; one authenticated only by
+// the skipped parent lease would fail closed with `TransitionFailure::Authority`.
+fn retained_checkpoint_headers(engine: &HeaderChainEngine, event: &TransitionEvent) -> bool {
+    matches!(event, TransitionEvent::VerifiedChainChanged(event)
+        if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow
+            && event.new_path.iter().all(|header| engine.graph().header_node(header.hash).is_some()))
+}
+
 fn authenticated_context_headers(
     store: &HeaderChainStore,
     parent: block::Hash,
@@ -6124,7 +6310,7 @@ fn authenticated_context_headers(
     let parent_node = staged_parent
         .or(stored_parent.as_ref())
         .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
-    let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+    let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
     let required = usize::try_from(parent_node.height.0.min(predecessor_span))
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in usize"))?;

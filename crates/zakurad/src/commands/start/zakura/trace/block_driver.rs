@@ -260,14 +260,14 @@ impl BlockDriverTraceExt for ZakuraTrace {
                     range_count: (*limit).into(),
                     best_header_tip: best_header_tip.0.into(),
                 }),
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    ReceivedAction::BlockRange {
-                        action: "query_blocks_by_height_range",
-                        peer: zakura_trace_peer_label(peer),
-                        range_start: start.0.into(),
-                        range_count: (*count).into(),
-                    }
-                }
+                BlockSyncAction::QueryBlocksByHeightRange {
+                    peer, start, count, ..
+                } => ReceivedAction::BlockRange {
+                    action: "query_blocks_by_height_range",
+                    peer: zakura_trace_peer_label(peer),
+                    range_start: start.0.into(),
+                    range_count: (*count).into(),
+                },
                 BlockSyncAction::SubmitBlock { token, block, .. } => ReceivedAction::SubmitBlock {
                     action: "submit_block",
                     apply_token: *token,

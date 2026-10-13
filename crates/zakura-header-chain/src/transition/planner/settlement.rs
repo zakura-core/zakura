@@ -94,7 +94,17 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     if work_rebased {
         metadata.work_origin = projected.graph().view_finalized_frontier();
     }
-    projected.refresh_verified_after_operator_change()?;
+    if let Some(authority) = context
+        .full_state_authority
+        .filter(|authority| authority.authorizes_full_state(event))
+    {
+        projected.forget_evicted_bodies(authority.evicted_bodies(event))?;
+    }
+    projected.refresh_verified_selection(
+        context
+            .full_state_authority
+            .and_then(|authority| authority.verified_tip(event)),
+    )?;
 
     let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;
     let full_state_finalized = match event {
@@ -235,6 +245,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let retention = projected.enforce_retention(
+        engine,
         selected_tip,
         context.retention_references.iter().copied(),
         context.config.limits,
@@ -266,6 +277,12 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
                 )
             })?;
         Cow::Borrowed(&old_selected[index..])
+    } else if selected_tip == snapshot_before_commit.frontiers.header_best
+        && projected.graph().view_finalized_frontier() == snapshot_before_commit.frontiers.finalized
+    {
+        // Canonical parent links are immutable, and retention protects the selected path.
+        // Unchanged endpoints therefore retain the engine's already verified projection.
+        Cow::Borrowed(old_selected)
     } else {
         Cow::Owned(path(projected.graph(), selected_tip)?)
     };

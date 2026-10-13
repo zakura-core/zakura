@@ -32,7 +32,7 @@ fn queued_block(seed: u128) -> QueuedCheckpointVerified {
         .expect("genesis block deserializes");
     let block = genesis.make_fake_child().set_work(seed);
     let (rsp_tx, _rsp_rx) = oneshot::channel();
-    (CheckpointVerifiedBlock::from(block), rsp_tx)
+    (CheckpointVerifiedBlock::from(block), rsp_tx, 0)
 }
 
 #[test]

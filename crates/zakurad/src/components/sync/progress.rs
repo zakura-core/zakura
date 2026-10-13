@@ -14,7 +14,7 @@ use zakura_chain::{
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     fmt::humantime_seconds,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade},
 };
 use zakura_state::MAX_BLOCK_REORG_HEIGHT;
 
@@ -23,8 +23,8 @@ use crate::components::{health::ChainTipMetrics, sync::SyncStatus};
 /// The amount of time between progress logs.
 const LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The amount of time between progress bar updates.
-const PROGRESS_BAR_INTERVAL: Duration = Duration::from_secs(5);
+/// The interval between sync progress checks.
+const PROGRESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The number of blocks we consider to be close to the tip.
 ///
@@ -59,8 +59,7 @@ const SYNC_PERCENT_FRAC_DIGITS: usize = 3;
 // TODO: change to HeightDiff?
 const MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE: u32 = 10;
 
-/// Logs Zebra's estimated progress towards the chain tip every minute or so, and
-/// updates a terminal progress bar every few seconds.
+/// Logs Zakura's estimated progress towards the chain tip every minute or so.
 ///
 /// TODO:
 /// - log progress towards, remaining blocks before, and remaining time to next network upgrade
@@ -88,30 +87,6 @@ pub async fn show_block_chain_progress(
         .add(min_after_checkpoint_blocks)
         .expect("hard-coded checkpoint height is far below Height::MAX");
 
-    let target_block_spacing = NetworkUpgrade::target_spacing_for_height(&network, Height::MAX);
-    let max_block_spacing =
-        NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, Height::MAX);
-
-    // We expect the state height to increase at least once in this interval.
-    //
-    // Most chain forks are 1-7 blocks long.
-    //
-    // TODO: remove the target_block_spacing multiplier,
-    //       after fixing slow syncing near tip (#3375)
-    let min_state_block_interval = max_block_spacing.unwrap_or(target_block_spacing * 4) * 2;
-
-    // Formatted strings for logging.
-    let target_block_spacing = humantime_seconds(
-        target_block_spacing
-            .to_std()
-            .expect("constant fits in std::Duration"),
-    );
-    let max_block_spacing = max_block_spacing
-        .map(|duration| {
-            humantime_seconds(duration.to_std().expect("constant fits in std::Duration"))
-        })
-        .unwrap_or_else(|| "None".to_string());
-
     // The last time we downloaded and verified at least one block.
     //
     // Initialized to the start time to simplify the code.
@@ -126,8 +101,6 @@ pub async fn show_block_chain_progress(
     // The last time we logged an update.
     let mut last_log_time = Instant::now();
 
-    #[cfg(feature = "progress-bar")]
-    let block_bar = howudoin::new().label("Blocks");
     let mut is_chain_metrics_chan_closed = false;
 
     loop {
@@ -145,18 +118,6 @@ pub async fn show_block_chain_progress(
                 .best_tip_height()
                 .expect("unexpected empty state: estimate requires a block height");
             let network_upgrade = NetworkUpgrade::current(&network, current_height);
-
-            // Send progress reports for block height
-            //
-            // TODO: split the progress bar height update into its own function.
-            #[cfg(feature = "progress-bar")]
-            if matches!(howudoin::cancelled(), Some(true)) {
-                block_bar.close();
-            } else {
-                block_bar
-                    .set_pos(current_height.0)
-                    .set_len(u64::from(estimated_height.0));
-            }
 
             let mut remaining_sync_blocks = estimated_height - current_height;
 
@@ -190,13 +151,34 @@ pub async fn show_block_chain_progress(
             // Skip logging and status updates if it isn't time for them yet.
             let elapsed_since_log = instant_now.saturating_duration_since(last_log_time);
             if elapsed_since_log < LOG_INTERVAL {
-                tokio::time::sleep(PROGRESS_BAR_INTERVAL).await;
+                tokio::time::sleep(PROGRESS_CHECK_INTERVAL).await;
                 continue;
             } else {
                 last_log_time = instant_now;
             }
 
             // TODO: split logging / status updates into their own function.
+
+            // The block spacing at the estimated network tip sets how often the state height
+            // increases near the tip. ZIP 218 shortens it at NU7.
+            let target_block_spacing =
+                NetworkUpgrade::target_spacing_for_height(&network, estimated_height);
+            let max_block_spacing =
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, estimated_height);
+            let min_state_block_interval =
+                min_state_block_interval(target_block_spacing, max_block_spacing);
+
+            // Formatted strings for logging.
+            let target_block_spacing = humantime_seconds(
+                target_block_spacing
+                    .to_std()
+                    .expect("constant fits in std::Duration"),
+            );
+            let max_block_spacing = max_block_spacing
+                .map(|duration| {
+                    humantime_seconds(duration.to_std().expect("constant fits in std::Duration"))
+                })
+                .unwrap_or_else(|| "None".to_string());
 
             // Work out the sync progress towards the estimated tip.
             let sync_progress = f64::from(current_height.0) / f64::from(estimated_height.0);
@@ -232,10 +214,6 @@ pub async fn show_block_chain_progress(
                      and your computer clock and time zone",
                     time_since_last_state_block_chrono.num_minutes(),
                 );
-
-                // TODO: use add_warn(), but only add each warning once
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: sync has stalled"));
             } else if is_syncer_stopped && remaining_sync_blocks > MIN_SYNC_WARNING_BLOCKS {
                 // We've stopped syncing blocks, but we estimate we're a long way from the tip.
                 //
@@ -251,17 +229,11 @@ pub async fn show_block_chain_progress(
                      Hint: check your network connection, \
                      and your computer clock and time zone",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!(
-                    "{network_upgrade}: sync is very slow, or estimated tip is wrong"
-                ));
             } else if is_syncer_stopped && current_height <= after_checkpoint_height {
                 // We've stopped syncing blocks,
                 // but we're below the minimum height estimated from our checkpoints.
-                let min_minutes_after_checkpoint_update = (MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE
-                    * POST_BLOSSOM_POW_TARGET_SPACING)
-                    .div_ceil(60);
+                let min_minutes_after_checkpoint_update =
+                    min_minutes_after_checkpoint_update(&network, estimated_height);
 
                 warn!(
                     %sync_percent,
@@ -276,9 +248,6 @@ pub async fn show_block_chain_progress(
                      Dev Hint: were the checkpoints updated in the last {} minutes?",
                     min_minutes_after_checkpoint_update,
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: sync is very slow"));
             } else if is_syncer_stopped {
                 // We've stayed near the tip for a while, and we've stopped syncing lots of blocks.
                 // So we're mostly using gossiped blocks now.
@@ -290,9 +259,6 @@ pub async fn show_block_chain_progress(
                     %time_since_last_state_block,
                     "finished initial sync to chain tip, using gossiped blocks",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: waiting for next block"));
             } else if remaining_sync_blocks <= MAX_CLOSE_TO_TIP_BLOCKS {
                 // We estimate we're near the tip, but we have been syncing lots of blocks recently.
                 // We might also be using some gossiped blocks.
@@ -305,9 +271,6 @@ pub async fn show_block_chain_progress(
                     "close to finishing initial sync, \
                      confirming using syncer and gossiped blocks",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: finishing initial sync"));
             } else {
                 // We estimate we're far from the tip, and we've been syncing lots of blocks.
                 info!(
@@ -318,14 +281,9 @@ pub async fn show_block_chain_progress(
                     %time_since_last_state_block,
                     "estimated progress to chain tip",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: syncing blocks"));
             }
         } else {
             let sync_percent = format!("{:.SYNC_PERCENT_FRAC_DIGITS$} %", 0.0f64,);
-            #[cfg(feature = "progress-bar")]
-            let network_upgrade = NetworkUpgrade::Genesis;
 
             if is_syncer_stopped {
                 // We've stopped syncing blocks,
@@ -337,9 +295,6 @@ pub async fn show_block_chain_progress(
                      Hint: check your network connection, \
                      and your computer clock and time zone",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!("{network_upgrade}: can't download genesis block"));
             } else {
                 // We're waiting for the genesis block to be committed to the state,
                 // before we can estimate the best chain tip.
@@ -348,14 +303,83 @@ pub async fn show_block_chain_progress(
                     current_height = %"None",
                     "initial sync is waiting to download the genesis block",
                 );
-
-                #[cfg(feature = "progress-bar")]
-                block_bar.desc(format!(
-                    "{network_upgrade}: waiting to download genesis block"
-                ));
             }
         }
 
-        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_BAR_INTERVAL)).await;
+        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_CHECK_INTERVAL)).await;
+    }
+}
+
+/// Returns the interval where we expect the state height to increase at least once.
+///
+/// The `max_block_spacing` is the Testnet minimum difficulty gap, or `None` where that rule is
+/// inactive. Most chain forks are 1-7 blocks long.
+///
+/// TODO: remove the target_block_spacing multiplier,
+///       after fixing slow syncing near tip (#3375)
+fn min_state_block_interval(
+    target_block_spacing: chrono::Duration,
+    max_block_spacing: Option<chrono::Duration>,
+) -> chrono::Duration {
+    max_block_spacing.unwrap_or(target_block_spacing * 4) * 2
+}
+
+/// Returns the minimum number of minutes between a checkpoint list update and a test that depends
+/// on it, based on the target spacing at the estimated network tip `height`.
+fn min_minutes_after_checkpoint_update(network: &Network, height: Height) -> u64 {
+    let target_spacing =
+        u64::try_from(NetworkUpgrade::target_spacing_for_height(network, height).num_seconds())
+            .expect("target spacings are positive");
+
+    (u64::from(MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE) * target_spacing).div_ceil(60)
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    use super::*;
+
+    /// Returns the stall warning interval, in seconds, when the estimated network tip is `height`.
+    fn stall_interval_seconds(network: &Network, height: Height) -> i64 {
+        min_state_block_interval(
+            NetworkUpgrade::target_spacing_for_height(network, height),
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(network, height),
+        )
+        .num_seconds()
+    }
+
+    #[test]
+    fn progress_timing_follows_tip_target_spacing() {
+        let _init_guard = zakura_test::init();
+
+        // Mainnet and Testnet have no NU7 height, so their values stay unchanged.
+        let tip = Height(3_500_000);
+        assert_eq!(stall_interval_seconds(&Network::Mainnet, tip), 600);
+        assert_eq!(
+            min_minutes_after_checkpoint_update(&Network::Mainnet, tip),
+            13
+        );
+
+        let testnet = Network::new_default_testnet();
+        assert_eq!(stall_interval_seconds(&testnet, tip), 900);
+        assert_eq!(min_minutes_after_checkpoint_update(&testnet, tip), 13);
+
+        const NU7: u32 = 1_000;
+        let regtest = Network::new_regtest(
+            ConfiguredActivationHeights {
+                nu7: Some(NU7),
+                ..Default::default()
+            }
+            .into(),
+        );
+        let pre_nu7 = Height(NU7 - 1);
+        let post_nu7 = Height(NU7);
+
+        assert_eq!(stall_interval_seconds(&regtest, pre_nu7), 600);
+        assert_eq!(min_minutes_after_checkpoint_update(&regtest, pre_nu7), 13);
+
+        assert_eq!(stall_interval_seconds(&regtest, post_nu7), 200);
+        assert_eq!(min_minutes_after_checkpoint_update(&regtest, post_nu7), 5);
     }
 }

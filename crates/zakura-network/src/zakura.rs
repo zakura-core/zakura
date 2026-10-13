@@ -17,6 +17,8 @@ use crate::{
 
 mod block_sync;
 mod discovery;
+#[cfg(test)]
+mod example_reactor;
 mod handler;
 mod handshake;
 mod header_sync;
@@ -27,6 +29,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+pub mod wire_codec;
 
 pub use block_sync::*;
 pub use discovery::*;
@@ -339,35 +342,28 @@ impl ZakuraHandshakeConnector {
             }
         };
         let dial_start = endpoint.start_upgrade_native_dial(node_addr);
-        if dial_start == ZakuraUpgradeDialStart::InvalidPeerId {
-            return ZakuraNativeHandoff::Failed;
-        }
+        // The legacy handshake runs this hand-off inside `HANDSHAKE_TIMEOUT`,
+        // which is shorter than the registration wait, so the timeout can drop
+        // this future before it returns. Cancel the dial we started from a drop
+        // guard, so that path also stops it. Otherwise a malicious legacy
+        // responder could repeat failed upgrades with distinct node ids and
+        // leak a redialing task and its outbound QUIC traffic per upgrade.
+        let cancel_guard = match dial_start {
+            ZakuraUpgradeDialStart::Started => Some(UpgradeDialCancelGuard { endpoint, peer_id }),
+            ZakuraUpgradeDialStart::AlreadyRunning => None,
+            ZakuraUpgradeDialStart::InvalidPeerId => return ZakuraNativeHandoff::Failed,
+        };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
-        match (dial_start, conn_id) {
-            (ZakuraUpgradeDialStart::Started, Some(conn_id)) => {
-                return ZakuraNativeHandoff::Registered(conn_id);
+        match (cancel_guard, conn_id) {
+            // The peer registered, so the dial now owns a live connection.
+            (Some(cancel_guard), Some(conn_id)) => {
+                cancel_guard.disarm();
+                ZakuraNativeHandoff::Registered(conn_id)
             }
-            (ZakuraUpgradeDialStart::AlreadyRunning, Some(_)) => {
-                return ZakuraNativeHandoff::Duplicate;
-            }
-            (ZakuraUpgradeDialStart::InvalidPeerId, _) => {
-                unreachable!("invalid peer identities return before waiting for registration")
-            }
-            (ZakuraUpgradeDialStart::AlreadyRunning, None) => {
-                return ZakuraNativeHandoff::Failed;
-            }
-            (ZakuraUpgradeDialStart::Started, None) => {}
+            (None, Some(_)) => ZakuraNativeHandoff::Duplicate,
+            // A dropped guard cancels the dial this hand-off started.
+            (_, None) => ZakuraNativeHandoff::Failed,
         }
-
-        // The hand-off did not complete within the wait window. The dial spawned
-        // by `start_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
-        // would keep redialing this peer-supplied address forever and retain its
-        // `upgrade_dials` entry. Cancel the dial and drop the entry so a
-        // malicious legacy responder cannot leak unbounded maintained dials and
-        // outbound QUIC traffic by repeating failed upgrades with distinct node
-        // ids.
-        endpoint.cancel_upgrade_native_dial(peer_id);
-        ZakuraNativeHandoff::Failed
     }
 
     /// Wait until the upgraded peer's inbound native QUIC connection registers
@@ -458,6 +454,27 @@ impl ZakuraHandshakeConnector {
             endpoint: None,
             test_outcome: Some((calls, outcome)),
         }
+    }
+}
+
+/// Cancels the maintained upgrade dial that a hand-off started, unless the
+/// hand-off disarms it after the peer registers.
+struct UpgradeDialCancelGuard<'a> {
+    endpoint: &'a ZakuraEndpoint,
+    peer_id: &'a ZakuraPeerId,
+}
+
+impl UpgradeDialCancelGuard<'_> {
+    /// Leave the dial running. The guard holds only references, so forgetting
+    /// it leaks nothing.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UpgradeDialCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.endpoint.cancel_upgrade_native_dial(self.peer_id);
     }
 }
 

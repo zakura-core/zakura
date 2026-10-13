@@ -243,7 +243,11 @@ proptest! {
 ///
 /// - a network (mainnet or testnet);
 /// - a block height between the Sapling activation height (inclusive) on that
-///   network and the maximum transaction expiry height.
+///   network and the height before NU7, or the maximum transaction expiry height
+///   if that is lower.
+///
+/// ZIP 2003 rejects V4 transactions from NU7, and Zakura cannot verify V5
+/// transactions at NU7 until librustzcash has an NU7 branch ID.
 fn sapling_onwards_strategy() -> impl Strategy<Value = (Network, block::Height)> {
     any::<Network>().prop_flat_map(|network| {
         let start_height_value = NetworkUpgrade::Sapling
@@ -251,7 +255,12 @@ fn sapling_onwards_strategy() -> impl Strategy<Value = (Network, block::Height)>
             .expect("Sapling to have an activation height")
             .0;
 
-        let end_height_value = block::Height::MAX_EXPIRY_HEIGHT.0;
+        let end_height_value = NetworkUpgrade::Nu7
+            .activation_height(&network)
+            .and_then(|nu7| nu7.previous().ok())
+            .map_or(block::Height::MAX_EXPIRY_HEIGHT.0, |before_nu7| {
+                before_nu7.0.min(block::Height::MAX_EXPIRY_HEIGHT.0)
+            });
 
         (start_height_value..=end_height_value)
             .prop_map(move |height_value| (network.clone(), block::Height(height_value)))

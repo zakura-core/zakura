@@ -4742,7 +4742,7 @@ end = "2025-07-09"
 
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
-user-id = 169181
+user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-12"
 end = "2027-07-10"
 
@@ -4778,24 +4778,24 @@ end = "2027-08-24"
 
 [[trusted.zcash_history]]
 criteria = "safe-to-deploy"
-user-id = 169181
+user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2026-07-01"
 end = "2027-07-10"
 
 [[trusted.zcash_keys]]
 criteria = "safe-to-deploy"
-user-id = 169181
+user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-01-15"
 end = "2027-07-10"
 
 [[trusted.zcash_primitives]]
 criteria = "safe-to-deploy"
-user-id = 169181
+user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-20"
 end = "2027-07-10"
 
 [[trusted.zcash_proofs]]
 criteria = "safe-to-deploy"
-user-id = 169181
+user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-20"
 end = "2027-07-10"

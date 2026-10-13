@@ -1692,6 +1692,7 @@ impl Request {
             | Self::BestChainNextMedianTimePast
             | Self::InvalidateBlock(_)
             | Self::ReconsiderBlock(_)
+            | Self::PreciousBlock(_)
             | Self::CheckBlockProposalValidity(_) => false,
         }
     }
@@ -2559,6 +2560,7 @@ mod spentness_gate_tests {
             (Request::AwaitBlockInfo(hash), true),
             (Request::BlockInfo(hash), true),
             (Request::BestChainNextMedianTimePast, false),
+            (Request::PreciousBlock(hash), false),
         ] {
             assert_eq!(
                 request.available_during_spentness(),

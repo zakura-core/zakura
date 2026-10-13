@@ -442,7 +442,27 @@ pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
 
 /// Per-connection QUIC transport samples, every 10 s and on close
 /// (zakura-quic OBS-3).
-pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("quic_conn", "quic_conn.jsonl");
+pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
+    "quic_conn",
+    "quic_conn.csv",
+    &[
+        "event",
+        "conn",
+        "direction",
+        "peer",
+        "admitted_ip",
+        "rtt_micros",
+        "cwnd",
+        "lost_packets",
+        "congestion_events",
+        "bytes_sent",
+        "bytes_received",
+        "current_mtu",
+        "bytes_in_flight",
+        "send_blocked_micros",
+        "close_reason",
+    ],
+);
 
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
 pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(

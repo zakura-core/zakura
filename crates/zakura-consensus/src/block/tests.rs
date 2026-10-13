@@ -3300,6 +3300,9 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                 let received = received.clone();
                 async move {
                     let response = match request {
+                        zs::Request::BlockParentContext(parent) => {
+                            activation_parent_context(parent)
+                        }
                         zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
                             (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
                         ),

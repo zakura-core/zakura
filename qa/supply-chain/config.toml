@@ -82,6 +82,11 @@ notes = "Introduced by the Zakura Common fork migration; retain this exact-versi
 version = "0.21.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.aead]]
+version = "0.6.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.aes-gcm]]
 version = "0.10.3"
 criteria = "safe-to-deploy"
@@ -97,6 +102,16 @@ version = "0.3.3"
 criteria = "safe-to-deploy"
 notes = "Audit held: AsyncBufRead::poll_fill_buf accepts an empty chunk from the wrapped TryStream but leaves its internal state unset, then reaches unreachable!(). A valid empty stream item can therefore panic safe callers; retain this exemption pending an upstream fix or replacement."
 
+[[exemptions.bip32]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.block-buffer]]
+version = "0.12.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.canonical-path]]
 version = "2.0.2"
 criteria = "safe-to-deploy"
@@ -106,6 +121,16 @@ notes = "Audit held: safe set_file_name and set_extension methods mutate the wra
 version = "0.10.2"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the public RNG get_block_pos method subtracts the four-block buffer width without wrapping. After set_block_pos(u64::MAX) followed by one generated word, the internal counter wraps to 3 and get_block_pos panics on 3 - 4 in debug builds. Reproduced with ChaCha20Rng; retain the exemption pending wrapping arithmetic or an upstream fix. 0.10.2 replaces the yanked 0.10.1 (its SSE2 backend emitted an SSE4.1 instruction, crashing x86 CPUs without SSE4.1) and does not resolve this hold."
+
+[[exemptions.chacha20poly1305]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.cipher]]
+version = "0.5.2"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.console]]
 version = "0.15.11"
@@ -130,6 +155,11 @@ version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
 notes = "Audit deferred: hazmat::SerializableState uses an 8-byte element width for [u128; N], causing serialize() to panic; reproduced with [u128; 1]."
 
+[[exemptions.crypto-common]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification. Preserve the prior audit hold for hazmat::SerializableState on [u128; N] until its status is checked against this release."
+
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
@@ -139,6 +169,11 @@ notes = "Audit hold: the doc-hidden Encoding tuple field and Encoding::internal_
 version = "0.2.3"
 criteria = "safe-to-deploy"
 notes = "Audit deferred: the safe single-sink wrappers preserve the documented exclusivity contract and ordinary tests pass, but the crate's core is a custom unsafe lock-free two-slot Waker state machine. Its published higher-bound Loom slot-reuse exploration did not complete within the batch review window; retain the exemption pending a dedicated concurrency review or completed model run."
+
+[[exemptions.digest]]
+version = "0.11.3"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.dlopen2]]
 version = "0.8.2"
@@ -179,6 +214,16 @@ notes = "Audit held: the safe default constructor for the public Murmur3 hasher 
 version = "0.25.2"
 criteria = "safe-to-deploy"
 notes = "Audit hold: two RustSec advisories are open against this version and cargo audit reports both for this workspace. RUSTSEC-2026-0119 is CPU exhaustion during message encoding from O(n squared) name compression, fixed in 0.26.1; RUSTSEC-2026-0118 is an unbounded loop in NSEC3 closest-encloser proof validation on cross-zone responses, for which no fixed release is listed. Both are reachable from untrusted DNS responses. The crate reaches this tree through hickory-resolver under iroh and iroh-relay, so clearing the exemption means moving past the Iroh 0.92 pin to hickory 0.26 or later. Retain the exemption until then."
+
+[[exemptions.hmac]]
+version = "0.13.0"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.hybrid-array]]
+version = "0.4.15"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.icu_normalizer_data]]
 version = "2.2.0"
@@ -283,6 +328,11 @@ version = "1.10.1"
 criteria = "safe-to-deploy"
 notes = "Audit hold: binary-plist dates below roughly -6.3e10 seconds pass the range guard but panic in Date::to_xml_format when RFC 3339 formatting rejects the negative year (src/date.rs), and that formatting runs during ordinary serde deserialization, XML writing and Debug output; 128 of 200,000 random date payloads reproduced it. An acyclic object graph in which each array references the next object twice passes the recursion check, which only rejects objects already on the stack, so a 123-byte file materializes 2^21 values and a 299-byte file is unbounded (src/stream/binary_reader.rs). Serde deserialization recurses without a depth limit and Value's drop glue is recursive, so 35,000 nesting levels abort the process with a stack overflow. There is no unsafe, FFI or build script, XML parsing resolves only the five predefined entities, declared lengths are bounded by file size, and a 200,000-iteration mutation sweep found no other panic. netdev reads only local system network configuration through this crate on macOS, so peer input does not reach it. Retain the exemption until upstream bounds the date range, rejects shared sub-objects or caps materialized size, and limits nesting depth."
 
+[[exemptions.poly1305]]
+version = "0.9.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.polyval]]
 version = "0.6.2"
 criteria = "safe-to-deploy"
@@ -312,16 +362,36 @@ version = "0.8.53"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the default as-bytes feature explicitly provides unsound Pod implementations for mixed-component RGBA, BGRA, ARGB, ABGR, and GrayAlpha types. repr(C) may insert padding between independently chosen Pod component types, but the Pod contract permits that padding to be read as bytes. Retain the exemption until those implementations are removed or constrained to padding-free layouts."
 
+[[exemptions.ripemd]]
+version = "0.2.0"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.same-file]]
 version = "1.0.6"
 criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade. Audit held: on Unix, IntoRawFd for a standard-stream Handle removes the File and then Drop unconditionally unwraps the now-empty Option, so the safe consuming conversion panics. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
+[[exemptions.secp256k1]]
+version = "0.33.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.secp256k1-sys]]
+version = "0.14.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.seize]]
 version = "0.5.1"
 criteria = "safe-to-deploy"
 notes = "Audit hold: ThreadGuard::drop returns the global thread ID without knowing whether a LocalGuard for that thread is still alive in another thread-local destructor (src/raw/tls/thread_id.rs); when a user thread-local holder is initialized before Collector::enter, the destructor order frees the ID first, a new thread can reuse it, and ThreadLocal::load_or returns the same reservation while the old guard remains live (src/raw/tls/mod.rs, src/guard.rs), so two threads can touch one reservation without a lock and reclaim early. A targeted probe observed the shared reservation in 101 of 101 executions. The race needs a guard held inside a thread-local destructor during thread teardown, a pattern absent from iroh's reviewed papaya call sites (src/socket/concurrent_read_map.rs). Barrier, reservation and reclaimer contracts were traced and 28 tests pass with and without all features; Linux membarrier and Windows paths were source-reviewed only. Retain the exemption until upstream ties thread-ID release to the last live guard."
+
+[[exemptions.sha2]]
+version = "0.11.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.tar]]
 version = "0.4.45"
@@ -331,6 +401,11 @@ criteria = "safe-to-deploy"
 version = "0.2.31"
 criteria = "safe-to-deploy"
 notes = "Audit held: timestamp parsing rounds arbitrary fractional precision to nanoseconds before calling Timestamp::__new_unchecked. timestamp!(0.9999999999) reproducibly produces 1_000_000_000 nanoseconds and fails the ranged-integer invariant during compilation instead of yielding a valid value or a normal macro diagnostic. Retain the exemption pending explicit carry or truncation handling."
+
+[[exemptions.universal-hash]]
+version = "0.6.1"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.wait-timeout]]
 version = "0.2.0"
@@ -390,44 +465,44 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-address]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-bellman]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-bls12-381]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-equihash]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-iroh]]
 version = "1.1.0-rc.1"
@@ -440,69 +515,79 @@ criteria = "safe-to-deploy"
 notes = "Audit hold: the 0.92.0 to 1.1.0 delta adds derived Debug output that includes relay bearer tokens on ServerConfig, ClientBuilder and RelayConfig (src/main.rs, src/client.rs, src/relay_map.rs), and a probe with debug logging enabled printed a configured token, so ordinary debug logs can leak a live relay credential. The server also replaces shutdown on a duplicate identity with an uncapped inactive-client list (src/server/clients.rs), so an authorized endpoint can hold arbitrarily many same-key connections. Frame decoding is bounded at 1 MiB per WebSocket message and 64 KiB per payload, fixed-width fields are length-checked, and the key cache is bounded by its configured capacity. Zakura runs with relays disabled and without the server feature, so neither path is reachable in the node; 82 all-feature tests and 20,000 malformed-frame property cases pass. Retain the exemption until upstream redacts tokens from Debug output and bounds the inactive list; the published compatibility package preserves the reviewed Rust source. Registry migration: the 1.1.0-rc.0 archive preserves every upstream Rust file byte for byte, renames sibling packages with exact version requirements, retains the reviewed Dalek versions, and pins relay LRU to 0.18.3. Existing defects and acceptance conditions remain unchanged. Rc1 review: the main Iroh package additionally accepts zero to disable QUIC NAT traversal and tests bilateral opt-out with direct data transfer; its other production source is unchanged. The relay production source is unchanged. Known upstream defects and their existing acceptance conditions remain."
 
 [[exemptions.zakura-jubjub]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-keys]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+
+[[exemptions.zakura-note-encryption]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+notes = "Newly adopted Common note-encryption package in the coordinated v3.0.0 release. Exact-version audit backlog entry pending direct package review; this is not an audit certification."
 
 [[exemptions.zakura-orchard]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-pairing]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-pasta-curves]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-primitives]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-proofs]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-protocol]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-reddsa]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-redjubjub]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-sinsemilla]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-transparent]]
-version = "2.2.0"
+version = "3.0.0"
 criteria = "safe-to-deploy"
-notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+
+[[exemptions.zcash_script]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.zerovec]]
 version = "0.11.6"

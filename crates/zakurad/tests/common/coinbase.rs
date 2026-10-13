@@ -31,7 +31,7 @@ use super::{
 
 /// Tests shielded coinbase construction through a live Regtest node.
 ///
-/// A node configured with a Sapling or Unified mining address must return a
+/// A node configured with a Unified mining address must return a
 /// shielded coinbase through `getblocktemplate`. The resulting block must be
 /// accepted by the production `submitblock`, consensus, and state path.
 ///
@@ -43,9 +43,9 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
 
         let net = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
-                // Current coinbase construction can create Orchard outputs for
-                // unified miner addresses, so use the fixed Orchard circuit.
-                nu6_2: Some(1),
+                // Coinbase construction pays unified miner addresses through
+                // the Ironwood pool, which activates at NU6.3.
+                nu6_3: Some(1),
                 ..Default::default()
             },
             funding_streams: Some(vec![ConfiguredFundingStreams {
@@ -105,10 +105,7 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
             .wrap_err("possible port conflict with another zakurad instance")
     }
 
-    tokio::try_join!(
-        regtest_coinbase(MinerAddressType::Sapling),
-        regtest_coinbase(MinerAddressType::Unified),
-    )?;
+    regtest_coinbase(MinerAddressType::Unified).await?;
 
     Ok(())
 }

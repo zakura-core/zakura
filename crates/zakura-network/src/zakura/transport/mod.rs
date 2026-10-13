@@ -24,7 +24,7 @@ pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
-    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
+    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame, ResponseFrameSlot,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]

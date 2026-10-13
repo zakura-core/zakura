@@ -31,10 +31,7 @@ use zakura_state::IntoDisk;
 use zcash_keys::address::Address;
 use zcash_primitives::transaction::{
     builder::{cached_orchard_proving_key, BuildConfig, Builder},
-    components::{
-        orchard::{bundle_version_for_branch, ACTION_SIZE},
-        GROTH_PROOF_SIZE,
-    },
+    components::orchard::{bundle_version_for_branch, ACTION_SIZE},
     fees::fixed::FeeRule,
     TxVersion,
 };
@@ -47,8 +44,11 @@ use zcash_transparent::{
     address::TransparentAddress, bundle::TxOut, coinbase::MAX_COINBASE_SCRIPT_LEN,
 };
 
+mod no_sapling;
+
 use super::zec::Zec;
 use super::{super::opthex, get_block_template::MinerParams};
+use no_sapling::NoSaplingProver;
 
 /// Transaction data and fields needed to generate blocks using the `getblocktemplate` RPC.
 #[derive(
@@ -152,9 +152,7 @@ pub(super) struct CoinbaseResourceUsage {
 
 #[derive(Clone, Copy)]
 enum MinerRewardAddress {
-    Orchard(::orchard::Address),
     Ironwood(::orchard::Address),
-    Sapling(sapling_crypto::PaymentAddress),
     Transparent(TransparentAddress),
 }
 
@@ -175,22 +173,14 @@ impl CoinbasePlan {
         let miner_reward_address = match miner_params.addr() {
             Address::Unified(addr) => {
                 let fallback = || {
-                    addr.sapling()
-                        .map(|addr| MinerRewardAddress::Sapling(*addr))
-                        .or_else(|| {
-                            addr.transparent()
-                                .map(|addr| MinerRewardAddress::Transparent(*addr))
-                        })
+                    addr.transparent()
+                        .map(|addr| MinerRewardAddress::Transparent(*addr))
                 };
-                let reward_address = if upgrade >= NetworkUpgrade::Nu5 {
+                // Orchard receivers are payable through Ironwood after NU6.3.
+                // Earlier templates use the transparent receiver, if present.
+                let reward_address = if upgrade >= NetworkUpgrade::Nu6_3 {
                     addr.orchard()
-                        .map(|addr| {
-                            if upgrade < NetworkUpgrade::Nu6_3 {
-                                MinerRewardAddress::Orchard(*addr)
-                            } else {
-                                MinerRewardAddress::Ironwood(*addr)
-                            }
-                        })
+                        .map(|addr| MinerRewardAddress::Ironwood(*addr))
                         .or_else(fallback)
                 } else {
                     fallback()
@@ -198,11 +188,19 @@ impl CoinbasePlan {
 
                 reward_address.ok_or_else(|| {
                     TransactionError::CoinbaseConstruction(
-                        "Could not construct miner reward output".to_string(),
+                        "Miner address needs an Ironwood-compatible or transparent receiver; \
+                         Sapling coinbase construction is not supported"
+                            .to_string(),
                     )
                 })?
             }
-            Address::Sapling(addr) => MinerRewardAddress::Sapling(*addr),
+            Address::Sapling(_) => {
+                return Err(TransactionError::CoinbaseConstruction(
+                    "Sapling coinbase construction is not supported; use a unified or \
+                     transparent miner address"
+                        .to_string(),
+                ));
+            }
             Address::Transparent(addr) => MinerRewardAddress::Transparent(*addr),
             _ => {
                 return Err(TransactionError::CoinbaseConstruction(
@@ -244,7 +242,6 @@ impl CoinbasePlan {
         const VALUE_BALANCE_BYTES: usize = 8;
         const ANCHOR_BYTES: usize = 32;
         const SIGNATURE_BYTES: usize = 64;
-        const SAPLING_OUTPUT_WITHOUT_PROOF_BYTES: usize = 756;
 
         let compact_size_bytes = |value| {
             CompactSizeMessage::try_from(value)
@@ -289,19 +286,9 @@ impl CoinbasePlan {
             + orchard_proof_bytes
             + SIGNATURE_BYTES
             + SIGNATURE_BYTES;
-        let sapling_bundle_bytes = compact_size_bytes(0)
-            + compact_size_bytes(1)
-            + VALUE_BALANCE_BYTES
-            + SAPLING_OUTPUT_WITHOUT_PROOF_BYTES
-            + GROTH_PROOF_SIZE
-            + SIGNATURE_BYTES;
-
         let (fixed_fields_bytes, shielded_bytes) = match version {
             TxVersion::V6 => {
-                let sapling = match self.miner_reward_address {
-                    MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
-                    _ => compact_size_bytes(0) + compact_size_bytes(0),
-                };
+                let sapling = compact_size_bytes(0) + compact_size_bytes(0);
                 let orchard = compact_size_bytes(0);
                 let ironwood = match self.miner_reward_address {
                     MinerRewardAddress::Ironwood(_) => orchard_bundle_bytes,
@@ -311,29 +298,13 @@ impl CoinbasePlan {
                 (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard + ironwood)
             }
             TxVersion::V5 => {
-                let sapling = match self.miner_reward_address {
-                    MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
-                    _ => compact_size_bytes(0) + compact_size_bytes(0),
-                };
-                let orchard = match self.miner_reward_address {
-                    MinerRewardAddress::Orchard(_) => orchard_bundle_bytes,
-                    _ => compact_size_bytes(0),
-                };
+                let sapling = compact_size_bytes(0) + compact_size_bytes(0);
+                let orchard = compact_size_bytes(0);
 
                 (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard)
             }
             TxVersion::V4 => {
-                let sapling = VALUE_BALANCE_BYTES
-                    + compact_size_bytes(0)
-                    + compact_size_bytes(usize::from(matches!(
-                        self.miner_reward_address,
-                        MinerRewardAddress::Sapling(_)
-                    )))
-                    + if matches!(self.miner_reward_address, MinerRewardAddress::Sapling(_)) {
-                        SAPLING_OUTPUT_WITHOUT_PROOF_BYTES + GROTH_PROOF_SIZE + SIGNATURE_BYTES
-                    } else {
-                        0
-                    };
+                let sapling = VALUE_BALANCE_BYTES + compact_size_bytes(0) + compact_size_bytes(0);
                 let joinsplit_count = compact_size_bytes(0);
 
                 (V4_FIXED_FIELDS_BYTES, sapling + joinsplit_count)
@@ -352,16 +323,8 @@ impl CoinbasePlan {
             .try_into()
             .expect("coinbase transparent output count fits in u32");
         let shielded_action_counts = match self.miner_reward_address {
-            MinerRewardAddress::Orchard(_) => ShieldedActionCounts {
-                orchard_actions: 1,
-                ..Default::default()
-            },
             MinerRewardAddress::Ironwood(_) => ShieldedActionCounts {
                 ironwood_actions: 1,
-                ..Default::default()
-            },
-            MinerRewardAddress::Sapling(_) => ShieldedActionCounts {
-                sapling_ios: 1,
                 ..Default::default()
             },
             MinerRewardAddress::Transparent(_) => ShieldedActionCounts::default(),
@@ -425,41 +388,32 @@ impl TransactionTemplate<NegativeOrZero> {
         // lifetime and repeat arming is free, so the first shielded coinbase pays
         // it once; without halo2's opt-in `orbits` feature it is a documented
         // no-op. Called only when a shielded reward output was actually added, so
-        // transparent- and Sapling-only miners never force the expensive
+        // transparent miners never force the expensive
         // proving-key build.
-        let arm_shielded_reward_proving_key = || {
+        let arm_shielded_reward_proving_key = || -> Result<(), TransactionError> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
             // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
             // the derivation in `Builder::build`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
-                let prepared =
-                    cached_orchard_proving_key(version.circuit_version()).prepare_proving();
+                let prepared = cached_orchard_proving_key(version.circuit_version())
+                    .map_err(|error| {
+                        TransactionError::CoinbaseConstruction(format!(
+                            "Failed to prepare shielded reward proving key: {error}"
+                        ))
+                    })?
+                    .prepare_proving();
                 tracing::debug!(
                     ?height,
                     prepared,
                     "armed the coinbase proving key's prepared commitment tables",
                 );
             }
+            Ok(())
         };
 
         match plan.miner_reward_address {
-            MinerRewardAddress::Orchard(addr) => {
-                builder
-                    .add_orchard_output::<String>(
-                        Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
-                        addr,
-                        miner_reward,
-                        memo.clone(),
-                    )
-                    .map_err(|error| {
-                        TransactionError::CoinbaseConstruction(format!(
-                            "Failed to add Orchard output: {error}"
-                        ))
-                    })?;
-                arm_shielded_reward_proving_key();
-            }
             MinerRewardAddress::Ironwood(addr) => {
                 builder
                     .add_ironwood_output::<String>(
@@ -473,21 +427,7 @@ impl TransactionTemplate<NegativeOrZero> {
                             "Failed to add Ironwood output: {error}"
                         ))
                     })?;
-                arm_shielded_reward_proving_key();
-            }
-            MinerRewardAddress::Sapling(addr) => {
-                builder
-                    .add_sapling_output::<String>(
-                        Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
-                        addr,
-                        miner_reward,
-                        memo.clone(),
-                    )
-                    .map_err(|error| {
-                        TransactionError::CoinbaseConstruction(format!(
-                            "Failed to add Sapling output: {error}"
-                        ))
-                    })?;
+                arm_shielded_reward_proving_key()?;
             }
             MinerRewardAddress::Transparent(addr) => {
                 builder.add_transparent_output(&addr, miner_reward)?;
@@ -498,16 +438,13 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        // Reuse the process-wide Sapling prover instead of re-parsing the bundled parameters on
-        // every coinbase build.
-        let sapling_prover = zakura_consensus::sapling_prover();
         let build_result = builder.build(
             &Default::default(),
             Default::default(),
             Default::default(),
             rand_10::rng(),
-            sapling_prover,
-            sapling_prover,
+            &NoSaplingProver,
+            &NoSaplingProver,
             &FeeRule::non_standard(Zatoshis::ZERO),
         )?;
 
@@ -521,7 +458,7 @@ impl TransactionTemplate<NegativeOrZero> {
             auth_digest: tx.auth_commitment().as_ref().try_into()?,
             depends: Vec::new(),
             fee: (-miner_fees).constrain()?,
-            sigops: tx.sigops()?,
+            sigops: tx.sigops(),
             required: true,
         })
     }

@@ -11,11 +11,19 @@ use libc::{getrlimit64 as getrlimit, rlimit64 as Rlimit, setrlimit64 as setrlimi
 ///
 /// An already sufficient soft limit is unchanged. Increases are capped by the
 /// hard limit and, on Apple and FreeBSD-like systems, `kern.maxfilesperproc`.
-/// System-call errors propagate to the database's existing fallback policy.
+/// System-call errors propagate to the database caller.
+#[cfg(unix)]
+pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
+    increase_nofile_limit_with(requested, kernel_open_file_limit)
+}
+
 #[cfg(unix)]
 // Resource-limit widths vary across Unix targets.
 #[allow(clippy::unnecessary_cast)]
-pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
+fn increase_nofile_limit_with(
+    requested: u64,
+    kernel_limit: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<u64> {
     let mut limits = open_file_limits()?;
     // Unix resource-limit types are unsigned integers of at most 64 bits.
     let soft = limits.rlim_cur as u64;
@@ -28,13 +36,10 @@ pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
         return Ok(soft);
     }
 
-    let requested = requested.min(hard);
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "freebsd",
-        target_os = "dragonfly"
-    ))]
-    let requested = requested.min(kernel_open_file_limit()?);
+    let requested = requested.min(hard).min(kernel_limit()?);
+    if requested <= soft {
+        return Ok(soft);
+    }
 
     // The requested limit is bounded by the same type's hard limit.
     limits.rlim_cur = requested as _;
@@ -46,6 +51,35 @@ pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
 #[cfg(not(unix))]
 pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
     Ok(requested)
+}
+
+/// Queries the current soft limit without changing either resource limit.
+#[allow(clippy::unnecessary_cast)]
+pub(super) fn current_nofile_limit() -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        // Unix resource-limit types are unsigned integers of at most 64 bits.
+        Ok(open_file_limits()?.rlim_cur as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unix open-file limits are unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))
+))]
+fn kernel_open_file_limit() -> io::Result<u64> {
+    Ok(u64::MAX)
 }
 
 #[cfg(unix)]

@@ -148,15 +148,16 @@ ARG CARGO_TARGET_DIR
 
 RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batch-control \
     --mount=type=bind,source=crates/tower-fallback,target=crates/tower-fallback \
-    --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
     --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
+    --mount=type=bind,source=crates/zakura-mmr-tree,target=crates/zakura-mmr-tree \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
+    --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \

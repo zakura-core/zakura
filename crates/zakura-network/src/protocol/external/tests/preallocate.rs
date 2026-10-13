@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use zakura_chain::{
     parameters::Network::*,
     serialization::{
-        arbitrary::max_allocation_is_big_enough, TrustedPreallocate, ZcashSerialize,
+        arbitrary::serialized_sizes_at_allocation_limit, TrustedPreallocate, ZcashSerialize,
         MAX_PROTOCOL_MESSAGE_LEN,
     },
 };
@@ -28,6 +28,22 @@ const ADDR_V1_SIZE: usize = 4 + 8 + 16 + 2;
 /// + 1 byte sizeAddr + 0 bytes addr + 2 bytes port.
 #[allow(clippy::identity_op)]
 const ADDR_V2_MIN_SIZE: usize = 4 + 1 + 1 + 1 + 0 + 2;
+
+/// Counted slice decoding needs a nonzero minimum for every element type; see the
+/// matching `zakura-chain` test. These are also the smallest encodings the decoders
+/// accept, so a larger value would reject valid messages.
+#[test]
+fn every_decodable_preallocate_type_has_a_nonzero_minimum() {
+    assert_eq!(InventoryHash::min_serialized_size(), 4 + 32);
+    assert_eq!(
+        AddrV1::min_serialized_size(),
+        u64::try_from(ADDR_V1_SIZE).unwrap()
+    );
+    assert_eq!(
+        AddrV2::min_serialized_size(),
+        u64::try_from(ADDR_V2_MIN_SIZE).unwrap()
+    );
+}
 
 /// The number of test cases to use for expensive proptests.
 const DEFAULT_PROPTEST_CASES: u32 = 8;
@@ -129,7 +145,7 @@ proptest! {
 
         let addr: AddrV1 = addr.unwrap().into();
 
-        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(addr);
+        let (_, largest_allowed_serialized_len) = serialized_sizes_at_allocation_limit(addr);
 
         // max_allocation must equal the protocol cap
         prop_assert_eq!(AddrV1::max_allocation(), MAX_ADDRS_IN_MESSAGE as u64);

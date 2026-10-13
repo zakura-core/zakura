@@ -2,235 +2,283 @@
 
 Status: **Draft for review**
 
-Version: 0.1
+Version: 0.2
 
-Date: 2026-09-06
+Date: 2026-10-04
 
-Scope: Native Zakura P2P v2 submission and wallet fallback
+Scope: Native wallet submission sessions, node capacity limits, and wallet
+behavior
 
-This specification defines the messages and behavior proposed by the
-[design document](../design/wallet-transaction-submission.md). A wallet discovers
-a serving node, submits a signed transaction, and receives the node's admission
-result. Wallets retain lightwalletd fallback. Tor submissions continue through
-lightwalletd until the separate Tor follow-on is available.
+This specification defines the protocol in the
+[design document](../design/wallet-transaction-submission.md). A wallet opens a
+short session with a Zakura node, sends signed transactions, and receives one
+admission result per transaction. Wallets keep lightwalletd as a fallback.
 
-This draft selects the wire values, admission contract, and initial wallet
-defaults. These choices are specified here and are not yet deployed.
-Message regulation integration and node resource budgets remain pending the
-GetBlocks work. Section 9 separates that dependency from rollout requirements.
+This document is authoritative. Nothing in it is implemented or deployed.
+Version 0.1 (zakura#906) was never implemented. Version 0.2 replaces its
+session model, result codes, discovery, and capacity sections, and it keeps
+stream version 1 because no version 1 implementation exists.
 
 ## 1. Contract
 
 The uppercase terms MUST, MUST NOT, SHOULD, and MAY carry their
-[BCP 14 meanings](https://www.rfc-editor.org/rfc/rfc8174.html). They describe the
-requirements proposed by this draft, not guarantees of the current implementation.
+[BCP 14 meanings](https://www.rfc-editor.org/rfc/rfc8174.html).
 
 | Term | Meaning |
 | --- | --- |
-| Client | The wallet's submission component. |
-| Provider | A Zakura node offering the submission service. |
+| Wallet | The wallet's submission component. |
+| Node | A Zakura node that serves wallet sessions. |
+| Session | One wallet connection, from accept to close. |
+| Request | One `Submit` stream and its `SubmitResult`. |
 | Admission | The existing node pipeline's decision to place a transaction in the verified mempool. |
-| Submission pass | One foreground send or scheduled background retry, with bounded attempts and elapsed time. |
-| Exact identity | The unmined transaction identifier, including authorizing data where the transaction format requires it. |
+| Commit point | The moment a request's job takes a verification permit and starts decoding. |
+| Exact identity | The unmined transaction identifier, including authorizing data where the transaction format requires it ([ZIP 239][zip-239]). |
+| Endpoint list | The wallet-maintained list of nodes it may contact (section 7.1). |
 
-`Accepted` means admission by one provider. It MUST NOT be treated as proof of
-propagation, durable retention, or block inclusion. Confirmation remains the
-wallet's responsibility through its existing chain observation path.
+`Accepted` means admission by one node. It MUST NOT be treated as proof of
+propagation, durable retention, or block inclusion. The wallet confirms
+inclusion through its existing chain observation path.
 
-The service receives complete serialized transactions. Wallet keys, account
+The node receives complete serialized transactions. Wallet keys, account
 identifiers, and partially signed transactions are not request fields.
 
-## 2. Negotiation
+## 2. Connection
 
-### 2.1 Service registration
+### 2.1 Registry
 
 | Property | Value |
 | --- | --- |
-| Discovery service ID | `zakura.tx_submit.v1` |
-| Connection protocol | Existing `p2p-v2/1` |
+| ALPN | `zakura-wallet/1` |
+| Capability bit | `ZAKURA_CAP_TX_SUBMIT = 1 << 7` (`0x80`) |
+| Stream kind | `ZAKURA_STREAM_TX_SUBMIT = 7` |
 | Stream mode | `RequestResponse` |
 | Stream version | `1` |
-| Capability bit | `ZAKURA_CAP_TX_SUBMIT = 1 << 6` (`0x40`) |
-| Stream kind | `ZAKURA_STREAM_TX_SUBMIT = 7` |
 
-These values are unused in the [shared registry][capability-registry] inspected
-at `f2cfab1cf59ccc6c3e280bbe0e6ab2c98a9645af`. Implementation MUST register them
-centrally and check for intervening allocations before merge. Retired values
-MUST NOT be reused.
+Main uses capability bits 0, 2, 3, and 5, and retired bits 1 and 4. Main uses
+stream kinds 2 through 6. Draft zakura#961 uses bit 6 and stream kind 8.
+Implementation MUST register these values centrally and recheck open
+allocations before merge. Retired values MUST NOT be reused.
 
-The client MUST validate the authenticated provider identity, network ID, and
-genesis chain ID through the existing handshake. Submission requires a mutually
-supported capability and stream version. Unsupported peers are skipped within
-the client's retry budget.
+### 2.2 Admission before the handshake
 
-Providers MUST register the service through the existing service registry and
-advertise it only when the listener and admission integration are enabled.
-Temporary overload is reported by the service; an advertisement is not a promise
-of immediate capacity.
+The node MUST classify each incoming connection from the ALPN list in the
+client's first QUIC Initial packet, before it starts the TLS handshake.
 
-### 2.2 Request direction
+1. If the list is exactly `zakura-wallet/1`, the connection is a wallet
+   session. The node MUST refuse it without handshake work when all `W` slots
+   are in use, or when the source already holds `ceil(W / F)` slots. A source is
+   an IPv4 address or an IPv6 /64. Otherwise the node reserves a slot and
+   accepts with the wallet transport profile (section 2.3).
+2. If the list contains `zakura-wallet/1` and any other ALPN, the node MUST
+   refuse the connection.
+3. If the node cannot read the ALPN list from the first Initial packet, it
+   applies the full-peer profile. If the handshake then selects
+   `zakura-wallet/1`, the node MUST close the connection before it reads any
+   stream.
+4. Under load, the node MAY require QUIC address validation before it counts a
+   source, so spoofed addresses cannot fill a source share.
 
-The client opens a fresh bidirectional stream for each operation. The existing
-stream prelude MUST contain a request ID. The client MUST allocate IDs from a
-strictly increasing counter within each connection generation and open a new
-connection before the counter would wrap.
+The wallet MUST send a ClientHello that fits in one Initial packet.
 
-Providers MUST correlate requests by connection and stream, retaining request-ID
-state only for active operations. They MUST NOT retain a history of completed
-IDs or enforce connection-wide ID uniqueness. Independent streams can arrive
-out of order, so a lower ID than one previously received is not a protocol error.
-Reused IDs on different streams MUST NOT combine their responses or accounting.
-Transaction deduplication uses the exact transaction identity under section 5.
+Wallet sessions MUST NOT count toward peer connection limits
+(`DEFAULT_ZAKURA_MAX_CONNECTIONS`, `max_connections_per_ip`, or
+`ServicePeerLimits`). Peer connections MUST NOT use wallet slots.
 
-Wallet clients MUST reject peer-opened submission requests before decoding
-transaction payloads.
+### 2.3 Wallet transport profile
 
-The shared requester MUST associate each response with the provider, connection
-generation, stream, and request ID of the operation that opened it, and validate
-the expected response type. Response payloads do not repeat the request ID.
-A delayed response from a replaced connection MUST NOT complete a request on
-the replacement connection.
+QUIC grants flow-control credit during the handshake, and a node cannot revoke
+it. The wallet profile bounds what one session can make the node buffer.
 
-Transport framing, correlation, deadlines, and cancellation belong in the shared
-requester. Submission supplies its own response decoder. The legacy response
-validator MUST NOT be extended with submission-specific cases.
+| QUIC setting | Value |
+| --- | --- |
+| Connection receive window | `R = Binflight + 32 KiB` |
+| Stream receive window | `Btx + 64` bytes |
+| Concurrent bidirectional streams | `K + 2` (control, session, `K` requests) |
+| Concurrent unidirectional streams | 0 |
+| Datagrams | Disabled |
+| Idle timeout | At most `Tsession` |
+| Keep-alive | Disabled |
+| Remote NAT traversal addresses | 0 |
 
-## 3. Discovery
+The 32 KiB margin covers the control exchange (`MAX_CONTROL_PAYLOAD_BYTES` is
+16 KiB), stream preludes, frame headers, and `Finish`. The 64-byte margin
+covers one prelude and one frame header.
 
-Providers advertise the service in existing signed node records. Clients use
-native discovery's bounded `GetPeers` request with the submission service filter.
-The filter MUST recognize the new service ID; block-serving capabilities are
-not prerequisites for selection.
+### 2.4 Native handshake
 
-Clients MUST validate record signatures, chain identity, protocol compatibility,
-sequence, expiration, and dial addresses using the shared discovery rules.
-Peer-supplied addresses MUST NOT direct a wallet to private or local network
-services. An explicitly configured local node is a separate permitted input.
+The wallet MUST initiate the connection. The node MUST NOT dial a wallet.
 
-The default bootstrap configuration MUST contain at least three independently
-operated sources.
-Clients SHOULD also retain validated peer records and allow user-configured
-nodes. Bootstrap sources supply candidates, not an authoritative provider list.
-Cache expiration or bootstrap failure MUST trigger bounded rediscovery and then
-the wallet's fallback, rather than indefinite connection attempts.
+Both sides MUST use the native control handshake. The wallet's hello MUST carry
+the initiator role, the configured network and genesis chain, a fresh nonce, no
+legacy upgrade transcript, a capability offer of exactly `ZAKURA_CAP_TX_SUBMIT`,
+and `required_channels = 0`. The node MUST refuse any other capability offer.
+The wallet MUST authenticate the node identity pinned in its endpoint list.
 
-An authenticated client MUST be able to request a bounded peer sample without
-publishing a reachable self-record. Provider-record validation remains unchanged.
-The wallet client profile must support this exchange without starting the normal
-full-node discovery publisher or requiring a public listening address.
+The node MUST exclude wallet sessions from gossip, discovery, address
+advertisement, sync, keep-alive management, peer-count targets, and reconnect
+scheduling.
 
-Selection SHOULD spread submissions across network groups and discovery sources,
-using independently known operator diversity where available. Different keys or
-addresses MUST NOT be treated as proof of independent ownership. Fanout, candidate
-counts, retained records, and discovery attempts MUST have configured bounds.
+The wallet SHOULD generate a fresh transport identity per connection. Transport
+identities MUST NOT grant resources. Both sides MUST refuse submission in 0-RTT
+early data.
+
+## 3. Session
+
+### 3.1 Streams and request IDs
+
+The wallet opens every stream. Each stream's prelude carries a request ID.
+
+| Request ID | Stream | Frames |
+| --- | --- | --- |
+| `0` | Session stream; one per connection | Node → wallet: `SessionInfo`. Wallet → node: `Finish`. |
+| `1..=Nsession` | Request stream | Wallet → node: `Submit`. Node → wallet: `SubmitResult`. |
+
+1. The wallet MUST open the session stream right after the handshake. It sends
+   only the prelude, then waits.
+2. The node MUST write one `SessionInfo` frame on the session stream and then
+   finish its send half. The wallet's send half stays open for `Finish`.
+3. The wallet MUST NOT open a request stream before it has received and
+   validated `SessionInfo` (section 7.2).
+4. The wallet MUST allocate request IDs consecutively from 1. Streams MAY
+   arrive out of order.
+5. The node MUST track request IDs in a bitmap of `Nsession` bits. It MUST treat
+   each of the following as a protocol violation, checked from the prelude
+   alone: a duplicate ID, an ID above `Nsession`, an ID above a received
+   `Finish` value, a second session stream, and a request stream that arrives
+   before the node sent `SessionInfo`.
+
+A protocol violation closes the session. The node keeps no record of it.
+
+The node MUST NOT open streams to a wallet. The wallet MUST reset any
+node-opened stream before reading its payload.
+
+### 3.2 Deadlines and states
+
+| Deadline | Starts | Ends |
+| --- | --- | --- |
+| `T_hs` | Connection accept | `SessionInfo` sent |
+| `Topen` | `SessionInfo` sent | Last moment the node accepts a new request stream |
+| `Tsession` | `SessionInfo` sent | Hard close |
+| `Trequest` | Request header read | Result sent |
+| `Tdrain` | Draining starts | Close |
+
+A session moves through these states:
+
+| State | Entered when |
+| --- | --- |
+| `Handshaking` | The node accepts the connection. |
+| `Active` | The node sends `SessionInfo`. |
+| `Sealed` | The node receives `Finish`. |
+| `Draining` | Every sealed ID has a result, `Nsession` requests have results, `Topen` expires with no outstanding request, or `Tsession` expires. |
+| `Closed` | Draining results are sent, or `Tdrain` expires. |
+
+No event extends a deadline. A completed request does not reset any deadline.
+
+The node holds the session's slot from accept until both the connection has
+closed and every verification job the session started has exited.
 
 ## 4. Messages
 
 ### 4.1 Framing
 
-Each stream carries one request frame and at most one response frame. The client
-finishes its send half after the request; the provider finishes its send half
-after its response. Additional frames MUST NOT create additional admission work.
-They are a stream protocol error and do not recall an already admitted transaction.
+Each stream carries one frame in each direction at most. The sender finishes
+its send half after its frame. Additional frames are a protocol violation and
+create no admission work.
 
-Use Zakura's existing `Frame` encoding. Its eight-byte header contains
-`message_type: u16`, `flags: u16`, and `payload_len: u32`. All integer fields in
-this service are unsigned little-endian values; byte arrays retain their defined
-order. Flags MUST be zero. No compression or application fragmentation is defined.
+Frames use Zakura's existing `Frame` encoding. Its eight-byte header contains
+`message_type: u16`, `flags: u16`, and `payload_len: u32`. All integers in this
+service are unsigned little-endian. Byte arrays keep their defined order. Flags
+MUST be zero.
 
-Message types are scoped to the submission stream:
+| Message | `message_type` | Direction | Stream |
+| --- | --- | --- | --- |
+| `Submit` | `0x0002` | Wallet → node | Request |
+| `Finish` | `0x0003` | Wallet → node | Session |
+| `SessionInfo` | `0x8001` | Node → wallet | Session |
+| `SubmitResult` | `0x8002` | Node → wallet | Request |
 
-| Message | `message_type` | Direction |
-| --- | --- | --- |
-| `GetInfo` | `0x0001` | Client to provider |
-| `Submit` | `0x0002` | Client to provider |
-| `Info` | `0x8001` | Provider to client |
-| `SubmitResult` | `0x8002` | Provider to client |
-
-Fields appear in the order shown below. Parsers MUST reject unknown tags, nonzero
-flags, invalid enum values, inconsistent lengths, and trailing payload bytes.
-Such errors close the affected stream; they are not transaction rejection results.
-A malformed response leaves the client without a known submission outcome.
+Message type `0x0001` (`GetInfo` in version 0.1) is reserved and MUST NOT be
+reused. Parsers MUST reject unknown message types, nonzero flags, invalid enum
+values, inconsistent lengths, and trailing bytes. Such errors are protocol
+violations, not transaction rejections. A malformed result leaves the wallet
+without a known outcome.
 
 ### 4.2 Wire limits
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `MAX_SUBMIT_TX_BYTES` | `zakura_chain::block::MAX_BLOCK_BYTES` (currently 2,000,000) | Shared ceiling for serialized transaction bytes in one request. |
-| `MAX_FORMATS` | 8 | Maximum entries in `Info.formats`. |
-| `MAX_SUBMISSION_FRAME_BYTES` | `MAX_SUBMIT_TX_BYTES + 8` (currently 2,000,008) | Largest `Submit`, including its eight-byte frame header. |
-| `MAX_INFO_FRAME_BYTES` | 115 | Largest `Info`, including its frame header. |
-| `MAX_RESULT_FRAME_BYTES` | 113 | Largest `SubmitResult`, including its frame header. |
+| `MAX_SUBMIT_TX_BYTES` | `zakura_chain::block::MAX_BLOCK_BYTES` (currently 2,000,000) | Ceiling for serialized transaction bytes in one `Submit`. |
+| `MAX_FORMATS` | 8 | Maximum entries in `SessionInfo.formats`. |
+| `MAX_SUBMISSION_FRAME_BYTES` | `MAX_SUBMIT_TX_BYTES + 8` | Largest `Submit` frame. |
+| `MAX_SESSION_INFO_FRAME_BYTES` | 150 | Largest `SessionInfo` frame. |
+| `FINISH_FRAME_BYTES` | 16 | Size of every `Finish` frame. |
+| `MAX_RESULT_FRAME_BYTES` | 113 | Largest `SubmitResult` frame. |
 
-The transaction ceiling MUST reuse the shared [`MAX_BLOCK_BYTES`][block-size]
-constant used by the transaction decoder. The submission frame ceiling MUST be
-derived from it plus the frame header. This is a decoding ceiling; a mined
-transaction must also leave room for the rest of its block.
-
-These wire bounds are separate from verification budgets and the node's local
-size policy, whose inspected default is 250,000 bytes. `Info.max_tx_bytes`
-advertises the provider's effective admission limit.
-
-All frames MUST also fit the applicable negotiated transport limits. A client
-MUST offer capacity for the maximum response to its requested operation. A
-provider MUST reject a stream with insufficient response capacity before
-dispatching admission work.
-
-Frame lengths MUST be bounded before allocation. A provider MAY enforce a lower
-inbound cap derived from its configured transaction policy. If the declared
-frame exceeds that cap, it may reset the stream without receiving the body or
-returning a typed rejection. A transaction received within the frame cap can
-still receive `TooLarge` if local policy excludes it. Clients MUST preserve the
-distinction between a response and a stream failure.
+These are decoding ceilings. The node's effective transaction limit is `Btx`
+(section 6.2), which the node advertises in `SessionInfo`. Each prelude's
+`max_frame_bytes` MUST cover the largest response frame for that stream.
 
 ### 4.3 Common fields
 
-`TipObservation` contains a one-byte presence tag. `0` means absent; `1` is
-followed by `height: u32` and `hash: [u8; 32]`. The hash uses the existing Zcash
-block-hash wire encoding, not display-order hexadecimal. Its maximum size is
-37 bytes. It is the provider's observation, not a chain proof.
+`TipObservation` starts with a one-byte presence tag. `0` means absent. `1` is
+followed by `height: u32` and `hash: [u8; 32]`. The hash uses the Zcash
+block-hash wire encoding, not display-order hexadecimal. The field is at most
+37 bytes. It is the node's observation, not a chain proof.
 
-`TransactionIdentity` begins with a one-byte tag:
+`TransactionIdentity` starts with a one-byte tag:
 
 | Tag | Following bytes | Meaning |
 | --- | --- | --- |
-| `0` | None | Identifier was not computed. |
-| `1` | 32-byte `txid` | Legacy unmined identity. |
-| `2` | 32-byte `txid`, then 32-byte authorizing data commitment | Witnessed unmined identity. |
+| `0` | None | The node did not compute the identifier. |
+| `1` | 32-byte `txid` | Legacy unmined identity (versions 1–4). |
+| `2` | 32-byte `txid`, then 32-byte authorizing data commitment | Witnessed unmined identity (versions 5–6). |
 
 Identifiers MUST use the shared transaction library and its wire serialization.
-For the current formats, versions 1–4 use legacy identities and versions 5–6 use
-witnessed identities. Supporting an identity encoding does not activate a
-transaction version on a network. A witnessed identity MUST NOT be reduced to
-`txid` for deduplication or response matching. See section 10 for the pinned
-protocol authority.
+A witnessed identity MUST NOT be reduced to `txid` for deduplication or result
+matching.
 
-### 4.4 GetInfo and Info
-
-`GetInfo` has an empty payload. `Info` has these fields:
+### 4.4 SessionInfo
 
 | Field | Encoding | Meaning |
 | --- | --- | --- |
 | `readiness` | `u8` | `0 = Ready`, `1 = NotReady`, `2 = Busy`. |
-| `max_tx_bytes` | `u32` | Current transaction size limit for this connection. |
+| `retry_after_ms` | `u32` | Retry hint for `NotReady` and `Busy`. `0` means no hint. Ignored when `Ready`. |
+| `tip` | `TipObservation` | The node's best chain tip. Required when `Ready`. |
+| `next_branch_id` | `u32` | Consensus branch ID at height `tip.height + 1`. Required when `Ready`; `0` otherwise. |
+| `min_fee_rate` | `u64` | Minimum fee rate the node currently admits, in zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` (10,000) units of [ZIP 401][zip-401] cost. `0` means no floor beyond the standard fee checks. |
+| `max_tx_bytes` | `u32` | `Btx`. |
+| `max_requests` | `u16` | `Nsession`. |
+| `max_outstanding` | `u8` | `K`. |
+| `max_outstanding_bytes` | `u32` | `Binflight`. |
+| `admission_window_ms` | `u32` | `Topen`. |
+| `session_deadline_ms` | `u32` | `Tsession`. |
+| `request_deadline_ms` | `u32` | `Trequest`. |
 | `format_count` | `u8` | Number of format entries, at most `MAX_FORMATS`. |
-| `formats` | Repeated pair of `u32` values | Serialized version header, including its flags, and version group ID. Use group ID zero for formats without that field. |
-| `tip` | `TipObservation` | Provider's current chain observation. |
+| `formats` | `format_count` pairs of `u32` | Serialized version header with flags, then version group ID. Group ID is zero for formats without that field. |
 
-Format pairs MUST be unique and sorted by numeric version header, then group ID.
-They describe formats the provider currently supports for admission, not a
-promise that a particular transaction is valid.
+The largest payload is 142 bytes, so the largest frame is 150 bytes.
 
-`Ready` requires a present tip, a nonempty format list, and a positive size limit.
-The limit MUST NOT exceed local policy, `MAX_SUBMIT_TX_BYTES`, or the connection's
-effective inbound `Submit` frame capacity minus eight bytes. An unavailable service
-may return zero size and an empty format list.
+Format pairs MUST be unique and sorted by version header, then group ID. They
+list formats the node currently admits; support does not imply validity.
 
-The client MAY request `Info` to check readiness or policy before sending a
-transaction. It MAY submit directly using cached policy information or handle
-policy differences through the submission result. The provider MUST process
-`Submit` without requiring an earlier `GetInfo`. Admission MUST check current
-readiness, format, and size policy regardless of any earlier metadata response.
+A `Ready` `SessionInfo` MUST have a present tip, a nonempty format list,
+`1 ≤ K ≤ Nsession`, `0 < Btx ≤ Binflight`, and `0 < Topen ≤ Tsession`. A
+`NotReady` or `Busy` `SessionInfo` MAY carry zero limits and an empty format
+list. After a `NotReady` or `Busy` `SessionInfo`, the node closes the session
+once it has flushed the frame.
+
+The node MUST set `min_fee_rate` to the larger of two values:
+
+- An operator-configured floor, if one exists.
+- When the verified mempool is full, the lowest package fee rate that
+  [zakura#1233][fee-eviction]'s eviction rule would displace, plus
+  `MARGINAL_FEE`, both in zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of
+  cost.
+
+A transaction with fee `f` and cost `c` meets the hint when
+`f × 10,000 ≥ min_fee_rate × c`. The hint is advisory. The node MUST recheck
+readiness, format, size, and fee policy for every request. `SessionInfo` does
+not reserve capacity.
 
 ### 4.5 Submit
 
@@ -238,352 +286,443 @@ readiness, format, and size policy regardless of any earlier metadata response.
 | --- | --- | --- |
 | `transaction` | Entire frame payload | One complete serialized Zcash transaction. |
 
-The frame's `payload_len` is the transaction length and MUST be from 1 through
-`MAX_SUBMIT_TX_BYTES`. Check this bound before allocating the payload. The
-transaction decoder MUST consume the entire payload. The provider
-computes the identity; the client does not supply a trusted hash alongside the
-transaction. A correctly framed request containing invalid transaction encoding
-receives `Rejected / InvalidEncoding` when response capacity is available.
+`payload_len` is the transaction length, from 1 through `Btx`. The node MUST
+check it against `Btx`, `K`, and `Binflight` from the frame header, before it
+reads the body. A transaction above `Btx` returns `Rejected / TooLarge`. A
+request that would exceed `K` or `Binflight` returns
+`NotAdmitted / SessionLimit`. Neither reads the body. The decoder MUST consume the
+entire payload. The node computes the exact identity. The wallet does not
+supply a trusted hash.
 
-### 4.6 SubmitResult
+### 4.6 Finish
 
 | Field | Encoding | Meaning |
 | --- | --- | --- |
-| `result` | `u8` | `0 = Accepted`, `1 = AlreadyPresent`, `2 = Rejected`, `3 = RetryLater`. |
-| `reason` | `u16` | Code from the table below. |
-| `identity` | `TransactionIdentity` | Computed identity when available. |
-| `tip` | `TipObservation` | Chain context associated with the decision when available. |
+| `last_request_id` | `u64` | The highest request ID the wallet will open. |
 
-The following result/reason combinations are permitted:
+The wallet sends `Finish` once and then finishes the session stream's send
+half. `Finish` seals the request set. It neither cancels requests nor waits for
+results. A value below an ID the node has already received, or above
+`Nsession`, is a protocol violation. Missing IDs up to the sealed value MAY
+still arrive until `Topen` expires.
+
+### 4.7 SubmitResult
+
+| Field | Encoding | Meaning |
+| --- | --- | --- |
+| `result` | `u8` | `0 = Accepted`, `1 = Rejected`, `2 = NotAdmitted`, `3 = Indeterminate`. |
+| `reason` | `u16` | Code from the table below. |
+| `identity` | `TransactionIdentity` | Exact identity when computed. |
+| `tip` | `TipObservation` | Chain context of the decision when available. |
+
+Only these result and reason pairs are valid:
 
 | Result | Reason | Meaning |
 | --- | --- | --- |
-| `Accepted`, `AlreadyPresent` | `0x0000 None` | Successful mempool observation. |
-| `Rejected` | `0x0101 InvalidEncoding` | Transaction bytes cannot be decoded completely. |
-| `Rejected` | `0x0102 UnsupportedFormat` | This provider does not support the transaction format. |
-| `Rejected` | `0x0103 TooLarge` | Transaction exceeds the provider's current size policy. |
-| `Rejected` | `0x0104 Policy` | Other local relay policy, such as fee policy. |
+| `Accepted` | `0x0000 None` | The exact transaction is in the node's verified mempool, whether this request inserted it or it was already present. |
+| `Rejected` | `0x0101 InvalidEncoding` | The bytes do not decode completely. |
+| `Rejected` | `0x0102 UnsupportedFormat` | The node does not admit this transaction format. |
+| `Rejected` | `0x0103 TooLarge` | The transaction exceeds `Btx` or local size policy. |
+| `Rejected` | `0x0104 Policy` | Other local relay policy, including fee policy. |
 | `Rejected` | `0x0105 InvalidTransaction` | Validation failed against the reported context. |
-| `Rejected` | `0x0106 Expired` | Transaction is expired in the reported context. |
-| `Rejected` | `0x0107 AlreadyMined` | Provider reports the transaction is already in its selected chain. |
-| `RetryLater` | `0x0201 Busy` | Admission capacity is unavailable. |
-| `RetryLater` | `0x0202 NotReady` | Provider cannot currently perform normal admission. |
-| `RetryLater` | `0x0203 MissingContext` | Required validation context or an ancestor is unavailable. |
-| `RetryLater` | `0x0204 ContextChanged` | A chain change prevented a definitive admission result. |
-| `RetryLater` | `0x0205 InternalError` | A local processing failure prevented a definitive result. |
+| `Rejected` | `0x0106 Expired` | The transaction is expired in the reported context. |
+| `Rejected` | `0x0107 AlreadyMined` | The node reports the transaction in its best chain. |
+| `Rejected` | `0x0108 MissingContext` | The node lacks a required input or ancestor. This is definite for the node's context, not a validity claim. |
+| `NotAdmitted` | `0x0201 Busy` | The node had no capacity, or the request expired before its commit point. |
+| `NotAdmitted` | `0x0202 NotReady` | The node cannot perform normal admission. |
+| `NotAdmitted` | `0x0203 SessionLimit` | The request exceeded `K`, `Binflight`, or `Topen`. |
+| `Indeterminate` | `0x0301 Timeout` | `Trequest` expired after the commit point. |
+| `Indeterminate` | `0x0302 ContextChanged` | A chain change prevented a definite result. |
+| `Indeterminate` | `0x0303 InternalError` | A local failure prevented a definite result. |
 
-All other combinations are invalid in stream version 1. Unknown result or reason
-codes MUST NOT be interpreted as success or silently treated as `Rejected`.
-Adding result or reason codes requires a new negotiated stream version.
+`NotAdmitted` means verification never started. `Indeterminate` means work
+started and the node cannot state the outcome. `Accepted` covers transactions
+that were already present, so a result does not reveal earlier mempool
+contents.
 
-`Accepted` and `AlreadyPresent` require both an exact identity and a tip.
-Other results MUST include the identity if computation completed, and context
-when the decision depends on it. Early rejection or overload may omit either.
-A client MUST compare any returned identity with its own transaction before
-applying the result. Internal exception text is not included in the wire response.
+`Accepted` MUST carry an exact identity and a tip. Other results MUST carry the
+identity once computed, and the tip when the decision depends on it. The wallet
+MUST compare a returned identity with its own transaction before it applies the
+result. Unknown result or reason codes MUST NOT be treated as success or as
+`Rejected`. New codes require a new stream version.
 
-`AlreadyMined` is a chain claim, not mempool acceptance or confirmation evidence.
-The wallet checks it through its existing confirmation path.
+`AlreadyMined` is a chain claim. The wallet checks it through its confirmation
+path.
 
 ## 5. Admission
 
 ### 5.1 Shared operation
 
 Define `AdmitTransaction` in `zakura-node-services` and implement it in the
-existing mempool owner. The service checks the frame and size limits, decodes
-once into the shared `UnminedTx` type, and calls this operation. Parsing remains
-subject to the resource reservations in section 7.
+existing mempool.
 
 | Input | Contract |
 | --- | --- |
-| Transaction | One decoded `UnminedTx`, with its serialized size and exact identity computed from the received bytes. |
-| Source | Existing `QueueSource::Zakura` attribution populated from the authenticated peer, never from request fields. |
-| Deadline | Absolute monotonic deadline for this admission attempt; queueing does not restart it. |
-| Cancellation | A signal that the caller no longer needs completion delivery. It does not release capacity still owned by running work. |
+| Transaction | The serialized bytes, checked against the frame limits. |
+| Source | New `QueueSource::Wallet`, populated by the network task, never from request fields. |
+| Deadline | Absolute monotonic deadline for this request. Queueing does not restart it. |
+| Cancellation | A signal that the caller no longer needs the result. It does not stop running work. |
 
-The operation produces one typed completion containing the admission outcome,
-exact identity, and associated tip under section 4.6. Immediate refusal returns
-the same completion type. Queue acceptance alone is not successful completion.
-The P2P adapter maps domain outcomes to the wire codes; the mempool MUST NOT
-depend on transport frames or wire message types.
+The operation returns one typed completion: the outcome, the exact identity,
+and the associated tip. The P2P service maps the outcome to wire codes. The
+mempool MUST NOT depend on transport types. `Queue`, `QueueFromPeer`, and
+`AdmitTransaction` MUST share the existing verification and insertion
+pipeline.
 
-Connection generation, stream, and request ID remain in the calling network task
-for response correlation. The mempool retains source attribution through queued
-and running work. `Queue`, `QueueFromPeer`, and `AdmitTransaction` MUST share the
-existing verification and insertion machinery, preserving the existing callers'
-contracts. Rust type layout and future/channel mechanics are implementation
-choices. Regulation permit plumbing remains deferred under section 7.2.
+`QueueSource::Wallet` MUST NOT reach `mempool_misbehavior_score` or any ban,
+cooldown, or ignore list. Wallet submissions MUST NOT acquire the RPC retry
+queue's background retention.
 
-### 5.2 Completion
+### 5.2 Sequence and commit point
 
-The admission sequence is:
+1. Check the prelude, frame header, `Btx`, `K`, and `Binflight`.
+2. Read the body and queue it serialized. The node schedules queued requests
+   round-robin across sessions.
+3. **Commit point:** take one of `V` verification permits and decode the
+   transaction.
+4. Compute the exact identity. Check the verified mempool and in-flight
+   verifications for the same identity.
+5. Run the existing policy, consensus, and contextual validation pipeline.
+6. Attempt verified mempool insertion and record the chain context.
+7. Return the result. Existing gossip relays admitted transactions.
 
-1. Check framing, request direction, local size policy, and available capacity
-   before the work each check protects.
-2. Decode the transaction and compute its exact unmined identity.
-3. Check for verified or pending copies and apply the duplicate rules below.
-4. Run the existing policy, consensus, and contextual validation pipeline.
-5. Attempt verified mempool insertion and capture the associated chain context.
-6. Return the decision. Existing mempool gossip handles admitted transactions.
+A request that expires or is cancelled before its commit point MUST release its
+capacity and return `NotAdmitted / Busy` if the session still exists. After the
+commit point, the job keeps its permit and its session slot until it exits,
+even when the wallet disconnects. Expiry after the commit point returns
+`Indeterminate / Timeout`.
 
-The service MUST NOT report `Accepted` merely because work was queued or proofs
-finished. It requires successful insertion. `AlreadyPresent` requires the exact
-authorized transaction to be in the verified mempool at the observation point.
-A pending verification is neither result.
+The node MUST NOT report `Accepted` for queued or partly verified work.
+A request whose identity matches an in-flight verification MUST wait on that
+verification instead of starting another. Each waiter still counts as an
+outstanding request of its own session. A different authorizing commitment is a
+different transaction, even with the same `txid`.
 
-Pending duplicates MAY join the existing verification through bounded completion
-waiters; otherwise return `RetryLater / Busy`. Sharing verification MUST NOT
-remove request or response accounting for additional callers. A different
-authorizing commitment remains a different candidate even when `txid` matches.
+A chain change before insertion uses the mempool's existing revalidation rules
+or returns `ContextChanged`. A later reorg or eviction does not change an
+earlier result. The node reports the context of its decision.
 
-A chain change before the insertion decision MUST use the mempool's existing
-revalidation rules or return `ContextChanged`. A later reorg or eviction does not
-invalidate an earlier admission observation. Report the context of that
-observation rather than a newer, unrelated tip.
+## 6. Capacity
 
-Disconnecting or timing out cancels result delivery; it does not guarantee that
-verification stopped or undo insertion. Work that continues MUST retain its
-resource reservations until completion. Results MUST NOT be delivered on a
-replacement connection. Public submissions do not acquire the RPC retry queue's
-background retention policy.
+### 6.1 Invariant
 
-## 6. Wallet behavior
+The node has one wallet limit, `W`. **If at most `W` wallet sessions exist,
+wallet state MUST stay within the bounds in section 6.4.** Every bound is a
+per-session constant times `W`, or a per-verification constant times `V`. No
+wallet state outlives its session and its jobs.
 
-### 6.1 Results and fallback
+### 6.2 Parameters
 
-Wallets MUST persist authorized transaction bytes and the state needed for safe
-retries before transmission. Initial sends and background retries use the same
-persisted routing policy.
+| Parameter | Meaning |
+| --- | --- |
+| `W` | Maximum concurrent wallet sessions, including handshaking and draining sessions and sessions with running jobs. Operator setting. |
+| `F` | Per-source divisor. One source holds at most `ceil(W / F)` slots. |
+| `V` | Maximum concurrent wallet verifications. Operator setting. |
+| `Btx` | `min(local transaction size policy, Binflight)`. |
+| `Binflight` | Maximum declared transaction bytes outstanding per session. |
+| `K` | Maximum outstanding requests per session. |
+| `Nsession` | Maximum requests per session. |
+| `R` | Wallet connection receive window, `Binflight + 32 KiB`. |
+| `C_quic` | Per-connection QUIC state under the wallet profile. Measured. |
+
+### 6.3 Decoded transaction size
+
+For a transaction of `S` serialized bytes, the node's memory from decoding
+through sighash preparation is at most:
+
+```text
+D(S) = 11 × S + 4 KiB + U
+U    = Σ over transparent inputs of (32 + spent scriptPubKey length)
+```
+
+`D` counts the serialized bytes, the decoded `Transaction`, the `UnminedTx`
+wrapper, and the `SigHasher` with its `librustzcash` copy, at their peak. `U`
+counts the spent outputs the verifier loads from state. Gossiped transactions
+load the same outputs. Batch verifier items are bounded by the batch verifiers'
+own limits and are not part of `D`.
+
+The factor 11 comes from a heap-counting measurement on main
+(`4127aa196`). The table lists peak bytes per element divided by wire bytes per
+element. Each row repeats one element of a real Mainnet or Testnet transaction.
+
+| Element | Wire bytes | Peak bytes | Ratio |
+| --- | --- | --- | --- |
+| Transparent output, empty script | 9 | 95 | 10.6 |
+| Sapling spend (v5) | 352 | 3,011 | 8.6 |
+| Sapling output (v5) | 948 | 6,165 | 6.5 |
+| Sapling spend (v4) | 384 | 2,444 | 6.4 |
+| Transparent input, empty script | 41 | 245 | 6.0 |
+| Orchard action with its proof share | 3,156 | 18,135 | 5.7 |
+| JoinSplit (v4) | 1,698 | 8,338 | 4.9 |
+
+Orchard decoding rejects a non-canonical proof size, so an action always
+carries its proof share. The largest fixed overhead at one element was
+1,470 bytes above `11 × S`. Version 6 Ironwood bundles are not yet measured. A
+node MUST NOT advertise a version 6 format until its elements are measured
+against this formula. A change to the decoder or the sighash path MUST
+re-run the measurement.
+
+### 6.4 State bounds
+
+| State | Bound | Freed when |
+| --- | --- | --- |
+| Wallet slots | `W` | Connection closed and the session's jobs exited |
+| Slots per source | `ceil(W / F)` | Same as the slot |
+| QUIC state and receive buffers | `W × (C_quic + R)` | Connection closed |
+| Session record and request-ID bitmap | `W ×` (fixed record + `Nsession` bits) | Connection closed |
+| Outstanding requests, serialized | `W × Binflight` bytes, `W × K` entries | Result sent, stream reset, or session closed before the commit point |
+| Decoded transactions in verification | `V × D(Btx)` | Job exit, including after disconnect |
+| In-flight identity index and waiters | `W × K` entries | Job exit |
+| Results awaiting send | `W × K × 113` bytes | Sent, or `Tdrain` expiry |
+| Persistent per-wallet state | None | Not applicable |
+
+Total wallet memory is therefore at most:
+
+```text
+W × (C_quic + R + Binflight + record) + V × D(Btx) + W × K × 113
+```
+
+### 6.5 CPU
+
+`W` does not bound CPU throughput; `V` does. One session's verification work is
+bounded instead: at most `Nsession` transactions of at most `Btx` bytes.
+
+```text
+CPU per session ≤ c_hs + Nsession × c(Btx)
+c(S)            = c_0 + c_byte × S
+```
+
+`c_hs` is the cost of one handshake. `c(S)` is the worst-case verification
+time for an `S`-byte transaction. Benchmarks MUST measure `c_byte` for each
+element type in section 6.3 and use the largest value.
+
+### 6.6 Provisional profile
+
+Qualification replaces these values. Implementations MUST label them
+provisional.
+
+| Parameter | Value |
+| --- | --- |
+| `W` | 2,048 |
+| `F` | 16 (128 slots per source) |
+| `V` | 32 |
+| `Btx` | 250,000 (the default size policy) |
+| `Binflight` | 256 KiB |
+| `K` | 4 |
+| `Nsession` | 16 |
+| `T_hs` | 5 s |
+| `Topen` | 10 s |
+| `Tsession` | 30 s |
+| `Trequest` | 10 s |
+| `Tdrain` | 2 s |
+
+With `C_quic` at most 64 KiB, the section 6.4 bound is about 1.3 GiB: 1.19 GiB
+of session state, 84 MiB of decoded transactions, and under 1 MiB of results,
+plus `V × U`.
+
+## 7. Wallet behavior
+
+### 7.1 Endpoint list
+
+The wallet MUST choose nodes from a finite, wallet-maintained endpoint list.
+Each entry MUST name the network, the endpoint address, and the node's identity
+key. Entries SHOULD name the operator when known. The protocol does not
+distribute or update the list. A list entry does not prove honesty or operator
+independence.
+
+### 7.2 SessionInfo checks
+
+The wallet MUST bound its wait for `SessionInfo`. It MUST validate
+`SessionInfo` before any upload, and close without uploading if any check
+fails:
+
+- `readiness` is not `Ready`.
+- `tip.height` is below the highest anchor height the transaction uses.
+- `tip.height` is more than `L` blocks below the wallet's own observed tip.
+- The wallet knows the block hash at `tip.height`, and it differs from
+  `tip.hash`.
+- `next_branch_id` differs from the transaction's consensus branch ID.
+- The transaction's nonzero expiry height is below `tip.height + 1`.
+- The transaction does not meet `min_fee_rate`.
+- The transaction exceeds `max_tx_bytes` or uses an unadvertised format.
+
+The wallet MUST NOT wait for a timer or a larger batch before it dispatches an
+eligible transaction.
+
+### 7.3 Dispatch
+
+The wallet MUST keep at most `K` requests and `Binflight` declared bytes
+outstanding, open at most `Nsession` requests, and open no request after
+`Topen`. It sends `Finish` after it dispatches its queue snapshot for the
+session. New work starts a later session.
+
+Each endpoint has its own queue, connection generation, outstanding-request
+map, and backoff. A slow endpoint MUST NOT block another. The first `Accepted`
+removes unsent copies from other queues. A later error MUST NOT override an
+acceptance. A result belongs to its node, connection generation, stream, and
+request ID; a result from an old connection resolves nothing.
+
+### 7.4 Results and fallback
+
+The wallet MUST persist the signed transaction bytes and its retry state
+before it transmits them.
 
 | Observation | Required action |
 | --- | --- |
-| `Accepted` or `AlreadyPresent` with matching identity | Record acceptance, end automatic retries for this pass, and monitor confirmation. |
-| `Busy` or `NotReady`, including `Info` readiness | Back off before retrying the same node or select another suitable node within budget. |
-| `MissingContext` or `ContextChanged` | Restore known ancestors where applicable, wait for context, or try another node within budget. |
-| `InternalError` | Treat the admission outcome as uncertain and use bounded retry or failover. |
-| `UnsupportedFormat`, `TooLarge`, or `Policy` | Try a suitable alternative within budget; do not repeat unchanged bytes to the same unchanged policy. |
-| `InvalidEncoding`, `InvalidTransaction`, or `Expired` | Check the claim with wallet validation or chain observation. If confirmed, stop automatic retransmission. Otherwise use bounded failover. |
-| `AlreadyMined` | Check confirmation through the wallet's chain observation path. Stop retransmission if confirmed; otherwise use bounded failover. |
-| Timeout, stream reset, malformed response, or cancellation after transmission began | Preserve an unknown outcome. Retry only the original bytes when routing policy and authorization allow. |
+| `Accepted` with matching identity | Record acceptance, end this pass, and monitor confirmation. |
+| `Rejected / UnsupportedFormat`, `TooLarge`, or `Policy` | Try another node within budget. Do not resend unchanged bytes to the same node. |
+| `Rejected / InvalidEncoding`, `InvalidTransaction`, or `Expired` | Check the claim locally or through chain observation. Stop if confirmed; otherwise try another node within budget. |
+| `Rejected / AlreadyMined` | Check confirmation. Stop if confirmed; otherwise try another node within budget. |
+| `Rejected / MissingContext` | Send known ancestors first, or try another node. |
+| `NotAdmitted` | Back off, honoring `retry_after_ms`, or try another node. |
+| `Indeterminate`, timeout, stream reset, or malformed result after upload began | Record an unknown outcome. Retry only the original bytes. |
+| Failure before any transaction byte was sent | Record the transaction as not transmitted. |
 
 A remote rejection MUST NOT by itself release reserved inputs, create a
-replacement payment, or mark a transaction as confirmed. A transport failure
-before any transaction bytes were sent may be recorded as not transmitted;
-failures after transmission begins MUST be treated conservatively.
+replacement payment, or mark a transaction confirmed.
 
-Each native submission pass MUST have positive, finite attempt and elapsed-time
-limits. Discovery, connection setup, metadata, and transaction attempts all count
-toward the native deadline. Responses and peer changes MUST NOT reset it.
-Backoff MUST remain within the remaining budget.
+Each native pass MUST have finite attempt and elapsed-time limits. Connection
+setup, `SessionInfo`, and requests all count toward them. Results and node
+changes MUST NOT reset them. When the native pass ends without acceptance or a
+confirmed terminal reason, the wallet MUST use its configured lightwalletd
+fallback with the same bytes and its own finite limits. Exhausting both routes
+ends the pass in a pending or failed state that matches the evidence.
 
-If native attempts cannot obtain acceptance, and no terminal reason has been
-confirmed, the wallet MUST use its configured lightwalletd fallback. That path
-has its own finite attempt limit and deadline and sends the same signed bytes.
-Exhausting both routes ends the pass with a pending or failed state appropriate
-to the evidence, not a fabricated rejection. Any later background pass retains
-the transaction state and rechecks authorization, expiry, and route policy.
+### 7.5 Defaults
 
-The client's initial fanout MUST be bounded. An acceptance ends further retry
-scheduling; already transmitted requests may still complete. Multiple
-acknowledgments are not a consensus quorum.
-
-### 6.2 Client defaults
-
-The reusable client starts with the following defaults. Wallets MAY override
-them with explicit finite configuration. They are initial client policy choices,
-not wire constants or measured performance guarantees. Mobile tests validate
-and, where necessary, tune them before release.
+Wallets MAY override these with explicit finite values. Mobile tests validate
+them before release.
 
 | Setting | Default |
 | --- | --- |
-| Native phase deadline | 30 seconds, including discovery, connection setup, metadata, and submissions. |
-| Provider attempts | 4 per native phase; a failed connection or retry to the same provider consumes an attempt. |
-| Concurrent native connections | 2 across discovery and submission; at most 2 providers receive a transaction concurrently. |
-| Connection deadline | 5 seconds including address resolution and handshake. |
-| `GetInfo` response deadline | 3 seconds. |
-| `Submit` response deadline | 10 seconds, including provider queueing and validation. |
-| Same-provider retry backoff | 1 second, doubled after each retryable failure, capped at 8 seconds; add random jitter of up to 25%. |
-| Discovery work | At most 3 source connection attempts and 2 `GetPeers` queries per phase, requesting 16 records each; 3 seconds per response and 10 seconds total including connection setup. |
-| Peer cache | 128 validated records, at most one current record per identity. |
-| Cache refresh | Refresh on use when the last successful sample is at least 10 minutes old, or when no eligible candidate remains. |
-| Cached `Info` | At most 30 seconds, scoped to provider identity and network; negotiated connection limits still apply. |
-| Lightwalletd attempts | 2 sequential attempts, preferring different configured endpoints when available. |
-| Direct lightwalletd deadline | 30 seconds for the phase, at most 15 seconds per attempt including connection setup. |
-| Tor/lightwalletd deadline | 60 seconds for the phase, at most 30 seconds per attempt including Tor connection setup. |
-| Automatic background retries | After 1 minute, doubling to at most 15 minutes between passes, with up to 25% additional jitter. |
+| Native pass deadline | 30 s, including connection setup, `SessionInfo`, and requests. |
+| Node attempts | 4 per native pass. A failed connection or retry to the same node consumes one. |
+| Concurrent endpoints | 2. |
+| Connection deadline | 5 s, including address resolution and handshake. |
+| `SessionInfo` deadline | 3 s after the handshake. |
+| Request deadline | `Trequest` from `SessionInfo`, at most 10 s. |
+| Tip lag `L` | 2 blocks. |
+| Same-node backoff | 1 s, doubled per retryable failure, capped at 8 s, plus up to 25% jitter. |
+| Lightwalletd attempts | 2 sequential attempts, preferring different endpoints. |
+| Direct lightwalletd deadline | 30 s per pass, at most 15 s per attempt. |
+| Tor lightwalletd deadline | 60 s per pass, at most 30 s per attempt. |
+| Background retries | After 1 minute, doubling to at most 15 minutes, plus up to 25% jitter. |
 
-Each operation uses the smaller of its own timeout and the remaining phase
-budget. The native phase ends early when no eligible attempt remains; it does
-not wait out its deadline before fallback. Under Tor, only the Tor/lightwalletd
-phase runs. Background scheduling rechecks the wallet state under section 6.1;
-app suspension may delay a pass and MUST NOT produce a burst of missed passes
-on resume. Concurrent callers MUST share these connection and discovery bounds.
+Each operation uses the smaller of its own timeout and the remaining pass
+budget. App suspension MAY delay a pass and MUST NOT cause a burst of missed
+passes on resume.
 
-An attempt is one provider visit, including optional metadata and ordered
-dependency submission. There are at most 8 `Submit` requests per native phase
-across all visits, including ancestor replay. Lightwalletd likewise has at most
-8 transaction submissions per phase. Larger dependency sets retain progress for
-a later pass. Every request also consumes the phase deadline.
+### 7.6 Dependencies
 
-Peer records expire under the shared signed-record rules and MUST NOT have
-their lifetime extended by a cache read or an unsuccessful refresh. The shared
-maximum accepted future lifetime is currently 24 hours. Refresh uses the phase's
-discovery budget and does not start a continuously running discovery loop.
-Unsolicited records do not count as a successful requested sample. Evict expired
-records first, then the least recently useful records while preserving source
-diversity where possible. A policy rejection invalidates conflicting cached
-`Info`; it does not reset an attempt budget.
+The wallet MUST send parents before children to a node that accepted or
+already holds the parents. On failover it replays required ancestors in order.
+Partial acceptance MUST survive cancellation and restart. The service provides
+no atomicity across transactions.
 
-### 6.3 Dependencies
+### 7.7 Tor
 
-For dependent transactions, the client MUST send parents before children to a
-provider that accepted or already holds those parents. On failover it replays
-required ancestors in order, allowing independently confirmed ancestors to be
-omitted. Partial acceptance MUST be retained across cancellation and restarts.
-The service provides no atomicity across transactions.
-
-### 6.4 Tor routing
-
-With Tor enabled, the wallet MUST use its existing Tor/lightwalletd route for
-submission. It MUST NOT perform direct native discovery, metadata requests, or
-submission as a fallback from Tor. This applies to background retries as well as
-foreground sends.
-
-An explicit route change MUST stop pending connection and retry work that would
-violate the new policy. It cannot recall already transmitted transactions.
-For direct native operation, clients SHOULD use ephemeral connection identities
-and MUST omit wallet/account identifiers from service metadata.
-
-## 7. Message regulation
-
-### 7.1 Required guarantees
-
-Submission will use the shared regulation framework once its integration is
-settled. It MUST provide these guarantees:
-
-- Bound retained transaction bytes, parsing expansion, verification work and
-  concurrency, duplicate waiters, and pending response capacity.
-- Reserve capacity before dispatching the work it covers, and retain ownership
-  through queued work, verification, and result delivery as applicable.
-- Apply aggregate submission limits across peers. Source-group and peer limits
-  provide fairness; a fresh identity MUST NOT reset aggregate capacity.
-- Return `RetryLater / Busy` when admission capacity is unavailable and a bounded
-  response can be sent. If no response capacity exists, reject the stream within
-  its deadline rather than queueing an unbounded response.
-- Keep block validation and normal relay progressing during submission load.
-  Peer-set policy separately bounds transient client connections and idle time.
-
-Wire-byte limits MUST NOT be presented as bounds on total process memory or
-verification CPU. A valid transaction's fee is not a substitute for admission
-resource accounting.
-
-### 7.2 Pending integration
-
-The [message regulation specification][regulation-spec] and
-[GetBlocks implementation][getblocks-work] are still being developed. This draft
-does not select a regulator API, queue scheduler, cost model, or production
-budget. GetBlocks serving rates MUST NOT be copied into transaction verification
-defaults without independent measurements.
-
-Codec, discovery, result handling, and wallet integration work may proceed
-against explicit interfaces and controlled test doubles. The public service
-MUST remain disabled until regulation is wired, its limits are specified, and
-the capacity and progress tests pass. An unlimited temporary path is not an
-implementation of this specification.
+Native submission is QUIC over UDP, and Tor carries only TCP. With Tor enabled,
+the wallet MUST submit through its Tor route to lightwalletd. It MUST NOT open
+native connections, including as a fallback or a background retry. A route
+change MUST stop pending work that would violate the new route policy.
 
 ## 8. Conformance
 
-Tests should use controlled peers and local fixtures. Runtime acceptance requires
-the following evidence; writing this specification does not claim it exists.
+Runtime acceptance requires the following evidence. This document does not
+claim it exists.
 
 | Area | Required cases |
 | --- | --- |
-| Negotiation (§2) | Wrong chain, unsupported capability/version, and peer-opened requests to a wallet. |
-| Request correlation (§2) | Increasing client IDs without wrap; out-of-order stream arrival; reused IDs on concurrent and later streams without response or accounting crossover; no completed-ID history after operations finish; and responses associated with the wrong stream or a replaced connection. |
-| Discovery (§3) | Submission service filtering, a client without a public self-record, record expiration, unsuitable addresses, bootstrap outage, and bounded fallback. |
-| Encoding (§4) | Canonical field order; empty, truncated, oversized, and trailing payloads; unknown tags/flags; exact response caps; and invalid result/reason combinations. |
-| Identity (§4–5) | Legacy and witnessed vectors; display/wire byte-order differences; matching `txid` with different authorizing commitments; and response identity mismatch. |
-| Admission (§5) | Queued versus inserted work, pending duplicates, bounded waiters, validation failure, chain changes, already mined transactions, and eviction after acceptance. |
-| Wallet routing (§6) | Submission with and without prior `GetInfo`; stale policy metadata; every result/reason action; overload and policy rejection reaching fallback; default attempt and deadline enforcement; shared connection bounds; restart without retry bursts; dependency replay; and unknown outcomes. |
-| Tor (§6.4) | No native discovery or submission under Tor, including failures, background retries, and route changes. |
-| Regulation (§7) | Capacity retained after timeout/disconnect, bounded combined submission work across peers, and continuing block validation and relay under controlled load. |
-| Propagation (§1, §5) | A wallet-like client submits a valid transaction, another node receives it through gossip, and regtest mines it in native and mixed native/legacy topologies. |
+| Pre-handshake admission (§2.2) | Wallet ALPN at `W` and at the source share; mixed ALPN lists; unreadable ALPN followed by a wallet handshake; peer limits unchanged by wallet load. |
+| Transport profile (§2.3) | A wallet cannot make the node buffer more than `R`; a wallet cannot open more than `K + 2` streams. |
+| Handshake (§2.4) | Wrong chain, extra capabilities, identity mismatch, node-opened streams. |
+| Request IDs (§3.1) | Duplicate, out-of-range, post-`Finish`, and early request streams; out-of-order arrival; second session stream. |
+| Deadlines (§3.2) | Every deadline expires without extension; slots stay held by running jobs after disconnect. |
+| Encoding (§4) | Field order, truncated and trailing payloads, unknown types and flags, exact frame caps, and invalid result/reason pairs. |
+| `SessionInfo` (§4.4) | `Ready` consistency rules; `min_fee_rate` from a full mempool and from a configured floor. |
+| Identity (§4.3, §5) | Legacy and witnessed vectors; matching `txid` with different authorizing commitments; identity mismatch. |
+| Admission (§5) | Expiry before and after the commit point; in-flight waiters; already-present transactions; chain changes; no misbehavior score for wallet sources. |
+| Capacity (§6) | Saturation at `W` keeps peer sync and relay progressing; measured memory stays within the §6.4 bound; the §6.3 measurement holds for every advertised format. |
+| Wallet (§7) | Every `SessionInfo` check skips without upload; per-endpoint queues; first acceptance; every result action; fallback; restart without retry bursts; dependency replay. |
+| Tor (§7.7) | No native connection under Tor, including failures, retries, and route changes. |
+| Propagation | A wallet submits a valid transaction, another node receives it through gossip, and regtest mines it in native and mixed topologies. |
 
-### 8.1 Initial vectors
+### 8.1 Vectors
 
-These vectors cover complete application frames, excluding the stream prelude.
-They use the message and reason values above.
-
-`GetInfo` has no payload:
+The session stream prelude: magic `ZKST`, stream kind 7, version 1, request
+ID 0, and `max_frame_bytes` 150.
 
 ```text
-01 00 00 00 00 00 00 00
+5a 4b 53 54 07 00 01 00 01 00 00 00 00 00 00 00 00 96 00 00 00
 ```
 
-`SubmitResult` for `RetryLater / NotReady`, with no computed identity or tip,
-has a five-byte payload. Its request ID belongs to the stream context:
+`SessionInfo` with `NotReady`, a 1,000 ms retry hint, no tip, and zero limits
+has a 42-byte payload:
+
+```text
+01 80 00 00 2a 00 00 00
+01 e8 03 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00
+```
+
+`Finish` with `last_request_id = 3`:
+
+```text
+03 00 00 00 08 00 00 00
+03 00 00 00 00 00 00 00
+```
+
+`SubmitResult` for `NotAdmitted / NotReady`, with no identity or tip:
 
 ```text
 02 80 00 00 05 00 00 00
-03 02 02 00 00
+02 02 02 00 00
 ```
 
-Transaction-dependent vectors MUST be generated from the shared chain fixtures
-and checked against the existing serializers before freezing stream version 1.
+Vectors for a `Ready` `SessionInfo` and for transaction-dependent results MUST
+be generated from the shared chain fixtures and checked against the existing
+serializers before stream version 1 is frozen.
 
 ## 9. Readiness
 
-### 9.1 Pending regulation
+Before the node enables wallet sessions:
 
-The remaining design dependency is the regulation integration described in
-section 7.2. Settle the shared API, scheduling policy, verification cost model,
-and measured node budgets after the GetBlocks work. The wire values, admission
-contract, and initial wallet defaults are specified above.
+- Implement pre-handshake classification, the wallet profile, the session
+  service, and `AdmitTransaction`.
+- Measure `C_quic`, the CPU constants in section 6.5, and the section 6.3
+  formula for every advertised format.
+- Replace the provisional profile with measured values.
+- Pass the conformance cases in section 8.
 
-### 9.2 Rollout requirements
-
-Before enabling the public service, implement the shared admission operation
-and regulation, register the protocol values, and pass the conformance tests.
-Before enabling wallet adoption, validate the client defaults on iOS and Android
-under network changes, app suspension, slow validation, and fallback failures.
-
-Wallet releases MUST ship at least three independently operated bootstrap
-sources and verify successful submission through independently operated providers
-with a working gossip path to the wider network. Discovery remains open to
-additional operators.
-
-The Tor follow-on will separately specify transport, endpoint advertisements,
-bootstrap discovery, and source accounting. Those decisions are outside this
-native wire specification.
+Before wallets adopt native submission, validate the defaults on iOS and
+Android under network changes, app suspension, slow validation, and fallback
+failures. Shipped endpoint lists MUST contain at least three independently
+operated nodes with a working gossip path to the wider network. Mainnet
+[defaults to legacy P2P][mainnet-default], so participating nodes must enable
+v2.
 
 ## 10. References
 
 - [Design document](../design/wallet-transaction-submission.md).
-- [Zakura stream prelude and frame encoding][framing], inspected at
-  `1e0d5c245c61dc31591dab30fbe41496dd020ec6`.
-- [Signed discovery records][discovery].
+- [zakura#906][pr-906]: version 0.1 of this design and specification.
+- [Zakura stream prelude and frame encoding][framing].
 - [Shared unmined transaction identities][identities] and
   [identifier wire serialization][identity-wire].
-- [Peer message regulation specification][regulation-spec], draft at
-  `44028a51893d17fe4202fee0e54a1c59ce2fc946`. Its discovery/header/block message
-  inventory must be extended for submission; this document does not claim that
-  its policy is already implemented for the new service.
-- Zcash Protocol Specification **v2026.7.0-187-ge753a6 [NU6.3 proposal]**, pinned to
-  `e753a6a301912cf77202db8f0d840f4796f5cca1`. Section 7.1.1,
-  [Transaction Identifiers, PDF page 130][protocol-identities], and its
-  [pinned source][protocol-source] define identity semantics. The NU6.3/v6 text
-  is a proposal, not an assertion of Mainnet activation.
-- [ZIP 239][zip-239], **Final** in the same snapshot, defines the witnessed
-  identity as the transaction ID followed by the authorizing data commitment.
+- [zakura#1233][fee-eviction]: fee-rate eviction, which defines the full-pool
+  admission threshold behind `min_fee_rate`.
+- [Peer message regulation specification][regulation-spec].
+- [ZIP 239][zip-239]: witnessed transaction identity.
+- [ZIP 317][zip-317]: proportional transfer fee mechanism.
+- [ZIP 401][zip-401]: mempool cost and eviction.
 
-[regulation-spec]: https://github.com/zakura-core/zakura/blob/44028a51893d17fe4202fee0e54a1c59ce2fc946/docs/specs/peer-message-regulation.md
-[getblocks-work]: https://github.com/zakura-core/zakura/pull/892
-[framing]: https://github.com/zakura-core/zakura/blob/1e0d5c245c61dc31591dab30fbe41496dd020ec6/crates/zakura-network/src/zakura/handshake.rs#L1192-L1317
-[block-size]: https://github.com/zakura-core/zakura/blob/1e0d5c245c61dc31591dab30fbe41496dd020ec6/crates/zakura-chain/src/block/serialize.rs#L18-L24
-[capability-registry]: https://github.com/zakura-core/zakura/blob/f2cfab1cf59ccc6c3e280bbe0e6ab2c98a9645af/crates/zakura-network/src/zakura.rs#L58-L72
-[discovery]: https://github.com/zakura-core/zakura/blob/1e0d5c245c61dc31591dab30fbe41496dd020ec6/crates/zakura-network/src/zakura/discovery/protocol.rs#L220-L299
-[identities]: https://github.com/zakura-core/zakura/blob/1e0d5c245c61dc31591dab30fbe41496dd020ec6/crates/zakura-chain/src/transaction/unmined.rs#L1-L13
-[identity-wire]: https://github.com/zakura-core/zakura/blob/1e0d5c245c61dc31591dab30fbe41496dd020ec6/crates/zakura-chain/src/transaction/hash.rs#L250-L283
-[protocol-identities]: https://zips.z.cash/protocol/nu6_3.pdf#txnidentifiers
-[protocol-source]: https://github.com/zcash/zips/blob/e753a6a301912cf77202db8f0d840f4796f5cca1/protocol/protocol.tex#L13608-L13618
-[zip-239]: https://github.com/zcash/zips/blob/e753a6a301912cf77202db8f0d840f4796f5cca1/zips/zip-0239.rst#L28-L37
+[pr-906]: https://github.com/zakura-core/zakura/pull/906
+[fee-eviction]: https://github.com/zakura-core/zakura/pull/1233
+[framing]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-network/src/zakura/handshake.rs#L1197-L1255
+[identities]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-chain/src/transaction/unmined.rs#L1-L13
+[identity-wire]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-chain/src/transaction/hash.rs
+[regulation-spec]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/docs/specs/peer-message-regulation.md
+[mainnet-default]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-network/src/config.rs
+[zip-239]: https://zips.z.cash/zip-0239
+[zip-317]: https://zips.z.cash/zip-0317
+[zip-401]: https://zips.z.cash/zip-0401

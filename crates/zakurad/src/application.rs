@@ -277,7 +277,7 @@ impl Application for ZakuradApp {
                      You can generate a valid config by running \"zakurad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
-                // Convert config::ConfigError to FrameworkError using a generic IO error
+                // Report the configuration error through the framework.
                 let io_error = std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Configuration error: {}", e),
@@ -298,17 +298,19 @@ impl Application for ZakuradApp {
         // skipping any env vars that aren't present
 
         // reads state disk version file, doesn't open RocksDB database
-        let disk_db_version =
-            match state_database_format_version_on_disk(&config.state, &config.network.network) {
-                Ok(Some(version)) => version.to_string(),
-                // This "version" is specially formatted to match a relaxed version regex in CI
-                Ok(None) => "creating.new.database".to_string(),
-                Err(error) => {
-                    let mut error = format!("error: {error:?}");
-                    error.truncate(100);
-                    error
-                }
-            };
+        let disk_db_version = match state_database_format_version_on_disk(
+            &config.mirrored_state_config(),
+            &config.network.network,
+        ) {
+            Ok(Some(version)) => version.to_string(),
+            // This "version" is specially formatted to match a relaxed version regex in CI
+            Ok(None) => "creating.new.database".to_string(),
+            Err(error) => {
+                let mut error = format!("error: {error:?}");
+                error.truncate(100);
+                error
+            }
+        };
 
         let app_metadata = [
             // build-time constant: cargo or git tag + short commit
@@ -420,34 +422,13 @@ impl Application for ZakuradApp {
         // handler is the last one installed
         let (panic_hook, eyre_hook) = builder.into_hooks();
         eyre_hook.install().expect("eyre_hook.install() error");
-
-        // The Sentry default config pulls in the DSN from the `SENTRY_DSN`
-        // environment variable.
-        if env::var_os("SENTRY_DSN").is_some() {
-            #[cfg(feature = "sentry")]
-            let guard = crate::sentry::init();
-
-            std::panic::set_hook(Box::new(move |panic_info| {
-                let panic_report = panic_hook.panic_report(panic_info);
-                eprintln!("{panic_report}");
-
-                #[cfg(feature = "sentry")]
-                {
-                    let event = crate::sentry::panic_event_from(panic_report);
-                    sentry::capture_event(event);
-
-                    if !guard.close(None) {
-                        warn!("unable to flush sentry events during panic");
-                    }
-                }
-            }));
-        }
+        panic_hook.install();
 
         // Apply the configured number of threads to the thread pool.
         //
         // TODO:
         // - set rayon panic handler to a function that takes `Box<dyn Any + Send + 'static>`,
-        //   which forwards to sentry. If possible, use eyre's panic report for formatting.
+        //   which reports through the panic hook. If possible, use eyre's panic report for formatting.
         // - do we also need to call this code in `zakura_consensus::init()`,
         //   when that crate is being used by itself?
         rayon::ThreadPoolBuilder::new()
@@ -471,7 +452,6 @@ impl Application for ZakuradApp {
         } else {
             // Don't apply the configured filter for short-lived commands.
             tracing_config.filter = Some(default_filter.to_owned());
-            tracing_config.flamegraph = None;
         }
         components.push(Box::new(Tracing::new(
             &config.network.network,

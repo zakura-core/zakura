@@ -6502,6 +6502,29 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
     );
 }
 
+/// A session torn down before its connect is processed must not stay in the
+/// reactor, where its sender would hold the session's reservation.
+#[tokio::test]
+async fn reactor_drops_a_session_cancelled_before_it_connects() {
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()));
+    let (send, mut outbound) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0x61), send, cancel),
+        ))
+        .await
+        .expect("the connect event queues");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while outbound.recv().await.is_some() {}
+    })
+    .await
+    .expect("the reactor drops the cancelled session and its sender");
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
     let (service, mut events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());

@@ -806,6 +806,11 @@ impl BlockSyncReactor {
     }
 
     async fn handle_peer_connected(&mut self, session: BlockSyncPeerSession) {
+        // A session already torn down must not be kept: its sender holds the
+        // session's reservation, and its disconnect has been or will be sent.
+        if session.cancel_token().is_cancelled() {
+            return;
+        }
         let peer = session.peer_id().clone();
         let direction = session.direction();
         let decision = self.admission_decision_for(&peer, direction);

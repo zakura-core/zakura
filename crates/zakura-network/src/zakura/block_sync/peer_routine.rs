@@ -511,8 +511,21 @@ impl PeerRoutine {
             Notified::enable(floor_ranking.as_mut());
 
             // Check before the biased receive arm so incoming traffic cannot
-            // keep abandoned authorization alive indefinitely.
-            self.check_request_liveness(time::Instant::now().into_std())?;
+            // keep abandoned authorization alive or postpone request timeouts.
+            let now = time::Instant::now().into_std();
+            self.check_request_liveness(now)?;
+            if self
+                .window
+                .outstanding
+                .iter()
+                .any(|outstanding| outstanding.deadline <= now)
+                || self
+                    .window
+                    .block_liveness_deadline
+                    .is_some_and(|deadline| deadline <= now)
+            {
+                self.handle_deadlines(now).await?;
+            }
             self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await

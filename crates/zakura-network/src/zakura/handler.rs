@@ -1887,6 +1887,14 @@ impl ServiceSessionState {
         self.local_session_id.is_some() || self.remote_session_id.is_some()
     }
 
+    /// Whether a peer-opened stream must be dropped before reserving capacity:
+    /// a remote session still owns its slot, or this side wins the collision
+    /// with its own session.
+    fn rejects_remote_offer(&self, i_open_collision_winner: bool) -> bool {
+        self.remote_session_id.is_some()
+            || (i_open_collision_winner && self.local_session_id.is_some())
+    }
+
     fn remove_active_session(&mut self, opened_locally: bool, session_id: u64) -> bool {
         let active_session = if opened_locally {
             &mut self.local_session_id
@@ -2902,12 +2910,12 @@ impl ZakuraProtocolHandler {
                 }, if incoming_setup.is_some() => {
                     incoming_setup = None;
                     let Some(setup) = setup else { continue; };
-                    // Active and retiring remote sessions still own their slot.
-                    // Reject duplicates before reserving capacity for any member.
                     if setup.session.as_ref().is_some_and(|(layout, _)| {
                         service_sessions
                             .get(&layout.primary().kind)
-                            .is_some_and(|session| session.remote_session_id.is_some())
+                            .is_some_and(|session| {
+                                session.rejects_remote_offer(context.i_open_collision_winner)
+                            })
                     }) {
                         continue;
                     }
@@ -8467,6 +8475,24 @@ mod tests {
         assert_eq!(session.remote_session_id, Some(2));
         assert!(session.remove_active_session(false, 2));
         assert_eq!(session.remote_session_id, None);
+    }
+
+    #[test]
+    fn losing_or_duplicate_remote_offers_are_rejected_before_reservation() {
+        let mut session = ServiceSessionState::new(test_ordered_stream());
+        assert!(!session.rejects_remote_offer(true));
+        session.local_session_id = Some(1);
+        assert!(
+            session.rejects_remote_offer(true),
+            "the collision winner keeps its own session"
+        );
+        assert!(
+            !session.rejects_remote_offer(false),
+            "the collision loser adopts the peer's stream"
+        );
+        session.local_session_id = None;
+        session.remote_session_id = Some(2);
+        assert!(session.rejects_remote_offer(false));
     }
 
     fn test_ordered_stream() -> Stream {

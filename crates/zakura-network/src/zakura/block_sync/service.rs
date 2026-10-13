@@ -994,6 +994,12 @@ impl Service for BlockSyncService {
                 handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
             }
         };
+        // Queue the connect before spawning, so the routine's teardown cannot
+        // publish its disconnect first on another worker.
+        let _ = self
+            .inner
+            .lifecycle
+            .send(BlockSyncEvent::PeerConnected(block_sync_session));
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
@@ -1003,11 +1009,6 @@ impl Service for BlockSyncService {
             on_panic,
             pipe,
         );
-
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {

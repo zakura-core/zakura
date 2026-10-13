@@ -433,10 +433,10 @@ impl PeerRegistry {
         now: Instant,
     ) -> bool {
         let source = zakura_header_chain::SourceId::from_digest(peer.digest());
-        let mut all_retries = self.body_retry_all_lock();
-        let mut retries = self.body_retry_lock();
-        all_retries.retain(|_, until| *until > now);
-        retries.entries.retain(|_, until| *until > now);
+        let all_retries = self.body_retry_all_lock();
+        let retries = self.body_retry_lock();
+        // Check each deadline instead of sweeping: this runs once per scheduled
+        // body, and insertion and `next_body_retry_deadline` purge expired entries.
         let current = retries
             .current
             .filter(|current| current.body_work_epoch == scope.body_work_epoch)
@@ -447,14 +447,18 @@ impl PeerRegistry {
         ];
         // There is at most one published alarm. Its exact body stays suppressed
         // across compatible snapshots, including before either reader has refreshed.
-        all_retries
-            .keys()
-            .any(|key| key.hash == hash && key.body_work_epoch == scope.body_work_epoch)
-            || keys.into_iter().any(|key| {
-                [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
-                    .into_iter()
-                    .any(|reason| retries.entries.contains_key(&(source, key, reason)))
-            })
+        all_retries.iter().any(|(key, until)| {
+            *until > now && key.hash == hash && key.body_work_epoch == scope.body_work_epoch
+        }) || keys.into_iter().any(|key| {
+            [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+                .into_iter()
+                .any(|reason| {
+                    retries
+                        .entries
+                        .get(&(source, key, reason))
+                        .is_some_and(|until| *until > now)
+                })
+        })
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -1469,6 +1473,29 @@ mod floor_bias_tests {
             ..fresh
         }));
         assert!(!registry.is_body_retry_avoided(&peer, fresh, hash, now));
+    }
+
+    /// Lookups honor each entry's expiry without sweeping the shared map.
+    #[test]
+    fn cooldown_lookups_check_expiry_without_sweeping() {
+        let registry = PeerRegistry::new();
+        let scope = super::super::test_work_scope();
+        let supplier = peer(1);
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        registry.defer_incompatible_bodies(
+            zakura_header_chain::SourceId::from_digest(supplier.digest()),
+            [(scope, hash)],
+            now + Duration::from_secs(1),
+        );
+        assert!(registry.is_body_retry_avoided(&supplier, scope, hash, now));
+        let later = now + Duration::from_secs(2);
+        assert!(!registry.is_body_retry_avoided(&supplier, scope, hash, later));
+        assert_eq!(
+            registry.body_retry_lock().entries.len(),
+            1,
+            "expired entries wait for the next insertion or deadline scan"
+        );
     }
 
     /// Identity churn cannot grow incompatibility cooldowns past their capacity.

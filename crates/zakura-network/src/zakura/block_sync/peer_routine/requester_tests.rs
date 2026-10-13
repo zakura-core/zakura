@@ -759,3 +759,37 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     assert!(connection.is_cancelled());
     assert_eq!(pool.held(), 0);
 }
+
+/// A peer that keeps the receive arm ready cannot postpone its own request timeouts.
+#[tokio::test]
+async fn a_status_flood_cannot_postpone_request_timeouts() {
+    let (mut routine, mut outbound, _pool, _connection, _events) =
+        requester_routine(block::Hash([1; 32]));
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert_eq!(routine.window.outstanding.len(), 1);
+    routine.window.outstanding[0].deadline = Instant::now() - Duration::from_secs(1);
+    let (input, recv) = crate::zakura::framed_channel(1024);
+    let status = BlockSyncMessage::Status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(10),
+        max_blocks_per_response: 1,
+        ..BlockSyncStatus::default()
+    })
+    .encode_frame()
+    .unwrap();
+    while input.try_send(status.clone()).is_ok() {}
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    let mut guard = block_sync_guard();
+    let mut running = Box::pin(routine.run_inner(&mut guard));
+    // One poll handles frames until the cooperative budget runs out, while
+    // frames are still queued.
+    assert!(futures::poll!(&mut running).is_pending());
+    drop(running);
+    assert!(
+        routine.window.outstanding.is_empty(),
+        "the overdue request timed out while frames were ready"
+    );
+}

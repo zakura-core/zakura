@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::{Bound, RangeBounds},
+    ops::RangeBounds,
     sync::Arc,
 };
 
@@ -143,78 +143,6 @@ impl ZakuraDb {
         self.db.zs_contains(&tx_by_loc, &first_tx)
     }
 
-    /// Returns finalized commitment roots for a contiguous height range.
-    ///
-    /// The result stops before the first missing height.
-    pub fn finalized_commitment_roots_by_height_range(
-        &self,
-        range: impl RangeBounds<block::Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        let Some(tip_height) = self.finalized_tip_height() else {
-            return Vec::new();
-        };
-        let Some(start_height) = (match range.start_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.next().ok(),
-            Bound::Unbounded => Some(block::Height::MIN),
-        }) else {
-            return Vec::new();
-        };
-        let Some(end_height) = (match range.end_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.previous().ok(),
-            Bound::Unbounded => Some(tip_height),
-        }) else {
-            return Vec::new();
-        };
-        let end_height = end_height.min(tip_height);
-        if start_height > end_height {
-            return Vec::new();
-        }
-
-        let mut roots = Vec::new();
-
-        // The per-height tree column families are sparse: they only store a row
-        // when that pool's tree changes. Resolve each requested finalized height
-        // through the backwards tree lookup instead of iterating those sparse
-        // rows as if they were a contiguous block-height index.
-        for raw_height in start_height.0..=end_height.0 {
-            let height = block::Height(raw_height);
-            let Some(sapling) = self.sapling_tree_by_height(&height) else {
-                break;
-            };
-            let Some(orchard) = self.orchard_tree_by_height(&height) else {
-                break;
-            };
-            let Some(ironwood) = self.ironwood_tree_by_height(&height) else {
-                break;
-            };
-
-            let Some(block) = self.block(height.into()) else {
-                break;
-            };
-            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
-                block.sapling_transactions_count(),
-                block.orchard_transactions_count(),
-                block.ironwood_transactions_count(),
-                block.auth_data_root(),
-            );
-
-            roots.push(BlockCommitmentRoots {
-                height,
-                sapling_root: sapling.root(),
-                orchard_root: orchard.root(),
-                ironwood_root: ironwood.root(),
-                sapling_tx,
-                orchard_tx,
-                ironwood_tx,
-                auth_data_root,
-            });
-        }
-
-        roots
-    }
-
     /// Returns the finalized hash for a given `block::Height` if it is present.
     #[allow(clippy::unwrap_in_result)]
     pub fn hash(&self, height: block::Height) -> Option<block::Hash> {
@@ -240,23 +168,6 @@ impl ZakuraDb {
         self.db.zs_get(&height_by_hash, &hash)
     }
 
-    /// Returns the previous block hash for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        let height = self.height(hash)?;
-        let prev_height = height.previous().ok()?;
-
-        self.hash(prev_height)
-    }
-
-    /// Returns the previous block height for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_height_for_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let height = self.height(hash)?;
-
-        height.previous().ok()
-    }
-
     /// Returns the [`block::Header`] with [`block::Hash`] or
     /// [`Height`], if it exists in the finalized chain.
     //
@@ -270,19 +181,6 @@ impl ZakuraDb {
         let header = self.db.zs_get(&block_header_by_height, &height)?;
 
         Some(header)
-    }
-
-    /// Returns block headers in height order.
-    #[cfg(feature = "indexer")]
-    pub fn block_headers_by_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<block::Header>)> + '_
-    where
-        R: RangeBounds<Height>,
-    {
-        let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
-        self.db.zs_forward_range_iter(block_header_by_height, range)
     }
 
     /// Returns the raw [`block::Header`] with [`block::Hash`] or [`Height`], if
@@ -665,32 +563,28 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_tx_loc, &location)
     }
 
-    /// Returns transaction hashes in block and transaction order.
-    #[cfg(feature = "indexer")]
-    pub fn transaction_hashes_by_location_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (TransactionLocation, transaction::Hash)> + '_
-    where
-        R: RangeBounds<TransactionLocation>,
-    {
-        let hash_by_tx_loc = self.db.cf_handle("hash_by_tx_loc").unwrap();
-        self.db.zs_forward_range_iter(hash_by_tx_loc, range)
-    }
-
     /// Returns the [`transaction::Hash`] of the transaction that spent or revealed the given
     /// [`transparent::OutPoint`] or nullifier, if it is spent or revealed in the finalized state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) for a
+    /// [`Spend::OutPoint`] if this database skips transparent indexes, even if a stale spender
+    /// entry exists. Nullifier lookups are always answered.
     #[cfg(feature = "indexer")]
-    pub fn spending_transaction_hash(&self, spend: &Spend) -> Option<transaction::Hash> {
+    pub fn spending_transaction_hash(
+        &self,
+        spend: &Spend,
+    ) -> Result<Option<transaction::Hash>, crate::TransparentIndexesUnavailable> {
         let tx_loc = match spend {
             Spend::OutPoint(outpoint) => self.spending_tx_loc(outpoint)?,
-            Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier)?,
-            Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier)?,
-            Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier)?,
-            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier)?,
+            Spend::Sprout(nullifier) => self.sprout_revealing_tx_loc(nullifier),
+            Spend::Sapling(nullifier) => self.sapling_revealing_tx_loc(nullifier),
+            Spend::Orchard(nullifier) => self.orchard_revealing_tx_loc(nullifier),
+            Spend::Ironwood(nullifier) => self.ironwood_revealing_tx_loc(nullifier),
         };
 
-        self.transaction_hash(tx_loc)
+        Ok(tx_loc.and_then(|tx_loc| self.transaction_hash(tx_loc)))
     }
 
     /// Returns the [`transaction::Hash`]es in the block with `hash_or_height`,
@@ -1056,18 +950,9 @@ impl ZakuraDb {
             .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
             .collect();
 
-        // Get the transparent addresses with changed balances/UTXOs
-        let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
-            .values()
-            .chain(
-                finalized
-                    .new_outputs
-                    .values()
-                    .map(|ordered_utxo| &ordered_utxo.utxo),
-            )
-            .filter_map(|utxo| utxo.output.address(network))
-            .unique()
-            .collect();
+        // Pruned checkpoint sync stops optional index writes in place. A durable marker
+        // keeps them disabled after configuration changes or rollback.
+        let skip_transparent_indexes = self.skips_transparent_indexes();
 
         // Get the current address balances, before the transactions in this block
 
@@ -1104,14 +989,33 @@ impl ZakuraDb {
         // reading all of the pending merge operands (potentially hundreds), and applying pending merge operands to the
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
-        let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+        //
+        // A database without transparent indexes reads and writes no address balances.
+        let address_balances: AddressBalanceLocationUpdates = if skip_transparent_indexes {
+            AddressBalanceLocationUpdates::Insert(HashMap::new())
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            // Get the transparent addresses with changed balances/UTXOs
+            let changed_addresses: HashSet<transparent::Address> = spent_utxos_by_out_loc
+                .values()
+                .chain(
+                    finalized
+                        .new_outputs
+                        .values()
+                        .map(|ordered_utxo| &ordered_utxo.utxo),
+                )
+                .filter_map(|utxo| utxo.output.address(network))
+                .unique()
+                .collect();
+
+            if self.finished_format_upgrades() {
+                AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
+                    self.address_balance_location(addr)
+                }))
+            } else {
+                AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
+                    Some(self.address_balance_location(addr)?.into_new_change())
+                }))
+            }
         };
 
         // Omitted outputs never enter the UTXO set, so their spends delete nothing.
@@ -1138,12 +1042,20 @@ impl ZakuraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
+            skip_transparent_indexes,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
             store_raw_txs,
             precomputed_raw_txs,
             vct_data,
         )?;
+
+        // The first block committed without transparent indexes durably marks the database, in
+        // the same atomic batch. This happens before any raw transaction pruning can start,
+        // because pruning only runs in later commits or later in this batch.
+        if skip_transparent_indexes && self.transparent_indexes_skipped_from().is_none() {
+            batch.prepare_transparent_indexes_skipped_marker_batch(self, finalized.height);
+        }
 
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
@@ -1459,6 +1371,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         address_balances: AddressBalanceLocationUpdates,
+        skip_transparent_indexes: bool,
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
@@ -1504,6 +1417,7 @@ impl DiskWriteBatch {
                 &out_loc_by_outpoint,
                 omitted_outputs,
                 address_balances,
+                skip_transparent_indexes,
             );
         }
 

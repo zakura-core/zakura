@@ -66,10 +66,9 @@ pub(crate) struct InvariantReport {
     /// `cwnd_bytes / body_size`, so it is the clean signal that request depth tracks
     /// the inverse of body size.
     pub(crate) peak_cwnd_requests: u64,
-    /// Lowest per-peer reliability (goodput per-mille, `0..=1000`) observed on any
-    /// `block_body_received` row. `1000` means no peer's request drops ever registered;
-    /// a value below `1000` proves the reliability discount engaged end-to-end for a
-    /// request-dropping carrier.
+    /// Lowest per-peer reliability (goodput per-mille, `0..=1000`) observed on any trace
+    /// row. `1000` means no peer's request drops ever registered; a value below `1000`
+    /// proves the reliability discount engaged end-to-end for a request-dropping carrier.
     pub(crate) min_reliability_permille: u64,
     /// The last per-peer byte cwnd observed in the run (`bbr_cwnd_bytes`, byte unit only),
     /// across `block_body_received` and `block_peer_bbr` heartbeat rows. Paired with
@@ -169,10 +168,10 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .filter_map(|row| u64_field(row, "bbr_cwnd"))
         .max()
         .unwrap_or(0);
-    // Reliability is emitted on both `block_get_blocks_sent` (request time, where it
-    // discounts the cwnd) and `block_body_received` rows, so scan the whole table: a
-    // dropping peer keeps requesting at a falling reliability even when it stops
-    // delivering.
+    // Reliability is emitted on `block_get_blocks_sent` (request time, where it discounts
+    // the cwnd), `block_body_received`, and `block_peer_bbr` rows, so scan the whole
+    // table. A wedged peer may never be asked again after its requests expire; the
+    // `block_peer_bbr` sample taken at each timeout still records the fall.
     let min_reliability_permille = reader
         .table("block_sync")
         .rows()

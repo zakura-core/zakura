@@ -262,13 +262,17 @@ impl QueuedBlocks {
             .expect("replacement hash exists in the queue");
         let replacement = self
             .blocks
-            .get(&hash)
+            .get_mut(&hash)
             .expect("replacement was inserted under the same hash");
         assert_eq!(old.0.height, replacement.0.height);
         assert_eq!(
             old.0.block.header.previous_block_hash,
             replacement.0.block.header.previous_block_hash
         );
+        // A redelivery gets a new verifier receipt once earlier attempts finish.
+        if old.0.block == replacement.0.block {
+            replacement.0.receipt_order = old.0.receipt_order;
+        }
 
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);
@@ -351,11 +355,11 @@ impl SentHashes {
     /// Creates a new [`SentHashes`] with the block hashes and UTXOs in the provided non-finalized state.
     pub fn new(non_finalized_state: &NonFinalizedState) -> Self {
         let mut sent_hashes = Self::default();
-        for (_, block) in non_finalized_state
+        for block in non_finalized_state
             .chain_iter()
-            .flat_map(|c| c.blocks.clone())
+            .flat_map(|c| c.blocks.values())
         {
-            sent_hashes.add(&block.into());
+            sent_hashes.add(&block.as_ref().clone().into());
         }
 
         if !sent_hashes.sent.is_empty() {

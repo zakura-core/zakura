@@ -36,11 +36,15 @@ pub(super) struct Job {
     pub(super) gate: Option<Arc<Semaphore>>,
     /// Run a blocking operation under this probe first.
     pub(super) blocking: Option<Arc<ExecutionProbe>>,
+    /// Let the blocking operation outlive `produce`.
+    pub(super) detach_blocking: bool,
     /// Fail locally after this many parts.
     pub(super) fail_after: Option<u32>,
     /// Return from `produce` after the ending and hold this gate, so the
     /// ending is queued while execution continues.
     pub(super) hold_after: Option<Arc<Semaphore>>,
+    panic_cap: bool,
+    panic_produce: bool,
 }
 
 /// A `Produce` that follows each request's [`Job`].
@@ -52,6 +56,7 @@ impl Produce for Scripted {
     type Message = Probe;
 
     fn response_cap(&self, job: &Job) -> ResponseCap {
+        assert!(!job.panic_cap, "injected dispatch panic");
         ResponseCap {
             frames: job.parts,
             // A part's payload is its bytes plus a one-byte count; the ending
@@ -66,14 +71,16 @@ impl Produce for Scripted {
         lease: WorkLease,
         mut sink: ResponseSink<Probe>,
     ) -> Result<Responded, ServeEnd> {
+        assert!(!job.panic_produce, "injected producer panic");
         if let Some(probe) = job.blocking.clone() {
             let lease = lease.clone();
-            tokio::task::spawn_blocking(move || {
+            let work = tokio::task::spawn_blocking(move || {
                 let _lease = lease;
                 probe.start().finish();
-            })
-            .await
-            .expect("the blocking operation does not panic");
+            });
+            if !job.detach_blocking {
+                work.await.expect("the blocking operation does not panic");
+            }
         }
         if let Some(gate) = &job.gate {
             gate.acquire()
@@ -142,6 +149,8 @@ pub(super) fn session(capacity: &ServeCapacity, peer_n: u8, advertised: u32) -> 
             advertised,
             send,
             cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
         ),
         output,
         cancel,
@@ -387,6 +396,52 @@ async fn cancellation_keeps_the_node_slot_until_the_work_ends() {
     .expect("the slot frees once the blocking operation ends");
 }
 
+#[tokio::test]
+async fn detached_work_keeps_peer_capacity_across_reconnect_after_output_drains() {
+    let capacity = capacity(ServeLimits {
+        peer_execution: 1,
+        node_execution: 2,
+        ..LIMITS
+    });
+    let probe = ExecutionProbe::new(true, false);
+    let _release = probe.release_on_drop();
+    let mut old = session(&capacity, 1, 4);
+    old.serve
+        .admit(Job {
+            blocking: Some(probe.clone()),
+            detach_blocking: true,
+            ..job()
+        })
+        .unwrap();
+    probe.wait_started(1).await;
+    assert_eq!(next(&mut old.output).await, Probe::Done(0));
+    old.cancel.cancel();
+    drop(old);
+    settle().await;
+    assert_eq!(capacity.active_and_waiting(), (0, 0));
+    assert_eq!(capacity.node_output_held(), 0);
+    assert_eq!(capacity.node_output_responses.reserved(), 0);
+    assert_eq!(capacity.node_execution_held(), 1);
+    assert_eq!(probe.snapshot().running, 1);
+
+    let mut new = session(&capacity, 1, 4);
+    new.serve.admit(job()).unwrap();
+    settle().await;
+    assert_eq!(
+        capacity.active_and_waiting(),
+        (0, 1),
+        "the reconnect waits on the old work's peer slot despite a free node slot"
+    );
+    assert!(new.output.try_recv().is_err());
+
+    probe.release();
+    probe.wait_finished(1).await;
+    assert_eq!(next(&mut new.output).await, Probe::Done(0));
+    settle().await;
+    assert_eq!(capacity.node_execution_held(), 0);
+    assert_eq!(capacity.node_output_held(), 0);
+}
+
 /// Record how many node slots are free when the peer slot's waiter wakes.
 struct ObserveNode {
     node: SlotBudget,
@@ -410,7 +465,15 @@ fn the_node_slot_returns_before_the_peer_slot() {
     // find the node slot already returned.
     let peer = SlotBudget::new(1).unwrap();
     let node = SlotBudget::new(1).unwrap();
-    let slots = ExecutionSlots::new(peer.try_reserve().unwrap(), node.try_reserve().unwrap());
+    let slots = ExecutionSlots::new(
+        peer.try_reserve().unwrap(),
+        node.try_reserve().unwrap(),
+        PeerBudgets {
+            output_responses: SlotBudget::new(1).unwrap(),
+            execution: peer.clone(),
+            output: OutputByteBudget::new(1).unwrap(),
+        },
+    );
     let observer = Arc::new(ObserveNode {
         node: node.clone(),
         free_at_wake: AtomicUsize::new(usize::MAX),
@@ -431,7 +494,15 @@ async fn a_non_reading_peer_holds_output_bytes_but_no_execution_slot() {
     // A one-frame output queue that nobody reads.
     let (send, _output) = framed_channel(1);
     let cancel = CancellationToken::new();
-    let serve = capacity.session(Arc::new(Scripted), &peer(1), 4, send, cancel.clone());
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
     for _ in 0..4 {
         serve
             .admit(Job {
@@ -487,7 +558,15 @@ async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
     let (send, output) = framed_channel(1);
     let cancel = CancellationToken::new();
     let mut session = Session {
-        serve: capacity.session(Arc::new(Scripted), &peer(1), 4, send, cancel.clone()),
+        serve: capacity.session(
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send,
+            cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
+        ),
         output,
         cancel,
     };
@@ -568,6 +647,31 @@ async fn response_slots_bound_all_peers_and_survive_session_replacement() {
 }
 
 #[tokio::test]
+async fn a_retired_session_keeps_its_peer_budget_until_output_is_written() {
+    let capacity = capacity(LIMITS);
+    let Session {
+        serve,
+        mut output,
+        cancel,
+    } = session(&capacity, 1, 4);
+    serve.admit(job()).unwrap();
+    settle().await;
+    cancel.cancel();
+    drop(serve);
+    settle().await;
+    let held = capacity.node_output_held();
+    assert!(held > 0, "the ending remains in the transport queue");
+    assert_eq!(
+        capacity.peer_held(&peer(1)),
+        (0, held),
+        "a reconnect must share the budget of the unwritten ending"
+    );
+    assert_eq!(next(&mut output).await, Probe::Done(0));
+    assert!(output.recv().await.is_none());
+    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+}
+
+#[tokio::test]
 async fn a_stalled_produce_on_one_peer_does_not_block_another() {
     let capacity = capacity(ServeLimits {
         peer_execution: 1,
@@ -610,14 +714,27 @@ async fn the_ending_frees_the_commitment_before_execution_ends() {
     let capacity = capacity(LIMITS);
     let session = session(&capacity, 1, 1);
     let hold = Arc::new(Semaphore::new(0));
+    let completed = Completions::default();
+    let completion = completed.track(1);
+    let id = completion.id();
     session
         .serve
-        .admit(Job {
-            hold_after: Some(hold.clone()),
-            ..job()
-        })
+        .admit_tracked(
+            Job {
+                hold_after: Some(hold.clone()),
+                ..job()
+            },
+            completion,
+        )
         .unwrap();
     settle().await;
+    let mut records = Vec::new();
+    completed.drain(|id| records.push(id));
+    assert_eq!(
+        records,
+        [id],
+        "the ending completes before the producer exits"
+    );
     assert_eq!(session.serve.open(), 0);
     assert_eq!(capacity.node_execution_held(), 1);
     hold.add_permits(1);
@@ -683,7 +800,7 @@ fn sink_and_core(
             _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer_budgets: capacity(LIMITS).peer(&peer(1)),
         }),
-        Commitment(commitments.clone()),
+        Commitment(Some(commitments.clone()), None),
     );
     let core = Arc::new(Mutex::new(core));
     (ResponseSink::new(core.clone()), queued, commitments, core)
@@ -691,6 +808,58 @@ fn sink_and_core(
 
 fn open(commitments: &Commitments) -> u32 {
     commitments.open.load(Ordering::Acquire)
+}
+
+#[test]
+fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
+    for tracked in [false, true] {
+        let counts = Arc::new(Commitments {
+            open: AtomicU32::new(1),
+            limit: AtomicU32::new(1),
+        });
+        let completed = Completions::default();
+        let mut old = Commitment(Some(counts.clone()), tracked.then(|| completed.track(1)));
+        let replacement = old
+            .queue_ending(|| {
+                // Publication can wake a writer on another thread before it returns.
+                assert_eq!(counts.open.fetch_add(1, Ordering::AcqRel), 0);
+                Ok::<_, ()>(Commitment(Some(counts.clone()), None))
+            })
+            .unwrap();
+        if tracked {
+            let mut records = Vec::new();
+            completed.drain(|id| records.push(id));
+            assert_eq!(records.len(), 1);
+        }
+        drop(old);
+        assert_eq!(
+            open(&counts),
+            1,
+            "the old commitment must not release twice"
+        );
+        drop(replacement);
+        assert_eq!(open(&counts), 0);
+    }
+}
+
+#[test]
+fn failed_ending_publication_releases_its_commitment_once() {
+    let (sink, queued, counts, core) = sink_and_core(ResponseCap {
+        frames: 1,
+        bytes: 64,
+    });
+    drop(queued);
+    assert!(matches!(
+        sink.finish(&Probe::Done(0)),
+        Err(SinkError::Closed)
+    ));
+    assert_eq!(open(&counts), 0);
+    drop(core);
+    assert_eq!(
+        open(&counts),
+        0,
+        "cleanup must not release an ended lease twice"
+    );
 }
 
 #[test]
@@ -785,4 +954,229 @@ fn a_part_the_row_allows_but_the_cap_refuses_queues_nothing() {
         assert_eq!(result.is_ok(), bytes >= 65 + 4, "cap of {bytes} bytes");
         assert_eq!(queued.try_recv().is_ok(), result.is_ok());
     }
+}
+
+#[tokio::test]
+#[allow(clippy::print_stderr)] // Report the retained-byte measurement with --nocapture.
+async fn queued_requests_allocate_only_commitments_until_dispatch() {
+    const COUNT: u32 = 64_000;
+    // Exercise the production protocol ceiling without starting a producer.
+    const REQUEST: crate::zakura::MessageRule = crate::zakura::MessageRule {
+        role: crate::zakura::MessageRole::Request {
+            max_in_flight: COUNT / 2,
+            cadence: None,
+        },
+        ..GET
+    };
+    let capacity = ServeCapacity::new("queued-memory", &REQUEST, LIMITS).unwrap();
+    let Session {
+        serve,
+        output: _output,
+        cancel,
+    } = session(&capacity, 1, COUNT / 2);
+    let completions = Completions::default();
+    let (_, allocations) = zakura_test::allocations::measure(|| {
+        for key in 0..COUNT {
+            serve
+                .admit_tracked(job(), completions.track(u64::from(key)))
+                .unwrap();
+        }
+    });
+    assert_eq!(serve.open(), COUNT);
+    // Includes queued jobs and completion leases without per-request channels.
+    // A response channel per queued job alone used several KiB per request.
+    let ceiling = usize::try_from(COUNT).unwrap() * 160;
+    assert!(allocations.retained_bytes < ceiling, "{allocations:?}");
+    eprintln!("queued requests={COUNT}, {allocations:?}");
+    cancel.cancel();
+    settle().await;
+    assert_eq!(serve.open(), 0, "cancelled jobs release their commitments");
+    let mut completed = 0;
+    completions.drain(|_| completed += 1);
+    assert_eq!(completed, COUNT);
+}
+
+#[tokio::test]
+async fn serving_output_keeps_a_queue_slot_for_control_messages() {
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(4);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send.clone(),
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    serve
+        .admit(Job {
+            parts: 10,
+            part_len: 1,
+            ..job()
+        })
+        .unwrap();
+    settle().await;
+    let control = crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap();
+    send.try_send(control)
+        .expect("serving must leave room for our control traffic");
+    let mut messages = Vec::new();
+    for _ in 0..12 {
+        messages.push(next(&mut output).await);
+    }
+    assert!(messages[..4].contains(&Probe::Ping(7)));
+    assert_eq!(messages.last(), Some(&Probe::Done(10)));
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
+    for panic_cap in [true, false] {
+        let capacity = capacity(LIMITS);
+        let (send, output) = framed_channel(1);
+        let cancel = CancellationToken::new();
+        let connection = CancellationToken::new();
+        let close_cause = crate::zakura::CloseCause::default();
+        let serve = capacity.session(
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send.clone(),
+            cancel.clone(),
+            connection.clone(),
+            close_cause.clone(),
+        );
+        let completed = Completions::default();
+        let leases = [completed.track(1), completed.track(2), completed.track(3)];
+        let expected = leases.each_ref().map(Completion::id);
+        let [first, panicking, queued] = leases;
+        // The first frame occupies the only queue slot. The writer waits on
+        // the rest of this response and cannot observe dispatch's channel closing.
+        serve
+            .admit_tracked(
+                Job {
+                    parts: 3,
+                    part_len: 8,
+                    ..job()
+                },
+                first,
+            )
+            .unwrap();
+        settle().await;
+        assert_eq!(send.capacity(), 0);
+        assert!(!connection.is_cancelled());
+        serve
+            .admit_tracked(
+                Job {
+                    panic_cap,
+                    panic_produce: !panic_cap,
+                    ..job()
+                },
+                panicking,
+            )
+            .unwrap();
+        serve.admit_tracked(job(), queued).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
+            .await
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+        settle().await;
+        assert_eq!(serve.open(), 0);
+        let mut records = Vec::new();
+        completed.drain(|id| records.push(id));
+        assert_eq!(records.len(), expected.len());
+        for id in expected {
+            assert_eq!(records.iter().filter(|record| **record == id).count(), 1);
+        }
+        drop(output);
+        settle().await;
+        assert_eq!(capacity.node_execution_held(), 0);
+        assert_eq!(capacity.node_output_held(), 0);
+        assert_eq!(capacity.node_output_responses.reserved(), 0);
+        completed.drain(|_| panic!("late task cleanup cannot report completion twice"));
+        let mut healthy = session(&capacity, 2, 4);
+        healthy.serve.admit(job()).unwrap();
+        assert!(matches!(next(&mut healthy.output).await, Probe::Done(0)));
+        assert!(!healthy.cancel.is_cancelled());
+        healthy.cancel.cancel();
+    }
+}
+
+/// A writer spawned by the production session reports cleanup panics to the connection.
+#[tokio::test]
+async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
+    #[derive(Debug)]
+    struct PanicOnDrop;
+    impl crate::zakura::SessionResources for PanicOnDrop {
+        fn admitted(&self) {}
+    }
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("injected writer cleanup panic");
+        }
+    }
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(2);
+    // The ordered writer is the only owner of these session resources.
+    let send = send.with_session_resources(Some(Arc::new(PanicOnDrop)));
+    let cancel = CancellationToken::new();
+    let connection = CancellationToken::new();
+    let close_cause = crate::zakura::CloseCause::default();
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        connection.clone(),
+        close_cause.clone(),
+    );
+    serve.admit(job()).unwrap();
+    assert_eq!(next(&mut output).await, Probe::Done(0));
+    assert!(!connection.is_cancelled());
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
+        .await
+        .unwrap();
+    assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+    assert_eq!(serve.open(), 0);
+}
+
+/// A one-slot legacy queue promises eventual control progress once serving drains.
+#[tokio::test]
+async fn one_slot_serving_drains_before_control_uses_the_slot() {
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send.clone(),
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    serve
+        .admit(Job {
+            parts: 2,
+            part_len: 8,
+            ..job()
+        })
+        .unwrap();
+    for _ in 0..3 {
+        next(&mut output).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        send.send(crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(next(&mut output).await, Probe::Ping(7));
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
 }

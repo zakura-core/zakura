@@ -8,7 +8,6 @@
 use std::{collections::HashMap, time::Duration};
 
 use lazy_static::lazy_static;
-use regex::Regex;
 
 // TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
@@ -411,6 +410,12 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
+/// The most block hashes a Zakura native `FindBlocks` response may carry.
+///
+/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// `zakura-state`; zakurad checks at compile time that the two match.
+pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
+
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 
@@ -438,14 +443,6 @@ lazy_static! {
 
         hash_map
     };
-
-    /// OS-specific error when the port attempting to be opened is already in use.
-    pub static ref PORT_IN_USE_ERROR: Regex = if cfg!(unix) {
-        #[allow(clippy::trivial_regex)]
-        Regex::new(&regex::escape("already in use"))
-    } else {
-        Regex::new("(access a socket in a way forbidden by its access permissions)|(Only one usage of each socket address)")
-    }.expect("regex is valid");
 }
 
 /// The timeout for DNS lookups.

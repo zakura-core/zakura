@@ -212,7 +212,6 @@ class SpentnessReleaseTests(unittest.TestCase):
                 base + "latest.json",
                 self.root / "fetched",
                 self.root / "fetched.json",
-                48,
                 fetch=fetch,
                 now=datetime(2026, 9, 10, tzinfo=timezone.utc),
                 minimum_schema=hints.minimum_bundle_schema(repo),
@@ -419,7 +418,6 @@ class SpentnessReleaseTests(unittest.TestCase):
             "latest_url": base + "latest.json",
             "output_dir": self.root / "fetched",
             "metadata_out": self.root / "resolution.json",
-            "max_age_hours": 48,
             "fetch": fetch,
             "now": datetime(2026, 9, 10, tzinfo=timezone.utc),
         }

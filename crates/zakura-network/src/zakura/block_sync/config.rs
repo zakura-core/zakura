@@ -92,8 +92,8 @@ pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
-/// Default block-sync status refresh interval after local frontier changes.
-pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound tip-growth advertisements so peers can promptly request new block bodies.
+pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Default tolerated size-hint deviation percentage before a peer is reported.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.
@@ -246,20 +246,20 @@ pub struct ZakuraBlockSyncConfig {
     /// `DESERIALIZED_MEM_FACTOR` times their wire size.
     pub max_reorder_lookahead_bytes: u64,
     /// How long to avoid reassigning an expired floor height to the same peer.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub floor_peer_avoid_cooldown: Duration,
     /// Depth for block-sync action/body channels, clamped to at least one full
     /// checkpoint range.
     pub max_submitted_block_applies: usize,
     /// Timeout for an outstanding block-body range request.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub request_timeout: Duration,
     /// Short leash on a floor request before its height is rescued to a faster
     /// carrier. Clamped positive and never above `request_timeout`.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub floor_rescue_timeout: Duration,
     /// How long to withhold a block-sync session after it makes no accepted block progress.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub no_progress_peer_cooldown: Duration,
     /// `GetBlocks` requests an unproven peer may receive before its first accepted body,
     /// so a peer that accepts requests but never serves bodies can't spend a full BBR
@@ -270,7 +270,7 @@ pub struct ZakuraBlockSyncConfig {
     /// deadline parks its block-sync session.
     pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
     pub size_deviation_tolerance: u32,
@@ -281,16 +281,16 @@ pub struct ZakuraBlockSyncConfig {
     /// max-filter already adopts higher delivery rates without an explicit up-probe).
     pub bbr_probe_bw_gain_percent: u32,
     /// How often to enter ProbeRTT to refresh the min-RTT estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_probe_rtt_interval: Duration,
     /// How long to hold the drained cwnd during ProbeRTT.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_probe_rtt_duration: Duration,
     /// Windowed-min horizon for the RTprop (min-RTT) estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_rtprop_window: Duration,
     /// Max-filter horizon for the delivery-rate (BtlBw) estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_delivery_rate_window: Duration,
     /// Per-RTT Startup cwnd growth, percent. Reserved: there is no separate Startup ramp
     /// phase yet, so this knob is currently inert (cold start uses

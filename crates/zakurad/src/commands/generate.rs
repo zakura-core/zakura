@@ -58,14 +58,14 @@ impl Runnable for GenerateCmd {
 #
 # 4. Hard-coded defaults (lowest precedence)
 #
-# The user's preference directory and the default path to the `zakurad` config are platform dependent,
-# based on `dirs::preference_dir`, see https://docs.rs/dirs/latest/dirs/fn.preference_dir.html :
+# The user's preference directory and the default path to the `zakurad` config
+# are platform dependent:
 #
 # | Platform | Value                                 | Example                                        |
 # | -------- | ------------------------------------- | ---------------------------------------------- |
 # | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
 # | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
-# | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
+# | Windows  | `{FOLDERID_LocalAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
 
 "
         .to_owned();

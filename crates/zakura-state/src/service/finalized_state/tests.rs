@@ -19,6 +19,7 @@ mod prop;
 mod rollback;
 mod spentness;
 mod transparent;
+mod transparent_indexes;
 mod vectors;
 
 /// Generates exactly the valid-commitment block prefix a finalized-state test

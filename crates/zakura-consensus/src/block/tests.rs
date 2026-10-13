@@ -4,7 +4,6 @@
 
 use chrono::DateTime;
 use color_eyre::eyre::{eyre, Report};
-use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{amount::NegativeAllowed, ironwood};
@@ -32,110 +31,12 @@ use zakura_chain::{
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
 use zakura_script::Sigops;
-use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use crate::{block::check::subsidy_is_valid, transaction};
 
 use super::*;
 
 mod nsm_fees;
-
-static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
-    Lazy::new(|| {
-        let block: Arc<_> =
-            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap()
-                .into();
-        let hash = Ok(block.as_ref().into());
-        vec![(Request::Commit(block), hash)]
-    });
-
-static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let mut block: Block =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-
-    // Modify the block's time
-    // Changing the block header also invalidates the header hashes, but
-    // those checks should be performed later in validation, because they
-    // are more expensive.
-    let three_hours_in_the_future = Utc::now()
-        .checked_add_signed(chrono::Duration::hours(3))
-        .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
-        .unwrap();
-    Arc::make_mut(&mut block.header).time = three_hours_in_the_future;
-
-    vec![(
-        Request::Commit(Arc::new(block)),
-        Err(ExpectedTranscriptError::Any),
-    )]
-});
-
-static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let mut block: Block =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-
-    // Change nonce to something invalid
-    Arc::make_mut(&mut block.header).nonce = [0; 32].into();
-
-    vec![(
-        Request::Commit(Arc::new(block)),
-        Err(ExpectedTranscriptError::Any),
-    )]
-});
-
-static INVALID_COINBASE_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let header = block::Header::zcash_deserialize(&zakura_test::vectors::DUMMY_HEADER[..]).unwrap();
-
-    // Test 1: Empty transaction
-    let block1 = Block {
-        header: header.into(),
-        transactions: Vec::new(),
-    };
-
-    // Test 2: Transaction at first position is not coinbase
-    let mut transactions = Vec::new();
-    let tx = zakura_test::vectors::DUMMY_TX1
-        .zcash_deserialize_into()
-        .unwrap();
-    transactions.push(tx);
-    let block2 = Block {
-        header: header.into(),
-        transactions,
-    };
-
-    // Test 3: Invalid coinbase position
-    let mut block3 =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-    assert_eq!(block3.transactions.len(), 1);
-
-    // Extract the coinbase transaction from the block
-    let coinbase_transaction = block3.transactions.first().unwrap().clone();
-
-    // Add another coinbase transaction to block
-    block3.transactions.push(coinbase_transaction);
-    assert_eq!(block3.transactions.len(), 2);
-
-    vec![
-        (
-            Request::Commit(Arc::new(block1)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-        (
-            Request::Commit(Arc::new(block2)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-        (
-            Request::Commit(Arc::new(block3)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-    ]
-});
 
 fn prepared_test_verifier(
     network: &Network,
@@ -301,7 +202,6 @@ where
         .expect("the verifier is ready")
         .call(Request::Prepare {
             block,
-            work_id: Some("work".to_owned()),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await
@@ -383,24 +283,51 @@ async fn mined_orphan_replays_skip_transaction_verification() {
         panic!("orphan replay must not reach transaction verification")
     });
     let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
-    for _ in 0..3 {
-        let result = verifier
-            .ready()
-            .await
-            .unwrap()
-            .call(Request::CommitMined {
-                block: candidate.clone(),
-                work_id: None,
-                admission: zs::BlockAdmission::pending(),
-            })
-            .await;
-        assert!(matches!(
-            result,
-            Err(VerifyBlockError::Commit(
-                zs::CommitBlockError::MissingMinedParent
-            ))
-        ));
-    }
+    let result = verifier
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::CommitMined {
+            block: candidate,
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Commit(
+            zs::CommitBlockError::MissingMinedParent
+        ))
+    ));
+}
+
+/// Prepares `candidate`, then commits it with `solve` applied, and checks the resulting error.
+///
+/// A cache hit skips full semantic verification, so every header field a solution may set has to
+/// be rechecked on the fast path. Each of these tests changes one of them.
+async fn assert_prepared_commit_rejects(
+    network: &Network,
+    candidate: Arc<Block>,
+    solve: impl FnOnce(&mut Block),
+    expected: impl Fn(&VerifyBlockError) -> bool,
+) {
+    let mut verifier = prepared_test_verifier(network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    solve(&mut solved);
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    let error = result.expect_err("the recheck rejects the solved block");
+    assert!(expected(&error), "unexpected recheck error: {error:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -463,34 +390,62 @@ async fn prepared_mined_commit_rechecks_equihash() {
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .expect("the genesis block deserializes"),
     );
+
+    assert_prepared_commit_rejects(
+        &network,
+        candidate,
+        |solved| {
+            Arc::make_mut(&mut solved.header).solution =
+                zakura_chain::work::equihash::Solution::for_proposal_for_network(&Network::Mainnet);
+            let height = solved
+                .coinbase_height()
+                .expect("the candidate has a coinbase height");
+            for nonce in 0u32.. {
+                Arc::make_mut(&mut solved.header).nonce.0[..4]
+                    .copy_from_slice(&nonce.to_le_bytes());
+                let hash = solved.hash();
+                if check::difficulty_is_valid(&solved.header, &Network::Mainnet, &height, &hash)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        },
+        |error| matches!(error, VerifyBlockError::Equihash { .. }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn prepared_mined_commit_rechecks_difficulty() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
     let mut verifier = prepared_test_verifier(&network);
     prepare_for_test(&mut verifier, candidate.clone()).await;
 
     let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).solution =
-        zakura_chain::work::equihash::Solution::for_proposal_for_network(&network);
-    let height = solved
-        .coinbase_height()
-        .expect("the candidate has a coinbase height");
-    for nonce in 0u32.. {
-        Arc::make_mut(&mut solved.header).nonce.0[..4].copy_from_slice(&nonce.to_le_bytes());
-        let hash = solved.hash();
-        if check::difficulty_is_valid(&solved.header, &network, &height, &hash).is_ok() {
-            break;
-        }
-    }
+    Arc::make_mut(&mut solved.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
     let result = verifier
         .ready()
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
+
             admission: zs::BlockAdmission::pending(),
         })
         .await;
 
-    assert!(matches!(result, Err(VerifyBlockError::Equihash { .. })));
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::InvalidDifficulty(_, _)
+        })
+    ));
 }
 
 #[tokio::test]
@@ -498,25 +453,18 @@ async fn prepared_mined_commit_rechecks_header_time() {
     let _init_guard = zakura_test::init();
     let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
     let candidate = Arc::new(nu5_prepared_test_block(&network, None));
-    let mut verifier = prepared_test_verifier(&network);
-    prepare_for_test(&mut verifier, candidate.clone()).await;
 
-    let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).time = Utc::now()
-        .checked_add_signed(chrono::Duration::hours(3))
-        .expect("three hours fits in the supported time range");
-    let result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-
-    assert!(matches!(result, Err(VerifyBlockError::Time(_))));
+    assert_prepared_commit_rejects(
+        &network,
+        candidate,
+        |solved| {
+            Arc::make_mut(&mut solved.header).time = Utc::now()
+                .checked_add_signed(chrono::Duration::hours(3))
+                .expect("three hours fits in the supported time range");
+        },
+        |error| matches!(error, VerifyBlockError::Time(_)),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -527,29 +475,19 @@ async fn prepared_mined_commit_rechecks_transaction_lock_time() {
         .expect("the recent timestamp is valid");
     let mut candidate = nu5_prepared_test_block(&network, Some(LockTime::Time(unlock_time)));
     Arc::make_mut(&mut candidate.header).time = unlock_time + chrono::Duration::seconds(1);
-    let candidate = Arc::new(candidate);
-    let mut verifier = prepared_test_verifier(&network);
-    prepare_for_test(&mut verifier, candidate.clone()).await;
 
-    let mut solved = (*candidate).clone();
-    Arc::make_mut(&mut solved.header).time = unlock_time;
-    let result = verifier
-        .ready()
-        .await
-        .expect("the verifier is ready")
-        .call(Request::CommitMined {
-            block: Arc::new(solved),
-            work_id: Some("work".to_owned()),
-            admission: zs::BlockAdmission::pending(),
-        })
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(VerifyBlockError::Transaction(
-            TransactionError::LockedUntilAfterBlockTime(_)
-        ))
-    ));
+    assert_prepared_commit_rejects(
+        &network,
+        Arc::new(candidate),
+        |solved| Arc::make_mut(&mut solved.header).time = unlock_time,
+        |error| {
+            matches!(
+                error,
+                VerifyBlockError::Transaction(TransactionError::LockedUntilAfterBlockTime(_))
+            )
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -589,7 +527,6 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .expect("the verifier is ready")
         .call(Request::Prepare {
             block: candidate.clone(),
-            work_id: Some("work".to_owned()),
             source: PreparedCandidateSource::ServerTemplate,
         })
         .await;
@@ -605,12 +542,221 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: candidate,
-            work_id: Some("work".to_owned()),
             admission: zs::BlockAdmission::pending(),
         })
         .await;
     assert!(commit_result.is_ok());
     assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+}
+
+/// Counts the work each preparation request costs.
+///
+/// The transaction counter covers script verification and the signature and proof batches; the
+/// proposal counter covers contextual validation against a cloned non-finalized state.
+fn counting_prepared_test_verifier(
+    network: &Network,
+) -> (
+    impl Service<Request, Response = block::Hash, Error = VerifyBlockError>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let transaction_calls = Arc::new(AtomicUsize::new(0));
+    let proposal_calls = Arc::new(AtomicUsize::new(0));
+    let transaction = service_fn({
+        let transaction_calls = transaction_calls.clone();
+        move |request| {
+            transaction_calls.fetch_add(1, Ordering::Relaxed);
+            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+        }
+    });
+    let state = service_fn({
+        let proposal_calls = proposal_calls.clone();
+        move |request: zs::Request| {
+            let proposal_calls = proposal_calls.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckBlockProposalValidity(_) => {
+                        proposal_calls.fetch_add(1, Ordering::Relaxed);
+                        zs::Response::ValidBlockProposal
+                    }
+                    _ => panic!("reuse test received an unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            }
+        }
+    });
+
+    let verifier = SemanticBlockVerifier::new(network, state, transaction);
+    (verifier, transaction_calls, proposal_calls)
+}
+
+async fn prepare_server_candidate<V>(verifier: &mut V, block: Arc<Block>)
+where
+    V: Service<Request, Response = block::Hash, Error = VerifyBlockError>,
+{
+    verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block,
+
+            source: PreparedCandidateSource::ServerTemplate,
+        })
+        .await
+        .expect("the candidate prepares successfully");
+}
+
+/// A miner polling an unchanged tip and mempool must not make the node prepare the same
+/// candidate again.
+///
+/// Every template response carries a fresh random work ID, so without reuse each poll re-runs
+/// script verification, the signature batches and proposal validation for transactions the node
+/// has already prepared.
+#[tokio::test]
+async fn unchanged_server_template_polls_reuse_the_prepared_candidate() {
+    use std::sync::atomic::Ordering;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let (mut verifier, transaction_calls, proposal_calls) =
+        counting_prepared_test_verifier(&network);
+
+    prepare_server_candidate(&mut verifier, candidate.clone()).await;
+    let transactions_after_first = transaction_calls.load(Ordering::Relaxed);
+    assert_eq!(transactions_after_first, candidate.transactions.len());
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 1);
+
+    // A later poll of the same template content, under a new work ID.
+    prepare_server_candidate(&mut verifier, candidate.clone()).await;
+    assert_eq!(
+        transaction_calls.load(Ordering::Relaxed),
+        transactions_after_first,
+        "an unchanged template must not be verified again",
+    );
+    assert_eq!(
+        proposal_calls.load(Ordering::Relaxed),
+        1,
+        "an unchanged template must not be validated against the state again",
+    );
+
+    // A template whose content changed is prepared as usual.
+    let mut changed = (*candidate).clone();
+    Arc::make_mut(&mut changed.header).previous_block_hash = block::Hash([9; 32]);
+    prepare_server_candidate(&mut verifier, Arc::new(changed)).await;
+    assert!(
+        transaction_calls.load(Ordering::Relaxed) > transactions_after_first,
+        "a changed template is verified",
+    );
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 2);
+}
+
+/// A client proposal's response is a verdict the client acts on, so it is verified even when an
+/// equivalent server candidate is already prepared.
+#[tokio::test]
+async fn a_client_proposal_is_verified_even_when_a_server_candidate_matches() {
+    use std::sync::atomic::Ordering;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let (mut verifier, transaction_calls, proposal_calls) =
+        counting_prepared_test_verifier(&network);
+
+    prepare_server_candidate(&mut verifier, candidate.clone()).await;
+    let transactions_after_server = transaction_calls.load(Ordering::Relaxed);
+
+    verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block: candidate,
+
+            source: PreparedCandidateSource::ClientProposal,
+        })
+        .await
+        .expect("the proposal is valid");
+
+    assert!(
+        transaction_calls.load(Ordering::Relaxed) > transactions_after_server,
+        "a client proposal is verified even when a server candidate matches",
+    );
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
+    const SERVER_CANDIDATE_LIMIT: u32 = 24;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+            ),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            _ => panic!("cache-eviction test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let resolved = candidate.clone();
+    for index in 0..=SERVER_CANDIDATE_LIMIT {
+        let mut replacement = (*candidate).clone();
+        Arc::make_mut(&mut replacement.header).version = index.saturating_add(5);
+        verifier.prepared_candidates.insert(
+            prepared::CandidateId::of(&replacement, &network),
+            PreparedCandidateSource::ServerTemplate,
+            zs::SemanticallyVerifiedBlock::from(Arc::new(replacement)),
+        );
+    }
+    assert!(verifier
+        .prepared_candidates
+        .lookup(&candidate, &network)
+        .is_none());
+
+    let mut tampered = (*resolved).clone();
+    let extra_transaction: Transaction = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .expect("the dummy transaction deserializes");
+    tampered.transactions.push(Arc::new(extra_transaction));
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(tampered),
+
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::BadMerkleRoot { .. }
+        })
+    ));
 }
 
 #[tokio::test]
@@ -657,60 +803,118 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .expect("the verifier is ready")
         .call(Request::Prepare {
             block: conflicting_proposal.clone(),
-            work_id: Some("work".to_owned()),
             source: PreparedCandidateSource::ClientProposal,
         })
         .await;
     assert!(proposal_result.is_ok());
     assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
 
+    let admission = zs::BlockAdmission::pending();
     let commit_result = verifier
         .ready()
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
             block: conflicting_proposal,
-            work_id: Some("work".to_owned()),
-            admission: zs::BlockAdmission::pending(),
+            admission: admission.clone(),
         })
         .await;
     assert!(commit_result.is_ok());
+    assert!(
+        !admission.optimistic_relay_authorized(),
+        "a proposal-only candidate stays commit-first"
+    );
     assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
 }
 
-// TODO: enable this test after implementing contextual verification
-// #[tokio::test]
-// #[ignore]
-#[allow(dead_code)]
-async fn check_transcripts_test() -> Result<(), Report> {
-    check_transcripts().await
-}
+#[tokio::test]
+async fn prepared_and_full_commits_produce_the_same_state_input() {
+    use std::sync::Mutex;
 
-#[allow(dead_code)]
-#[spandoc::spandoc]
-async fn check_transcripts() -> Result<(), Report> {
+    let state_service = |committed: Arc<Mutex<Option<zs::SemanticallyVerifiedBlock>>>| {
+        service_fn(move |request: zs::Request| {
+            let committed = committed.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                        (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                    ),
+                    zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                    zs::Request::CheckPreparedMinedRelayEligibility(_) => {
+                        zs::Response::PreparedMinedRelayEligibility(
+                            zs::PreparedMinedRelayEligibility::CommitFirst,
+                        )
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block)
+                    | zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                        let hash = block.hash;
+                        *committed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::Committed(hash)
+                    }
+                    _ => {
+                        panic!("equivalence test received an unexpected state request: {request:?}")
+                    }
+                };
+                Ok(response)
+            }
+        })
+    };
+
     let _init_guard = zakura_test::init();
-
     let network = Network::Mainnet;
-    let state_service = zakura_state::init_test(&network).await;
-
-    let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
-    let transaction = Buffer::new(BoxService::new(transaction), 1);
-    let block_verifier = Buffer::new(
-        SemanticBlockVerifier::new(&network, state_service.clone(), transaction),
-        1,
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
     );
+    let full_commit = Arc::new(Mutex::new(None));
+    let prepared_commit = Arc::new(Mutex::new(None));
+    let transaction = || {
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) })
+    };
 
-    for transcript_data in &[
-        &VALID_BLOCK_TRANSCRIPT,
-        &INVALID_TIME_BLOCK_TRANSCRIPT,
-        &INVALID_HEADER_SOLUTION_TRANSCRIPT,
-        &INVALID_COINBASE_TRANSCRIPT,
-    ] {
-        let transcript = Transcript::from(transcript_data.iter().cloned());
-        transcript.check(block_verifier.clone()).await.unwrap();
-    }
-    Ok(())
+    let mut full_verifier =
+        SemanticBlockVerifier::new(&network, state_service(full_commit.clone()), transaction());
+    let full_hash = full_verifier
+        .ready()
+        .await
+        .expect("the full verifier is ready")
+        .call(Request::Commit(block.clone()))
+        .await
+        .expect("full verification commits the block");
+
+    let mut prepared_verifier = SemanticBlockVerifier::new(
+        &network,
+        state_service(prepared_commit.clone()),
+        transaction(),
+    );
+    prepare_for_test(&mut prepared_verifier, block.clone()).await;
+    let prepared_hash = prepared_verifier
+        .ready()
+        .await
+        .expect("the prepared verifier is ready")
+        .call(Request::CommitMined {
+            block,
+
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await
+        .expect("prepared verification commits the block");
+
+    assert_eq!(prepared_hash, full_hash);
+
+    // Each submission takes a fresh process-wide receipt order, so compare the rest.
+    let take_commit = |commit: &Mutex<Option<zs::SemanticallyVerifiedBlock>>| {
+        let mut block = commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the verifier committed the block");
+        assert!(block.receipt_order.take().is_some());
+        block
+    };
+    assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
 }
 
 #[test]
@@ -1629,7 +1833,7 @@ fn legacy_sigops_count_for_large_generated_blocks() {
     let block = large_single_transaction_block_many_inputs();
     let mut legacy_sigop_count = 0;
     for tx in block.transactions {
-        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        let tx_sigop_count = tx.sigops();
         assert_eq!(tx_sigop_count, 0);
         legacy_sigop_count += tx_sigop_count;
     }
@@ -1639,7 +1843,7 @@ fn legacy_sigops_count_for_large_generated_blocks() {
     let block = large_multi_transaction_block();
     let mut sigops = 0;
     for tx in block.transactions {
-        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        let tx_sigop_count = tx.sigops();
         assert_eq!(tx_sigop_count, 1);
         sigops += tx_sigop_count;
     }
@@ -1660,7 +1864,7 @@ fn legacy_sigops_count_for_historic_blocks() {
             .zcash_deserialize_into()
             .expect("block test vector is valid");
         for tx in block.transactions {
-            sigops += tx.sigops().expect("unexpected invalid sigop count");
+            sigops += tx.sigops();
         }
 
         // Test that historic blocks pass the sigops check.
@@ -2207,6 +2411,92 @@ fn zip234_test_block(
     block
 }
 
+/// A server template's verification does not report completion while its own checks still run.
+///
+/// The response to a server-template preparation is what the mining RPC uses to decide that this
+/// block's verification is over, and it bounds speculative work on that. Returning the first
+/// transaction error would abandon the checks still in flight without stopping the batch work
+/// they dispatched, so the RPC would release its one speculative worker while compute continues
+/// and let the next preparation overlap it.
+#[tokio::test]
+async fn a_server_template_error_waits_for_the_checks_it_dispatched() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    // Two transactions: the coinbase, and one that this test holds.
+    let candidate = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let held_finished = Arc::new(AtomicBool::new(false));
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+            }
+            _ => panic!("the drain test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction = {
+        let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+        let held_finished = held_finished.clone();
+        service_fn(move |request: tx::Request| {
+            let tx::Request::Block { transaction, .. } = &request else {
+                panic!("the drain test received a mempool transaction request");
+            };
+            let is_coinbase = transaction.is_coinbase();
+            let released = released.clone();
+            let held_finished = held_finished.clone();
+            async move {
+                if is_coinbase {
+                    // The failing check returns straight away.
+                    return Err::<tx::Response, BoxError>("invalid coinbase".into());
+                }
+                // The check still in flight, standing in for dispatched batch work.
+                if let Some(receiver) = released.lock().await.take() {
+                    let _ = receiver.await;
+                }
+                held_finished.store(true, Ordering::SeqCst);
+                Ok(accept_block_transaction(request))
+            }
+        })
+    };
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    let preparation = tokio::spawn(verifier.ready().await.expect("the verifier is ready").call(
+        Request::Prepare {
+            block: candidate,
+            source: PreparedCandidateSource::ServerTemplate,
+        },
+    ));
+
+    // The failing check has returned, but the other one has not.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !preparation.is_finished(),
+        "the preparation must not report completion while a check it dispatched still runs",
+    );
+
+    release.send(()).expect("the held check is still running");
+    let result = preparation
+        .await
+        .expect("the preparation task does not panic");
+
+    assert!(
+        held_finished.load(Ordering::SeqCst),
+        "every dispatched check finished before the error was reported",
+    );
+    assert!(matches!(result, Err(VerifyBlockError::Transaction(_))));
+}
+
 /// A retry must observe the queued commit's outcome before reporting a duplicate.
 #[tokio::test(start_paused = true)]
 async fn pending_commit_retry_waits_for_state_outcome() {
@@ -2666,4 +2956,236 @@ mod zip218_shielded_action_limits {
             sapling_shielded_data: None,
         })
     }
+}
+
+#[tokio::test]
+async fn malformed_headers_do_not_stop_buffered_verification() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| async move {
+        assert!(matches!(request, zs::Request::KnownBlock(requested) if requested == hash));
+        Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::Finalized)))
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("malformed headers and committed duplicates stop before transaction verification")
+    });
+    let verifier = Buffer::new(
+        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+        1,
+    );
+
+    for (version, time) in [
+        (3, block.header.time),
+        (1 << 31, block.header.time),
+        (4, DateTime::from_timestamp(-1, 0).unwrap()),
+        (
+            4,
+            DateTime::from_timestamp(i64::from(u32::MAX) + 1, 0).unwrap(),
+        ),
+    ] {
+        let mut malformed = block.as_ref().clone();
+        let header = Arc::make_mut(&mut malformed.header);
+        header.version = version;
+        header.time = time;
+        let malformed = Arc::new(malformed);
+        for request in [
+            Request::Commit(malformed.clone()),
+            Request::CommitMined {
+                block: malformed,
+                admission: zs::BlockAdmission::pending(),
+            },
+        ] {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                verifier.clone().oneshot(request),
+            )
+            .await
+            .expect("malformed headers must return without waiting on state")
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<VerifyBlockError>(),
+                Some(VerifyBlockError::Block {
+                    source: BlockError::InvalidHeaderEncoding(_),
+                })
+            ));
+        }
+    }
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        verifier.oneshot(Request::Commit(block)),
+    )
+    .await
+    .expect("the verifier worker must still accept subsequent requests")
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<VerifyBlockError>(),
+        Some(VerifyBlockError::Block {
+            source: BlockError::AlreadyInChain(duplicate, zs::KnownBlock::Finalized),
+        }) if *duplicate == hash
+    ));
+}
+
+#[tokio::test]
+async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    let _init_guard = zakura_test::init();
+    for cache_hit in [false, true] {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let state = service_fn({
+            let received = received.clone();
+            move |request: zs::Request| {
+                let received = received.clone();
+                async move {
+                    let response = match request {
+                        zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                            (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                        ),
+                        zs::Request::CheckBlockProposalValidity(block) => {
+                            assert!(block.receipt_order.is_none());
+                            zs::Response::ValidBlockProposal
+                        }
+                        zs::Request::CheckParentInputs { .. } => {
+                            zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                        }
+                        zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
+                            block, ..
+                        } => {
+                            received.lock().unwrap().push(
+                                block
+                                    .receipt_order
+                                    .expect("solved submissions have receipt order"),
+                            );
+                            zs::Response::Committed(block.hash)
+                        }
+                        _ => panic!("unexpected receipt-order test request: {request:?}"),
+                    };
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let transaction_calls = Arc::new(AtomicUsize::new(0));
+        let transaction = service_fn({
+            let calls = transaction_calls.clone();
+            move |request| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+            }
+        });
+        let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        if cache_hit {
+            verifier
+                .call(Request::Prepare {
+                    block: candidate.clone(),
+                    source: PreparedCandidateSource::ClientProposal,
+                })
+                .await
+                .unwrap();
+        }
+        let request = || Request::CommitMined {
+            block: candidate.clone(),
+            admission: zs::BlockAdmission::pending(),
+        };
+        let early = verifier.call(request());
+        let late = verifier.call(request());
+        late.await.unwrap();
+        early.await.unwrap();
+        let receipts = received.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts[1], receipts[0],
+            "overlapping copies share their first receipt"
+        );
+        assert_eq!(
+            transaction_calls.load(Ordering::Relaxed),
+            if cache_hit { 1 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for cache_hit in [false, true] {
+            let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            state
+                .clone()
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                    genesis.clone().into(),
+                ))
+                .await
+                .unwrap();
+            let mut a = nu5_prepared_test_block(&network, None);
+            let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                &a.auth_data_root(),
+            );
+            let header = Arc::make_mut(&mut a.header);
+            header.previous_block_hash = genesis.hash();
+            header.time = genesis.header.time + chrono::Duration::seconds(150);
+            header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+            let a = Arc::new(a);
+            let mut b = a.as_ref().clone();
+            Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+            let b = Arc::new(b);
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let mut verifier = SemanticBlockVerifier::new(&network, state.clone(), transaction);
+            if cache_hit {
+                for block in [a.clone(), b.clone()] {
+                    verifier
+                        .call(Request::Prepare {
+                            block,
+                            source: PreparedCandidateSource::ClientProposal,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            // A arrives first but its first verification is held. B and the
+            // duplicate A finish before it, using the real state's deduplication.
+            let early_a = verifier.call(Request::Commit(a.clone()));
+            let later_b = verifier.call(Request::CommitMined {
+                block: b.clone(),
+                admission: zs::BlockAdmission::pending(),
+            });
+            let duplicate_a = verifier.call(Request::CommitMined {
+                block: Arc::new(a.as_ref().clone()),
+                admission: zs::BlockAdmission::pending(),
+            });
+            later_b.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(b.hash()));
+            duplicate_a.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+            assert!(early_a.await.unwrap_err().is_duplicate_request());
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+
+            // Cancellation releases an unpolled request's registration.
+            let mut c = a.as_ref().clone();
+            Arc::make_mut(&mut c.header).nonce.0[1] ^= 1;
+            let c = Arc::new(c);
+            let cancelled = verifier.call(Request::Commit(c.clone()));
+            drop(cancelled);
+            verifier.call(Request::Commit(c)).await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+        }
+    })
+    .await
+    .expect("duplicate receipt regression must finish");
 }

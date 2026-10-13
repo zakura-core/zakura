@@ -258,9 +258,9 @@ Completed databases need no bitmap and no recognized commitment. Startup checks
 only their chain identity and revocation. Unknown or revoked commitments stop
 incomplete runs with a compatibility error.
 
-Database format 30.0.0 gives this construction a separate major-version
-directory. The existing upgrade mechanism reuses ordinary format-29 data. Older
-binaries do not open format-30 data as ordinary state. Incomplete runs also
+Database format 31.0.0 gives this construction a separate major-version
+directory. The existing upgrade mechanism reuses ordinary format-30 data. Older
+binaries do not open format-31 data as ordinary state. Incomplete runs also
 require the same database format and indexer feature when they resume.
 
 Read-only opens, exports, offline pruning, and offline rollback reject incomplete

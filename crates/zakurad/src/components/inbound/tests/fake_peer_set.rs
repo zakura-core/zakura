@@ -57,8 +57,7 @@ use InventoryResponse::*;
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
-    // Let background gossip tasks arm their timers before this paused runtime
-    // advances to the next gossip deadline.
+    // Let background gossip tasks run, then wait out the transaction gossip delay.
     tokio::task::yield_now().await;
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
 }
@@ -591,7 +590,9 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+// Use real time until the expected gossip is observed. The state writer acknowledges
+// commits before publishing tips, so a paused clock can reach the gossip timeout first.
+#[tokio::test(flavor = "current_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -890,6 +891,9 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             ),
         };
     }
+
+    // All commits and expected gossip are done, so the quiet check can use virtual time.
+    tokio::time::pause();
 
     // check that nothing unexpected happened
     peer_set.expect_no_requests().await;
@@ -1408,7 +1412,7 @@ async fn setup_with_misbehavior_receiver(
     // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
     // which is called by the gossip_best_tip_block_hashes task once the chain tip changes.
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &MempoolConfig::default(),
         false,
@@ -1419,7 +1423,8 @@ async fn setup_with_misbehavior_receiver(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
+        misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Pretend we're close to tip
@@ -1484,7 +1489,6 @@ async fn setup_with_misbehavior_receiver(
     let inbound_service = BoxService::new(inbound_service);
     let inbound_service = ServiceBuilder::new().buffer(1).service(inbound_service);
 
-    let (misbehavior_sender, misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: buffered_peer_set,

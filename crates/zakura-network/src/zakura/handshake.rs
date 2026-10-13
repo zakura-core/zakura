@@ -21,8 +21,12 @@ pub const P2P_V2_UPGRADE_COMMAND: &str = "p2pv2up";
 /// The padded Zcash command used for Zakura upgrade prelude messages.
 pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 
-/// The ALPN for the Iroh 1.x Zakura transport cohort.
-pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/2";
+/// The ALPN for the zakura-quic transport (SPEC WIRE-2).
+///
+/// Its suffix is [`ZAKURA_PROTOCOL_VERSION_CURRENT`]. Version 3 replaced the
+/// Iroh 1.x wire profile of `p2p-v2/2`, so nodes on different versions reach
+/// each other only over the legacy protocol.
+pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/3";
 
 /// Magic bytes for Zakura legacy upgrade prelude messages.
 pub const PRELUDE_MAGIC: [u8; 8] = *b"ZAKURA1\0";
@@ -39,14 +43,58 @@ pub const STREAM_PRELUDE_MAGIC: [u8; 4] = *b"ZKST";
 /// The only prelude encoding version supported by this implementation.
 pub const PRELUDE_VERSION: u16 = 1;
 
-/// The only control handshake encoding version supported by this implementation.
+/// The control handshake encoding version this implementation writes.
+///
+/// It is the minimum version a peer's control hello and ack must carry. Control
+/// messages are append-only: a later release adds fields after the fields this
+/// version knows and raises the version, and this release parses its known prefix
+/// and ignores the rest. A change that an older release cannot parse that way is a
+/// hard break and needs a new Zakura protocol version and ALPN.
 pub const CONTROL_VERSION: u16 = 1;
 
 /// The first Zakura wire protocol version.
 pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
 
-/// Iroh 1.x requires a separate cohort from the incompatible Iroh 0.92 transport.
-pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 2;
+/// The oldest Zakura wire protocol version the native transport speaks.
+///
+/// A node offers one ALPN per version from [`ZAKURA_PROTOCOL_VERSION_CURRENT`]
+/// down to this one, and the negotiated ALPN selects the version. A release
+/// that adds version N+1 while it still speaks N keeps this at N, so the two
+/// cohorts keep connecting natively; a hard break raises it.
+pub const ZAKURA_PROTOCOL_VERSION_MIN_NATIVE: u16 = 3;
+
+/// Returns the ALPN that selects a native Zakura protocol version.
+pub fn p2p_v2_alpn(version: u16) -> Vec<u8> {
+    format!("p2p-v2/{version}").into_bytes()
+}
+
+/// Returns the native ALPNs this node speaks, newest first.
+pub fn supported_p2p_v2_alpns() -> Vec<Vec<u8>> {
+    (ZAKURA_PROTOCOL_VERSION_MIN_NATIVE..=ZAKURA_PROTOCOL_VERSION_CURRENT)
+        .rev()
+        .map(p2p_v2_alpn)
+        .collect()
+}
+
+/// Returns the protocol version a negotiated ALPN selects, if this node
+/// speaks it.
+pub fn zakura_protocol_for_alpn(alpn: &[u8]) -> Option<u16> {
+    let version = std::str::from_utf8(alpn.strip_prefix(b"p2p-v2/")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    (p2p_v2_alpn(version) == alpn
+        && (ZAKURA_PROTOCOL_VERSION_MIN_NATIVE..=ZAKURA_PROTOCOL_VERSION_CURRENT)
+            .contains(&version))
+    .then_some(version)
+}
+
+/// The current Zakura wire protocol version, which [`P2P_V2_ALPN`] carries.
+///
+/// The legacy upgrade prelude advertises it, so a node on another native
+/// transport version stays on the legacy protocol instead of dialing a QUIC
+/// profile it can't speak. Version 2 was Iroh 1.x; version 3 is zakura-quic.
+pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 3;
 
 /// Hard cap for any legacy TCP upgrade prelude payload.
 pub const MAX_PRELUDE_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -209,7 +257,7 @@ impl ZakuraHandshakeConfig {
     pub fn for_network(network: &Network) -> Self {
         Self {
             prelude_version: PRELUDE_VERSION,
-            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_MIN_NATIVE,
             zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: ZakuraNetworkId::from_network(network),
             chain_id: network.genesis_hash().0,
@@ -945,6 +993,9 @@ impl ZakuraControlHello {
     }
 
     /// Decodes this control hello with the hard control cap.
+    ///
+    /// Bytes after the known fields are fields from a newer control version, so the
+    /// decoder ignores them.
     pub fn decode(bytes: &[u8]) -> Result<Self, ZakuraProtocolError> {
         if bytes.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(ZakuraProtocolError::OversizedPayload {
@@ -974,7 +1025,6 @@ impl ZakuraControlHello {
         let capabilities = reader.read_u64::<LittleEndian>()?;
         let required_channels = reader.read_u64::<LittleEndian>()?;
         let initial_limits = ZakuraInitialLimits::decode_from(&mut reader)?;
-        reject_trailing(bytes, &reader)?;
 
         Ok(Self {
             magic,
@@ -1003,7 +1053,7 @@ impl ZakuraControlHello {
         if self.magic != CONTROL_HELLO_MAGIC {
             return Err(ZakuraValidationError::MalformedControl);
         }
-        if self.control_version != CONTROL_VERSION {
+        if self.control_version < CONTROL_VERSION {
             return Err(ZakuraValidationError::UnsupportedVersion("control"));
         }
         if self.selected_zakura_protocol != expected.selected_zakura_protocol {
@@ -1126,6 +1176,9 @@ impl ZakuraControlAck {
     }
 
     /// Decodes this control ack with the hard control cap.
+    ///
+    /// Bytes after the known fields are fields from a newer control version, so the
+    /// decoder ignores them.
     pub fn decode(bytes: &[u8]) -> Result<Self, ZakuraProtocolError> {
         if bytes.len() > MAX_CONTROL_PAYLOAD_BYTES {
             return Err(ZakuraProtocolError::OversizedPayload {
@@ -1145,7 +1198,6 @@ impl ZakuraControlAck {
         let accepted_capabilities = reader.read_u64::<LittleEndian>()?;
         let accepted_channels = reader.read_u64::<LittleEndian>()?;
         let accepted_limits = ZakuraAcceptedLimits::decode_from(&mut reader)?;
-        reject_trailing(bytes, &reader)?;
 
         Ok(Self {
             magic,
@@ -1168,7 +1220,7 @@ impl ZakuraControlAck {
         requested_limits: &ZakuraInitialLimits,
         local: &ZakuraHandshakeConfig,
     ) -> Result<(), ZakuraValidationError> {
-        if self.magic != CONTROL_ACK_MAGIC || self.control_version != CONTROL_VERSION {
+        if self.magic != CONTROL_ACK_MAGIC || self.control_version < CONTROL_VERSION {
             return Err(ZakuraValidationError::MalformedControl);
         }
         if self.selected_zakura_protocol != selected_zakura_protocol {
@@ -1940,6 +1992,40 @@ mod tests {
     }
 
     #[test]
+    fn alpn_carries_the_current_protocol_version() {
+        assert_eq!(P2P_V2_ALPN, p2p_v2_alpn(ZAKURA_PROTOCOL_VERSION_CURRENT));
+        assert_eq!(supported_p2p_v2_alpns()[0], P2P_V2_ALPN);
+        assert_eq!(
+            zakura_protocol_for_alpn(P2P_V2_ALPN),
+            Some(ZAKURA_PROTOCOL_VERSION_CURRENT)
+        );
+        for unsupported in [
+            &b"p2p-v2/2"[..],
+            b"p2p-v2/03",
+            b"p2p-v2/",
+            b"p2p-v2/99999999",
+            b"zakura-wallet/1",
+        ] {
+            assert_eq!(zakura_protocol_for_alpn(unsupported), None);
+        }
+    }
+
+    #[test]
+    fn previous_native_cohort_stays_on_legacy() {
+        // A peer on the Iroh 1.x release advertises protocol 2 only. The
+        // prelude must reject it, so the legacy connection survives instead of
+        // waiting on a native dial that fails ALPN negotiation.
+        let local = local_config();
+        let mut previous = init();
+        previous.zakura_protocol_min = ZAKURA_PROTOCOL_VERSION_CURRENT - 1;
+        previous.zakura_protocol_max = ZAKURA_PROTOCOL_VERSION_CURRENT - 1;
+        assert_eq!(
+            previous.validate(&local, nonces()),
+            Err(ZakuraRejectReason::IncompatibleZakuraProtocol)
+        );
+    }
+
+    #[test]
     fn init_validation_selects_overlap_and_rejects_bad_ranges() {
         let local = local_config();
         assert_eq!(
@@ -2622,7 +2708,7 @@ mod tests {
             }
         }
 
-        fn assert_rejects_trailing_bytes(&self) {
+        fn assert_trailing_bytes_policy(&self) {
             let mut bytes = self.encode();
             bytes.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
 
@@ -2632,13 +2718,14 @@ mod tests {
                     P2pV2Upgrade::decode(&bytes).is_err(),
                     "p2pv2up accepted trailing bytes",
                 ),
-                Self::ControlHello(_) => assert!(
-                    ZakuraControlHello::decode(&bytes).is_err(),
-                    "control hello accepted trailing bytes",
+                // Control messages are append-only, so trailing bytes are newer fields.
+                Self::ControlHello(value) => assert_eq!(
+                    ZakuraControlHello::decode(&bytes).expect("control hello ignores newer fields"),
+                    *value,
                 ),
-                Self::ControlAck(_) => assert!(
-                    ZakuraControlAck::decode(&bytes).is_err(),
-                    "control ack accepted trailing bytes",
+                Self::ControlAck(value) => assert_eq!(
+                    ZakuraControlAck::decode(&bytes).expect("control ack ignores newer fields"),
+                    *value,
                 ),
                 Self::StreamPrelude(_) => assert!(
                     StreamPrelude::decode(&bytes).is_err(),
@@ -2767,14 +2854,80 @@ mod tests {
         }
     }
 
+    /// The legacy upgrade prelude, stream prelude and frame reject trailing data.
+    /// Control messages accept it as fields from a newer control version.
     #[test]
-    fn compat_i3_v1_zakura_decoders_reject_unknown_trailing_data() {
+    fn compat_i3_zakura_decoders_apply_trailing_data_policy() {
         for message in wire_messages()
             .into_iter()
             .filter(|message| !matches!(message, WireMessage::Version(_)))
         {
-            message.assert_rejects_trailing_bytes();
+            message.assert_trailing_bytes_policy();
         }
+    }
+
+    /// A peer on a newer control version appends fields and raises `control_version`.
+    /// This release parses its known prefix, ignores the rest, and accepts the peer.
+    #[test]
+    fn control_messages_from_newer_control_version_are_accepted() {
+        let local = local_config();
+        let newer_fields = [0x01, 0x00, 0x02, 0x00, 0xaa, 0xbb];
+
+        let hello = ZakuraControlHello {
+            control_version: CONTROL_VERSION + 1,
+            ..control_hello()
+        };
+        let mut hello_bytes = hello.encode().expect("valid hello encodes");
+        hello_bytes.extend_from_slice(&newer_fields);
+        let decoded = ZakuraControlHello::decode(&hello_bytes).expect("newer hello decodes");
+        assert_eq!(decoded, hello);
+        let expected = ZakuraControlValidation {
+            local: &local,
+            authenticated_remote_id: &[7; 32],
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            handshake_path: ZakuraHandshakePath::Upgraded,
+            remote_role: ZakuraControlRole::Initiator,
+            initiator_upgrade_nonce: [1; 32],
+            responder_upgrade_nonce: [2; 32],
+            legacy_upgrade_transcript: [4; 32],
+        };
+        assert_eq!(decoded.validate(&expected), Ok(()));
+
+        let older = ZakuraControlHello {
+            control_version: CONTROL_VERSION - 1,
+            ..hello.clone()
+        };
+        assert_eq!(
+            older.validate(&expected),
+            Err(ZakuraValidationError::UnsupportedVersion("control"))
+        );
+
+        let ack = ZakuraControlAck {
+            control_version: CONTROL_VERSION + 1,
+            ..control_ack()
+        };
+        let mut ack_bytes = ack.encode().expect("valid ack encodes");
+        ack_bytes.extend_from_slice(&newer_fields);
+        let decoded = ZakuraControlAck::decode(&ack_bytes).expect("newer ack decodes");
+        assert_eq!(decoded, ack);
+        assert_eq!(
+            decoded.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                &decoded.accepted_limits,
+                &local
+            ),
+            Ok(())
+        );
+
+        // The hard control cap still bounds the appended fields.
+        let mut oversized = hello.encode().expect("valid hello encodes");
+        oversized.resize(MAX_CONTROL_PAYLOAD_BYTES + 1, 0);
+        assert!(matches!(
+            ZakuraControlHello::decode(&oversized),
+            Err(ZakuraProtocolError::OversizedPayload { .. })
+        ));
     }
 
     #[test]

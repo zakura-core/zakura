@@ -1186,7 +1186,7 @@ def run_self_test() -> None:
             write_csv(node / f"{table}.csv", [row])
             assert read_csv(node / f"{table}.csv", "node1", table)[0].row == row, table
         loaded = load_traces(root)
-        assert len(loaded) == 1 and len(loaded[0].tables) == 12
+        assert len(loaded) == 1 and len(loaded[0].tables) == len(CSV_SCHEMAS)
         for suffix, event in ((".2", "old"), (".1", "middle"), ("", "new")):
             path = node / "block_sync.csv"
             write_csv(path, [{"event": event, "reason": "comma,\nand newline"}])

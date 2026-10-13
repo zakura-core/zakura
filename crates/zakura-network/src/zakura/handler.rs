@@ -10803,17 +10803,13 @@ mod tests {
         let server = LocalEndpointFactory::new().endpoint(85).await?;
         let (conn_tx, _conn_rx) = mpsc::channel(8);
         let (stream_tx, mut stream_rx) = mpsc::channel(8);
-        let router = Router::builder(server)
-            .accept(
-                ALPN,
-                CaptureConnection {
-                    connection_tx: conn_tx,
-                    stream_tx,
-                },
-            )
-            .spawn();
+        server.serve(CaptureConnection {
+            alpn: ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
         let client = LocalEndpointFactory::new().endpoint(86).await?;
-        let server_addr = router.endpoint().addr();
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
         let encode = |rule: MessageRule| {
             Frame {
                 message_type: rule.message_type,
@@ -10833,7 +10829,7 @@ mod tests {
         for (responses, accepted) in cases {
             let connection = timeout(
                 Duration::from_secs(5),
-                client.connect(server_addr.clone(), ALPN),
+                client.connect(server_addr.clone(), &[ALPN]),
             )
             .await??;
             let serve = async {
@@ -10871,7 +10867,7 @@ mod tests {
             }
         }
 
-        router.shutdown().await?;
+        server.shutdown().await;
         Ok(())
     }
 

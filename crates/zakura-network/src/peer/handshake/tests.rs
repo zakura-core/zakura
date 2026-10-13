@@ -738,7 +738,10 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         &responder_connector,
         &config,
         responder_nonces,
-        iroh::SecretKey::generate().public().as_bytes().to_vec(),
+        zakura_quic::NodeSecretKey::generate()
+            .public()
+            .as_bytes()
+            .to_vec(),
         vec![b"192.0.2.1:1".to_vec()],
         ResponderRegistrationWait::Production,
     );

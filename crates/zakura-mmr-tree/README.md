@@ -1,4 +1,4 @@
-# zakura_mmr_tree
+# zakura-mmr-tree
 
 Zakura's Zcash chain history Merkle mountain range (MMR) implementation. It
 supports versioned node metadata, serialization, hashing, and partially loaded
@@ -27,7 +27,7 @@ hashes across 16 leaves per version. Property tests cover metadata serialization
 append/truncate operations, tree lengths, and root structure.
 
 ```sh
-cargo test -p zakura_mmr_tree
+cargo test -p zakura-mmr-tree
 cargo test -p zakura-chain zcash_history
 cargo test -p zakura-chain history_tree
 ```

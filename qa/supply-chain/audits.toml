@@ -2755,6 +2755,12 @@ criteria = "safe-to-deploy"
 version = "0.11.16"
 notes = "Reviewed the manifest, the module-level documentation, and the frame and packet decoding paths. This is the sans-io QUIC state machine, so it is the crate that reads attacker-controlled packets, and it is written for that: it holds only five unsafe expressions, every frame decoder reads through a bounds-checked cursor that errors rather than panicking on truncation, connection IDs and token lengths are validated against their protocol maxima before use, and flow control, stream counts, and the anti-amplification limit are enforced before any buffer grows. There is no build script. All 267 tests passed with all features."
 
+[[audits.quinn-proto]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.16 -> 0.11.19"
+notes = "Reviewed every hunk of the 0.11.16 -> 0.11.19 diff (24 files). There is no new or changed unsafe; the five existing VarInt::from_u64_unchecked sites are unchanged. There is no build script, the dependencies and features are unchanged (only the version string differs in Cargo.toml), and no added code performs filesystem, environment, process or network I/O. The changes harden attacker-reachable paths. Stream reassembly bounds the chunk count and no longer skips the guard after dedup (GHSA-qfwj). Retired CIDs from already-retired NEW_CONNECTION_ID frames go through the capped queue (GHSA-hmxj). Queued datagrams are charged per-datagram overhead (GHSA-2hv7). RangeSet::Replace ignores empty ranges (GHSA-465w). The peer min_ack_delay clamp panic is replaced with min/max (GHSA-3g6h). MAX_STREAM_DATA validates the stream ID against the limit (GHSA-53rm). Initial packets whose token leaves no frame space close the connection instead of panicking or over-allocating, and ACKs reserve room for CONNECTION_CLOSE (GHSA-wppq). The release also adds a transport-parameter length-consistency check, drops sub-1200-byte unsupported-version packets, saturates the CUBIC window, removes server_config unwrap panics for pending incomings and corrects stopped-stream reset credit. New arithmetic on peer-influenced values is checked or saturating, or bounded by invariants verified in the source."
+
 [[audits.quinn-udp]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"

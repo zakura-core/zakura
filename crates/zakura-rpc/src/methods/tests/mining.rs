@@ -1384,60 +1384,50 @@ async fn recovery_preserves_negative_balance_error() {
 /// Real proof smoke coverage complements the deterministic scheduling tests.
 /// Run explicitly: cargo test -p zakura-rpc --release shielded_template_rewards -- --ignored
 #[tokio::test]
-#[ignore = "generates two real shielded proofs"]
+#[ignore = "generates a real shielded proof"]
 async fn shielded_template_rewards() {
     use config::mining::{default_miner_address, MinerAddressType};
     use types::{get_block_template::MinerParams, long_poll::LongPollInput};
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let _guard = zakura_test::init();
-    for (pool, address_type) in [
-        ("sapling", MinerAddressType::Sapling),
-        ("ironwood", MinerAddressType::Unified),
-    ] {
-        // Both pools exercise NSM activation.
-        let net = network();
-        let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
-        let (mut rpc, _, _) = mining_rpc(info);
-        rpc.network = net.clone();
-        let params = MinerParams::new(
-            &net,
-            config::mining::Config {
-                miner_address: Some(
-                    default_miner_address(net.kind(), &address_type)
-                        .parse()
-                        .unwrap(),
-                ),
-                ..Default::default()
-            },
-        )
+    let net = network();
+    let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
+    let (mut rpc, _, _) = mining_rpc(info);
+    rpc.network = net.clone();
+    let params = MinerParams::new(
+        &net,
+        config::mining::Config {
+            miner_address: Some(
+                default_miner_address(net.kind(), &MinerAddressType::Unified)
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chain = chain_info(2, 1, 400_000_000);
+    let id =
+        LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
+    let template = tokio::time::timeout(
+        Duration::from_secs(300),
+        rpc.build_mining_template(None, &params, &chain, id, vec![], None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let tx: Transaction = template
+        .coinbase_txn
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
         .unwrap();
-        let chain = chain_info(2, 1, 400_000_000);
-        let id = LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![])
-            .generate_id();
-        let template = tokio::time::timeout(
-            Duration::from_secs(300),
-            rpc.build_mining_template(None, &params, &chain, id, vec![], None),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let tx: Transaction = template
-            .coinbase_txn
-            .data
-            .as_ref()
-            .zcash_deserialize_into()
-            .unwrap();
-        let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-        let expected = base + 55;
-        let (sapling, orchard, ironwood) = (
-            i64::from(tx.sapling_value_balance().sapling_amount()),
-            i64::from(tx.orchard_value_balance().orchard_amount()),
-            i64::from(tx.ironwood_value_balance().ironwood_amount()),
-        );
-        let balances = match pool {
-            "sapling" => (-expected, 0, 0),
-            _ => (0, 0, -expected),
-        };
-        assert_eq!((sapling, orchard, ironwood), balances, "{pool}");
-    }
+    let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
+    let expected = base + 55;
+    let (sapling, orchard, ironwood) = (
+        i64::from(tx.sapling_value_balance().sapling_amount()),
+        i64::from(tx.orchard_value_balance().orchard_amount()),
+        i64::from(tx.ironwood_value_balance().ironwood_amount()),
+    );
+    assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }

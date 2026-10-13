@@ -355,12 +355,10 @@ async fn mining_requests_fail_fast_during_spentness_construction() {
         Request::CheckProposal(block.clone()),
         Request::Prepare {
             block: block.clone(),
-            work_id: None,
             source: PreparedCandidateSource::ClientProposal,
         },
         Request::CommitMined {
             block: block.clone(),
-            work_id: None,
             admission: zs::BlockAdmission::pending(),
         },
     ] {

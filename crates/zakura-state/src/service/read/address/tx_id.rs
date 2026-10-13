@@ -22,7 +22,7 @@ use crate::{
     service::{
         finalized_state::ZakuraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
     },
-    BoxError, TransactionLocation,
+    BoxError, TransactionLocation, TransparentIndexesUnavailable,
 };
 
 /// Returns the transaction IDs that sent or received funds from the supplied [`transparent::Address`]es,
@@ -31,6 +31,11 @@ use crate::{
 /// If the addresses do not exist in the non-finalized `chain` or finalized `db`,
 /// or the `query_height_range` is totally outside both the `chain` and `db` range,
 /// returns an empty list.
+///
+/// # Errors
+///
+/// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) if `db`
+/// skips transparent indexes.
 pub fn transparent_tx_ids<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -40,6 +45,8 @@ pub fn transparent_tx_ids<C>(
 where
     C: AsRef<Chain>,
 {
+    db.check_transparent_indexes_available()?;
+
     let mut tx_id_error = None;
 
     // Retry the finalized tx ID query if it was interrupted by a finalizing block,
@@ -48,7 +55,7 @@ where
     // TODO: refactor this into a generic retry(finalized_closure, process_and_check_closure) fn
     for _ in 0..=FINALIZED_STATE_QUERY_RETRIES {
         let (finalized_tx_ids, finalized_tip_range) =
-            finalized_transparent_tx_ids(db, &addresses, query_height_range.clone());
+            finalized_transparent_tx_ids(db, &addresses, query_height_range.clone())?;
 
         // Apply the non-finalized tx ID changes.
         let chain_tx_id_changes = chain_transparent_tx_id_changes(
@@ -83,10 +90,13 @@ fn finalized_transparent_tx_ids(
     db: &ZakuraDb,
     addresses: &HashSet<transparent::Address>,
     query_height_range: RangeInclusive<Height>,
-) -> (
-    BTreeMap<TransactionLocation, transaction::Hash>,
-    Option<RangeInclusive<Height>>,
-) {
+) -> Result<
+    (
+        BTreeMap<TransactionLocation, transaction::Hash>,
+        Option<RangeInclusive<Height>>,
+    ),
+    TransparentIndexesUnavailable,
+> {
     // # Correctness
     //
     // The StateService can commit additional blocks while we are querying transaction IDs.
@@ -94,7 +104,8 @@ fn finalized_transparent_tx_ids(
     // Check if the finalized state changed while we were querying it
     let start_finalized_tip = db.finalized_tip_height();
 
-    let finalized_tx_ids = db.partial_finalized_transparent_tx_ids(addresses, query_height_range);
+    let finalized_tx_ids =
+        db.partial_finalized_transparent_tx_ids(addresses, query_height_range)?;
 
     let end_finalized_tip = db.finalized_tip_height();
 
@@ -107,7 +118,7 @@ fn finalized_transparent_tx_ids(
         None
     };
 
-    (finalized_tx_ids, finalized_tip_range)
+    Ok((finalized_tx_ids, finalized_tip_range))
 }
 
 /// Returns the extra transaction IDs for `addresses` in the non-finalized chain `query_height_range`,

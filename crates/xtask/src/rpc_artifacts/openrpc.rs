@@ -7,6 +7,11 @@ use syn::{FnArg, GenericArgument, PathArguments, ReturnType, TraitItem, Type};
 
 use crate::BoxError;
 
+/// Methods whose result schema is generated from their declared `Result<T>` type.
+///
+/// Every other method keeps the inherited OpenRPC meta-schema result placeholder.
+const TYPED_RESULT_METHODS: &[&str] = &["preciousblock"];
+
 pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError> {
     let source = syn::parse_file(&fs::read_to_string(source)?)?;
     let rpc = source
@@ -92,11 +97,23 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             writeln!(output, "        _g.param::<{schema}>({parameter:?}, crate::methods::PARAM_{upper}_DESC, {required}),")?;
         }
         writeln!(output, "    ],")?;
-        writeln!(
-            output,
-            "    result: |g| g.result({:?}),",
-            format!("{name}_result")
-        )?;
+        if TYPED_RESULT_METHODS.contains(&name.as_str()) {
+            let result = result_type(&method.sig.output)?
+                .to_token_stream()
+                .to_string();
+            let upper = name.to_uppercase();
+            writeln!(
+                output,
+                "    result: |g| g.typed_result::<{result}>({:?}, crate::methods::RESULT_{upper}_DESC),",
+                format!("{name}_result")
+            )?;
+        } else {
+            writeln!(
+                output,
+                "    result: |g| g.result({:?}),",
+                format!("{name}_result")
+            )?;
+        }
         let deprecated = method
             .attrs
             .iter()
@@ -105,9 +122,40 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
         writeln!(output, "}}),")?;
     }
 
+    for name in TYPED_RESULT_METHODS {
+        if !output.contains(&format!("({name:?}, openrpc::RpcMethod {{")) {
+            return Err(format!("typed-result RPC method {name} is not in the Rpc trait").into());
+        }
+    }
+
     output.push_str("];");
     fs::write(output_dir.join("rpc_openrpc.rs"), output)?;
     Ok(())
+}
+
+/// Returns `T` from a method's declared `Result<T>` return type.
+fn result_type(output: &ReturnType) -> Result<&Type, BoxError> {
+    let ReturnType::Type(_, result) = output else {
+        return Err("RPC methods must declare their result type".into());
+    };
+    let Type::Path(result) = result.as_ref() else {
+        return Err("RPC result types must be paths".into());
+    };
+    let segment = result
+        .path
+        .segments
+        .last()
+        .ok_or("RPC result path is empty")?;
+    if segment.ident != "Result" {
+        return Err("typed RPC results must be declared as `Result<T>`".into());
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err("typed RPC results must have a type argument".into());
+    };
+    match args.args.first() {
+        Some(GenericArgument::Type(inner)) => Ok(inner),
+        _ => Err("typed RPC results must have a type argument".into()),
+    }
 }
 
 fn parameter_type(ty: &Type) -> Result<(&Type, Option<bool>), BoxError> {

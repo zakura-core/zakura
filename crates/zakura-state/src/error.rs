@@ -269,7 +269,38 @@ pub enum StateInitError {
          Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
     VctSproutHistoryUnrepairable,
+
+    /// A database that stopped building transparent address indexes was opened in archive storage mode.
+    ///
+    /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot
+    /// answer completely.
+    #[error(
+        "cannot open state in archive storage mode: the database at {path:?} was created by a \
+         pruned checkpoint-syncing node and stopped maintaining transparent address indexes. \
+         Hint: configure `storage_mode.pruned`, or sync an archive node into a fresh cache directory"
+    )]
+    TransparentIndexesMissingInArchiveMode {
+        /// The database directory without transparent indexes.
+        path: PathBuf,
+    },
 }
+
+/// A transparent address or transparent spender query was sent to a state database that does not
+/// build those indexes.
+///
+/// A pruned checkpoint-syncing node stops updating finalized transparent address balances,
+/// address UTXO and transaction indexes, and transparent spender indexes in its existing database.
+/// Answering from partial data would return balances, UTXO lists, histories, or spenders that look
+/// authoritative but are incomplete, so these queries fail instead.
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "transparent address and spender indexes are unavailable: this node's state database \
+     stopped maintaining them in pruned storage mode with checkpoint sync. \
+     getaddressbalance, getaddressutxos, getaddresstxids, and transparent spending transaction \
+     lookups need an archive node, or a pruned node that synced into a fresh cache directory with \
+     consensus.checkpoint_sync = false"
+)]
+pub struct TransparentIndexesUnavailable;
 
 /// An error describing why a block could not be queued to be committed to the state.
 #[derive(Debug, Error, Clone, PartialEq, Eq, new)]
@@ -583,6 +614,39 @@ pub enum ReconsiderError {
 
     /// The staged state mutation disagreed with or could not commit its header transition.
     #[error("could not commit matching header-chain reconsideration: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
+        error: String,
+    },
+}
+
+/// An error describing why a `preciousblock` request failed.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PreciousError {
+    /// The state is still committing checkpointed blocks and cannot prefer a tip yet.
+    #[error("cannot prefer blocks while still committing checkpointed blocks")]
+    ProcessingCheckpointedBlocks,
+
+    /// Every block write slot is held by an in-flight commit or operator change.
+    #[error("the block write task is at capacity, retry the precious block request")]
+    WriterFull,
+
+    /// Sending the precious request to the block write task failed.
+    #[error("failed to send precious block request to block write task")]
+    SendPreciousRequestFailed,
+
+    /// The precious request was dropped before processing.
+    #[error("precious block request was unexpectedly dropped")]
+    PreciousRequestDropped,
+
+    /// The block hash was not found in the finalized or non-finalized state.
+    #[error("block hash {0} not found")]
+    BlockNotFound(block::Hash),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain selection: {error}")]
     HeaderChain {
         /// Stable local error diagnostic.
         /// State never attributes this diagnostic to a peer.

@@ -8,6 +8,10 @@ use super::{
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 use std::num::NonZeroU64;
 
+mod outstanding;
+
+pub(super) use outstanding::{OutstandingRequests, RequestKey};
+
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
 ///
 /// A safety bound only; the binding per-peer concurrency is the peer's advertised
@@ -408,7 +412,7 @@ impl BlockSyncState {
 #[derive(Clone, Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outstanding: Vec<OutstandingBlockRange>,
+    pub(super) outstanding: OutstandingRequests,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -442,7 +446,7 @@ impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
-            outstanding: Vec::new(),
+            outstanding: OutstandingRequests::default(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -703,12 +707,9 @@ impl DownloadWindow {
     }
 
     /// Bytes reserved across this peer's in-flight requests (the per-request size
-    /// estimates of heights not yet received). Recomputed on demand — the byte unit is
-    /// experimental; a hot path would maintain a running counter instead.
+    /// estimates of heights not yet received).
     pub(super) fn outstanding_reserved_bytes(&self) -> u64 {
-        self.outstanding.iter().fold(0u64, |acc, range| {
-            acc.saturating_add(range.reserved_bytes())
-        })
+        self.outstanding.reserved_bytes()
     }
 
     /// Record `timed_out` requests that expired without a body. Applies the BBR cwnd dip
@@ -758,9 +759,7 @@ impl DownloadWindow {
     }
 
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
-        if let Some(outstanding) = self.outstanding.last_mut() {
-            outstanding.charged_for_liveness = true;
-        }
+        self.outstanding.charge_last_for_liveness();
         self.last_request_at = Some(now);
         self.requests_without_block_progress =
             self.requests_without_block_progress.saturating_add(1);
@@ -772,9 +771,7 @@ impl DownloadWindow {
     pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
-        for outstanding in &mut self.outstanding {
-            outstanding.charged_for_liveness = false;
-        }
+        self.outstanding.clear_liveness_charges();
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -809,33 +806,28 @@ impl DownloadWindow {
 
     /// Retire attempts that never reached the wire, refunding only their own
     /// probe charges. Keep unanswered requests from this peer accountable.
-    pub(super) fn discard_skipped_requests(&mut self) -> bool {
-        let mut removed = false;
-        let mut index = 0;
-        while index < self.outstanding.len() {
-            if self.outstanding[index].write_status.was_skipped() {
-                self.retire_locally(index);
-                removed = true;
-            } else {
-                index += 1;
-            }
-        }
-        removed
+    pub(super) fn discard_skipped_requests(&mut self) -> Vec<OutstandingBlockRange> {
+        self.outstanding
+            .skipped()
+            .into_iter()
+            .filter_map(|key| self.retire_locally(key))
+            .collect()
     }
 
     /// End a locally retired obligation before discarding its write status. If
     /// transport has not started, it must skip the frame and refund this probe.
-    pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
-        let outstanding = self.outstanding.remove(index);
+    pub(super) fn retire_locally(&mut self, key: RequestKey) -> Option<OutstandingBlockRange> {
+        let charged = self.outstanding.is_charged_for_liveness(key);
+        let outstanding = self.outstanding.remove(key)?;
         outstanding.write_status.expire_unwritten();
-        if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
+        if outstanding.write_status.was_skipped() && charged {
             self.requests_without_block_progress =
                 self.requests_without_block_progress.saturating_sub(1);
         }
         if self.requests_without_block_progress == 0 {
             self.clear_liveness_if_idle();
         }
-        outstanding
+        Some(outstanding)
     }
 
     /// Give a briefly congested writer time to deliver our queued request before
@@ -867,16 +859,15 @@ impl DownloadWindow {
             .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
-    pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.contains(height))
+    pub(super) fn outstanding_key_for_height(&self, height: block::Height) -> Option<RequestKey> {
+        self.outstanding.key_for_height(height)
     }
 
-    pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+    pub(super) fn outstanding_key_for_start(
+        &self,
+        start_height: block::Height,
+    ) -> Option<RequestKey> {
+        self.outstanding.key_for_start(start_height)
     }
 }
 
@@ -910,8 +901,6 @@ impl PeerBlockState {
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) write_status: RequestWriteStatus,
-    /// Whether this attempt still contributes to the no-progress probe streak.
-    pub(super) charged_for_liveness: bool,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,

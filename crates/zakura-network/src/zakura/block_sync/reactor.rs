@@ -611,10 +611,7 @@ impl BlockSyncReactor {
             let released = self
                 .state
                 .work_queue
-                .release_reserved_and_return_items_detailed_for_owner(
-                    claim.meta.owner,
-                    [claim.height],
-                );
+                .revoke_for_owner(claim.meta.owner, [claim.height]);
             self.state.budget.release(released.released_bytes);
             // Settlement arbitrates against writer startup. Skipped frames and
             // already-settled work must not count against the peer.

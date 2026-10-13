@@ -30,6 +30,11 @@ impl RequestWriteStatus {
         self.0.load(Ordering::Acquire) == EXPIRED
     }
 
+    /// Whether transport started writing the frame, after which it cannot skip it.
+    pub(in crate::zakura::block_sync) fn has_started(&self) -> bool {
+        matches!(self.0.load(Ordering::Acquire), STARTED | WRITTEN)
+    }
+
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {

@@ -1031,7 +1031,6 @@ mod bbr_tests {
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
-                charged_for_liveness: true,
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: block::Height(0),
@@ -1138,7 +1137,6 @@ mod bbr_tests {
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
-                charged_for_liveness: true,
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: height,
@@ -1330,7 +1328,10 @@ mod bbr_tests {
         );
 
         // Drain the byte queue to the floor (4 KB <= 8 KB): the hold timer starts now...
-        window.outstanding.truncate(1);
+        while window.outstanding.len() > 1 {
+            let last = window.outstanding.last_key().expect("the window is not empty");
+            window.outstanding.remove(last);
+        }
         let t4 = t3 + Duration::from_millis(10);
         deliver(&mut window, t4);
         assert_eq!(

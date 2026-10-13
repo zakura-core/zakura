@@ -1,7 +1,7 @@
 mod retention;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     future,
 };
 
@@ -1101,7 +1101,6 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1127,7 +1126,6 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1147,6 +1145,100 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+    }
+}
+
+/// Each indexed window query must match a scan over the requests in issue order.
+#[test]
+fn indexed_window_matches_a_linear_scan() {
+    let base = Instant::now();
+    let mut rng = 0x5eed_u64;
+    let mut next = |bound: u32| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // The shifted value is below 2^31, so it fits in u32.
+        ((rng >> 33) as u32) % bound
+    };
+    let mut window = OutstandingRequests::default();
+    let mut model: Vec<(RequestKey, OutstandingBlockRange)> = Vec::new();
+    for _ in 0..1_500 {
+        match next(4) {
+            0 | 1 => {
+                let mut request = window_request_range(1 + next(200), 1 + next(4));
+                request.deadline = base + Duration::from_millis(u64::from(next(50)));
+                let key = window.push(request.clone());
+                model.push((key, request));
+            }
+            2 if !model.is_empty() => {
+                let index = usize::try_from(next(u32::try_from(model.len()).unwrap())).unwrap();
+                let (key, request) = model.remove(index);
+                assert_eq!(window.remove(key).unwrap().request, request.request);
+                assert!(window.remove(key).is_none());
+            }
+            3 if !model.is_empty() => {
+                let index = usize::try_from(next(u32::try_from(model.len()).unwrap())).unwrap();
+                let (key, request) = &mut model[index];
+                let height = block::Height(request.request.start_height.0 + next(5));
+                if next(2) == 0 {
+                    let newly = !request.has_received(height) && request.request.contains(height);
+                    request.mark_received(height);
+                    assert_eq!(window.mark_received(*key, height), newly);
+                } else {
+                    assert_eq!(
+                        window.mark_received_through(*key, height),
+                        request.mark_received_through(height),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        window.assert_consistent();
+        assert_eq!(window.len(), model.len());
+        assert_eq!(
+            window.reserved_bytes(),
+            model
+                .iter()
+                .map(|(_, request)| request.reserved_bytes())
+                .sum::<u64>(),
+        );
+        assert_eq!(
+            window.earliest_deadline(),
+            model.iter().map(|(_, request)| request.deadline).min(),
+        );
+        let height = block::Height(next(210));
+        assert_eq!(
+            window.key_for_height(height),
+            model
+                .iter()
+                .find(|(_, request)| request.request.contains(height))
+                .map(|(key, _)| *key),
+        );
+        assert_eq!(
+            window.key_for_start(height),
+            model
+                .iter()
+                .find(|(_, request)| request.request.start_height == height)
+                .map(|(key, _)| *key),
+        );
+        assert_eq!(
+            window.ending_at_or_below(height),
+            model
+                .iter()
+                .filter(|(_, request)| request.request.end_height() <= height)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+        );
+        let now = base + Duration::from_millis(u64::from(next(60)));
+        assert_eq!(
+            window.due_at(now),
+            model
+                .iter()
+                .filter(|(_, request)| request.deadline <= now)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -1242,7 +1334,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
 
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, Some(now + timeout));
@@ -1257,7 +1349,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, None);
@@ -1299,7 +1391,7 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
@@ -1356,7 +1448,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
 
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
@@ -1394,7 +1486,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     assert!(window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 8);
 
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
@@ -2116,10 +2208,10 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
             Instant::now(),
         )
         .generation();
-    registry.set_outstanding(
+    registry.insert_outstanding(
         &peer,
         generation,
-        BTreeMap::from([(
+        [(
             height,
             OutstandingMeta {
                 owner,
@@ -2128,7 +2220,7 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
                 queued_at: Instant::now(),
                 deadline: Instant::now(),
             },
-        )]),
+        )],
     );
 
     queue.refresh_authority(refreshed);
@@ -3162,10 +3254,10 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             CancellationToken::new(),
         );
         assert!(write.publish(|| {
-            wiring.registry.set_outstanding(
+            wiring.registry.insert_outstanding(
                 &peer(1),
                 generation,
-                BTreeMap::from([(
+                [(
                     block::Height(1),
                     OutstandingMeta {
                         owner,
@@ -3174,7 +3266,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
                         queued_at: now,
                         deadline: now,
                     },
-                )]),
+                )],
             );
         }));
         let started = matches!(write_state, WriteState::Started | WriteState::Written);
@@ -5941,7 +6033,6 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6339,7 +6430,6 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,

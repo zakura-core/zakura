@@ -23,7 +23,10 @@
 
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
 
 use tokio::sync::Notify;
@@ -138,6 +141,10 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     available: Notify,
+    /// Counts events that take an unreceived height from its owner without that
+    /// owner's routine retiring the request. Routines rescan their requests for
+    /// lost ownership only after this changes.
+    revocations: AtomicU64,
 }
 
 impl WorkQueue {
@@ -155,7 +162,32 @@ impl WorkQueue {
                 request_writes: std::collections::HashMap::new(),
             }),
             available: Notify::new(),
+            revocations: AtomicU64::new(0),
         }
+    }
+
+    /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
+    pub(super) fn revocations(&self) -> u64 {
+        self.revocations.load(Ordering::Acquire)
+    }
+
+    fn note_revocation(&self) {
+        self.revocations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Return `owner`'s unreceived heights on behalf of another actor, such as
+    /// the floor watchdog. The owner's routine learns of the change from
+    /// [`Self::revocations`].
+    pub(super) fn revoke_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
+        let outcome = self.release_reserved_and_return_items_detailed_for_owner(owner, heights);
+        if outcome.returned_count > 0 || outcome.committed_count > 0 {
+            self.note_revocation();
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -905,6 +937,7 @@ impl WorkQueue {
                 .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
+        let mut revoked = false;
         while let Some((&height, _)) = inner.in_flight.first_key_value() {
             if height > floor {
                 break;
@@ -913,9 +946,14 @@ impl WorkQueue {
                 .in_flight
                 .pop_first()
                 .expect("first_key_value returned Some");
+            revoked |= item.budget.is_reserved();
             released = released.saturating_add(item.budget.release_reserved());
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        drop(inner);
+        if revoked {
+            self.note_revocation();
+        }
         released
     }
 
@@ -952,6 +990,7 @@ impl WorkQueue {
                 .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
+        let mut revoked = false;
         while let Some((&height, _)) = inner.in_flight.last_key_value() {
             if height <= floor {
                 break;
@@ -960,11 +999,15 @@ impl WorkQueue {
                 .in_flight
                 .pop_last()
                 .expect("last_key_value returned Some");
+            revoked |= item.budget.is_reserved();
             released = released.saturating_add(item.budget.release_reserved());
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         drop(inner);
         drop(claims);
+        if revoked {
+            self.note_revocation();
+        }
         released
     }
 
@@ -1158,15 +1201,19 @@ impl WorkQueue {
         self.lock().owner_for_height(height)
     }
 
-    /// Filter height metadata against current owners under one queue lock.
-    /// `Copy` prevents removed values from dropping request resources under the lock.
-    pub(super) fn retain_owned<T: Copy>(
+    /// Return the entries whose height no longer belongs to their owner, checked
+    /// under one queue lock. `Copy` keeps request resources out of the lock.
+    pub(super) fn disowned<T: Copy>(
         &self,
-        entries: &mut Vec<(block::Height, T)>,
+        entries: &[(block::Height, T)],
         owner_of: impl Fn(&T) -> zakura_header_chain::BodyWorkOwner,
-    ) {
+    ) -> Vec<(block::Height, T)> {
         let inner = self.lock();
-        entries.retain(|(height, entry)| inner.owner_for_height(*height) == Some(owner_of(entry)));
+        entries
+            .iter()
+            .filter(|(height, entry)| inner.owner_for_height(*height) != Some(owner_of(entry)))
+            .copied()
+            .collect()
     }
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {

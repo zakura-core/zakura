@@ -621,6 +621,8 @@ impl PeerRoutine {
                     });
             }
             BlockSyncMessage::Block(block) => {
+                self.trace
+                    .record_block_body_received(block.hash(), BlockBodySource::Zakura);
                 self.trace_wake("own_body");
                 self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
                     .await;
@@ -1629,8 +1631,6 @@ impl PeerRoutine {
                 return;
             }
         }
-        self.trace
-            .record_block_body_received(hash, BlockBodySource::Zakura);
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
@@ -1866,8 +1866,6 @@ impl PeerRoutine {
         if reserved_in_flight.is_none() && !is_pending {
             return false;
         }
-        self.trace
-            .record_block_body_received(hash, BlockBodySource::Zakura);
         let Some(owner) = self.work.owner_for_height(height) else {
             // Pending work has no active request owner.
             // Accepting a body here would create an unowned completion.

@@ -4244,7 +4244,7 @@ async fn check_cold_probe_deadline(expired: bool) {
 
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -4254,6 +4254,8 @@ async fn check_cold_probe_deadline(expired: bool) {
         tip_rx,
         config.clone(),
     );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
@@ -4328,6 +4330,11 @@ async fn check_cold_probe_deadline(expired: bool) {
         }
     })
     .await;
+    assert_eq!(
+        trace.first_block_body_source(blocks[0].hash()),
+        Some(BlockBodySource::Zakura),
+        "decoded body receipt must be recorded even after its request expires"
+    );
     if !expired {
         submitted.expect("the still-owned cold probe must reach the verifier");
         assert_eq!(handle.peer_snapshot().outbound_peers, 1);
@@ -7002,6 +7009,51 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     assert_eq!(
         trace.first_block_body_source(block_hash),
         Some(BlockBodySource::Zakura)
+    );
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn decoded_body_receipt_is_recorded_below_the_verified_frontier() {
+    let config = immediate_body_download_config();
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), block.hash()));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block::Hash([0x77; 32]),
+        },
+        (block::Height(1), block.hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+    let (_peer, inbound, _outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        40,
+        block::Height(1),
+        block.hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    send_inbound(&inbound, BlockSyncMessage::Block(block.clone())).await;
+    await_until("decoded body receipt", Duration::from_secs(1), || {
+        trace.first_block_body_source(block.hash()) == Some(BlockBodySource::Zakura)
+    })
+    .await
+    .expect("the trace must record a decoded body that request matching discards");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), actions.recv())
+            .await
+            .is_err(),
+        "recording a receipt must not submit a body below the verified frontier"
     );
     reactor_task.abort();
 }

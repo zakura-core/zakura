@@ -347,6 +347,21 @@ fn tip_dependent_failures_never_ban() {
 }
 
 #[test]
+fn parser_panic_does_not_penalize_relaying_peer() {
+    for transaction_version in [4, 5, 6] {
+        let failure = relayed_transaction_failure(
+            TransactionError::TransactionParserPanicked,
+            transaction_version,
+        );
+        assert_eq!(transaction_ban_peer(&failure), None);
+        assert_eq!(
+            transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            None,
+        );
+    }
+}
+
+#[test]
 fn sprout_deposits_start_cooldowns() {
     let error = TransactionError::DisabledAddToSproutPool;
     for transaction_version in [4, 5, 6] {

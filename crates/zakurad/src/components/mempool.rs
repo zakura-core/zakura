@@ -389,6 +389,7 @@ fn peer_action(error: &TransactionError) -> PeerAction {
 
         // The verifier failed, or the error does not name the rule that failed.
         Script(_)
+        | TransactionParserPanicked
         | InternalDowncastError(_)
         | Io(_)
         | TryFromSlice(_)

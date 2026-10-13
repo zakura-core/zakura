@@ -179,6 +179,12 @@ pub struct Config {
     /// to validate future spends. This is a one-way mode: once data has been
     /// pruned, the database cannot be reopened in [`StorageMode::Archive`] without
     /// re-syncing from genesis.
+    ///
+    /// With checkpoint sync enabled, pruned storage stops maintaining transparent address
+    /// balances, address UTXO and transaction lists, and transparent spender indexes in the
+    /// existing database. Existing rows are retained but never served as complete results.
+    /// The first skipped block records this permanently, including across restart and rollback.
+    /// Restoring complete address queries requires syncing a fresh indexed database.
     pub storage_mode: StorageMode,
 
     // Debug configs
@@ -216,6 +222,11 @@ fn gen_temp_path(prefix: &str) -> PathBuf {
 }
 
 impl Config {
+    /// Whether this configuration stops optional transparent index updates.
+    pub(crate) fn skips_transparent_indexes(&self) -> bool {
+        self.pruning_config().is_some() && self.checkpoint_sync
+    }
+
     /// Returns the path for the database, based on the kind, major version and network.
     /// Each incompatible database format or network gets its own unique path.
     pub fn db_path(

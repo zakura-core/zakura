@@ -37,6 +37,7 @@ impl PeerRoutine {
     /// the per-variant field detail lives on the reactor's heavier trace path.
     pub(super) fn trace_message_received(&self, msg: &BlockSyncMessage) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.kind = Some(block_sync_message_label(msg));
         });
     }

@@ -371,9 +371,8 @@ mod tests {
 
     use crate::{
         config::Config,
-        service::finalized_state::{
-            DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE, STATE_DATABASE_KIND,
-        },
+        constants::STATE_DATABASE_KIND,
+        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
         state_database_format_version_in_code,
     };
 

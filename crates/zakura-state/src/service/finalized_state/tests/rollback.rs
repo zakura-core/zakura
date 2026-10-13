@@ -518,7 +518,11 @@ pub(super) fn coinbase_tx(
 }
 
 /// A V1 transaction spending `outpoint` and paying `value` to `address`.
-fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -> Arc<Transaction> {
+pub(super) fn spend_tx(
+    outpoint: OutPoint,
+    value: Amount<NonNegative>,
+    address: &Address,
+) -> Arc<Transaction> {
     Arc::new(Transaction::V1 {
         inputs: vec![Input::PrevOut {
             outpoint,
@@ -588,7 +592,7 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
     })
 }
 
-fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
+pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
     use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
     use zakura_chain::{
         at_least_one,
@@ -727,6 +731,7 @@ fn rollback_reverses_intra_block_self_spend() {
         rolled
             .db
             .address_balance(&address)
+            .expect("indexed databases answer address balance queries")
             .map(|(balance, _)| balance),
         Some(value),
         "address balance is restored to its height-1 value",

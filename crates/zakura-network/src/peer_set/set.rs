@@ -1748,6 +1748,10 @@ where
 
     fn call(&mut self, req: Request) -> Self::Future {
         let fut = match req {
+            Request::DisconnectPeer(addr) => {
+                self.remove(&addr);
+                async { Ok(Response::Nil) }.boxed()
+            }
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>

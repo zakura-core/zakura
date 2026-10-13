@@ -13,6 +13,7 @@ impl PeerRoutine {
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
             row.reason = Some(reason);
         });
@@ -99,6 +100,15 @@ impl PeerRoutine {
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
             row.peer = Some(trace_peer(&self.peer));
             row.fill_stop_reason = Some(reason);
+            let view = *self.sequencer_view.borrow();
+            let snapshot = self.admission_snapshot(&view);
+            row.body_download_floor = Some(trace_height(view.download_floor));
+            row.verified_block_tip = Some(trace_height(view.verified_tip));
+            row.reserved_memory_exposure_bytes = Some(snapshot.reserved_above_floor_bytes);
+            row.resident_pipeline_bytes = Some(
+                super::super::admission::estimated_resident_pipeline_bytes(&snapshot),
+            );
+            row.lookahead_limit_bytes = Some(self.config.effective_max_reorder_lookahead_bytes());
             row.fill_sent = Some(0);
             row.normal_slots = Some(saturating_usize(self.window.available_slots_at(now)));
             row.floor_slots = Some(saturating_usize(
@@ -122,6 +132,28 @@ impl PeerRoutine {
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(count));
             row.estimated_bytes = Some(estimated_bytes);
+            self.insert_bbr_fields(row);
+            if let Some(item) = self.work.in_flight_item(start_height) {
+                row.estimate_source = Some(match item.size_hint {
+                    _ if !item.reservation_has_size_hint => {
+                        if item.estimated_bytes < block::MAX_BLOCK_BYTES {
+                            "observed"
+                        } else {
+                            "unknown_worst_case"
+                        }
+                    }
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Confirmed(_) => {
+                        "confirmed"
+                    }
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Advertised(_) => {
+                        "advertised"
+                    }
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Unknown => {
+                        "unknown_worst_case"
+                    }
+                });
+                row.request_owner = item.owner.map(|owner| format!("{owner:?}"));
+            }
             row.available_slots = Some(saturating_usize(self.window.available_slots()));
             row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));
             self.insert_no_progress_fields(row);
@@ -225,11 +257,6 @@ impl PeerRoutine {
             self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);
         });
-        // Refresh the published slot diagnostics on the same cadence so the cross-peer
-        // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
-        // past the horizon (→ `None` = worst floor server).
-        self.publish_outstanding();
     }
 
     pub(super) fn trace_body_sequencer_sent(

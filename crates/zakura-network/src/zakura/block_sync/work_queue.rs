@@ -164,6 +164,7 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     available: Notify,
+    refill: Notify,
 }
 
 impl WorkQueue {
@@ -181,6 +182,7 @@ impl WorkQueue {
                 request_writes: std::collections::HashMap::new(),
             }),
             available: Notify::new(),
+            refill: Notify::new(),
         }
     }
 
@@ -1118,8 +1120,16 @@ impl WorkQueue {
         released
     }
 
-    /// The "work added" notifier (per-peer routines wake source).
-    #[allow(dead_code)]
+    /// One producer consumes refill requests. Notify retains a permit until it waits.
+    pub(super) fn request_refill(&self) {
+        self.refill.notify_one();
+    }
+
+    pub(super) fn subscribe_refill(&self) -> &Notify {
+        &self.refill
+    }
+
+    /// Workers register before checking the queue to avoid missed publications.
     pub(super) fn subscribe_available(&self) -> &Notify {
         &self.available
     }

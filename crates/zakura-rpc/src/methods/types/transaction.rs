@@ -390,7 +390,7 @@ impl TransactionTemplate<NegativeOrZero> {
         // no-op. Called only when a shielded reward output was actually added, so
         // transparent miners never force the expensive
         // proving-key build.
-        let arm_shielded_reward_proving_key = || {
+        let arm_shielded_reward_proving_key = || -> Result<(), TransactionError> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
             // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
@@ -398,7 +398,11 @@ impl TransactionTemplate<NegativeOrZero> {
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
                 let prepared = cached_orchard_proving_key(version.circuit_version())
-                    .expect("Ironwood coinbase rewards use the supported post-NU6.3 circuit")
+                    .map_err(|error| {
+                        TransactionError::CoinbaseConstruction(format!(
+                            "Failed to prepare shielded reward proving key: {error}"
+                        ))
+                    })?
                     .prepare_proving();
                 tracing::debug!(
                     ?height,
@@ -406,6 +410,7 @@ impl TransactionTemplate<NegativeOrZero> {
                     "armed the coinbase proving key's prepared commitment tables",
                 );
             }
+            Ok(())
         };
 
         match plan.miner_reward_address {
@@ -422,7 +427,7 @@ impl TransactionTemplate<NegativeOrZero> {
                             "Failed to add Ironwood output: {error}"
                         ))
                     })?;
-                arm_shielded_reward_proving_key();
+                arm_shielded_reward_proving_key()?;
             }
             MinerRewardAddress::Transparent(addr) => {
                 builder.add_transparent_output(&addr, miner_reward)?;
@@ -453,7 +458,7 @@ impl TransactionTemplate<NegativeOrZero> {
             auth_digest: tx.auth_commitment().as_ref().try_into()?,
             depends: Vec::new(),
             fee: (-miner_fees).constrain()?,
-            sigops: tx.sigops()?,
+            sigops: tx.sigops(),
             required: true,
         })
     }

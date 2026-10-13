@@ -999,7 +999,7 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
     // unarmed control key. Proving uses the post-NU6.3 circuit, the only
     // circuit the coinbase proving path still exercises.
     let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3)
-        .expect("post-NU6.3 proving is supported");
+        .expect("the current Orchard circuit supports proving");
     let unarmed_prover_result = prove_shielding_bundle(&pk);
 
     let first_arming = pk.prepare_proving();

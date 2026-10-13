@@ -76,13 +76,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          lychee \
-            --verbose \
-            --no-progress \
-            --cache \
-            --max-cache-age 2d \
-            --config .github/lychee.toml \
-            "**/*.md"
+          # Lychee 0.24.2 does not retry rejected HTTP 503 responses.
+          # Retry validation once; persistent broken links still fail the job.
+          for attempt in 1 2; do
+            if lychee \
+              --verbose \
+              --no-progress \
+              --cache \
+              --max-cache-age 2d \
+              --config .github/lychee.toml \
+              "**/*.md"; then
+              exit 0
+            else
+              status=$?
+            fi
+            if [ "$status" -ne 2 ] || [ "$attempt" -eq 2 ]; then
+              exit "$status"
+            fi
+            echo "::warning::Link validation failed; retrying once in 15 seconds"
+            sleep 15
+          done
 
       - name: Save lychee cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

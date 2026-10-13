@@ -82,6 +82,9 @@ cache = true
 # Maximum age of cached results
 max_cache_age = "7d"
 
+# Recheck server errors on the workflow retry instead of reusing a failure.
+cache_exclude_status = "500.."
+
 # Maximum concurrent requests
 max_concurrency = 8
 

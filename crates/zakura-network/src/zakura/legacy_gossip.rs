@@ -4465,7 +4465,7 @@ mod tests {
         assert!(
             matches!(
                 &response,
-                Response::Blocks(blocks)
+                Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }
                     if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
             ),
             "the same peer must still serve the block; got {response:?}"
@@ -5026,7 +5026,7 @@ mod tests {
                 assert!(
                     matches!(
                         &response,
-                        Response::Blocks(blocks)
+                        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }
                             if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
                     ),
                     "the honest peer must serve the block; got {response:?}"

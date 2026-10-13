@@ -148,19 +148,42 @@ impl ZakuraDb {
         // on-disk database) and reads the on-disk format version directly. The cache directory is
         // checked for readability first, so a missing or unreadable directory returns a typed
         // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
-        let version_path =
-            config.version_file_path(&db_kind, format_version_in_code.major, network);
-        let read_disk_version = || {
-            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
-                .map_err(|source| StateInitError::DatabaseFormatVersion {
-                    path: version_path.clone(),
+        let read_disk_version = |major_version| {
+            database_format_version_on_disk(config, &db_kind, major_version, network).map_err(
+                |source| StateInitError::DatabaseFormatVersion {
+                    path: config.version_file_path(&db_kind, major_version, network),
                     source,
-                })
+                },
+            )
         };
+        let mut read_only_previous_major = None;
         let disk_version = if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
 
-            read_disk_version()?
+            match read_disk_version(format_version_in_code.major)? {
+                Some(version) => Some(version),
+                // A primary that has not run this release yet still uses a reusable
+                // previous-major database. Read it in place, like an older minor version: the
+                // primary renames and upgrades it on its next start.
+                None => match DiskDb::previous_reusable_db_major(
+                    &restorable_db_versions(),
+                    format_version_in_code,
+                    config,
+                    &db_kind,
+                    network,
+                ) {
+                    Some(major_version) => {
+                        let version = read_disk_version(major_version)?;
+                        tracing::info!(
+                            ?version,
+                            "opening a previous-major state database read-only without upgrading it"
+                        );
+                        read_only_previous_major = Some(major_version);
+                        version
+                    }
+                    None => None,
+                },
+            }
         } else {
             match DiskDb::try_reusing_previous_db_after_major_upgrade(
                 &restorable_db_versions(),
@@ -170,7 +193,7 @@ impl ZakuraDb {
                 network,
             ) {
                 Some(version) => Some(version),
-                None => read_disk_version()?,
+                None => read_disk_version(format_version_in_code.major)?,
             }
         };
         let disk_version_before_open = disk_version.clone();
@@ -199,14 +222,24 @@ impl ZakuraDb {
         // changes to the default database version. Then we set the correct version in the
         // upgrade thread. We need to do the version change in this order, because the version
         // file can only be changed while we hold the RocksDB database lock.
-        let disk_db = DiskDb::new(
-            config,
-            db_kind,
-            format_version_in_code,
-            network,
-            column_families_in_code,
-            read_only,
-        )?;
+        let disk_db = match read_only_previous_major {
+            Some(major_version) => DiskDb::new_read_only_at_major(
+                config,
+                db_kind,
+                format_version_in_code,
+                major_version,
+                network,
+                column_families_in_code,
+            )?,
+            None => DiskDb::new(
+                config,
+                db_kind,
+                format_version_in_code,
+                network,
+                column_families_in_code,
+                read_only,
+            )?,
+        };
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),

@@ -125,6 +125,12 @@ pub struct DiskDb {
     /// The format version of the running Zebra code.
     format_version_in_code: Version,
 
+    /// The major version of the directory this database was opened from.
+    ///
+    /// This is `format_version_in_code.major`, except when a read-only open uses a reusable
+    /// previous-major database that a primary has not upgraded yet.
+    major_version: u64,
+
     /// The configured network for this database.
     network: Network,
 
@@ -1146,6 +1152,49 @@ impl DiskDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> Result<DiskDb, StateInitError> {
+        DiskDb::open(
+            config,
+            db_kind,
+            format_version_in_code,
+            format_version_in_code.major,
+            network,
+            column_families_in_code,
+            read_only,
+        )
+    }
+
+    /// Opens an existing database read-only from the `major_version` directory, which can be
+    /// older than `format_version_in_code`.
+    ///
+    /// Callers must only pass a major version that [`DiskDb::previous_reusable_db_major`] returned.
+    pub(crate) fn new_read_only_at_major(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        major_version: u64,
+        network: &Network,
+        column_families_in_code: impl IntoIterator<Item = String>,
+    ) -> Result<DiskDb, StateInitError> {
+        DiskDb::open(
+            config,
+            db_kind,
+            format_version_in_code,
+            major_version,
+            network,
+            column_families_in_code,
+            true,
+        )
+    }
+
+    fn open(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        major_version: u64,
+        network: &Network,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+    ) -> Result<DiskDb, StateInitError> {
         // `ephemeral` and `read_only` describe mutually-exclusive modes: an ephemeral
         // database is a read-write primary this process owns and deletes on drop, while
         // a read-only secondary follows another process's primary and must never delete
@@ -1172,7 +1221,7 @@ impl DiskDb {
         }
 
         let db_kind = db_kind.as_ref();
-        let path = config.db_path(db_kind, format_version_in_code.major, network);
+        let path = config.db_path(db_kind, major_version, network);
 
         let db_options = DiskDb::options();
 
@@ -1216,6 +1265,7 @@ impl DiskDb {
                 let db = DiskDb {
                     db_kind: db_kind.to_string(),
                     format_version_in_code: format_version_in_code.clone(),
+                    major_version,
                     network: network.clone(),
                     mode,
                     db: Arc::new(db),
@@ -1248,9 +1298,9 @@ impl DiskDb {
         self.format_version_in_code.clone()
     }
 
-    /// Returns the fixed major version for this database.
+    /// Returns the major version of the directory this database was opened from.
     pub fn major_version(&self) -> u64 {
-        self.format_version_in_code().major
+        self.major_version
     }
 
     /// Returns the configured network for this database.
@@ -1444,6 +1494,36 @@ impl DiskDb {
 
     // Private methods
 
+    /// Returns the major version of the newest existing database that the running code can reuse
+    /// after a major upgrade, without moving it.
+    ///
+    /// A node may have skipped releases, so this searches older major versions only while every
+    /// intervening major upgrade explicitly permits reuse. It never returns a newer major version.
+    pub(crate) fn previous_reusable_db_major(
+        restorable_db_versions: &[u64],
+        format_version_in_code: &Version,
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        network: &Network,
+    ) -> Option<u64> {
+        let major_db_ver = format_version_in_code.major;
+        if !restorable_db_versions.contains(&major_db_ver) {
+            return None;
+        }
+
+        let mut old_major_db_ver = major_db_ver.checked_sub(1)?;
+        loop {
+            let candidate = config.db_path(db_kind.as_ref(), old_major_db_ver, network);
+            if fs::exists(&candidate).ok()? {
+                return Some(old_major_db_ver);
+            }
+            if !restorable_db_versions.contains(&old_major_db_ver) {
+                return None;
+            }
+            old_major_db_ver = old_major_db_ver.checked_sub(1)?;
+        }
+    }
+
     /// Tries to reuse an existing db after a major upgrade.
     ///
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
@@ -1461,26 +1541,19 @@ impl DiskDb {
         db_kind: impl AsRef<str>,
         network: &Network,
     ) -> Option<Version> {
-        if let Some(&major_db_ver) = restorable_db_versions
-            .iter()
-            .find(|v| **v == format_version_in_code.major)
-        {
-            let db_kind = db_kind.as_ref();
+        let db_kind = db_kind.as_ref();
 
-            // A node may have skipped releases. Reuse the newest existing cache only while
-            // every intervening major upgrade explicitly permits reuse. The ordered format
-            // upgrades still run after the move, including any skipped intermediate migrations.
-            let mut old_major_db_ver = major_db_ver.checked_sub(1)?;
-            let old_path = loop {
-                let candidate = config.db_path(db_kind, old_major_db_ver, network);
-                if fs::exists(&candidate).ok()? {
-                    break candidate;
-                }
-                if !restorable_db_versions.contains(&old_major_db_ver) {
-                    return None;
-                }
-                old_major_db_ver = old_major_db_ver.checked_sub(1)?;
-            };
+        // The ordered format upgrades still run after the move, including any skipped
+        // intermediate migrations.
+        if let Some(old_major_db_ver) = DiskDb::previous_reusable_db_major(
+            restorable_db_versions,
+            format_version_in_code,
+            config,
+            db_kind,
+            network,
+        ) {
+            let major_db_ver = format_version_in_code.major;
+            let old_path = config.db_path(db_kind, old_major_db_ver, network);
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
 

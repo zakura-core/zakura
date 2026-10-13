@@ -147,7 +147,9 @@ pub(crate) struct UdpIo {
     /// GSO works until the first `EIO`, which means the NIC can't checksum
     /// segmented sends.
     gso: AtomicBool,
+    #[cfg(target_os = "linux")]
     gro: bool,
+    #[cfg(target_os = "linux")]
     pktinfo: bool,
     mtud: bool,
 }
@@ -166,7 +168,9 @@ impl UdpIo {
         Ok(Self {
             socket: tokio::net::UdpSocket::from_std(socket)?,
             gso: AtomicBool::new(caps.gso),
+            #[cfg(target_os = "linux")]
             gro: caps.gro,
+            #[cfg(target_os = "linux")]
             pktinfo: caps.pktinfo,
             mtud: caps.mtud,
         })
@@ -317,7 +321,9 @@ fn is_droppable(error: &io::Error) -> bool {
 #[derive(Clone, Copy, Debug, Default)]
 struct Caps {
     gso: bool,
+    #[cfg(target_os = "linux")]
     gro: bool,
+    #[cfg(target_os = "linux")]
     pktinfo: bool,
     mtud: bool,
 }

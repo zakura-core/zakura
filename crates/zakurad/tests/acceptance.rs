@@ -2878,6 +2878,17 @@ async fn pruned_checkpoint_sync_mines_without_transparent_indexes() -> Result<()
     common::regtest::pruned_checkpoint_sync_mining_without_transparent_indexes_test().await
 }
 
+/// Normal startup upgrades the preceding database format and continues mining.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_upgrades_previous_database_and_records_finalized_height() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        common::regtest::startup_upgrades_previous_database_test(),
+    )
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await

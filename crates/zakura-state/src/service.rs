@@ -498,6 +498,7 @@ impl StateService {
                 .await;
 
         let non_finalized_block_write_sent_hashes = SentHashes::new(&non_finalized_state);
+        let finalized_tip_height = finalized_tip.as_ref().map(|tip| tip.height.0);
         let initial_tip = non_finalized_state
             .best_tip_block()
             .map(|cv_block| cv_block.block.clone())
@@ -505,7 +506,11 @@ impl StateService {
             .map(ChainTipBlock::from)
             .or(finalized_tip);
 
-        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
+        tracing::info!(
+            chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)),
+            finalized_tip_height,
+            "loaded Zakura state cache"
+        );
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);

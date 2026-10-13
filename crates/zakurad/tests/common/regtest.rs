@@ -106,6 +106,111 @@ const SPEND_FEE: i64 = 10_000;
 const TRANSPARENT_INDEXES_UNAVAILABLE: &str =
     "transparent address and spender indexes are unavailable";
 
+/// Seed the unchanged v29 chain encoding, then exercise migration through normal node startup.
+pub(crate) async fn startup_upgrades_previous_database_test() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let net = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    config.state.ephemeral = false;
+    config.state.storage_mode = StorageMode::Pruned(PruningConfig {
+        tx_retention: min_pruning_retention(&net),
+    });
+    config.consensus.checkpoint_sync = false;
+    let test_dir = testdir()?.with_config(&mut config)?;
+    let mut seed_node = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let seed_rpc = read_listen_addr_from_logs(&mut seed_node, OPENED_RPC_ENDPOINT_MSG)?;
+    seed_node.expect_stdout_line_matches("activating mempool")?;
+    let saved_block = RpcRequestClient::new(seed_rpc)
+        .mine_proposed_block(&net)
+        .await?;
+    seed_node.kill(false)?;
+    let mut output = seed_node.wait_with_output()?.assert_failure()?;
+    output.assert_was_killed()?;
+    let test_dir = output.dir.take().expect("the saved database is kept");
+    let state_config = config.mirrored_state_config();
+    let current_version = zakura_state::state_database_format_version_in_code();
+    let previous_version = semver::Version::new(29, 1, 0);
+    let kind = zakura_state::constants::STATE_DATABASE_KIND;
+    let current_path = state_config.db_path(kind, current_version.major, &net);
+    let previous_path = state_config.db_path(kind, previous_version.major, &net);
+    {
+        let mut state = zakura_state::FinalizedState::new(&state_config, &net)?;
+        // The mined block is within the reorg window; finalize it to seed a nonzero saved tip.
+        state.commit_finalized_direct(
+            zakura_state::CheckpointVerifiedBlock::from(Arc::new(saved_block.clone())).into(),
+            None,
+            None,
+            "startup upgrade test",
+        )?;
+        // v30 changes the version boundary, while retaining v29's chain row encodings.
+        zakura_state::write_database_format_version_to_disk(
+            &state_config,
+            kind,
+            current_version.major,
+            &previous_version,
+            &net,
+        )
+        .map_err(|error| eyre!("{error}"))?;
+    }
+    std::fs::create_dir_all(
+        previous_path
+            .parent()
+            .expect("the database path has a version directory"),
+    )?;
+    std::fs::rename(&current_path, &previous_path)?;
+
+    let mut zakurad = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    zakurad.expect_stdout_line_matches("loaded Zakura state cache.*finalized_tip_height=1")?;
+    let rpc_address = read_listen_addr_from_logs(&mut zakurad, OPENED_RPC_ENDPOINT_MSG)?;
+    zakurad.expect_stdout_line_matches("activating mempool")?;
+    let client = RpcRequestClient::new(rpc_address);
+    assert!(
+        !previous_path.exists(),
+        "startup reuses the previous database"
+    );
+    assert!(
+        current_path.exists(),
+        "startup opens the current version path"
+    );
+    assert_eq!(
+        zakura_state::database_format_version_on_disk(
+            &state_config,
+            kind,
+            current_version.major,
+            &net,
+        )
+        .map_err(|error| eyre!("{error}"))?,
+        Some(current_version),
+        "startup completes the format upgrade before RPC opens"
+    );
+    assert_eq!(client.blockchain_info().await?.blocks(), Height(1));
+    let saved_hash: GetBlockHashResponse = client
+        .json_result_from_call("getblockhash", "[1]".to_owned())
+        .await
+        .map_err(|error| eyre!("{error}"))?;
+    assert_eq!(saved_hash.hash(), saved_block.hash());
+    let mined = client.mine_proposed_block(&net).await?;
+    assert_eq!(mined.header.previous_block_hash, saved_block.hash());
+    assert_eq!(client.blockchain_info().await?.blocks(), Height(2));
+
+    zakurad.kill(false)?;
+    zakurad
+        .wait_with_output()?
+        .assert_failure()?
+        .assert_was_killed()?;
+    Ok(())
+}
+
 /// Mines and spends on a pruned, checkpoint-syncing Regtest node, which creates a state database
 /// without transparent address and spender indexes.
 ///

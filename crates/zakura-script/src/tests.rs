@@ -255,7 +255,7 @@ fn build_and_verify_zip244_p2pkh(
     sig_hash_type_byte: u8,
 ) -> std::result::Result<(), crate::Error> {
     use ripemd::{Digest as _, Ripemd160};
-    use secp256k1::{Message, Secp256k1, SecretKey};
+    use secp256k1::{Message, SecretKey};
     use sha2::Sha256;
 
     let nu = match version {
@@ -263,11 +263,10 @@ fn build_and_verify_zip244_p2pkh(
         6 => NetworkUpgrade::Nu6_3,
         _ => panic!("fixture supports ZIP-244 transaction versions"),
     };
-    let secp = Secp256k1::new();
 
     // Deterministic keypair (32 bytes, nonzero)
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("valid secret key");
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
+    let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize(); // 33 bytes, compressed
 
     // Derive P2PKH lock script: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
@@ -348,7 +347,7 @@ fn build_and_verify_zip244_p2pkh(
 
     // Sign the sighash with the private key
     let msg = Message::from_digest(*sighash.as_ref());
-    let signature = secp.sign_ecdsa(&msg, &secret_key);
+    let signature = secp256k1::ecdsa::sign(msg, &secret_key);
     let der_sig = signature.serialize_der();
 
     // Build the unlock script: <sig_len> <DER_sig || hash_type_byte> <pubkey_len> <pubkey>
@@ -511,14 +510,13 @@ fn build_and_verify_v5_p2pkh_single_with_missing_output(
     anyone_can_pay: bool,
 ) -> std::result::Result<(), crate::Error> {
     use ripemd::{Digest as _, Ripemd160};
-    use secp256k1::{Message, Secp256k1, SecretKey};
+    use secp256k1::{Message, SecretKey};
     use sha2::Sha256;
 
     assert!(signed_input_index < 2, "test fixture only has two inputs");
 
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("valid secret key");
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
+    let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 
     // Standard P2PKH lock script reused for every prevout.
@@ -603,7 +601,7 @@ fn build_and_verify_v5_p2pkh_single_with_missing_output(
     };
 
     let msg = Message::from_digest(sighash);
-    let signature = secp.sign_ecdsa(&msg, &secret_key);
+    let signature = secp256k1::ecdsa::sign(msg, &secret_key);
     let der_sig = signature.serialize_der();
 
     let mut signed_unlock = Vec::new();
@@ -685,12 +683,11 @@ fn sighash_divergence_v5_sighash_single_with_corresponding_output_accepted() {
 /// and Zebra accepts.
 fn build_and_verify_v4_p2pkh(sig_hash_type_byte: u8) -> std::result::Result<(), crate::Error> {
     use ripemd::{Digest as _, Ripemd160};
-    use secp256k1::{Message, Secp256k1, SecretKey};
+    use secp256k1::{Message, SecretKey};
     use sha2::Sha256;
 
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("valid secret key");
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
+    let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 
     let sha_hash = Sha256::digest(pubkey_bytes);
@@ -738,7 +735,7 @@ fn build_and_verify_v4_p2pkh(sig_hash_type_byte: u8) -> std::result::Result<(), 
         sighasher.sighash_v4_raw(sig_hash_type_byte, Some((0, lock_script_bytes.clone())));
 
     let msg = Message::from_digest(*sighash.as_ref());
-    let signature = secp.sign_ecdsa(&msg, &secret_key);
+    let signature = secp256k1::ecdsa::sign(msg, &secret_key);
     let der_sig = signature.serialize_der();
 
     let mut unlock_script_bytes = Vec::new();
@@ -1487,13 +1484,12 @@ fn is_valid_rejects_out_of_range_input_index() {
 /// returns an error — matching `zcashd`.
 #[test]
 fn stale_sighash_buffer_v5_two_checksig_rejected() {
-    use secp256k1::{Message, Secp256k1, SecretKey};
+    use secp256k1::{Message, SecretKey};
 
     let _init_guard = zakura_test::init();
 
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("valid secret key");
-    let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+    let secret_key = SecretKey::from_secret_bytes([0xcd; 32]).expect("valid secret key");
+    let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
     let pubkey_bytes = public_key.serialize();
 
     // scriptPubKey: <0x21> <pubkey 33 bytes> OP_CHECKSIGVERIFY
@@ -1544,7 +1540,7 @@ fn stale_sighash_buffer_v5_two_checksig_rejected() {
     // the stale C++ buffer to still hold when the second CHECKSIG runs.
     let sighash = sighasher.sighash(HashType::ALL, Some((0, lock_script_bytes.clone())));
     let msg = Message::from_digest(*sighash.as_ref());
-    let signature = secp.sign_ecdsa(&msg, &secret_key);
+    let signature = secp256k1::ecdsa::sign(msg, &secret_key);
     let der_sig = signature.serialize_der();
 
     // scriptSig pushes:

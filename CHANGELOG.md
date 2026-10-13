@@ -11,7 +11,7 @@ independently.
 
 ## [Unreleased]
 
-## [1.7.0-rc0] - 2026-10-12
+## [1.7.0-rc0] - 2026-10-13
 
 ### Added
 

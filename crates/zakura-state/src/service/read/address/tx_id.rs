@@ -34,7 +34,7 @@ use crate::{
 ///
 /// # Errors
 ///
-/// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) if `db`
+/// Returns [`TransparentIndexesUnavailable`] if `db`
 /// skips transparent indexes.
 pub fn transparent_tx_ids<C>(
     chain: Option<C>,

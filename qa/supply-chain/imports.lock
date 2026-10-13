@@ -70,8 +70,8 @@ when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
 
 [[publisher.zakura-assets]]
-version = "0.3505845.0"
-when = "2026-10-05"
+version = "0.3513777.0"
+when = "2026-10-12"
 trusted-publisher = "github:zakura-core/zakura"
 
 [[audits.bytecode-alliance.wildcard-audits.bumpalo]]
@@ -1452,6 +1452,11 @@ delta = "0.3.3 -> 0.3.4"
 who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 version = "0.5.0"
+
+[[audits.isrg.audits.inout]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.1.4 -> 0.2.2"
 
 [[audits.isrg.audits.once_cell]]
 who = "J.C. Jones <jc@insufficient.coffee>"

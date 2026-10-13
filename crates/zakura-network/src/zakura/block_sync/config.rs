@@ -92,8 +92,8 @@ pub const DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS: u32 = 64;
 pub const DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN: Duration = Duration::from_secs(180);
 /// Default hard floor-peer avoid cooldown after a watchdog cancellation.
 pub const DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN: Duration = DEFAULT_BS_REQUEST_TIMEOUT;
-/// Default block-sync status refresh interval after local frontier changes.
-pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound tip-growth advertisements so peers can promptly request new block bodies.
+pub const DEFAULT_BS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// Default tolerated size-hint deviation percentage before a peer is reported.
 pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// Maximum peer-advertised aggregate byte target accepted per requested range.

@@ -94,6 +94,19 @@ pub struct ZakuradConfig {
 }
 
 impl ZakuradConfig {
+    /// Returns the state config with the settings `zakurad` mirrors into it from other sections.
+    ///
+    /// State owns the checkpoint-sync commit path and chooses its database kind from it, but users
+    /// configure checkpoint sync under `[consensus]` and the P2P stack under `[network]`. Offline
+    /// commands use this too, so they open the same state database as `start`.
+    pub fn mirrored_state_config(&self) -> zakura_state::Config {
+        let mut state_config = self.state.clone();
+        state_config.enable_zakura_header_seed_from_committed_blocks = self.network.v2_p2p();
+        state_config.checkpoint_sync = self.consensus.checkpoint_sync;
+        state_config.vct_fast_sync = self.consensus.vct_fast_sync_enabled();
+        state_config
+    }
+
     /// Loads the configuration from the conventional sources.
     ///
     /// Configuration is loaded from four sources, in order of precedence:

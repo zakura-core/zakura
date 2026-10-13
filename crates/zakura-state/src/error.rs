@@ -269,7 +269,38 @@ pub enum StateInitError {
          Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
     VctSproutHistoryUnrepairable,
+
+    /// A database that stopped building transparent address indexes was opened in archive storage mode.
+    ///
+    /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot
+    /// answer completely.
+    #[error(
+        "cannot open state in archive storage mode: the database at {path:?} was created by a \
+         pruned checkpoint-syncing node and stopped maintaining transparent address indexes. \
+         Hint: configure `storage_mode.pruned`, or sync an archive node into a fresh cache directory"
+    )]
+    TransparentIndexesMissingInArchiveMode {
+        /// The database directory without transparent indexes.
+        path: PathBuf,
+    },
 }
+
+/// A transparent address or transparent spender query was sent to a state database that does not
+/// build those indexes.
+///
+/// A pruned checkpoint-syncing node stops updating finalized transparent address balances,
+/// address UTXO and transaction indexes, and transparent spender indexes in its existing database.
+/// Answering from partial data would return balances, UTXO lists, histories, or spenders that look
+/// authoritative but are incomplete, so these queries fail instead.
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "transparent address and spender indexes are unavailable: this node's state database \
+     stopped maintaining them in pruned storage mode with checkpoint sync. \
+     getaddressbalance, getaddressutxos, getaddresstxids, and transparent spending transaction \
+     lookups need an archive node, or a pruned node that synced into a fresh cache directory with \
+     consensus.checkpoint_sync = false"
+)]
+pub struct TransparentIndexesUnavailable;
 
 /// An error describing why a block could not be queued to be committed to the state.
 #[derive(Debug, Error, Clone, PartialEq, Eq, new)]

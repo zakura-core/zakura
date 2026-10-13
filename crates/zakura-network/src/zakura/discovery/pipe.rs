@@ -212,6 +212,34 @@ mod tests {
         );
     }
 
+    /// A `Peers` message whose relayed records all fail to decode is an empty sample,
+    /// not a protocol violation by the relaying peer.
+    #[test]
+    fn run_one_accepts_peers_with_only_undecodable_records() {
+        let mut pipe = discovery_pipe(peer());
+        let mut payload = vec![super::super::protocol::MSG_DISCOVERY_PEERS];
+        // One record: a 3-byte body that cannot hold a node id, then a 64-byte signature.
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&[0xff; 3]);
+        payload.extend_from_slice(&[0; 64]);
+
+        let flow = pipe.run_one(Frame {
+            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
+            flags: 0,
+            payload,
+        });
+
+        assert!(matches!(flow, Flow::Continue(())));
+        assert!(
+            matches!(
+                pipe.local_mut().take_decoded(),
+                Some(DiscoveryMessage::Peers { records }) if records.is_empty()
+            ),
+            "the empty sample is handed off like any other Peers message"
+        );
+    }
+
     /// A frame whose envelope type is not the discovery type is rejected by the
     /// guard before decode, and nothing is handed off.
     #[test]

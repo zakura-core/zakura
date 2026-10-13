@@ -46,7 +46,7 @@ impl Runnable for PruneStateCmd {
     fn run(&self) {
         let config = APPLICATION.config();
 
-        if let Err(error) = self.run_with_config(config.state.clone()) {
+        if let Err(error) = self.run_with_config(config.mirrored_state_config()) {
             tracing::error!("Failed to prune finalized state: {error}");
             // Exit non-zero so scripts can detect failures.
             std::process::exit(1);

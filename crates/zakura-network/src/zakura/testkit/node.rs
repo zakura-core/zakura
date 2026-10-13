@@ -2,13 +2,13 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::QuicTransportConfig, protocol::Router, EndpointAddr, EndpointId};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 use zakura_jsonl_trace::JsonlTracer;
+use zakura_quic::{NodeAddr, NodeId, QuicConfig};
 
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
         HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
         ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraHeaderSyncDriverStartup,
         ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
-        ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
+        ZakuraSupervisorHandle, ZakuraTrace,
     },
     BoxError, Config,
 };
@@ -48,8 +48,8 @@ impl ZakuraTestNode {
         self.seed
     }
 
-    /// Current Iroh node address.
-    pub async fn node_addr(&self) -> EndpointAddr {
+    /// Current node address.
+    pub async fn node_addr(&self) -> NodeAddr {
         self.endpoint.node_addr().await
     }
 
@@ -114,11 +114,11 @@ impl ZakuraTestNode {
     }
 
     /// Insert `peer` as a trusted static discovery candidate (loopback allowed)
-    /// and teach iroh its route, so the candidate dialer can connect to it.
+    /// and record its route, so the candidate dialer can connect to it.
     pub async fn insert_static_discovery_candidate(
         &self,
         peer: &ZakuraTestNode,
-    ) -> Result<EndpointId, BoxError> {
+    ) -> Result<NodeId, BoxError> {
         let node_addr = peer.node_addr().await;
         let node_id = node_addr.id;
 
@@ -136,12 +136,12 @@ impl ZakuraTestNode {
         self.connect_native_to_addr(peer_addr, timeout).await
     }
 
-    /// Start a native dial to an explicit [`EndpointAddr`] and wait until this node
+    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
     /// registers it. Lets tests advertise a specific direct-address list (for
     /// example a decoy address ahead of the reachable one).
     pub async fn connect_native_to_addr(
         &self,
-        peer_addr: EndpointAddr,
+        peer_addr: NodeAddr,
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
@@ -215,7 +215,7 @@ pub struct ZakuraTestNodeBuilder {
     seed: u64,
     limits: ZakuraLocalLimits,
     max_connections_per_ip: usize,
-    transport_config: Option<QuicTransportConfig>,
+    quic_config: Option<QuicConfig>,
     legacy_upgrade: bool,
     tracer: JsonlTracer,
     service: Option<Arc<dyn Service>>,
@@ -245,7 +245,7 @@ impl fmt::Debug for ZakuraTestNodeBuilder {
             .field("seed", &self.seed)
             .field("limits", &self.limits)
             .field("max_connections_per_ip", &self.max_connections_per_ip)
-            .field("transport_config", &self.transport_config.is_some())
+            .field("quic_config", &self.quic_config)
             .field("legacy_upgrade", &self.legacy_upgrade)
             .field("tracer", &self.tracer)
             .field(
@@ -270,7 +270,7 @@ impl ZakuraTestNodeBuilder {
             seed,
             limits,
             max_connections_per_ip: config.zakura.max_connections_per_ip(),
-            transport_config: None,
+            quic_config: None,
             legacy_upgrade: false,
             tracer: JsonlTracer::noop(),
             service: None,
@@ -310,9 +310,9 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Set the complete transport configuration used by the endpoint factory.
-    pub fn transport(mut self, transport: QuicTransportConfig) -> Self {
-        self.transport_config = Some(transport);
+    /// Override the transport settings, which otherwise come from the limits.
+    pub fn quic_config(mut self, quic: QuicConfig) -> Self {
+        self.quic_config = Some(quic);
         self
     }
 
@@ -396,12 +396,11 @@ impl ZakuraTestNodeBuilder {
             );
         }
 
-        let transport = self
-            .transport_config
-            .unwrap_or_else(|| self.limits.transport_config());
-        let endpoint = LocalEndpointFactory::with_transport_config(transport)
-            .endpoint(self.seed)
-            .await?;
+        let mut factory = LocalEndpointFactory::with_limits(&self.limits);
+        if let Some(quic) = self.quic_config.clone() {
+            factory = factory.quic_config(quic);
+        }
+        let endpoint = factory.endpoint(self.seed).await?;
         let supervisor = ZakuraSupervisorHandle::new(self.max_connections_per_ip);
         let recorder = InboundRecorder::new(usize::from(self.limits.max_inbound_queue_depth));
         let base_service = if let Some(factory) = self.service_factory {
@@ -550,14 +549,14 @@ impl ZakuraTestNodeBuilder {
         if let Some(supported_capabilities) = self.supported_capabilities {
             handler = handler.with_supported_capabilities(supported_capabilities);
         }
-        let router = Router::builder(endpoint)
-            .accept(P2P_V2_ALPN, handler.clone())
-            .spawn();
+        let handler = handler.with_local_node_id(endpoint.local_id());
+        endpoint.serve(handler.clone())?;
+        let quic = endpoint;
         let endpoint = if let (Some(header_handle), Some(block_handle), Some((shutdown, actions))) =
             (header_sync_handle, block_sync_handle, header_sync_actions)
         {
             ZakuraEndpoint::from_parts_with_sync_services(
-                router,
+                quic,
                 supervisor,
                 handler,
                 header_handle,
@@ -568,7 +567,7 @@ impl ZakuraTestNodeBuilder {
                 block_sync_actions,
             )
         } else {
-            ZakuraEndpoint::from_parts(router, supervisor, handler)
+            ZakuraEndpoint::from_parts(quic, supervisor, handler)
         };
 
         Ok(ZakuraTestNode {
@@ -657,16 +656,17 @@ mod tests {
 
     // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
     // dials share one source IP (test nodes also bind an IPv6 loopback socket).
-    fn ipv4_loopback_addr(peer_addr: &EndpointAddr) -> EndpointAddr {
-        let addr = EndpointAddr::new(peer_addr.id).with_addrs(
-            (peer_addr
-                .ip_addrs()
+    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
+        let addr = NodeAddr::with_addrs(
+            peer_addr.id,
+            peer_addr
+                .direct
+                .iter()
                 .copied()
-                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()))
-            .map(iroh::TransportAddr::Ip),
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
         );
         assert!(
-            addr.ip_addrs().next().is_some(),
+            !addr.direct.is_empty(),
             "test peer must advertise an IPv4 loopback direct address",
         );
         addr
@@ -677,7 +677,7 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // `serve_native_dial_connection` previously charged the first advertised address.
-        // Iroh can confirm a different path.
+        // The handshake can win on a different address.
         // An unreachable first address could therefore bypass the per-IP cap.
         let peer1 = ZakuraTestNode::builder(9201)
             .spawn()
@@ -692,20 +692,18 @@ mod tests {
         // Advertise an unreachable address before peer1's loopback address.
         // Charge the confirmed loopback path instead of the advertised address.
         //
-        // `EndpointAddr::direct_addresses` stores addresses in a `BTreeSet`.
-        // The decoy must sort below 127.0.0.1 to expose the previous behavior.
-        // RFC 6598 shared address space meets that requirement and is not routable.
+        // The dialer tries addresses in the given order, so the decoy goes first.
+        // RFC 6598 shared address space is not routable.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
         let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
-        let decoy_first = EndpointAddr::new(peer1_loopback.id).with_addrs(
-            std::iter::once(decoy)
-                .chain(peer1_loopback.ip_addrs().copied())
-                .map(iroh::TransportAddr::Ip),
+        let decoy_first = NodeAddr::with_addrs(
+            peer1_loopback.id,
+            std::iter::once(decoy).chain(peer1_loopback.direct.iter().copied()),
         );
         assert_eq!(
-            decoy_first.ip_addrs().next(),
+            decoy_first.direct.first(),
             Some(&decoy),
-            "the decoy must sort first, or this test cannot discriminate",
+            "the decoy must come first, or this test cannot discriminate",
         );
         node.connect_native_to_addr(decoy_first, TEST_NET_TIMEOUT)
             .await
@@ -733,5 +731,74 @@ mod tests {
 
         node.shutdown().await;
         peer1.shutdown().await;
+    }
+
+    // V12 F-58: the discovery dialer clears backoff only for the address whose
+    // handshake won. The dial must report that address, not the decoy, in
+    // either address order, and must report it before the peer registers.
+    #[tokio::test]
+    async fn outbound_dial_reports_the_admitted_ip_before_registration() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip;
+
+        let peer = ZakuraTestNode::builder(9205)
+            .spawn()
+            .await
+            .expect("peer spawns");
+        let peer_loopback = ipv4_loopback_addr(&peer.node_addr().await);
+        let peer_id = peer_loopback.id.as_bytes().to_vec();
+        // RFC 6598 shared address space is not routable.
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
+        let decoy_first = NodeAddr::with_addrs(
+            peer_loopback.id,
+            std::iter::once(decoy).chain(peer_loopback.direct.iter().copied()),
+        );
+        let decoy_last = NodeAddr::with_addrs(
+            peer_loopback.id,
+            peer_loopback
+                .direct
+                .iter()
+                .copied()
+                .chain(std::iter::once(decoy)),
+        );
+
+        // Each order uses its own dialer, because the peer stays registered.
+        for (seed, peer_addr) in [(9207, decoy_first), (9209, decoy_last)] {
+            let node = ZakuraTestNode::builder(seed)
+                .spawn()
+                .await
+                .expect("dialer spawns");
+            let mut peer_set_rx = node.supervisor().subscribe();
+            let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+            let endpoint = node.endpoint();
+            let limits = node.limits().clone();
+            let dial = tokio::spawn(async move {
+                serve_native_dial_connection_reporting_admitted_ip(
+                    &endpoint,
+                    peer_addr,
+                    &limits,
+                    Some(admitted_ip_tx),
+                )
+                .await
+            });
+
+            tokio::time::timeout(
+                TEST_NET_TIMEOUT,
+                wait_for_peer_registration(&mut peer_set_rx, peer_id.as_slice()),
+            )
+            .await
+            .expect("peer registers before the timeout")
+            .expect("peer-set watcher stays open");
+            assert_eq!(
+                admitted_ip_rx.try_recv().ok(),
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                "dialer {seed} reports the loopback path its handshake won, before registration",
+            );
+
+            dial.abort();
+            node.shutdown().await;
+        }
+        peer.shutdown().await;
     }
 }

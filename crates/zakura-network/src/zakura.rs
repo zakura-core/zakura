@@ -1,14 +1,15 @@
 //! Zakura P2P dependency, identity, handshake, and protocol-handler scaffolding.
 //!
-//! This module reserves the iroh dependency, privacy-preserving endpoint posture,
-//! persistent identity storage surface, and bounded Zakura handshake wire types.
+//! This module holds the privacy-preserving endpoint posture, persistent
+//! identity storage surface, and bounded Zakura handshake wire types. The QUIC
+//! transport lives in `zakura-quic`.
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use zakura_quic::{NodeAddr, NodeId};
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -42,7 +43,7 @@ pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
     BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
-    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
 
@@ -54,9 +55,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-
-/// The pinned iroh version the Zakura P2P plan was verified against.
-pub const IROH_VERSION: &str = "0.92.0";
 
 /// Capability bit for the legacy gossip compatibility service.
 pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
@@ -199,17 +197,6 @@ const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// so the `Responded` liveness never ages into a reconnection candidate while
 /// the Zakura connection is alive.
 const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
-
-/// Returns an iroh endpoint builder with relays and external address lookup disabled.
-///
-/// Callers must add explicit direct bind addresses before binding.
-pub fn direct_endpoint_builder(secret_key: SecretKey) -> endpoint::Builder {
-    Endpoint::builder(endpoint::presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .clear_ip_transports()
-        .secret_key(secret_key)
-}
 
 /// The result of routing a mutually P2P-v2-capable legacy handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,18 +465,17 @@ impl Drop for UpgradeDialCancelGuard<'_> {
     }
 }
 
-/// Builds an iroh dial address from the node id and direct-address hints a peer
+/// Builds a dial address from the node id and direct-address hints a peer
 /// advertised in a legacy upgrade prelude.
 ///
 /// Direct addresses are carried as `SocketAddr` strings (the same encoding used
 /// by configured bootstrap peers), so each entry is parsed back into a
 /// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
 /// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<EndpointAddr> {
-    let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
-    let node_id = EndpointId::from_bytes(&node_id_bytes).ok()?;
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+    let node_id = NodeId::try_from(node_id).ok()?;
 
-    let direct: Vec<std::net::SocketAddr> = direct_addresses
+    let mut direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
         .filter_map(|address| std::str::from_utf8(address).ok()?.parse().ok())
         .collect();
@@ -497,8 +483,11 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
     if direct.is_empty() {
         return None;
     }
+    // Keep the sorted, duplicate-free order Iroh's address set used to give.
+    direct.sort_unstable();
+    direct.dedup();
 
-    Some(EndpointAddr::new(node_id).with_addrs((direct).into_iter().map(iroh::TransportAddr::Ip)))
+    Some(NodeAddr::with_addrs(node_id, direct))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
@@ -536,53 +525,8 @@ async fn run_legacy_liveness_keeper(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        error::Error,
-        net::{Ipv4Addr, SocketAddrV4},
-    };
-
-    use iroh::{
-        endpoint::Connection,
-        protocol::{AcceptError, ProtocolHandler, Router},
-        SecretKey,
-    };
-
     use super::*;
     use crate::{CacheDir, Config};
-
-    #[derive(Debug, Clone)]
-    struct SmokeProtocolHandler;
-
-    impl ProtocolHandler for SmokeProtocolHandler {
-        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn iroh_endpoint_starts_without_relay_or_discovery() -> Result<(), Box<dyn Error>> {
-        let secret_key = SecretKey::from_bytes(&[7; 32]);
-
-        let endpoint = direct_endpoint_builder(secret_key)
-            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
-            .bind()
-            .await?;
-
-        let router = Router::builder(endpoint)
-            .accept(b"/zakura/smoke/0", SmokeProtocolHandler)
-            .spawn();
-
-        let addr = router.endpoint().addr();
-
-        assert_eq!(addr.id, router.endpoint().id());
-        assert!(addr.ip_addrs().next().is_some());
-        assert!(addr.relay_urls().next().is_none());
-        assert!(router.endpoint().address_lookup()?.is_empty());
-
-        router.shutdown().await?;
-
-        Ok(())
-    }
 
     #[test]
     fn zakura_secret_key_path_uses_identity_dir() {

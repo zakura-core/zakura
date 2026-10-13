@@ -90,20 +90,28 @@ who is connecting. Main grants every connection a 32 MiB receive window and
 sessions could pin 64 GiB.
 
 The wallet ALPN fixes this on the existing port. The wallet names its ALPN in
-the first QUIC packet. The node reads it there with `Incoming::decrypt()`,
-before any handshake work. For the wallet ALPN, the node checks `W` and the
-per-source share. It then accepts with a small transport profile through
-`Incoming::accept_with`: a receive window of one in-flight budget plus control
-overhead, and `K + 2` streams. Full peers keep `p2p-v2/2` and their current
-profile. Wallet sessions never take one of the 256 peer connection slots.
+the ClientHello, inside the first QUIC packet. The server's first flight
+carries the transport parameters, so the node must pick the profile before
+`quinn-proto` reads the ClientHello. `quinn-proto` 0.11.19 has no API that
+exposes the ClientHello before `Endpoint::accept`. `zakura-quic` therefore
+reads the ALPN itself. It derives the Initial keys from the client's
+destination connection ID (RFC 9001 §5.2) through
+`crypto::ServerConfig::initial_keys`, decrypts the first Initial packet, and
+reads the ALPN extension. It passes the ALPN to `Acceptor::admit` in
+`IncomingInfo`. For the wallet ALPN, the node checks `W` and the per-source
+share. It then accepts with a small transport profile, which the driver
+passes to `Endpoint::accept`: a receive window of one in-flight budget plus
+control overhead, and `K + 2` streams. Full peers keep `p2p-v2/3` and their
+current profile. Wallet sessions never take one of the 256 peer connection
+slots.
 
 Two alternatives were rejected:
 
 - A second listener also works, but adds a port that operators must open and
   advertise.
 - Starting every connection with small credit and raising it after the
-  handshake fails for full peers. noq can raise a connection's window and stream
-  count, but not its per-stream window, which block sync needs.
+  handshake fails for full peers. quinn-proto can raise a connection's window
+  and stream count, but not its per-stream window, which block sync needs.
 
 ## 4. Results
 
@@ -137,7 +145,7 @@ reserved inputs.
 
 | Piece | Location | Work |
 | --- | --- | --- |
-| ALPN classification | `zakura-iroh` [`Router`][router] incoming filter | Add an outcome that accepts with a caller-supplied `ServerConfig`, so the filter can apply `Incoming::accept_with`. |
+| ALPN classification | `zakura-quic` `Acceptor` and `IncomingInfo` | Read the ALPN from the first Initial packet, pass it in `IncomingInfo`, and let `Admit::Accept` name a transport profile for `Endpoint::accept`. |
 | Wallet transport profile | `zakura-network` [`transport_config_builder`][transport-config] | Add a second profile with wallet windows and stream count. |
 | Wallet service | `zakura-network` | Session stream, `SessionInfo`, request-ID bitmap, deadlines, and `W` slot accounting. |
 | Admission | `zakura-node-services` [mempool requests][mempool-requests], `zakurad` mempool | `AdmitTransaction` returns the verified-insertion result and marks the commit point. A new `QueueSource::Wallet` never reaches [`mempool_misbehavior_score`][misbehavior]. |
@@ -148,7 +156,6 @@ including the [bridge to legacy peers][legacy-bridge]. Miners need no changes.
 
 [vizor-providers]: https://github.com/chainapsis/vizor-wallet/blob/4ecdfa4cb748d7b37dd893acc295d81e6de87807/lib/src/core/config/rpc_endpoint_config.dart#L64-L150
 [zodl-providers]: https://github.com/zodl-inc/zodl-ios/blob/7cb54efd696bf78a3a135a4d50d52ad80c33ee94/secant/Sources/Dependencies/ZcashSDKEnvironment/ZcashSDKEnvironmentInterface.swift#L19-L112
-[router]: https://github.com/zakura-core/iroh/blob/zakura-iroh-v1.1.0-rc.1/iroh/src/protocol.rs#L462-L475
 [transport-config]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-network/src/zakura/handler.rs#L505-L525
 [mempool-requests]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakura-node-services/src/mempool.rs#L55-L64
 [misbehavior]: https://github.com/zakura-core/zakura/blob/4127aa19644a5a7a4aa91f82088929624bdd7c20/crates/zakurad/src/components/mempool.rs#L182

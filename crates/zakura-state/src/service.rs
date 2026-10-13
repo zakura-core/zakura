@@ -438,7 +438,10 @@ impl StateService {
                     .unwrap_or_else(|error| match error {
                         // This database cannot be repaired, and the generic hint below would
                         // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
+                        error @ (StateInitError::VctSproutHistoryUnrepairable
+                        | StateInitError::TransparentIndexesMissingInArchiveMode {
+                            ..
+                        }) => {
                             panic!("{error}")
                         }
                         error => panic!(
@@ -495,6 +498,7 @@ impl StateService {
                 .await;
 
         let non_finalized_block_write_sent_hashes = SentHashes::new(&non_finalized_state);
+        let finalized_tip_height = finalized_tip.as_ref().map(|tip| tip.height.0);
         let initial_tip = non_finalized_state
             .best_tip_block()
             .map(|cv_block| cv_block.block.clone())
@@ -502,7 +506,11 @@ impl StateService {
             .map(ChainTipBlock::from)
             .or(finalized_tip);
 
-        tracing::info!(chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)), "loaded Zakura state cache");
+        tracing::info!(
+            chain_tip = ?initial_tip.as_ref().map(|tip| (tip.hash, tip.height)),
+            finalized_tip_height,
+            "loaded Zakura state cache"
+        );
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
@@ -3081,7 +3089,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
-                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
+                read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend)?,
             )),
 
             ReadRequest::CheckParentInputs { parent, outpoints } => {
@@ -3296,7 +3304,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BlocksByHeightRange { start, count } => {
-                let best_chain = state.latest_best_chain();
+                let snapshot = state.block_range_snapshot()?;
                 let blocks = (0..count)
                     .map_while(|offset| {
                         start
@@ -3304,7 +3312,8 @@ impl Service<ReadRequest> for ReadStateService {
                             .checked_add(offset)
                             .map(block::Height)
                             .and_then(|height| {
-                                read::block_and_size(best_chain.clone(), &state.db, height.into())
+                                snapshot
+                                    .block_and_size(&state.db, height)
                                     .map(|(block, size)| (height, block, size))
                             })
                     })

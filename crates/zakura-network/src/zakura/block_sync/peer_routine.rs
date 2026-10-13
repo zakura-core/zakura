@@ -612,13 +612,26 @@ impl PeerRoutine {
             } => {
                 // Serving is reactor-owned (state query + driver). Forward the
                 // request; the reactor serves via the session clone it holds.
-                let _ = self
+                if self
                     .routine_to_reactor
                     .try_send(RoutineToReactor::ServeGetBlocks {
                         peer: self.peer.clone(),
                         start_height,
                         count,
+                    })
+                    .is_err()
+                {
+                    metrics::counter!("sync.block.serving.reactor_queue_unavailable").increment(1);
+                    self.emit("block_serve_rejected", |row| {
+                        row.peer = Some(super::trace::peer(&self.peer));
+                        row.range_start = Some(u64::from(start_height.0));
+                        row.range_count = Some(u64::from(count));
+                        row.reason = Some("reactor_queue_unavailable");
                     });
+                    self.session
+                        .try_send_range_unavailable(start_height, count)
+                        .map_err(SinkReject::local)?;
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -932,19 +945,21 @@ impl PeerRoutine {
             }
             // A faster peer must also be eligible to retry this exact body.
             // Otherwise its preference would keep honest suppliers from taking it.
-            let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
-                floor_work.map_or(view.download_floor, |(height, _)| height),
-                &self.peer,
-                self.window.bbr_rtprop_ms(now),
-                in_bypass,
-                |peer| {
-                    floor_work.is_none_or(|(_, item)| {
-                        !self
-                            .registry
-                            .is_body_retry_avoided(peer, item.scope, item.hash, now)
-                    })
-                },
-            );
+            let floor_arm_allowed = floor_work.is_some_and(|(height, _)| {
+                !self.registry.floor_has_preferred_unsaturated_server(
+                    height,
+                    &self.peer,
+                    self.window.bbr_rtprop_ms(now),
+                    in_bypass,
+                    |peer| {
+                        floor_work.is_none_or(|(_, item)| {
+                            !self
+                                .registry
+                                .is_body_retry_avoided(peer, item.scope, item.hash, now)
+                        })
+                    },
+                )
+            });
             let Some(request_id) = self.next_request_id else {
                 break FillStop::Internal;
             };
@@ -2486,8 +2501,8 @@ mod tests {
         BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
         ZakuraBlockSyncConfig,
     };
-    use super::PeerRoutine;
     use super::RoutineToReactor;
+    use super::{block_sync_guard, PeerRoutine};
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
@@ -2545,6 +2560,100 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test]
+    async fn full_reactor_queue_returns_range_unavailable() {
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        while routine.routine_to_reactor.capacity() > 0 {
+            routine
+                .routine_to_reactor
+                .try_send(RoutineToReactor::RequeryNeeded)
+                .unwrap();
+        }
+        let request = BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 2,
+        }
+        .encode_frame()
+        .unwrap();
+        routine
+            .handle_frame(&mut block_sync_guard(), request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(outbound.try_recv().unwrap()).unwrap(),
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(1),
+                count: 2,
+            }
+        ));
+        assert!(!routine.session.cancel_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn floor_provider_does_not_defer_to_a_peer_behind_the_missing_block() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        routine.received_status = true;
+        routine.servable_low = block::Height(0);
+        routine.servable_high = block::Height(1);
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = routine
+            .registry
+            .admit_session(
+                &fast_peer,
+                routine.session.direction(),
+                &routine.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        for (peer, generation, high, latency) in [
+            (&routine.peer, routine.generation, 1, 145),
+            (&fast_peer, fast_generation, 0, 5),
+        ] {
+            routine.registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(high),
+                    ..BlockSyncStatus::default()
+                },
+            );
+            routine.registry.publish_slots(
+                peer,
+                generation,
+                SlotDiagnostics {
+                    available_slots: 3,
+                    bbr_rtprop_ms: Some(latency),
+                    ..SlotDiagnostics::default()
+                },
+            );
+        }
+        routine.work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        routine.try_fill().await;
+
+        let frame = outbound
+            .try_recv()
+            .expect("the only provider must request the missing block immediately");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

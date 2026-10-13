@@ -66,6 +66,9 @@ impl DiskFormatUpgrade for Upgrade {
         };
         let network = db.network();
         let balance_by_transparent_addr = db.address_balance_cf();
+        // A database without transparent indexes has no address balances to add received
+        // amounts to. Block info is still added.
+        let skip_transparent_indexes = db.skips_transparent_indexes();
         let chunk_size = rayon::current_num_threads();
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
@@ -123,7 +126,7 @@ impl DiskFormatUpgrade for Upgrade {
                             }
                         }
 
-                        for output in tx.outputs() {
+                        for output in tx.outputs().iter().filter(|_| !skip_transparent_indexes) {
                             if let Some(address) = output.address(&network) {
                                 // Note: using `empty()` will set the location
                                 // to a dummy value. This only works because the
@@ -290,6 +293,12 @@ impl DiskFormatUpgrade for Upgrade {
 
         if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {
             return Err(super::FormatChangeError::Cancelled);
+        }
+
+        // A database without transparent indexes never stores address balances, so there are no
+        // received balances to check. The block info check above still applies.
+        if db.skips_transparent_indexes() {
+            return Ok(Ok(()));
         }
 
         // Check that all recipient addresses of transparent transfers in the range have a non-zero received balance.

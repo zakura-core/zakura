@@ -9,7 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -64,7 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: ${{ env.HEADER_FUZZ_NIGHTLY }}
           cache: true
@@ -88,7 +89,8 @@ jobs:
           if [ "${SCHEDULE}" = "13 5 * * 0" ]; then
             seconds="${WEEKLY_SECONDS}"
           fi
-          cargo fuzz run "${TARGET}" -- \
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
             -max_len="${MAX_LEN}" \

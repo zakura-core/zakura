@@ -109,10 +109,12 @@ This check runs automatically on pull requests with the `A-release` label. It mu
 > performs the mechanical steps in this section (crate and zakura version
 > bumps, lockfile, stored config, changelog assembly, release-level validation,
 > public-API reports, and a projected end-of-support height from the latest
-> verified release-state bundle) and opens a draft PR. It also refuses stale
-> committed release state unless an urgent-RC waiver reason is supplied. The
-> remaining judgment items are changelog curation and confirmation that no
-> release hold is active.
+> verified release-state bundle) and opens a draft PR. It also refuses committed
+> release state behind a newer verified bundle unless an urgent-RC waiver reason
+> is supplied. Bundle age alone does not block preparation. The
+> remaining judgment items are changelog curation, end-of-support height
+> validation (check `#zakura-collab` or ask Dev/Sean), and confirmation that
+> no release hold is active.
 
 ## Update Zakura Version
 
@@ -243,12 +245,21 @@ make prepare-release-changelog RELEASE_TAG=v<version>
 
 ## Verify End of Support
 
-The preparation workflow calculates the release height from a fresh,
-digest-verified Mainnet release-state bundle, projects it to the expected tag
-date, and updates `ESTIMATED_RELEASE_HEIGHT` when needed:
+The preparation workflow calculates the release height from a digest-verified
+Mainnet release-state bundle, projects it to the expected tag
+date, and updates `ESTIMATED_RELEASE_HEIGHT` when needed. It does **not**
+choose the support window: `EOS_PANIC_AFTER` (and therefore the halt height)
+is a manual release judgment.
 
 - [ ] Review the bundle height, generation time, expected tag delay, and
       resulting `ESTIMATED_RELEASE_HEIGHT` recorded in the release PR.
+- [ ] Validate the halt height
+      (`ESTIMATED_RELEASE_HEIGHT` + `EOS_PANIC_AFTER` × blocks/day) against
+      the intended support horizon for this release. Adjust `EOS_PANIC_AFTER`
+      if the window is too short or too long. Review recent discussion in
+      `#zakura-collab` or ask Dev/Sean before checking this off — the
+      release-readiness workflow requires the matching manual-judgment
+      checkbox on the generated release PR.
 - [ ] If tagging is delayed, re-run preparation with the new expected delay;
       `Create release` currently warns when the estimate is below its freshly
       resolved projection.
@@ -344,7 +355,7 @@ so only crates whose workspace version is absent are uploaded. See
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
   - [ ] Update [`crates/zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/crates/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
-  - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
+  - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact, pinning that release's standalone `zcashd-zebra-compat-<tag>-linux-x86_64` executable and its SHA-256, before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, and `SHA256SUMS.txt` to the GitHub release.

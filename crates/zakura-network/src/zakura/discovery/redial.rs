@@ -2,10 +2,12 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-use iroh::EndpointAddr;
 use tokio::time::Instant;
+use zakura_quic::NodeAddr;
 
-use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
+use crate::zakura::{
+    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
+};
 
 /// A connection that served at least this long is treated as healthy, so the
 /// next re-dial after it drops starts from the initial (fast) backoff again
@@ -37,6 +39,23 @@ impl RedialPolicy {
             max_attempts: None,
             registered_settle_timeout: ZAKURA_REDIAL_HEALTHY_CONNECTION,
             redial_after_drop: true,
+        }
+    }
+
+    /// Maintain a connection like [`Self::maintain`], but stop after `attempts`
+    /// consecutive failed dials (legacy->Zakura upgrade hand-offs).
+    ///
+    /// A peer-supplied upgrade address must not get a dial that lives forever.
+    /// A healthy connection resets the failure count, so a live peer keeps its
+    /// dial through brief drops, and a peer that stops answering loses it.
+    pub(crate) fn maintain_bounded(
+        initial_backoff: Duration,
+        max_backoff: Duration,
+        attempts: usize,
+    ) -> Self {
+        Self {
+            max_attempts: Some(attempts),
+            ..Self::maintain(initial_backoff, max_backoff)
         }
     }
 
@@ -75,6 +94,9 @@ enum DialResult {
     Healthy,
     /// Failed to establish, or served only briefly (e.g. a duplicate was closed).
     Failed,
+    /// The peer speaks another ALPN; wait at least
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
+    AlpnMismatch,
 }
 
 /// Maintain a Zakura connection to `node_addr`, re-dialing with bounded backoff.
@@ -87,7 +109,7 @@ enum DialResult {
 /// supplies the real dial attempt and the supervisor's registration watch.
 pub(crate) async fn native_dial_supervised(
     endpoint: ZakuraEndpoint,
-    node_addr: EndpointAddr,
+    node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
 ) {
@@ -109,6 +131,13 @@ pub(crate) async fn native_dial_supervised(
                     DialResult::Healthy
                 }
                 Ok(()) => DialResult::Failed,
+                Err(error) if error.is_alpn_mismatch() => {
+                    tracing::debug!(
+                        ?error,
+                        "Zakura peer speaks another protocol version; backing off"
+                    );
+                    DialResult::AlpnMismatch
+                }
                 Err(error) => {
                     tracing::debug!(?error, "Zakura native dial failed; will retry");
                     DialResult::Failed
@@ -231,7 +260,7 @@ async fn run_dial_supervisor<F>(
                 failures = 0;
                 continue;
             }
-            DialResult::Failed => {}
+            DialResult::Failed | DialResult::AlpnMismatch => {}
         }
 
         failures += 1;
@@ -243,7 +272,12 @@ async fn run_dial_supervisor<F>(
         // from another connection. Ignore unrelated peer-set changes,
         // including the deregistration from the failed attempt we just
         // observed.
-        let sleep = tokio::time::sleep(backoff);
+        let wait = if attempt == DialResult::AlpnMismatch {
+            backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
+        } else {
+            backoff
+        };
+        let sleep = tokio::time::sleep(wait);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
@@ -449,6 +483,75 @@ mod tests {
         supervisor.abort();
     }
 
+    /// A bounded maintained dial (legacy->Zakura upgrades) stops after its
+    /// attempt limit, so a peer-supplied address that never answers does not
+    /// get a dial that lives forever.
+    ///
+    /// Regression test for V12 #298060 and #299229.
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_maintain_bounded_gives_up_after_max_attempts() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy =
+            RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 6);
+
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            run_dial_supervisor(
+                redial_test_peer_id(),
+                registered,
+                policy,
+                count_dial(&calls, DialResult::Failed),
+            ),
+        )
+        .await
+        .expect("a bounded maintained dial must stop after exhausting its attempts");
+
+        assert_eq!(dial_count(&calls), 6);
+    }
+
+    /// A healthy connection resets the failure count of a bounded maintained
+    /// dial, so a live upgraded peer keeps its dial through repeated drops.
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_maintain_bounded_survives_healthy_connection_drops() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy =
+            RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 3);
+
+        // Two failed redials follow each healthy connection. Without the reset,
+        // the failure after the first healthy connection would be the third
+        // and end the dial.
+        let dial_calls = calls.clone();
+        let dial = move || {
+            let call = dial_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = if call % 3 == 2 {
+                DialResult::Healthy
+            } else {
+                DialResult::Failed
+            };
+            Box::pin(async move { result }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        };
+
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            policy,
+            dial,
+        ));
+
+        while dial_count(&calls) < 12 {
+            assert!(
+                !supervisor.is_finished(),
+                "a healthy connection's drop ended a bounded maintained dial after {} dials",
+                dial_count(&calls),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!supervisor.is_finished());
+        supervisor.abort();
+    }
+
     /// A lagging deregistration must not turn one healthy connection into a
     /// second failed attempt.
     #[tokio::test(start_paused = true)]
@@ -541,5 +644,34 @@ mod tests {
             6,
             "a peer that closes every connection must use one backoff step per dial",
         );
+    }
+
+    /// A peer on another ALPN is redialed no sooner than
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`], however short the policy's backoff
+    /// (zakura-quic DIAL-5).
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_backs_off_ten_minutes_after_alpn_mismatch() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+            count_dial(&calls, DialResult::AlpnMismatch),
+        ));
+
+        tokio::time::sleep(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(
+            dial_count(&calls),
+            1,
+            "the redial must wait out the ALPN backoff"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            dial_count(&calls),
+            2,
+            "the redial runs once the ALPN backoff ends"
+        );
+        supervisor.abort();
     }
 }

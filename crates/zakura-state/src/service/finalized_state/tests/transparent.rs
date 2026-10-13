@@ -130,6 +130,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         transaction_hashes,
         deferred_pool_balance_change: None,
         auth_data_root: None,
+        receipt_order: None,
     };
     let finalized = FinalizedBlock::from_checkpoint_verified(
         CheckpointVerifiedBlock(semantically_verified),
@@ -184,6 +185,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         #[cfg(feature = "indexer")]
         &HashMap::new(),
         address_balances,
+        false,
     );
 
     // Write the batch and confirm the final on-disk balance matches the consensus value
@@ -194,6 +196,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
 
     let (balance, received) = zakura_db
         .address_balance(&address)
+        .expect("indexed databases answer address balance queries")
         .expect("address balance is present after writing the batch");
     assert_eq!(balance, value, "final balance equals the existing balance");
     assert_eq!(

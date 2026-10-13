@@ -14,7 +14,10 @@ use zakura_chain::{
     ironwood, orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
+        subsidy::{
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+            FundingStreamReceiver, SubsidyError,
+        },
         Network, NetworkUpgrade,
     },
     sapling,
@@ -50,7 +53,7 @@ use crate::{
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
-    Config, SemanticallyVerifiedBlock,
+    Config, SemanticallyVerifiedBlock, StateInitError,
 };
 
 /// Options for rolling back the finalized state.
@@ -101,6 +104,10 @@ pub struct RollbackFinalizedStateSummary {
 /// Errors returned by finalized-state rollback.
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
+    /// The state database could not be opened for this configuration.
+    #[error("cannot open the state database to roll back: {0}")]
+    Database(#[from] StateInitError),
+
     /// The on-disk state database format does not match the running code.
     #[error(
         "state database format mismatch: on disk {on_disk:?}, running code {in_code}; \
@@ -263,7 +270,7 @@ pub fn preview_rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, true);
+    let db = open_rollback_db(&config, network, true)?;
     let bounds = validate_rollback(&db, &options)?;
 
     // A dry run only reports the plan, so it deliberately skips the genesis-to-target treestate
@@ -283,8 +290,17 @@ pub fn rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, false);
-    let prepared = prepare_rollback(&db, network, &options)?;
+    let db = open_rollback_db(&config, network, false)?;
+    rollback_open_db(&db, network, options)
+}
+
+fn rollback_open_db(
+    db: &ZakuraDb,
+    network: &Network,
+    options: RollbackFinalizedStateOptions,
+) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+    let config = db.config();
+    let prepared = prepare_rollback(db, network, &options)?;
 
     let backup = if options.keep_rolled_back_blocks {
         let backup_dir = config
@@ -316,6 +332,19 @@ pub fn rollback_finalized_state(
     Ok(summary)
 }
 
+#[cfg(test)]
+impl ZakuraDb {
+    /// Run the rollback implementation without reopening a test-owned database.
+    pub(in crate::service::finalized_state) fn rollback_for_test(
+        &self,
+        network: &Network,
+        options: RollbackFinalizedStateOptions,
+    ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+        check_format_version(self.config(), network)?;
+        rollback_open_db(self, network, options)
+    }
+}
+
 fn check_format_version(
     config: &Config,
     network: &Network,
@@ -338,7 +367,11 @@ fn check_format_version(
     }
 }
 
-fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> ZakuraDb {
+fn open_rollback_db(
+    config: &Config,
+    network: &Network,
+    read_only: bool,
+) -> Result<ZakuraDb, StateInitError> {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -353,7 +386,7 @@ fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> Zaku
             .iter()
             .map(ToString::to_string),
         read_only,
-    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
+    )
 }
 
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
@@ -460,6 +493,11 @@ fn prepare_rollback(
         .value_pools()
         .to_owned();
 
+    // Only the durable marker proves that committed index updates are incomplete. Before the
+    // first skipped commit, rollback must still reverse the complete indexes, even if the
+    // current configuration would stop updating them on the next block. Keep any marker intact.
+    let skip_transparent_indexes = db.transparent_indexes_skipped_from().is_some();
+
     let mut batch = DiskWriteBatch::new();
     let mut address_balances = HashMap::new();
     let mut removed_blocks = Vec::new();
@@ -473,7 +511,7 @@ fn prepare_rollback(
             .block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
-            .with_deferred_pool_balance_change(deferred_pool_balance_change(height, network)?);
+            .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
 
         reverse_transparent_block(
             db,
@@ -482,6 +520,7 @@ fn prepare_rollback(
             &mut address_balances,
             height,
             &block,
+            skip_transparent_indexes,
         )?;
         delete_shielded_block(db, &mut batch, &block);
         delete_block_and_transaction_data(db, &mut batch, height, &block)?;
@@ -696,14 +735,29 @@ fn rebuild_treestate_to_height(
 }
 
 fn deferred_pool_balance_change(
+    db: &ZakuraDb,
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
-    if height <= network.slow_start_interval() {
-        return Ok(None);
-    }
+    // Block commits apply the deferred funding stream at every height, including heights
+    // in slow start on configured networks, so rollback must reverse it at every height too.
+    // ZIP 234 derives the block subsidy from the money reserve after the parent block.
+    // Every block being rolled back is finalized, so its parent's pools are in the db.
+    let nsm_value_balance = if is_zip234_active(network, height) {
+        height
+            .previous()
+            .ok()
+            .and_then(|parent| db.block_info(parent.into()))
+            .map(|parent_info| {
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
-    let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
+    let block_subsidy = block_subsidy(height, network, nsm_value_balance)?;
+    let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
         .checked_sub(network.lockbox_disbursement_total_amount(height))
@@ -717,6 +771,11 @@ fn deferred_pool_balance_change(
     Ok(Some(DeferredPoolBalanceChange::new(deferred_amount)))
 }
 
+/// Reverses `block`'s transparent changes: the canonical UTXO set and, unless
+/// `skip_transparent_indexes` is set, the transparent address indexes and balances.
+///
+/// Transparent spender entries for the outputs `block` spent are always deleted. A database
+/// without transparent indexes never writes them, so deleting them is a no-op there.
 fn reverse_transparent_block(
     db: &ZakuraDb,
     network: &Network,
@@ -724,6 +783,7 @@ fn reverse_transparent_block(
     address_balances: &mut HashMap<transparent::Address, Option<AddressBalanceLocation>>,
     height: Height,
     block: &Arc<Block>,
+    skip_transparent_indexes: bool,
 ) -> Result<(), RollbackFinalizedStateError> {
     // Undo the forward write transaction-by-transaction in reverse order, un-crediting each
     // transaction's created outputs before un-debiting its spent inputs.
@@ -742,7 +802,10 @@ fn reverse_transparent_block(
             let created_output_location =
                 OutputLocation::from_usize(height, tx_index, output_index);
 
-            if let Some(address) = output.address(network) {
+            if let Some(address) = output
+                .address(network)
+                .filter(|_| !skip_transparent_indexes)
+            {
                 let address_location =
                     cached_address_balance(db, address_balances, &address)?.address_location();
 
@@ -769,7 +832,11 @@ fn reverse_transparent_block(
         for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
             let (spent_output_location, spent_utxo) = finalized_output(db, &spent_outpoint)?;
 
-            if let Some(address) = spent_utxo.output.address(network) {
+            if let Some(address) = spent_utxo
+                .output
+                .address(network)
+                .filter(|_| !skip_transparent_indexes)
+            {
                 let address_location =
                     cached_address_balance(db, address_balances, &address)?.address_location();
 
@@ -791,10 +858,12 @@ fn reverse_transparent_block(
                 spent_output_location,
                 &spent_utxo.output,
             );
-            batch.zs_delete(
-                db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
-                spent_output_location,
-            );
+            if !skip_transparent_indexes {
+                batch.zs_delete(
+                    db.db.cf_handle(TX_LOC_BY_SPENT_OUT_LOC).unwrap(),
+                    spent_output_location,
+                );
+            }
         }
     }
 
@@ -1507,6 +1576,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(4), Height(5), Height(6)],
             "a request at or above U is served from the index"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deferred_pool_tests {
+    use zakura_chain::{
+        amount::{Amount, NonNegative},
+        block::Height,
+        parameters::{
+            subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver},
+            testnet::{
+                self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
+                ConfiguredFundingStreams,
+            },
+        },
+    };
+
+    use crate::{config::Config, service::finalized_state::FinalizedState};
+
+    /// Rollback reverses the deferred funding stream inside slow start, where block commits
+    /// already apply it on configured networks.
+    #[test]
+    fn deferred_pool_change_applies_during_slow_start() {
+        let _init_guard = zakura_test::init();
+
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(2),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .with_funding_streams(vec![ConfiguredFundingStreams {
+                height_range: Some(Height(2)..Height(100)),
+                recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                }]),
+            }])
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let height = Height(10);
+        assert!(height <= network.slow_start_interval());
+
+        let expected = funding_stream_values(
+            height,
+            &network,
+            block_subsidy(height, &network, None).expect("valid subsidy"),
+        )
+        .expect("valid funding streams")
+        .remove(&FundingStreamReceiver::Deferred)
+        .expect("the deferred stream is active");
+        assert!(expected > Amount::<NonNegative>::zero());
+
+        let state = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("an ephemeral database opens");
+        let change = super::deferred_pool_balance_change(&state.db, height, &network)
+            .expect("the deferred change is valid")
+            .expect("the deferred change is always computed");
+
+        assert_eq!(
+            change.value(),
+            expected
+                .constrain::<zakura_chain::amount::NegativeAllowed>()
+                .expect("valid amount")
         );
     }
 }

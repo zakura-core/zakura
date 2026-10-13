@@ -248,7 +248,7 @@ The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
 mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
-iroh identity (the node ids hardcoded as bootstrap peers in
+Zakura identity (the node ids hardcoded as bootstrap peers in
 `crates/zakura-network/src/zakura/handler.rs`) — and their state DB lives at
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets
@@ -301,7 +301,9 @@ The mainnet workflow also installs a Slack watchdog on `us-east-0`:
 The watchdog polls the mainnet dashboard locally at
 `http://127.0.0.1:8090/data` and the testnet dashboard at
 `http://167.99.103.111:8090/data`. It posts transition alerts to Slack
-`#zakura-alerts` via an incoming webhook in `SLACK_WEB_HOOK`. A node alert fires
+`#zakura-alerts` via an incoming webhook in `SLACK_WEB_HOOK`. Mac/Linux
+divergence and mainnet fleet-wide stalls also page through PagerDuty with
+`PAGERDUTY_ROUTING_KEY`; see `deploy/runner/README.md`. A node alert fires
 when either of these conditions stays true for at least 10 minutes:
 
 - `health` is `down` or `rpc_error`
@@ -322,9 +324,12 @@ refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
 in the future, new failure alerts are logged but not posted to Slack.
 
 Restart deploys that include `zakura-compat` also refresh that host's node-local
-watchdog marker and restart the active watchdog before `zakurad-compat`. This
-suppresses expected Sentry transitions and stays in the workflow so rollback
-refs whose deployer predates the marker remain covered.
+compatibility marker (`/run/zakura-watchdog/deployment-suppressed-until`) before
+`zakurad-compat` restarts. The compatibility checker reports it with every probe,
+and only the fleet watchdog's compatibility lane honors it, for at most 20
+minutes. It stays in the workflow so rollback refs whose deployer predates the
+marker remain covered. See `deploy/runner/README.md` for compatibility
+monitoring and its `operation=monitoring` stages.
 
 Manual dry run from `us-east-0`:
 
@@ -406,3 +411,13 @@ for new hosts.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).
+
+### Release-state publisher
+
+The mainnet archive publisher uses `release_state_publisher = true` on its node
+entry. This requires a binary-only systemd Mainnet archive node and an existing
+archive publisher installation on `roman-zakura-archive-vct-off`. It builds the
+node and offline exporter at the same commit and verifies publication after the
+restart. `--no-restart` is rejected for selections containing this node. See
+[the publisher runbook](../release-state/README.md#updating-the-archive-publisher)
+for locking, validation, and failure recovery.

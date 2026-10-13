@@ -42,7 +42,7 @@ Release PR:
 - [ ] Update README
 - [ ] Update Zakura Versions
 - [ ] Update Crate Versions
-- [ ] Update End of Support Height
+- [ ] Update End of Support Height (validate halt height; check `#zakura-collab` or ask Dev/Sean)
 
 Publish Release:
 

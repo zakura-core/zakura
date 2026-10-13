@@ -444,6 +444,10 @@ fn is_reconstructible(repair: &RecoveryRepair) -> bool {
             | RecoveryRepair::InheritedEligibility
             | RecoveryRepair::RetentionMetadata
             | RecoveryRepair::BodyAvailabilityAlarm
+            // Startup audits the whole store against the configured trust anchors and network
+            // policy, then rebinds these durable digests to the configured values.
+            | RecoveryRepair::TrustAnchorConfiguration
+            | RecoveryRepair::NetworkPolicyConfiguration
     )
 }
 
@@ -531,6 +535,17 @@ mod tests {
         let rejection = replay_recovery_rows_bytes(&[5, 0, 0, 0]);
         assert!(rejection.rejected);
         assert_eq!(rejection.repairs, 0);
+    }
+
+    #[test]
+    fn configuration_digest_rebinds_are_reconstructible_repairs() {
+        let network_policy = replay_recovery_rows_bytes(&[0x34, 0x8b, 0x16, 0x21]);
+        assert!(!network_policy.rejected);
+        assert_eq!(network_policy.repairs, 1);
+
+        let trust_anchor = replay_recovery_rows_bytes(&[0x44, 0x29, 0x2a, 0x23]);
+        assert!(!trust_anchor.rejected);
+        assert_eq!(trust_anchor.repairs, 1);
     }
 
     #[test]

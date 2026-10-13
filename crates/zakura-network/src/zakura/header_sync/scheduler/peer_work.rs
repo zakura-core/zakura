@@ -205,7 +205,7 @@ impl Drop for HeaderCountReservationInner {
 }
 
 #[derive(Clone, Debug)]
-struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
+pub(in crate::zakura::header_sync) struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
 
 #[derive(Debug)]
 struct HeaderCapacityLeaseInner {
@@ -264,6 +264,9 @@ impl AdvertisedHeaderTarget {
     /// Whether this status names a different target that can actually serve a request.
     pub fn is_discovery_eligible(&self, local: &EngineSnapshot) -> bool {
         self.status.selected_tip_hash != local.frontiers.header_best.hash
+            // Normal discovery cannot replace the finalized prefix. Historical
+            // auxiliary repair uses its own explicitly selected target path.
+            && self.status.selected_tip_height > local.frontiers.finalized.height
             && self.status.max_headers_per_response != 0
             && self.status.max_inflight_requests != 0
             && self.status.max_message_bytes != 0
@@ -293,7 +296,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
-    /// Effective count bound preserved across continuation requests.
+    /// Negotiated page bound before temporary credit limits.
+    /// Each request reserves its count against current shared headroom.
     pub max_header_count: u32,
     /// Requested auxiliary schema preserved across continuation requests.
     pub tree_aux_schema: AuxSchema,
@@ -851,6 +855,14 @@ impl PeerWorkQueue {
         true
     }
 
+    /// Keep local work charged after its peer slot retires.
+    pub(in crate::zakura::header_sync) fn retain_header_capacity(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Vec<HeaderCapacityLease> {
+        self.staged_capacity.get(peer).cloned().unwrap_or_default()
+    }
+
     pub(in crate::zakura::header_sync) fn owned_header_count(&self, peer: &ZakuraPeerId) -> usize {
         self.staged_capacity
             .get(peer)
@@ -1030,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_status_targets_remain_eligible_regardless_of_advisory_shape() {
+    fn unknown_targets_above_finality_remain_eligible_regardless_of_work_claims() {
         let local = snapshot();
 
         let mut same_height_fork = advertisement(1);
@@ -1052,18 +1064,35 @@ mod tests {
         );
 
         let mut incomparable = advertisement(3);
+        incomparable.status.selected_tip_height = block::Height(90);
         incomparable.status.work_anchor_hash = hash(11);
         incomparable.status.suffix_cumulative_work = U256::MAX;
         assert!(incomparable.is_discovery_eligible(&local));
         assert_eq!(incomparable.claimed_work_order(&local), None);
 
         let mut known = advertisement(4);
+        known.status.selected_tip_height = local.frontiers.header_best.height;
         known.status.selected_tip_hash = local.frontiers.header_best.hash;
         assert!(!known.is_discovery_eligible(&local));
 
         let mut pure_requester = advertisement(5);
+        pure_requester.status.selected_tip_height = local.frontiers.header_best.height;
         pure_requester.status.max_headers_per_response = 0;
         assert!(!pure_requester.is_discovery_eligible(&local));
+    }
+
+    #[test]
+    fn discovery_skips_targets_at_or_below_finality_but_keeps_shorter_forks() {
+        let local = snapshot();
+        let mut target = advertisement(3);
+        target.status.suffix_cumulative_work = U256::MAX;
+        target.status.work_anchor_hash = hash(11);
+        for height in [0, 9, 10] {
+            target.status.selected_tip_height = block::Height(height);
+            assert!(!target.is_discovery_eligible(&local));
+        }
+        target.status.selected_tip_height = block::Height(11);
+        assert!(target.is_discovery_eligible(&local));
     }
 
     #[test]

@@ -1457,10 +1457,9 @@ impl PeerRoutine {
         // out, so another peer can contest them (the peer-local timeout bias).
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
         self.note_retry_avoid(timed_out_heights);
-        if timed_out.is_empty() {
-            self.publish_outstanding();
-        } else {
-            // Trace the window and reliability this timeout cut; the sample also publishes.
+        self.publish_outstanding();
+        if !timed_out.is_empty() {
+            // Trace the window and reliability this timeout cut.
             self.trace_bbr_sample();
         }
         true

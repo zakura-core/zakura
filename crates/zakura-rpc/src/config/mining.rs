@@ -37,7 +37,9 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
-    /// Used in coinbase tx constructed in `getblocktemplate` RPC.
+    /// Used in coinbase tx constructed in `getblocktemplate` RPC. Sapling-only
+    /// addresses are unsupported. Unified addresses use their Orchard receiver
+    /// for Ironwood rewards after NU6.3, or their transparent receiver otherwise.
     #[serde(with = "miner_address")]
     pub miner_address: Option<ZcashAddress>,
 

@@ -150,7 +150,13 @@ fn format_upgrades(
             "add Zakura header auxiliary body size corrections",
             Version::new(29, 1, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 12])
+        // Reuse the existing cache, but keep binaries that do not understand incomplete
+        // transparent indexes from opening it through their older version directory.
+        Box::new(no_migration::NoMigration::new(
+            "allow transparent index updates to stop in place",
+            Version::new(30, 0, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 13])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1118,7 +1124,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 8);
+    assert_eq!(upgrades.len(), 9);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
@@ -1127,6 +1133,8 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
     assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
     assert_eq!(upgrades[7].version(), Version::new(29, 1, 0));
+    assert_eq!(upgrades[8].version(), Version::new(30, 0, 0));
+    assert!(upgrades[8].is_reusable_major_upgrade());
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

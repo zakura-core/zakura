@@ -522,7 +522,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
+async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
     let finalized = zakura_header_chain::Frontier::new(block::Height(0), block::Hash([1; 32]));
     let first_header = zakura_header_chain::Frontier::new(
         block::Height(EMPTY_STATE_HEADER_QUIET_MIN_LAG),
@@ -564,13 +564,17 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
         )))
         .expect("the newer committed snapshot receiver is live");
     time::advance(Duration::from_millis(1)).await;
-    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD - Duration::from_secs(1)).await;
+    time::advance(EMPTY_STATE_HEADER_QUIET_PERIOD - Duration::from_secs(11)).await;
     if let Ok(action) = actions.try_recv() {
-        panic!("newer header page did not restart the body-work quiet period: {action:?}");
+        panic!("body work started before the initial bootstrap wait: {action:?}");
     }
 
     time::advance(Duration::from_secs(1)).await;
-    let action = next_action(&mut actions).await;
+    time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    let action = actions
+        .try_recv()
+        .expect("new headers must not extend the initial bootstrap wait");
     assert!(matches!(
         action,
         BlockSyncAction::QueryNeededBlocks {
@@ -578,6 +582,27 @@ async fn empty_state_body_queries_wait_for_the_latest_header_quiet_period() {
             best_header_tip,
             ..
         } if best_header_tip == second_header.height
+    ));
+
+    let third_header = zakura_header_chain::Frontier::new(
+        block::Height(second_header.height.0 + 1),
+        block::Hash([4; 32]),
+    );
+    snapshot_tx
+        .send(Some(committed_view(
+            committed_snapshot(3, 3, 1, finalized, finalized, third_header),
+            0,
+        )))
+        .expect("the committed snapshot receiver is live");
+    time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    let action = actions
+        .try_recv()
+        .expect("new headers must not rearm the wait before the first body commits");
+    assert!(matches!(
+        action,
+        BlockSyncAction::QueryNeededBlocks { best_header_tip, .. }
+            if best_header_tip == third_header.height
     ));
 
     reactor_task.abort();
@@ -12340,6 +12365,61 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
 }
 
 #[tokio::test]
+async fn reactor_advertises_default_serving_tip_growth_promptly() {
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(4), block::Hash([4; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        62,
+        block::Height(4),
+        block::Hash([4; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    // `connect_peer_with_status` already read the connect-time `Status`; the
+    // peer's first inbound `Status` now gets a reply as well.
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    for height in 1..=3 {
+        handle
+            .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(height),
+                verified_block_hash: block::Hash([height as u8; 32]),
+            }))
+            .await
+            .expect("serving frontier queues");
+        let frame = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("the reactor must advertise a new block within two seconds")
+            .expect("the peer stream remains open");
+        let BlockSyncMessage::Status(status) =
+            BlockSyncMessage::decode_frame(frame).expect("the status frame decodes")
+        else {
+            panic!("a serving frontier change must advertise body availability");
+        };
+        assert_eq!(status.servable_high, block::Height(height));
+    }
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_millis(100),
@@ -14257,7 +14337,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         62,
@@ -14279,6 +14359,7 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     )
     .await
     .expect("the valid serving peer becomes ready");
+    wait_for_outbound_status(&mut outbound_rx).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     while wiring.actions.capacity() > 0 {
         wiring
@@ -14326,7 +14407,24 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         },
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let frame = outbound_rx
+                .recv()
+                .await
+                .expect("the peer remains connected");
+            match BlockSyncMessage::decode_frame(frame).unwrap() {
+                BlockSyncMessage::Status(_) => continue,
+                BlockSyncMessage::RangeUnavailable {
+                    start_height: block::Height(1),
+                    count: 1,
+                } => break,
+                message => panic!("expected overload response, got {message:?}"),
+            }
+        }
+    })
+    .await
+    .expect("action queue pressure must release the requester's reservation promptly");
 
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {

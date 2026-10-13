@@ -89,6 +89,7 @@ network = "Mainnet"
 #   releases. Currently "legacy" on Mainnet, and "dual" everywhere else.
 p2p_stack = "default"
 peerset_initial_target_size = 100
+unconditional_peers = []
 
 [network.zakura]
 bootstrap_peers = [

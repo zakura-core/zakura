@@ -4747,6 +4747,7 @@ dependencies = [
  "futures",
  "hex",
  "indexmap",
+ "ipnet",
  "itertools 0.14.0",
  "lazy_static",
  "metrics",

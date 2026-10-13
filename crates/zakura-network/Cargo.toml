@@ -51,6 +51,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
+ipnet = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pin-project = { workspace = true }

@@ -15,6 +15,7 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
+    config::UnconditionalPeers,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
@@ -264,6 +265,11 @@ pub struct AddressBook {
     /// A list of banned addresses, with the time they were banned.
     bans_by_ip: BannedIps,
 
+    /// Peer IP addresses and ranges that are never scored or banned.
+    ///
+    /// The address book drops misbehavior changes for these peers.
+    unconditional_peers: UnconditionalPeers,
+
     /// The local listener address.
     local_listener: SocketAddr,
 
@@ -375,6 +381,7 @@ impl AddressBook {
             last_address_log: None,
             most_recent_by_ip: should_limit_outbound_conns_per_ip.then(HashMap::new),
             bans_by_ip: Default::default(),
+            unconditional_peers: UnconditionalPeers::default(),
         };
 
         new_book.update_metrics(instant_now, chrono_now);
@@ -394,6 +401,16 @@ impl AddressBook {
     #[must_use]
     pub(crate) fn with_expose_peer_addresses(mut self, expose_peer_addresses: bool) -> Self {
         self.expose_peer_addresses = expose_peer_addresses;
+        self
+    }
+
+    /// Sets the peer IP addresses and ranges that are never scored or banned.
+    #[must_use]
+    pub(crate) fn with_unconditional_peers(
+        mut self,
+        unconditional_peers: UnconditionalPeers,
+    ) -> Self {
+        self.unconditional_peers = unconditional_peers;
         self
     }
 
@@ -655,6 +672,18 @@ impl AddressBook {
             return None;
         }
 
+        if matches!(change, MetaAddrChange::UpdateMisbehavior { .. })
+            && self.unconditional_peers.contains(change.addr().ip())
+        {
+            debug!(
+                peer = %addr_label,
+                score_increment = change.misbehavior_score(),
+                "ignored misbehavior report for an unconditional peer"
+            );
+            metrics::counter!("address_book.misbehavior.unconditional_ignored.total").increment(1);
+            return None;
+        }
+
         let previous = self.get(change.addr());
 
         let _guard = self.span.enter();
@@ -678,6 +707,10 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
+                debug_assert!(
+                    !self.unconditional_peers.contains(banned_ip),
+                    "unconditional peers must never be banned"
+                );
                 {
                     let mut bans_by_ip = self
                         .bans_by_ip
@@ -1153,6 +1186,7 @@ impl Clone for AddressBook {
             last_address_log: None,
             most_recent_by_ip: self.most_recent_by_ip.clone(),
             bans_by_ip: self.bans_by_ip.clone(),
+            unconditional_peers: self.unconditional_peers.clone(),
         }
     }
 }

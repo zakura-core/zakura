@@ -54,7 +54,7 @@ impl TipHeightCmd {
 
     /// Starts a state service using the `cache_dir` and `network` from the provided arguments.
     fn load_read_state(&self) -> Result<ReadStateService> {
-        let mut config = APPLICATION.config().state.clone();
+        let mut config = APPLICATION.config().mirrored_state_config();
 
         if let Some(cache_dir) = self.cache_dir.clone() {
             config.cache_dir = cache_dir;

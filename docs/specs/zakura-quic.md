@@ -315,6 +315,10 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   (RFC 9000 §3.5). `quinn-proto` leaves the reset to the application. Without
   it the peer never learns the final size and never frees the stream, so each
   stop would cost the sender one stream credit for the connection's life.
+  For a peer-opened stream this node hasn't accepted yet, the task MUST keep
+  the code and send the reset on accept, because `quinn-proto` counts a
+  remote send stream only from acceptance. A later write on the accepted
+  stream gets `Stopped(code)`.
 - **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
   the call after the connection task replied, the stream goes to the next
   caller. A lost stream ID would hold its stream open, and its credit, for the

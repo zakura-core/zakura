@@ -144,11 +144,15 @@ struct ConnTask {
     accepted_spare: VecDeque<StreamId>,
     sends: HashMap<StreamId, SendState>,
     /// The peer's STOP_SENDING code for each stream this node reset in
-    /// answer, until the handle finishes, resets or drops it. A later write
-    /// gets `Stopped(code)` instead of the reset stream's `ClosedStream`.
+    /// answer, or will reset once it is accepted, until the handle finishes,
+    /// resets or drops it. A later write gets `Stopped(code)` instead of the
+    /// reset stream's `ClosedStream`.
     stopped: HashMap<StreamId, VarInt>,
     /// Streams whose send handles can still issue writes.
     writable_handles: HashSet<StreamId>,
+    /// How many remote bidirectional streams quinn-proto has handed out. A
+    /// remote stream with a higher index is still waiting to be accepted.
+    accepted_bidi: u64,
     /// Each stream's waiting read and the most bytes it asked for.
     reads: HashMap<StreamId, (oneshot::Sender<ReadReply>, usize)>,
     recv_ends: HashMap<StreamId, RecvEnd>,
@@ -206,6 +210,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         sends: HashMap::new(),
         stopped: HashMap::new(),
         writable_handles: HashSet::new(),
+        accepted_bidi: 0,
         reads: HashMap::new(),
         recv_ends: HashMap::new(),
         send_buf: Vec::new(),
@@ -551,11 +556,6 @@ impl ConnTask {
                 Event::Stream(StreamEvent::Finished { .. }) => {}
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                     self.on_stopped(id, error_code);
-                    // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM.
-                    // quinn-proto leaves this to the application, and without
-                    // it the peer never learns the final size, so it never
-                    // frees the stream or returns its stream credit.
-                    let _ = self.conn.send_stream(id).reset(error_code);
                 }
             }
         }
@@ -757,13 +757,20 @@ impl ConnTask {
             if reply.is_closed() {
                 continue;
             }
-            let Some(id) = self
-                .accepted_spare
-                .pop_front()
-                .or_else(|| self.conn.streams().accept(Dir::Bi))
-            else {
-                self.acceptors.push_front(reply);
-                return;
+            let id = match self.accepted_spare.pop_front() {
+                Some(id) => id,
+                None => {
+                    let Some(id) = self.conn.streams().accept(Dir::Bi) else {
+                        self.acceptors.push_front(reply);
+                        return;
+                    };
+                    self.accepted_bidi = id.index() + 1;
+                    // The reset `on_stopped` deferred until this accept.
+                    if let Some(&code) = self.stopped.get(&id) {
+                        let _ = self.conn.send_stream(id).reset(code);
+                    }
+                    id
+                }
             };
             self.writable_handles.insert(id);
             if let Err(Ok(id)) = reply.send(Ok(id)) {
@@ -816,11 +823,29 @@ impl ConnTask {
         self.sends.remove(&id);
     }
 
+    /// Handles the peer's STOP_SENDING: fails pending writes, keeps the code
+    /// while a handle can still write or the stream awaits acceptance, and
+    /// answers with RESET_STREAM.
     fn on_stopped(&mut self, id: StreamId, error_code: VarInt) {
         self.fail_writes(id, WriteError::Stopped(error_code));
+        let awaiting_accept = id.initiator() != self.conn.side()
+            && id.dir() == Dir::Bi
+            && id.index() >= self.accepted_bidi;
+        if awaiting_accept {
+            // quinn-proto counts a remote send stream only once it is
+            // accepted, so a reset acked before then underflows that count.
+            // `serve_acceptors` sends the reset on accept.
+            self.stopped.insert(id, error_code);
+            return;
+        }
         if self.writable_handles.contains(&id) {
             self.stopped.insert(id, error_code);
         }
+        // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM. quinn-proto
+        // leaves this to the application, and without it the peer never
+        // learns the final size, so it never frees the stream or returns its
+        // stream credit.
+        let _ = self.conn.send_stream(id).reset(error_code);
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -1104,6 +1129,7 @@ mod tests {
             sends: HashMap::new(),
             stopped: HashMap::new(),
             writable_handles: HashSet::new(),
+            accepted_bidi: 0,
             reads: HashMap::new(),
             recv_ends: HashMap::new(),
             send_buf: Vec::new(),

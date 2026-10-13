@@ -313,6 +313,30 @@ async fn stream_errors_carry_the_peer_code() {
     .unwrap();
 }
 
+/// DRV-9: a stream the peer stops before this node accepts it still reports
+/// the peer's code to the later writer.
+#[tokio::test]
+async fn stop_before_accept_keeps_the_peer_code() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = client();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        let (mut send, mut recv) = inbound.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        recv.stop(VarInt::from_u32(9)).unwrap();
+        // Let STOP_SENDING reach the client before it accepts the stream.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (mut accepted, _accepted_recv) = conn.accept_bi().await.unwrap();
+        assert_eq!(
+            write_until_error(&mut accepted).await,
+            crate::WriteError::Stopped(VarInt::from_u32(9))
+        );
+    })
+    .await
+    .unwrap();
+}
+
 // SOCK-12: an interface change reaches every connection once, and a
 // connection keeps working after it forgets its pinned local address.
 #[tokio::test]

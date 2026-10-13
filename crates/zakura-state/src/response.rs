@@ -81,6 +81,10 @@ pub enum Response {
     /// of block hashes that were reconsidered in the state and successfully re-committed.
     Reconsidered(Vec<block::Hash>),
 
+    /// Response to [`Request::PreciousBlock`] indicating that the state contains the block
+    /// and applied the preference where it could.
+    Precious,
+
     /// Response to [`Request::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -301,8 +305,13 @@ impl NonFinalizedBlocksListener {
                 // Take blocks from the chain in reverse height order until we
                 // reach a block the listener already has, then restore
                 // ascending height order.
-                let mut blocks: Vec<_> =
-                    chain.blocks.values().rev().take_while(take_cond).collect();
+                let mut blocks: Vec<_> = chain
+                    .blocks
+                    .values()
+                    .rev()
+                    .map(Arc::as_ref)
+                    .take_while(take_cond)
+                    .collect();
                 blocks.reverse();
                 blocks
             })

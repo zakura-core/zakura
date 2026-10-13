@@ -40,7 +40,7 @@ fn classified_module() -> RpcModule<()> {
 #[test]
 fn access_policy_matches_the_openrpc_method_set() {
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
-    let documented: BTreeSet<_> = METHODS.keys().copied().collect();
+    let documented: BTreeSet<_> = METHODS.iter().map(|(name, _)| *name).collect();
 
     assert_eq!(
         classified.len(),
@@ -68,6 +68,7 @@ fn restricted_surface_contains_only_unauthenticated_methods() {
     assert_eq!(actual, expected);
     assert!(!actual.contains("invalidateblock"));
     assert!(!actual.contains("reconsiderblock"));
+    assert!(!actual.contains("preciousblock"));
     assert!(!actual.contains("stop"));
     assert!(!actual.contains("generate"));
     assert!(!actual.contains("addnode"));
@@ -83,6 +84,7 @@ fn full_surface_retains_admin_and_test_methods() {
 
     assert!(actual.contains("invalidateblock"));
     assert!(actual.contains("reconsiderblock"));
+    assert!(actual.contains("preciousblock"));
     assert!(actual.contains("stop"));
     assert!(actual.contains("generate"));
     assert!(actual.contains("addnode"));
@@ -178,6 +180,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .await
         .expect("admin RPC listener should start");
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -208,6 +211,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         "sendrawtransaction",
         "getblocktemplate",
         "submitblock",
+        "submitsolution",
     ] {
         assert!(
             restricted_methods.contains(method),
@@ -216,6 +220,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     }
     assert!(!restricted_methods.contains("invalidateblock"));
     assert!(!restricted_methods.contains("reconsiderblock"));
+    assert!(!restricted_methods.contains("preciousblock"));
 
     let blocked_call = client
         .post(format!("http://{restricted_addr}"))
@@ -287,6 +292,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     let admin_methods = discovered_methods(&admin_discovery);
     assert!(admin_methods.contains("invalidateblock"));
     assert!(admin_methods.contains("reconsiderblock"));
+    assert!(admin_methods.contains("preciousblock"));
 
     let admin_call = client
         .post(format!("http://{admin_addr}"))

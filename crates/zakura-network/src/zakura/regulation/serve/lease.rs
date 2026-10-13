@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
+use super::capacity::PeerBudgets;
 use crate::zakura::regulation::SlotPermit;
 
 /// The node and peer execution slots of one admitted request.
@@ -16,13 +17,16 @@ use crate::zakura::regulation::SlotPermit;
 pub(crate) struct ExecutionSlots {
     _node: SlotPermit,
     _peer: SlotPermit,
+    // Keep both budgets discoverable across reconnects while work remains.
+    _peer_budgets: PeerBudgets,
 }
 
 impl ExecutionSlots {
-    pub(super) fn new(peer: SlotPermit, node: SlotPermit) -> Self {
+    pub(super) fn new(peer: SlotPermit, node: SlotPermit, peer_budgets: PeerBudgets) -> Self {
         Self {
             _node: node,
             _peer: peer,
+            _peer_budgets: peer_budgets,
         }
     }
 }

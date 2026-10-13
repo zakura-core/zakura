@@ -84,6 +84,62 @@ fn equihash_solution_test_vectors_are_valid() -> color_eyre::eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "internal-miner")]
+#[test]
+fn equihash_solver_reproduces_a_historical_solution() {
+    use crate::work::equihash::SolverCancelled;
+
+    let _init_guard = zakura_test::init();
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+    let mut template = *block.header;
+
+    // The miner increments before solving, so start just before the known
+    // nonce. Limit cancellation checks to one nonce to bound the test's work.
+    for byte in template.nonce.iter_mut().rev() {
+        let (previous, borrowed) = byte.overflowing_sub(1);
+        *byte = previous;
+        if !borrowed {
+            break;
+        }
+    }
+    template.solution = Solution::for_proposal();
+    let mut cancellation_checks = 0;
+    let headers = Solution::solve(template, || {
+        cancellation_checks += 1;
+        if cancellation_checks <= 2 {
+            Ok(())
+        } else {
+            Err(SolverCancelled)
+        }
+    })
+    .expect("the historical nonce has a solution meeting its difficulty target");
+
+    assert!(headers.iter().any(|header| header == block.header.as_ref()));
+    for header in headers.iter() {
+        assert_eq!(header.nonce, block.header.nonce);
+        header
+            .solution
+            .check(header, &Network::Mainnet)
+            .expect("mined solutions must pass the block verifier");
+        assert!(header.hash() <= header.difficulty_threshold.to_expanded().unwrap());
+    }
+}
+
+#[cfg(feature = "internal-miner")]
+#[test]
+fn equihash_solver_honors_cancellation() {
+    use crate::work::equihash::SolverCancelled;
+
+    let _init_guard = zakura_test::init();
+    let block = Block::zcash_deserialize(zakura_test::vectors::BLOCKS[0])
+        .expect("block test vector should deserialize");
+    assert!(matches!(
+        Solution::solve(*block.header, || Err(SolverCancelled)),
+        Err(SolverCancelled)
+    ));
+}
+
 static EQUIHASH_SIZE_TESTS: &[usize] = &[
     0,
     1,

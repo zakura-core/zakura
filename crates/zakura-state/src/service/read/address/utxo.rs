@@ -16,7 +16,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use derive_getters::Getters;
+use getset::Getters;
 use zakura_chain::{
     block::{self, Height},
     parameters::Network,
@@ -27,7 +27,7 @@ use crate::{
     service::{
         finalized_state::ZakuraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
     },
-    BoxError, OutputLocation, TransactionLocation,
+    BoxError, OutputLocation, TransactionLocation, TransparentIndexesUnavailable,
 };
 
 /// The full range of address heights.
@@ -41,19 +41,17 @@ pub const ADDRESS_HEIGHTS_FULL_RANGE: RangeInclusive<Height> = Height(1)..=Heigh
 #[derive(Clone, Debug, Default, Eq, PartialEq, Getters)]
 pub struct AddressUtxos {
     /// A set of unspent transparent outputs.
-    #[getter(skip)]
     utxos: BTreeMap<OutputLocation, transparent::Output>,
 
     /// The transaction IDs for each [`OutputLocation`] in `utxos`.
-    #[getter(skip)]
     tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
 
     /// The configured network for this state.
-    #[getter(skip)]
     network: Network,
 
     /// The last height and hash that was queried to produce these UTXOs, if any.
     /// It will be None if the state is empty.
+    #[getset(get = "pub")]
     last_height_and_hash: Option<(block::Height, block::Hash)>,
 }
 
@@ -108,6 +106,10 @@ impl AddressUtxos {
 ///
 /// If the addresses do not exist in the non-finalized `chain` or finalized `db`,
 /// returns an empty list.
+///
+/// # Errors
+///
+/// Returns [`TransparentIndexesUnavailable`] if `db` skips transparent indexes.
 pub fn address_utxos<C>(
     network: &Network,
     chain: Option<C>,
@@ -117,6 +119,8 @@ pub fn address_utxos<C>(
 where
     C: AsRef<Chain>,
 {
+    db.check_transparent_indexes_available()?;
+
     let mut utxo_error = None;
     let address_count = addresses.len();
 
@@ -127,7 +131,7 @@ where
     for attempt in 0..=FINALIZED_STATE_QUERY_RETRIES {
         debug!(?attempt, ?address_count, "starting address UTXO query");
 
-        let (finalized_utxos, finalized_tip_range) = finalized_address_utxos(db, &addresses);
+        let (finalized_utxos, finalized_tip_range) = finalized_address_utxos(db, &addresses)?;
 
         debug!(
             finalized_utxo_count = ?finalized_utxos.len(),
@@ -207,10 +211,13 @@ where
 fn finalized_address_utxos(
     db: &ZakuraDb,
     addresses: &HashSet<transparent::Address>,
-) -> (
-    BTreeMap<OutputLocation, transparent::Output>,
-    Option<RangeInclusive<Height>>,
-) {
+) -> Result<
+    (
+        BTreeMap<OutputLocation, transparent::Output>,
+        Option<RangeInclusive<Height>>,
+    ),
+    TransparentIndexesUnavailable,
+> {
     // # Correctness
     //
     // The StateService can commit additional blocks while we are querying address UTXOs.
@@ -218,7 +225,7 @@ fn finalized_address_utxos(
     // Check if the finalized state changed while we were querying it
     let start_finalized_tip = db.finalized_tip_height();
 
-    let finalized_utxos = db.partial_finalized_address_utxos(addresses);
+    let finalized_utxos = db.partial_finalized_address_utxos(addresses)?;
 
     let end_finalized_tip = db.finalized_tip_height();
 
@@ -231,7 +238,7 @@ fn finalized_address_utxos(
         None
     };
 
-    (finalized_utxos, finalized_tip_range)
+    Ok((finalized_utxos, finalized_tip_range))
 }
 
 /// Returns the UTXO changes (created and spent) for `addresses` in the

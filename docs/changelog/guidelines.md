@@ -65,8 +65,8 @@ This PR only changes tests and has no operator-visible effect.
 
 Dependabot, release PRs, and automated release-state updates are automated
 exceptions to the one-file check. Release-state PRs (the Mainnet checkpoint and
-VCT frontier refresh) carry `A-release-state`: their Rust changes contain the
-generated end-of-support floor and reviewed spentness commitments. These PRs do not consume
+VCT frontier refresh) carry `A-release-state`: their `Cargo.toml` change pins
+the refreshed assets and their Rust changes contain reviewed spentness commitments, and unlike the release PR they do not consume
 the pending fragments. The `C-exclude-from-changelog` label remains useful
 release metadata, but does not replace the explicit fragment for Rust or
 `Cargo.toml` PRs.

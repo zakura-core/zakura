@@ -365,18 +365,29 @@ pub fn parent_inputs(
 /// the provided [`transparent::OutPoint`] or revealed the provided nullifier, if it exists
 /// and is spent or revealed in the non-finalized `chain` or finalized `db` and its
 /// spending transaction hash has been indexed.
+///
+/// # Errors
+///
+/// Returns [`TransparentIndexesUnavailable`](crate::TransparentIndexesUnavailable) for every
+/// [`Spend::OutPoint`] if `db` skips transparent indexes. A non-finalized answer could only be
+/// partial, so it is not returned either.
 #[cfg(feature = "indexer")]
 pub fn spending_transaction_hash<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     spend: Spend,
-) -> Option<transaction::Hash>
+) -> Result<Option<transaction::Hash>, crate::TransparentIndexesUnavailable>
 where
     C: AsRef<Chain>,
 {
-    chain
-        .and_then(|chain| chain.as_ref().spending_transaction_hash(&spend))
-        .or_else(|| db.spending_transaction_hash(&spend))
+    if matches!(spend, Spend::OutPoint(_)) {
+        db.check_transparent_indexes_available()?;
+    }
+
+    match chain.and_then(|chain| chain.as_ref().spending_transaction_hash(&spend)) {
+        Some(hash) => Ok(Some(hash)),
+        None => db.spending_transaction_hash(&spend),
+    }
 }
 
 /// Returns the [`Utxo`] for [`transparent::OutPoint`], if it exists in any chain

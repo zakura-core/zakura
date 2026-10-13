@@ -30,7 +30,7 @@ impl PeerProfile {
         Self::Zakura(PinnedZakuraProfile::v1())
     }
 
-    /// The Iroh 1.x cohort deliberately does not offer the old native transport.
+    /// The current cohort deliberately does not offer an older native transport.
     pub fn zakura_v2() -> Self {
         Self::Zakura(PinnedZakuraProfile {
             protocol_min: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
@@ -49,7 +49,7 @@ impl PeerProfile {
             control_version: CONTROL_VERSION,
             capabilities: 0,
             required_capabilities: 0,
-            alpns: vec![b"p2p-v2/2".to_vec(), b"p2p-v2/1".to_vec()],
+            alpns: vec![P2P_V2_ALPN.to_vec(), b"p2p-v2/1".to_vec()],
         })
     }
 
@@ -281,7 +281,7 @@ mod tests {
             v2.negotiate(&v2),
             PinnedNegotiation::Upgrade {
                 selected_protocol: 2,
-                alpn: b"p2p-v2/2".to_vec(),
+                alpn: P2P_V2_ALPN.to_vec(),
             }
         );
     }

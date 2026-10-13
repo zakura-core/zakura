@@ -151,7 +151,7 @@ const DEFAULT_EXPECTATIONS: &[MatrixExpectation] = &[
     MatrixExpectation {
         local: ProfileId::ZakuraV2,
         remote: ProfileId::ZakuraV2,
-        expected: ExpectedOutcome::Upgrade(2),
+        expected: ExpectedOutcome::Upgrade(crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT),
     },
 ];
 

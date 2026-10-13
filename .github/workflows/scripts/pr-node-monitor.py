@@ -40,9 +40,7 @@ def rpc_call(url: str, method: str):
         return json.loads(resp.read())["result"]
 
 
-def scrape_metric(url: str, name: str) -> float | None:
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        text = resp.read().decode("utf-8", "replace")
+def metric_value(text: str, name: str) -> float | None:
     values = [
         float(match.group(1))
         for match in re.finditer(
@@ -81,6 +79,7 @@ def take_sample(args) -> dict:
         "peers": None,
         "finalized_height": None,
         "vct_fast_blocks": None,
+        "vct_committed_blocks": None,
     }
     try:
         info = rpc_call(args.rpc_url, "getblockchaininfo")
@@ -93,12 +92,16 @@ def take_sample(args) -> dict:
     except Exception:  # noqa: BLE001
         pass
     try:
-        sample["finalized_height"] = scrape_metric(
-            args.metrics_url, "state_finalized_block_height"
-        )
-        sample["vct_fast_blocks"] = scrape_metric(
-            args.metrics_url, "state_vct_fast_block_count"
-        )
+        with urllib.request.urlopen(args.metrics_url, timeout=15) as resp:
+            metrics = resp.read().decode("utf-8", "replace")
+        # Retain one complete scrape and use it for all counters in this sample.
+        (Path(args.out) / "metrics.prom").write_text(metrics)
+        for key, name in (
+            ("finalized_height", "state_finalized_block_height"),
+            ("vct_fast_blocks", "state_vct_fast_block_count"),
+            ("vct_committed_blocks", "state_vct_fast_path_hit"),
+        ):
+            sample[key] = metric_value(metrics, name)
     except Exception as exc:  # noqa: BLE001 — metrics failure is recorded in the sample
         sample["metrics_error"] = str(exc)
     props = systemd_props(args.service)
@@ -107,6 +110,64 @@ def take_sample(args) -> dict:
     pid = props.get("MainPID", "0")
     sample["rss_mib"] = rss_mib(pid) if pid != "0" else None
     return sample
+
+
+def missed_vct_handoff(sample: dict, checkpoint: int | None) -> bool:
+    """A fresh scrape past C cannot gain a VCT commit later in this process.
+
+    Counters are registered lazily, so an absent hit counter in a successful
+    scrape means zero. Callers require two consecutive observations because
+    the finalized gauge and post-commit counter are not updated atomically.
+    """
+    return (
+        checkpoint is not None
+        and not sample.get("metrics_error")
+        and sample.get("finalized_height") is not None
+        and sample["finalized_height"] >= checkpoint
+        and (sample.get("vct_committed_blocks") or 0) <= 0
+    )
+
+
+def read_startup_height(log_file: str) -> tuple[int | None, str | None]:
+    """Read the restored finalized height recorded after startup format upgrades."""
+    entry = None
+    try:
+        with open(log_file, errors="replace") as stream:
+            for line in stream:
+                if "loaded Zakura state cache" not in line:
+                    continue
+                if entry is not None:
+                    return None, "Multiple startup state entries were recorded."
+                entry = line
+    except OSError:
+        return None, "The startup state log could not be read."
+    if entry is None:
+        return None, "No startup state entry was recorded."
+    height = re.search(r"(?:^|\s)finalized_tip_height=([0-9]+)(?=\s|$)", entry)
+    if height is None or entry.count("finalized_tip_height=") != 1:
+        return None, "The startup finalized height is missing or malformed."
+    # A real block height is a u32; reject impossible or unbounded log values.
+    digits = height.group(1)
+    if len(digits) > 10 or int(digits) > 2**32 - 1:
+        return None, "The startup finalized height is outside the block height range."
+    return int(digits), None
+
+
+def startup_height_failure(
+    height: int | None,
+    error: str | None,
+    expected: int | None,
+    checkpoint: int | None,
+) -> str | None:
+    if error is not None:
+        return error
+    if height is None:
+        return "No startup finalized height was recorded."
+    if expected is not None and height != expected:
+        return f"Snapshot height {expected} does not match startup finalized height {height}."
+    if checkpoint is not None and height >= checkpoint:
+        return f"Startup finalized height {height} is not below checkpoint {checkpoint}."
+    return None
 
 
 def scan_logs(log_file: str, service: str) -> dict:
@@ -150,10 +211,19 @@ def build_summary(
     stop_after_height: int | None = None,
     required_finalized_at_least: int | None = None,
     require_vct_fast_blocks: bool = False,
+    require_startup_height: bool = False,
+    expected_snapshot_height: int | None = None,
+    startup_height_error: str | None = None,
 ) -> dict:
     heighted = [s for s in samples if s["height"] is not None]
     first_observed_h = heighted[0]["height"] if heighted else None
-    start_h = known_start_height if known_start_height is not None else first_observed_h
+    start_h = (
+        known_start_height if require_startup_height or known_start_height is not None
+        else first_observed_h
+    )
+    startup_failure = startup_height_failure(
+        start_h, startup_height_error, expected_snapshot_height, required_start_below,
+    ) if require_startup_height else None
     end_h = heighted[-1]["height"] if heighted else None
     progress = (end_h - start_h) if end_h is not None and start_h is not None else None
     last = samples[-1] if samples else {}
@@ -165,6 +235,11 @@ def build_summary(
     vct_fast = [s["vct_fast_blocks"] for s in samples if s.get("vct_fast_blocks") is not None]
     finalized_h = max(finalized) if finalized else None
     vct_fast_blocks = max(vct_fast) if vct_fast else None
+    vct_committed = [
+        s["vct_committed_blocks"]
+        for s in samples if s.get("vct_committed_blocks") is not None
+    ]
+    vct_committed_blocks = max(vct_committed) if vct_committed else None
     restarts = max((s["restarts"] for s in samples), default=0)
 
     if (
@@ -172,6 +247,7 @@ def build_summary(
         or logs["panics"] > 0
         or restarts > 0
         or not heighted
+        or startup_failure is not None
         or (
             required_start_below is not None
             and (start_h is None or start_h >= required_start_below)
@@ -184,7 +260,10 @@ def build_summary(
             required_finalized_at_least is not None
             and (finalized_h is None or finalized_h < required_finalized_at_least)
         )
-        or (require_vct_fast_blocks and (vct_fast_blocks is None or vct_fast_blocks <= 0))
+        or (
+            require_vct_fast_blocks
+            and (vct_committed_blocks is None or vct_committed_blocks <= 0)
+        )
     ):
         verdict = "failed"
     elif logs["errors"] > 0 or (progress is not None and progress <= 0):
@@ -218,7 +297,20 @@ def build_summary(
         "finalized_height": finalized_h,
         "required_finalized_at_least": required_finalized_at_least,
         "vct_fast_blocks": vct_fast_blocks,
+        "vct_committed_blocks": vct_committed_blocks,
+        "vct_failure_reason": (
+            "Checkpoint finalized without a successful VCT commit; handoff was not exercised."
+            if require_vct_fast_blocks
+            and finalized_h is not None
+            and required_finalized_at_least is not None
+            and finalized_h >= required_finalized_at_least
+            and (vct_committed_blocks or 0) <= 0
+            else None
+        ),
         "require_vct_fast_blocks": require_vct_fast_blocks,
+        "require_startup_height": require_startup_height,
+        "expected_snapshot_height": expected_snapshot_height,
+        "startup_height_failure_reason": startup_failure,
     }
 
 
@@ -256,8 +348,16 @@ def write_markdown(out: Path, summary: dict, samples: list[dict], notes_file: st
         )
         lines.append(
             f"| VCT fast-path blocks | {fmt(summary['vct_fast_blocks'])} "
+            "(before commit) |"
+        )
+        lines.append(
+            f"| Successful VCT commits | {fmt(summary['vct_committed_blocks'])} "
             f"(required > 0: {summary['require_vct_fast_blocks']}) |"
         )
+    if summary["vct_failure_reason"]:
+        lines += ["", summary["vct_failure_reason"]]
+    if summary["startup_height_failure_reason"]:
+        lines += ["", summary["startup_height_failure_reason"]]
 
     shown = [s for s in samples if s["height"] is not None]
     if shown:
@@ -294,12 +394,18 @@ def main() -> int:
     parser.add_argument("--log-file", default="/var/log/zakura/zakura.log")
     parser.add_argument("--notes", default=None, help="markdown notes file to append")
     parser.add_argument("--meta", default="", help="comma-separated key=value run metadata")
-    parser.add_argument(
+    starting_height = parser.add_mutually_exclusive_group()
+    starting_height.add_argument(
         "--known-start-height",
         type=int,
         default=None,
-        help="state snapshot height, used when sync crosses before RPC is available",
+        help="previously verified state height, used when sync crosses before RPC is available",
     )
+    starting_height.add_argument(
+        "--require-startup-height", action="store_true",
+        help="require the restored finalized height from this run's startup log",
+    )
+    parser.add_argument("--expected-snapshot-height", type=int, default=None)
     parser.add_argument(
         "--required-start-below",
         type=int,
@@ -313,9 +419,16 @@ def main() -> int:
         help="stop successfully once RPC block height is strictly above this height",
     )
     parser.add_argument("--required-finalized-at-least", type=int, default=None)
-    parser.add_argument("--require-vct-fast-blocks", action="store_true")
+    parser.add_argument(
+        "--require-vct-fast-blocks", action="store_true",
+        help="require successful tree_aux commits, not just pre-commit fast-block attempts",
+    )
     parser.add_argument("--out", required=True, help="output directory")
     args = parser.parse_args()
+    if args.expected_snapshot_height is not None and (
+        not args.require_startup_height or args.expected_snapshot_height < 0
+    ):
+        parser.error("--expected-snapshot-height requires --require-startup-height and a nonnegative height")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -324,24 +437,50 @@ def main() -> int:
     start = time.monotonic()
     deadline = start + args.duration_minutes * 60
     samples: list[dict] = []
+    missed_handoff_samples = 0
+    startup_height_checked = False
     while True:
         sample = take_sample(args)
         sample["elapsed"] = time.monotonic() - start
         samples.append(sample)
+        with (out / "samples.jsonl").open("a") as stream:
+            stream.write(json.dumps(sample) + "\n")
         status = (
             f"[{int(sample['elapsed'])}s] height={fmt(sample['height'])} "
             f"finalized={fmt(sample['finalized_height'])} "
             f"vct_fast={fmt(sample['vct_fast_blocks'])} "
+            f"vct_committed={fmt(sample['vct_committed_blocks'])} "
             f"peers={fmt(sample['peers'])} rss={fmt(sample['rss_mib'])}MiB "
             f"state={sample['active_state']}"
         )
         print(status, flush=True)
+        if args.require_startup_height and not startup_height_checked:
+            startup_height, startup_error = read_startup_height(args.log_file)
+            if startup_error is None or sample["elapsed"] > RPC_GRACE_SECS:
+                failure = startup_height_failure(
+                    startup_height, startup_error, args.expected_snapshot_height,
+                    args.required_start_below,
+                )
+                if failure is not None:
+                    print(f"startup height check failed: {failure}", flush=True)
+                    break
+                startup_height_checked = True
         # Bail out early once the node is clearly gone (past the startup grace).
         if sample["elapsed"] > RPC_GRACE_SECS and sample["active_state"] == "failed":
             print("service failed; stopping monitor early", flush=True)
             break
+        if args.require_vct_fast_blocks and missed_vct_handoff(
+            sample, args.required_finalized_at_least
+        ):
+            missed_handoff_samples += 1
+        else:
+            missed_handoff_samples = 0
+        if missed_handoff_samples >= 2:
+            print("checkpoint finalized without a VCT commit; stopping monitor", flush=True)
+            break
         if (
             args.stop_after_height is not None
+            and (not args.require_startup_height or startup_height_checked)
             and sample["height"] is not None
             and sample["height"] > args.stop_after_height
             and (
@@ -354,8 +493,8 @@ def main() -> int:
             and (
                 not args.require_vct_fast_blocks
                 or (
-                    sample["vct_fast_blocks"] is not None
-                    and sample["vct_fast_blocks"] > 0
+                    sample["vct_committed_blocks"] is not None
+                    and sample["vct_committed_blocks"] > 0
                 )
             )
         ):
@@ -368,6 +507,10 @@ def main() -> int:
             break
         time.sleep(args.interval)
 
+    startup_height, startup_error = (
+        read_startup_height(args.log_file) if args.require_startup_height
+        else (args.known_start_height, None)
+    )
     logs = scan_logs(args.log_file, args.service)
     actual_duration_min = (time.monotonic() - start) / 60
     summary = build_summary(
@@ -375,11 +518,14 @@ def main() -> int:
         samples,
         logs,
         actual_duration_min,
-        known_start_height=args.known_start_height,
+        known_start_height=startup_height,
         required_start_below=args.required_start_below,
         stop_after_height=args.stop_after_height,
         required_finalized_at_least=args.required_finalized_at_least,
         require_vct_fast_blocks=args.require_vct_fast_blocks,
+        require_startup_height=args.require_startup_height,
+        expected_snapshot_height=args.expected_snapshot_height,
+        startup_height_error=startup_error,
     )
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     write_markdown(out, summary, samples, args.notes)

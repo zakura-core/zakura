@@ -439,12 +439,7 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
-        let mut state_config = config.state.clone();
-        state_config.enable_zakura_header_seed_from_committed_blocks = config.network.v2_p2p();
-        // State owns the VCT commit path, but users configure its checkpoint-sync controls
-        // together under `[consensus]`.
-        state_config.checkpoint_sync = config.consensus.checkpoint_sync;
-        state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
+        let state_config = config.mirrored_state_config();
 
         let (
             mut state_service,
@@ -578,7 +573,7 @@ impl StartCmd {
                 latest_chain_tip.clone(),
                 user_agent(),
                 advertised_services,
-                zcashd_compat_block_gossip_peer_ips,
+                zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
             )
@@ -684,6 +679,7 @@ impl StartCmd {
             latest_chain_tip.clone(),
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
+            zcashd_compat_block_gossip_peer_ips.clone(),
         );
         let mempool = BoxService::new(mempool);
         let mempool = ServiceBuilder::new()

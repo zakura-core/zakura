@@ -21,15 +21,15 @@ use std::{
 };
 
 use zakura_chain::{
-    block::{Commitment, CommitmentError, Height},
-    history_tree::HistoryTree,
+    block::{Commitment, CommitmentError, Header, Height},
+    history_tree::{HistoryTree, HistoryTreeBlockParts},
     parallel::{
         commitment_aux::BlockCommitmentRoots,
         commitment_aux_verify::{verify_supplied_roots_from_parts, SuppliedRootsError},
     },
     parameters::{Network, NetworkUpgrade},
 };
-use zakura_header_chain::{ApplyResult, AuxDelivery, Frontier};
+use zakura_header_chain::{ApplyResult, AuxDelivery, EvidenceId, Frontier, HeaderGeneration};
 
 use crate::{
     error::VctCommitFailure,
@@ -213,6 +213,19 @@ impl VctAuthenticationSweeper {
                 break;
             };
             if deliveries_share_dispute_evidence(&auxiliary_window, &successor_witness) {
+                if let Some(history_tree) = authenticate_alternative_pair(
+                    writer,
+                    &network,
+                    &verified_prefix.history_tree,
+                    projection_index,
+                    selected_frontier,
+                    captured_projection.engine_snapshot.header_generation,
+                ) {
+                    verified_prefix.history_tree = history_tree;
+                    verified_prefix.frontier = selected_frontier;
+                    projection_index += 1;
+                    continue;
+                }
                 repair_manager
                     .request_sweep_repair(selected_height, VctRepairTrigger::MissingRootObserved);
                 break;
@@ -266,7 +279,27 @@ impl VctAuthenticationSweeper {
                         failed_height,
                         &error,
                     );
-                    break;
+                    let ambiguous = failed_height == successor_witness.height
+                        && auxiliary_window.attribute_failure(VctCommitFailure::SuccessorBoundary)
+                            == VctAuxiliaryFailureAttribution::AmbiguousDeliveries;
+                    let Some(history_tree) = ambiguous
+                        .then(|| {
+                            authenticate_alternative_pair(
+                                writer,
+                                &network,
+                                &verified_prefix.history_tree,
+                                projection_index,
+                                selected_frontier,
+                                captured_projection.engine_snapshot.header_generation,
+                            )
+                        })
+                        .flatten()
+                    else {
+                        break;
+                    };
+                    verified_prefix.history_tree = history_tree;
+                    verified_prefix.frontier = selected_frontier;
+                    projection_index += 1;
                 }
             }
         }
@@ -406,6 +439,122 @@ impl VctAuthenticationSweeper {
     fn reset_verified_prefix(&mut self) {
         self.verified_selected_prefix = None;
     }
+}
+
+/// Authenticates an untried delivery pair at a boundary whose selected pair cannot verify.
+///
+/// Selection pairs the best row of each header, and a disputed row cannot take a second dispute.
+/// A wrong row that sorts first would therefore hide the pair that verifies from every later
+/// sweep. The search folds each current row once and screens every successor row against that
+/// fold. It returns the history tree folded through the current height after the full two-header
+/// verification passes and the authentication persists.
+fn authenticate_alternative_pair(
+    writer: &HeaderChainWriter,
+    network: &Network,
+    history_tree: &HistoryTree,
+    projection_index: usize,
+    selected_frontier: Frontier,
+    header_generation: HeaderGeneration,
+) -> Option<HistoryTree> {
+    let windows = match writer
+        .vct_boundary_alternatives_at_projection_index(projection_index, selected_frontier)
+    {
+        Ok(windows) => windows,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                height = ?selected_frontier.height,
+                "VCT: header-time authentication could not read alternative delivery pairs"
+            );
+            return None;
+        }
+    };
+    metrics::counter!("state.vct.aux.sweep.alternative_search.count").increment(1);
+    // Each window shares its current delivery with its neighbors, so one fold serves the group.
+    let mut current_fold: Option<(EvidenceId, Option<HistoryTree>)> = None;
+    for window in &windows {
+        if window.engine_snapshot.header_generation != header_generation {
+            return None;
+        }
+        let Some(successor_witness) = window.successor.as_ref() else {
+            continue;
+        };
+        let (Some(current_roots), Some(successor_roots)) = (
+            supplied_roots(&window.delivery),
+            successor_witness.delivery.as_ref().and_then(supplied_roots),
+        ) else {
+            continue;
+        };
+        if current_fold.as_ref().map(|(delivery_id, _)| *delivery_id)
+            != Some(window.delivery.delivery_id)
+        {
+            let folded = fold_current_roots(
+                network,
+                history_tree,
+                window.delivery_header.as_ref(),
+                &current_roots,
+            );
+            current_fold = Some((window.delivery.delivery_id, folded));
+        }
+        let Some((_, Some(folded))) = current_fold.as_ref() else {
+            continue;
+        };
+        if verify_supplied_roots_from_parts(
+            network,
+            folded.clone(),
+            [(successor_witness.header.as_ref(), &successor_roots)],
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let Ok(verified) = verify_supplied_roots_from_parts(
+            network,
+            history_tree.clone(),
+            [
+                (window.delivery_header.as_ref(), &current_roots),
+                (successor_witness.header.as_ref(), &successor_roots),
+            ],
+        ) else {
+            continue;
+        };
+        if !persist_delivery_authentication(writer, network, window, successor_witness) {
+            return None;
+        }
+        metrics::counter!("state.vct.aux.sweep.authenticated.count").increment(1);
+        return Some(verified.history_tree().clone());
+    }
+    None
+}
+
+/// Checks the current header against `history_tree` and folds the current roots into it.
+///
+/// This is the first step of [`verify_supplied_roots_from_parts`] over the current and successor
+/// headers. The caller confirms a passing pair with that function.
+fn fold_current_roots(
+    network: &Network,
+    history_tree: &HistoryTree,
+    header: &Header,
+    roots: &BlockCommitmentRoots,
+) -> Option<HistoryTree> {
+    verify_supplied_roots_from_parts(network, history_tree.clone(), [(header, roots)]).ok()?;
+    let mut folded = history_tree.clone();
+    folded
+        .push_from_parts(
+            network,
+            HistoryTreeBlockParts {
+                header,
+                height: roots.height,
+                sapling_root: &roots.sapling_root,
+                orchard_root: &roots.orchard_root,
+                ironwood_root: &roots.ironwood_root,
+                sapling_tx: roots.sapling_tx,
+                orchard_tx: roots.orchard_tx,
+                ironwood_tx: roots.ironwood_tx,
+            },
+        )
+        .ok()?;
+    Some(folded)
 }
 
 fn deliveries_share_dispute_evidence(

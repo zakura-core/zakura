@@ -102,7 +102,10 @@ fn assert_fork_eviction_body_evidence(reconsider: bool) {
     header.merkle_root = merkle_root;
     header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
 
-    let siblings = template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
     for (order, block) in siblings.iter().enumerate() {
         let refill_after_invalidation =
             reconsider && order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
@@ -111,7 +114,8 @@ fn assert_fork_eviction_body_evidence(reconsider: bool) {
             staged.invalidate_block(siblings[0].hash()).unwrap();
             commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), true).unwrap();
         }
-        let prepared = block.clone().prepare();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
         let mut staged = live.clone();
         staged.commit_new_chain(prepared, &finalized.db).unwrap();
         commit_verified_change(
@@ -301,7 +305,7 @@ fn production_activation_headers_pass_shared_rules() {
 
 #[test]
 // DF-01: one coherent fork graph crosses NU5 through both validation paths;
-// matching tips and work are the complete observable fork-choice result.
+// unequal work agrees, while equal work can keep distinct header and mining tips.
 fn generated_nu5_graph_matches_full_state_before_finalization() {
     let _init_guard = zakura_test::init();
     fn network(checkpoint_blocks: Option<&[Arc<Block>]>) -> Network {
@@ -526,13 +530,15 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
         assert_eq!(batch.headers()[0].hash, block.hash());
 
         let mut staged = live.clone();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::from(height.0));
         if index == 31 {
             staged
-                .commit_new_chain(block.clone().prepare(), &finalized_state.db)
+                .commit_new_chain(prepared, &finalized_state.db)
                 .expect("the first generated body enters full state");
         } else {
             staged
-                .commit_block(block.clone().prepare(), &finalized_state.db)
+                .commit_block(prepared, &finalized_state.db)
                 .expect("the next generated body enters full state");
         }
         let accepted = Frontier::new(height, block.hash());
@@ -610,6 +616,48 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
         .validation_context(side_frontier.hash)
         .expect("the accepted side context reads")
         .is_some());
+
+    let tied = (1..=u8::MAX)
+        .map(|nonce| {
+            let mut block = chain[40].clone();
+            Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[0] = nonce;
+            block
+        })
+        .find(|block| block.hash().0 > incumbent.hash.0)
+        .expect("the fixed fixture has a sibling with a greater raw hash");
+    let tied_frontier = Frontier::new(block::Height(40), tied.hash());
+    let mut prepared = tied.prepare();
+    prepared.receipt_order = Some(100);
+    let mut staged = live.clone();
+    staged.commit_block(prepared, &finalized_state.db).unwrap();
+    commit_verified_change(&writer, &mut live, staged, tied_frontier);
+    let snapshot = writer.runtime.publisher().snapshot();
+    assert_eq!(snapshot.frontiers.header_best, tied_frontier);
+    assert_eq!(snapshot.frontiers.verified_best, incumbent);
+
+    let mut staged = live.clone();
+    staged.invalidate_block(incumbent.hash).unwrap();
+    commit_operator_change(&writer, &mut live, staged, incumbent.hash, true).unwrap();
+    assert_eq!(
+        writer
+            .runtime
+            .publisher()
+            .snapshot()
+            .frontiers
+            .verified_best,
+        tied_frontier
+    );
+    let mut staged = live.clone();
+    staged
+        .reconsider_block(incumbent.hash, &finalized_state.db)
+        .unwrap();
+    commit_operator_change(&writer, &mut live, staged, incumbent.hash, false).unwrap();
+    let snapshot = writer.runtime.publisher().snapshot();
+    assert_eq!(snapshot.frontiers.header_best, tied_frontier);
+    assert_eq!(snapshot.frontiers.verified_best, incumbent);
+    let mut staged = live.clone();
+    staged.invalidate_block(tied_frontier.hash).unwrap();
+    commit_operator_change(&writer, &mut live, staged, tied_frontier.hash, true).unwrap();
 
     let mut replacement = chain[39].clone().set_work(1_000);
     let replacement_block = Arc::make_mut(&mut replacement);
@@ -1067,7 +1115,7 @@ async fn rejected_precious_header_commit_changes_nothing_and_returns_the_write_s
                 zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
         },
     );
-    let (senders, _invalid_resets, _, _, _, _, _task) = BlockWriteSender::spawn_with_header_chain(
+    let (senders, _invalid_resets, _, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
         finalized,
         live,
         chain_tip_sender,
@@ -1142,4 +1190,16 @@ async fn rejected_precious_header_commit_changes_nothing_and_returns_the_write_s
     assert!(published
         .chain_iter()
         .any(|chain| chain.non_finalized_tip_hash() == unrecorded));
+
+    // Closing the requests starts database shutdown on the writer thread. Join it before
+    // dropping the other database owners so their cleanup cannot race with that shutdown.
+    drop(senders);
+    let task = Arc::into_inner(task.expect("the writer task was spawned"))
+        .expect("the fixture owns the only writer-task handle");
+    let result = timeout(limit, tokio::task::spawn_blocking(move || task.join()))
+        .await
+        .expect("the writer shuts down after its request channels close")
+        .expect("the join task does not panic")
+        .expect("the writer does not panic");
+    assert!(matches!(result, BlockWriteTaskExit::Completed));
 }

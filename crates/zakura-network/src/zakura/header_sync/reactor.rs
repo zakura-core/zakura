@@ -8,7 +8,6 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use iroh::EndpointId;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -16,6 +15,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
+use zakura_quic::NodeId;
 
 use super::{
     events::{HeaderPortOperation, PortDispatch},
@@ -1419,17 +1419,20 @@ impl HeaderSyncReactor {
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
-            let input = response.entries[0]
-                .tree_aux
-                .expect("a repair response has schema-1 auxiliary input");
+            let inputs: Vec<_> = response
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .tree_aux
+                        .expect("a repair response has schema-1 auxiliary input")
+                })
+                .collect();
             let excluded = self.vct_repair.get(repair_owner).is_some_and(|task| {
                 let RepairPolicyState::Assigned { context } = &task.state else {
                     return false;
                 };
-                context.target == *selected_target
-                    && context.selected_header_count() == 1
-                    && context.episode == episode
-                    && (context.excludes(input) || context.retains_payload(input))
+                context.episode == episode && !context.admits_new_input(active.source, &inputs)
             });
             if excluded {
                 metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
@@ -3255,6 +3258,20 @@ impl HeaderSyncReactor {
                 peer_supported_count
             } else {
                 peer_supported_count.min(local_capacity)
+            };
+            // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
+            // Missing local capacity only delays the full request.
+            let unshortenable = context
+                .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
+                .is_none();
+            if unshortenable && peer_supported_count < desired_count {
+                rejections.insufficient_capacity += 1;
+                continue;
+            }
+            let supported_count = if unshortenable {
+                desired_count
+            } else {
+                supported_count
             };
             if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
                 rejections.unsupported_schema += 1;
@@ -5280,9 +5297,9 @@ fn next_height(height: block::Height) -> block::Height {
     block::Height(height.0.saturating_add(1).min(block::Height::MAX.0))
 }
 
-fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<EndpointId> {
+fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
-    EndpointId::from_bytes(&bytes).ok()
+    NodeId::from_bytes(&bytes).ok()
 }
 
 fn header_direction_label(direction: ServicePeerDirection) -> &'static str {

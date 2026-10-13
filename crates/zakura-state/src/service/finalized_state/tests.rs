@@ -18,6 +18,7 @@ mod nsm_value_balance;
 mod prop;
 mod rollback;
 mod transparent;
+mod transparent_indexes;
 mod vectors;
 
 /// Generates exactly the valid-commitment block prefix a finalized-state test

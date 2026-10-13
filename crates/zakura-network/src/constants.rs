@@ -410,6 +410,12 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
+/// The most block hashes a Zakura native `FindBlocks` response may carry.
+///
+/// A zakurad responder sends at most `MAX_FIND_BLOCK_HASHES_RESULTS` from
+/// `zakura-state`; zakurad checks at compile time that the two match.
+pub const MAX_FIND_BLOCKS_RESPONSE_HASHES: usize = 500;
+
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 

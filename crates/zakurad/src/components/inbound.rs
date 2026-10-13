@@ -86,6 +86,14 @@ pub const GETDATA_MAX_BLOCK_COUNT: usize = 16;
 /// Minimum interval between zcashd-compat errors for requested pruned block bodies.
 const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+// Zakura requesters reject `FindBlocks` responses above their limit, so this
+// node must never answer with more.
+const _: () = assert!(
+    // A `u32` always fits `usize` on the 32- and 64-bit targets Zakura supports.
+    zs::constants::MAX_FIND_BLOCK_HASHES_RESULTS as usize
+        == zn::constants::MAX_FIND_BLOCKS_RESPONSE_HASHES
+);
+
 /// Actionable error emitted when a zcashd sidecar requests a pruned block body.
 pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
     "zcashd_compat: cannot serve block because its body has been pruned; a zcashd sidecar \

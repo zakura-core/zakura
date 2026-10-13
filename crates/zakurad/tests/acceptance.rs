@@ -2032,46 +2032,38 @@ where
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn delete_old_databases() -> Result<()> {
-    use std::fs::{canonicalize, create_dir};
+    use std::fs::{canonicalize, create_dir, create_dir_all};
 
     let _init_guard = zakura_test::init();
 
-    // Skip this test because it can be very slow without a network.
-    //
-    // The delete databases task is launched last during startup, after network setup.
-    // If there is no network, network setup can take a long time to timeout,
-    // so the task takes a long time to launch, slowing down this test.
-    if zakura_test::net::zebra_skip_network_tests() {
-        return Ok(());
-    }
-
     let mut config = default_test_config(&Mainnet);
+    // Cleanup needs a local node, not public seed discovery. Let startup finish offline.
+    config.network.initial_mainnet_peers.clear();
     let run_dir = testdir()?;
-    let cache_dir = run_dir.path().join("state");
+    let state_dir = run_dir.path().join("state");
 
-    // create cache dir
-    create_dir(cache_dir.clone())?;
+    // Create the state directory under the cache root supplied by `with_config`.
+    create_dir(&state_dir)?;
 
-    // create a v1 dir outside cache dir that should not be deleted
+    // A version directory outside the state directory must be kept.
     let outside_dir = run_dir.path().join("v1");
     create_dir(&outside_dir)?;
     assert!(outside_dir.as_path().exists());
 
-    // create a `v1` dir inside cache dir that should be deleted
-    let inside_dir = cache_dir.join("v1");
-    create_dir(&inside_dir)?;
+    // Create an old Mainnet database in the network-specific state layout.
+    let inside_dir = state_dir.join("v1").join("mainnet");
+    create_dir_all(&inside_dir)?;
     let canonicalized_inside_dir = canonicalize(inside_dir.clone()).ok().unwrap();
     assert!(inside_dir.as_path().exists());
 
-    // modify config with our cache dir and not ephemeral configuration
-    // (delete old databases function will not run when ephemeral = true)
-    config.state.cache_dir = cache_dir;
+    // Cleanup only runs for persistent state.
     config.state.ephemeral = false;
 
     // run zebra with our config
     let mut child = run_dir
         .with_config(&mut config)?
-        .spawn_child(args!["start"])?;
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
     // delete checker running
     child.expect_stdout_line_matches("checking for old database versions".to_string())?;

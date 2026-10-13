@@ -34,7 +34,9 @@ pub(super) fn generate(db: &ZakuraDb, height: u32, hash: block::Hash) -> Result<
         for (location, output) in outputs_in_order(&canonical.block, h) {
             let retained = match utxos.next_if(|(next, _)| *next <= location) {
                 None => false,
-                Some((next, _)) if next != location => bail!("unmatched UTXO at {next:?}"),
+                Some((next, _)) if next != location => {
+                    bail!("unmatched UTXO at {next:?}");
+                }
                 Some((_, entry)) => {
                     ensure!(h.0 != 0, "genesis outputs must not enter the UTXO set");
                     let tx_index = location.transaction_index().as_usize();

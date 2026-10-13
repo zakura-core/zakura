@@ -82,7 +82,23 @@ impl fmt::Debug for SessionDemand {
     }
 }
 
-/// A service-declared Zakura stream.
+/// A service-declared Zakura stream: its identity and every local rule the
+/// transport applies to it.
+///
+/// A service declares each stream once, as a constant. Fields that keep their
+/// defaults come from [`Stream::PERSISTENT`] or [`Stream::REQUEST_RESPONSE`]:
+///
+/// ```
+/// # use zakura_network::zakura::{Stream, StreamQueueDepths};
+/// const EVENTS: Stream = Stream {
+///     kind: 64,
+///     version: 1,
+///     frame_cap: 1024 * 1024,
+///     capability: 1 << 16,
+///     queue_depths: Some(StreamQueueDepths { inbound: 8, outbound: 8 }),
+///     ..Stream::PERSISTENT
+/// };
+/// ```
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
     /// Unique stream kind carried in `StreamPrelude.stream_kind`.
@@ -95,6 +111,57 @@ pub struct Stream {
     pub capability: u64,
     /// Stream lifetime and opening semantics.
     pub mode: StreamMode,
+    /// Payload size limits, as `(message_type, maximum_bytes)` pairs.
+    ///
+    /// The reader checks these limits before allocating a payload. Limits
+    /// exclude the frame header and may only tighten `frame_cap`. Unlisted
+    /// message types keep that cap; the codec checks message validity.
+    pub payload_limits: &'static [(u16, usize)],
+    /// Message types accepted on this stream, or `None` for any type.
+    ///
+    /// The reader rejects an unlisted type from its header, before allocating
+    /// or reading its payload.
+    pub message_types: Option<&'static [u16]>,
+    /// Application queue limits, or `None` for the transport's defaults.
+    ///
+    /// The transport also applies its connection-wide inbound queue allowance.
+    pub queue_depths: Option<StreamQueueDepths>,
+    /// Write deadline for a persistent stream.
+    ///
+    /// A stream that allows indefinite writes relies on its service's bounded
+    /// progress policy. Cancelling the session always interrupts a pending write.
+    pub write_policy: StreamWritePolicy,
+}
+
+impl Stream {
+    /// Defaults for a persistent stream. Every declaration sets `kind`,
+    /// `version`, `frame_cap`, and `capability`.
+    pub const PERSISTENT: Self = Self {
+        kind: 0,
+        version: 0,
+        frame_cap: 0,
+        capability: 0,
+        mode: StreamMode::Persistent,
+        payload_limits: &[],
+        message_types: None,
+        queue_depths: None,
+        write_policy: StreamWritePolicy::Timeout(Duration::from_secs(10)),
+    };
+
+    /// Defaults for a request/response stream.
+    pub const REQUEST_RESPONSE: Self = Self {
+        mode: StreamMode::RequestResponse,
+        ..Self::PERSISTENT
+    };
+}
+
+/// Per-stream application queue limits.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct StreamQueueDepths {
+    /// Frames the reader may queue for the service.
+    pub inbound: usize,
+    /// Frames the service may queue for the writer.
+    pub outbound: usize,
 }
 
 /// A persistent stream's write deadline within its service session.
@@ -405,27 +472,6 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Advance its version whenever the session layout changes.
     fn streams(&self) -> &[Stream];
 
-    /// Payload size limits for this stream, as `(message_type, maximum_bytes)` pairs.
-    ///
-    /// The reader checks these limits before allocating a payload. Limits exclude
-    /// the frame header and may only tighten the stream's existing cap. Unlisted
-    /// message types keep that cap; message validity is checked by the codec.
-    fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
-        &[]
-    }
-
-    /// Optional message types accepted on this role. The transport rejects an
-    /// unlisted type from its header, before allocating or reading its payload.
-    fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
-        None
-    }
-
-    /// Optional per-stream inbound and outbound application queue limits.
-    /// The transport also applies its connection-wide inbound queue allowance.
-    fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {
-        None
-    }
-
     /// Reserve service capacity before starting a persistent session. The returned
     /// owner lives through incomplete setup and all workers' eventual teardown.
     fn reserve_session(
@@ -433,14 +479,6 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         _direction: ServicePeerDirection,
     ) -> Result<Option<std::sync::Arc<dyn SessionResources>>, SessionFull> {
         Ok(None)
-    }
-
-    /// Control writes independently for each persistent stream.
-    ///
-    /// Services that allow indefinite writes must enforce their own bounded
-    /// progress policy. Cancelling the session always interrupts a pending write.
-    fn stream_write_policy(&self, _stream: Stream) -> StreamWritePolicy {
-        StreamWritePolicy::Timeout(Duration::from_secs(10))
     }
 
     /// Return the opening and re-admission policy for the whole service session.

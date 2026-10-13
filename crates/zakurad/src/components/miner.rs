@@ -92,6 +92,13 @@ fn cancel_if_mining_template_changed(
     }
 }
 
+/// Waits for a template update or channel closure, with a timeout for shutdown checks.
+async fn wait_for_mining_template_change(
+    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+) {
+    let _ = tokio::time::timeout(BLOCK_TEMPLATE_WAIT_TIME, template_receiver.changed()).await;
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -549,7 +556,7 @@ where
 
             // Skip the wait if we didn't get a template because we are shutting down.
             if !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
+                wait_for_mining_template_change(&mut template_receiver).await;
             }
 
             continue;
@@ -776,6 +783,71 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_arrives() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            sender.send(Some(block.clone())).unwrap();
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("new work must wake an idle solver before the 20-second timer");
+        }
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_observes_template_arriving_before_wait() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        receiver.mark_as_seen();
+        assert!(receiver.cloned_watch_data().is_none());
+        sender.send(Some(block.clone())).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("a template arriving between the read and wait must not be missed");
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_sender_closes() {
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            drop(sender);
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("channel closure must wake an idle solver promptly");
+        }
+        assert!(receiver.has_changed().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wait_is_bounded_for_shutdown_checks() {
+        let (_sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            BLOCK_TEMPLATE_WAIT_TIME + Duration::from_secs(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("an idle solver must periodically recheck shutdown without channel updates");
+        assert!(started.elapsed() >= BLOCK_TEMPLATE_WAIT_TIME);
+    }
+
     #[tokio::test]
     async fn template_generation_failure_invalidates_current_template() {
         let network = Network::Mainnet;
@@ -910,6 +982,7 @@ mod tests {
             assert!(matches!(request, zakura_state::ReadRequest::ChainInfo));
             Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::ChainInfo(
                 zakura_state::GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: difficulty,
                     tip_height: height,
                     tip_hash: parent,

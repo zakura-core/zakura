@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use zakura_chain::{
     block,
     parameters::{
-        testnet::{Parameters, RegtestParameters},
+        testnet::{ConfiguredActivationHeights, Parameters, RegtestParameters},
         Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
@@ -49,7 +49,7 @@ fn validate_with_expected_target(
         context.iter().copied(),
     ) {
         Ok(adjustment) => adjustment,
-        Err(error) => panic!("the helper requires an exact height-dependent context: {error}"),
+        Err(error) => panic!("the helper requires a valid height-dependent context: {error}"),
     };
     let expected = adjustment.expected_difficulty_threshold();
     validate_contextual_difficulty_and_time(expected, adjustment)
@@ -119,7 +119,9 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
                 continue;
             }
             let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
-            let context_len = usize::try_from(height.0.min(28))
+            let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+                .expect("the difficulty adjustment span fits in u32");
+            let context_len = usize::try_from(height.0.min(span))
                 .expect("bounded test context length fits in usize");
             let context = context(&network, candidate_time, spacing, context_len);
             validate_with_expected_target(&network, height, candidate_time, &context)
@@ -131,7 +133,7 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
     let activation_height = block::Height(299_188);
     let spacing = NetworkUpgrade::target_spacing_for_height(&testnet, activation_height);
     let previous_time = candidate_time - spacing * 6;
-    let mut exact_gap = context(&testnet, candidate_time, spacing, 28);
+    let mut exact_gap = context(&testnet, candidate_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN);
     exact_gap[0].1 = previous_time;
     let previous_height = (activation_height - 1).expect("height is positive");
     let exact_gap_target = AdjustedDifficulty::new_from_header_time(
@@ -148,7 +150,7 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
     );
 
     let minimum_time = candidate_time + Duration::seconds(1);
-    let minimum_context = context(&testnet, minimum_time, spacing, 28)
+    let minimum_context = context(&testnet, minimum_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN)
         .into_iter()
         .enumerate()
         .map(|(index, (difficulty, time))| {
@@ -170,6 +172,220 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
         testnet.target_difficulty_limit().to_compact(),
         "ZIP 205/208 minimum difficulty begins strictly above six target spacings"
     );
+}
+
+const NU7_VECTOR_TARGET_BITS: [u32; 5] =
+    [0x1e0ffff0, 0x1e0e0000, 0x1e0c8000, 0x1e0b4000, 0x1e0a2000];
+const NU7_VECTOR_TIME_STEPS: [i64; 7] = [19, 31, 23, 29, 17, 37, 21];
+
+fn compact_vector_target(bits: u32) -> CompactDifficulty {
+    CompactDifficulty::from_bytes_in_display_order(&bits.to_be_bytes())
+        .expect("the fixed compact target is valid")
+}
+
+fn nu7_vector_context(
+    candidate_time: DateTime<Utc>,
+    len: usize,
+) -> Vec<(CompactDifficulty, DateTime<Utc>)> {
+    let mut time = candidate_time;
+    (0..len)
+        .map(|index| {
+            time -= Duration::seconds(NU7_VECTOR_TIME_STEPS[index % NU7_VECTOR_TIME_STEPS.len()]);
+            (
+                compact_vector_target(NU7_VECTOR_TARGET_BITS[index % NU7_VECTOR_TARGET_BITS.len()]),
+                time,
+            )
+        })
+        .collect()
+}
+
+fn configured_nu7_testnet(nu7_height: u32) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(nu7_height),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid")
+}
+
+/// Fixed expected `nBits` values independently calculated from the ZIP 218
+/// difficulty formulas using integer arithmetic.
+#[test]
+fn nu7_difficulty_vectors_match_expected_nbits() {
+    const NU7: u32 = 200;
+
+    let network = configured_nu7_testnet(NU7);
+    assert!(!network.disable_pow());
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+
+    // At NU7 - 1, the 17-target mean has nBits 0x1e0d0965. Its 425-second
+    // median gap is damped and bounded to 1,071 seconds, producing 0x1e0af369.
+    // At and after NU7, the 102-target mean has nBits 0x1e0cd18e. Its
+    // 2,572-second median gap is damped to 2,555 seconds, producing 0x1e0cd7fd.
+    for (height, expected_bits, wrong_window_bits) in [
+        (NU7 - 1, 0x1e0af369, 0x1e0cd7fd),
+        (NU7, 0x1e0cd7fd, 0x1e0af369),
+        (NU7 + 1, 0x1e0cd7fd, 0x1e0af369),
+    ] {
+        let adjustment = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(height - 1),
+            &network,
+            context.iter().copied(),
+        )
+        .expect("the vector supplies the complete height-dependent context");
+        assert_eq!(
+            adjustment.expected_difficulty_threshold(),
+            compact_vector_target(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+
+        let wrong_window_target = compact_vector_target(wrong_window_bits);
+        assert!(matches!(
+            validate_contextual_difficulty_and_time(wrong_window_target, adjustment),
+            Err(ContextualValidationError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            }) if difficulty_threshold == wrong_window_target
+                && expected_difficulty == compact_vector_target(expected_bits)
+        ));
+    }
+}
+
+#[test]
+fn nu7_moves_the_pow_limit_cutoff_to_height_102() {
+    let network = configured_nu7_testnet(1);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+
+    for (height, expected_bits) in [(102, 0x2007ffff), (103, 0x1e0caecf)] {
+        let context = nu7_vector_context(
+            candidate_time,
+            usize::try_from(height).expect("test height fits in usize"),
+        );
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(height - 1),
+            &network,
+            context,
+        )
+        .expect("the vector supplies every predecessor back to genesis")
+        .expected_difficulty_threshold();
+        assert_eq!(
+            actual,
+            compact_vector_target(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+    }
+}
+
+#[test]
+fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_150_seconds() {
+    let network = configured_nu7_testnet(200);
+    let candidate_height = block::Height(300_000);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+
+    for (gap, expected_bits) in [(150, 0x1e0cd7fd), (151, 0x2007ffff)] {
+        let mut context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+        context[0].1 = candidate_time - Duration::seconds(gap);
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            candidate_height
+                .previous()
+                .expect("the test candidate is not genesis"),
+            &network,
+            context,
+        )
+        .expect("the vector supplies the complete post-NU7 context")
+        .expected_difficulty_threshold();
+        assert_eq!(
+            actual,
+            compact_vector_target(expected_bits),
+            "unexpected nBits for a {gap}-second parent gap"
+        );
+    }
+}
+
+#[test]
+fn difficulty_context_accepts_retained_inactive_tail() {
+    let network = Network::Mainnet;
+    let candidate_height = block::Height(700_000);
+    let previous_height = (candidate_height - 1).expect("height is positive");
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let spacing = NetworkUpgrade::target_spacing_for_height(&network, candidate_height);
+
+    let expected = AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_height,
+        &network,
+        context(&network, candidate_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN),
+    )
+    .expect("the active difficulty context is accepted")
+    .expected_difficulty_threshold();
+
+    for len in [
+        POW_ADJUSTMENT_BLOCK_SPAN + 1,
+        70,
+        MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+    ] {
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            previous_height,
+            &network,
+            context(&network, candidate_time, spacing, len),
+        )
+        .expect("retained inactive context is accepted")
+        .expected_difficulty_threshold();
+        assert_eq!(actual, expected, "inactive context changed the result");
+    }
+
+    assert!(matches!(
+        AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            previous_height,
+            &network,
+            context(
+                &network,
+                candidate_time,
+                spacing,
+                MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1,
+            ),
+        ),
+        Err(AdjustedDifficultyError::ContextLength {
+            expected: MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+            actual,
+        }) if actual == MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1
+    ));
+
+    let early_height = block::Height(20);
+    let early_previous = (early_height - 1).expect("height is positive");
+    AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        early_previous,
+        &network,
+        context(&network, candidate_time, spacing, 20),
+    )
+    .expect("early context ending at genesis is accepted");
+    assert!(matches!(
+        AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            early_previous,
+            &network,
+            context(&network, candidate_time, spacing, 21),
+        ),
+        Err(AdjustedDifficultyError::ContextLength {
+            expected: 20,
+            actual: 21,
+        })
+    ));
 }
 
 #[test]
@@ -275,7 +491,13 @@ fn median_and_production_max_time_boundaries_are_exact() {
     ] {
         let context = vec![
             (network.target_difficulty_limit().to_compact(), base);
-            usize::try_from(height.0.min(28)).expect("bounded height fits in usize")
+            usize::try_from(
+                height.0.min(
+                    u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+                        .expect("the difficulty adjustment span fits in u32"),
+                )
+            )
+            .expect("bounded height fits in usize")
         ];
         assert!(matches!(
             validate_with_expected_target(&network, height, base, &context),
@@ -917,6 +1139,94 @@ fn contextual_writer_hold_microbench() {
                 "mode={mode} case={case} headers_examined={} elapsed={elapsed:?}",
                 invalid_offset + 1,
             );
+        }
+    }
+}
+
+/// Pin the existing 17-block calculation with a nonuniform mean and an irrelevant tail.
+#[test]
+fn candidate_height_window_preserves_existing_targets() {
+    // NU7 widens the averaging window, so this network stops at NU6.3.
+    let custom = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(100),
+            nu6_3: Some(200),
+            ..Default::default()
+        })
+        .unwrap()
+        .clear_funding_streams()
+        .to_network()
+        .unwrap();
+    let time = DateTime::from_timestamp(2_000_000_000, 0).unwrap();
+    let low =
+        CompactDifficulty::from_bytes_in_display_order(&0x1c010000_u32.to_be_bytes()).unwrap();
+    let high =
+        CompactDifficulty::from_bytes_in_display_order(&0x1c020000_u32.to_be_bytes()).unwrap();
+    // Nine targets of 2^216 and eight of 2^217 have mean floor(25 * 2^216 / 17).
+    // With a median gap of exactly 17 spacings, damping leaves the timespan unchanged.
+    // Division by 2550 or 1275 before multiplication does not change its compact encoding.
+    let expected =
+        CompactDifficulty::from_bytes_in_display_order(&0x1c017878_u32.to_be_bytes()).unwrap();
+
+    for network in Network::iter().chain([custom]) {
+        for height in [99, 100, 101, 199, 200, 201, 700_000] {
+            let height = block::Height(height);
+            let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
+            assert_eq!(
+                NetworkUpgrade::averaging_window_for_height(&network, height),
+                17
+            );
+            assert_eq!(
+                NetworkUpgrade::averaging_window_timespan_for_height(&network, height),
+                spacing * 17
+            );
+            let len = usize::try_from(height.0)
+                .unwrap()
+                .min(MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+            let mut entries = context(&network, time, spacing, len);
+            for (index, (target, _)) in entries.iter_mut().enumerate().take(17) {
+                *target = if index % 2 == 0 { low } else { high };
+            }
+            // Neither thresholds outside the mean window nor timestamps past the active
+            // median window may affect the result, even when extra history is retained.
+            for (target, timestamp) in entries.iter_mut().skip(28) {
+                *target = high;
+                *timestamp = time - Duration::days(100);
+            }
+            let adjustment = AdjustedDifficulty::new_from_header_time(
+                time,
+                height.previous().unwrap(),
+                &network,
+                entries,
+            )
+            .unwrap();
+            assert_eq!(
+                adjustment.expected_difficulty_threshold(),
+                expected,
+                "{network:?} at {height:?}"
+            );
+            assert!(matches!(
+                validate_contextual_difficulty_and_time(low, adjustment),
+                Err(ContextualValidationError::InvalidDifficultyThreshold { .. })
+            ));
+        }
+        for height in [17, 18] {
+            let height = block::Height(height);
+            let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
+            let entries = context(&network, time, spacing, usize::try_from(height.0).unwrap());
+            let result = AdjustedDifficulty::new_from_header_time(
+                time,
+                height.previous().unwrap(),
+                &network,
+                entries,
+            )
+            .unwrap()
+            .expected_difficulty_threshold();
+            if height.0 == 17 {
+                assert_eq!(result, network.target_difficulty_limit().to_compact());
+            } else {
+                assert_ne!(result, network.target_difficulty_limit().to_compact());
+            }
         }
     }
 }

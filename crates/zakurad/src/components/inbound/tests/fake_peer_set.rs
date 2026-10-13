@@ -1200,6 +1200,7 @@ async fn caches_getaddr_response() {
             mempool: buffered_mempool_service.clone(),
             state: state_service.clone(),
             latest_chain_tip,
+            network: network.clone(),
             misbehavior_sender,
         };
         let r = setup_tx.send(setup_data);
@@ -1459,7 +1460,10 @@ async fn setup_with_misbehavior_receiver(
     // Add transactions to the mempool, skipping verification and broadcast
     let mut added_transactions = Vec::new();
     if add_transactions {
-        added_transactions.extend(add_some_stuff_to_mempool(&mut mempool_service, network));
+        added_transactions.extend(add_some_stuff_to_mempool(
+            &mut mempool_service,
+            network.clone(),
+        ));
     }
 
     let mempool_service = BoxService::new(mempool_service);
@@ -1491,6 +1495,7 @@ async fn setup_with_misbehavior_receiver(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        network: network.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

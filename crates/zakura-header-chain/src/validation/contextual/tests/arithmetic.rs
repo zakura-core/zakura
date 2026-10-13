@@ -5,7 +5,8 @@ use zakura_chain::{
     work::difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
 
-use super::super::AdjustedDifficulty;
+use super::super::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+use zakura_chain::parameters::POW_AVERAGING_WINDOW;
 
 #[test]
 fn custom_target_scaling_clamps_before_overflowing_u256() {
@@ -17,10 +18,10 @@ fn custom_target_scaling_clamps_before_overflowing_u256() {
         .expect("the maximum compact-representable target is valid")
         .to_network()
         .expect("the custom network parameters are valid");
-    let mut context = vec![(compact, candidate_time - Duration::seconds(1)); 17];
+    let mut context = vec![(compact, candidate_time - Duration::seconds(1)); POW_AVERAGING_WINDOW];
     context.extend(vec![
         (compact, candidate_time - Duration::seconds(100_000));
-        11
+        POW_ADJUSTMENT_BLOCK_SPAN - POW_AVERAGING_WINDOW
     ]);
     let adjustment = AdjustedDifficulty::new_from_header_time(
         candidate_time,

@@ -42,7 +42,7 @@ use super::trace::BlockBodySource;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
-    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
+    SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerHandle,
     ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
@@ -145,14 +145,14 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Persistent,
+        ..Stream::PERSISTENT
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::RequestResponse,
+        ..Stream::REQUEST_RESPONSE
     },
 ];
 

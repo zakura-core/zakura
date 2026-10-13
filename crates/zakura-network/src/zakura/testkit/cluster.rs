@@ -154,10 +154,10 @@ mod tests {
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
             DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
             HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
-            Stream, StreamMode, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits,
-            FRAME_HEADER_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -495,7 +495,7 @@ mod tests {
         version: 1,
         frame_cap: CUSTOM_FRAME_CAP_BYTES,
         capability: CUSTOM_FRAME_CAP_CAPABILITY,
-        mode: StreamMode::Persistent,
+        ..Stream::PERSISTENT
     }];
 
     #[derive(Debug, Default)]

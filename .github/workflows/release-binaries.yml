@@ -294,7 +294,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -585,7 +585,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -678,7 +678,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
 
       - name: Create and verify Docker manifest
         env:
@@ -728,7 +728,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
         with:
           version: lab:latest
           driver: docker
@@ -832,7 +832,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e #v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
 
       - name: Create and verify zcashd compat Docker manifest
         env:

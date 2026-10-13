@@ -4,7 +4,6 @@ version = "0.1.0"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -21,3 +20,7 @@ sha2.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 tonic-prost-build.workspace = true
+
+# Intentional: this is a CLI tool that prints to stdout/stderr. Do not inherit
+# the workspace clippy print_* / missing-docs deny set.
+[lints]

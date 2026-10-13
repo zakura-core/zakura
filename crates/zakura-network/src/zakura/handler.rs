@@ -61,9 +61,9 @@ use crate::{
         FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
         HeaderSyncStartup, Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry,
         ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
-        StreamMode, StreamPrelude, StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        StreamMode, StreamPrelude, StreamQueueDepths, StreamWritePolicy, ZakuraAcceptedLimits,
+        ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck, ZakuraControlHello,
+        ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
         ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
         ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraServiceId,
         ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
@@ -1617,7 +1617,7 @@ struct StreamWorkerContext {
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
-    queue_depths: Option<(usize, usize)>,
+    queue_depths: Option<StreamQueueDepths>,
     write_policy: StreamWritePolicy,
     session_resources: Option<Arc<dyn crate::zakura::SessionResources>>,
     outbound_frame_cap: u32,
@@ -2885,8 +2885,8 @@ impl ZakuraProtocolHandler {
                                     &connection,
                                     limits,
                                     stream,
-                                    self.registry.message_payload_limits(stream),
-                                    self.registry.message_types(stream),
+                                    stream.payload_limits,
+                                    stream.message_types,
                                     request_id,
                                     message_type,
                                     flags,
@@ -3235,10 +3235,10 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
-            message_payload_limits: self.registry.message_payload_limits(stream),
-            message_types: self.registry.message_types(stream),
-            queue_depths: self.registry.stream_queue_depths(stream),
-            write_policy: self.registry.stream_write_policy(stream),
+            message_payload_limits: stream.payload_limits,
+            message_types: stream.message_types,
+            queue_depths: stream.queue_depths,
+            write_policy: stream.write_policy,
             session_resources: resources,
             outbound_frame_cap: peer_accepted_frame_cap(
                 &admission.limits,
@@ -4090,12 +4090,12 @@ fn spawn_persistent_stream_worker(
 
 fn bounded_stream_queue_depths(
     transport_depth: usize,
-    service: Option<(usize, usize)>,
+    service: Option<StreamQueueDepths>,
 ) -> (usize, usize) {
-    service.map_or((transport_depth, transport_depth), |(inbound, outbound)| {
+    service.map_or((transport_depth, transport_depth), |depths| {
         (
-            transport_depth.min(inbound.max(1)),
-            transport_depth.min(outbound.max(1)),
+            transport_depth.min(depths.inbound.max(1)),
+            transport_depth.min(depths.outbound.max(1)),
         )
     })
 }
@@ -6507,7 +6507,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let service = GenerationGuardedRecordingService::new(vec![stream]);
         let registry = Arc::new(
@@ -6622,7 +6622,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let service = GenerationGuardedRecordingService::new(vec![stream]);
         let registry = Arc::new(
@@ -7099,7 +7099,7 @@ mod tests {
             version: 1,
             frame_cap: 64 * 1024,
             capability: 1 << 16,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
 
         let _guard = zakura_test::init();
@@ -7717,7 +7717,7 @@ mod tests {
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let exit = SessionExit {
             stream: initiator_opened,
@@ -7827,7 +7827,7 @@ mod tests {
                 version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
                 frame_cap: 1,
                 capability: ZAKURA_CAP_BLOCK_SYNC,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             },
             session_id: 1,
             opened_locally: false,
@@ -7862,7 +7862,7 @@ mod tests {
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let mut session = ServiceSessionState::new(stream);
         session.remote_session_id = Some(2);
@@ -7879,7 +7879,7 @@ mod tests {
             version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
             frame_cap: 1,
             capability: ZAKURA_CAP_HEADER_SYNC,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         }
     }
 
@@ -8123,7 +8123,7 @@ mod tests {
             version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
             frame_cap: 2_000_009,
             capability: ZAKURA_CAP_BLOCK_SYNC,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let encoded = frame.encode(stream.frame_cap)?;
         // Opening a QUIC stream becomes visible to the receiver after the first bytes.
@@ -8338,7 +8338,7 @@ mod tests {
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: 2_000_009,
             capability: ZAKURA_CAP_BLOCK_SYNC,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let context = StreamWorkerContext {
             conn: ZakuraConnTrace::without_peer(1),
@@ -8544,7 +8544,7 @@ mod tests {
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
                 capability: ZAKURA_CAP_LEGACY_GOSSIP,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             };
             let context = StreamWorkerContext {
                 conn: ZakuraConnTrace::without_peer(1),
@@ -8688,7 +8688,7 @@ mod tests {
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
             capability: ZAKURA_CAP_DISCOVERY,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
         let frame_cap = application_frame_cap(&limits, stream);
 
@@ -8840,48 +8840,11 @@ mod tests {
         use crate::zakura::{block_sync_streams, BlockSyncMessage};
         use zakura_chain::{block, serialization::ZcashDeserializeInto};
 
-        #[derive(Debug)]
-        struct PayloadLimitedService(Stream);
-
-        impl Service for PayloadLimitedService {
-            fn name(&self) -> &'static str {
-                "payload-limited"
-            }
-
-            fn streams(&self) -> &[Stream] {
-                std::slice::from_ref(&self.0)
-            }
-
-            fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
-                if stream == self.0 {
-                    &[(2, 9)]
-                } else {
-                    &[]
-                }
-            }
-
-            fn add_peer(&self, _peer: Peer) {}
-
-            fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
-        }
-
-        let stream = block_sync_streams()[0];
-        let registry = ServiceRegistry::new(vec![Arc::new(PayloadLimitedService(stream))])?;
-        let payload_limits = registry.message_payload_limits(stream);
-        assert_eq!(payload_limits, &[(2, 9)]);
-        assert!(registry
-            .message_payload_limits(Stream {
-                version: stream.version + 1,
-                ..stream
-            })
-            .is_empty());
-        assert!(registry
-            .message_payload_limits(Stream {
-                kind: u16::MAX,
-                ..stream
-            })
-            .is_empty());
-        assert!(NoopService.message_payload_limits(stream).is_empty());
+        let stream = Stream {
+            payload_limits: &[(2, 9)],
+            ..block_sync_streams()[0]
+        };
+        let payload_limits = stream.payload_limits;
 
         const ALPN: &[u8] = b"/zakura/testkit/message-payload-limits/0";
         let _guard = zakura_test::init();
@@ -9020,7 +8983,7 @@ mod tests {
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
             capability: ZAKURA_CAP_LEGACY_GOSSIP,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         };
 
         let limits = ZakuraConnectionLimits {
@@ -9345,7 +9308,7 @@ mod tests {
             version: ZAKURA_STREAM_VERSION_1,
             frame_cap: CUSTOM_FRAME_CAP,
             capability: 1 << 20,
-            mode: StreamMode::RequestResponse,
+            ..Stream::REQUEST_RESPONSE
         };
 
         assert_eq!(
@@ -9417,35 +9380,35 @@ mod tests {
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: 1024,
                 capability: ZAKURA_CAP_LEGACY_GOSSIP,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             },
             Stream {
                 kind: LEGACY_REQUEST_STREAM_KIND,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: 1024,
                 capability: ZAKURA_CAP_LEGACY_GOSSIP,
-                mode: StreamMode::RequestResponse,
+                ..Stream::REQUEST_RESPONSE
             },
             Stream {
                 kind: DISCOVERY_STREAM_KIND,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: 1024,
                 capability: ZAKURA_CAP_DISCOVERY,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             },
             Stream {
                 kind: HEADER_SYNC_STREAM_KIND,
                 version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
                 frame_cap: 1024,
                 capability: ZAKURA_CAP_HEADER_SYNC,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             },
             Stream {
                 kind: ZAKURA_STREAM_BLOCK_SYNC,
                 version: ZAKURA_STREAM_VERSION_1,
                 frame_cap: MAX_BS_FRAME_BYTES,
                 capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             },
         ];
         let services = streams

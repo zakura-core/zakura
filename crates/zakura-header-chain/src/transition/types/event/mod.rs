@@ -97,7 +97,16 @@ impl TransitionEvent {
                     event.aux.first().map(|delivery| delivery.delivery_id)
                 }
                 TargetCompletion::TargetComplete { .. } | TargetCompletion::TargetPrefix { .. } => {
-                    Some(event.batch.evidence())
+                    // Header preparation is supplier-independent. A later delivery of
+                    // the same headers can carry a corrected scheduling hint.
+                    let batch = event.batch.evidence();
+                    Some(event.aux.first().map_or(batch, |delivery| {
+                        let mut hasher = Sha256::new();
+                        hasher.update(b"zakura-header-delivery-attempt-v1");
+                        hasher.update(batch.digest());
+                        hasher.update(delivery.delivery_id.digest());
+                        EvidenceId::from_digest(hasher.finalize().into())
+                    }))
                 }
             },
             Self::VerifiedChainChanged(event) => Some(event.full_state_transition_id),

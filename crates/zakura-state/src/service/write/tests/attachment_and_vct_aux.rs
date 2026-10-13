@@ -42,6 +42,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         _invalid_reset_receiver,
         _rejected_receiver,
         _vct_repair_receiver,
+        _block_commit_receiver,
         task_failure,
         task,
     ) = BlockWriteSender::spawn_with_header_chain(
@@ -84,6 +85,68 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         &*runtime_status_receiver.borrow(),
         zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Failed { error, .. }
             if error.contains("finalized state has no authenticated genesis header")
+    ));
+}
+
+#[test]
+fn rolled_back_full_state_reports_divergence_before_resizing_the_context() {
+    use crate::service::finalized_state::{
+        FallibleDiskValue, RawBytes, WriteDisk, HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT,
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let mut finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("the fixture finalized state opens");
+    let genesis = regtest_genesis_block();
+    finalized_state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(genesis.clone()).into(),
+            None,
+            None,
+            "divergence fixture genesis",
+        )
+        .expect("genesis commits");
+    let mut block1 = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut block1).header).time += chrono::Duration::seconds(1);
+    finalized_state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(block1.clone()).into(),
+            None,
+            None,
+            "divergence fixture block one",
+        )
+        .expect("block one commits");
+    let live = NonFinalizedState::new(&network);
+    drop(
+        HeaderChainWriter::attach_at_semantic_handoff(&finalized_state, &live)
+            .expect("the header engine attaches from authenticated finalized state"),
+    );
+
+    // Model a full state rolled back below the persisted header finality, with a
+    // validation context that is shorter than the current build retains.
+    let disk = finalized_state.db.header_chain_disk_db();
+    let store = HeaderChainStore::new(disk.clone());
+    let mut metadata = store.metadata().expect("the attached store has metadata");
+    metadata.frontiers.finalized = Frontier::new(block::Height(2), block::Hash([0x2d; 32]));
+    let metadata_cf = disk
+        .cf_handle(HEADER_ENGINE_META)
+        .expect("the header-chain metadata column exists");
+    let context_cf = disk
+        .cf_handle(HEADER_VALIDATION_CONTEXT)
+        .expect("the validation context column exists");
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata.encode().expect("the metadata encodes")),
+    );
+    batch.zs_delete(&context_cf, genesis.hash());
+    disk.write(batch).expect("the rolled-back fixture writes");
+
+    assert!(matches!(
+        HeaderChainWriter::attach_at_semantic_handoff(&finalized_state, &live),
+        Err(HeaderChainAttachmentError::FinalizedDivergence)
     ));
 }
 

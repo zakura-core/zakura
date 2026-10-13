@@ -281,6 +281,29 @@ pub(super) fn admit_received_body(
         && serialized_bytes <= remaining_lookahead_wire_bytes(config, snapshot)
 }
 
+/// Final, serialized-backlog cap checked by the single sequencer owner.
+/// Request estimates and queued copies are not retained backlog. Decoded input
+/// and submitted blocks have separate bounded windows. The verified checkpoint
+/// window remains fundable even when speculative retention is full.
+pub(super) fn retain_received_body(
+    limit: u64,
+    verified_tip: block::Height,
+    retained_bytes: u64,
+    retained_blocks: u64,
+    height: block::Height,
+    bytes: u64,
+) -> bool {
+    let window_high = block::Height(
+        verified_tip
+            .0
+            .saturating_add(COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS),
+    );
+    height <= window_high
+        || (retained_blocks < LOOKAHEAD_BLOCK_HARD_CAP
+            && bytes <= limit.saturating_sub(retained_bytes)
+            && retained_bytes <= limit)
+}
+
 /// Plans one contiguous take starting at `start_height`: the single authority for
 /// the commit-window exemption, the resident-memory gate, and request sizing.
 ///

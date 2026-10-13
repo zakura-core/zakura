@@ -7,7 +7,7 @@
 # result with `make pre-release`, and opens or updates a draft PR through the
 # release GitHub App. Nothing merges, tags, or publishes from this workflow:
 # the PR is always a draft, judgment items (bump-level review, authoritative
-# end-of-support height, changelog curation) are listed in the PR body, and
+# end-of-support halt height, changelog curation) are listed in the PR body, and
 # create-release.yml re-validates everything after merge.
 #
 # Re-running with the same tag recreates the release/v* branch from the
@@ -171,7 +171,7 @@ jobs:
             crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         id: toolchain
         with:
           toolchain: stable
@@ -196,7 +196,7 @@ jobs:
 
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
       # must track new stable rustdoc formats.
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab #v2.87.13
         with:
           tool: cargo-release,cargo-semver-checks
 
@@ -437,6 +437,12 @@ jobs:
                   "crates require initial publish versions."
               )
           lines += [
+              "- [ ] <!-- release-judgment:eos-height --> Validate the "
+              "end-of-support halt height "
+              "(`ESTIMATED_RELEASE_HEIGHT` + `EOS_PANIC_AFTER`) against the "
+              "intended support horizon for this release. Review recent "
+              "discussion in `#zakura-collab` or ask Dev/Sean before checking "
+              "this off.",
               "- [ ] <!-- release-judgment:release-hold --> Confirm no release "
               "hold is in effect (an embargoed hotfix may be in flight for "
               "the same version).",

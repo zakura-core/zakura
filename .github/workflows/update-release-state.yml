@@ -112,7 +112,7 @@ jobs:
           persist-credentials: false
           ref: main
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           # This job packages one dependency-free crate and never builds the workspace.
@@ -210,7 +210,7 @@ jobs:
           persist-credentials: false
           ref: main
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}

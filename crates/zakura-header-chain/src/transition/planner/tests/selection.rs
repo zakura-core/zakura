@@ -136,6 +136,81 @@ fn complete_unchanged_projection_remains_borrowed() {
 }
 
 #[test]
+fn settlement_reuses_only_an_unchanged_selected_path() {
+    use super::super::{
+        admission::HeaderInsertionRebase,
+        projected_state::ProjectedTransitionState,
+        settlement::{derive_finality_and_retention, FinalityRetentionOutcome, SettlementInputs},
+    };
+    use crate::graph::HeaderGraphView;
+
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let tip = insert_verified_branch(
+        &mut store.graph,
+        anchor,
+        32,
+        regtest_genesis_block().header.difficulty_threshold,
+        0x92,
+    );
+    synchronize_fixture(&mut store, tip);
+    let engine = test_engine(&store);
+    let snapshot = engine.snapshot();
+
+    for extend in [false, true] {
+        let mut projected = ProjectedTransitionState::new(&engine);
+        if extend {
+            let mut header = *regtest_genesis_block().header;
+            header.previous_block_hash = tip.hash;
+            header.nonce.0[0] = 0x93;
+            projected
+                .insert_header(
+                    Arc::new(header),
+                    HeaderValidationState::Valid,
+                    Vec::new(),
+                    BodyValidationState::Unknown,
+                )
+                .expect("the extension links to the retained selected tip");
+        } else {
+            projected
+                .set_body_validation_state(
+                    tip.hash,
+                    BodyValidationState::Verified {
+                        evidence: EvidenceId::from_digest([0x94; 32]),
+                    },
+                )
+                .expect("body evidence can change without changing header ancestry");
+        }
+        let selected_tip = projected
+            .graph()
+            .view_select_best_header_chain()
+            .expect("the projected graph has an eligible tip")
+            .0;
+        let expected = path(projected.graph(), selected_tip)
+            .expect("the reference path follows canonical parent links");
+        let outcome = derive_finality_and_retention(SettlementInputs {
+            engine: &engine,
+            projected,
+            metadata: store.metadata.clone(),
+            snapshot_before_commit: &snapshot,
+            event: &TransitionEvent::ReevaluateDeferred,
+            header_rebase: HeaderInsertionRebase::Current,
+            context: &context(&config, &clock, None),
+            old_selected: engine.selected_projection(),
+            old_verified: engine.verified_projection(),
+            full_state_authorization_version: None,
+        })
+        .expect("the bounded graph settles without advancing finality");
+        let FinalityRetentionOutcome::Settled(settled) = outcome else {
+            panic!("the bounded fixture fits within retention limits");
+        };
+        assert_eq!(settled.selected.as_ref(), expected);
+        assert_eq!(matches!(settled.selected, Cow::Borrowed(_)), !extend);
+    }
+}
+
+#[test]
 fn committed_transition_reports_a_stale_source_without_panicking() {
     let (store, config) = TestStore::new(EngineMode::HeadersOnly);
     let clock = ManualClock(Utc::now());

@@ -25,8 +25,8 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Event, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, OrderedSendError,
     Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection,
-    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId,
-    ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId,
+    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 
 #[cfg(test)]
@@ -47,7 +47,7 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
     frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
     capability: ZAKURA_CAP_DISCOVERY,
-    mode: StreamMode::Persistent,
+    ..Stream::PERSISTENT
 }];
 
 /// Service-declared streams for native discovery.

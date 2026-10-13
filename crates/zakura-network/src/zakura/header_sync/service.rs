@@ -19,8 +19,8 @@ use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, CloseCause, Frame, FramedRecv,
     FramedSend, OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerDirection,
-    SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream, StreamMode,
-    ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
+    SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream, ZakuraConnId,
+    ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// Conservative re-offer delay when header sync publishes no peer backoff deadline.
@@ -35,7 +35,7 @@ const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
     frame_cap: HEADER_SYNC_FRAME_CAP,
     capability: ZAKURA_CAP_HEADER_SYNC,
-    mode: StreamMode::Persistent,
+    ..Stream::PERSISTENT
 }];
 
 /// The sole stream declaration for native header sync.
@@ -58,7 +58,7 @@ mod stream_tests {
                 version: 8,
                 frame_cap: HEADER_SYNC_FRAME_CAP,
                 capability: 1 << 5,
-                mode: StreamMode::Persistent,
+                ..Stream::PERSISTENT
             }
         );
     }

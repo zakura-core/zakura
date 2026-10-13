@@ -102,7 +102,7 @@ jobs:
           ref: ${{ steps.release.outputs.target_sha }}
           path: release
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: stable
           # This job compiles the release tag with a current stable toolchain, so
@@ -208,7 +208,7 @@ jobs:
           ref: ${{ needs.plan-verify.outputs.target_sha }}
           path: release
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: stable
           # This job packages crates with --no-verify but never compiles them,
@@ -311,7 +311,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: stable
           # The published tag is compiled with a current stable toolchain, so

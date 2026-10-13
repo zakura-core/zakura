@@ -267,7 +267,7 @@ async fn await_block_info_wakes_after_reconsider() {
     let hash = child.hash;
     timeout(
         limit,
-        state.queue_and_commit_to_non_finalized_state(child, None),
+        state.queue_and_commit_to_non_finalized_state(child, None, None),
     )
     .await
     .expect("non-finalized commit completes")
@@ -325,7 +325,7 @@ async fn await_block_info_fails_when_the_block_is_rejected() {
     let hash = invalid.hash;
 
     let wait = state.call(Request::AwaitBlockInfo(hash));
-    let commit = state.queue_and_commit_to_non_finalized_state(invalid, None);
+    let commit = state.queue_and_commit_to_non_finalized_state(invalid, None, None);
     timeout(limit, commit)
         .await
         .expect("non-finalized commit completes")
@@ -366,7 +366,7 @@ async fn await_block_info_times_out() {
     let child = chain[2].clone().prepare();
     timeout(
         Duration::from_secs(10),
-        state.queue_and_commit_to_non_finalized_state(child, None),
+        state.queue_and_commit_to_non_finalized_state(child, None, None),
     )
     .await
     .expect("non-finalized commit completes")
@@ -918,7 +918,7 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         let prepared = block.clone().prepare();
         tokio::time::timeout(
             Duration::from_secs(10),
-            state.queue_and_commit_to_non_finalized_state(prepared, None),
+            state.queue_and_commit_to_non_finalized_state(prepared, None, None),
         )
         .await
         .unwrap()
@@ -945,7 +945,7 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         if parent.hash() == evicted.hash() {
             tip = tip.make_fake_child();
             let mut child_response =
-                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None);
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None, None);
             assert!(
                 matches!(
                     child_response.try_recv(),
@@ -955,7 +955,7 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
             );
             tokio::time::timeout(
                 Duration::from_secs(10),
-                state.queue_and_commit_to_non_finalized_state(parent.clone().prepare(), None),
+                state.queue_and_commit_to_non_finalized_state(parent.clone().prepare(), None, None),
             )
             .await
             .unwrap()
@@ -972,7 +972,7 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
             tip = tip.make_fake_child();
             tokio::time::timeout(
                 Duration::from_secs(10),
-                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None),
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None, None),
             )
             .await
             .unwrap()
@@ -1049,7 +1049,7 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
         let prepared = block.clone().prepare();
         timeout(
             limit,
-            state.queue_and_commit_to_non_finalized_state(prepared, None),
+            state.queue_and_commit_to_non_finalized_state(prepared, None, None),
         )
         .await
         .unwrap()
@@ -1099,7 +1099,7 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     let prepared = evicted.clone().prepare();
     timeout(
         limit,
-        state.queue_and_commit_to_non_finalized_state(prepared, None),
+        state.queue_and_commit_to_non_finalized_state(prepared, None, None),
     )
     .await
     .unwrap()
@@ -1122,7 +1122,7 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     header.commitment_bytes = <[u8; 32]>::from(history_root).into();
     timeout(
         limit,
-        state.queue_and_commit_to_non_finalized_state(child.clone().prepare(), None),
+        state.queue_and_commit_to_non_finalized_state(child.clone().prepare(), None, None),
     )
     .await
     .unwrap()
@@ -1982,7 +1982,8 @@ async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
 
     // Exercise the internal writer queue with the small historical vectors. Production consensus
     // submits semantic blocks after Canopy; this test only checks their release to the writer.
-    let _child = state.queue_and_commit_to_non_finalized_state(blocks[2].clone().prepare(), None);
+    let _child =
+        state.queue_and_commit_to_non_finalized_state(blocks[2].clone().prepare(), None, None);
     state
         .queue_and_commit_to_finalized_state(blocks[1].clone().into())
         .await??;
@@ -3257,7 +3258,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
 
     for block in &blocks[2..] {
         state
-            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None, None)
             .await
             .expect("the writer responds")
             .expect("the non-finalized block commits");
@@ -3389,7 +3390,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     }
     for block in &blocks[2..] {
         state_a
-            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None, None)
             .await
             .expect("writer responds")
             .expect("non-finalized block commits");
@@ -3581,7 +3582,7 @@ async fn await_block_info_waits_for_a_valid_retry_after_rejection() {
     assert_eq!(hash, chain[2].hash());
     timeout(
         limit,
-        state.queue_and_commit_to_non_finalized_state(bad, None),
+        state.queue_and_commit_to_non_finalized_state(bad, None, None),
     )
     .await
     .unwrap()
@@ -3593,7 +3594,7 @@ async fn await_block_info_waits_for_a_valid_retry_after_rejection() {
     let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
     state.block_write_sender.non_finalized = Some(gate);
     let valid_retry =
-        state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None);
+        state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None, None);
     let message = timeout(limit, intercepted.recv()).await.unwrap().unwrap();
     let mut wait = state.call(Request::AwaitBlockInfo(hash));
     assert!(

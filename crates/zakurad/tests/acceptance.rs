@@ -2868,6 +2868,27 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
     Ok(())
 }
 
+/// Mines, validates proposals, and spends mature coinbase outputs on a pruned checkpoint-syncing
+/// Regtest node, whose state database skips transparent address and spender indexes.
+///
+/// It mines more than two reorg windows of blocks and restarts the node, so it runs in the
+/// `zakura-pruned-storage` nextest profile.
+#[tokio::test(flavor = "multi_thread")]
+async fn pruned_checkpoint_sync_mines_without_transparent_indexes() -> Result<()> {
+    common::regtest::pruned_checkpoint_sync_mining_without_transparent_indexes_test().await
+}
+
+/// Normal startup upgrades the preceding database format and continues mining.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_upgrades_previous_database_and_records_finalized_height() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        common::regtest::startup_upgrades_previous_database_test(),
+    )
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn regtest_coinbase() -> Result<()> {
     common::coinbase::regtest_coinbase().await
@@ -3316,7 +3337,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
     let (submitted_hash, submitted_height) = match submit_block_channel_data {
         MinedBlockEvent::Early { hash, height, .. }
-        | MinedBlockEvent::Committed { hash, height } => (hash, height),
+        | MinedBlockEvent::Committed { hash, height, .. } => (hash, height),
     };
     assert_eq!(submitted_hash, proposal_block.hash());
     assert_eq!(submitted_height, proposal_block.coinbase_height().unwrap());
@@ -3763,6 +3784,12 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
     let first = proposal_block_from_template(&template, BlockTemplateTimeSource::MinTime, &net)?;
     let second = proposal_block_from_template(&template, BlockTemplateTimeSource::MaxTime, &net)?;
     assert_ne!(first.hash(), second.hash());
+    // Submit the lower hash first so receipt order deliberately opposes hash order.
+    let (first, second) = if first.hash().0 < second.hash().0 {
+        (first, second)
+    } else {
+        (second, first)
+    };
     rpc_client.submit_block(first.clone()).await?;
     rpc_client.submit_block(second.clone()).await?;
 
@@ -3772,14 +3799,9 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
             .await
             .map_err(|err| eyre!(err))
     };
-    let (hash_loser, hash_winner) = if first.hash().0 < second.hash().0 {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    assert_eq!(best_block_hash().await?, hash_winner.hash().to_string());
+    assert_eq!(best_block_hash().await?, first.hash().to_string());
 
-    for preferred in [hash_loser, hash_winner] {
+    for preferred in [&second, &first] {
         let params = serde_json::to_string(&[preferred.hash().to_string()])?;
         let _: () = rpc_client
             .json_result_from_call("preciousblock", &params)

@@ -28,6 +28,7 @@ use zakura_chain::{
 };
 
 use crate::{
+    error::TransparentIndexesUnavailable,
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
@@ -40,6 +41,7 @@ use crate::{
             TransactionLocation,
         },
         zakura_db::ZakuraDb,
+        PRUNING_METADATA,
     },
     FromDisk, IntoDisk,
 };
@@ -76,6 +78,26 @@ pub fn fetch_add_balance_and_received(
         .map(|address_balance_location| address_balance_location.as_bytes().to_vec())
 }
 
+/// The [`PRUNING_METADATA`] key that records the first height committed without transparent
+/// address and spender indexes.
+///
+/// The marker is written in the same batch as the first block that skips those indexes, so a
+/// database never holds a skipped block without it. It is never removed: once a block has been
+/// committed without transparent indexes, the indexes stay incomplete, even after a rollback.
+///
+/// Its bytes are distinct from the unit key that stores the raw transaction pruning cursor, so
+/// the two entries never collide.
+#[derive(Debug)]
+struct TransparentIndexesSkippedFromKey;
+
+impl IntoDisk for TransparentIndexesSkippedFromKey {
+    type Bytes = &'static [u8];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        b"transparent_indexes_skipped_from"
+    }
+}
+
 /// The type for reading value pools from the database.
 ///
 /// This constant should be used so the compiler can detect incorrectly typed accesses to the
@@ -94,11 +116,46 @@ impl ZakuraDb {
             .expect("column family was created when database was created")
     }
 
+    // Transparent index availability
+
+    /// Returns the first height committed without transparent address and spender indexes, if
+    /// any block has been.
+    ///
+    /// See [`TransparentIndexesSkippedFromKey`].
+    pub fn transparent_indexes_skipped_from(&self) -> Option<Height> {
+        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
+        self.db
+            .zs_get(&pruning_metadata, &TransparentIndexesSkippedFromKey)
+    }
+
+    /// Returns `true` if this database does not build finalized transparent address balances,
+    /// address UTXO and transaction indexes, or transparent spender indexes.
+    ///
+    /// Pruned checkpoint sync stops updates in the existing database. The first skipped block
+    /// records this durably, so changing configuration or rolling back cannot resume writes
+    /// to incomplete indexes. Existing index rows are retained but must not be served.
+    pub fn skips_transparent_indexes(&self) -> bool {
+        self.config().skips_transparent_indexes()
+            || self.transparent_indexes_skipped_from().is_some()
+    }
+
+    /// Returns an error if transparent address and spender queries can't be answered completely.
+    pub fn check_transparent_indexes_available(&self) -> Result<(), TransparentIndexesUnavailable> {
+        if self.skips_transparent_indexes() {
+            Err(TransparentIndexesUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
     // Read transparent methods
 
     /// Returns the [`TransactionLocation`] for a transaction that spent the output
     /// at the provided [`OutputLocation`], if it is in the finalized state.
-    pub fn tx_location_by_spent_output_location(
+    ///
+    /// This raw lookup does not check [`Self::skips_transparent_indexes`]. Use
+    /// [`Self::spending_tx_loc`] to answer spender queries.
+    pub(crate) fn tx_location_by_spent_output_location(
         &self,
         output_location: &OutputLocation,
     ) -> Option<TransactionLocation> {
@@ -112,8 +169,11 @@ impl ZakuraDb {
 
     /// Returns the [`AddressBalanceLocation`] for a [`transparent::Address`],
     /// if it is in the finalized state.
+    ///
+    /// This raw lookup does not check [`Self::skips_transparent_indexes`]. Use
+    /// [`Self::address_balance`] to answer balance queries.
     #[allow(clippy::unwrap_in_result)]
-    pub fn address_balance_location(
+    pub(crate) fn address_balance_location(
         &self,
         address: &transparent::Address,
     ) -> Option<AddressBalanceLocation> {
@@ -124,19 +184,31 @@ impl ZakuraDb {
 
     /// Returns the balance and received balance for a [`transparent::Address`],
     /// if it is in the finalized state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
     pub fn address_balance(
         &self,
         address: &transparent::Address,
-    ) -> Option<(Amount<NonNegative>, u64)> {
-        self.address_balance_location(address)
-            .map(|abl| (abl.balance(), abl.received()))
+    ) -> Result<Option<(Amount<NonNegative>, u64)>, TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
+        Ok(self
+            .address_balance_location(address)
+            .map(|abl| (abl.balance(), abl.received())))
     }
 
     /// Returns the first output that sent funds to a [`transparent::Address`],
     /// if it is in the finalized state.
     ///
     /// This location is used as an efficient index key for addresses.
-    pub fn address_location(&self, address: &transparent::Address) -> Option<AddressLocation> {
+    ///
+    /// This raw lookup does not check [`Self::skips_transparent_indexes`].
+    pub(crate) fn address_location(
+        &self,
+        address: &transparent::Address,
+    ) -> Option<AddressLocation> {
         self.address_balance_location(address)
             .map(|abl| abl.address_location())
     }
@@ -163,9 +235,20 @@ impl ZakuraDb {
     /// Returns the [`TransactionLocation`] of the transaction that spent the given
     /// [`transparent::OutPoint`], if it is unspent in the finalized state and its
     /// spending transaction hash has been indexed.
-    pub fn spending_tx_loc(&self, outpoint: &transparent::OutPoint) -> Option<TransactionLocation> {
-        let output_location = self.output_location(outpoint)?;
-        self.tx_location_by_spent_output_location(&output_location)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes,
+    /// even if a stale spender entry exists for `outpoint`.
+    pub fn spending_tx_loc(
+        &self,
+        outpoint: &transparent::OutPoint,
+    ) -> Result<Option<TransactionLocation>, TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
+        Ok(self.output_location(outpoint).and_then(|output_location| {
+            self.tx_location_by_spent_output_location(&output_location)
+        }))
     }
 
     /// Returns the transparent output for an [`OutputLocation`],
@@ -190,19 +273,25 @@ impl ZakuraDb {
 
     /// Returns the unspent transparent outputs for a [`transparent::Address`],
     /// if they are in the finalized state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
     pub fn address_utxos(
         &self,
         address: &transparent::Address,
-    ) -> BTreeMap<OutputLocation, transparent::Output> {
+    ) -> Result<BTreeMap<OutputLocation, transparent::Output>, TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
         let address_location = match self.address_location(address) {
             Some(address_location) => address_location,
-            None => return BTreeMap::new(),
+            None => return Ok(BTreeMap::new()),
         };
 
         let output_locations = self.address_utxo_locations(address_location);
 
         // Ignore any outputs spent by blocks committed during this query
-        output_locations
+        Ok(output_locations
             .iter()
             .filter_map(|&addr_out_loc| {
                 Some((
@@ -212,12 +301,14 @@ impl ZakuraDb {
                         .output,
                 ))
             })
-            .collect()
+            .collect())
     }
 
     /// Returns the unspent transparent output locations for a [`transparent::Address`],
     /// if they are in the finalized state.
-    pub fn address_utxo_locations(
+    ///
+    /// This raw lookup does not check [`Self::skips_transparent_indexes`].
+    pub(crate) fn address_utxo_locations(
         &self,
         address_location: AddressLocation,
     ) -> BTreeSet<AddressUnspentOutput> {
@@ -271,14 +362,21 @@ impl ZakuraDb {
     /// If address has no finalized sends or receives,
     /// or the `query_height_range` is totally outside the finalized block range,
     /// returns an empty list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
     pub fn address_tx_ids(
         &self,
         address: &transparent::Address,
         query_height_range: RangeInclusive<Height>,
-    ) -> BTreeMap<TransactionLocation, transaction::Hash> {
+    ) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, TransparentIndexesUnavailable>
+    {
+        self.check_transparent_indexes_available()?;
+
         let address_location = match self.address_location(address) {
             Some(address_location) => address_location,
-            None => return BTreeMap::new(),
+            None => return Ok(BTreeMap::new()),
         };
 
         // Skip this address if it was first used after the end height.
@@ -286,13 +384,13 @@ impl ZakuraDb {
         // The address location is the output location of the first UTXO sent to the address,
         // and addresses can not spend funds until they receive their first UTXO.
         if address_location.height() > *query_height_range.end() {
-            return BTreeMap::new();
+            return Ok(BTreeMap::new());
         }
 
         let transaction_locations =
             self.address_transaction_locations(address_location, query_height_range);
 
-        transaction_locations
+        Ok(transaction_locations
             .iter()
             .map(|&tx_loc| {
                 (
@@ -301,12 +399,14 @@ impl ZakuraDb {
                         .expect("transactions whose locations are stored must exist"),
                 )
             })
-            .collect()
+            .collect())
     }
 
     /// Returns the locations of any transactions that sent or received from a [`transparent::Address`],
     /// if they are in the finalized state.
-    pub fn address_transaction_locations(
+    ///
+    /// This raw lookup does not check [`Self::skips_transparent_indexes`].
+    pub(crate) fn address_transaction_locations(
         &self,
         address_location: AddressLocation,
         query_height_range: RangeInclusive<Height>,
@@ -337,13 +437,23 @@ impl ZakuraDb {
     ///
     /// The total balances will only be correct if the non-finalized chain matches the finalized state.
     /// Specifically, the root of the partial non-finalized chain must be a child block of the finalized tip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
+    #[allow(clippy::unwrap_in_result)]
     pub fn partial_finalized_transparent_balance(
         &self,
         addresses: &HashSet<transparent::Address>,
-    ) -> (Amount<NonNegative>, u64) {
+    ) -> Result<(Amount<NonNegative>, u64), TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
         let balance: amount::Result<(Amount<NonNegative>, u64)> = addresses
             .iter()
-            .filter_map(|address| self.address_balance(address))
+            .filter_map(|address| {
+                self.address_balance_location(address)
+                    .map(|abl| (abl.balance(), abl.received()))
+            })
             .try_fold(
                 (Amount::zero(), 0),
                 |(a_balance, a_received): (Amount<NonNegative>, u64), (b_balance, b_received)| {
@@ -352,9 +462,9 @@ impl ZakuraDb {
                 },
             );
 
-        balance.expect(
+        Ok(balance.expect(
             "unexpected amount overflow: value balances are valid, so partial sum should be valid",
-        )
+        ))
     }
 
     /// Returns the UTXOs for `addresses` in the finalized chain.
@@ -370,14 +480,23 @@ impl ZakuraDb {
     ///
     /// Specifically, a block in the partial chain must be a child block of the finalized tip.
     /// (But the child block does not have to be the partial chain root.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
     pub fn partial_finalized_address_utxos(
         &self,
         addresses: &HashSet<transparent::Address>,
-    ) -> BTreeMap<OutputLocation, transparent::Output> {
-        addresses
-            .iter()
-            .flat_map(|address| self.address_utxos(address))
-            .collect()
+    ) -> Result<BTreeMap<OutputLocation, transparent::Output>, TransparentIndexesUnavailable> {
+        self.check_transparent_indexes_available()?;
+
+        let mut utxos = BTreeMap::new();
+
+        for address in addresses {
+            utxos.extend(self.address_utxos(address)?);
+        }
+
+        Ok(utxos)
     }
 
     /// Returns the transaction IDs that sent or received funds to `addresses`,
@@ -401,15 +520,25 @@ impl ZakuraDb {
     /// This condition does not apply if there is only one address.
     /// Since address transactions are only appended by blocks, and this query reads them in order,
     /// it is impossible to get inconsistent transactions for a single address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransparentIndexesUnavailable`] if this database skips transparent indexes.
     pub fn partial_finalized_transparent_tx_ids(
         &self,
         addresses: &HashSet<transparent::Address>,
         query_height_range: RangeInclusive<Height>,
-    ) -> BTreeMap<TransactionLocation, transaction::Hash> {
-        addresses
-            .iter()
-            .flat_map(|address| self.address_tx_ids(address, query_height_range.clone()))
-            .collect()
+    ) -> Result<BTreeMap<TransactionLocation, transaction::Hash>, TransparentIndexesUnavailable>
+    {
+        self.check_transparent_indexes_available()?;
+
+        let mut tx_ids = BTreeMap::new();
+
+        for address in addresses {
+            tx_ids.extend(self.address_tx_ids(address, query_height_range.clone())?);
+        }
+
+        Ok(tx_ids)
     }
 }
 
@@ -419,6 +548,10 @@ impl DiskWriteBatch {
     ///
     /// If this method returns an error, it will be propagated,
     /// and the batch should not be written to the database.
+    ///
+    /// If `skip_transparent_indexes` is true, only the canonical UTXO set is updated. The
+    /// transparent address balances, address UTXO and transaction indexes, and transparent
+    /// spender indexes are left untouched, and `address_balances` is ignored.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_transparent_transaction_batch(
         &mut self,
@@ -433,9 +566,15 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
+        skip_transparent_indexes: bool,
     ) {
         let db = &zakura_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
+
+        if skip_transparent_indexes {
+            self.prepare_utxo_set_batch(db, new_outputs_by_out_loc, spent_utxos_by_out_loc);
+            return;
+        }
 
         // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
         // before crediting outputs within each transaction. This ordering keeps every
@@ -482,6 +621,42 @@ impl DiskWriteBatch {
         }
 
         self.prepare_transparent_balances_batch(db, address_balances);
+    }
+
+    /// Prepare a database batch that only updates the canonical UTXO set for a block: insert its
+    /// new outputs, then delete the outputs it spent.
+    ///
+    /// This is the subset of [`Self::prepare_new_transparent_outputs_batch`] and
+    /// [`Self::prepare_spent_transparent_outputs_batch`] that consensus needs. It uses the same
+    /// order, so an output created and spent in the same block ends up deleted.
+    fn prepare_utxo_set_batch(
+        &mut self,
+        db: &DiskDb,
+        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+    ) {
+        let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
+
+        for (new_output_location, utxo) in new_outputs_by_out_loc {
+            self.zs_insert(&utxo_by_out_loc, new_output_location, &utxo.output);
+        }
+
+        for spent_output_location in spent_utxos_by_out_loc.keys() {
+            self.zs_delete(&utxo_by_out_loc, spent_output_location);
+        }
+    }
+
+    /// Adds the durable marker that this database committed `height` without transparent
+    /// address and spender indexes.
+    ///
+    /// See [`ZakuraDb::transparent_indexes_skipped_from`].
+    pub fn prepare_transparent_indexes_skipped_marker_batch(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        height: Height,
+    ) {
+        let pruning_metadata = zakura_db.db.cf_handle(PRUNING_METADATA).unwrap();
+        self.zs_insert(&pruning_metadata, TransparentIndexesSkippedFromKey, height);
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,

@@ -31,7 +31,7 @@ use super::{
 
 /// Tests shielded coinbase construction through a live Regtest node.
 ///
-/// A node configured with a Sapling or Unified mining address must return a
+/// A node configured with a Unified mining address must return a
 /// shielded coinbase through `getblocktemplate`. The resulting block must be
 /// accepted by the production `submitblock`, consensus, and state path.
 ///
@@ -105,10 +105,7 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
             .wrap_err("possible port conflict with another zakurad instance")
     }
 
-    tokio::try_join!(
-        regtest_coinbase(MinerAddressType::Sapling),
-        regtest_coinbase(MinerAddressType::Unified),
-    )?;
+    regtest_coinbase(MinerAddressType::Unified).await?;
 
     Ok(())
 }

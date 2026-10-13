@@ -40,8 +40,8 @@ pub mod zip317;
 
 /// The minimum cost value for a transaction in the mempool.
 ///
-/// Contributes to the randomized, weighted eviction of transactions from the
-/// mempool when it reaches a max size, also based on the total cost.
+/// The mempool limits its size by the total cost of its transactions, and ranks eviction
+/// victims by fee per unit of cost.
 ///
 /// # Standard Rule
 ///
@@ -63,14 +63,6 @@ pub mod zip317;
 ///
 /// [ZIP-401]: https://zips.z.cash/zip-0401
 pub const MEMPOOL_TRANSACTION_COST_THRESHOLD: u64 = 10_000;
-
-/// When a transaction pays a fee less than the conventional fee,
-/// this low fee penalty is added to its cost for mempool eviction.
-///
-/// See [VerifiedUnminedTx::eviction_weight()] for details.
-///
-/// [ZIP-401]: https://zips.z.cash/zip-0401
-const MEMPOOL_TRANSACTION_LOW_FEE_PENALTY: u64 = 40_000;
 
 /// A unique identifier for an unmined transaction, regardless of version.
 ///
@@ -365,6 +357,7 @@ pub struct VerifiedUnminedTx {
     pub transaction: UnminedTx,
 
     /// The transaction fee for this unmined transaction.
+    /// This is the full fee before the block's aggregate NSM fee split.
     pub miner_fee: Amount<NonNegative>,
 
     /// The number of legacy transparent signature operations in this transaction.
@@ -498,33 +491,6 @@ impl VerifiedUnminedTx {
             u64::try_from(self.transaction.size).expect("fits in u64"),
             MEMPOOL_TRANSACTION_COST_THRESHOLD,
         )
-    }
-
-    /// The computed _eviction weight_ of a verified unmined transaction as part
-    /// of the mempool set, as defined in [ZIP-317] and [ZIP-401].
-    ///
-    /// # Standard Rule
-    ///
-    /// > Each transaction also has an *eviction weight*, which is *cost* + *low_fee_penalty*,
-    /// > where *low_fee_penalty* is 40000 if the transaction pays a fee less than the
-    /// > conventional fee, otherwise 0. The conventional fee is currently defined in
-    /// > [ZIP-317].
-    ///
-    /// > zcashd and zakurad limit the size of the mempool as described in [ZIP-401].
-    /// > This specifies a low fee penalty that is added to the "eviction weight" if the transaction
-    /// > pays a fee less than the conventional transaction fee. This threshold is
-    /// > modified to use the new conventional fee formula.
-    ///
-    /// [ZIP-317]: https://zips.z.cash/zip-0317#mempool-size-limiting
-    /// [ZIP-401]: https://zips.z.cash/zip-0401
-    pub fn eviction_weight(&self) -> u64 {
-        let mut cost = self.cost();
-
-        if !self.pays_conventional_fee() {
-            cost += MEMPOOL_TRANSACTION_LOW_FEE_PENALTY
-        }
-
-        cost
     }
 }
 

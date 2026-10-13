@@ -181,6 +181,11 @@ impl Network {
     }
 
     /// Creates a new [`Network::Testnet`] with `Regtest` parameters and the provided network upgrade activation heights.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameters are invalid. Use [`testnet::Parameters::new_regtest`] to
+    /// validate user-provided settings and return a configuration error instead.
     pub fn new_regtest(params: testnet::RegtestParameters) -> Self {
         Self::new_configured_testnet(
             testnet::Parameters::new_regtest(params)

@@ -1,10 +1,13 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
+mod nsm_fees;
+
 use anyhow::anyhow;
 use std::iter;
 use zakura_chain::amount::Amount;
 
 use zcash_keys::address::Address;
+use zcash_script::script::Evaluable;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -16,10 +19,11 @@ use zakura_chain::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network, NetworkUpgrade,
     },
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,
     transparent,
 };
+use zakura_script::Sigops;
 
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
@@ -98,11 +102,30 @@ async fn template_rejection_retains_notifications_for_late_subscribers() {
 fn template_preparation_queue_keeps_the_latest_pending_template() {
     let queue = TemplatePreparationQueue::<u8>::default();
 
-    assert_eq!(queue.enqueue(1), Some(1));
-    assert_eq!(queue.enqueue(2), None);
-    assert_eq!(queue.enqueue(3), None);
-    assert_eq!(queue.next_or_finish(), Some(3));
-    assert_eq!(queue.next_or_finish(), None);
+    let (first, mut worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert_eq!(first, 1);
+    assert!(queue.enqueue(2).is_none());
+    assert!(queue.enqueue(3).is_none());
+    assert_eq!(worker.next(), Some(3));
+    assert_eq!(worker.next(), None);
+}
+
+/// A loop that ends without taking its next template still releases the worker slot.
+///
+/// Every exit releases it, including a `break` or a panic: `running` staying set would stop the
+/// node ever preparing another template.
+#[test]
+fn a_dropped_preparation_worker_releases_the_queue() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    let (_first, worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert!(queue.enqueue(2).is_none());
+    drop(worker);
+
+    let (next, _worker) = queue
+        .enqueue(3)
+        .expect("a released queue admits the next worker");
+    assert_eq!(next, 3, "the discarded loop's pending template is not run");
 }
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
@@ -125,7 +148,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
         })?
         .with_funding_streams(vec![
             ConfiguredFundingStreams {
-                height_range: Some(Height(1)..Height(100)),
+                height_range: Some(Height(5)..Height(7)),
                 recipients: Some(vec![
                     ConfiguredFundingStreamRecipient::new_for(Ecc),
                     ConfiguredFundingStreamRecipient::new_for(ZcashFoundation),
@@ -133,7 +156,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
                 ]),
             },
             ConfiguredFundingStreams {
-                height_range: Some(Height(1)..Height(100)),
+                height_range: Some(Height(7)..Height(100)),
                 recipients: Some(vec![
                     ConfiguredFundingStreamRecipient::new_for(MajorGrants),
                     ConfiguredFundingStreamRecipient {
@@ -158,6 +181,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
         for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
             if let Some(height) = nu.activation_height(&net) {
                 let transaction = coinbase_transaction(&net, height, &miner_params)?;
+                assert_coinbase_resource_usage(&net, height, &miner_params, &transaction)?;
                 assert!(transaction.sapling_outputs().next().is_none());
                 assert!(transaction.orchard_shielded_data().is_none());
                 assert!(transaction.ironwood_shielded_data().is_none());
@@ -190,7 +214,7 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
         .ok_or(anyhow!("hard-coded address must be valid"))?,
     );
     let transaction =
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             .zcash_deserialize_into::<Transaction>()?;
@@ -275,7 +299,7 @@ fn coinbase_tag_and_limit() {
         .expect("maximum-length tag is valid");
     let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
     let max_coinbase =
-        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero())
+        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero(), None)
             .expect("maximum-length tag fits a coinbase transaction")
             .data()
             .as_ref()
@@ -290,32 +314,67 @@ fn coinbase_tag_and_limit() {
     );
 }
 
-/// Tests each distinct shielded coinbase construction and routing path.
+/// Internal miners that share a miner address must still search different work.
 ///
-/// The exhaustive [`transparent_coinbase`] test does not need shielded proofs.
-/// This test limits real proof generation to the paths where the address type or
-/// network upgrade changes the selected shielded pool or circuit.
-///
-/// Run this test with `--release` because it generates five real proofs.
+/// Each node runs one solver thread starting from the same nonce. Two nodes that build
+/// a template for the same parent in the same second therefore repeat each other's
+/// Equihash attempts unless their headers differ. A distinct `extra_coinbase_data`
+/// changes the coinbase script. A V5 txid excludes scripts, so the merkle root stays
+/// equal; the header still differs through the authorizing-data root that NU5 block
+/// commitments bind.
 #[test]
-#[ignore]
-fn shielded_coinbase_paths() -> anyhow::Result<()> {
+fn distinct_coinbase_tags_give_shared_address_miners_distinct_work() {
+    use zcash_address::ZcashAddress;
+
+    use crate::config::mining::{Config, ExtraCoinbaseData};
+
+    let net = Network::new_default_testnet();
+    let addr: ZcashAddress = default_miner_address(net.kind(), &MinerAddressType::Transparent)
+        .parse()
+        .expect("default miner address parses");
+    let height = Height(4_420_700);
+    let coinbase_auth_digest = |tag: Option<&str>| {
+        let params = MinerParams::new(
+            &net,
+            Config {
+                miner_address: Some(addr.clone()),
+                extra_coinbase_data: tag
+                    .map(|tag| ExtraCoinbaseData::try_from(tag.to_string()).expect("short tag")),
+                internal_miner: true,
+                ..Default::default()
+            },
+        )
+        .expect("valid miner config");
+        TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero(), None)
+            .expect("coinbase builds")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("coinbase deserializes")
+            .auth_digest()
+            .expect("a V5 or later coinbase has an authorizing-data digest")
+    };
+
+    assert_eq!(
+        coinbase_auth_digest(None),
+        coinbase_auth_digest(None),
+        "untagged miners sharing an address build identical coinbase transactions",
+    );
+    assert_ne!(
+        coinbase_auth_digest(Some("nu7-us")),
+        coinbase_auth_digest(Some("nu7-eu"))
+    );
+    assert_ne!(
+        coinbase_auth_digest(Some("nu7-us")),
+        coinbase_auth_digest(None)
+    );
+}
+
+/// Sapling payouts fail explicitly, and unified addresses use transparent
+/// receivers before Ironwood activation.
+#[test]
+fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
     let net = shielded_coinbase_testnet();
-    let sapling_height = NetworkUpgrade::Sapling
-        .activation_height(&net)
-        .expect("Sapling activation height is configured");
-    let canopy_height = NetworkUpgrade::Canopy
-        .activation_height(&net)
-        .expect("Canopy activation height is configured");
-    let nu5_height = NetworkUpgrade::Nu5
-        .activation_height(&net)
-        .expect("NU5 activation height is configured");
-    let nu6_2_height = NetworkUpgrade::Nu6_2
-        .activation_height(&net)
-        .expect("NU6.2 activation height is configured");
-    let nu6_3_height = NetworkUpgrade::Nu6_3
-        .activation_height(&net)
-        .expect("NU6.3 activation height is configured");
     let sapling_params = MinerParams::from(
         Address::decode(
             &net,
@@ -330,77 +389,79 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
         )
         .expect("hard-coded unified miner address is valid"),
     );
+    let sapling_receiver = match sapling_params.addr() {
+        Address::Sapling(addr) => *addr,
+        _ => unreachable!(),
+    };
+    let sapling_only_unified = MinerParams::from(Address::Unified(
+        zcash_keys::address::UnifiedAddress::from_receivers(None, Some(sapling_receiver), None)
+            .expect("a Sapling receiver forms a valid unified address"),
+    ));
+    for upgrade in [
+        NetworkUpgrade::Sapling,
+        NetworkUpgrade::Canopy,
+        NetworkUpgrade::Nu5,
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_3,
+    ] {
+        let height = upgrade
+            .activation_height(&net)
+            .expect("test network activation height is configured");
+        for params in [&sapling_params, &sapling_only_unified] {
+            let error = coinbase_transaction(&net, height, params).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("Sapling coinbase construction is not supported"));
+            let error = TransactionTemplate::coinbase_resource_usage(&net, height, params, None)
+                .err()
+                .expect("resource planning rejects unsupported payouts too");
+            assert!(error
+                .to_string()
+                .contains("Sapling coinbase construction is not supported"));
+        }
 
-    let sapling_tx = coinbase_transaction(&net, sapling_height, &sapling_params)?;
-    assert!(
-        sapling_tx.sapling_outputs().next().is_some(),
-        "a Sapling miner address should receive a Sapling output"
-    );
-    assert!(
-        sapling_tx.orchard_shielded_data().is_none(),
-        "a Sapling miner address should not receive an Orchard output"
-    );
-    assert!(
-        sapling_tx.ironwood_shielded_data().is_none(),
-        "a Sapling miner address should not receive an Ironwood output"
-    );
+        if upgrade < NetworkUpgrade::Nu6_3 {
+            let tx = coinbase_transaction(&net, height, &unified_params)?;
+            assert_coinbase_resource_usage(&net, height, &unified_params, &tx)?;
+            assert!(tx.sapling_outputs().next().is_none());
+            assert!(tx.orchard_shielded_data().is_none());
+            assert!(tx.ironwood_shielded_data().is_none());
+            let receiver = match unified_params.addr() {
+                Address::Unified(addr) => addr.transparent().unwrap(),
+                _ => unreachable!(),
+            };
+            let script = receiver.script().to_bytes();
+            assert!(tx
+                .outputs()
+                .iter()
+                .any(|output| output.lock_script.as_raw_bytes() == script));
+        }
+    }
+    Ok(())
+}
 
-    let pre_nu5_tx = coinbase_transaction(&net, canopy_height, &unified_params)?;
-    assert!(
-        pre_nu5_tx.sapling_outputs().next().is_some(),
-        "a pre-NU5 unified address should fall back to its Sapling receiver"
+/// Tests Ironwood coinbase construction with a real proof.
+///
+/// Run with `--release` because it generates a shielded proof.
+#[test]
+#[ignore]
+fn shielded_coinbase_paths() -> anyhow::Result<()> {
+    let net = shielded_coinbase_testnet();
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&net)
+        .expect("NU6.3 activation height is configured");
+    let params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Unified),
+        )
+        .expect("hard-coded unified miner address is valid"),
     );
-    assert!(
-        pre_nu5_tx.orchard_shielded_data().is_none(),
-        "a pre-NU5 coinbase cannot contain an Orchard output"
-    );
-    assert!(
-        pre_nu5_tx.ironwood_shielded_data().is_none(),
-        "a pre-NU5 coinbase cannot contain an Ironwood output"
-    );
-
-    let pre_nu6_2_tx = coinbase_transaction(&net, nu5_height, &unified_params)?;
-    assert!(
-        pre_nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU5 unified address should prefer its Orchard receiver"
-    );
-    assert!(
-        pre_nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU5 unified address should prefer Orchard over Sapling"
-    );
-    assert!(
-        pre_nu6_2_tx.ironwood_shielded_data().is_none(),
-        "an NU5 coinbase cannot contain an Ironwood output"
-    );
-
-    let nu6_2_tx = coinbase_transaction(&net, nu6_2_height, &unified_params)?;
-    assert!(
-        nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU6.2 unified address should receive an Orchard output"
-    );
-    assert!(
-        nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU6.2 unified address should prefer Orchard over Sapling"
-    );
-    assert!(
-        nu6_2_tx.ironwood_shielded_data().is_none(),
-        "an NU6.2 coinbase cannot contain an Ironwood output"
-    );
-
-    let nu6_3_tx = coinbase_transaction(&net, nu6_3_height, &unified_params)?;
-    assert!(
-        nu6_3_tx.ironwood_shielded_data().is_some(),
-        "an NU6.3 unified address should receive an Ironwood output"
-    );
-    assert!(
-        nu6_3_tx.sapling_outputs().next().is_none(),
-        "an NU6.3 unified address should prefer Ironwood over Sapling"
-    );
-    assert!(
-        nu6_3_tx.orchard_shielded_data().is_none(),
-        "an NU6.3 coinbase should not contain an Orchard output"
-    );
-
+    let tx = coinbase_transaction(&net, height, &params)?;
+    assert_coinbase_resource_usage(&net, height, &params, &tx)?;
+    assert!(tx.ironwood_shielded_data().is_some());
+    assert!(tx.sapling_outputs().next().is_none());
+    assert!(tx.orchard_shielded_data().is_none());
     Ok(())
 }
 
@@ -431,11 +492,38 @@ fn coinbase_transaction(
     miner_params: &MinerParams,
 ) -> anyhow::Result<Transaction> {
     Ok(
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             // Deserialization contains checks for elementary consensus rules,
             // which must pass.
             .zcash_deserialize_into::<Transaction>()?,
     )
+}
+
+fn assert_coinbase_resource_usage(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+    transaction: &Transaction,
+) -> anyhow::Result<()> {
+    use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
+
+    let resources = TransactionTemplate::coinbase_resource_usage(net, height, miner_params, None)?;
+    let coinbase_script_len = transaction.inputs()[0]
+        .coinbase_script()
+        .expect("generated coinbase input has a canonical script")
+        .len();
+
+    assert_eq!(
+        resources.max_serialized_size,
+        transaction.zcash_serialized_size() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
+    );
+    assert_eq!(resources.sigops, transaction.sigops());
+    assert_eq!(
+        resources.shielded_action_counts,
+        transaction.shielded_action_counts(),
+    );
+
+    Ok(())
 }

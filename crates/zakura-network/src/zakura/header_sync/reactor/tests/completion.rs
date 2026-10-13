@@ -97,8 +97,8 @@ fn early_checkpoint_prefix_preserves_minimum_work_and_exact_branch_scope() {
     snapshot.frontiers.header_best.height = block::Height(401);
     active.common_ancestor = Some(snapshot.frontiers.header_best);
     assert!(
-        !HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
-        "a checkpoint-sized body backlog already has enough work"
+        HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+        "a completed batch replenishes the backlog before it drains"
     );
     snapshot.frontiers.verified_best.height = block::Height(1);
     assert!(HeaderSyncReactor::should_prepare_checkpoint_prefix(
@@ -127,9 +127,13 @@ fn early_checkpoint_prefix_preserves_minimum_work_and_exact_branch_scope() {
 
 #[test]
 fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills() {
-    let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
+    let (mut reactor, mut actions, mut snapshot, peer, _source, owner) = peer_violation_fixture();
+    snapshot.frontiers.header_best.height = block::Height(3_599);
+    snapshot.frontiers.verified_best.height = block::Height(400);
+    reactor.committed_snapshot = Some(snapshot.clone());
     let active = reactor.peer_work_queue.active_mut(&peer).unwrap();
     active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
     active.entries.clear();
     active.target.status.selected_tip_height = block::Height(10_000);
     active.max_header_count = 250;
@@ -179,7 +183,7 @@ fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills()
         panic!("the prefix must still pass normal header preparation");
     };
     assert_eq!(entries.len(), 500);
-    assert_eq!(target.height, block::Height(500));
+    assert_eq!(target.height, block::Height(4_099));
     assert_eq!(
         prefix_owner.header_authority().branch.target_tip_hash,
         target.hash
@@ -426,23 +430,35 @@ fn durable_prefix_headroom_accounts_for_staged_headers_at_exact_limits() {
 }
 
 #[test]
-fn integrated_request_headroom_refills_at_half_window_and_admits_the_final_prefix() {
+fn integrated_request_headroom_refills_one_checkpoint_below_capacity() {
     let anchor =
         zakura_header_chain::Frontier::new(block::Height(10), regtest_genesis_block().hash());
     let mut snapshot = committed_snapshot(anchor);
     let remote_tip = block::Height(20_000);
+    let batch =
+        u32::try_from(zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP)
+            .unwrap()
+            + 1;
 
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
-        MAX_HS_RANGE
-    );
+    for (lead, expected) in [
+        (0, MAX_HS_RANGE),
+        (MAX_HS_RANGE + 1, 0),
+        (MAX_HS_RANGE, 0),
+        (MAX_HS_RANGE - 1, 0),
+        (MAX_HS_RANGE - batch + 1, 0),
+        (MAX_HS_RANGE - batch, batch),
+        (MAX_HS_RANGE - batch - 1, batch + 1),
+        (2_001, MAX_HS_RANGE - 2_001),
+    ] {
+        snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + lead);
+        assert_eq!(
+            HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
+            expected,
+            "header lead {lead} must respect the refill and capacity boundaries"
+        );
+    }
 
     snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + MAX_HS_RANGE - 1);
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
-        0,
-        "a nearly full window does not cause one-header durable transitions"
-    );
     assert_eq!(
         HeaderSyncReactor::request_header_prefix_remaining(
             &snapshot,
@@ -450,39 +466,42 @@ fn integrated_request_headroom_refills_at_half_window_and_admits_the_final_prefi
             block::Height(snapshot.frontiers.header_best.height.0 + 1),
         ),
         1,
-        "the exact final partial target remains reachable"
+        "a final partial target must not wait for a complete refill batch"
     );
 
-    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + 750);
-    snapshot.frontiers.verified_best.height = block::Height(anchor.height.0 + 400);
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
-        MAX_HS_RANGE - 350,
-        "a partial native admission cannot starve the next checkpoint range"
-    );
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 1, remote_tip),
-        MAX_HS_RANGE - 351,
-        "staged entries consume the already-open low-water refill"
-    );
+    snapshot.frontiers.header_best.height = block::Height(anchor.height.0 + MAX_HS_RANGE - batch);
+    for claimed in [0, 1, batch - 1, batch, batch + 1] {
+        assert_eq!(
+            HeaderSyncReactor::request_header_prefix_remaining(
+                &snapshot,
+                usize::try_from(claimed).unwrap(),
+                remote_tip,
+            ),
+            batch.saturating_sub(claimed),
+            "all reserved and staged headers consume shared window credits"
+        );
+    }
+}
 
-    snapshot.frontiers.finalized.height = block::Height(anchor.height.0 + 400);
-    snapshot.frontiers.header_best.height =
-        block::Height(anchor.height.0 + INTEGRATED_HEADER_REFILL_LOW_WATER_V1 + 400);
-    snapshot.frontiers.verified_best.height = block::Height(anchor.height.0 + 400);
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
-        MAX_HS_RANGE - INTEGRATED_HEADER_REFILL_LOW_WATER_V1,
-        "the half-window boundary opens enough headroom to refill the durable prefix"
-    );
-
-    snapshot.frontiers.header_best.height =
-        block::Height(anchor.height.0 + INTEGRATED_HEADER_REFILL_LOW_WATER_V1 + 400 + 1);
-    assert_eq!(
-        HeaderSyncReactor::request_header_prefix_remaining(&snapshot, 0, remote_tip),
-        0,
-        "one block above half-window low water remains closed"
-    );
+#[test]
+fn completed_refill_does_not_chase_credits_returned_during_download() {
+    let (reactor, _actions, mut snapshot, peer, _source, _owner) = peer_violation_fixture();
+    let mut active = reactor.peer_work_queue.active(&peer).unwrap().clone();
+    let entry = active.entries[0].clone();
+    snapshot.frontiers.header_best.height = block::Height(3_599);
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    let batch = zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+    for progress in [0, 1, 200, 400, 800] {
+        snapshot.frontiers.verified_best.height = block::Height(progress);
+        active.entries = vec![entry.clone(); batch - 1];
+        assert!(!HeaderSyncReactor::should_prepare_checkpoint_prefix(
+            &snapshot, &active
+        ));
+        active.entries.push(entry.clone());
+        assert!(HeaderSyncReactor::should_prepare_checkpoint_prefix(
+            &snapshot, &active
+        ));
+    }
 }
 
 #[tokio::test]
@@ -1252,4 +1271,117 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
 
     shutdown.cancel();
     task.await.expect("the reactor exits cleanly");
+}
+
+#[test]
+fn header_continuation_uses_credits_released_after_a_small_first_request() {
+    for advertised_limit in [1, 1_000] {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best.height = block::Height(1_999);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+        let supplier = peer();
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts(
+            supplier.clone(),
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().expect("the initial status was sent");
+
+        let other = ZakuraPeerId::new(vec![0x72; 32]).unwrap();
+        seed_applying_request(&mut reactor, &snapshot, other.clone(), 1);
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&other, 2_000, 0);
+        let target = block::Hash([0x53; 32]);
+        reactor.handle_wire_message(
+            supplier.clone(),
+            0,
+            HeaderSyncMessage::Status(Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                selected_tip_height: block::Height(10_000),
+                selected_tip_hash: target,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: advertised_limit,
+                max_inflight_requests: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: 0,
+            }),
+        );
+        let HeaderPortOperation::QueryHeaderLocator { scope, .. } = actions.try_recv().unwrap()
+        else {
+            panic!("the advertised target requires a locator");
+        };
+        reactor.handle_header_locator_ready(
+            supplier.clone(),
+            0,
+            target,
+            scope,
+            Some(zakura_header_chain::HeaderLocator::for_continuation(
+                snapshot.frontiers.header_best,
+            )),
+        );
+        let HeaderSyncMessage::GetHeaders(first) = reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap()
+        else {
+            panic!("the first wire request must be GetHeaders");
+        };
+        assert_eq!(
+            first.max_header_count, 1,
+            "the other request owns the remaining credits"
+        );
+        reactor.retire_peer_work(&other, HeaderRequestTerminal::LocalError);
+
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = snapshot.frontiers.header_best.hash;
+        header.time += chrono::Duration::seconds(1);
+        let header = Arc::new(header);
+        reactor.handle_headers(
+            supplier.clone(),
+            0,
+            scope,
+            Headers {
+                request_id: first.request_id,
+                target_tip_hash: target,
+                common_ancestor_height: snapshot.frontiers.header_best.height,
+                common_ancestor_hash: snapshot.frontiers.header_best.hash,
+                complete: false,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: header.clone(),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            },
+        );
+        let HeaderSyncMessage::GetHeaders(next) = reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap()
+        else {
+            panic!("the partial response must trigger a continuation");
+        };
+        assert_eq!(
+            next.max_header_count,
+            advertised_limit.min(250),
+            "the negotiated peer and byte limits still bound the page"
+        );
+        if advertised_limit > 1 {
+            assert!(next.max_header_count > first.max_header_count);
+        }
+        assert_eq!(next.locator_hashes, vec![header.hash()]);
+        assert_eq!(
+            reactor.peer_work_queue.claimed_header_count(),
+            1 + usize::try_from(next.max_header_count).unwrap()
+        );
+    }
 }

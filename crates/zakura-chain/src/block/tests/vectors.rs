@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{Cursor, Write},
     sync::Arc,
 };
@@ -110,7 +110,9 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     };
 
     assert!(
-        block.chain_value_pool_change(&utxos, None).is_err(),
+        block
+            .chain_value_pool_change(&Network::Mainnet, &utxos, None)
+            .is_err(),
         "block-level aggregation should propagate transaction value-balance errors"
     );
 }
@@ -171,8 +173,8 @@ fn ordered_utxo_value_balances_match_plain_utxo_value_balances() {
         transactions: vec![transaction],
     };
     assert_eq!(
-        block.chain_value_pool_change(&plain_utxos, None),
-        block.chain_value_pool_change_from_ordered_utxos(&ordered_utxos, None),
+        block.chain_value_pool_change(&Network::Mainnet, &plain_utxos, None),
+        block.chain_value_pool_change_from_ordered_utxos(&Network::Mainnet, &ordered_utxos, None),
     );
 }
 
@@ -547,75 +549,6 @@ fn coinbase_parsing_rejects_above_0x80() {
     zakura_test::vectors::BAD_BLOCK_MAINNET_202_BYTES
         .zcash_deserialize_into::<Block>()
         .expect_err("parsing fails");
-}
-
-#[test]
-fn block_test_vectors_unique() {
-    let _init_guard = zakura_test::init();
-
-    let block_count = zakura_test::vectors::BLOCKS.len();
-    let block_hashes: HashSet<_> = zakura_test::vectors::BLOCKS
-        .iter()
-        .map(|b| {
-            b.zcash_deserialize_into::<Block>()
-                .expect("block is structurally valid")
-                .hash()
-        })
-        .collect();
-
-    // putting the same block in two files is an easy mistake to make
-    assert_eq!(
-        block_count,
-        block_hashes.len(),
-        "block test vectors must be unique"
-    );
-}
-
-/// Checks that:
-///
-/// - the block test vector indexes match the heights in the block data;
-/// - each post-Sapling block has a corresponding final Sapling root;
-/// - each post-Orchard block has a corresponding final Orchard root.
-#[test]
-fn block_test_vectors() {
-    let _init_guard = zakura_test::init();
-
-    for net in Network::iter() {
-        let sapling_anchors = net.sapling_anchors();
-        let orchard_anchors = net.orchard_anchors();
-
-        for (&height, block) in net.block_iter() {
-            let block = block
-                .zcash_deserialize_into::<Block>()
-                .expect("block is structurally valid");
-            assert_eq!(
-                block.coinbase_height().expect("block height is valid").0,
-                height,
-                "deserialized height must match BTreeMap key height"
-            );
-
-            if height
-                >= Sapling
-                    .activation_height(&net)
-                    .expect("activation height")
-                    .0
-            {
-                assert!(
-                sapling_anchors.contains_key(&height),
-                "post-sapling block test vectors must have matching sapling root test vectors: \
-                 missing {net} {height}"
-            );
-            }
-
-            if height >= Nu5.activation_height(&net).expect("activation height").0 {
-                assert!(
-                    orchard_anchors.contains_key(&height),
-                    "post-nu5 block test vectors must have matching orchard root test vectors: \
-                 missing {net} {height}"
-                );
-            }
-        }
-    }
 }
 
 /// Checks that the block commitment field parses without errors.

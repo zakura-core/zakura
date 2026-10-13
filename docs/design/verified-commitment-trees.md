@@ -417,8 +417,14 @@ Three properties keep the committer authoritative:
   It does not move the trust boundary.
 - **Failure attribution matches the committer.** The header-chain writer disputes both deliveries
   when the boundary cannot identify the invalid delivery. A replacement can later authenticate the
-  honest delivery and reject the invalid delivery. A failure on a delivery's pre-activation fields
-  rejects only that delivery.
+  honest delivery and reject the invalid delivery. Repair of that dispute requests both headers in
+  one range. Honest suppliers return the same payload for the honest header, so a repair of either
+  header alone could wait forever. State admits the range when it carries at least one new payload,
+  and it drops the repeated payload. Selection pairs the best row of each header, and a disputed
+  row cannot take a second dispute. After an ambiguous failure, the sweep therefore verifies every
+  other delivery pair at that boundary that has not failed together, and it authenticates the
+  first pair that passes. A failure on a delivery's pre-activation fields rejects only that
+  delivery.
 - **Authentication pins selection.** `select_vct_auxiliary_delivery` prefers an authenticated
   delivery. Authentication state cannot return to `Unauthenticated`. A later delivery cannot
   displace roots that the running MMR already folded.
@@ -571,9 +577,12 @@ queue**. The writer continues to process header-chain control messages while it 
 An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
 unrelated block-write messages in their original order. The write loop also publishes a bounded
 repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
-selected prefix through the root-authentication lane. Durable evidence at the blocking height
-keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
-tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+selected prefix through the root-authentication lane. A rooted or judged row at the blocking
+height keeps the existing one-height repair. Otherwise one atomic range covers the gap up to the
+selected tip, checkpoint handoff, 4,000-header transition limit, or first rooted or judged row.
+Rootless rows do not end the range. Suppliers attach roots only to their finalized prefix, so
+every header a node received near the network tip holds one. A handoff that later rises above
+those headers therefore repairs them in one request, not one request per block.
 The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
@@ -929,7 +938,9 @@ publisher then atomically replaces the mutable `release-state/latest.json` point
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
-redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
+redirects, bounded reads, and digest verification at every hop. Bundle age does not invalidate
+the checkpoint/frontier pairing; generation timestamps must still parse and cannot be in the
+future beyond the allowed clock skew. They
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
 byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the
@@ -938,9 +949,9 @@ cover the bundle's own checkpoint, replaces all four artifacts, and writes
 `vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests,
 entry count, bundle binding).
 
-The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
+The standalone update workflow leaves `ESTIMATED_RELEASE_HEIGHT` unchanged, validates everything
 — including proving the candidate subtree roots against its frontier — restricts the diff to
-exactly those six files, and opens a signed **draft PR** for human review. The grid is the one
+release-state artifacts and Cargo pins, and opens a signed **draft PR** for human review. The grid is the one
 committed artifact large enough to matter to `history-growth.yml`, which raises its packed-growth
 allowance only for a change that touches nothing outside the release-state files. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the

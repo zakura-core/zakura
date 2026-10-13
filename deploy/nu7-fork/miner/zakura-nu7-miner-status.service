@@ -1,0 +1,36 @@
+[Unit]
+Description=NU7 remote mining node health endpoint
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# No root and no journal access: the report reads only the world-readable node
+# config and log file, node RPC on localhost, and `systemctl is-active`.
+DynamicUser=yes
+# Blocks mined before the current network generation started are not counted.
+Environment=NU7_GENERATION_START=0
+EnvironmentFile=-/etc/zakura/nu7-generation.env
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-miner/remote-status.py --config /etc/zakura/zakura.toml --since ${NU7_GENERATION_START}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Only the primary's status collector may connect. Its address is added by the
+# collector-allowlist.conf drop-in; without that drop-in, only localhost can.
+# systemd enforces these only when built with +BPF_FRAMEWORK (`systemctl --version`)
+# and silently ignores them otherwise: there, keep a host firewall rule admitting
+# port 8094 from the primary alone, and check access from another host either way.
+IPAddressDeny=any
+IPAddressAllow=localhost
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

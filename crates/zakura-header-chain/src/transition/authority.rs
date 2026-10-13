@@ -42,6 +42,20 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     /// Return true only when the complete event is the writer's staged mutation.
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool;
 
+    /// Return the full state's selected tip for this exact staged event.
+    ///
+    /// Full state can prefer an operator-chosen tip on equal work. The planner uses it in place
+    /// of the hash tie-break, and still checks eligibility, verified ancestry, and greatest work.
+    fn verified_tip(&self, _event: &TransitionEvent) -> Option<crate::Frontier> {
+        None
+    }
+
+    /// Bodies evicted by this exact staged block acceptance or reconsideration.
+    /// Their headers remain eligible, but no longer represent retained verified bodies.
+    fn evicted_bodies(&self, _event: &TransitionEvent) -> &[zakura_chain::block::Hash] {
+        &[]
+    }
+
     /// Return the header-engine version that the writer consumed to authorize this event.
     fn full_state_authorization_version(&self, _event: &TransitionEvent) -> Option<StateVersion> {
         None

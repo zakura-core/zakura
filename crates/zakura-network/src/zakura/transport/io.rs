@@ -16,6 +16,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
+use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck, SlotBudget, SlotPermit};
 use std::sync::{Arc, OnceLock};
 
 /// Why a persistent stream ended before local cancellation.
@@ -44,6 +45,7 @@ impl OrderedStreamFailureCause {
 pub struct FramedRecv {
     receiver: FramedReceiver,
     failure_cause: Option<OrderedStreamFailureCause>,
+    precheck: Option<PrecheckSlot>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,7 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Plain(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
@@ -65,12 +68,31 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
     pub(crate) fn with_failure_cause(mut self, failure_cause: OrderedStreamFailureCause) -> Self {
         self.failure_cause = Some(failure_cause);
         self
+    }
+
+    /// Share the reader's precheck slot, so the service can attach one.
+    pub(crate) fn with_precheck(mut self, precheck: PrecheckSlot) -> Self {
+        self.precheck = Some(precheck);
+        self
+    }
+
+    /// Check every response header against `precheck` before the reader
+    /// allocates its payload. Attach it before the first receive call.
+    ///
+    /// Returns false if this stream has no transport reader, such as an
+    /// in-process channel, or if the service already started receiving or
+    /// attached a precheck.
+    pub(crate) fn attach_precheck(&self, precheck: Arc<dyn ResponsePrecheck>) -> bool {
+        self.precheck
+            .as_ref()
+            .is_some_and(|slot| slot.attach(precheck))
     }
 
     /// Failure of any member, retained through session cancellation for service policy.
@@ -88,6 +110,9 @@ impl FramedRecv {
 
     /// Receive an already queued frame without waiting for transport progress.
     pub(crate) fn try_recv(&mut self) -> Result<Frame, mpsc::error::TryRecvError> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.try_recv(),
             FramedReceiver::Queued(receiver) => loop {
@@ -100,6 +125,9 @@ impl FramedRecv {
 
     /// Receive the next admitted frame, or `None` after the transport closes the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.recv().await,
             FramedReceiver::Queued(receiver) => {
@@ -118,6 +146,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
+    response_slots: Option<SlotBudget>,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
 }
 
@@ -132,12 +161,16 @@ impl FramedSend {
     pub fn new(sender: mpsc::Sender<Frame>) -> Self {
         Self {
             sender: FramedSender::Plain(sender),
+            response_slots: None,
             session_resources: None,
         }
     }
 
     fn queued(sender: mpsc::Sender<QueuedFrame>) -> Self {
+        let response_slots = SlotBudget::new(sender.max_capacity().saturating_sub(1).max(1))
+            .expect("a transport queue has a positive semaphore-bounded capacity");
         Self {
+            response_slots: Some(response_slots),
             sender: FramedSender::Queued(sender),
             session_resources: None,
         }
@@ -201,6 +234,22 @@ impl FramedSend {
             .map_err(|_| GuardedReserveError::Closed)
     }
 
+    /// Reserve a response without consuming the last queue slot for control.
+    /// The response allowance is shared by all sender clones and held through
+    /// the write. A one-slot queue makes progress as frames drain, but cannot
+    /// provide independent control headroom.
+    pub(crate) async fn reserve_response_guarded(
+        &self,
+    ) -> Result<ResponseFrameSlot<'_>, GuardedReserveError> {
+        let budget = self
+            .response_slots
+            .as_ref()
+            .ok_or(GuardedReserveError::Unsupported)?;
+        let response = budget.reserve().await;
+        let slot = self.reserve_guarded().await?;
+        Ok(ResponseFrameSlot { slot, response })
+    }
+
     /// Current free slots in the bounded transport queue.
     pub fn capacity(&self) -> usize {
         match &self.sender {
@@ -244,6 +293,20 @@ impl GuardedFrameSlot<'_> {
             claim: Some(claim),
         });
         !self.sender.is_closed()
+    }
+}
+
+/// A response queue slot that leaves space for independent control traffic.
+#[derive(Debug)]
+pub(crate) struct ResponseFrameSlot<'a> {
+    slot: GuardedFrameSlot<'a>,
+    response: SlotPermit,
+}
+
+impl ResponseFrameSlot<'_> {
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+        self.slot
+            .send(frame, FrameGuard::new(Arc::new((guard, self.response))));
     }
 }
 
@@ -541,6 +604,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_slot_queue_admits_requests_and_control_after_a_response_drains() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Full)
+        ));
+        let mut control = Box::pin(sender.send(frame(2)));
+        assert!(futures::poll!(&mut control).is_pending());
+        let response = receiver.recv().await.unwrap();
+        control.await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(2));
+        sender
+            .try_reserve_guarded()
+            .unwrap()
+            .send(frame(3), FrameGuard::new(Arc::new(())));
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(3));
+        drop(response);
+        assert!(sender.reserve_response_guarded().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn response_headroom_is_shared_and_held_until_the_write_ends() {
+        let (sender, mut receiver) = worker_framed_channel(2);
+        let clone = sender.clone();
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        let mut pending = Box::pin(clone.reserve_response_guarded());
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        let queued = receiver.recv().await.unwrap();
+        let mut write = Box::pin(queued.write_with(|_| async {
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        }));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(futures::poll!(&mut pending).is_pending());
+        sender
+            .try_send(frame(2))
+            .expect("control retains queue capacity");
+
+        drop(write);
+        let slot = pending.await.unwrap();
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 1);
+        drop(slot);
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+        drop(receiver);
+        assert!(matches!(
+            sender.reserve_response_guarded().await,
+            Err(GuardedReserveError::Closed)
+        ));
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+    }
+
+    #[tokio::test]
     async fn cancelling_or_closing_a_guarded_queue_wait_keeps_the_callers_reservation() {
         let (sender, mut receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).expect("filler fits");
@@ -606,45 +730,52 @@ mod tests {
     #[tokio::test]
     async fn quic_backpressure_holds_producer_and_preserves_another_stream() {
         use crate::zakura::testkit::LocalEndpointFactory;
-        use iroh::{
-            endpoint::{Connection, QuicTransportConfig, VarInt},
-            protocol::{AcceptError, ProtocolHandler, Router},
-        };
+        use futures::future::BoxFuture;
         use std::time::Duration;
+        use zakura_quic::{Acceptor, Admit, Conn, IncomingInfo, QuicConfig};
+
+        const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
 
         #[derive(Debug)]
-        struct AcceptConnection(mpsc::Sender<Connection>);
-        impl ProtocolHandler for AcceptConnection {
-            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-                let _ = self.0.send(connection).await;
-                Ok(())
+        struct AcceptConnection(mpsc::Sender<Conn>);
+        impl Acceptor for AcceptConnection {
+            fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+                Admit::Accept
+            }
+
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                vec![ALPN.to_vec()]
+            }
+
+            fn handle(&self, connection: Conn) -> BoxFuture<'static, ()> {
+                let accepted = self.0.clone();
+                Box::pin(async move {
+                    let _ = accepted.send(connection).await;
+                })
             }
         }
 
-        const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
         // Scale down the windows so a single bounded frame reaches flow control.
-        let transport_config = || {
-            QuicTransportConfig::builder()
-                .max_remote_nat_traversal_addresses(0)
-                .stream_receive_window(VarInt::from_u32(16 * 1024))
-                .receive_window(VarInt::from_u32(128 * 1024))
-                .send_window(128 * 1024)
-                .build()
+        let quic_config = || QuicConfig {
+            stream_receive_window_bytes: 64 * 1024,
+            receive_window_bytes: 128 * 1024,
+            send_window_bytes: 128 * 1024,
+            ..QuicConfig::default()
         };
-        let server = LocalEndpointFactory::with_transport_config(transport_config())
+        let server = LocalEndpointFactory::new()
+            .quic_config(quic_config())
             .endpoint(92_001)
             .await
             .unwrap();
-        let client = LocalEndpointFactory::with_transport_config(transport_config())
+        let client = LocalEndpointFactory::new()
+            .quic_config(quic_config())
             .endpoint(92_002)
             .await
             .unwrap();
         let (accepted, mut incoming) = mpsc::channel(1);
-        let router = Router::builder(server)
-            .accept(ALPN, AcceptConnection(accepted))
-            .spawn();
-        let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
-        let connection = client.connect(address, ALPN).await.unwrap();
+        server.serve(AcceptConnection(accepted)).unwrap();
+        let address = LocalEndpointFactory::node_addr(&server).await;
+        let connection = client.connect(address, &[ALPN]).await.unwrap();
         let remote = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
             .await
             .unwrap()
@@ -702,7 +833,7 @@ mod tests {
         .expect("draining the peer resumes the write");
         assert!(producer.try_reserve().is_some());
         connection.close(0u32.into(), b"done");
-        client.close().await;
-        router.shutdown().await.unwrap();
+        client.shutdown().await;
+        server.shutdown().await;
     }
 }

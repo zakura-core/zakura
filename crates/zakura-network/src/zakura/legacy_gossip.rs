@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexSet;
+use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -31,8 +33,9 @@ use zakura_chain::{
 };
 
 use crate::{
+    constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
     protocol::{
-        external::InventoryHash,
+        external::{InventoryHash, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
     },
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -42,7 +45,7 @@ use super::trace::BlockBodySource;
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
     RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
-    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
+    SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerHandle,
     ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
@@ -114,6 +117,12 @@ const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Distinct peers a block or transaction request tries: the primary and up to
+/// two fallbacks, since a missing answer is a reason to look elsewhere.
+const LEGACY_INVENTORY_REQUEST_ATTEMPTS: usize = 3;
+/// Distinct peers any other request tries. Empty discovery and mempool answers
+/// are normal at the tip, so these keep a single fallback.
+const LEGACY_REQUEST_ATTEMPTS: usize = 2;
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reserve half of each connection's stream-open budget for native ordered
 /// streams, reconnects, and other request clients.
@@ -145,14 +154,14 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Persistent,
+        ..Stream::PERSISTENT
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::RequestResponse,
+        ..Stream::REQUEST_RESPONSE
     },
 ];
 
@@ -178,9 +187,9 @@ impl LegacyGossipFrame {
     /// Convert a legacy network request into a gossip frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => {
-                Ok(Self::AdvertiseBlock(hash))
-            }
+            Request::AdvertiseBlock(hash, _)
+            | Request::AdvertiseBlockToAll(hash)
+            | Request::AdvertiseMinedBlock(hash) => Ok(Self::AdvertiseBlock(hash)),
             Request::AdvertiseTransactionIds(ids, _) => Self::advertise_transaction_ids(ids),
             request => Err(LegacyGossipError::UnsupportedRequest(request.command())),
         }
@@ -256,6 +265,16 @@ impl LegacyGossipFrame {
             ),
         }
     }
+}
+
+/// The inventory IDs an outbound legacy request asked for, used by
+/// `LegacyResponseCodec::decode_response` to reject unsolicited items.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RequestedInventory {
+    /// Requested block hashes.
+    Blocks(HashSet<block::Hash>),
+    /// Requested transaction IDs, in the same form as the request encoding.
+    Transactions(HashSet<UnminedTxId>),
 }
 
 /// A typed legacy inventory request carried by Zakura stream kind 3.
@@ -415,9 +434,11 @@ impl LegacyRequestFrame {
                 Ok(Self::Ping)
             }
             MSG_REQUEST_PUSH_TRANSACTION => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let transaction = Transaction::zcash_deserialize(&mut reader)?;
-                reject_trailing(&reader)?;
+                let mut bytes = frame.payload.as_slice();
+                let transaction = Transaction::zcash_deserialize_from_slice(&mut bytes)?;
+                if !bytes.is_empty() {
+                    return Err(LegacyGossipError::TrailingBytes);
+                }
                 Ok(Self::PushTransaction(UnminedTx::from(transaction)))
             }
             message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
@@ -470,6 +491,18 @@ pub(super) enum LegacyRequestKind {
 }
 
 impl LegacyRequestKind {
+    /// Distinct peers one request of this kind tries before giving up.
+    fn max_attempts(self) -> usize {
+        match self {
+            Self::Blocks | Self::Transactions => LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+            Self::FindBlocks
+            | Self::FindHeaders
+            | Self::MempoolTransactionIds
+            | Self::Ping
+            | Self::PushTransaction => LEGACY_REQUEST_ATTEMPTS,
+        }
+    }
+
     fn command(self) -> &'static str {
         match self {
             LegacyRequestKind::Blocks => "BlocksByHash",
@@ -610,8 +643,13 @@ impl LegacyResponseCodec {
         request_id: u64,
         request_kind: LegacyRequestKind,
         frames: Vec<Frame>,
-        requested_block_hashes: Option<&HashSet<block::Hash>>,
+        requested: Option<&RequestedInventory>,
     ) -> Result<Response, LegacyGossipError> {
+        let (requested_block_hashes, requested_transaction_ids) = match requested {
+            Some(RequestedInventory::Blocks(hashes)) => (Some(hashes), None),
+            Some(RequestedInventory::Transactions(ids)) => (None, Some(ids)),
+            None => (None, None),
+        };
         let mut blocks = Vec::new();
         let mut transactions = Vec::new();
         let mut block_hashes = Vec::new();
@@ -632,9 +670,11 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let block = Arc::new(Block::zcash_deserialize(&mut Cursor::new(
-                            bytes.as_slice(),
-                        ))?);
+                        let mut remaining = bytes.as_slice();
+                        let block = Arc::new(Block::zcash_deserialize_from_slice(&mut remaining)?);
+                        if !remaining.is_empty() {
+                            return Err(LegacyGossipError::TrailingBytes);
+                        }
                         // Bind the delivered block to a hash we actually requested.
                         // Without this, a peer can substitute any other valid block
                         // for the one requested, corrupting downstream hash/source
@@ -654,12 +694,23 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Transactions"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
+                        let mut remaining = bytes.as_slice();
                         let transaction =
-                            Transaction::zcash_deserialize(&mut Cursor::new(bytes.as_slice()))?;
-                        transactions.push(InventoryResponse::Available((
-                            UnminedTx::from(transaction),
-                            None,
-                        )));
+                            Transaction::zcash_deserialize_from_slice(&mut remaining)?;
+                        if !remaining.is_empty() {
+                            return Err(LegacyGossipError::TrailingBytes);
+                        }
+                        let transaction = UnminedTx::from(transaction);
+                        // Bind the delivered transaction to an ID we requested, as
+                        // for blocks above.
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&transaction.id()) {
+                                return Err(LegacyGossipError::UnsolicitedTransaction(
+                                    transaction.id(),
+                                ));
+                            }
+                        }
+                        transactions.push(InventoryResponse::Available((transaction, None)));
                     }
                 }
                 MSG_RESPONSE_MISSING_BLOCKS => {
@@ -683,6 +734,11 @@ impl LegacyResponseCodec {
                     }
                     reassembler.reject_if_active()?;
                     for id in decode_tx_ids_response(request_id, frame.payload)? {
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&id) {
+                                return Err(LegacyGossipError::UnsolicitedTransaction(id));
+                            }
+                        }
                         transactions.push(InventoryResponse::Missing(id));
                     }
                 }
@@ -756,7 +812,17 @@ impl LegacyResponseCodec {
                 Err(LegacyGossipError::MissingResponse(request_kind.command()))
             }
             LegacyRequestKind::Transactions => Ok(Response::Transactions(transactions)),
-            LegacyRequestKind::FindBlocks => Ok(Response::BlockHashes(block_hashes)),
+            LegacyRequestKind::FindBlocks => {
+                if block_hashes.len() > MAX_FIND_BLOCKS_RESPONSE_HASHES {
+                    return Err(LegacyGossipError::TooManyInventoryItems(block_hashes.len()));
+                }
+                // An honest responder lists distinct consecutive chain hashes.
+                let mut seen = HashSet::with_capacity(block_hashes.len());
+                if let Some(hash) = block_hashes.iter().find(|hash| !seen.insert(**hash)) {
+                    return Err(LegacyGossipError::DuplicateBlockHash(*hash));
+                }
+                Ok(Response::BlockHashes(block_hashes))
+            }
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
             LegacyRequestKind::MempoolTransactionIds => {
                 Ok(Response::TransactionIds(transaction_ids))
@@ -818,7 +884,7 @@ fn write_hash_list(out: &mut Vec<u8>, hashes: &[block::Hash]) -> Result<(), Lega
 
 fn read_hash_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<block::Hash>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut hashes = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         hashes.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -843,7 +909,7 @@ fn read_block_locator(
     reader: &mut Cursor<&[u8]>,
 ) -> Result<(Vec<block::Hash>, Option<block::Hash>), LegacyGossipError> {
     let count = bounded_block_locator_count(reader)?;
-    let mut known_blocks = Vec::with_capacity(count);
+    let mut known_blocks = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         known_blocks.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -864,7 +930,7 @@ fn write_tx_id_list(out: &mut Vec<u8>, ids: &[UnminedTxId]) -> Result<(), Legacy
 
 fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut ids = Vec::with_capacity(count);
+    let mut ids = Vec::with_capacity(fitting_capacity(reader, count, MIN_INV_HASH_SIZE));
     for _ in 0..count {
         let inv = InventoryHash::zcash_deserialize(&mut *reader)?;
         let Some(id) = inv.unmined_tx_id() else {
@@ -873,6 +939,16 @@ fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, Legac
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// Byte length of an encoded block hash.
+const HASH_LEN: usize = 32;
+
+/// Limits a declared `count` to the `item_len`-byte items the unread payload
+/// can hold, so a short frame cannot reserve its full declared capacity.
+fn fitting_capacity(reader: &Cursor<&[u8]>, count: usize, item_len: usize) -> usize {
+    let read = usize::try_from(reader.position()).unwrap_or(usize::MAX);
+    count.min(reader.get_ref().len().saturating_sub(read) / item_len)
 }
 
 fn bounded_inventory_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {
@@ -1908,6 +1984,7 @@ where
         let route = match &request {
             Request::AdvertiseBlock(..)
             | Request::AdvertiseBlockToAll(..)
+            | Request::AdvertiseMinedBlock(..)
             | Request::AdvertiseTransactionIds(..) => DualStackRoute::Advertise,
             Request::BlocksByHash(..)
             | Request::BlocksByHashFrom { .. }
@@ -2019,7 +2096,7 @@ fn record_block_response_source(
     trace: &ZakuraTrace,
     response: Response,
     source: BlockBodySource,
-    requested_hashes: Option<&HashSet<block::Hash>>,
+    requested_hashes: Option<&IndexSet<block::Hash>>,
 ) -> Response {
     if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
         for block in blocks {
@@ -2110,35 +2187,39 @@ impl ZakuraRequestClient {
         };
 
         let handles = self.ready_handles().await?;
-        let Some(primary) = select_handle(&handles, preferred.as_ref()) else {
-            return Err("no ready Zakura peer for legacy inventory request".into());
-        };
-
         let request_kind = frame.kind();
-        let first_result = self
-            .request_one(primary.clone(), frame.clone(), request_kind)
-            .await;
-        match first_result {
-            Ok(response) if !all_inventory_missing(&response) => Ok(response),
-            Ok(response) => {
-                let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
-                    if retry_source_missing && preferred.is_some() {
-                        return self
-                            .retry_source_missing(primary, frame, request_kind, response)
-                            .await;
-                    }
-                    return Ok(response);
-                };
-                self.request_one(fallback, frame, request_kind)
+        let candidates = request_candidates(
+            &handles,
+            preferred.as_ref(),
+            request_kind.max_attempts(),
+            &mut OsRng,
+        );
+
+        let mut missing_response = None;
+        let mut last_error = None;
+        for handle in &candidates {
+            match self
+                .request_one(handle.clone(), frame.clone(), request_kind)
+                .await
+            {
+                Ok(response) if !all_inventory_missing(&response) => return Ok(response),
+                Ok(response) => missing_response = Some(response),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match (missing_response, last_error, candidates.as_slice()) {
+            // Only retry the advertising peer itself, not an unrelated peer
+            // that happened to be the sole candidate.
+            (Some(response), _, [only])
+                if retry_source_missing && preferred.as_ref() == Some(only.peer_id()) =>
+            {
+                self.retry_source_missing(only.clone(), frame, request_kind, response)
                     .await
-                    .or(Ok(response))
             }
-            Err(error) => {
-                let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
-                    return Err(error);
-                };
-                self.request_one(fallback, frame, request_kind).await
-            }
+            (Some(response), _, _) => Ok(response),
+            (None, Some(error), _) => Err(error),
+            (None, None, _) => Err("no ready Zakura peer for legacy inventory request".into()),
         }
     }
 
@@ -2191,10 +2272,15 @@ impl ZakuraRequestClient {
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        // Capture the requested block hashes (if any) before consuming the frame,
-        // so the response can be bound to a hash we actually asked for.
-        let requested_block_hashes: Option<HashSet<block::Hash>> = match &frame {
-            LegacyRequestFrame::BlocksByHash(hashes) => Some(hashes.iter().copied().collect()),
+        // Capture the requested inventory (if any) before consuming the frame,
+        // so the response can be bound to IDs we actually asked for.
+        let requested = match &frame {
+            LegacyRequestFrame::BlocksByHash(hashes) => {
+                Some(RequestedInventory::Blocks(hashes.iter().copied().collect()))
+            }
+            LegacyRequestFrame::TransactionsById(ids) => Some(RequestedInventory::Transactions(
+                ids.iter().copied().collect(),
+            )),
             _ => None,
         };
         let frame = frame.encode_frame()?;
@@ -2255,7 +2341,7 @@ impl ZakuraRequestClient {
             request_id,
             request_kind,
             response,
-            requested_block_hashes.as_ref(),
+            requested.as_ref(),
         ) {
             Ok(response) => response,
             Err(error) => {
@@ -2268,6 +2354,11 @@ impl ZakuraRequestClient {
                         error.to_string(),
                     )
                 });
+                // Match the transport's `Fatal` handling, so source-attributed
+                // retries cannot pick the same misbehaving peer again.
+                if error.is_peer_fault() {
+                    self.supervisor.disconnect_peer(handle.peer_id()).await;
+                }
                 return Err(error.into());
             }
         };
@@ -2294,31 +2385,25 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
         .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
 }
 
-fn select_handle(
+/// Orders the ready peers for one request: the preferred peer first, then the
+/// others in random order, capped at `attempts`.
+///
+/// A fresh random order keeps a few unhelpful peers from always being tried
+/// first, and unlike a shared rotation counter, other traffic cannot steer it.
+fn request_candidates<R: Rng + ?Sized>(
     handles: &[ZakuraPeerHandle],
     preferred: Option<&ZakuraPeerId>,
-) -> Option<ZakuraPeerHandle> {
-    // v1 controlled-network routing: source-less chain-sync requests use the
-    // first ready Zakura peer. Production spreading/rotation belongs with the
-    // future zakurad wiring milestone.
-    preferred
-        .and_then(|peer_id| {
-            handles
-                .iter()
-                .find(|handle| handle.peer_id() == peer_id)
-                .cloned()
-        })
-        .or_else(|| handles.first().cloned())
-}
-
-fn select_fallback_handle(
-    handles: &[ZakuraPeerHandle],
-    primary: &ZakuraPeerId,
-) -> Option<ZakuraPeerHandle> {
-    handles
+    attempts: usize,
+    rng: &mut R,
+) -> Vec<ZakuraPeerHandle> {
+    let (mut candidates, mut others): (Vec<_>, Vec<_>) = handles
         .iter()
-        .find(|handle| handle.peer_id() != primary)
         .cloned()
+        .partition(|handle| Some(handle.peer_id()) == preferred);
+    others.shuffle(rng);
+    candidates.extend(others);
+    candidates.truncate(attempts);
+    candidates
 }
 
 fn all_inventory_missing(response: &Response) -> bool {
@@ -3106,10 +3191,17 @@ pub enum LegacyGossipError {
     /// A request that requires an acknowledgement received none.
     #[error("missing legacy response: {0}")]
     MissingResponse(&'static str),
+    /// A `FindBlocks` response listed the same block hash more than once.
+    #[error("legacy block hash response repeated a hash: {0:?}")]
+    DuplicateBlockHash(block::Hash),
     /// The peer returned a block we did not request, so the response is not bound
     /// to the requested hash. Treated as a peer fault.
     #[error("legacy block response contained an unrequested block: {0:?}")]
     UnsolicitedBlock(block::Hash),
+    /// The peer returned an available or missing transaction ID we did not
+    /// request. Treated as a peer fault.
+    #[error("legacy transaction response contained an unrequested transaction: {0:?}")]
+    UnsolicitedTransaction(UnminedTxId),
     /// Zcash serialization failed.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
@@ -3119,6 +3211,43 @@ pub enum LegacyGossipError {
     /// Integer conversion failed while checking a peer-controlled bound.
     #[error(transparent)]
     Integer(#[from] std::num::TryFromIntError),
+}
+
+impl LegacyGossipError {
+    /// Returns true if this error, from decoding a peer's response, proves the
+    /// peer violated the protocol, so its connection should be closed.
+    ///
+    /// The transport already rejects the structural variants as `Fatal` before
+    /// decoding; the live addition here is requested-item binding
+    /// (`UnsolicitedBlock`, `UnsolicitedTransaction`). Missing or unexpected
+    /// responses are not faults on their own: the caller falls back to another
+    /// peer.
+    pub(crate) fn is_peer_fault(&self) -> bool {
+        match self {
+            Self::UnsupportedFlags(_)
+            | Self::UnknownMessageType(_)
+            | Self::EmptyTransactionAdvertisement
+            | Self::TooManyInventoryItems(_)
+            | Self::TooManyBlockLocatorHashes(_)
+            | Self::TooManyHeaders(_)
+            | Self::NonTransactionInventory
+            | Self::TrailingBytes
+            | Self::WrongRequestId { .. }
+            | Self::IncompleteResponseChunk
+            | Self::TruncatedResponse
+            | Self::OversizedResponse(_)
+            | Self::UnsolicitedBlock(_)
+            | Self::UnsolicitedTransaction(_)
+            | Self::DuplicateBlockHash(_)
+            | Self::Serialization(_) => true,
+            Self::UnsupportedRequest(_)
+            | Self::ResponseAggregateBudget(_)
+            | Self::UnexpectedResponse(_)
+            | Self::MissingResponse(_)
+            | Self::Io(_)
+            | Self::Integer(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for LegacyGossipFrame {
@@ -3155,6 +3284,9 @@ impl fmt::Display for LegacyRequestFrame {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod bounded_decoding;
 
 #[cfg(test)]
 mod tests {
@@ -3348,6 +3480,118 @@ mod tests {
                 }
             };
             std::future::ready(Ok(response))
+        }
+    }
+
+    /// Answers every block request with its block, whatever hash was requested.
+    #[derive(Clone, Debug)]
+    struct SubstitutingBlockResponder {
+        block: Arc<Block>,
+    }
+
+    impl Service<Request> for SubstitutingBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
+                self.block.clone(),
+                None,
+            ))])))
+        }
+    }
+
+    /// Answers the first request with `Nil`, like an inbound service still in
+    /// setup, then answers block requests with its block.
+    #[derive(Clone, Debug)]
+    struct NilThenBlockResponder {
+        block: Arc<Block>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for NilThenBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return std::future::ready(Ok(Response::Nil));
+            }
+            std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
+                self.block.clone(),
+                None,
+            ))])))
+        }
+    }
+
+    /// Declines every request, so the sink resets the stream and the requester
+    /// sees a response with no frames.
+    #[derive(Clone, Debug)]
+    struct DecliningResponder;
+
+    impl Service<Request> for DecliningResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Err("declined".into()))
+        }
+    }
+
+    /// Answers every request with `Nil` and counts the requests it served.
+    #[derive(Clone, Debug)]
+    struct CountingNilResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingNilResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(Response::Nil))
+        }
+    }
+
+    /// Answers every request with a block-hash list that repeats a hash.
+    #[derive(Clone, Debug)]
+    struct RepeatingHashResponder;
+
+    impl Service<Request> for RepeatingHashResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Ok(Response::BlockHashes(vec![
+                block_hash(1),
+                block_hash(1),
+            ])))
         }
     }
 
@@ -3887,7 +4131,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([hash])),
+                Request::BlocksByHash(IndexSet::from([hash])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -3924,7 +4168,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([block.hash()])),
+                Request::BlocksByHash(IndexSet::from([block.hash()])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -3936,6 +4180,142 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-45: a `FindBlocks` answer that repeats a hash is a peer fault, so the
+    /// requester disconnects the responder instead of keeping it eligible.
+    #[tokio::test]
+    async fn request_adapter_disconnects_peer_on_repeated_find_blocks_hash() -> Result<(), BoxError>
+    {
+        let _guard = zakura_test::init();
+        let node_a = ZakuraTestNode::builder(84)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(RepeatingHashResponder, supervisor))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(85).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let result = adapter
+            .request_from_source(
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(9)],
+                    stop: None,
+                },
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "a repeated hash must not be returned");
+        wait_registered_count(&node_b, 0).await?;
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-38: an unsolicited block response is a peer fault, so the requester
+    /// disconnects the peer instead of leaving it eligible for source-attributed
+    /// retries.
+    #[tokio::test]
+    async fn request_adapter_disconnects_peer_on_unsolicited_block() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = ZakuraTestNode::builder(70)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    SubstitutingBlockResponder { block },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(71).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let result = adapter
+            .request_from_source(
+                Request::BlocksByHash(IndexSet::from([block_hash(90)])),
+                Some(PeerSource::Zakura(a_peer_id)),
+            )
+            .await;
+
+        assert!(result.is_err(), "an unsolicited block must not be returned");
+        wait_registered_count(&node_b, 0).await?;
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// A peer still in inbound setup answers a block request with NIL. That
+    /// fails the request without disconnecting the peer, so it serves the block
+    /// once setup completes.
+    #[tokio::test]
+    async fn request_adapter_keeps_peer_after_nil_inventory_response() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let node_a = ZakuraTestNode::builder(72)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    NilThenBlockResponder {
+                        block,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(73).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        // Any disconnect, including one followed by a quick re-registration,
+        // changes the registered peer set.
+        let mut peer_set = node_b.supervisor().subscribe();
+        peer_set.borrow_and_update();
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let request = || Request::BlocksByHash(IndexSet::from([hash]));
+        let source = Some(PeerSource::Zakura(a_peer_id));
+        assert!(
+            adapter
+                .request_from_source(request(), source.clone())
+                .await
+                .is_err(),
+            "a NIL answer to a block request must not return blocks"
+        );
+
+        let response = adapter.request_from_source(request(), source).await?;
+        assert!(
+            matches!(
+                &response,
+                Response::Blocks(blocks)
+                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+            ),
+            "the same peer must still serve the block; got {response:?}"
+        );
+        assert!(
+            !peer_set.has_changed()?,
+            "the NIL answer must not disconnect the peer"
+        );
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -4359,6 +4739,247 @@ mod tests {
 
         advertiser.shutdown().await;
         fallback.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// The preferred peer goes first, the rest come in random order, the list is
+    /// capped at the attempt limit, and every peer gets a turn across requests.
+    #[test]
+    fn request_candidates_prefer_source_and_randomize_the_rest() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let handles: Vec<_> = (1..=5)
+            .map(|byte| {
+                let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid");
+                let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+                ZakuraPeerHandle::new_for_tests(peer, sender)
+            })
+            .collect();
+        let ids = |candidates: Vec<ZakuraPeerHandle>| -> Vec<ZakuraPeerId> {
+            candidates
+                .iter()
+                .map(|handle| handle.peer_id().clone())
+                .collect()
+        };
+        let peer = |index: usize| handles[index].peer_id().clone();
+        let unknown = ZakuraPeerId::new(vec![9; 32]).expect("32-byte node id is valid");
+        let mut rng = StdRng::seed_from_u64(1350);
+
+        let mut first_seen = HashSet::new();
+        for _ in 0..64 {
+            let candidates = ids(request_candidates(
+                &handles,
+                Some(&peer(2)),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng,
+            ));
+            assert_eq!(candidates.len(), LEGACY_INVENTORY_REQUEST_ATTEMPTS);
+            assert_eq!(candidates[0], peer(2), "the preferred peer goes first");
+            assert_eq!(
+                candidates.iter().collect::<HashSet<_>>().len(),
+                candidates.len(),
+                "candidates are distinct"
+            );
+
+            let candidates = ids(request_candidates(
+                &handles,
+                Some(&unknown),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng,
+            ));
+            assert_eq!(candidates.len(), LEGACY_INVENTORY_REQUEST_ATTEMPTS);
+            first_seen.insert(candidates[0].clone());
+        }
+        assert_eq!(
+            first_seen.len(),
+            handles.len(),
+            "every peer is tried first on some request"
+        );
+
+        assert_eq!(
+            ids(request_candidates(
+                &handles[..1],
+                Some(&peer(0)),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng
+            )),
+            vec![peer(0)]
+        );
+    }
+
+    /// F-46: two peers that answer with no frames cannot keep a request from
+    /// reaching an honest peer, and they stay connected.
+    #[tokio::test]
+    async fn request_adapter_routes_around_peers_that_return_no_frames() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let mut responders = Vec::new();
+        for seed in [74, 75] {
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .service_from_supervisor(|supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(DecliningResponder, supervisor))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+        responders.push(
+            ZakuraTestNode::builder(76)
+                .service_from_supervisor(move |supervisor| {
+                    Arc::new(LegacyGossipSink::spawn(
+                        SubstitutingBlockResponder { block },
+                        supervisor,
+                    ))
+                })
+                .spawn()
+                .await?,
+        );
+        let requester = ZakuraTestNode::builder(77)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        for responder in &responders {
+            requester
+                .connect_native(responder, TEST_NET_TIMEOUT)
+                .await?;
+        }
+        wait_registered_count(&requester, 3).await?;
+        let declining = node_peer_id(&responders[0]).await?;
+
+        let mut peer_set = requester.supervisor().subscribe();
+        peer_set.borrow_and_update();
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+        for source in [None, Some(PeerSource::Zakura(declining))] {
+            for _ in 0..3 {
+                let response = adapter
+                    .request_from_source(
+                        Request::BlocksByHash(IndexSet::from([hash])),
+                        source.clone(),
+                    )
+                    .await?;
+                assert!(
+                    matches!(
+                        &response,
+                        Response::Blocks(blocks)
+                            if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+                    ),
+                    "the honest peer must serve the block; got {response:?}"
+                );
+            }
+        }
+        assert!(
+            !peer_set.has_changed()?,
+            "declining peers are routed around, not disconnected"
+        );
+
+        for responder in responders {
+            responder.shutdown().await;
+        }
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// An empty discovery answer is normal at the tip, so it keeps a single
+    /// fallback, while a block request that finds nothing tries three peers.
+    #[tokio::test]
+    async fn empty_discovery_answers_keep_one_fallback() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut responders = Vec::new();
+        for seed in [80, 81, 82] {
+            let calls = calls.clone();
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .service_from_supervisor(move |supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(
+                            CountingNilResponder { calls },
+                            supervisor,
+                        ))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+        let requester = ZakuraTestNode::builder(83)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        for responder in &responders {
+            requester
+                .connect_native(responder, TEST_NET_TIMEOUT)
+                .await?;
+        }
+        wait_registered_count(&requester, 3).await?;
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+
+        let response = adapter
+            .request_from_source(
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+                None,
+            )
+            .await?;
+        assert!(all_inventory_missing(&response), "got {response:?}");
+        assert_eq!(calls.swap(0, Ordering::SeqCst), LEGACY_REQUEST_ATTEMPTS);
+
+        assert!(adapter
+            .request_from_source(Request::BlocksByHash(IndexSet::from([block_hash(2)])), None)
+            .await
+            .is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            LEGACY_INVENTORY_REQUEST_ATTEMPTS
+        );
+
+        for responder in responders {
+            responder.shutdown().await;
+        }
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// When the advertising peer is not ready and an unrelated peer is the only
+    /// candidate, a missing answer is not retried against that unrelated peer.
+    #[tokio::test]
+    async fn source_missing_retries_skip_an_unrelated_sole_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let txid = UnminedTx::from(empty_v5_transaction(4)).id();
+        let (unrelated, mut unrelated_rx) = recording_inventory_node(78, None).await?;
+        let requester = ZakuraTestNode::builder(79).spawn().await?;
+        requester
+            .connect_native(&unrelated, TEST_NET_TIMEOUT)
+            .await?;
+        wait_registered_count(&requester, 1).await?;
+        let absent_source = ZakuraPeerId::new(vec![0xab; 32])?;
+
+        let mut adapter = LegacyRequestAdapter::new(requester.supervisor());
+        let response = adapter
+            .ready()
+            .await?
+            .call(Request::TransactionsByIdFrom {
+                ids: HashSet::from([txid]),
+                source: PeerSource::Zakura(absent_source),
+            })
+            .await?;
+        assert!(all_inventory_missing(&response), "got {response:?}");
+
+        match recv_request(&mut unrelated_rx).await? {
+            Request::TransactionsById(ids) => assert_eq!(ids, HashSet::from([txid])),
+            request => panic!("unexpected request: {request:?}"),
+        }
+        assert!(
+            unrelated_rx.try_recv().is_err(),
+            "the unrelated peer must not receive source-missing retries"
+        );
+
+        unrelated.shutdown().await;
         requester.shutdown().await;
         Ok(())
     }
@@ -4989,6 +5610,20 @@ mod tests {
             block_request
         );
 
+        let requested_hashes = vec![block_hash(2), block_hash(1), block_hash(2)];
+        let peer_id = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let Request::BlocksByHash(hashes) = LegacyRequestFrame::BlocksByHash(requested_hashes)
+            .into_service_request(peer_id)
+            .expect("block request has a service request")
+        else {
+            panic!("block request must produce BlocksByHash");
+        };
+        assert_eq!(
+            hashes.into_iter().collect::<Vec<_>>(),
+            vec![block_hash(2), block_hash(1)],
+            "block request conversion must preserve first-seen hash order",
+        );
+
         let tx_request =
             LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(3), witnessed_tx_id(4)]);
         assert_eq!(
@@ -5307,6 +5942,53 @@ mod tests {
     /// without binding, a peer can substitute any other valid block for the one
     /// requested. The decoder must reject a delivered block whose hash is not in
     /// the requested set, and accept it when it is.
+    /// A `FindBlocks` answer above the responder limit, or one that repeats a
+    /// hash, is a peer fault.
+    #[test]
+    fn decode_response_rejects_oversized_or_repeated_find_blocks_answers() -> Result<(), BoxError> {
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let decode = |hashes: Vec<block::Hash>| -> Result<Response, LegacyGossipError> {
+            let frames = LegacyResponseCodec::encode_response(
+                7,
+                Response::BlockHashes(hashes),
+                frame_cap,
+                frame_cap,
+            )?;
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::FindBlocks, frames, None)
+        };
+        let distinct = |count: usize| -> Vec<block::Hash> {
+            (0..count)
+                .map(|index| {
+                    let mut hash = [0; 32];
+                    hash[..8].copy_from_slice(
+                        &u64::try_from(index)
+                            .expect("at most 501 hashes, so the index fits u64")
+                            .to_le_bytes(),
+                    );
+                    block::Hash(hash)
+                })
+                .collect()
+        };
+
+        assert!(matches!(
+            decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES))?,
+            Response::BlockHashes(hashes) if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
+        ));
+
+        let oversized = decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES + 1));
+        assert!(
+            matches!(&oversized, Err(error @ LegacyGossipError::TooManyInventoryItems(_)) if error.is_peer_fault()),
+            "got {oversized:?}"
+        );
+
+        let repeated = decode(vec![block_hash(1), block_hash(2), block_hash(1)]);
+        assert!(
+            matches!(&repeated, Err(error @ LegacyGossipError::DuplicateBlockHash(hash)) if *hash == block_hash(1) && error.is_peer_fault()),
+            "got {repeated:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn decode_response_binds_blocks_to_requested_hashes() -> Result<(), BoxError> {
         let block = Arc::new(Block::zcash_deserialize(
@@ -5323,7 +6005,7 @@ mod tests {
         // A peer substitutes a real block we never asked for. Bound against a
         // requested-hash set that does not contain it, the codec rejects it
         // instead of correlating the response by request id and kind alone.
-        let unrelated: HashSet<block::Hash> = std::iter::once(block_hash(99)).collect();
+        let unrelated = RequestedInventory::Blocks(HashSet::from([block_hash(99)]));
         assert!(
             matches!(
                 LegacyResponseCodec::decode_response(
@@ -5338,7 +6020,7 @@ mod tests {
         );
 
         // The same response is accepted when its hash is among those requested.
-        let requested: HashSet<block::Hash> = std::iter::once(block.hash()).collect();
+        let requested = RequestedInventory::Blocks(HashSet::from([block.hash()]));
         let response = LegacyResponseCodec::decode_response(
             7,
             LegacyRequestKind::Blocks,
@@ -5353,6 +6035,94 @@ mod tests {
                     [InventoryResponse::Available((received, None))]
                         if received.hash() == block.hash()
                 )
+        ));
+
+        Ok(())
+    }
+
+    /// F-36: transaction responses, available or missing, must be bound to the
+    /// requested IDs, as block responses are.
+    #[test]
+    fn decode_response_binds_transactions_to_requested_ids() -> Result<(), BoxError> {
+        let transaction = UnminedTx::from(empty_v5_transaction(21));
+        let missing_id = witnessed_tx_id(22);
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![
+                InventoryResponse::Available((transaction.clone(), None)),
+                InventoryResponse::Missing(missing_id),
+            ]),
+            frame_cap,
+            frame_cap,
+        )?;
+
+        // Each delivered ID is rejected when it is the one we did not request.
+        for unrequested in [transaction.id(), missing_id] {
+            let partial = RequestedInventory::Transactions(
+                [transaction.id(), missing_id]
+                    .into_iter()
+                    .filter(|id| *id != unrequested)
+                    .collect(),
+            );
+            assert!(
+                matches!(
+                    LegacyResponseCodec::decode_response(
+                        7,
+                        LegacyRequestKind::Transactions,
+                        frames.clone(),
+                        Some(&partial),
+                    ),
+                    Err(LegacyGossipError::UnsolicitedTransaction(id)) if id == unrequested,
+                ),
+                "an unrequested transaction ID must be rejected",
+            );
+        }
+
+        let requested =
+            RequestedInventory::Transactions(HashSet::from([transaction.id(), missing_id]));
+        let response = LegacyResponseCodec::decode_response(
+            7,
+            LegacyRequestKind::Transactions,
+            frames,
+            Some(&requested),
+        )?;
+        assert!(matches!(
+            response,
+            Response::Transactions(transactions)
+                if matches!(
+                    transactions.as_slice(),
+                    [
+                        InventoryResponse::Available((received, None)),
+                        InventoryResponse::Missing(missing),
+                    ] if received.id() == transaction.id() && *missing == missing_id
+                )
+        ));
+
+        Ok(())
+    }
+
+    /// F-37: a valid transaction padded with junk bytes is rejected.
+    #[test]
+    fn decode_response_rejects_padded_transaction() -> Result<(), BoxError> {
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let mut frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![InventoryResponse::Available((
+                UnminedTx::from(empty_v5_transaction(23)),
+                None,
+            ))]),
+            frame_cap,
+            frame_cap,
+        )?;
+        let [frame] = frames.as_mut_slice() else {
+            panic!("a small transaction encodes as one frame");
+        };
+        frame.payload.extend_from_slice(&[0; 16]);
+
+        assert!(matches!(
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::Transactions, frames, None),
+            Err(LegacyGossipError::TrailingBytes),
         ));
 
         Ok(())
@@ -5568,7 +6338,7 @@ mod tests {
     fn unsupported_requests_fail_loudly() {
         let unsupported = [
             (
-                Request::BlocksByHash(HashSet::from([block_hash(1)])),
+                Request::BlocksByHash(IndexSet::from([block_hash(1)])),
                 "BlocksByHash",
             ),
             (
@@ -5749,7 +6519,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request(vec![response]);
@@ -5781,7 +6551,7 @@ mod tests {
         let adapter =
             LegacyRequestAdapter::new_with_timeout(node.supervisor(), Duration::from_millis(100));
         let first_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id.clone())),
         );
         let hold_first = hostile.accept_next_request_without_response();
@@ -5797,7 +6567,7 @@ mod tests {
 
         let second_hash = block_hash(2);
         let second_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([second_hash])),
+            Request::BlocksByHash(IndexSet::from([second_hash])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let second_response = hostile.respond_to_next_request_with(|request_id| {
@@ -5827,7 +6597,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -5849,9 +6619,13 @@ mod tests {
         responder_result?;
         let error = request_result.expect_err("excessive response frames are rejected");
         assert!(
-            error
-                .to_string()
-                .contains("too many legacy response frames"),
+            matches!(
+                error.downcast_ref::<crate::zakura::handler::ZakuraHandlerError>(),
+                Some(crate::zakura::handler::ZakuraHandlerError::RejectedFrame {
+                    rejection: crate::zakura::FrameRejection::Unsolicited,
+                    ..
+                })
+            ),
             "unexpected error: {error}"
         );
         wait_registered_count(&node, 0).await?;
@@ -5871,7 +6645,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -5966,25 +6740,25 @@ mod tests {
             true,
         );
 
-        let hash = block_hash(9);
-        composite
-            .ready()
-            .await?
-            .call(Request::AdvertiseBlockToAll(hash))
-            .await?;
-
-        // Legacy peer set received the advertisement verbatim.
-        match recv_request(&mut rx_legacy).await? {
-            Request::AdvertiseBlockToAll(received) => assert_eq!(received, hash),
-            request => panic!("unexpected legacy request: {request:?}"),
-        }
-        // Zakura delivered it to node_b, attributed to node_a.
-        match recv_request(&mut rx_b).await? {
-            Request::AdvertiseBlock(received, Some(PeerSource::Zakura(peer_id))) => {
-                assert_eq!(received, hash);
-                assert_eq!(peer_id, a_peer_id);
+        for request in [
+            Request::AdvertiseBlockToAll(block_hash(9)),
+            Request::AdvertiseMinedBlock(block_hash(10)),
+        ] {
+            let hash = match &request {
+                Request::AdvertiseBlockToAll(hash) | Request::AdvertiseMinedBlock(hash) => *hash,
+                _ => unreachable!(),
+            };
+            composite.ready().await?.call(request.clone()).await?;
+            // The legacy peer set retains the local mining classification.
+            assert_eq!(recv_request(&mut rx_legacy).await?, request);
+            // The native wire frame remains ordinary block inventory.
+            match recv_request(&mut rx_b).await? {
+                Request::AdvertiseBlock(received, Some(PeerSource::Zakura(peer_id))) => {
+                    assert_eq!(received, hash);
+                    assert_eq!(peer_id, a_peer_id);
+                }
+                request => panic!("unexpected zakura request: {request:?}"),
             }
-            request => panic!("unexpected zakura request: {request:?}"),
         }
 
         node_a.shutdown().await;
@@ -6023,7 +6797,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6063,7 +6837,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6085,7 +6859,7 @@ mod tests {
             BLOCK_TESTNET_141042_BYTES.as_slice(),
         )?);
         let received_hash = block.hash();
-        let requested_hashes = HashSet::from([block_hash(250)]);
+        let requested_hashes = IndexSet::from([block_hash(250)]);
         assert!(!requested_hashes.contains(&received_hash));
         let trace = ZakuraTrace::noop();
 

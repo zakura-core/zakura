@@ -38,6 +38,7 @@ impl PeerRoutine {
     /// the per-variant field detail lives on the reactor's heavier trace path.
     pub(super) fn trace_message_received(&self, msg: &BlockSyncMessage) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.kind = Some(block_sync_message_label(msg));
         });
     }
@@ -226,10 +227,11 @@ impl PeerRoutine {
         row.bbr_reliability_permille = Some(self.window.bbr_reliability_permille());
     }
 
-    /// Emit the periodic per-peer BBR heartbeat (`block_peer_bbr`). Fires even while the
+    /// Emit a per-peer BBR sample (`block_peer_bbr`). The heartbeat fires even while the
     /// peer is idle, so the controller's balance is observable between deliveries — e.g.
     /// a cwnd that keeps ramping up only to be pulled back by the reliability discount
-    /// instead of settling near `r = 1.0`.
+    /// instead of settling near `r = 1.0`. A sample also follows each batch of expired
+    /// requests, because those usually return without a trace row of their own.
     pub(super) fn trace_bbr_sample(&self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.peer));

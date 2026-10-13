@@ -1033,14 +1033,7 @@ fn v3_clone_preserves_root_and_future_append() -> Result<()> {
 /// versions.
 #[test]
 fn history_tree_from_block_matches_parts_across_history_versions() -> Result<()> {
-    let pre_heartwood = Network::new_regtest(RegtestParameters {
-        activation_heights: ConfiguredActivationHeights {
-            heartwood: Some(2),
-            canopy: Some(2),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
+    let pre_heartwood = Network::Mainnet;
     let v1 = Network::new_regtest(RegtestParameters::default());
     let v2 = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {

@@ -277,8 +277,8 @@ borrowed a bypass slot.
 
 ## Size corrections
 
-A later known hint for the same header and auxiliary payload can replace an unknown
-or stale size. Unknown never erases known. State keeps the correction in a sparse
+A later known hint for the same header and auxiliary payload can fill an unknown size
+once, but never replaces a known one. State keeps the fill in a sparse
 `header_aux_body_size_v1` row beside the original delivery evidence and removes it
 when that delivery is pruned. Committed block sizes still take precedence.
 

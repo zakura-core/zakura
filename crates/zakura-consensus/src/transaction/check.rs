@@ -396,8 +396,8 @@ pub fn coinbase_has_no_orchard_shielded_data(
 /// <https://developer.bitcoin.org/devguide/block_chain.html#introduction>
 ///
 /// A _nullifier_ *MUST NOT* repeat either within a _transaction_, or across _transactions_ in a
-/// _valid blockchain_ . *Sprout* and *Sapling* and *Orchard* _nulliers_ are considered disjoint,
-/// even if they have the same bit pattern.
+/// _valid blockchain_. Sprout, Sapling, Orchard, and Ironwood nullifiers are
+/// considered disjoint, even if they have the same bit pattern.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#nullifierset>
 pub fn spend_conflicts(transaction: &Transaction) -> Result<(), TransactionError> {
@@ -431,12 +431,43 @@ fn check_for_duplicates<'t, T>(
 where
     T: Clone + Eq + Hash + 't,
 {
-    let mut hash_set = HashSet::new();
+    const MAX_INITIAL_CAPACITY: usize = 1_024;
 
-    for item in items {
-        if let Some(duplicate) = hash_set.replace(item) {
-            return Err(error_wrapper(duplicate.into_owned()));
+    let mut items = items.into_iter();
+    // Avoid allocating a hash table for groups with at most four items.
+    let mut small: [Option<Cow<'t, T>>; 4] = [None, None, None, None];
+    let mut small_len = 0;
+
+    while let Some(item) = items.next() {
+        for previous in small[..small_len].iter().flatten() {
+            if previous == &item {
+                return Err(error_wrapper((*previous).clone().into_owned()));
+            }
         }
+
+        if small_len < small.len() {
+            small[small_len] = Some(item);
+            small_len += 1;
+            continue;
+        }
+
+        // An early duplicate in a large untrusted transaction should not
+        // allocate for every later input or action before it is rejected.
+        let capacity = small
+            .len()
+            .saturating_add(1)
+            .saturating_add(items.size_hint().1.unwrap_or(0))
+            .min(MAX_INITIAL_CAPACITY);
+        let mut hash_set = HashSet::with_capacity(capacity);
+        hash_set.extend(small.into_iter().flatten());
+
+        for item in std::iter::once(item).chain(items) {
+            if let Some(duplicate) = hash_set.replace(item) {
+                return Err(error_wrapper(duplicate.into_owned()));
+            }
+        }
+
+        return Ok(());
     }
 
     Ok(())
@@ -523,15 +554,7 @@ pub fn coinbase_expiry_height(
         //
         // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
         if *block_height >= nu5_activation_height {
-            if expiry_height != Some(*block_height) {
-                return Err(TransactionError::CoinbaseExpiryBlockHeight {
-                    expiry_height,
-                    block_height: *block_height,
-                    transaction_hash: coinbase.hash(),
-                });
-            } else {
-                return Ok(());
-            }
+            return coinbase_height_matches_expiry(block_height, coinbase);
         }
     }
 
@@ -542,6 +565,23 @@ pub fn coinbase_expiry_height(
     //
     // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
     validate_expiry_height_max(expiry_height, true, block_height, coinbase)
+}
+
+/// Checks the height rule for NU5+ coinbase transactions.
+/// Their transaction IDs commit to the expiry height but exclude the coinbase input height.
+pub(crate) fn coinbase_height_matches_expiry(
+    block_height: &Height,
+    coinbase: &Transaction,
+) -> Result<(), TransactionError> {
+    let expiry_height = coinbase.expiry_height();
+    if expiry_height != Some(*block_height) {
+        return Err(TransactionError::CoinbaseExpiryBlockHeight {
+            expiry_height,
+            block_height: *block_height,
+            transaction_hash: coinbase.hash(),
+        });
+    }
+    Ok(())
 }
 
 /// Returns `Ok(())` if the expiry height for a non coinbase transaction is
@@ -907,4 +947,93 @@ pub fn consensus_branch_id(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use std::hash::{Hash, Hasher};
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct Key {
+        id: u8,
+        payload: u8,
+    }
+
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    impl Eq for Key {}
+
+    impl Hash for Key {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.id.hash(state);
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_matches_hash_set_for_small_and_large_inputs() {
+        for length in 0usize..=10 {
+            let unique: Vec<_> = (0..length)
+                .map(|index| {
+                    let index = u8::try_from(index).expect("test index is at most ten");
+                    Key {
+                        id: index,
+                        payload: index,
+                    }
+                })
+                .collect();
+
+            let check = |keys: &[Key]| {
+                let items = || {
+                    keys.iter().enumerate().map(|(index, key)| {
+                        if index % 2 == 0 {
+                            Cow::Borrowed(key)
+                        } else {
+                            Cow::Owned(key.clone())
+                        }
+                    })
+                };
+
+                let actual = check_for_duplicates(items(), |key| {
+                    TransactionError::Other(format!("{}:{}", key.id, key.payload))
+                })
+                .err()
+                .map(|error| error.to_string());
+
+                let mut unknown_size_items = items();
+                let without_upper_bound = check_for_duplicates(
+                    std::iter::from_fn(move || unknown_size_items.next()),
+                    |key| TransactionError::Other(format!("{}:{}", key.id, key.payload)),
+                )
+                .err()
+                .map(|error| error.to_string());
+
+                let mut seen = HashSet::new();
+                let expected = items().find_map(|item| {
+                    seen.replace(item)
+                        .map(|prior| format!("{}:{}", prior.id, prior.payload))
+                });
+                let expected = expected.map(|key| TransactionError::Other(key).to_string());
+
+                assert_eq!(actual, expected, "keys: {keys:?}");
+                assert_eq!(without_upper_bound, expected, "keys: {keys:?}");
+            };
+
+            check(&unique);
+            for first in 0..length {
+                for second in first + 1..length {
+                    let mut duplicate = unique.clone();
+                    duplicate[second].id = duplicate[first].id;
+                    duplicate[second].payload =
+                        200 + u8::try_from(second).expect("test index is at most ten");
+                    check(&duplicate);
+                }
+            }
+        }
+    }
 }

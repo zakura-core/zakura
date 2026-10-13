@@ -52,7 +52,10 @@ pub(super) fn quick_check(db: &ZakuraDb) -> Result<(), String> {
     let mut prev_key = None;
     let mut prev_tree: Option<Arc<HistoryTree>> = None;
 
-    for (key, tree) in db.history_trees_full_tip() {
+    for (key, tree) in db
+        .try_history_trees_full_tip()
+        .map_err(|error| format!("cannot load stored history tree snapshots: {error}"))?
+    {
         // The tip tree should be indexed by `()` (which serializes to an empty array).
         if !key.raw_bytes().is_empty() {
             result = Err(format!(
@@ -95,4 +98,43 @@ pub(super) fn detailed_check(
 ) -> Result<Result<(), String>, CancelFormatChange> {
     // This upgrade only changes two key-value pairs, so checking it is always quick.
     Ok(quick_check(db))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        service::finalized_state::{disk_format::RawBytes, FinalizedState},
+        Config,
+    };
+    use zakura_chain::parameters::Network;
+
+    #[test]
+    fn quick_check_reports_history_snapshot_decode_errors() {
+        let _init_guard = zakura_test::init();
+        let state = FinalizedState::new(&Config::ephemeral(), &Network::Mainnet)
+            .expect("the ephemeral state opens");
+        state
+            .db
+            .raw_history_tree_cf()
+            .new_batch_for_writing()
+            .zs_insert(
+                &RawBytes::new_raw_bytes(Vec::new()),
+                &RawBytes::new_raw_bytes(vec![0xff]),
+            )
+            .write_batch()
+            .expect("the malformed snapshot writes");
+        let error = quick_check(&state.db).expect_err("snapshot decoding must return an error");
+        assert!(error.contains("cannot load stored history tree snapshots"));
+
+        // Shutdown checks a current-format database and panics on an invalid one,
+        // so remove the malformed snapshot before the state drops.
+        state
+            .db
+            .raw_history_tree_cf()
+            .new_batch_for_writing()
+            .zs_delete(&RawBytes::new_raw_bytes(Vec::new()))
+            .write_batch()
+            .expect("the malformed snapshot deletes");
+    }
 }

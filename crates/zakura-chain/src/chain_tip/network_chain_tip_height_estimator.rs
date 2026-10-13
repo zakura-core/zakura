@@ -68,7 +68,11 @@ impl NetworkChainTipHeightEstimator {
     /// estimation.
     pub fn estimate_height_at(mut self, target_time: DateTime<Utc>) -> block::Height {
         while let Some((change_height, next_target_spacing)) = self.next_target_spacings.next() {
-            self.estimate_up_to(change_height);
+            self.estimate_up_to(
+                change_height
+                    .previous()
+                    .expect("target spacing changes after genesis"),
+            );
 
             if self.current_block_time >= target_time {
                 break;

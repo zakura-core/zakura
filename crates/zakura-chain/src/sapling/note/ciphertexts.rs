@@ -1,8 +1,8 @@
 //! Encrypted parts of Sapling notes.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
-
-use serde_big_array::BigArray;
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
@@ -10,7 +10,9 @@ use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize}
 ///
 /// Corresponds to the Sapling 'encCiphertext's
 #[derive(Deserialize, Serialize)]
-pub struct EncryptedNote(#[serde(with = "BigArray")] pub(crate) [u8; 580]);
+pub struct EncryptedNote(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub(crate) [u8; 580],
+);
 
 impl From<[u8; 580]> for EncryptedNote {
     fn from(byte_array: [u8; 580]) -> Self {
@@ -52,7 +54,9 @@ impl ZcashSerialize for EncryptedNote {
 }
 
 impl ZcashDeserialize for EncryptedNote {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 580];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))
@@ -69,7 +73,9 @@ impl From<EncryptedNote> for [u8; 580] {
 ///
 /// Corresponds to Sapling's 'outCiphertext'
 #[derive(Deserialize, Serialize)]
-pub struct WrappedNoteKey(#[serde(with = "BigArray")] pub(crate) [u8; 80]);
+pub struct WrappedNoteKey(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub(crate) [u8; 80],
+);
 
 impl From<[u8; 80]> for WrappedNoteKey {
     fn from(byte_array: [u8; 80]) -> Self {
@@ -111,7 +117,9 @@ impl ZcashSerialize for WrappedNoteKey {
 }
 
 impl ZcashDeserialize for WrappedNoteKey {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 80];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

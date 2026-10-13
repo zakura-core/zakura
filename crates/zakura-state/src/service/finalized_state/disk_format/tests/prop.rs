@@ -1,9 +1,9 @@
 //! Randomised tests for the finalized disk format.
 
-use proptest::prelude::*;
+use proptest::{prelude::*, test_runner::TestCaseResult};
 
 use zakura_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Height},
     block_info::BlockInfo,
     ironwood, orchard, sapling, sprout,
@@ -24,6 +24,38 @@ use crate::service::finalized_state::{
         FromDisk, IntoDisk, TransactionLocation,
     },
 };
+
+fn assert_serialized_equality<T>(val1: T, val2: T) -> TestCaseResult
+where
+    T: IntoDisk + PartialEq + std::fmt::Debug,
+    T::Bytes: PartialEq + std::fmt::Debug,
+{
+    if val1 == val2 {
+        prop_assert_eq!(
+            val1.as_bytes(),
+            val2.as_bytes(),
+            "struct values were equal, but serialized bytes were not.\n\
+             Values:\n\
+             {:?}\n\
+             {:?}",
+            val1,
+            val2,
+        );
+    } else {
+        prop_assert_ne!(
+            val1.as_bytes(),
+            val2.as_bytes(),
+            "struct values were not equal, but serialized bytes were equal.\n\
+             Values:\n\
+             {:?}\n\
+             {:?}",
+            val1,
+            val2,
+        );
+    }
+
+    Ok(())
+}
 
 // Common
 
@@ -107,35 +139,12 @@ fn roundtrip_transaction() {
 
 // Transparent
 
-// TODO: turn this into a generic function like assert_value_properties()
 #[test]
 fn serialized_transparent_address_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<transparent::Address>(), val2 in any::<transparent::Address>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -241,29 +250,7 @@ fn serialized_sprout_nullifier_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<sprout::Nullifier>(), val2 in any::<sprout::Nullifier>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -273,29 +260,7 @@ fn serialized_sprout_tree_root_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<sprout::tree::Root>(), val2 in any::<sprout::tree::Root>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -316,29 +281,7 @@ fn serialized_sapling_nullifier_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<sapling::Nullifier>(), val2 in any::<sapling::Nullifier>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -348,29 +291,7 @@ fn serialized_sapling_tree_root_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<sapling::tree::Root>(), val2 in any::<sapling::tree::Root>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -401,29 +322,7 @@ fn serialized_orchard_nullifier_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<orchard::Nullifier>(), val2 in any::<orchard::Nullifier>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -433,29 +332,7 @@ fn serialized_orchard_tree_root_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<orchard::tree::Root>(), val2 in any::<orchard::tree::Root>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -486,29 +363,7 @@ fn serialized_ironwood_nullifier_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<ironwood::Nullifier>(), val2 in any::<ironwood::Nullifier>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -518,29 +373,7 @@ fn serialized_ironwood_tree_root_equal() {
     let _init_guard = zakura_test::init();
 
     proptest!(|(val1 in any::<ironwood::tree::Root>(), val2 in any::<ironwood::tree::Root>())| {
-        if val1 == val2 {
-            prop_assert_eq!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were equal, but serialized bytes were not.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        } else {
-            prop_assert_ne!(
-                val1.as_bytes(),
-                val2.as_bytes(),
-                "struct values were not equal, but serialized bytes were equal.\n\
-                 Values:\n\
-                 {:?}\n\
-                 {:?}",
-                val1,
-                val2,
-            );
-        }
+        assert_serialized_equality(val1, val2)?;
     }
     );
 }
@@ -582,8 +415,30 @@ fn roundtrip_block_info_with_ironwood_value_pool() {
     let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
     let block_info = BlockInfo::new(ValueBalance::from_ironwood_amount(ironwood_amount), 123);
 
-    assert_eq!(block_info.as_bytes().len(), 52);
+    assert_eq!(block_info.as_bytes().len(), 60);
     assert_value_properties(block_info);
+}
+
+/// A `BlockInfo` written before the NSM value balance leg still decodes, with a zero
+/// balance. The `nsm_value_balance_pool` database upgrade replaces that placeholder.
+#[test]
+fn block_info_decodes_pre_nsm_value_balance_value_pools() {
+    let _init_guard = zakura_test::init();
+
+    let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
+    let value_pools = ValueBalance::from_ironwood_amount(ironwood_amount);
+
+    let mut pre_upgrade_bytes = value_pools.as_bytes()[..48].to_vec();
+    pre_upgrade_bytes.extend_from_slice(&123_u32.to_le_bytes());
+
+    let block_info = BlockInfo::from_bytes(pre_upgrade_bytes);
+
+    assert_eq!(block_info.value_pools().ironwood_amount(), ironwood_amount);
+    assert_eq!(
+        block_info.value_pools().nsm_value_balance_amount(),
+        Amount::<NegativeAllowed>::zero(),
+    );
+    assert_eq!(block_info.size(), 123);
 }
 
 #[test]

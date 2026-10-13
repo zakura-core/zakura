@@ -79,23 +79,6 @@ impl ZakuraTestCluster {
         &self.nodes[index]
     }
 
-    /// Connect nodes according to `topology`.
-    pub async fn connect_topology(
-        &self,
-        topology: ClusterTopology,
-        timeout: Duration,
-    ) -> Result<(), BoxError> {
-        match topology {
-            ClusterTopology::FullMesh => self.connect_full_mesh(timeout).await,
-            ClusterTopology::Line => {
-                for pair in self.nodes.windows(2) {
-                    pair[0].connect_native(&pair[1], timeout).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Connect every pair in the cluster.
     pub async fn connect_full_mesh(&self, timeout: Duration) -> Result<(), BoxError> {
         for left in 0..self.nodes.len() {
@@ -144,9 +127,10 @@ fn contains_peer(peers: &[ZakuraPeerId], expected: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HostilePeer, TraceValue};
+    use super::super::{HostilePeer, LocalEndpointFactory, TraceValue};
     use super::*;
     use crate::{
+        zakura::handler::i_open_collision_winner,
         zakura::trace::block_sync_trace as bs_trace,
         zakura::{
             block_sync::{MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC},
@@ -154,10 +138,10 @@ mod tests {
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
             DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
             HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
-            Stream, StreamMode, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits,
-            FRAME_HEADER_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -495,7 +479,7 @@ mod tests {
         version: 1,
         frame_cap: CUSTOM_FRAME_CAP_BYTES,
         capability: CUSTOM_FRAME_CAP_CAPABILITY,
-        mode: StreamMode::Persistent,
+        ..Stream::PERSISTENT
     }];
 
     #[derive(Debug, Default)]
@@ -1172,9 +1156,24 @@ mod tests {
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let driver =
             drive_native_block_sync_actions(victim, blocks.clone(), submitted.clone()).await;
-        let hostile =
-            HostilePeer::connect_native_with_capabilities(victim, 61, ZAKURA_CAP_BLOCK_SYNC)
-                .await?;
+        // The victim also opens stream 6 for its own demand. It adopts the
+        // hostile peer's stream only when the hostile peer wins the
+        // ordered-stream collision, so pick a seed with a smaller node id.
+        let victim_id = LocalEndpointFactory::secret_key(60).public();
+        let hostile_seed = (61..1061)
+            .find(|seed| {
+                i_open_collision_winner(
+                    &LocalEndpointFactory::secret_key(*seed).public(),
+                    &victim_id,
+                )
+            })
+            .expect("about half of all seeds derive a node id smaller than the victim's");
+        let hostile = HostilePeer::connect_native_with_capabilities(
+            victim,
+            hostile_seed,
+            ZAKURA_CAP_BLOCK_SYNC,
+        )
+        .await?;
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
         await_until("block-sync peer registered", Duration::from_secs(5), || {

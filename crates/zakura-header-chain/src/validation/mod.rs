@@ -30,8 +30,9 @@ pub use context_free::{
     PowPolicy, PowPolicyError,
 };
 pub use contextual::{
-    validate_contextual_difficulty_and_time, AdjustedDifficulty, AdjustedDifficultyError,
-    ContextualValidationError, BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN,
-    POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
+    pow_adjustment_block_span_for_height, validate_contextual_difficulty_and_time,
+    AdjustedDifficulty, AdjustedDifficultyError, ContextualValidationError,
+    BLOCK_MAX_TIME_SINCE_MEDIAN, MAX_POW_ADJUSTMENT_BLOCK_SPAN, MAX_POW_PREDECESSOR_CONTEXT_SPAN,
+    POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
 };
 pub use prepare::{prepare_headers, HeaderBatchInput, HeaderFailure, HeaderRule, HeaderRules};

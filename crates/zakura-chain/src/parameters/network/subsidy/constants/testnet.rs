@@ -20,6 +20,12 @@ pub(crate) const FIRST_HALVING: Height = Height(1_116_000);
 /// The start height of post-NU6 funding streams on Testnet as described in [ZIP-1015](https://zips.z.cash/zip-1015).
 pub(crate) const POST_NU6_FUNDING_STREAM_START_HEIGHT: u32 = 2_976_000;
 
+/// `INITIAL_NSM_VALUE_BALANCE` on Testnet, measured the same way as Mainnet's at the
+/// last pre-NU6 height, 2,975,999.
+///
+/// See [`mainnet::INITIAL_NSM_VALUE_BALANCE`](super::mainnet::INITIAL_NSM_VALUE_BALANCE).
+pub(crate) const INITIAL_NSM_VALUE_BALANCE: Amount<NonNegative> = Amount::new(55_768_414_957);
+
 /// The one-time lockbox disbursement output addresses and amounts expected in the NU6.1 activation block's
 /// coinbase transaction on Testnet.
 /// See:
@@ -197,6 +203,10 @@ lazy_static! {
     /// - [protocol specification §7.10.1][7.10.1]
     /// - [ZIP-1015](https://zips.z.cash/zip-1015)
     /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
+    ///
+    /// ZIP 218 moves the third halving, so the heights listed here are the heights
+    /// before ZIP 218. The Testnet parameters builder moves the end of the Revision 2
+    /// streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
     ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![

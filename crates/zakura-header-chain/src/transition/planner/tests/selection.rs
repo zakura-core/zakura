@@ -118,7 +118,7 @@ fn projection_delta_and_verified_selection_cover_fork_boundaries() {
         .set_body_validation_state(first.hash, BodyValidationState::Unknown)
         .expect("the intermediate body becomes unverified");
     assert_eq!(
-        select_fully_verified_path(&store.graph)
+        select_fully_verified_path(&store.graph, None)
             .expect("verified selection remains finalized-rooted"),
         vec![anchor],
         "a verified descendant cannot jump over an unverified parent"
@@ -133,6 +133,81 @@ fn complete_unchanged_projection_remains_borrowed() {
         .expect("the complete fixture projection remains valid");
 
     assert!(matches!(trimmed, Cow::Borrowed(_)));
+}
+
+#[test]
+fn settlement_reuses_only_an_unchanged_selected_path() {
+    use super::super::{
+        admission::HeaderInsertionRebase,
+        projected_state::ProjectedTransitionState,
+        settlement::{derive_finality_and_retention, FinalityRetentionOutcome, SettlementInputs},
+    };
+    use crate::graph::HeaderGraphView;
+
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let tip = insert_verified_branch(
+        &mut store.graph,
+        anchor,
+        32,
+        regtest_genesis_block().header.difficulty_threshold,
+        0x92,
+    );
+    synchronize_fixture(&mut store, tip);
+    let engine = test_engine(&store);
+    let snapshot = engine.snapshot();
+
+    for extend in [false, true] {
+        let mut projected = ProjectedTransitionState::new(&engine);
+        if extend {
+            let mut header = *regtest_genesis_block().header;
+            header.previous_block_hash = tip.hash;
+            header.nonce.0[0] = 0x93;
+            projected
+                .insert_header(
+                    Arc::new(header),
+                    HeaderValidationState::Valid,
+                    Vec::new(),
+                    BodyValidationState::Unknown,
+                )
+                .expect("the extension links to the retained selected tip");
+        } else {
+            projected
+                .set_body_validation_state(
+                    tip.hash,
+                    BodyValidationState::Verified {
+                        evidence: EvidenceId::from_digest([0x94; 32]),
+                    },
+                )
+                .expect("body evidence can change without changing header ancestry");
+        }
+        let selected_tip = projected
+            .graph()
+            .view_select_best_header_chain()
+            .expect("the projected graph has an eligible tip")
+            .0;
+        let expected = path(projected.graph(), selected_tip)
+            .expect("the reference path follows canonical parent links");
+        let outcome = derive_finality_and_retention(SettlementInputs {
+            engine: &engine,
+            projected,
+            metadata: store.metadata.clone(),
+            snapshot_before_commit: &snapshot,
+            event: &TransitionEvent::ReevaluateDeferred,
+            header_rebase: HeaderInsertionRebase::Current,
+            context: &context(&config, &clock, None),
+            old_selected: engine.selected_projection(),
+            old_verified: engine.verified_projection(),
+            full_state_authorization_version: None,
+        })
+        .expect("the bounded graph settles without advancing finality");
+        let FinalityRetentionOutcome::Settled(settled) = outcome else {
+            panic!("the bounded fixture fits within retention limits");
+        };
+        assert_eq!(settled.selected.as_ref(), expected);
+        assert_eq!(matches!(settled.selected, Cow::Borrowed(_)), !extend);
+    }
 }
 
 #[test]
@@ -757,5 +832,98 @@ fn transition_installs_only_on_its_exact_source_engine() {
     assert_eq!(
         engine.selected_projection().last().copied(),
         Some(expected.frontiers.header_best)
+    );
+}
+
+#[test]
+fn preferred_verified_tip_must_be_a_connected_greatest_work_tip() {
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let mut siblings = [0x31, 0x32]
+        .map(|seed| insert_verified_branch(&mut store.graph, anchor, 1, difficulty, seed));
+    siblings.sort_unstable_by_key(|frontier| frontier.hash.0);
+    let [hash_loser, hash_winner] = siblings;
+
+    // An equal-work tip whose own body is unverified.
+    let header_only = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x33);
+    store
+        .graph
+        .set_body_validation_state(header_only.hash, BodyValidationState::Unknown)
+        .expect("the header-only tip body becomes unverified");
+    // A verified tip with more work, above an unverified parent body.
+    let disconnected = insert_verified_branch(&mut store.graph, anchor, 2, difficulty, 0x34);
+    let unverified_parent = store
+        .graph
+        .header_ancestor(disconnected.hash, block::Height(1))
+        .expect("the test ancestry is coherent")
+        .expect("the two-header branch contains height one");
+    store
+        .graph
+        .set_body_validation_state(unverified_parent.hash, BodyValidationState::Unknown)
+        .expect("the intermediate body becomes unverified");
+    store
+        .graph
+        .recompute_all_header_eligibility()
+        .expect("the fixture eligibility cache recomputes");
+    let unknown = Frontier::new(hash_loser.height, block::Hash([0xee; 32]));
+    let tip_mismatch = TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::header_path(
+        HeaderPathKind::Verified,
+        HeaderPathProblem::TipMismatch,
+    ));
+
+    // Without a preference, the raw hash breaks the tie among connected verified tips.
+    assert_eq!(
+        select_fully_verified_path(&store.graph, None).unwrap(),
+        vec![anchor, hash_winner]
+    );
+    assert_eq!(
+        select_fully_verified_path(&store.graph, Some(hash_loser)).unwrap(),
+        vec![anchor, hash_loser]
+    );
+    for (preferred, reason) in [
+        (unknown, "an unknown hash"),
+        (header_only, "an equal-work tip without a verified body"),
+        (disconnected, "a higher-work tip above an unverified body"),
+    ] {
+        assert_eq!(
+            select_fully_verified_path(&store.graph, Some(preferred)),
+            Err(tip_mismatch.clone()),
+            "full state cannot prefer {reason}"
+        );
+    }
+
+    // A connected tip with more work still wins, so an equal-work preference no longer applies.
+    // The tip above an unverified body now has equal work, so only its ancestry excludes it.
+    let extended = insert_verified_branch(&mut store.graph, hash_winner, 1, difficulty, 0x35);
+    store
+        .graph
+        .recompute_all_header_eligibility()
+        .expect("the fixture eligibility cache recomputes");
+    assert_eq!(
+        store
+            .graph
+            .header_chain_score(extended.hash)
+            .unwrap()
+            .suffix_work,
+        store
+            .graph
+            .header_chain_score(disconnected.hash)
+            .unwrap()
+            .suffix_work
+    );
+    for (preferred, reason) in [
+        (hash_loser, "an eligible tip with less work"),
+        (disconnected, "an equal-work tip above an unverified body"),
+    ] {
+        assert_eq!(
+            select_fully_verified_path(&store.graph, Some(preferred)),
+            Err(tip_mismatch.clone()),
+            "full state cannot prefer {reason}"
+        );
+    }
+    assert_eq!(
+        select_fully_verified_path(&store.graph, Some(extended)).unwrap(),
+        vec![anchor, hash_winner, extended]
     );
 }

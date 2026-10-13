@@ -1,0 +1,347 @@
+//! Message tables: the messages each stream carries and the rules they follow.
+//!
+//! A service declares one [`MessageRule`] per message type in
+//! [`Stream::messages`]. The table is the single source of truth for that
+//! stream's messages:
+//!
+//! - the reader checks each frame header against it before reading the payload
+//!   ([`frame_filter`]);
+//! - [`Stream::validate_layout`] checks the tables of a whole layout when the
+//!   crate builds, and the registry checks them again at startup ([`layout`]);
+//! - the message family's codec and the generated test suites read the same
+//!   rows, so the header check, the decoder, and the tests cannot disagree.
+//!
+//! Tables hold values only: numbers, roles, message types, and durations. A bound
+//! that depends on a message's contents, such as a response cap chosen by its
+//! request, belongs in the codec or the reactor.
+//!
+//! A stream whose `messages` is `None` keeps the legacy behavior: its reader
+//! admits any message type and any flags up to the stream's frame cap.
+
+use std::time::Duration;
+
+use crate::zakura::handshake::LOCAL_MAX_IDLE_TIMEOUT_MILLIS;
+
+#[cfg(doc)]
+use super::Stream;
+
+pub(crate) mod frame_filter;
+pub(crate) mod layout;
+
+#[cfg(test)]
+pub(crate) mod frame_suite;
+#[cfg(test)]
+mod tests;
+
+/// One message type that a stream accepts.
+///
+/// ```
+/// # use zakura_network::zakura::{MessageRole, MessageRule, PayloadLen};
+/// const GET_ITEMS: MessageRule = MessageRule {
+///     message_type: 2,
+///     payload: PayloadLen::exact(8),
+///     role: MessageRole::Request {
+///         max_in_flight: 4,
+///         cadence: None,
+///     },
+/// };
+/// const ITEMS_DONE: MessageRule = MessageRule {
+///     message_type: 4,
+///     payload: PayloadLen::exact(8),
+///     role: MessageRole::Response {
+///         request: GET_ITEMS.message_type,
+///         ends_exchange: true,
+///     },
+/// };
+/// ```
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MessageRule {
+    /// Frame-header message type.
+    pub message_type: u16,
+    /// Payload length bounds, checked from the frame header before the payload
+    /// is read.
+    pub payload: PayloadLen,
+    /// The message's protocol role and the limits that role needs.
+    pub role: MessageRole,
+}
+
+impl MessageRule {
+    /// Return the row for `message_type`, if `rules` declares one.
+    pub fn find(rules: &[Self], message_type: u16) -> Option<&Self> {
+        rules.iter().find(|rule| rule.message_type == message_type)
+    }
+}
+
+/// A message's role in the peer-message regulation specification.
+///
+/// Each role carries exactly the limits the specification requires of it, so a
+/// row cannot declare a limit that its role does not use.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MessageRole {
+    /// Unsolicited state that the sender pushes at its own cadence.
+    Announcement {
+        /// Receiver-side bucket for each `(peer, message_type)`.
+        cadence: Cadence,
+    },
+    /// A message that asks the receiver to do work and respond.
+    Request {
+        /// Most exchanges of this request type a peer session may have open.
+        ///
+        /// This is the protocol maximum. A peer may advertise a lower limit at
+        /// runtime.
+        max_in_flight: u32,
+        /// Receiver-side bucket, for requests that exchange metadata at a
+        /// limited rate.
+        cadence: Option<Cadence>,
+    },
+    /// A request that opens, renews, and closes a subscription.
+    ///
+    /// The subscriber sends `Open`, `Grant`, and `Close` updates as frames of
+    /// this row; the payload tells them apart. The publisher pushes pages
+    /// while the subscriber's credit lasts, then ends the subscription with a
+    /// terminal outcome. Pages are response rows that do not end the exchange,
+    /// and the terminal outcome is a response row that does.
+    ///
+    /// Updates change a live exchange. They are not new commitments, so
+    /// serving never receives them.
+    ///
+    /// A subscription row needs a persistent stream, a live subscription,
+    /// nonzero credit, a cursor history that covers the credit, and a page row
+    /// whose smallest payload fits the byte credit. Each broken rule fails the
+    /// build. This one has no page row:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// const ENDED: MessageRule = MessageRule {
+    ///     message_type: 3,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// };
+    /// const FEED: [Stream; 1] = [Stream {
+    ///     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    ///     messages: Some(&[WATCH, ENDED]), ..Stream::PERSISTENT
+    /// }];
+    /// const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    ///
+    /// [`LayoutError`](layout::LayoutError) lists the other rules, each with
+    /// a failing declaration.
+    Subscription {
+        /// Most live or closing subscriptions one peer session may hold.
+        max_live: u32,
+        /// Most credit a subscription may hold beyond its acknowledged
+        /// progress. See [`Credit`].
+        credit: Credit,
+        /// Sent pages the publisher remembers so that an acknowledgement can
+        /// name one. It must cover `credit.objects`.
+        cursor_history: u32,
+        /// Receiver-side bucket for updates, where declared.
+        cadence: Option<Cadence>,
+    },
+    /// Part of the answer to a request that the receiver sent earlier.
+    Response {
+        /// Message type of the request this message answers.
+        ///
+        /// The request row may sit on another stream of the same layout.
+        request: u16,
+        /// Whether this message is the exchange's final message.
+        ///
+        /// A request's exchange ends with exactly one ending message. Messages
+        /// that do not end it may precede the ending, as bounded by the reactor.
+        ends_exchange: bool,
+    },
+}
+
+/// A subscription's credit window: objects and encoded payload bytes.
+///
+/// The window is the credit the subscriber granted minus the progress it
+/// acknowledged. Each grant must keep the window within these values. Both
+/// sides compute the same window: pages in flight move credit from "unspent"
+/// to "unacknowledged", which the window counts either way. So a grant that
+/// breaks it is a protocol violation.
+///
+/// Every page spends at least one object, so the publisher never holds more
+/// unacknowledged pages than `objects`. A cursor history of `objects` entries
+/// therefore always suffices.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Credit {
+    /// Objects, such as headers or items.
+    pub objects: u32,
+    /// Encoded payload bytes of the pages, frame headers excluded.
+    pub bytes: u32,
+}
+
+/// A row's rate: the sender's obligation and the receiver's bucket.
+///
+/// One declaration serves both sides. The sender leaves at least
+/// `send_interval` between two messages of the row. The receiver keeps a
+/// message-count bucket for each `(connection, message_type)`: a full bucket
+/// holds `capacity` messages and regains one every `refill_interval`.
+///
+/// [`Stream::validate_layout`] requires a faster refill than the sender and
+/// capacity for a connection-wide outage plus two messages. These checks size
+/// the observation bucket; they do not prove a sender violation. A single
+/// stream can stall longer while sibling traffic keeps the connection alive.
+/// The receiver records exhaustion without rejecting the message.
+///
+/// The receiver credits its own read pauses as they happen.
+///
+/// A sender every 30 seconds needs a refill under 30 seconds and a capacity of
+/// at least `10 min / 30 s + 2 = 22`:
+///
+/// ```
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 22,
+///     refill_interval: Duration::from_secs(20),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
+///
+/// A refill as slow as the sender fails the build, because jitter alone could
+/// empty the bucket:
+///
+/// ```compile_fail,E0080
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 22,
+///     refill_interval: Duration::from_secs(30),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
+///
+/// So does a capacity below the outage burst:
+///
+/// ```compile_fail,E0080
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 21,
+///     refill_interval: Duration::from_secs(20),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Cadence {
+    /// Messages a full bucket admits back to back.
+    pub capacity: u32,
+    /// Time for the receiver's bucket to regain one message.
+    pub refill_interval: Duration,
+    /// Shortest gap the sender leaves between two messages of the row.
+    pub send_interval: Duration,
+}
+
+impl Cadence {
+    /// Connection-wide outage used to size observation buckets.
+    ///
+    /// A connection closes after its negotiated idle timeout passes without a
+    /// packet, and this node never negotiates more than 10 minutes. Sibling
+    /// traffic can keep a connection alive while one stream stalls longer.
+    // Widening u32 to u64 is lossless.
+    pub const MAX_OUTAGE: Duration = Duration::from_millis(LOCAL_MAX_IDLE_TIMEOUT_MILLIS as u64);
+
+    /// Smallest observation capacity for a sender at `send_interval` after
+    /// a connection-wide outage. This does not bound stream-specific stalls.
+    ///
+    /// During an outage of [`Cadence::MAX_OUTAGE`], the sender queues at most
+    /// `MAX_OUTAGE / send_interval` messages in its transport buffers. The two
+    /// extra messages cover the initial send and one message of jitter.
+    ///
+    /// # Panics
+    ///
+    /// If `send_interval` is zero.
+    pub const fn min_capacity(send_interval: Duration) -> u32 {
+        let queued = Self::MAX_OUTAGE.as_nanos() / send_interval.as_nanos();
+        // Widening u32 to u128 is lossless, and the check keeps the narrowing
+        // cast below lossless. Only a sub-microsecond interval saturates.
+        if queued > (u32::MAX - 2) as u128 {
+            u32::MAX
+        } else {
+            queued as u32 + 2
+        }
+    }
+}
+
+/// Inclusive payload length bounds for one message type.
+///
+/// The bounds exclude the frame header. Every row has a finite maximum, which
+/// must equal the codec's largest valid encoding.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PayloadLen {
+    min: usize,
+    max: usize,
+}
+
+impl PayloadLen {
+    /// A payload of exactly `len` bytes.
+    pub const fn exact(len: usize) -> Self {
+        Self { min: len, max: len }
+    }
+
+    /// A payload of `min..=max` bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `min > max`. In a `const` declaration, this fails the build.
+    pub const fn between(min: usize, max: usize) -> Self {
+        assert!(min <= max, "a payload minimum must not exceed its maximum");
+        Self { min, max }
+    }
+
+    /// Smallest valid payload in bytes.
+    pub const fn min(self) -> usize {
+        self.min
+    }
+
+    /// Largest valid payload in bytes.
+    pub const fn max(self) -> usize {
+        self.max
+    }
+
+    /// Whether `len` is within these bounds.
+    pub const fn contains(self, len: usize) -> bool {
+        self.min <= len && len <= self.max
+    }
+}

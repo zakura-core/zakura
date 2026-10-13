@@ -3270,6 +3270,9 @@ mod zakura_header_sync_driver_tests {
             evidence: zakura_header_chain::EvidenceId::from_digest([4; 32]),
             kind: zakura_header_chain::TransientBodyFailureKind::Storage,
             availability: zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 3,
                 suppliers: 2,
                 alarmed: false,
@@ -3278,8 +3281,9 @@ mod zakura_header_sync_driver_tests {
         };
         action_tx
             .send(BlockSyncAction::RecordBodyUnavailable {
+                body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
                 expected_version,
-                failure,
+                failure: failure.clone(),
             })
             .await
             .expect("body retry persistence action queues");

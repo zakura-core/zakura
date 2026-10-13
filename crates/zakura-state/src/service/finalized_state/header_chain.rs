@@ -623,29 +623,167 @@ pub struct StartupReport {
     pub publication_allowed: bool,
 }
 
+type BodyUnavailableEntries =
+    HashMap<block::Hash, (Frontier, zakura_header_chain::BodyUnavailableSummary)>;
+
+struct AvailabilityChange {
+    hash: block::Hash,
+    entry: Option<(Frontier, zakura_header_chain::BodyUnavailableSummary)>,
+}
+
+fn availability_changes(changes: &ChangeSet, graph: &MemHeaderStore) -> Vec<AvailabilityChange> {
+    changes
+        .put_nodes
+        .iter()
+        .filter_map(|node| {
+            let entry = match &node.body_validation_state {
+                zakura_header_chain::BodyValidationState::Unavailable(summary) => {
+                    Some((Frontier::new(node.height, node.hash), summary.clone()))
+                }
+                _ if graph.header_node(node.hash).is_some_and(|old| {
+                    matches!(
+                        old.body_validation_state,
+                        zakura_header_chain::BodyValidationState::Unavailable(_)
+                    )
+                }) =>
+                {
+                    None
+                }
+                _ => return None,
+            };
+            Some(AvailabilityChange {
+                hash: node.hash,
+                entry,
+            })
+        })
+        .chain(changes.delete_nodes.iter().map(|hash| AvailabilityChange {
+            hash: *hash,
+            entry: None,
+        }))
+        .collect()
+}
+
+fn selected_contains(selected: &[Frontier], frontier: Frontier) -> bool {
+    selected
+        .binary_search_by_key(&frontier.height, |entry| entry.height)
+        .is_ok_and(|index| selected[index] == frontier)
+}
+
 /// The sole latest-value publisher for durable header-chain snapshots.
 #[derive(Clone, Debug)]
 pub struct Publisher {
     sender: watch::Sender<EngineSnapshot>,
+    retained_unavailable: Arc<Mutex<BodyUnavailableEntries>>,
     views: watch::Sender<CommittedHeaderChainView>,
     mirrors: Arc<Mutex<Vec<watch::Sender<Option<EngineSnapshot>>>>>,
     view_mirrors: Arc<Mutex<Vec<watch::Sender<Option<CommittedHeaderChainView>>>>>,
 }
 
 impl Publisher {
-    fn new(snapshot: EngineSnapshot) -> Self {
-        record_published_snapshot(&snapshot);
-        let (sender, _) = watch::channel(snapshot.clone());
-        let (views, _) = watch::channel(CommittedHeaderChainView::new(
-            snapshot,
+    fn new(snapshot: EngineSnapshot, engine: &HeaderChainEngine) -> Self {
+        // Recovery rebuilt the graph once; retain only unavailable episodes for incremental publication.
+        let retained_unavailable: BodyUnavailableEntries = engine
+            .graph()
+            .header_nodes()
+            .filter_map(|node| match &node.body_validation_state {
+                zakura_header_chain::BodyValidationState::Unavailable(summary) => Some((
+                    node.hash,
+                    (Frontier::new(node.height, node.hash), summary.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut view = CommittedHeaderChainView::new(
+            snapshot.clone(),
             zakura_header_chain::BodyWorkEpoch::default(),
-        ));
+        );
+        view.body_unavailable = Arc::new(
+            retained_unavailable
+                .iter()
+                .filter(|(_, (frontier, _))| {
+                    selected_contains(engine.selected_projection(), *frontier)
+                })
+                .map(|(hash, entry)| (*hash, entry.clone()))
+                .collect(),
+        );
+        record_published_snapshot(&snapshot);
+        let (sender, _) = watch::channel(snapshot);
+        let (views, _) = watch::channel(view);
         Self {
             sender,
+            retained_unavailable: Arc::new(Mutex::new(retained_unavailable)),
             views,
             mirrors: Arc::new(Mutex::new(Vec::new())),
             view_mirrors: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn project_availability(
+        &self,
+        changes: &[AvailabilityChange],
+        engine: &HeaderChainEngine,
+        effect: TransitionEffect,
+    ) -> Arc<BodyUnavailableEntries> {
+        let previous = self.views.borrow();
+        let mut retained = self
+            .retained_unavailable
+            .lock()
+            .expect("availability publication is serialized by the state writer");
+        for change in changes {
+            match &change.entry {
+                Some(entry) => {
+                    retained.insert(change.hash, entry.clone());
+                }
+                None => {
+                    retained.remove(&change.hash);
+                }
+            }
+        }
+        let selected = engine.selected_projection();
+        if effect.invalidates_body_work()
+            || !selected_contains(selected, previous.frontiers.header_best)
+            || !selected_contains(selected, previous.frontiers.finalized)
+        {
+            let projected: BodyUnavailableEntries = retained
+                .iter()
+                .filter(|(_, (frontier, _))| selected_contains(selected, *frontier))
+                .map(|(hash, entry)| (*hash, entry.clone()))
+                .collect();
+            return if *previous.body_unavailable == projected {
+                previous.body_unavailable.clone()
+            } else {
+                Arc::new(projected)
+            };
+        }
+        let mut projected = previous.body_unavailable.clone();
+        for change in changes {
+            let current = retained
+                .get(&change.hash)
+                .filter(|(frontier, _)| selected_contains(selected, *frontier));
+            if projected.get(&change.hash) == current {
+                continue;
+            }
+            match current {
+                Some(entry) => {
+                    Arc::make_mut(&mut projected).insert(change.hash, entry.clone());
+                }
+                None => {
+                    Arc::make_mut(&mut projected).remove(&change.hash);
+                }
+            }
+        }
+        // A preserved lineage can only append selected headers. Existing off-branch episodes
+        // become visible when that suffix is selected, even if their own rows did not change.
+        let appended = selected
+            .partition_point(|frontier| frontier.height <= previous.frontiers.header_best.height);
+        for frontier in &selected[appended..] {
+            if let Some(entry) = retained.get(&frontier.hash) {
+                if projected.get(&frontier.hash) != Some(entry) {
+                    Arc::make_mut(&mut projected).insert(frontier.hash, entry.clone());
+                }
+            }
+        }
+        projected
     }
 
     /// Return the latest durable snapshot.
@@ -686,8 +824,14 @@ impl Publisher {
             .push(sender);
     }
 
-    fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect) {
-        self.publish_with_hint_changes(snapshot, effect, Vec::new());
+    fn publish(
+        &self,
+        snapshot: EngineSnapshot,
+        effect: TransitionEffect,
+        availability: &[AvailabilityChange],
+        engine: &HeaderChainEngine,
+    ) {
+        self.publish_with_hint_changes(snapshot, effect, Vec::new(), availability, engine);
     }
 
     fn publish_with_hint_changes(
@@ -699,6 +843,8 @@ impl Publisher {
             block::Hash,
             zakura_header_chain::BodySizeHint,
         )>,
+        availability: &[AvailabilityChange],
+        engine: &HeaderChainEngine,
     ) {
         let previous_hint_revision = self.views.borrow().body_size_hint_revision;
         let previous_epoch = self.views.borrow().body_work_epoch;
@@ -710,6 +856,7 @@ impl Publisher {
             previous_epoch
         };
         let mut view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        view.body_unavailable = self.project_availability(availability, engine, effect);
         view.body_size_hint_batches = self.views.borrow().body_size_hint_batches.clone();
         view.body_size_hint_revision = if !updates.is_empty() {
             previous_hint_revision
@@ -814,6 +961,7 @@ fn record_published_snapshot(snapshot: &EngineSnapshot) {
         body_unavailable = snapshot
             .alarms
             .header_best_body_unavailable
+            .as_ref()
             .is_some_and(|alarm| alarm.alarmed),
         migrated_pin_refuted = ?snapshot.alarms.migrated_pin_refuted,
         "published committed Zakura header-chain snapshot"
@@ -937,6 +1085,7 @@ fn restore_transition_engine_after_staging_error(
 /// Read-only coherent queries serialized against durable header transitions.
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderChainReader {
+    publisher: Publisher,
     store: HeaderChainStore,
     config: Arc<EngineConfig>,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
@@ -1588,6 +1737,29 @@ impl HeaderChainReader {
             .validation_context(parent_hash, self.config.network())
             .map(Some)
             .map_err(HeaderChainStoreError::Store)
+    }
+
+    /// Read one exact retained body without scanning or copying the selected path.
+    pub(crate) fn body_state(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<crate::HeaderChainBodyState>, HeaderChainStoreError> {
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let snapshot = self.store.snapshot()?;
+        let Some(node) = self.store.header_node(hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::HeaderChainBodyState {
+            body_work_epoch: self.publisher.view().body_work_epoch,
+            state_version: snapshot.state_version,
+            frontier: Frontier::new(node.height, hash),
+            selected: self.store.selected_hash(node.height)? == Some(hash),
+            validation: node.body_validation_state,
+        }))
     }
 
     pub(crate) fn selected_tip(&self) -> Result<Frontier, HeaderChainStoreError> {
@@ -2689,6 +2861,7 @@ impl HeaderChainRuntime {
     /// Return a read-only handle whose compound reads share the transition lock.
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
+            publisher: self.publisher.clone(),
             store: self.store.clone(),
             config: Arc::new(self.config.clone()),
             leases: self.leases.clone(),
@@ -2921,6 +3094,7 @@ impl HeaderChainRuntime {
                 "checkpoint auxiliary authentication exhausted header resources",
             ));
         }
+        let mut availability = availability_changes(first.change_set(), transition_engine.graph());
         let batch = self
             .store
             .batch_for_combined(first.change_set(), full_state_batch)?;
@@ -2975,6 +3149,10 @@ impl HeaderChainRuntime {
             return Err(error);
         }
         let checkpoint_effect = checkpoint.effect();
+        availability.extend(availability_changes(
+            checkpoint.change_set(),
+            transition_engine.graph(),
+        ));
 
         let current = checkpoint.snapshot_after_commit();
         let batch = match self
@@ -3008,7 +3186,12 @@ impl HeaderChainRuntime {
             return Err(error);
         }
         memory_swap();
-        self.publisher.publish(current, checkpoint_effect);
+        self.publisher.publish(
+            current,
+            checkpoint_effect,
+            &availability,
+            &transition_engine,
+        );
         Ok(ApplyResult::Committed)
     }
 
@@ -3531,6 +3714,7 @@ impl HeaderChainRuntime {
             Err(error) => return Err(error.into()),
         };
         let transition_effect = transition.effect();
+        let availability = availability_changes(transition.change_set(), transition_engine.graph());
         let resource_stalled = transition_effect.is_resource_stalled();
         let stall_receipt = resource_stalled.then(|| CommittedStallReceipt {
             state_version: transition.change_set().metadata.state_version,
@@ -3563,7 +3747,12 @@ impl HeaderChainRuntime {
             transition_engine.install_committed_transition(transition)?;
             #[cfg(test)]
             fault(FaultPoint::AfterCommit)?;
-            self.publisher.publish(current, transition_effect);
+            self.publisher.publish(
+                current,
+                transition_effect,
+                &availability,
+                &transition_engine,
+            );
             #[cfg(test)]
             fault(FaultPoint::AfterPublish)?;
             return Ok(ApplyResult::ResourceStalled(receipt));
@@ -3682,8 +3871,13 @@ impl HeaderChainRuntime {
                 ))
             })
             .collect();
-        self.publisher
-            .publish_with_hint_changes(current, transition_effect, updates);
+        self.publisher.publish_with_hint_changes(
+            current,
+            transition_effect,
+            updates,
+            &availability,
+            &transition_engine,
+        );
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
@@ -4212,6 +4406,7 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(current.clone(), &transition_engine);
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
@@ -4219,7 +4414,6 @@ impl HeaderChainStore {
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         drop(writer);
@@ -4298,6 +4492,7 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(current.clone(), &transition_engine);
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
@@ -4305,7 +4500,6 @@ impl HeaderChainStore {
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {
@@ -4377,6 +4571,7 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(current.clone(), &transition_engine);
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
@@ -4384,7 +4579,6 @@ impl HeaderChainStore {
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {
@@ -4594,6 +4788,7 @@ impl HeaderChainStore {
         let transition_engine =
             settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
+        let publisher = Publisher::new(current.clone(), &transition_engine);
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
             previous,
@@ -4601,7 +4796,6 @@ impl HeaderChainStore {
             repairs,
             publication_allowed: true,
         };
-        let publisher = Publisher::new(current);
         drop(writer);
         Ok((
             HeaderChainRuntime {

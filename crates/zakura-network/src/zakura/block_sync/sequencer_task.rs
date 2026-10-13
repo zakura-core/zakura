@@ -47,6 +47,7 @@ pub(super) struct SequencedBody {
     pub(super) bytes: u64,
     pub(super) peer: ZakuraPeerId,
     pub(super) received_at: Instant,
+    pub(super) rejected_delivery: Option<zakura_header_chain::BodyPayloadMismatch>,
     queue_accounting: SequencerInputAccounting,
 }
 
@@ -76,6 +77,7 @@ impl SequencedBody {
             bytes,
             peer,
             received_at,
+            rejected_delivery: None,
             queue_accounting: SequencerInputAccounting::new(
                 input_bytes,
                 bytes,
@@ -189,7 +191,7 @@ pub(super) enum SequencerControlInput {
         hash: block::Hash,
         outcome: BlockApplyOutcome,
         eligible_sources: BTreeSet<zakura_header_chain::SourceId>,
-        persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
+        persisted_availability: Option<Box<zakura_header_chain::BodyUnavailableSummary>>,
         semantic_completion: Option<(
             zakura_header_chain::BodyWorkOwner,
             zakura_header_chain::StateVersion,
@@ -279,6 +281,7 @@ pub(super) struct SequencerTask {
     current_scope: Option<zakura_header_chain::BodyWorkAuthority>,
     /// Global CAS coordinate for synchronous alarm writes, never body-work authority.
     current_state_version: Option<zakura_header_chain::StateVersion>,
+    committed_views: Option<watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
     body_retries: crate::zakura::header_sync::BodyRetryQueue,
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     body_input_rx: mpsc::Receiver<SequencedBody>,
@@ -343,6 +346,7 @@ impl SequencerTask {
             current_scope,
             current_state_version: current_scope
                 .map(|_| zakura_header_chain::StateVersion::default()),
+            committed_views: None,
             body_retries: crate::zakura::header_sync::BodyRetryQueue::default(),
             retry_jitter,
             body_input_rx,
@@ -369,6 +373,14 @@ impl SequencerTask {
         state_version: Option<zakura_header_chain::StateVersion>,
     ) -> Self {
         self.current_state_version = state_version.or(self.current_state_version);
+        self
+    }
+
+    pub(super) fn with_committed_views(
+        mut self,
+        snapshots: Option<watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
+    ) -> Self {
+        self.committed_views = snapshots;
         self
     }
 
@@ -411,7 +423,11 @@ impl SequencerTask {
                     match body {
                         Some(mut body) => {
                             body.leave_queue();
-                            self.handle_accept_body(body);
+                            if body.rejected_delivery.is_some() {
+                                self.handle_rejected_delivery(body).await;
+                            } else {
+                                self.handle_accept_body(body);
+                            }
                             // Publish the synchronous queue → reorder/applying ownership
                             // transfer before an action-channel send can await or time out.
                             // This updates observability without waking scheduling watchers.
@@ -437,7 +453,6 @@ impl SequencerTask {
                     .current_scope
                     .is_none_or(|old| { old.body_work_epoch == authority.body_work_epoch }));
                 self.current_scope = Some(authority);
-                self.registry.refresh_body_retry_scope(authority);
                 self.body_retries
                     .refresh_scope(authority.header_generation, authority.branch);
                 false
@@ -511,7 +526,7 @@ impl SequencerTask {
                         hash,
                         &mut outcome,
                         eligible_sources,
-                        persisted_availability,
+                        persisted_availability.map(|summary| *summary),
                         semantic_completion,
                     )
                     .await;
@@ -521,6 +536,90 @@ impl SequencerTask {
                 needs_reaction
             }
         }
+    }
+
+    /// Account for a requested payload that failed header binding before apply.
+    /// The received claim stays owned until retry deferral is installed.
+    async fn handle_rejected_delivery(&mut self, body: SequencedBody) {
+        let Some(mismatch) = body.rejected_delivery else {
+            return;
+        };
+        if self.work.owner_for_height(body.height) != Some(body.owner)
+            || self.work.hash_for_height(body.height) != Some(body.hash)
+            || self.work.reserved_in_flight_charge(body.height).is_some()
+            || mismatch.requested != body.hash
+            || mismatch.source != body.source
+        {
+            return;
+        }
+        let snapshot = self
+            .committed_views
+            .as_ref()
+            .and_then(|views| views.borrow().clone());
+        let authority = snapshot.as_ref().and_then(|snapshot| {
+            let mut pending = zakura_header_chain::PendingOwners::default();
+            pending.insert(body.source, body.owner);
+            match zakura_header_chain::Gate::check_body(
+                snapshot,
+                &pending,
+                body.source,
+                &body.owner,
+            ) {
+                zakura_header_chain::BodyCompletionDecision::Current => {
+                    Some((body.owner, snapshot.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
+                    Some((owner, snapshot.state_version))
+                }
+                zakura_header_chain::BodyCompletionDecision::Stale(_) => None,
+            }
+        });
+        #[cfg(test)]
+        let authority = authority.or_else(|| {
+            (self.committed_views.is_none()
+                && self.current_scope.is_none_or(|scope| {
+                    scope.body_work_epoch == body.owner.authority().body_work_epoch
+                }))
+            .then_some((body.owner, self.current_state_version.unwrap_or_default()))
+        });
+        let Some((owner, state_version)) = authority else {
+            return;
+        };
+        let persisted = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.body_unavailable_for(body.hash).cloned());
+        drop(body.body);
+        let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+        let mut suppliers = self.registry.eligible_sources(body.height);
+        let availability = self.record_body_retry(
+            owner,
+            body.source,
+            zakura_header_chain::Frontier::new(body.height, body.hash),
+            &mut outcome,
+            &mut suppliers,
+            persisted,
+        );
+        if let Some(availability) = availability {
+            self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
+                body_work_epoch: owner.authority().body_work_epoch,
+                expected_version: state_version,
+                failure: zakura_header_chain::TransientBodyFailure {
+                    hash: body.hash,
+                    evidence: mismatch.evidence,
+                    kind: zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                    availability,
+                },
+            })
+            .await;
+        }
+        self.work
+            .return_rejected_received_for_owner(body.owner, body.height, body.hash);
+        self.reaction_epoch = self.reaction_epoch.saturating_add(1);
+        self.send_action(BlockSyncAction::Misbehavior {
+            peer: body.peer,
+            reason: BlockSyncMisbehavior::BodyPayloadMismatch(mismatch),
+        })
+        .await;
     }
 
     /// Body-acceptance tail: offer the body to the reorder buffer, then drain the
@@ -757,11 +856,9 @@ impl SequencerTask {
             let released = self
                 .sequencer
                 .finish_submission(owner, source, token, height, hash);
-            let verified = matches!(
-                outcome.verification(),
-                zakura_header_chain::BodyVerificationOutcome::Verified(_)
-            );
-            return (false, released && verified && semantic_completion.is_some());
+            // Detached completions carry no current evidence, but freeing their exact
+            // submission slot must wake buffered current work regardless of the old result.
+            return (false, released);
         };
         if applying_owner != owner
             || applying_source != source
@@ -799,7 +896,7 @@ impl SequencerTask {
                 .await;
             }
         }
-        self.record_body_retry(
+        let availability = self.record_body_retry(
             semantic_owner,
             source,
             zakura_header_chain::Frontier::new(height, hash),
@@ -807,14 +904,36 @@ impl SequencerTask {
             &mut eligible_sources,
             persisted_availability,
         );
-        if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
-            outcome.verification()
-        {
-            self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
-                expected_version: semantic_state_version,
-                failure: *failure,
-            })
-            .await;
+        match outcome.verification() {
+            zakura_header_chain::BodyVerificationOutcome::Retryable(failure) => {
+                self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
+                    body_work_epoch: semantic_owner.authority().body_work_epoch,
+                    expected_version: semantic_state_version,
+                    failure: failure.clone(),
+                })
+                .await;
+            }
+            // A header whose deliveries never bind is bounded like a header whose
+            // body is withheld, so it publishes the same availability episode.
+            // The mismatch scores its supplier separately below.
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                let evidence = mismatch.evidence;
+                if let Some(availability) = availability {
+                    self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
+                        body_work_epoch: semantic_owner.authority().body_work_epoch,
+                        expected_version: semantic_state_version,
+                        failure: zakura_header_chain::TransientBodyFailure {
+                            hash,
+                            evidence,
+                            kind: zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                            availability,
+                        },
+                    })
+                    .await;
+                }
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_)
+            | zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {}
         }
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
             // Keep a duplicate attached until the committed snapshot includes its height.
@@ -891,14 +1010,36 @@ impl SequencerTask {
         outcome: &mut BlockApplyOutcome,
         eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-    ) {
+    ) -> Option<zakura_header_chain::BodyUnavailableSummary> {
         let hash = header.hash;
-        let Some(failure) = outcome.retryable_mut() else {
-            self.body_retries
-                .remove(owner.header_generation, owner.branch, hash);
-            self.registry.clear_body_retry(owner.authority(), hash);
-            return;
-        };
+        match outcome.verification() {
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                if mismatch.source != source {
+                    return None;
+                }
+                // A bad payload still needs another delivery. Keep the failed
+                // supplier in the retry episode before making the height available.
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {}
+            _ => {
+                self.body_retries
+                    .remove(owner.header_generation, owner.branch, hash);
+                self.registry.clear_body_retry(owner.authority(), hash);
+                return None;
+            }
+        }
+        // A committed operator reset supersedes process-local history even when
+        // it used the same timestamp and body-work authority.
+        if let Some(persisted) = persisted_availability.as_ref() {
+            if self
+                .body_retries
+                .get_mut(owner.header_generation, owner.branch, hash)
+                .is_some_and(|episode| episode.episode_id != persisted.episode_id)
+            {
+                self.body_retries
+                    .remove(owner.header_generation, owner.branch, hash);
+            }
+        }
         eligible_sources.insert(source);
         if self
             .body_retries
@@ -906,7 +1047,6 @@ impl SequencerTask {
             .is_none()
         {
             let episode = persisted_availability
-                .filter(|summary| summary.alarmed)
                 .map(|summary| {
                     crate::zakura::header_sync::BodyRetryEpisode::restore(
                         owner.branch,
@@ -917,20 +1057,24 @@ impl SequencerTask {
                     )
                 })
                 .unwrap_or_else(|| {
-                    crate::zakura::header_sync::BodyRetryEpisode::new(
+                    let mut episode = crate::zakura::header_sync::BodyRetryEpisode::new(
                         owner.branch,
                         owner.header_generation,
                         header,
                         eligible_sources.clone(),
                         &zakura_header_chain::SystemClock,
-                    )
+                    );
+                    episode.episode_id = Some(outcome.evidence());
+                    episode
                 });
             self.body_retries.insert(episode);
         }
-        let episode = self
+        let Some(episode) = self
             .body_retries
             .get_mut(owner.header_generation, owner.branch, hash)
-            .expect("the exact retry episode exists because it was inserted above");
+        else {
+            unreachable!("the exact retry episode exists because it was inserted above")
+        };
         episode.refresh_suppliers(eligible_sources.clone());
         let update = episode.record_failure(
             source,
@@ -948,12 +1092,9 @@ impl SequencerTask {
             | crate::zakura::header_sync::RetryUpdate::ProbeAt(retry_at) => retry_at,
             crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
         };
-        failure.availability = episode.summary();
-        if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
-            if persisted.suppliers > failure.availability.suppliers {
-                failure.availability.suppliers = persisted.suppliers;
-                failure.availability.supplier_set_digest = persisted.supplier_set_digest;
-            }
+        let availability = episode.summary();
+        if let Some(failure) = outcome.retryable_mut() {
+            failure.availability = availability.clone();
         }
         self.registry.defer_body_retry(
             deferred_sources,
@@ -961,6 +1102,7 @@ impl SequencerTask {
             hash,
             retry_deadline_instant(retry_at),
         );
+        Some(availability)
     }
 
     /// Drain the contiguous reorder prefix into applying, then submit it.
@@ -1514,8 +1656,16 @@ mod tests {
             std::num::NonZeroU64::new(1).unwrap(),
         );
         let owner = taken[0].1.owner.unwrap();
-        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
+        let reserved = taken[0].1.estimated_bytes;
         task.budget.charge(reserved);
+        let request = super::super::work_queue::RequestWrite::new(
+            owner,
+            taken,
+            task.work.clone(),
+            task.budget.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        assert!(request.publish(|| {}));
         assert_eq!(
             task.work
                 .release_active_reserved_height_for_owner(owner, height),
@@ -1537,6 +1687,156 @@ mod tests {
         );
         body.leave_queue();
         body
+    }
+
+    #[tokio::test]
+    async fn rejected_delivery_accounts_once_without_submitting_a_body() {
+        let mut task = retention_test_task(1_000_000);
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        task.actions = actions;
+        let mut body = received_test_body(&mut task, 1, 1024);
+        body.source = zakura_header_chain::SourceId::from_digest(body.peer.digest());
+        let (owner, source, height, hash) = (body.owner, body.source, body.height, body.hash);
+        let mismatch = zakura_header_chain::BodyPayloadMismatch {
+            evidence: zakura_header_chain::EvidenceId::from_digest([0xc4; 32]),
+            source,
+            requested: hash,
+            delivered: block::Hash([0xc5; 32]),
+            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
+        };
+        let mut duplicate = SequencedBody::new_queued(
+            owner,
+            source,
+            height,
+            hash,
+            body.previous_block_hash,
+            body.body.clone(),
+            body.bytes,
+            body.peer.clone(),
+            Instant::now(),
+            task._body_input_bytes.clone(),
+            task.body_input_decoded_attributed_memory_bytes.clone(),
+        );
+        body.rejected_delivery = Some(mismatch);
+        duplicate.rejected_delivery = Some(mismatch);
+        duplicate.leave_queue();
+        task.handle_rejected_delivery(body).await;
+        let Some(BlockSyncAction::RecordBodyUnavailable { failure, .. }) =
+            actions_rx.try_recv().ok()
+        else {
+            panic!("the rejected delivery must publish retry evidence, not SubmitBlock");
+        };
+        assert_eq!(
+            failure.kind,
+            zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+        );
+        assert_eq!(failure.hash, hash);
+        assert_eq!(failure.availability.attempts, 1);
+        assert!(matches!(
+            actions_rx.try_recv(),
+            Ok(BlockSyncAction::Misbehavior { .. })
+        ));
+        assert!(task.registry.is_body_retry_avoided(
+            &ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            owner.authority(),
+            hash,
+            Instant::now()
+        ));
+        assert_eq!(task.work.owner_for_height(height), None);
+        assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+        assert_eq!(task.sequencer.reorder_len(), 0);
+        assert_eq!(task.sequencer.applying_len(), 0);
+        task.handle_rejected_delivery(duplicate).await;
+        assert!(
+            actions_rx.try_recv().is_err(),
+            "a duplicate claim cannot count twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_delivery_restores_alarm_and_rejects_changed_epoch() {
+        for changed_epoch in [false, true] {
+            let mut task = retention_test_task(1_000_000);
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            task.actions = actions;
+            let mut body = received_test_body(&mut task, 1, 1024);
+            let hash = body.hash;
+            let current_source = body.source;
+            body.rejected_delivery = Some(zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xc6; 32]),
+                source: body.source,
+                requested: hash,
+                delivered: block::Hash([0xc7; 32]),
+                kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
+            });
+            let verified =
+                zakura_header_chain::Frontier::new(block::Height(0), block::Hash([4; 32]));
+            let snapshot = zakura_header_chain::EngineSnapshot {
+                mode: zakura_header_chain::EngineMode::Integrated,
+                state_version: zakura_header_chain::StateVersion::new(91),
+                header_generation: zakura_header_chain::HeaderGeneration::new(2),
+                verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+                frontiers: zakura_header_chain::FrontierSet {
+                    finalized: verified,
+                    verified_best: verified,
+                    header_best: zakura_header_chain::Frontier::new(block::Height(1), hash),
+                },
+                header_best_score: zakura_header_chain::ChainScore::new(
+                    zakura_header_chain::SuffixWork::zero(),
+                    hash,
+                ),
+                oldest_retained_height: block::Height(0),
+                alarms: zakura_header_chain::AlarmSet {
+                    header_best_body_unavailable: Some(
+                        zakura_header_chain::BodyUnavailableSummary {
+                            supplier_ids: None,
+                            tried_supplier_ids: None,
+                            episode_id: None,
+                            started_at: chrono::Utc::now() - chrono::Duration::minutes(30),
+                            attempts: 12,
+                            suppliers: 2,
+                            supplier_set_digest: [0xa9; 32],
+                            alarmed: true,
+                            next_probe_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+                        },
+                    ),
+                    ..Default::default()
+                },
+            };
+            let (_views, rx) =
+                watch::channel(Some(zakura_header_chain::CommittedHeaderChainView::new(
+                    snapshot,
+                    zakura_header_chain::BodyWorkEpoch::new(u64::from(changed_epoch)),
+                )));
+            task.committed_views = Some(rx);
+            task.handle_rejected_delivery(body).await;
+            if changed_epoch {
+                assert!(
+                    actions_rx.try_recv().is_err(),
+                    "a stale epoch must not add retry evidence"
+                );
+            } else {
+                let Ok(BlockSyncAction::RecordBodyUnavailable {
+                    expected_version,
+                    failure,
+                    ..
+                }) = actions_rx.try_recv()
+                else {
+                    panic!("the persisted alarm must be republished");
+                };
+                assert_eq!(expected_version, zakura_header_chain::StateVersion::new(91));
+                assert!(failure.availability.alarmed);
+                assert!(failure.availability.attempts >= 12);
+                assert_eq!(
+                    failure.availability.suppliers, 1,
+                    "only the current eligible supplier is persisted"
+                );
+                assert_eq!(
+                    failure.availability.supplier_ids.as_deref(),
+                    Some([current_source].as_slice())
+                );
+            }
+        }
     }
 
     #[test]
@@ -1870,6 +2170,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_completion_refills_the_released_submission_slot() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        // A frontier transition detaches the applying body while its verifier still owns
+        // the only submission slot. Its late completion must wake current work.
+        task.sequencer.remove_applying(height);
+        assert_eq!(task.sequencer.in_flight_submission_count(), 1);
+        let mut outcome = super::test_block_apply_outcome(BlockApplyResult::Unavailable);
+
+        assert_eq!(
+            task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                None,
+            )
+            .await,
+            (false, true),
+            "releasing the detached submission must refill current work without reacting to stale evidence"
+        );
+        assert_eq!(
+            task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                None,
+            )
+            .await,
+            (false, false),
+            "a duplicate completion releases no capacity and must not wake submissions"
+        );
+        assert!(!task.sequencer.applying_contains(height));
+        assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+        assert!(
+            task.body_retries.is_empty(),
+            "stale transient completion cannot create a retry episode"
+        );
+        assert!(
+            actions_rx.try_recv().is_err(),
+            "stale completion emits no action"
+        );
+    }
+
+    #[tokio::test]
     async fn consensus_invalid_evidence_waits_for_action_capacity() {
         let frontiers = BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2083,6 +2480,7 @@ mod tests {
             Some(BlockSyncAction::RecordBodyUnavailable {
                 expected_version,
                 failure,
+                    ..
             }) if expected_version == zakura_header_chain::StateVersion::new(8)
                 && failure.hash == hash
                 && failure.evidence
@@ -2237,6 +2635,12 @@ mod tests {
                     source: attributed_source,
                 };
                 let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+                let supplier = ZakuraPeerId::new(vec![1; 32]).unwrap();
+                let alternate = ZakuraPeerId::new(vec![2; 32]).unwrap();
+                let eligible_sources = BTreeSet::from([
+                    source,
+                    zakura_header_chain::SourceId::from_digest(alternate.digest()),
+                ]);
 
                 assert_eq!(
                     task.handle_apply_finished(
@@ -2246,7 +2650,7 @@ mod tests {
                         height,
                         hash,
                         &mut outcome,
-                        BTreeSet::new(),
+                        eligible_sources,
                         None,
                         Some((owner, zakura_header_chain::StateVersion::default())),
                     )
@@ -2256,8 +2660,37 @@ mod tests {
                 );
                 assert!(!task.sequencer.applying_contains(height));
                 assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+                assert_eq!(
+                    task.registry.is_body_retry_avoided(
+                        &supplier,
+                        owner.authority(),
+                        hash,
+                        Instant::now(),
+                    ),
+                    attribution_matches,
+                    "only the proven supplier must be deferred before the body is refetched",
+                );
+                assert!(
+                    !task.registry.is_body_retry_avoided(
+                        &alternate,
+                        owner.authority(),
+                        hash,
+                        Instant::now(),
+                    ),
+                    "an alternate supplier must remain eligible",
+                );
 
                 if attribution_matches {
+                    // The episode that will refetch this body is published before
+                    // its supplier is scored. Body-unavailable evidence does not
+                    // affect selection, so neither action changes eligibility.
+                    assert!(matches!(
+                        actions_rx.recv().await,
+                        Some(BlockSyncAction::RecordBodyUnavailable { failure, .. })
+                            if failure.hash == hash
+                                && failure.kind
+                                    == zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+                    ));
                     assert!(matches!(
                         actions_rx.recv().await,
                         Some(BlockSyncAction::Misbehavior {
@@ -2270,9 +2703,255 @@ mod tests {
                 }
                 assert!(
                     actions_rx.try_recv().is_err(),
-                    "payload mismatch can emit only exact-supplier scoring, never eligibility state"
+                    "payload mismatch emits only supplier scoring and its retry \
+                     episode, never eligibility state"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    // IN-03: a header whose deliveries never bind is bounded like a withheld
+    // body, so its mismatch episode must publish body-unavailable evidence
+    // instead of probing silently forever.
+    async fn payload_mismatch_publishes_the_body_unavailable_episode() {
+        for persisted_alarm in [false, true] {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            };
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let mut task = SequencerTask::new(
+                Sequencer::new(block::Height(0), 1),
+                ByteBudget::new(123),
+                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(PeerRegistry::new()),
+                actions,
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_secs(1),
+                ZakuraTrace::noop(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xc1; 32]),
+                requested: hash,
+                delivered: block::Hash([0xc2; 32]),
+                kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+                source,
+            };
+            let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+            let alternate = zakura_header_chain::SourceId::from_digest([2; 32]);
+            let eligible_sources = BTreeSet::from([source, alternate]);
+            // An alarmed episode is restored from persisted evidence, because the
+            // episode clock is the system clock inside `record_body_retry`.
+            let persisted = persisted_alarm.then(|| zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(30),
+                attempts: 12,
+                suppliers: 2,
+                supplier_set_digest:
+                    zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(
+                        &eligible_sources,
+                    ),
+                alarmed: true,
+                next_probe_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            });
+
+            let _ = task
+                .handle_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    &mut outcome,
+                    eligible_sources,
+                    persisted,
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                )
+                .await;
+
+            let Some(BlockSyncAction::RecordBodyUnavailable { failure, .. }) =
+                actions_rx.recv().await
+            else {
+                panic!("a mismatch episode must publish its body-unavailable evidence");
+            };
+            assert_eq!(failure.hash, hash);
+            assert_eq!(
+                failure.kind,
+                zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                "the episode records that no delivery bound to this header",
+            );
+            assert_eq!(
+                failure.availability.alarmed, persisted_alarm,
+                "a restored alarm must survive a mismatch delivery",
+            );
+            assert_eq!(failure.availability.suppliers, 2);
+            assert!(failure.availability.attempts >= 1);
+            assert!(
+                matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(_),
+                        ..
+                    })
+                ),
+                "the delivery still scores only its supplier",
+            );
+        }
+    }
+
+    #[tokio::test]
+    // IN-03: a header whose deliveries never bind is bounded like a withheld
+    // body, so its mismatch episode must publish body-unavailable evidence
+    // instead of probing silently forever.
+    async fn prealarm_episode_restores_age_and_attempts_before_counting_a_failure() {
+        for persisted_alarm in [false] {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            };
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let mut task = SequencerTask::new(
+                Sequencer::new(block::Height(0), 1),
+                ByteBudget::new(123),
+                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(PeerRegistry::new()),
+                actions,
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_secs(1),
+                ZakuraTrace::noop(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xc1; 32]),
+                requested: hash,
+                delivered: block::Hash([0xc2; 32]),
+                kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+                source,
+            };
+            let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+            let alternate = zakura_header_chain::SourceId::from_digest([2; 32]);
+            let eligible_sources = BTreeSet::from([source, alternate]);
+            // An alarmed episode is restored from persisted evidence, because the
+            // episode clock is the system clock inside `record_body_retry`.
+            let persisted = zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(2),
+                attempts: 3,
+                suppliers: 2,
+                supplier_set_digest:
+                    zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(
+                        &eligible_sources,
+                    ),
+                alarmed: false,
+                next_probe_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            };
+
+            let _ = task
+                .handle_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    &mut outcome,
+                    eligible_sources,
+                    Some(persisted.clone()),
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                )
+                .await;
+
+            let Some(BlockSyncAction::RecordBodyUnavailable { failure, .. }) =
+                actions_rx.recv().await
+            else {
+                panic!("a mismatch episode must publish its body-unavailable evidence");
+            };
+            assert_eq!(failure.hash, hash);
+            assert_eq!(
+                failure.kind,
+                zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                "the episode records that no delivery bound to this header",
+            );
+            assert_eq!(
+                failure.availability.alarmed, persisted_alarm,
+                "a restored alarm must survive a mismatch delivery",
+            );
+            assert_eq!(failure.availability.suppliers, 2);
+            assert_eq!(failure.availability.attempts, 4);
+            assert_eq!(failure.availability.started_at, persisted.started_at);
+            assert!(
+                matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(_),
+                        ..
+                    })
+                ),
+                "the delivery still scores only its supplier",
+            );
         }
     }
 
@@ -2621,5 +3300,140 @@ mod tests {
             .await
             .expect("sequencer view sender is still live");
         assert_eq!(*view_rx.borrow(), schedulable);
+    }
+    #[tokio::test]
+    // IN-03: a header whose deliveries never bind is bounded like a withheld
+    // body, so its mismatch episode must publish body-unavailable evidence
+    // instead of probing silently forever.
+    async fn same_clock_reset_rehydrates_cached_body_retry_before_new_failure() {
+        for persisted_alarm in [false] {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            };
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let mut task = SequencerTask::new(
+                Sequencer::new(block::Height(0), 1),
+                ByteBudget::new(123),
+                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(PeerRegistry::new()),
+                actions,
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_secs(1),
+                ZakuraTrace::noop(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xc1; 32]),
+                requested: hash,
+                delivered: block::Hash([0xc2; 32]),
+                kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+                source,
+            };
+            let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+            let alternate = zakura_header_chain::SourceId::from_digest([2; 32]);
+            let eligible_sources = BTreeSet::from([source, alternate]);
+            // An alarmed episode is restored from persisted evidence, because the
+            // episode clock is the system clock inside `record_body_retry`.
+            let persisted = zakura_header_chain::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: Some(zakura_header_chain::EvidenceId::from_digest([0x72; 32])),
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(2),
+                attempts: 3,
+                suppliers: 2,
+                supplier_set_digest:
+                    zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(
+                        &eligible_sources,
+                    ),
+                alarmed: false,
+                next_probe_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            };
+
+            let mut cached = persisted.clone();
+            cached.episode_id = Some(zakura_header_chain::EvidenceId::from_digest([0x71; 32]));
+            cached.attempts = 8;
+            task.body_retries
+                .insert(crate::zakura::header_sync::BodyRetryEpisode::restore(
+                    owner.branch,
+                    owner.header_generation,
+                    zakura_header_chain::Frontier::new(height, hash),
+                    eligible_sources.clone(),
+                    cached,
+                ));
+
+            let _ = task
+                .handle_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    &mut outcome,
+                    eligible_sources,
+                    Some(persisted.clone()),
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                )
+                .await;
+
+            let Some(BlockSyncAction::RecordBodyUnavailable { failure, .. }) =
+                actions_rx.recv().await
+            else {
+                panic!("a mismatch episode must publish its body-unavailable evidence");
+            };
+            assert_eq!(failure.hash, hash);
+            assert_eq!(
+                failure.kind,
+                zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                "the episode records that no delivery bound to this header",
+            );
+            assert_eq!(
+                failure.availability.alarmed, persisted_alarm,
+                "a restored alarm must survive a mismatch delivery",
+            );
+            assert_eq!(failure.availability.suppliers, 2);
+            assert_eq!(failure.availability.attempts, 4);
+            assert_eq!(failure.availability.episode_id, persisted.episode_id);
+            assert_eq!(failure.availability.started_at, persisted.started_at);
+            assert!(
+                matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(_),
+                        ..
+                    })
+                ),
+                "the delivery still scores only its supplier",
+            );
+        }
     }
 }

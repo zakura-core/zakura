@@ -876,7 +876,7 @@ impl HeaderChainWriter {
                 "prepared scheduler retry differs from its staged authority",
             ));
         }
-        let authority = PreparedSchedulerAuthority(retry);
+        let authority = PreparedSchedulerAuthority(retry.clone());
         let mut context = self.context();
         context.full_state_authority = Some(&authority);
         self.runtime.apply(

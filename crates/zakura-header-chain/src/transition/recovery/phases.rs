@@ -51,7 +51,7 @@ pub(super) struct ReconstructedDerivedViews {
     pub(super) selected_tip: Frontier,
     pub(super) selected_score: ChainScore,
     pub(super) oldest_retained_height: block::Height,
-    pub(super) body_unavailable_alarm: Option<crate::BodyUnavailableSummary>,
+    pub(super) body_unavailable_alarm: Option<(Frontier, crate::BodyUnavailableSummary)>,
 }
 
 /// Load the complete durable rows used by startup audit.

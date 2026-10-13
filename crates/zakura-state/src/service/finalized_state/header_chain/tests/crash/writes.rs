@@ -160,6 +160,9 @@ pub(super) fn crash_fixture_every_state_writer_crash_point_reopens_complete_befo
                 evidence,
                 kind: TransientBodyFailureKind::Storage,
                 availability: BodyUnavailableSummary {
+                    supplier_ids: None,
+                    tried_supplier_ids: None,
+                    episode_id: None,
                     attempts: 1,
                     suppliers: 1,
                     alarmed: false,

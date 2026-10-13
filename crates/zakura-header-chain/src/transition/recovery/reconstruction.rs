@@ -71,14 +71,17 @@ pub(super) fn reconstruct_derived_views(
         .map(|header_node| header_node.height)
         .min()
         .unwrap_or(finalized.height);
-    let body_unavailable_alarm = match &header_nodes_by_hash
-        .get(&selected_tip.hash)
-        .ok_or_else(|| source_failure(AuditViolation::ProtectedPath(selected_tip.hash)))?
-        .body_validation_state
-    {
-        crate::BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
-        _ => None,
-    };
+    let body_unavailable_alarm = selected_projection.iter().find_map(|frontier| {
+        match &header_nodes_by_hash
+            .get(&frontier.hash)?
+            .body_validation_state
+        {
+            crate::BodyValidationState::Unavailable(summary) if summary.alarmed => {
+                Some((*frontier, summary.clone()))
+            }
+            _ => None,
+        }
+    });
     Ok(ReconstructedDerivedViews {
         source_nodes: audited.source_header_nodes.clone(),
         header_nodes,

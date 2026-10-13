@@ -306,12 +306,17 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         .db
         .cf_handle(HEADER_ENGINE_META)
         .expect("the header-chain metadata column exists");
-    let mut metadata = state
+    let metadata = state
         .db
         .raw_get_cf(&metadata_cf, b"")
         .expect("the metadata row reads")
         .expect("the initialized store has metadata");
-    metadata[..4].copy_from_slice(&4_u32.to_be_bytes());
+    let mut metadata = zakura_header_chain::EngineMetadata::decode(&metadata)
+        .expect("the current metadata fixture decodes");
+    metadata.disk_format = HeaderChainDiskVersion(4);
+    let metadata = metadata
+        .encode()
+        .expect("actual version-four metadata encodes");
     downgrade.zs_insert(
         &metadata_cf,
         RawBytes::new_raw_bytes(Vec::new()),

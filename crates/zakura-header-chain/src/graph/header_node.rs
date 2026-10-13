@@ -255,7 +255,7 @@ pub enum BodyValidationState {
 }
 
 /// Durable bounded summary of one body-unavailability retry episode.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BodyUnavailableSummary {
     /// Authoritative start of the current retry episode.
     pub started_at: DateTime<Utc>,
@@ -265,6 +265,13 @@ pub struct BodyUnavailableSummary {
     pub suppliers: u32,
     /// Stable digest of the complete eligible-supplier identity set.
     pub supplier_set_digest: [u8; 32],
+    /// Sorted current eligible identities, bounded by live session admission.
+    /// Legacy disk summaries have no identities; count/digest evidence remains usable.
+    pub supplier_ids: Option<Arc<[SourceId]>>,
+    /// Stable reset identity; absent only for legacy episodes.
+    pub episode_id: Option<EvidenceId>,
+    /// Current eligible suppliers already tried in this episode.
+    pub tried_supplier_ids: Option<Arc<[SourceId]>>,
     /// Whether the persistent unavailability alarm has fired.
     pub alarmed: bool,
     /// Earliest time the scheduler permits another repeated-supplier attempt or alarm probe.
@@ -272,8 +279,43 @@ pub struct BodyUnavailableSummary {
 }
 
 impl BodyUnavailableSummary {
+    /// Whether this observation proves a supplier absent from the previous set.
+    /// Departures alone never make an alarm probe due.
+    pub fn has_new_supplier_since(&self, previous: &Self) -> bool {
+        match (&self.supplier_ids, &previous.supplier_ids) {
+            (Some(current), Some(previous)) => current
+                .iter()
+                .any(|source| previous.binary_search(source).is_err()),
+            // Legacy summaries cannot prove new membership in a smaller set.
+            _ => {
+                self.suppliers > previous.suppliers
+                    || (self.suppliers == previous.suppliers
+                        && self.supplier_set_digest != previous.supplier_set_digest)
+            }
+        }
+    }
+
+    /// Check exact supplier evidence without accepting duplicate or unsorted identities.
+    pub fn has_consistent_supplier_ids(&self) -> bool {
+        self.supplier_ids.as_ref().is_none_or(|ids| {
+            usize::try_from(self.suppliers).ok() == Some(ids.len())
+                && ids.windows(2).all(|pair| pair[0] < pair[1])
+                && Self::digest_sorted_suppliers(ids.iter()) == self.supplier_set_digest
+        }) && self.tried_supplier_ids.as_ref().is_none_or(|tried| {
+            tried.windows(2).all(|pair| pair[0] < pair[1])
+                && self
+                    .supplier_ids
+                    .as_ref()
+                    .is_some_and(|ids| tried.iter().all(|source| ids.binary_search(source).is_ok()))
+        })
+    }
+
     /// Return a stable digest of one complete sorted eligible-supplier set.
     pub fn supplier_set_digest(suppliers: &BTreeSet<SourceId>) -> [u8; 32] {
+        Self::digest_sorted_suppliers(suppliers.iter())
+    }
+
+    fn digest_sorted_suppliers<'a>(suppliers: impl IntoIterator<Item = &'a SourceId>) -> [u8; 32] {
         let mut state = Sha256::new();
         state.update(b"zakura-body-supplier-set-v1");
         for supplier in suppliers {

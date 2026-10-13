@@ -95,12 +95,15 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
 fn body_unavailability_alarm_is_reconstructed_from_the_selected_node() {
     let (mut store, config) = fixture();
     let summary = BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         attempts: 10,
         suppliers: 2,
         alarmed: true,
         ..Default::default()
     };
-    store.nodes[1].body_validation_state = BodyValidationState::Unavailable(summary);
+    store.nodes[1].body_validation_state = BodyValidationState::Unavailable(summary.clone());
 
     let plan = audit_store(&store, &config).expect("the derived alarm is reconstructible");
     assert_eq!(

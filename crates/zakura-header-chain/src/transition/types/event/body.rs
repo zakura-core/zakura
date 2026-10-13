@@ -60,10 +60,15 @@ pub enum TransientBodyFailureKind {
     Timeout,
     /// The node temporarily exhausted local resources.
     ResourceExhausted,
+    /// No supplier delivered a body matching this header's commitments. The
+    /// mismatches themselves score their suppliers under LC-BODY-01; this kind
+    /// records only that a valid body remains unacquired, so LC-AVAIL-02 can
+    /// alarm instead of probing silently.
+    NoBindingBody,
 }
 
 /// Retryable body failure evidence.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransientBodyFailure {
     /// Exact affected header.
     pub hash: block::Hash,
@@ -76,7 +81,7 @@ pub struct TransientBodyFailure {
 }
 
 /// Authenticated discovery of a changed eligible body-supplier set.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BodySupplierDiscovered {
     /// Exact selected header whose persistent retry episode gains a supplier.
     pub hash: block::Hash,
@@ -87,7 +92,7 @@ pub struct BodySupplierDiscovered {
 }
 
 /// Authenticated operator request to restart one persistent body retry episode.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperatorBodyRetry {
     /// Exact selected header whose retry episode restarts.
     pub hash: block::Hash,

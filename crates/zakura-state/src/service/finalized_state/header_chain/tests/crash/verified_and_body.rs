@@ -254,6 +254,9 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 .single()
                 .expect("the fixture timestamp is valid");
             let old = BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 started_at,
                 attempts: 10,
                 suppliers: 2,
@@ -283,7 +286,7 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                                 hash: anchor.hash,
                                 evidence: seed_evidence,
                                 kind: TransientBodyFailureKind::Timeout,
-                                availability: old,
+                                availability: old.clone(),
                             },
                         )),
                     },
@@ -291,12 +294,18 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 )
                 .expect("the persistent body alarm fixture commits");
             let before = runtime.publisher().snapshot();
-            assert_eq!(before.alarms.header_best_body_unavailable, Some(old));
+            assert_eq!(
+                before.alarms.header_best_body_unavailable,
+                Some(old.clone())
+            );
 
             let marker = u8::try_from(index + if operator_retry { 0x90 } else { 0x70 })
                 .expect("the fault-point list fits in u8");
             let fresh_at = started_at + chrono::Duration::minutes(20);
             let fresh = BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 started_at: if operator_retry {
                     fresh_at
                 } else {
@@ -328,16 +337,24 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                 TransitionEvent::OperatorBodyRetry(zakura_header_chain::OperatorBodyRetry {
                     hash: anchor.hash,
                     evidence,
-                    availability: fresh,
+                    availability: fresh.clone(),
                 })
             } else {
                 TransitionEvent::BodySupplierDiscovered(
                     zakura_header_chain::BodySupplierDiscovered {
                         hash: anchor.hash,
                         evidence,
-                        availability: fresh,
+                        availability: fresh.clone(),
                     },
                 )
+            };
+            let fresh = if operator_retry {
+                BodyUnavailableSummary {
+                    episode_id: Some(evidence),
+                    ..fresh
+                }
+            } else {
+                fresh
             };
             let marker_key = [marker; 4];
             let mut full_state_batch = DiskWriteBatch::new();
@@ -417,10 +434,10 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     if operator_retry {
                         None
                     } else {
-                        Some(fresh)
+                        Some(fresh.clone())
                     }
                 } else {
-                    Some(old)
+                    Some(old.clone())
                 },
                 "{target:?}, operator_retry={operator_retry}"
             );
@@ -432,7 +449,11 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     .expect("the retry node read succeeds")
                     .expect("the selected retry node remains retained")
                     .body_validation_state,
-                BodyValidationState::Unavailable(if committed { fresh } else { old }),
+                BodyValidationState::Unavailable(if committed {
+                    fresh.clone()
+                } else {
+                    old.clone()
+                }),
                 "{target:?}, operator_retry={operator_retry}"
             );
             assert_eq!(
@@ -454,10 +475,10 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     if operator_retry {
                         None
                     } else {
-                        Some(fresh)
+                        Some(fresh.clone())
                     }
                 } else {
-                    Some(old)
+                    Some(old.clone())
                 },
                 "{target:?}, operator_retry={operator_retry}"
             );
@@ -469,7 +490,11 @@ pub(super) fn crash_fixture_body_retry_restarts_reopen_complete_before_or_after(
                     .expect("the reopened retry node read succeeds")
                     .expect("the reopened selected retry node remains retained")
                     .body_validation_state,
-                BodyValidationState::Unavailable(if committed { fresh } else { old }),
+                BodyValidationState::Unavailable(if committed {
+                    fresh.clone()
+                } else {
+                    old.clone()
+                }),
                 "{target:?}, operator_retry={operator_retry}"
             );
         }

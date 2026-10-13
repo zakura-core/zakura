@@ -19,11 +19,23 @@ pub(super) fn project_transient_body_failure(
     projected: &mut ProjectedTransitionState<'_>,
     event: &crate::TransientBodyFailure,
 ) -> Result<(), TransitionFailure> {
-    if event.availability.attempts == 0
+    if !event.availability.has_consistent_supplier_ids()
+        || event.availability.attempts == 0
         || event.availability.suppliers == 0
         || event.availability.started_at > event.availability.next_probe_at
     {
         return Err(InvalidTransitionEvidence::Body(BodyViolation::InvalidTransientEpisode).into());
+    }
+    if let Some(BodyValidationState::Unavailable(previous)) = projected
+        .graph()
+        .view_header_node(event.hash)
+        .map(|node| &node.body_validation_state)
+    {
+        if previous.episode_id != event.availability.episode_id {
+            return Err(
+                InvalidTransitionEvidence::Body(BodyViolation::InvalidTransientEpisode).into(),
+            );
+        }
     }
     if matches!(
         projected
@@ -38,7 +50,7 @@ pub(super) fn project_transient_body_failure(
     }
     projected.set_body_validation_state(
         event.hash,
-        BodyValidationState::Unavailable(event.availability),
+        BodyValidationState::Unavailable(event.availability.clone()),
     )?;
     Ok(())
 }
@@ -56,10 +68,9 @@ pub(super) fn project_body_supplier_discovery(
         .map(|node| &node.body_validation_state)
     {
         Some(BodyValidationState::Unavailable(summary))
-            if event.hash == projected.graph().view_select_best_header_chain()?.0.hash
-                && summary.alarmed =>
+            if summary.alarmed && selected_body(projected, event.hash)? =>
         {
-            *summary
+            summary.clone()
         }
         _ => {
             return Err(InvalidTransitionEvidence::Body(
@@ -68,7 +79,9 @@ pub(super) fn project_body_supplier_discovery(
             .into());
         }
     };
-    if event.availability.started_at != old.started_at
+    if !event.availability.has_consistent_supplier_ids()
+        || event.availability.episode_id != old.episode_id
+        || event.availability.started_at != old.started_at
         || event.availability.attempts != old.attempts
         || event.availability.suppliers == 0
         || !event.availability.alarmed
@@ -77,15 +90,28 @@ pub(super) fn project_body_supplier_discovery(
     {
         return Err(InvalidTransitionEvidence::Body(BodyViolation::SupplierEpisodeChanged).into());
     }
-    let has_new_supplier = event.availability.suppliers > old.suppliers
-        || (event.availability.suppliers == old.suppliers
-            && event.availability.supplier_set_digest != old.supplier_set_digest);
+    let has_new_supplier = event.availability.has_new_supplier_since(&old);
     if !has_new_supplier {
         return Err(InvalidTransitionEvidence::Body(BodyViolation::NoNewSupplier).into());
     }
     projected.set_body_validation_state(
         event.hash,
-        BodyValidationState::Unavailable(event.availability),
+        BodyValidationState::Unavailable(event.availability.clone()),
     )?;
     Ok(())
+}
+
+/// Check membership only for the requested evidence target.
+pub(super) fn selected_body(
+    projected: &ProjectedTransitionState<'_>,
+    hash: zakura_chain::block::Hash,
+) -> Result<bool, TransitionFailure> {
+    let Some(node) = projected.graph().view_header_node(hash) else {
+        return Ok(false);
+    };
+    let best = projected.graph().view_select_best_header_chain()?.0;
+    Ok(projected
+        .graph()
+        .view_header_ancestor(best.hash, node.height)?
+        == Some(crate::Frontier::new(node.height, hash)))
 }

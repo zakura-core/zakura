@@ -40,6 +40,32 @@ def make_args(**overrides):
     return argparse.Namespace(**defaults)
 
 
+class ApplyDiagnosticsTests(unittest.TestCase):
+    def test_alert_distinguishes_reactor_work_from_commit_ownership(self):
+        fleet = watchdog.Fleet(
+            name="testnet", url="http://localhost/data", dashboard_url="http://localhost"
+        )
+        row = {
+            "name": "node",
+            "health": "stale",
+            "height": 4355419,
+            "alert_diagnostics": {
+                "metrics_available": True,
+                "metrics": {
+                    "sync_block_applying": 0,
+                    "sync_zakura_apply_operations": 5,
+                    "sync_zakura_apply_in_flight": 5,
+                    "sync_zakura_apply_oldest_seconds": 630,
+                    "sync_zakura_apply_phase": 2,
+                },
+            },
+        }
+        text = watchdog.node_alert_text(fleet, row, "stalled", 630)
+        self.assertIn("block applying 0", text)
+        self.assertIn("apply operations 5 | apply in flight 5 | oldest apply seconds 630", text)
+        self.assertIn("apply phase draining", text)
+
+
 class StallRecoveryTests(unittest.TestCase):
     """A stalled node must not be declared recovered at an unchanged height."""
 

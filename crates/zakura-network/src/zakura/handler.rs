@@ -9924,7 +9924,9 @@ mod tests {
     /// request window of any size would, and the peer sends full-size bodies
     /// at the largest negotiable transport depth. The reader still holds only
     /// the declared depth plus the frame it waits to forward. The rest waits
-    /// in QUIC flow control, and the reader resumes when the routine takes one.
+    /// in QUIC flow control. When the routine takes a body and holds it, the
+    /// reader admits exactly one more, so the session never holds more than
+    /// the depth plus two.
     #[tokio::test]
     async fn block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe(
     ) -> Result<(), BoxError> {
@@ -9958,8 +9960,9 @@ mod tests {
             .expect("stream 6 declares its inbound depth")
             .inbound;
         let held = depth + 1;
-        // The resource ledger's raw-frame term: about 18 MB per session.
-        assert!(held * BODY_PAYLOAD < 20_000_000);
+        // The resource ledger's raw-frame term counts these and the routine's
+        // body: about 20 MB per session.
+        assert!((held + 1) * BODY_PAYLOAD < 21_000_000);
         assert!(held < SENT, "the peer sends more than the queue holds");
 
         const ALPN: &[u8] = b"/zakura/testkit/block-sync-queue-depth/0";
@@ -10035,7 +10038,8 @@ mod tests {
         assert_eq!(precheck.bytes.load(Ordering::SeqCst), held * BODY_PAYLOAD);
         assert!(!cancel.is_cancelled(), "a full queue is backpressure");
 
-        // The routine takes one body, so the reader admits exactly one more.
+        // The routine takes one body and keeps it, as it does while it waits
+        // for decode capacity. The reader admits exactly one more.
         let frame = timeout(Duration::from_secs(2), admitted.streams[0].recv.recv())
             .await?
             .expect("the reader forwarded the first body");

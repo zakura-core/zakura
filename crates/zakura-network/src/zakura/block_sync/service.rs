@@ -25,8 +25,9 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
 ///
 /// The live reservations' owed bound grows with the request window, at up to
 /// one 2 MB body per live range. This depth caps the queue at a constant
-/// instead: these frames plus the one the reader holds while it waits, about
-/// 18 MB per session. Later frames wait in the QUIC stream receive window, so
+/// instead. A session holds these frames, the one the reader waits to forward
+/// and the one the routine is working on: 10 frames, about 20 MB. Later
+/// frames wait in the QUIC stream receive window, so
 /// the cap only slows a peer when the routine is already the bottleneck.
 /// Requests and control share the queue, so it keeps the two slots that
 /// regulation needs (`minimum_ordered_queue_capacity`).

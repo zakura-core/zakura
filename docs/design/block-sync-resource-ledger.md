@@ -30,14 +30,14 @@ connection; the node admits at most `zakura.max_connections` = 256 of them.
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
 | Serving encoded output | 64 MiB | 1.25 GB, 1 response slot per 4 KiB | `regulation/sizing.rs` (`peer_output_bytes`, `node_output_bytes`) |
 | Requester bookkeeping | ≤ live ranges | 32,768 ranges; ≤ 128 MiB of expected hashes | `MAX_BS_INFLIGHT_REQUESTS` request pool in `reactor.rs` |
-| Raw stream-6 frames awaiting the routine | ≤ 9 frames, about 18 MB, and ≤ what live reservations owe | 4.6 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
+| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 5.1 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
 | Look-ahead backlog (raw) | — | `max_reorder_lookahead_bytes` = 1.5 GiB plus one range | `admission.rs` byte gate, re-checked by the sequencer on every body |
 | Decoded bodies | one transient junk decode before rejection | 401 submissions × measured decoded size | `max_submitted_block_applies`; admission charges `max(4 × wire, measured decoded)` |
 | Control state | bounded maps | 8,192 supplier cooldowns; Status keeps the latest value | `MAX_SUPPLIER_RETRIES` in `peer_registry.rs` |
 
-At defaults, block-sync application memory sums to about 13.4 GB in the worst case: 0.5 GiB
+At defaults, block-sync application memory sums to about 14 GB in the worst case: 0.5 GiB
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
-for real blocks), 0.13 GiB requester hashes, 4.6 GB of raw frames awaiting their routines and
+for real blocks), 0.13 GiB requester hashes, 5.1 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
 add 8 + 8 GiB. They are shared with every other service on the connection and stay unchanged:
 256 connections × 32 MiB is the transport budget, not a block-sync choice.
@@ -102,9 +102,10 @@ Post-NU5 transparent signatures are outside the txid, so a peer can pad a body u
 range's cap, and the padding survives until consensus checks the auth-data commitment.
 
 Stream 6 therefore also declares an inbound queue depth of 8 frames
-(`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). The reader holds at most those 8 and the one it is
-forwarding, so a session's raw frames stay under 9 × 2 MB, about 18 MB, whatever the window.
-That is 4.6 GB across 256 connections. Later frames wait in the 16 MiB QUIC stream receive
+(`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). A session holds at most those 8, the one the reader is
+forwarding and the one the routine keeps while it waits for decode capacity. Its raw frames
+therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 5.1 GB across 256
+connections. Later frames wait in the 16 MiB QUIC stream receive
 window the transport already budgets. The owed check still disconnects a peer that sends more
 than it was asked for. `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe`
 pins the depth with a precheck that owes an unlimited window.

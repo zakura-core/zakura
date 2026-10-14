@@ -101,8 +101,8 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
 ///
-/// Validates the final config before creating any task, channel, or advertised
-/// limit, so no caller can negotiate with an unfundable config.
+/// Checks the final config's serving limits before creating any task, channel,
+/// or advertised limit, so no caller can negotiate with an unfundable config.
 pub fn spawn_block_sync_reactor(
     mut startup: BlockSyncStartup,
 ) -> Result<
@@ -115,7 +115,7 @@ pub fn spawn_block_sync_reactor(
 > {
     startup
         .config
-        .validate()
+        .validate_serving()
         .map_err(BlockSyncStartError::InvalidConfig)?;
     let body_retention = startup.body_retention.clone();
     debug_assert!(

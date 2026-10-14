@@ -3,7 +3,8 @@ use super::*;
 /// Errors that prevent the block-sync reactor from starting.
 #[derive(Debug, Error)]
 pub enum BlockSyncStartError {
-    /// The final block-sync config failed [`ZakuraBlockSyncConfig::validate`].
+    /// The final block-sync config failed [`ZakuraBlockSyncConfig::validate`]
+    /// or, at the reactor, [`ZakuraBlockSyncConfig::validate_serving`].
     #[error("invalid zakura.block_sync config: {0}")]
     InvalidConfig(&'static str),
 }

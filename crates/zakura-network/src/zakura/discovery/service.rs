@@ -1335,7 +1335,8 @@ mod tests {
                 (block::Height(5), block::Hash([5; 32])),
                 tip_rx,
                 ZakuraBlockSyncConfig::default(),
-            ));
+            ))
+            .expect("valid block-sync config");
         let service = DiscoveryService::with_sync_services(
             discovery_handle,
             header_sync,

@@ -25,8 +25,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use jsonrpsee::server::{
-    middleware::rpc::RpcServiceBuilder, stop_channel, Server, ServerConfig, ServerHandle,
-    StopHandle,
+    middleware::rpc::RpcServiceBuilder, stop_channel, BatchRequestConfig, Server, ServerConfig,
+    ServerHandle, StopHandle,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -54,8 +54,8 @@ use crate::{
     },
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer, rpc_batch::RpcBatchMiddleware,
-        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
-        rpc_tracing::RpcTracingMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_logger::RpcLoggerMiddleware,
+        rpc_metrics::RpcMetricsMiddleware, rpc_tracing::RpcTracingMiddleware,
     },
 };
 
@@ -64,6 +64,7 @@ pub mod error;
 pub mod http_request_compatibility;
 pub mod rpc_batch;
 pub mod rpc_call_compatibility;
+pub mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_tracing;
 
@@ -128,6 +129,18 @@ const MAX_TLS_CONNECTIONS: usize = 256;
 /// This closes connections that are silent after the handshake or idle between
 /// keep-alive requests. It does not limit time spent handling a request.
 const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of entries in a JSON-RPC batch, counting notifications and
+/// invalid entries.
+///
+/// `jsonrpsee` decodes every entry of an admitted batch before running the first
+/// one, and keeps them until the batch finishes. A larger batch is rejected after
+/// a shallow parse of the array, before any entry is decoded or run.
+const MAX_RPC_BATCH_REQUESTS: u32 = 1_000;
+
+/// Maximum number of characters of each request or response payload in TRACE
+/// logs.
+const MAX_RPC_LOG_CHARS: usize = 1024;
 
 impl RpcServer {
     /// Starts the primary RPC server.
@@ -264,12 +277,13 @@ impl RpcServer {
                     .try_into()
                     .expect("should be valid"),
             )
+            .set_batch_request_config(BatchRequestConfig::Limit(MAX_RPC_BATCH_REQUESTS))
             .build();
 
         let max_response_body_size = conf.max_response_body_size;
         let rpc_middleware = RpcServiceBuilder::new()
             .layer_fn(move |service| RpcBatchMiddleware::new(service, max_response_body_size))
-            .rpc_logger(1024)
+            .layer_fn(|service| RpcLoggerMiddleware::new(service, MAX_RPC_LOG_CHARS))
             .layer_fn(FixRpcResponseMiddleware::new)
             .layer_fn(RpcMetricsMiddleware::new)
             .layer_fn(RpcTracingMiddleware::new);

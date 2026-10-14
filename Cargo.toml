@@ -308,6 +308,14 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
+# Block sync hashes every body's transaction ids on its peer tasks.
+[profile.dev.package.sha2]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment
 # (security_requirements.md SR-1); do not set "abort". Enforced by a

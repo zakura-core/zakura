@@ -197,7 +197,8 @@ fn the_default_serving_limit_fits_the_bookkeeping_budget() {
     assert_eq!(config.advertised_max_inflight_requests(), 32_000);
 }
 
-/// Fewer sessions keep the configured limit; more sessions shrink it to at least one.
+/// Fewer sessions keep the configured limit; more sessions shrink it. Past 3,633
+/// slots nothing fits, and the reactor refuses that config before serving.
 #[test]
 fn the_serving_limit_follows_session_slots_and_configuration() {
     let with = |inbound, outbound, configured| {
@@ -215,8 +216,9 @@ fn the_serving_limit_follows_session_slots_and_configuration() {
     assert_eq!(budgeted_inflight_requests(0), None);
     assert_eq!(budgeted_inflight_requests(3633), Some(1));
     assert_eq!(budgeted_inflight_requests(3634), Some(0));
-    assert_eq!(with(3634, 0, 32_000), 1);
-    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 1);
+    assert_eq!(with(3633, 0, 32_000), 1);
+    assert_eq!(with(3634, 0, 32_000), 0);
+    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 0);
 }
 
 /// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.
@@ -242,5 +244,54 @@ async fn serving_enforces_the_budgeted_limit() {
         session.admit(Height(height), 1).unwrap();
     }
     assert!(session.admit(Height(2 * limit + 1), 1).is_err());
+    cancel.cancel();
+}
+
+/// Live ranges may touch but never share a height. Each overlap is a peer
+/// fault, and a refused range leaves the admitted ranges unchanged.
+#[tokio::test]
+async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(Arc::new(Semaphore::new(0))),
+        ..Default::default()
+    });
+    let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
+    let cancel = CancellationToken::new();
+    let (send, _output) = framed_channel(4);
+    let mut session = serving.session(
+        &ZakuraPeerId::new(vec![63; 32]).unwrap(),
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        Default::default(),
+    );
+    // Heights 10..=14, then the ranges that end just below and start just above it.
+    for (start, count) in [(10, 5), (5, 5), (15, 3)] {
+        session.admit(Height(start), count).unwrap();
+    }
+    for (start, count) in [
+        (10, 5),
+        (12, 1),
+        (4, 2),
+        (9, 2),
+        (14, 2),
+        (17, 1),
+        (16, 4),
+        (1, 128),
+    ] {
+        assert!(
+            matches!(
+                session.admit(Height(start), count),
+                Err(SinkReject::Protocol(_))
+            ),
+            "{count} heights from {start} overlap a live range"
+        );
+    }
+    assert_eq!(
+        session.ranges.keys().copied().collect::<Vec<_>>(),
+        [Height(5), Height(10), Height(15)]
+    );
+    session.admit(Height(18), 1).unwrap();
+    session.admit(Height(1), 4).unwrap();
     cancel.cancel();
 }

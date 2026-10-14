@@ -238,6 +238,71 @@ async fn body_limit_excludes_tags_and_ending_and_stops_at_a_prefix() {
     cancel.cancel();
 }
 
+/// A source that returns `blocks` at the given heights, whatever was asked.
+fn store_at(blocks: &[(u32, &[u8])]) -> Arc<Store> {
+    Arc::new(Store {
+        blocks: blocks
+            .iter()
+            .map(|(height, bytes)| {
+                (
+                    block::Height(*height),
+                    Arc::new(bytes.zcash_deserialize_into().unwrap()),
+                )
+            })
+            .collect(),
+        started: Arc::new(Semaphore::new(0)),
+        release: Arc::new(Semaphore::new(128)),
+        fail: false,
+    })
+}
+
+/// Serving trusts no source ordering. It sends only the contiguous prefix from
+/// the requested start, within its block limit, and ends with the count it sent.
+#[tokio::test]
+async fn serving_stops_at_the_first_noncontiguous_or_excess_source_block() {
+    let first: &[u8] = &BLOCK_MAINNET_1_BYTES;
+    let second: &[u8] = &BLOCK_MAINNET_2_BYTES;
+    let limit = u32::try_from(first.len() + second.len()).unwrap();
+    let range = Range::new(block::Height(1), 2).unwrap();
+    let prefix = vec![
+        Message::Block(first.to_vec()),
+        Message::BlocksDone {
+            start: range.start,
+            returned: 1,
+        },
+    ];
+    let unavailable = vec![Message::RangeUnavailable(range)];
+    for (source, max_blocks, expected) in [
+        (vec![(1, first), (3, second)], 128, prefix.clone()),
+        (vec![(1, first), (1, first)], 128, prefix.clone()),
+        (vec![(2, second)], 128, unavailable.clone()),
+        (vec![(1, first), (2, second)], 1, prefix.clone()),
+        (vec![], 128, unavailable.clone()),
+    ] {
+        let capacity = capacity(limit);
+        let (send, mut recv) = framed_channel(4);
+        let cancel = CancellationToken::new();
+        let server = capacity.session(
+            Arc::new(Server::new(store_at(&source), max_blocks, limit).unwrap()),
+            &ZakuraPeerId::new(vec![6; 32]).unwrap(),
+            2,
+            send,
+            cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
+        );
+        server.admit(range).unwrap();
+        for message in &expected {
+            assert_eq!(&receive(&mut recv).await, message, "source {source:?}");
+        }
+        assert!(
+            !cancel.is_cancelled(),
+            "a short source is not a local fault"
+        );
+        cancel.cancel();
+    }
+}
+
 #[tokio::test]
 async fn too_small_body_budget_returns_original_unavailable_range() {
     let source = store(&[&BLOCK_MAINNET_1_BYTES], true);
@@ -442,8 +507,9 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     let mut startup =
         super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
     startup.shutdown = cancel.clone();
-    let (handle, _actions, _task) = super::super::spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let (handle, _actions, _task) =
+        super::super::spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let service = BlockSyncService::new_with_handle(handle);
     let resources = service
         .reserve_session(ServicePeerDirection::Outbound)
         .unwrap()

@@ -41,8 +41,8 @@ pub(crate) use serve::{
 
 mod reservations;
 pub(crate) use reservations::{
-    ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot, ReservationPool,
-    Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
+    shrink_after_peak, ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot,
+    ReservationPool, Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
 };
 
 mod session_capacity;

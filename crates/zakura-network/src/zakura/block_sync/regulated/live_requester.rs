@@ -41,15 +41,23 @@ impl Shared {
     }
 }
 
+fn frame_rejection(error: ClaimRefused) -> FrameRejection {
+    match error {
+        ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
+        ClaimRefused::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
+        _ => FrameRejection::Unsolicited,
+    }
+}
+
+/// The transport reader's gate. Every response it queues stays charged until
+/// [`LiveRequester::authorize`] takes it, so the queue never holds more than
+/// the live ranges owe.
 impl ResponsePrecheck for Shared {
     fn check(&self, tag: u16, len: usize) -> Result<(), FrameRejection> {
         if !(3..=5).contains(&tag) {
             return Ok(());
         }
-        self.lock().precheck(tag, len).map_err(|error| match error {
-            ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-            _ => FrameRejection::Unsolicited,
-        })
+        self.lock().admit(tag, len).map_err(frame_rejection)
     }
 }
 
@@ -63,6 +71,8 @@ pub(crate) struct LiveRequester {
     shared: Arc<Shared>,
     pub(crate) pool: ReservationPool,
     fence: WriterFence,
+    /// Whether a transport reader admits responses through [`Shared`].
+    transport_admits: bool,
 }
 
 /// One local wait in the session reader. These waits must not overlap.
@@ -98,11 +108,12 @@ impl LiveRequester {
         });
         // In-process channels have no transport precheck. The routine applies
         // the same authorization before decoding their frames.
-        recv.attach_precheck(shared.clone());
+        let transport_admits = recv.attach_precheck(shared.clone());
         Self {
             shared,
             pool,
             fence,
+            transport_admits,
         }
     }
 
@@ -171,6 +182,9 @@ impl LiveRequester {
     /// Authorize the exact header before decoding the block's transactions.
     /// Endings are small and must validate before their reservation is removed.
     pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
+        if self.transport_admits && (3..=5).contains(&frame.message_type) {
+            self.shared.lock().take_admitted(frame.payload.len());
+        }
         let rule = MessageRule::find(RULES, frame.message_type)
             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
         if frame.flags != 0
@@ -182,8 +196,9 @@ impl LiveRequester {
         }
         if frame.message_type == 3 {
             self.shared
-                .check(frame.message_type, frame.payload.len())
-                .map_err(SinkReject::protocol)?;
+                .lock()
+                .precheck(frame.message_type, frame.payload.len())
+                .map_err(|error| SinkReject::protocol(frame_rejection(error)))?;
             let header = block::Header::zcash_deserialize(&frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
             let result = self
@@ -238,8 +253,73 @@ impl FrameWriteClaim for FencedRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::{framed_channel, regulation::UNFINISHED_EXCHANGE, CloseCause};
+    use crate::zakura::{
+        framed_channel,
+        regulation::{PrecheckSlot, UNFINISHED_EXCHANGE},
+        CloseCause,
+    };
     use tokio_util::sync::CancellationToken;
+
+    /// The reader may queue the whole response it was asked for, and a frame
+    /// past that is refused before its payload is read. The routine releases
+    /// each frame it takes, so a conformant peer is never refused.
+    #[test]
+    fn the_transport_queue_holds_only_what_the_live_ranges_owe() {
+        let pool = ReservationPool::new(2).unwrap();
+        let connection = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let (session, _) = framed_channel(1);
+        let (_, recv) = framed_channel(1);
+        let slot = PrecheckSlot::default();
+        let recv = recv.with_precheck(slot.clone());
+        let requester = LiveRequester::new(pool.clone(), fence, &recv, session);
+        let reader = slot.get().expect("the requester attaches its precheck");
+
+        let hash = block::Hash([7; 32]);
+        let writer = requester
+            .reserve(
+                block::Height(1),
+                &[hash],
+                100,
+                pool.try_entry().unwrap(),
+                requester.open().unwrap(),
+            )
+            .unwrap();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+
+        // One body and one ending are owed, and the reader queues both.
+        assert_eq!(reader.check(3, 50), Ok(()));
+        assert_eq!(reader.check(4, 9), Ok(()));
+        assert_eq!(
+            reader.check(4, 9),
+            Err(FrameRejection::AboveOwed {
+                frames: 2,
+                bytes: 110
+            })
+        );
+        // Status is not a response, so it never charges the queue.
+        assert_eq!(reader.check(1, 53), Ok(()));
+
+        // The routine takes and claims the body, then the ending.
+        requester.shared.lock().take_admitted(50);
+        requester.shared.lock().claim_block(hash, 50).unwrap();
+        let mut ending = vec![4];
+        ending.extend_from_slice(&1u32.to_le_bytes());
+        ending.extend_from_slice(&1u32.to_le_bytes());
+        let ending = Frame {
+            message_type: 4,
+            flags: 0,
+            payload: ending,
+        };
+        assert!(matches!(
+            requester.authorize(&ending),
+            Ok(Authorization::Control)
+        ));
+        assert_eq!(pool.held(), 0);
+        assert_eq!(reader.check(4, 9), Err(FrameRejection::Unsolicited));
+        assert!(!connection.is_cancelled());
+    }
 
     #[test]
     fn missing_endings_close_without_peer_fault_and_keep_entries_through_reader_cleanup() {
@@ -255,6 +335,7 @@ mod tests {
             }),
             pool: pool.clone(),
             fence,
+            transport_admits: false,
         };
         // The transport reader can retain the authorization after the routine exits.
         let reader = requester.shared.clone();

@@ -429,11 +429,6 @@ version = "3.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
-[[exemptions.zakura-keys]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
-
 [[exemptions.zakura-note-encryption]]
 version = "3.0.0"
 criteria = "safe-to-deploy"

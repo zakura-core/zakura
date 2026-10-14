@@ -53,7 +53,6 @@ orchard = { version = "=3.0.0", package = "zakura-orchard" }
 sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto" }
 zcash_address = { version = "=3.0.0", package = "zakura-address" }
 zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
-zcash_keys = { version = "=3.0.0", package = "zakura-keys" }
 zcash_primitives = { version = "=3.0.0", package = "zakura-primitives" }
 zcash_transparent = { version = "=3.0.0", package = "zakura-transparent" }
 zcash_protocol = { version = "=3.0.0", package = "zakura-protocol" }

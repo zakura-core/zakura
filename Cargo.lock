@@ -4705,25 +4705,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zakura-keys"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "014d4dad193818a08d32983a12579edafeff17a341e30a536a7000c177f9249d"
-dependencies = [
- "bech32",
- "bs58",
- "corez",
- "nonempty",
- "secrecy",
- "zakura-address",
- "zakura-orchard",
- "zakura-protocol",
- "zakura-sapling-crypto",
- "zakura-transparent",
- "zip32",
-]
-
-[[package]]
 name = "zakura-mmr-tree"
 version = "0.0.1"
 dependencies = [
@@ -5015,7 +4996,6 @@ dependencies = [
  "zakura-chain",
  "zakura-consensus",
  "zakura-jubjub",
- "zakura-keys",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",

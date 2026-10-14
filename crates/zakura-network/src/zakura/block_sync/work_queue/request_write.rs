@@ -115,6 +115,8 @@ impl RequestWrite {
                 .expect("every provisional item was checked under this lock");
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
+            let charge = item.estimated_bytes;
+            inner.in_flight_reserved.add(charge);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
         inner.request_writes.insert(

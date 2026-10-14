@@ -297,6 +297,8 @@ impl PeerRegistry {
         }
     }
 
+    /// Skip `source` for bodies whose header or payload it served incompatibly.
+    ///
     /// A local compatibility cooldown must not replace the sequencer's retry episode.
     pub(super) fn defer_incompatible_bodies(
         &self,

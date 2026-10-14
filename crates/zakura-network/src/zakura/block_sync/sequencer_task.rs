@@ -287,6 +287,8 @@ pub(super) struct SequencerTask {
     body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
+    /// How long a supplier is skipped for a body it delivered with a mismatched payload.
+    body_mismatch_cooldown: Duration,
     submission_retry_at: Option<time::Instant>,
     submission_retry_started_at: Option<time::Instant>,
     submission_retry_attempt: u64,
@@ -351,6 +353,7 @@ impl SequencerTask {
             body_input_decoded_attributed_memory_bytes,
             view_tx,
             action_send_timeout,
+            body_mismatch_cooldown: ZakuraBlockSyncConfig::default().effective_liveness_timeout(),
             submission_retry_at: None,
             submission_retry_started_at: None,
             submission_retry_attempt: 0,
@@ -360,6 +363,12 @@ impl SequencerTask {
 
     pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
         self.retained_body_limit = limit;
+        self
+    }
+
+    /// Use the configured cooldown for suppliers that delivered a mismatched body.
+    pub(super) fn with_body_mismatch_cooldown(mut self, cooldown: Duration) -> Self {
+        self.body_mismatch_cooldown = cooldown;
         self
     }
 
@@ -858,6 +867,13 @@ impl SequencerTask {
                 if matches!(result, BlockApplyResult::Rejected) && attribution_matches {
                     let reason = match outcome.verification() {
                         zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                            // `record_body_retry` cleared this body's retry state,
+                            // so keep the retried height away from this supplier.
+                            self.registry.defer_incompatible_bodies(
+                                source,
+                                [(semantic_owner.authority(), hash)],
+                                time::Instant::now().into_std() + self.body_mismatch_cooldown,
+                            );
                             BlockSyncMisbehavior::BodyPayloadMismatch(*mismatch)
                         }
                         zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(invalid) => {
@@ -2273,6 +2289,109 @@ mod tests {
                     "payload mismatch can emit only exact-supplier scoring, never eligibility state"
                 );
             }
+        }
+    }
+
+    /// An attributed mismatch skips only its supplier for the retried body, until the cooldown ends.
+    #[tokio::test]
+    async fn payload_mismatch_avoids_the_supplier_for_the_retried_body() {
+        for attribution_matches in [true, false] {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            };
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let registry = Arc::new(PeerRegistry::new());
+            let cooldown = Duration::from_secs(30);
+            let mut task = SequencerTask::new(
+                Sequencer::new(block::Height(0), 1),
+                ByteBudget::new(123),
+                Arc::new(WorkQueue::new(block::Height(0))),
+                registry.clone(),
+                actions,
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_secs(1),
+                ZakuraTrace::noop(),
+            )
+            .with_body_mismatch_cooldown(cooldown);
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let supplier = ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid");
+            assert_eq!(
+                zakura_header_chain::SourceId::from_digest(supplier.digest()),
+                source
+            );
+            let mut outcome =
+                BlockApplyOutcome::payload_mismatch(zakura_header_chain::BodyPayloadMismatch {
+                    evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+                    requested: hash,
+                    delivered: block::Hash([0x41; 32]),
+                    kind: zakura_header_chain::BodyCommitmentKind::TransactionMerkleRoot,
+                    source: if attribution_matches {
+                        source
+                    } else {
+                        zakura_header_chain::SourceId::from_digest([9; 32])
+                    },
+                });
+
+            let before = Instant::now();
+            task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::default())),
+            )
+            .await;
+            let scope = owner.authority();
+            assert_eq!(
+                registry.is_body_retry_avoided(&supplier, scope, hash, before),
+                attribution_matches,
+                "only an attributed mismatch skips its supplier for the retried body"
+            );
+            let other = ZakuraPeerId::new(vec![2; 32]).expect("test peer ID is valid");
+            assert!(!registry.is_body_retry_avoided(&other, scope, hash, before));
+            assert!(
+                !registry.is_body_retry_avoided(
+                    &supplier,
+                    scope,
+                    hash,
+                    Instant::now() + cooldown + Duration::from_millis(1),
+                ),
+                "the avoidance expires so an only supplier is retried later"
+            );
         }
     }
 

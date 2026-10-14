@@ -93,7 +93,6 @@ mod tests {
         value::{NoteValue, ValueCommitment},
         Action, Address, Note,
     };
-    use rand_core::OsRng;
     use zcash_note_encryption::Domain;
 
     use crate::{
@@ -194,7 +193,7 @@ mod tests {
             .expect("test vector has a valid value commitment");
         let ovk = orchard::keys::OutgoingViewingKey::from([0; 32]);
         let encryptor = IronwoodNoteEncryption::new(Some(ovk), note, v.memo);
-        let mut rng = OsRng;
+        let mut rng = rand_10::rng();
 
         Action::from_parts(
             Nullifier::from_bytes(&v.rho).expect("test vector has a valid nullifier"),

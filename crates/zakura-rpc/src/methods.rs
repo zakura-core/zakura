@@ -208,7 +208,6 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getinfo", RpcAccess::Unauthenticated),
     ("getdeprecationinfo", RpcAccess::Unauthenticated),
     ("getblockchaininfo", RpcAccess::Unauthenticated),
-    ("getnetworkparameters", RpcAccess::Unauthenticated),
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
@@ -362,11 +361,6 @@ pub trait Rpc {
     /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
-
-    /// Returns the configured consensus rules for a block at `height`.
-    /// This does not require that the block has been mined.
-    #[method(name = "getnetworkparameters")]
-    async fn get_network_parameters(&self, height: u32) -> Result<serde_json::Value>;
 
     /// Returns the total balance of provided `addresses` in a
     /// [`GetAddressBalanceResponse`] instance.
@@ -2098,21 +2092,6 @@ where
         Ok(GetDeprecationInfoResponse { end_of_service })
     }
 
-    async fn get_network_parameters(&self, height: u32) -> Result<serde_json::Value> {
-        let height = Height::try_from(height).map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                error.to_string(),
-                None::<()>,
-            )
-        })?;
-        Ok(types::network_parameters::network_parameters(
-            &self.network,
-            height,
-            &self.build_version,
-        ))
-    }
-
     #[allow(clippy::unwrap_in_result)]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
         let debug_force_finished_sync = self.debug_force_finished_sync;
@@ -2286,6 +2265,14 @@ where
             nsm_value_balance_zat,
             upgrades,
             consensus,
+            consensus_parameters: Some(
+                types::get_blockchain_info::ConsensusParameters::for_heights(
+                    network,
+                    tip_height,
+                    next_block_height,
+                    &self.build_version,
+                ),
+            ),
             headers: header_height,
             difficulty,
             verification_progress,
@@ -4884,6 +4871,16 @@ pub struct GetBlockchainInfoResponse {
     #[getset(get_copy = "pub")]
     consensus: TipConsensusBranch,
 
+    /// Configured consensus rules at the reported block height and its successor.
+    /// Older RPC responses can omit this Zakura extension.
+    #[serde(
+        rename = "consensusParameters",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get = "pub")]
+    consensus_parameters: Option<types::get_blockchain_info::ConsensusParameters>,
+
     /// Zakura's authoritative header-chain state after semantic handoff.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getset(get = "pub")]
@@ -5044,6 +5041,7 @@ impl Default for GetBlockchainInfoResponse {
                 chain_tip: ConsensusBranchIdHex(ConsensusBranchId::default()),
                 next_block: ConsensusBranchIdHex(ConsensusBranchId::default()),
             },
+            consensus_parameters: None,
             headers: Height(1),
             difficulty: 0.0,
             verification_progress: 0.0,
@@ -5092,6 +5090,7 @@ impl GetBlockchainInfoResponse {
             nsm_value_balance_zat: None,
             upgrades,
             consensus,
+            consensus_parameters: None,
             headers,
             difficulty,
             verification_progress,

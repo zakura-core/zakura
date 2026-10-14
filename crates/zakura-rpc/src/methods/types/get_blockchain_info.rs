@@ -147,3 +147,37 @@ impl GetBlockchainInfoBalance {
             .expect("at least one pool")
     }
 }
+
+/// Configured validation rules for the reported chain tip and the next block.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsensusParameters {
+    /// Rules for the block height reported by `getblockchaininfo`.
+    #[getset(get = "pub")]
+    at_tip: serde_json::Value,
+    /// Rules for the block immediately following the reported chain tip.
+    #[getset(get = "pub")]
+    next_block: serde_json::Value,
+}
+
+impl ConsensusParameters {
+    pub(crate) fn for_heights(
+        network: &zakura_chain::parameters::Network,
+        tip_height: zakura_chain::block::Height,
+        next_height: zakura_chain::block::Height,
+        build_version: &str,
+    ) -> Self {
+        Self {
+            at_tip: super::network_parameters::network_parameters(
+                network,
+                tip_height,
+                build_version,
+            ),
+            next_block: super::network_parameters::network_parameters(
+                network,
+                next_height,
+                build_version,
+            ),
+        }
+    }
+}

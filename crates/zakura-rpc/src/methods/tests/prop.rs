@@ -563,6 +563,13 @@ proptest! {
                     prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
                     prop_assert_eq!(info.chain, network.bip70_network_name());
                     prop_assert_eq!(info.blocks, block_height);
+                    let parameters = info.consensus_parameters().as_ref()
+                        .expect("the node reports configured rules with its chain tip");
+                    prop_assert_eq!(&parameters.at_tip()["effectiveHeight"], &serde_json::json!(block_height.0));
+                    prop_assert_eq!(&parameters.next_block()["effectiveHeight"], &serde_json::json!(block_height.0 + 1));
+                    prop_assert_eq!(parameters.at_tip()["branchId"].as_str().unwrap_or("00000000"), format!("{:08x}", info.consensus.chain_tip.inner()));
+                    prop_assert_eq!(parameters.next_block()["branchId"].as_str().unwrap_or("00000000"), format!("{:08x}", info.consensus.next_block.inner()));
+
                     prop_assert_eq!(info.best_block_hash, block_hash);
                     prop_assert_eq!(info.headers, header_height);
                     prop_assert_eq!(

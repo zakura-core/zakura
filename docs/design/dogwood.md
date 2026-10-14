@@ -13,7 +13,7 @@ pushing is cheap. Parity lets a node stop after any `k` parts of a stripe, so it
 can skip slow neighbours instead of waiting for them.
 
 The tradeoff is state: pushed lanes avoid a request round trip, but they need
-learning, loop avoidance, and a way to stop. The
+learning, cycle avoidance, and a way to stop. The
 [protocol specification](../specs/dogwood.md) defines the rules. This document
 explains the design. The [experiment report](dogwood-experiments.md) records
 the local codec and controller experiments behind the first draft.
@@ -200,14 +200,11 @@ Push:       A ──Part──> Node
 Demote:     Node ──Unsubscribe──> A ... A ──SubscriptionEnd──> Node
 ```
 
-**Loop freedom.** Each node advertises, per lane and block, its potential: the
-median delay of the lane's parts after the block's creation time. A node
-accepts a new parent only if the parent's potential for that block is lower
-than its own. Every node compares advertised numbers, so no cycle can pass this
-filter within one block. A second rule breaks cycles that form across blocks:
-when a node's own parent subscribes to it for the same lane, it leaves that
-parent. Clock skew between nodes can bias the ranking, but it cannot create a
-cycle.
+**Avoiding cycles.** A node accepts a parent only if the parent's advertised
+potential, its median arrival delay for the lane in that block, is lower than
+the node's own. Parents therefore always point upstream, and no cycle forms
+within a block, even under clock skew. A node also leaves a parent that
+subscribes to it for the same lane, which breaks cycles that form across blocks.
 
 **Falling behind.** A node that runs several blocks behind still learns. It
 keeps each neighbour's adverts for the last 64 blocks and compares against the
@@ -246,47 +243,61 @@ entry-peer round-trip time, remains untested.
 
 ## Bounding what peers can send
 
-The first draft bounded incoming traffic with immutable grants of part and byte
-credit. The prototype dropped credit because the QUIC send window already
-queues honest traffic. QUIC's receive window does not bound a dishonest peer,
-though: the node reads and drops each part, so the window refills at once.
+QUIC's receive window does not bound a dishonest peer: the node reads and drops
+each unwanted part, so the window refills at once. The first draft added part
+and byte credit for this. Dogwood instead keeps a wanted set per connection.
+Node N wants part `i` from peer A only in these cases:
 
-Dogwood now bounds receive traffic with a wanted set. Per connection, a node
-wants a part from a peer only if it subscribed to the part's lane there, sent
-that peer a `Want` that allows the part, or the peer is the block's proposer
-and the node is the part's entry peer. Each wanted part is wanted once from each
-peer. An unwanted part or a second copy from the same peer disconnects the peer
-before proof verification. Any peer can therefore send at most one copy of each
-part the node asked for, and total receive bytes follow the node's own
-subscriptions and `Want`s. A byte budget adds nothing to that bound.
+| N wants `i` from A while | Until |
+| --- | --- |
+| N subscribes to `i`'s lane at A | A's `SubscriptionEnd` arrives |
+| N's live `Want` to A allows `i` | A's `WantEnd` arrives |
+| A is the block's proposer and N is `i`'s entry peer | The part arrives |
 
-Ends make the bound exact under crossings. An `Unsubscribe` cannot recall parts
-the parent already queued, so the lane stays wanted until the parent's
-`SubscriptionEnd` arrives. `SubscriptionEnd` and `WantEnd` travel on the data
-stream behind every part they authorized, so nothing of an ended exchange can
-follow them. Every subscription ends the same way: the subscriber sends one
-`Unsubscribe`, and the publisher answers with one `SubscriptionEnd`. A publisher
-that declines or stops pushing sends `Refuse`, which asks for that
+N wants each part at most once from each peer. An unwanted part or a second
+copy disconnects the peer before proof verification. A peer can therefore send
+at most one copy of each part that N asked for, so a byte budget adds nothing.
+
+Ends keep the bound exact when messages cross. A parent may queue parts before
+the `Unsubscribe` arrives, so the lane stays wanted until the parent's
+`SubscriptionEnd`. `SubscriptionEnd` and `WantEnd` travel on the data stream
+behind every part they authorized. In this diagram, solid arrows use the control
+stream and dashed arrows use the data stream.
+
+```mermaid
+sequenceDiagram
+    participant N as Node N
+    participant A as Parent A
+    N->>A: Subscribe (lane E)
+    A-->>N: Part, Part, ...
+    N->>A: Unsubscribe (lane E)
+    A-->>N: Part (queued earlier, still wanted)
+    A-->>N: SubscriptionEnd (lane E)
+    Note over N: Lane E is no longer wanted from A.<br/>Another lane-E part from A disconnects A.
+```
+
+A parent that declines or stops pushing sends `Refuse`, which asks for the
 `Unsubscribe`. `Refuse` shares the data stream with `SubscriptionEnd`, so it
-never arrives after the end. No timer ends a subscription or a `Want`, so a slow
-peer never looks like a lying one.
+always arrives first. No timer ends a subscription or a `Want`, so a slow peer
+never looks like a lying one.
 
-Messages name a block by its metadata variant, not its consensus hash. A
-proposer can sign two variants of one header. A node holding the other variant
-then sees an unknown block, never a bad proof, so equivocation cannot make
-honest peers disconnect each other. Messages about unknown blocks wait in a
-small per-peer early record until the metadata arrives. When that record fills,
-the node stops reading the peer's data stream, so unknown-block parts cost at
-most the record's size per age bound. The control stream never pauses, because
-the metadata that resolves the block travels on it. Coded propagation covers only the last 16
-blocks, which lets a node remember every block it retired and reject repeats.
+Three rules bound traffic about blocks that a node cannot check yet:
 
-Every Dogwood message follows the
-[peer message regulation](peer-message-regulation.md) model: a frame cap, bounded
-decoding, a reservation check before expensive work, then verification. A node
-disconnects only on an event no conformant peer can cause. Crossings, local
-eviction, and local capacity produce `Drop` and a bounded trace. The spec lists,
-for each message, the checks and the sender obligation behind each disconnect.
+- **Variant names.** Messages name a block by its metadata variant, not its
+  consensus hash. A node that holds another variant sees an unknown block, never
+  a bad proof. An equivocating proposer therefore cannot make honest peers
+  disconnect each other.
+- **Early record.** Messages about unknown blocks wait in a small per-peer
+  record. When the record fills, the node pauses that peer's data stream. The
+  control stream never pauses, because it carries the metadata that resolves
+  the block.
+- **Propagation window.** Coded propagation covers only the last 16 blocks, so a
+  node can remember every block it retired and reject repeats.
+
+Every message follows the [peer message regulation](peer-message-regulation.md)
+model. A node disconnects only when no conformant peer could have sent the
+message, and the spec names the sender obligation behind each disconnect.
+Crossings and local capacity return `Drop`.
 
 ## Recovery
 

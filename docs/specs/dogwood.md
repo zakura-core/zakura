@@ -1080,7 +1080,7 @@ that lane in the block. The ranking lag is an EWMA of raw lags with weight
 The node runs one learning step per block, `LEARN_DELAY_MS` after it assembles
 the block. The step waits up to `ADV_WAIT_MS` for its candidates' `Advert`s.
 
-### Potentials and loop freedom
+### Potentials and cycle avoidance
 
 A node's potential for a lane in a block is the median first-arrival delay,
 after `created_ms`, of the lane's sampled parts. Parts that the node
@@ -1350,7 +1350,7 @@ infrastructure that the
 8. Recovery. The stall resets on progress; the reconstruction deadline does not.
    The ladder never moves backward. Block download follows repair failure, a
    metadata conflict, or a failed re-encode check.
-9. Routing. Loop freedom within a block, the cycle-break rule, a node that runs
+9. Routing. No cycles within a block, the cycle-break rule, a node that runs
    several blocks behind, two proposers at once, random proposer pairs, and
    proposer changes with shared entry peers.
 

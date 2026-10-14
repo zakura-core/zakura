@@ -10603,7 +10603,10 @@ mod tests {
                 stop: None,
             },
             LegacyRequestKind::FindBlocks,
-            Response::BlockHashes(vec![block_hash(2)]),
+            Response::BlockHashes {
+                hashes: vec![block_hash(2)],
+                feedback: None,
+            },
         )?;
         assert_codec_frames_validate_at_transport(
             LegacyRequestFrame::FindHeaders {
@@ -11081,7 +11084,10 @@ mod tests {
                 .collect();
             let frame = LegacyResponseCodec::encode_response(
                 request_id,
-                Response::BlockHashes(hashes),
+                Response::BlockHashes {
+                    hashes,
+                    feedback: None,
+                },
                 limits.max_frame_bytes,
                 limits.max_message_bytes,
             )
@@ -11108,7 +11114,10 @@ mod tests {
         // ends, so a peer cannot avoid it by holding the stream open.
         let frame = LegacyResponseCodec::encode_response(
             request_id,
-            Response::BlockHashes(vec![block_hash(1), block_hash(2), block_hash(1)]),
+            Response::BlockHashes {
+                hashes: vec![block_hash(1), block_hash(2), block_hash(1)],
+                feedback: None,
+            },
             limits.max_frame_bytes,
             limits.max_message_bytes,
         )

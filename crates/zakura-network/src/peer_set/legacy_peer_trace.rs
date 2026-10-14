@@ -157,7 +157,7 @@ impl LegacyPeerTrace {
     ) {
         self.emitter.emit_event(|| {
             let result = match result {
-                Ok(Response::BlockHashes(hashes)) => {
+                Ok(Response::BlockHashes { hashes, .. }) => {
                     let (inferred_start_height, inferred_end_height) =
                         inferred_height_range(peer.local_tip_height, hashes.len());
                     FindBlocksResult::BlockHashes {
@@ -328,7 +328,10 @@ mod tests {
             Some(hash(1)),
             None,
             Duration::from_millis(12),
-            &Ok(Response::BlockHashes(vec![hash(2), hash(3)])),
+            &Ok(Response::BlockHashes {
+                hashes: vec![hash(2), hash(3)],
+                feedback: None,
+            }),
         );
         trace.block_request_finish(
             2,
@@ -431,7 +434,10 @@ mod tests {
             None,
             None,
             Duration::from_millis(12),
-            &Ok(Response::BlockHashes(hashes)),
+            &Ok(Response::BlockHashes {
+                hashes,
+                feedback: None,
+            }),
         );
 
         drop(trace);

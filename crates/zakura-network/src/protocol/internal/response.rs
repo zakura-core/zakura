@@ -45,7 +45,13 @@ pub enum Response {
     /// The list contains zero or more block hashes.
     //
     // TODO: make this into an IndexMap - an ordered unique list of hashes (#2244)
-    BlockHashes(Vec<block::Hash>),
+    BlockHashes {
+        /// Advertised block hashes.
+        hashes: Vec<block::Hash>,
+        /// Local feedback from the selected connection.
+        #[cfg_attr(any(test, feature = "proptest-impl"), proptest(value = "None"))]
+        feedback: Option<crate::DiscoveryFeedback>,
+    },
 
     /// An ordered list of block headers.
     ///
@@ -92,7 +98,9 @@ impl fmt::Display for Response {
 
             Response::Pong(duration) => format!("Pong {{ latency: {duration:?} }}"),
 
-            Response::BlockHashes(hashes) => format!("BlockHashes {{ hashes: {} }}", hashes.len()),
+            Response::BlockHashes { hashes, .. } => {
+                format!("BlockHashes {{ hashes: {} }}", hashes.len())
+            }
             Response::BlockHeaders(headers) => {
                 format!("BlockHeaders {{ headers: {} }}", headers.len())
             }
@@ -138,7 +146,7 @@ impl Response {
 
             Response::Pong(_) => "Pong",
 
-            Response::BlockHashes(_) => "BlockHashes",
+            Response::BlockHashes { .. } => "BlockHashes",
             Response::BlockHeaders(_) => "BlockHeaders",
             Response::TransactionIds(_) => "TransactionIds",
 

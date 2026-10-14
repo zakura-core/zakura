@@ -596,7 +596,7 @@ impl LegacyResponseCodec {
                     )?;
                 }
             }
-            Response::BlockHashes(hashes) => {
+            Response::BlockHashes { hashes, .. } => {
                 // FindBlocks should already be service-capped; overflowing the wire cap is a bug.
                 push_response_frame(
                     &mut frames,
@@ -821,7 +821,10 @@ impl LegacyResponseCodec {
                 if let Some(hash) = block_hashes.iter().find(|hash| !seen.insert(**hash)) {
                     return Err(LegacyGossipError::DuplicateBlockHash(*hash));
                 }
-                Ok(Response::BlockHashes(block_hashes))
+                Ok(Response::BlockHashes {
+                    hashes: block_hashes,
+                    feedback: None,
+                })
             }
             LegacyRequestKind::FindHeaders => Ok(Response::BlockHeaders(block_headers)),
             LegacyRequestKind::MempoolTransactionIds => {
@@ -2122,6 +2125,7 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    last_discovery_peer: Arc<Mutex<Option<ZakuraPeerId>>>,
 }
 
 impl ZakuraRequestClient {
@@ -2155,6 +2159,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            last_discovery_peer: Default::default(),
         }
     }
 
@@ -2186,11 +2191,41 @@ impl ZakuraRequestClient {
             _ => None,
         };
 
-        let handles = self.ready_handles().await?;
+        let mut handles = self.ready_handles().await?;
+        if preferred.is_none()
+            && matches!(
+                frame,
+                LegacyRequestFrame::FindBlocks { .. } | LegacyRequestFrame::FindHeaders { .. }
+            )
+        {
+            // Share rotation across adapter clones. Nonempty inventory cannot retain selection.
+            handles.sort_by(|a, b| a.peer_id().as_bytes().cmp(b.peer_id().as_bytes()));
+            let mut last = self.last_discovery_peer.lock().await;
+            let next = last
+                .as_ref()
+                .and_then(|last| {
+                    handles
+                        .iter()
+                        .position(|handle| handle.peer_id().as_bytes() > last.as_bytes())
+                })
+                .unwrap_or(0);
+            handles.rotate_left(next);
+            *last = handles.first().map(|handle| handle.peer_id().clone());
+        }
+        let discovery_preferred = if preferred.is_none()
+            && matches!(
+                frame,
+                LegacyRequestFrame::FindBlocks { .. } | LegacyRequestFrame::FindHeaders { .. }
+            ) {
+            handles.first().map(|handle| handle.peer_id())
+        } else {
+            None
+        };
+
         let request_kind = frame.kind();
         let candidates = request_candidates(
             &handles,
-            preferred.as_ref(),
+            preferred.as_ref().or(discovery_preferred),
             request_kind.max_attempts(),
             &mut OsRng,
         );
@@ -2417,7 +2452,7 @@ fn all_inventory_missing(response: &Response) -> bool {
                     .iter()
                     .all(|transaction| transaction.is_missing())
         }
-        Response::BlockHashes(hashes) => hashes.is_empty(),
+        Response::BlockHashes { hashes, .. } => hashes.is_empty(),
         Response::BlockHeaders(headers) => headers.is_empty(),
         Response::TransactionIds(ids) => ids.is_empty(),
         _ => false,
@@ -3588,10 +3623,10 @@ mod tests {
         }
 
         fn call(&mut self, _request: Request) -> Self::Future {
-            std::future::ready(Ok(Response::BlockHashes(vec![
-                block_hash(1),
-                block_hash(1),
-            ])))
+            std::future::ready(Ok(Response::BlockHashes {
+                hashes: vec![block_hash(1), block_hash(1)],
+                feedback: None,
+            }))
         }
     }
 
@@ -3755,7 +3790,10 @@ mod tests {
 
         fn call(&mut self, request: Request) -> Self::Future {
             let response = match request {
-                Request::FindBlocks { .. } => Response::BlockHashes(vec![self.block.hash()]),
+                Request::FindBlocks { .. } => Response::BlockHashes {
+                    hashes: vec![self.block.hash()],
+                    feedback: None,
+                },
                 Request::FindHeaders { .. } => Response::BlockHeaders(vec![self.header()]),
                 Request::MempoolTransactionIds => {
                     Response::TransactionIds(vec![self.transaction.id()])
@@ -4119,6 +4157,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_rotates_v2_peers_across_adapter_clones() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let first = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let mut second = first.as_ref().clone();
+        Arc::make_mut(&mut second.header).nonce[0] ^= 1;
+        let second = Arc::new(second);
+        let transaction = UnminedTx::from(empty_v5_transaction(4));
+        let (node_a, _) = normal_network_node(171, first.clone(), transaction.clone()).await?;
+        let (node_b, _) = normal_network_node(172, second.clone(), transaction).await?;
+        let victim = ZakuraTestNode::builder(173).spawn().await?;
+        victim.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        victim.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        let adapter = LegacyRequestAdapter::new(victim.supervisor());
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            let response = adapter
+                .clone()
+                .request_from_source(
+                    Request::FindBlocks {
+                        known_blocks: vec![],
+                        stop: None,
+                    },
+                    None,
+                )
+                .await?;
+            let Response::BlockHashes { hashes, .. } = response else {
+                panic!("expected inventory");
+            };
+            seen.extend(hashes);
+        }
+        assert_eq!(seen, HashSet::from([first.hash(), second.hash()]));
+        victim.shutdown().await;
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn request_adapter_fetches_missing_block_from_advertiser() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(1));
@@ -4399,7 +4477,11 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        let Response::BlockHashes(remote_hashes) = find_blocks else {
+        let Response::BlockHashes {
+            hashes: remote_hashes,
+            ..
+        } = find_blocks
+        else {
             panic!("unexpected FindBlocks response: {find_blocks:?}");
         };
         assert_eq!(remote_hashes, vec![block.hash()]);
@@ -4504,7 +4586,7 @@ mod tests {
                 Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
-        let Response::BlockHashes(hashes) = hashes else {
+        let Response::BlockHashes { hashes, .. } = hashes else {
             panic!("unexpected FindBlocks response: {hashes:?}");
         };
         assert_eq!(hashes, vec![block.hash()]);
@@ -5791,7 +5873,10 @@ mod tests {
                 None,
             )
             .expect("nil is a valid empty FindBlocks response"),
-            Response::BlockHashes(vec![]),
+            Response::BlockHashes {
+                hashes: vec![],
+                feedback: None
+            },
         );
         assert_eq!(
             LegacyResponseCodec::decode_response(
@@ -5950,7 +6035,10 @@ mod tests {
         let decode = |hashes: Vec<block::Hash>| -> Result<Response, LegacyGossipError> {
             let frames = LegacyResponseCodec::encode_response(
                 7,
-                Response::BlockHashes(hashes),
+                Response::BlockHashes {
+                    hashes,
+                    feedback: None,
+                },
                 frame_cap,
                 frame_cap,
             )?;
@@ -5972,7 +6060,7 @@ mod tests {
 
         assert!(matches!(
             decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES))?,
-            Response::BlockHashes(hashes) if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
+            Response::BlockHashes { hashes, .. } if hashes.len() == MAX_FIND_BLOCKS_RESPONSE_HASHES
         ));
 
         let oversized = decode(distinct(MAX_FIND_BLOCKS_RESPONSE_HASHES + 1));
@@ -6203,7 +6291,10 @@ mod tests {
             header: block.header.clone(),
         };
 
-        let block_hash_response = Response::BlockHashes(vec![block.hash(), block_hash(10)]);
+        let block_hash_response = Response::BlockHashes {
+            hashes: vec![block.hash(), block_hash(10)],
+            feedback: None,
+        };
         let frames = LegacyResponseCodec::encode_response(
             8,
             block_hash_response.clone(),
@@ -6952,7 +7043,7 @@ mod tests {
             })
             .await?;
         match find_blocks {
-            Response::BlockHashes(hashes) => assert_eq!(hashes, vec![block.hash()]),
+            Response::BlockHashes { hashes, .. } => assert_eq!(hashes, vec![block.hash()]),
             other => panic!("unexpected FindBlocks response: {other:?}"),
         }
 

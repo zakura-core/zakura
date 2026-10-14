@@ -51,6 +51,7 @@ impl OutstandingRequests {
     }
 
     /// Requests in issue order.
+    #[cfg(test)]
     pub(in crate::zakura::block_sync) fn iter(
         &self,
     ) -> impl Iterator<Item = &OutstandingBlockRange> + '_ {

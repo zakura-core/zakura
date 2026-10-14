@@ -512,8 +512,8 @@ impl PeerRoutine {
             if self
                 .window
                 .outstanding
-                .iter()
-                .any(|outstanding| outstanding.deadline <= now)
+                .earliest_deadline()
+                .is_some_and(|deadline| deadline <= now)
                 || self
                     .window
                     .block_liveness_deadline

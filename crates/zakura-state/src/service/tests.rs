@@ -1548,7 +1548,7 @@ fn block_sync_body_anchor_rolls_back_to_the_selected_fork_intersection() {
 }
 
 async fn test_populated_state_responds_correctly(
-    mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,
+    mut state: Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
 ) -> Result<()> {
     let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
         .range(0..=LAST_BLOCK_HEIGHT)

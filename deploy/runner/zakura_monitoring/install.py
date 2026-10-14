@@ -173,6 +173,7 @@ PACKAGE_TOP_FILES = (
     "zakura-fleet-watchdog.service",
     "test_zakura_monitoring_compat.py",
     "test_zakura_monitoring_lane.py",
+    "test_zakura_monitoring_nu7.py",
     "test_zakura_monitoring_install.py",
 )
 

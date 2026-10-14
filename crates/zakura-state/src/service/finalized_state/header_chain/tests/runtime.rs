@@ -3381,3 +3381,440 @@ fn retained_checkpoint_still_rejects_mismatched_header_identity() {
         .is_err());
     assert_eq!(runtime.publisher().snapshot(), before);
 }
+
+#[test]
+fn stored_validation_context_equals_the_lease_built_from_rehashed_headers() {
+    let path_len = u8::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 6)
+        .expect("the predecessor span fixture is shorter than 256");
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(path_len);
+    let (engine_config, _, _) = fixture();
+    let network = engine_config.network();
+    let parent = path.last().expect("the fixture path is nonempty");
+
+    let lease = runtime
+        .store
+        .validation_context(parent.hash, network)
+        .expect("the retained parent has a coherent validation context");
+
+    // Rebuild the lease the way it was built before hash reuse: hash every context header.
+    let parent_node = runtime
+        .store
+        .header_node(parent.hash)
+        .expect("the parent row decodes")
+        .expect("the parent is retained");
+    let mut facts = vec![zakura_header_chain::HeaderContextFact {
+        frontier: Frontier::new(parent_node.height, parent.hash),
+        header: parent_node.header.clone(),
+    }];
+    facts.extend(
+        authenticated_context_headers(&runtime.store, parent.hash, None)
+            .expect("the stored context authenticates")
+            .into_iter()
+            .rev()
+            .map(|context| context.fact()),
+    );
+    assert_eq!(
+        facts.len(),
+        zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 1
+    );
+    for fact in &facts {
+        assert_eq!(fact.frontier.hash, fact.header.hash());
+    }
+    let expected = zakura_header_chain::ValidationLease::new(
+        lease.parent(),
+        facts,
+        network.clone(),
+        runtime
+            .store
+            .metadata()
+            .expect("the metadata row exists")
+            .anchor_manifest_digest,
+    );
+    assert_eq!(lease, expected);
+}
+
+#[test]
+fn stored_validation_context_rejects_a_predecessor_row_with_altered_header_bytes() {
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(8);
+    let (engine_config, _, _) = fixture();
+    let parent = &path[7];
+    let altered = path[5].hash;
+    runtime
+        .store
+        .validation_context(parent.hash, engine_config.network())
+        .expect("the unaltered context is coherent");
+
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let mut row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &altered.0)
+        .expect("the node row reads")
+        .expect("the predecessor is retained");
+    // The row starts with a four-byte header length, then the header: version (4), previous
+    // hash (32), merkle root (32), and commitment (32) precede the four-byte time.
+    row[4 + 100] ^= 0x01;
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, altered.0, &row)
+        .expect("the altered row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the fixture corruption is durable");
+
+    assert!(matches!(
+        runtime
+            .store
+            .validation_context(parent.hash, engine_config.network()),
+        Err(StoreError::Incoherent("durable header-chain read failed"))
+    ));
+}
+
+/// Rewrites the stored node row of `hash` with `rewrite`, durably.
+fn rewrite_node_row(
+    runtime: &HeaderChainRuntime,
+    hash: block::Hash,
+    rewrite: impl FnOnce(&mut Vec<u8>),
+) {
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let mut row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &hash.0)
+        .expect("the node row reads")
+        .expect("the node is retained");
+    rewrite(&mut row);
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, hash.0, &row)
+        .expect("the row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the fixture corruption is durable");
+}
+
+#[test]
+fn validation_context_rejects_truncated_and_hash_flipped_predecessor_rows() {
+    use zakura_chain::serialization::ZcashSerialize;
+
+    for corruption in ["truncated", "stored hash flipped"] {
+        let (runtime, path, network) = hashed_evidence_fixture();
+        let parent = path.last().expect("the fixture path is nonempty").hash;
+        let corrupted = path[path.len() - 5].hash;
+        rewrite_node_row(&runtime, corrupted, |row| {
+            let (node, _) = HeaderNodeDisk::decode_hashed(row).expect("the stored row decodes");
+            let header_len = node
+                .header
+                .zcash_serialize_to_vec()
+                .expect("a decoded header serializes")
+                .len();
+            match corruption {
+                // Cut the row inside the stored hash that follows the header.
+                "truncated" => row.truncate(4 + header_len + 16),
+                // The row is a four-byte length, the header, then the redundant stored hash.
+                _ => row[4 + header_len] ^= 0x01,
+            }
+        });
+
+        assert!(
+            matches!(
+                runtime.store.validation_context(parent, &network),
+                Err(StoreError::Incoherent("durable header-chain read failed"))
+            ),
+            "{corruption} row must fail the integrity-checking decode"
+        );
+    }
+}
+
+#[test]
+fn validation_context_rejects_rows_with_tampered_parent_or_work_fields() {
+    use crate::service::finalized_state::disk_format::FallibleDiskValue;
+
+    for field in ["parent_hash", "block_work"] {
+        let (runtime, path, network) = hashed_evidence_fixture();
+        let parent = path.last().expect("the fixture path is nonempty").hash;
+        let tampered = path[path.len() - 5].hash;
+        // Re-encode a well-formed row: the header bytes and stored hash stay consistent, so
+        // only the hashed-header node construction can notice the contradicted field.
+        rewrite_node_row(&runtime, tampered, |row| {
+            let (mut node, _) = HeaderNodeDisk::decode_hashed(row).expect("the stored row decodes");
+            match field {
+                "parent_hash" => node.parent_hash.0[0] ^= 0x01,
+                // Valid headers have nonzero work, so doubling it changes the field.
+                _ => node.block_work <<= 1,
+            }
+            *row = node.encode().expect("a tampered field still encodes");
+        });
+
+        assert!(
+            matches!(
+                runtime.store.validation_context(parent, &network),
+                Err(StoreError::Incoherent("invalid durable node"))
+            ),
+            "a row with a tampered {field} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn validation_context_notices_corruption_written_between_two_builds() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("the uncorrupted context is coherent");
+
+    // A later build must read the row again rather than reuse anything from the first build.
+    rewrite_node_row(&runtime, path[path.len() - 5].hash, |row| {
+        row[4 + 100] ^= 0x01;
+    });
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("durable header-chain read failed"))
+    ));
+}
+
+fn hashed_evidence_fixture() -> (HeaderChainRuntime, Vec<VerifiedHeaderRef>, Network) {
+    let path_len = u8::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 6)
+        .expect("the predecessor span fixture is shorter than 256");
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(path_len);
+    let (engine_config, _, _) = fixture();
+    (runtime, path, engine_config.network().clone())
+}
+
+#[test]
+fn repeated_validation_contexts_reread_every_row_and_build_identical_leases() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let first = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+    let first_reads = HeaderChainStore::header_node_disk_reads();
+    HeaderChainStore::reset_header_node_disk_reads();
+    let second = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+    let second_reads = HeaderChainStore::header_node_disk_reads();
+
+    assert_eq!(first, second);
+    // The parent is read by the build and again by the context walk, then one read per
+    // predecessor: no row is served from an earlier build.
+    let expected = u64::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 2)
+        .expect("the span fits in u64");
+    assert_eq!(first_reads, expected);
+    assert_eq!(second_reads, expected);
+}
+
+#[test]
+fn validation_context_rejects_a_missing_predecessor_row() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let missing = path[path.len() - 5].hash;
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, missing.0)
+        .expect("the node row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the deletion is durable");
+
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("validation context has a gap"))
+    ));
+}
+
+#[test]
+fn validation_context_rejects_a_valid_row_stored_under_another_hash() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let replaced = path[path.len() - 5].hash;
+    let other = path[path.len() - 6].hash;
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let other_row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &other.0)
+        .expect("the node row reads")
+        .expect("the other predecessor is retained");
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, replaced.0, &other_row)
+        .expect("the row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the replacement is durable");
+
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("node key/hash mismatch"))
+    ));
+}
+
+#[test]
+fn header_evidence_from_another_row_is_not_used() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let raw = |hash: block::Hash| {
+        runtime
+            .store
+            .db
+            .raw_get_cf(&cf, &hash.0)
+            .expect("the node row reads")
+            .expect("the node is retained")
+    };
+    let a = path[path.len() - 2].hash;
+    let b = path[path.len() - 3].hash;
+    let (row_a, evidence_a) = HeaderNodeDisk::decode_hashed(&raw(a)).expect("row a decodes");
+    let (_, evidence_b) = HeaderNodeDisk::decode_hashed(&raw(b)).expect("row b decodes");
+    assert_eq!(evidence_a.hash(), a);
+    assert_eq!(evidence_b.hash(), b);
+
+    let expected = row_a
+        .clone()
+        .into_domain(Vec::new())
+        .expect("row a is coherent");
+    let with_foreign = row_a
+        .clone()
+        .into_domain_hashed(evidence_b, Vec::new())
+        .expect("foreign evidence is ignored and row a is re-hashed");
+    let with_own = row_a
+        .into_domain_hashed(evidence_a, Vec::new())
+        .expect("row a is coherent");
+    assert_eq!(with_foreign, expected);
+    assert_eq!(with_own, expected);
+    assert_eq!(expected.hash, a);
+
+    // Evidence for an equal header in a different allocation is not used either.
+    let (mut row_copy, evidence_copy) =
+        HeaderNodeDisk::decode_hashed(&raw(a)).expect("row a decodes");
+    row_copy.header = Arc::new(*row_copy.header);
+    assert!(!Arc::ptr_eq(evidence_copy.header(), &row_copy.header));
+    assert_eq!(
+        row_copy
+            .into_domain_hashed(evidence_copy, Vec::new())
+            .expect("row a is coherent"),
+        expected
+    );
+}
+
+/// Replace one retained predecessor's node row with a `HEADER_VALIDATION_CONTEXT` row.
+fn replace_node_with_context_row(
+    runtime: &HeaderChainRuntime,
+    target: &VerifiedHeaderRef,
+    context: HeaderValidationContextDisk,
+) {
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, target.hash.0)
+        .expect("the node row is addressable");
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_VALIDATION_CONTEXT,
+            target.hash.0,
+            &context,
+        )
+        .expect("the context row encodes");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the replacement is durable");
+}
+
+#[test]
+fn validation_context_fallback_rows_build_the_same_lease_and_reject_tampering() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let target = path[path.len() - 5].clone();
+    let original = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+
+    // A coherent fallback row builds exactly the same lease.
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: target.header.clone(),
+            height: target.height,
+        },
+    );
+    assert_eq!(
+        runtime
+            .store
+            .validation_context(parent, &network)
+            .expect("coherent"),
+        original
+    );
+
+    // A wrong height is rejected.
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: target.header.clone(),
+            height: target
+                .height
+                .next()
+                .expect("the fixture height has a successor"),
+        },
+    );
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent(
+            "invalid immutable validation context"
+        ))
+    ));
+
+    // Different header bytes under the same key are rejected.
+    let mut altered = *target.header;
+    altered.time += chrono::Duration::seconds(1);
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: Arc::new(altered),
+            height: target.height,
+        },
+    );
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent(
+            "invalid immutable validation context"
+        ))
+    ));
+}

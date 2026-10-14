@@ -49,8 +49,8 @@ edition = "2021"
 # gate refers to `zakura-assets` and nothing else.
 zakura-assets = { version = "=0.3513777.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = { version = "=3.0.0", package = "zakura-orchard" }
-sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto" }
+orchard = { version = "=3.0.0", package = "zakura-orchard", default-features = false, features = ["circuit", "multicore", "std"] }
+sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto", default-features = false, features = ["circuit", "multicore"] }
 zcash_address = { version = "=3.0.0", package = "zakura-address" }
 zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
 zcash_primitives = { version = "=3.0.0", package = "zakura-primitives" }
@@ -97,9 +97,9 @@ idna_adapter = "~1.1.0"
 indexmap = "2.8"
 insta = "1.42"
 itertools = "0.14"
-jsonrpsee = "0.24.8"
-jsonrpsee-proc-macros = "0.24.9"
-jsonrpsee-types = "0.24.9"
+jsonrpsee = "0.26.1"
+jsonrpsee-proc-macros = "0.26.1"
+jsonrpsee-types = "0.26.1"
 jubjub = { version = "=3.0.0", package = "zakura-jubjub" }
 lazy_static = "1.4"
 libc = "0.2"
@@ -159,7 +159,7 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
-tower = "0.4.13"
+tower = "0.5.3"
 tracing = "0.1.41"
 tracing-error = "0.2"
 tracing-journald = "0.3"

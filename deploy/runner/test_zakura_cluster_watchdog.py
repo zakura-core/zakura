@@ -40,6 +40,13 @@ def make_args(**overrides):
     return argparse.Namespace(**defaults)
 
 
+class Nu7DashboardContractTests(unittest.TestCase):
+    def test_activation_dashboard_fixture_is_available(self):
+        path = Path(__file__).parent / "testdata" / "nu7-dashboard-v1-sample.json"
+        data = json.loads(path.read_text())
+        self.assertIsNone(watchdog.nu7.failure(data, data["generatedAt"], 600))
+
+
 class StallRecoveryTests(unittest.TestCase):
     """A stalled node must not be declared recovered at an unchanged height."""
 

@@ -3962,7 +3962,7 @@ pub fn spawn_init_read_only(
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_test(
     network: &Network,
-) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
+) -> Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
@@ -3981,7 +3981,7 @@ pub async fn init_test(
 pub async fn init_test_services(
     network: &Network,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     ReadStateService,
     LatestChainTip,
     ChainTipChange,

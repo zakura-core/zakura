@@ -66,6 +66,8 @@ fn restricted_surface_contains_only_unauthenticated_methods() {
         .collect();
 
     assert_eq!(actual, expected);
+    // The public NU7 activation collector reads this from restricted validators.
+    assert!(actual.contains("getnetworkparameters"));
     assert!(!actual.contains("invalidateblock"));
     assert!(!actual.contains("reconsiderblock"));
     assert!(!actual.contains("preciousblock"));

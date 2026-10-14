@@ -1,0 +1,82 @@
+{
+  "atTip": {
+    "actionLimits": {
+      "globalShieldedBudget": 330,
+      "orchardActionsPerPool": 330,
+      "saplingSpendsAndOutputs": 300,
+      "sproutJoinSplits": 0
+    },
+    "activationHeight": 4465026,
+    "baseSubsidyZat": 52083333,
+    "branchId": "77190ad9",
+    "buildVersion": "v1.6.1+gf6f458641c03",
+    "coinbaseMaturityBlocks": 100,
+    "difficulty": {
+      "averagingTimespanSeconds": 2550,
+      "averagingWindowBlocks": 102,
+      "dampingFactor": 4,
+      "maxAdjustDownPercent": 32,
+      "maxAdjustUpPercent": 16,
+      "medianTimeSpanBlocks": 11,
+      "minimumDifficultyGapMultiplier": 18,
+      "minimumDifficultyGapSeconds": 450,
+      "minimumDifficultyStrictlyGreater": true,
+      "powLimit": "07ffff0000000000000000000000000000000000000000000000000000000000",
+      "powLimitCompact": "2007ffff"
+    },
+    "effectiveHeight": 4492960,
+    "fees": {
+      "minerPercent": 40,
+      "nsmPercent": 60,
+      "nsmRounding": "floor-on-block-aggregate"
+    },
+    "minimumProtocolVersion": 170180,
+    "network": "Testnet",
+    "networkMagic": "fa1af9bf",
+    "nsmReissuanceHeight": 7305222,
+    "nu7Active": true,
+    "nu7BranchId": "77190ad9",
+    "schemaVersion": 1,
+    "targetSpacingSeconds": 25
+  },
+  "nextBlock": {
+    "actionLimits": {
+      "globalShieldedBudget": 330,
+      "orchardActionsPerPool": 330,
+      "saplingSpendsAndOutputs": 300,
+      "sproutJoinSplits": 0
+    },
+    "activationHeight": 4465026,
+    "baseSubsidyZat": 52083333,
+    "branchId": "77190ad9",
+    "buildVersion": "v1.6.1+gf6f458641c03",
+    "coinbaseMaturityBlocks": 100,
+    "difficulty": {
+      "averagingTimespanSeconds": 2550,
+      "averagingWindowBlocks": 102,
+      "dampingFactor": 4,
+      "maxAdjustDownPercent": 32,
+      "maxAdjustUpPercent": 16,
+      "medianTimeSpanBlocks": 11,
+      "minimumDifficultyGapMultiplier": 18,
+      "minimumDifficultyGapSeconds": 450,
+      "minimumDifficultyStrictlyGreater": true,
+      "powLimit": "07ffff0000000000000000000000000000000000000000000000000000000000",
+      "powLimitCompact": "2007ffff"
+    },
+    "effectiveHeight": 4492961,
+    "fees": {
+      "minerPercent": 40,
+      "nsmPercent": 60,
+      "nsmRounding": "floor-on-block-aggregate"
+    },
+    "minimumProtocolVersion": 170180,
+    "network": "Testnet",
+    "networkMagic": "fa1af9bf",
+    "nsmReissuanceHeight": 7305222,
+    "nu7Active": true,
+    "nu7BranchId": "77190ad9",
+    "schemaVersion": 1,
+    "targetSpacingSeconds": 25
+  }
+}

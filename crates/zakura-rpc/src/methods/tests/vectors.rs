@@ -293,6 +293,69 @@ async fn rpc_getinfo() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// The NU7 activation collector reads `getnetworkparameters` at the tip and the next
+/// height from every public-Testnet validator, so it must stay dispatchable.
+///
+/// The fixture holds the last exports that a deployed node published before the
+/// method was dropped. Only `buildVersion` and `minimumProtocolVersion` describe
+/// the running binary rather than consensus, so the test takes them from this one.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getnetworkparameters_matches_deployed_public_testnet_export() {
+    let _init_guard = zakura_test::init();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let network = zakura_chain::parameters::Network::new_default_testnet();
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        network.clone(),
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+    let module = rpc.into_rpc();
+
+    let deployed: serde_json::Value =
+        serde_json::from_str(include_str!("getnetworkparameters-testnet.json"))
+            .expect("the fixture is valid JSON");
+    for key in ["atTip", "nextBlock"] {
+        let mut expected = deployed[key].clone();
+        let height = expected["effectiveHeight"]
+            .as_u64()
+            .and_then(|height| u32::try_from(height).ok())
+            .expect("the fixture records a block height");
+        expected["buildVersion"] = "v0.0.1".into();
+        expected["minimumProtocolVersion"] =
+            Version::min_remote_for_height(&network, Some(Height(height)))
+                .0
+                .into();
+
+        let exported = module
+            .call::<_, serde_json::Value>("getnetworkparameters", [height])
+            .await
+            .expect("getnetworkparameters is served for public Testnet");
+        assert_eq!(exported, expected, "{key} export");
+    }
+
+    let invalid = module
+        .call::<_, serde_json::Value>("getnetworkparameters", [u32::MAX])
+        .await
+        .expect_err("heights above the maximum block height are rejected");
+    match invalid {
+        jsonrpsee::core::server::MethodsError::JsonRpc(error) => {
+            assert_eq!(error.code(), ErrorCode::InvalidParams.code())
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_uses_latest_checkpoint_without_tip() {
     let _init_guard = zakura_test::init();

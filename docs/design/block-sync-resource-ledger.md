@@ -189,8 +189,59 @@ the extra block and the ending is identical on the wire, so the check is redunda
 
 ## Measurements
 
-Release probes comparing this branch with its base are in progress. This section will record
-the commands, host and results.
+Release builds of base `e33dc4308` and this branch ran alternately on one host: AMD Ryzen AI 9
+HX 370 (24 threads, Zen 5 and Zen 5c cores), 93 GiB RAM, Linux 7.2, loopback, no netem. Other
+work shared the host, so each figure is a range over repeated runs. Every probe ran with
+`cargo +1.98.0 nextest run --release -p zakura-network --features zakura-testkit
+--run-ignored only` under a 32 GiB cgroup memory cap.
+
+The candidate passed if each range overlapped the base range. A gap beyond the run-to-run
+spread counted as a regression to investigate.
+
+**Serving over native QUIC** (`regulated_getblocks_throughput_probe`, `ZAKURA_RTT_PROBE=1`,
+`ZAKURA_PROBE_SECS=10`, 6 runs each). Body MB/s:
+
+| Body | Blocks per request | Depth | Base | Branch |
+| --- | --- | --- | --- | --- |
+| 1,617 B | 1 | 64 | 158–170 | 157–183 |
+| 1,617 B | 1 | 512 | 158–192 | 171–186 |
+| 1,617 B | 1 | 2,816 (advertised) | 171–193 | 160–194 |
+| 1,617 B | 16 | 2,816 | 355–389 | 353–373 |
+| 73,079 B | 1 | 64 | 862–875 | 842–898 |
+| 73,079 B | 1 | 512 | 844–882 | 840–860 |
+| 73,079 B | 1 | 2,816 | 845–873 | 841–874 |
+
+Loopback CPU limits these figures, not the protocol: each case used 32–47 CPU-seconds in
+10 seconds.
+
+**Serving at every default session slot** (`maximum_sessions_continuous_serving_probe`,
+`ZAKURA_MAX_PEER_PROBE=1`, 512 sessions, 2 runs each):
+
+| Shape | Base responses/s | Branch responses/s | RSS after admission |
+| --- | --- | --- | --- |
+| `useful` | 236,095–238,688 | 240,811–242,188 | about 190 MB on both |
+| `unavailable` | 268,179–269,002 | 264,909–271,131 | about 189 MB on both |
+| `stalled`, window 5,632 (twice the limit) | — | — | 353 MB on both |
+
+Per-session completions stayed within 0.4% of each other in every run, so no session starved.
+The stalled shape queues twice the advertised limit in all 512 sessions. Its 343 MB above
+baseline fits the 512 MiB bookkeeping budget.
+
+**Requesting end to end** (`zakura_mock_blocksync_throughput`, `ZAKURA_MOCK_BS_RUN=1`, 4 seeds,
+100,000 synthetic blocks of 1–16 transactions, 3 runs each, alternating): base 1,434–1,584
+blocks/s, branch 1,474–1,565 blocks/s. This harness saturates about one core, so it is
+sensitive to codegen in the peer routine's loop. An earlier revision traced the ending timeout
+inside the per-iteration liveness check and ran at 940–1,060 blocks/s. Moving the trace to the
+routine's exit restored parity.
+
+**Routine bookkeeping** (`request_bookkeeping_scaling`, 5 runs each): both builds fill at
+2.3–5.1 µs per request and settle at 8.8–17.0 µs per response, nearly flat from 1,000 to 16,000
+requests.
+The two modes in both builds track which core type ran the test.
+
+In the mock harness, measured decoded bytes exceeded the 4× estimate on almost every admission
+check. Synthetic transactions are tiny, so they decode at about 8× their wire size. The
+look-ahead gate never closed, so the larger charge did not reduce throughput.
 
 ## Throughput requirement and the 10 Gbps target
 

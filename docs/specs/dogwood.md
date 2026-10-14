@@ -1,13 +1,13 @@
 # Dogwood protocol specification
 
 Status: protocol draft, second revision. This document defines the proposed
-behavior. The [design document](../design/dogwood.md) explains the choices.
-This revision replaces the first draft's part masks, immutable grants, and
+behavior. The [design document](../design/dogwood.md) explains the choices. This
+revision replaces the first draft's part masks, immutable grants, and
 byte-budgeted route controller. It adopts the mechanisms that the `flow`
-prototype measured on an 80-node fleet: coded stripes, proposer roots, one
-stream per root, pull-first routing, and receiver-chosen push. Section 8 fixes
-candidate payload profile W2. Transport negotiation and the production chain
-adapter remain open.
+prototype measured on an 80-node fleet: coded stripes, proposer entry peers, one
+lane per entry peer, pull-first routing, and receiver-chosen push. Section 8
+fixes candidate payload profile W2. Transport negotiation and the production
+chain adapter remain open.
 
 `MUST` defines a security or interoperability requirement. `SHOULD` defines the
 default policy. An alternative policy must preserve every `MUST`. `TBD`
@@ -135,7 +135,7 @@ HeaderMeta {
     coding: Coding,           // codec, body_bytes, part_bytes, stripes, k, n
     part_root: Hash,
     created_ms: u64,          // proposer's Unix time, in milliseconds
-    roots: [NodeId],          // 1..=MAX_ROOTS proposer peers, in stream order
+    entry_peers: [NodeId],  // 1..=MAX_ENTRY_PEERS proposer peers, in lane order
     signature: Signature,
 }
 ```
@@ -143,8 +143,8 @@ HeaderMeta {
 `body_bytes` MUST equal `len(B)`. Admission MUST check the combined header and
 body size with checked arithmetic before it allocates assembly state.
 
-`roots` MUST be nonempty and MUST NOT repeat an identity. It MUST NOT contain
-`proposer_node`. Section 3 derives each part's stream from `roots`.
+`entry_peers` MUST be nonempty and MUST NOT repeat an identity. It MUST NOT
+contain `proposer_node`. Section 3 derives each part's lane from `entry_peers`.
 
 `created_ms` anchors the arrival potentials in section 7. Nodes MUST NOT use it
 for admission, retention, or deadlines. A skewed proposer clock shifts every
@@ -154,10 +154,10 @@ The block identifier is the consensus hash of `header`. The profile MUST define
 one canonical serialization for the metadata fields and one hash `T`. The
 proposer signature MUST cover a domain separator, the chain identifier, the
 protocol profile, the block identifier, the proposer key, the proposer node, the
-coding tuple, the part root, the creation time, and the root list. The metadata
-variant identifier MUST hash these signed fields, excluding the signature and
-the key-binding proof. Alternate encodings of equivalent proof or signature
-evidence MUST NOT create apparent proposer equivocation.
+coding tuple, the part root, the creation time, and the entry-peer list. The
+metadata variant identifier MUST hash these signed fields, excluding the
+signature and the key-binding proof. Alternate encodings of equivalent proof or
+signature evidence MUST NOT create apparent proposer equivocation.
 
 Every Dogwood message other than `HeaderMeta` names a block by its variant
 identifier, not by its consensus hash. This document calls that identifier
@@ -170,8 +170,8 @@ height this node has admitted, which never decreases. A node MUST NOT admit
 metadata for a block at or below `top - PROPAGATION_DEPTH`. Such a block uses
 the existing block-download path.
 
-The signature binds `proposer_node` to the block. A root therefore accepts seed
-parts only from the connection authenticated as `proposer_node`.
+The signature binds `proposer_node` to the block. An entry peer therefore
+accepts seed parts only from the connection authenticated as `proposer_node`.
 
 ### Bind the proposer to the proof of work
 
@@ -221,13 +221,14 @@ rules before signature verification, part-root admission, or route-state
 allocation. It MUST bound even invalid-header verification with per-peer and
 global work limits.
 
-A valid header does not limit how many roots its signer can sign. Nodes MUST
-retain at most one admitted metadata variant per block hash. Exact duplicates
-MUST NOT create additional assembly or forwarding work. On a second distinct,
-fully authenticated variant, a node MUST stop coded propagation for that block,
-retain bounded conflict evidence, and recover through the existing block-download
-path. A metadata conflict alone MUST NOT invalidate the consensus header or
-penalize an honest relay. Local variant selection is not a consensus rule.
+A valid header does not limit how many entry-peer lists its signer can sign.
+Nodes MUST retain at most one admitted metadata variant per block hash. Exact
+duplicates MUST NOT create additional assembly or forwarding work. On a second
+distinct, fully authenticated variant, a node MUST stop coded propagation for
+that block, retain bounded conflict evidence, and recover through the existing
+block-download path. A metadata conflict alone MUST NOT invalidate the consensus
+header or penalize an honest relay. Local variant selection is not a consensus
+rule.
 
 ### Authenticate parts and reconstruction
 
@@ -280,31 +281,32 @@ whether the body's transaction commitments match the admitted header. Coding
 verification does not establish consensus validity and MUST NOT substitute for
 that validation.
 
-## 3. Streams and route state
+## 3. Lanes and route state
 
-### Roots and streams
+### Entry peers and lanes
 
-A root is a peer of the proposer that `roots` lists. With `R = len(roots)`,
-wire index `i` belongs to the stream of root `roots[i mod R]`. A stream is
-identified by its root's `NodeId` alone. Streams are shared across proposers:
-two proposers that list the same root feed the same stream.
+An entry peer is a peer of the proposer that `entry_peers` lists. With
+`R = len(entry_peers)`, wire index `i` belongs to the lane of entry peer
+`entry_peers[i mod R]`. A lane is identified by its entry peer's `NodeId`
+alone. Lanes are shared across proposers: two proposers that list the same
+entry peer feed the same lane.
 
-The proposer sends each part of its block exactly once, to the part's root. The
-root forwards it. Every other node obtains a stream's parts from a parent that
-pushes them, or by pulling parts that its neighbours announce.
+The proposer sends each part of its block exactly once, to the part's entry
+peer. The entry peer forwards it. Every other node obtains a lane's parts from a
+parent that pushes them, or by pulling parts that its neighbours announce.
 
 ### Subscriptions
 
-A subscriber asks a publisher to push a stream. The scope of a subscription is
+A subscriber asks a publisher to push a lane. The scope of a subscription is
 `Standing` or `Block(block_id)`. A standing subscription covers each part of the
-stream in every admitted block while it lasts. A block subscription covers the
-stream's parts in one admitted block.
+lane in every admitted block while it lasts. A block subscription covers the
+lane's parts in one admitted block.
 
-Each connection direction keeps one subscription state per `(scope, stream)`:
+Each connection direction keeps one subscription state per `(scope, lane)`:
 
 | Subscriber state | Entered when | Parts wanted |
 | --- | --- | --- |
-| `Idle` | Initially, or when the subscriber reads the subscription's `StreamEnd` | No |
+| `Idle` | Initially, or when the subscriber reads the subscription's `SubscriptionEnd` | No |
 | `Live` | The subscriber sends `Subscribe` | Yes |
 | `Draining` | The subscriber sends `Unsubscribe` | Yes |
 
@@ -320,43 +322,45 @@ Every subscription follows one lifecycle:
    `Refuse` read in `Draining` changes nothing.
 5. The subscriber sends exactly one `Unsubscribe` per `Subscribe`. The state
    becomes `Draining`.
-6. The publisher answers every `Unsubscribe` with exactly one `StreamEnd` on the
-   data stream. `StreamEnd` travels behind every part that the publisher queued
-   for the subscription. The publisher then forgets the subscription.
-7. The subscriber returns to `Idle` when it reads `StreamEnd` in `Draining`.
+6. The publisher answers every `Unsubscribe` with exactly one `SubscriptionEnd`
+   on the data stream. `SubscriptionEnd` travels behind every part that the
+   publisher queued for the subscription. The publisher then forgets the
+   subscription.
+7. The subscriber returns to `Idle` when it reads `SubscriptionEnd` in
+   `Draining`.
 
-Only `StreamEnd` ends a subscription, and only `Unsubscribe` causes it. Neither
-side ends a subscription on a timer. A publisher keeps a refused subscription
-until its `Unsubscribe` arrives, so every crossing has a defined answer.
-`Refuse` and `StreamEnd` share the data stream, so a subscription's `Refuse`
-always arrives before its `StreamEnd`. Section 4 explains why this ordering
-keeps in-flight parts legal.
+Only `SubscriptionEnd` ends a subscription, and only `Unsubscribe` causes it.
+Neither side ends a subscription on a timer. A publisher keeps a refused
+subscription until its `Unsubscribe` arrives, so every crossing has a defined
+answer. `Refuse` and `SubscriptionEnd` share the data stream, so a
+subscription's `Refuse` always arrives before its `SubscriptionEnd`. Section 4
+explains why this ordering keeps in-flight parts legal.
 
 A subscriber MUST keep at most `MAX_OPEN_SUBS` subscriptions outside `Idle` at
-each peer. The publisher holds each subscription from its `Subscribe` until
-its `StreamEnd` enters the data stream's ordered output. It then forgets the
+each peer. The publisher holds each subscription from its `Subscribe` until its
+`SubscriptionEnd` enters the data stream's ordered output. It then forgets the
 subscription's key, before the subscriber can leave `Draining`. The publisher
 therefore never holds more subscriptions than the subscriber's limit, and never
 holds a key that the subscriber may subscribe to again. Each held subscription
-reserves the output for its `Refuse` and its `StreamEnd`. That output
+reserves the output for its `Refuse` and its `SubscriptionEnd`. That output
 reservation lasts until the write completes.
 
 A publisher that retires a block stops pushing its parts. It keeps the block's
 subscriptions until their `Unsubscribe`s arrive, and it MAY refuse them with
 reason `Shed`. A subscriber that retires a block MUST send `Unsubscribe` for the
 block's `Live` subscriptions. It keeps them in `Draining` until their
-`StreamEnd`s arrive.
+`SubscriptionEnd`s arrive.
 
 ### Wanted set
 
 Each node keeps, per connection, the parts it wants from that peer. Part `i` of
 admitted block `b` is wanted from peer `p` when at least one of these holds:
 
-1. A subscription at `p` whose scope covers `b` and whose stream contains `i` is
+1. A subscription at `p` whose scope covers `b` and whose lane contains `i` is
    `Live` or `Draining`.
 2. A live `Want` sent to `p` for `b` has `i` in its allowed set and unspent
    count.
-3. `p` is `b`'s `proposer_node`, and this node is the root of `i`'s stream.
+3. `p` is `b`'s `proposer_node`, and this node is the entry peer of `i`'s lane.
    This is the seed slot.
 
 Each wanted part is wanted once from each peer. The receive record holds, per
@@ -371,12 +375,12 @@ receiver attributes a part to the subscription and the sender attributes it to
 the `Want`. The receiver then counts fewer `Want` answers than the sender sent,
 never more.
 
-**Reservation messages.** `Subscribe`, `Unsubscribe`, `Refuse`, `StreamEnd`,
-`Want`, and `WantEnd` match reservation state by key, whether or not the block
-they name is admitted, retired, or unknown. They never enter the early record or
-the retired path. Section 5 gives the answer for an unknown or retired block:
-`Refuse` with reason `UnknownBlock` for a block subscription, and `WantEnd` with
-`sent = 0` for a `Want`.
+**Reservation messages.** `Subscribe`, `Unsubscribe`, `Refuse`,
+`SubscriptionEnd`, `Want`, and `WantEnd` match reservation state by key, whether
+or not the block they name is admitted, retired, or unknown. They never enter
+the early record or the retired path. Section 5 gives the answer for an unknown
+or retired block: `Refuse` with reason `UnknownBlock` for a block subscription,
+and `WantEnd` with `sent = 0` for a `Want`.
 
 **Unknown blocks.** Another message can name a `block_id` that this node has not
 admitted: its metadata is still in flight or under admission, the peer admitted
@@ -426,18 +430,18 @@ per-peer byte budget per block MAY still serve as defence in depth.
 Each node maintains these bounded structures:
 
 ```text
-meta[b]                          // admitted metadata, layout, roots
+meta[b]                          // admitted metadata, layout, entry peers
 store[b][i]                      // verified or regenerated parts
 receive_record[peer][b]          // indices received from the peer
 send_mark[peer][b]               // indices queued to the peer
-subs_in[peer][scope][stream]     // this node subscribes: Live | Draining
-subs_out[peer][scope][stream]    // this node publishes: accepted | refused
+subs_in[peer][scope][lane]       // this node subscribes: Live | Draining
+subs_out[peer][scope][lane]      // this node publishes: accepted | refused
 wants_out[peer][want_id]         // block, stripe, allowed set, count, spent
 wants_in[peer][want_id]          // Wants this node serves
 peer_view[peer][b]               // Haves, StripeDone, BlockDone, parts written
 early[peer]                      // messages about unknown blocks
 adverts[peer][b]                 // advertised potentials and wait
-learner[stream]                  // parent, candidates, lags, streaks (section 7)
+learner[lane]                    // parent, candidates, lags, streaks (section 7)
 retired[b][peer]                 // remaining late parts and indices per peer
 ```
 
@@ -459,7 +463,7 @@ streams:
 - The **control stream** carries `HeaderMeta`, `Subscribe`, `Unsubscribe`,
   `Want`, `StripeDone`, `BlockDone`, and `Advert`.
 - The **data stream** carries `Part`, `Have`, `Refuse`, `WantEnd`, and
-  `StreamEnd`.
+  `SubscriptionEnd`.
 
 The control stream MUST have higher write priority than the data stream. Data
 queues MUST NOT block control traffic.
@@ -467,8 +471,8 @@ queues MUST NOT block control traffic.
 The two streams impose no order on each other. The protocol places each message
 by the ordering it needs:
 
-- **Ends travel behind parts.** `StreamEnd` and `WantEnd` follow, on the FIFO
-  data stream, every part their exchange authorized. No part of an ended
+- **Ends travel behind parts.** `SubscriptionEnd` and `WantEnd` follow, on the
+  FIFO data stream, every part their exchange authorized. No part of an ended
   subscription or `Want` can follow its end. The receiver can therefore close
   the authorization exactly when it reads the end.
 - **Haves travel behind parts.** A `Have` queues behind the data already waiting
@@ -476,10 +480,10 @@ by the ordering it needs:
   section 7 measures.
 - **Stop signals overtake parts.** `StripeDone` and `BlockDone` travel on the
   control stream so they reach the sender before its queued parts drain.
-- **Refusals travel ahead of ends.** `Refuse` and `StreamEnd` share the data
-  stream, so a subscriber always reads a subscription's `Refuse` before its
-  `StreamEnd`. A refusal ends nothing: parts already queued stay wanted until
-  the `StreamEnd` that answers the subscriber's `Unsubscribe`.
+- **Refusals travel ahead of ends.** `Refuse` and `SubscriptionEnd` share the
+  data stream, so a subscriber always reads a subscription's `Refuse` before its
+  `SubscriptionEnd`. A refusal ends nothing: parts already queued stay wanted
+  until the `SubscriptionEnd` that answers the subscriber's `Unsubscribe`.
 
 A message can arrive before the metadata of the block it names. Section 3's
 early record handles that case.
@@ -503,7 +507,7 @@ describes. Payload caps below are W2 values.
 | 9 | `Have` | data | Announcement | — | 16,418 |
 | 10 | `Refuse` | data | Subscription update | Refuses `Subscribe` | 8,196 |
 | 11 | `WantEnd` | data | Response | Ends `Want` | 7 |
-| 12 | `StreamEnd` | data | Response | Answers `Unsubscribe`; ends the subscription | 8,195 |
+| 12 | `SubscriptionEnd` | data | Response | Answers `Unsubscribe`; ends the subscription | 8,195 |
 
 ### Results and filter order
 
@@ -540,7 +544,7 @@ MAX_N              = 86          // STRIPE_K + ceil(STRIPE_K / 3)
 MAX_STRIPES        = 512
 MAX_PARTS          = 44,032      // MAX_STRIPES * MAX_N
 MAX_PROOF_DEPTH    = 16          // log2(128) + log2(512)
-MAX_ROOTS          = 255
+MAX_ENTRY_PEERS    = 255
 MAX_HAVE_INDICES   = 4,096
 MAX_WANTS_INFLIGHT = 64          // live Wants per connection direction
 MAX_OPEN_SUBS      = 1,024       // subscriptions outside Idle per connection direction
@@ -555,8 +559,8 @@ charge one per-connection announcement bucket: capacity = 256 messages, refill
 are therefore visible without risking an honest peer.
 
 A scope encodes as `u8(0)` for `Standing`, or `u8(1) || block_id[32]` for
-`Block`. A stream encodes as its root's 32-byte `NodeId`. Section 8 lists every
-field in transmission order.
+`Block`. A lane encodes as its entry peer's 32-byte `NodeId`. Section 8 lists
+every field in transmission order.
 
 ### Control stream
 
@@ -568,8 +572,8 @@ field in transmission order.
   - header length = 1..=4,096 bytes
   - binding length = 1..=17,413 bytes
   - codec = W2 codec identifier; `part_bytes = S`
-  - root count = 1..=255
-  - roots unique; no root equals `proposer_node`
+  - entry-peer count = 1..=255
+  - entry peers unique; none equals `proposer_node`
   - exact consumption
 - **Verify**
   - `stripes`, `k`, and `n` equal the values recomputed from `body_bytes`
@@ -610,7 +614,7 @@ rule in section 2; the node then retires every variant of the block. Metadata
 for a retired block, or for a block outside the propagation window, returns
 `Drop`.
 
-After admission, a node that appears in `roots` wants its seed slot from
+After admission, a node that appears in `entry_peers` wants its seed slot from
 `proposer_node` under section 3.
 
 #### `Subscribe` — Subscription open, discriminator 2
@@ -619,15 +623,16 @@ After admission, a node that appears in `roots` wants its seed slot from
   - payload cap = 8,195 bytes
 - **Decode**
   - scope tag 0 or 1
-  - stream count = 1..=255
-  - streams unique
+  - lane count = 1..=255
+  - lanes unique
   - exact consumption
 - **Reservation**, at the publisher
-  - each `(scope, stream)` is not currently held
+  - each `(scope, lane)` is not currently held
   - held subscriptions per connection <= `MAX_OPEN_SUBS`; the publisher serves
     and traces up to twice that limit and returns `Disconnect` beyond it
 - **Capacity**
-  - each held subscription reserves output for one `Refuse` and one `StreamEnd`
+  - each held subscription reserves output for one `Refuse` and one
+    `SubscriptionEnd`
   - the publisher's accept limit may be lower than `MAX_OPEN_SUBS`; above it,
     the publisher refuses
 - **Cadence**
@@ -635,23 +640,23 @@ After admission, a node that appears in `roots` wants its seed slot from
   - refill = 32 messages/s
   - on_empty = record and forward, as the regulation design requires
 
-The publisher MUST accept or refuse each listed stream when it processes the
-message. It MAY refuse any stream for local policy, including its child budget
+The publisher MUST accept or refuse each listed lane when it processes the
+message. It MAY refuse any lane for local policy, including its child budget
 in section 7. Refusal is never a violation. It MUST refuse a block subscription
-for a block it has not admitted or has retired. It answers every refused stream
+for a block it has not admitted or has retired. It answers every refused lane
 in one `Refuse`.
 
 An accepted subscription authorizes the publisher to push each part of the
-stream that it holds or later verifies, once, for every covered block. The
+lane that it holds or later verifies, once, for every covered block. The
 publisher MAY skip any part. The protocol imposes no push deadline. A slow
 publisher is a routing problem for the subscriber's learner, not a violation.
 
-A `Subscribe` for a `(scope, stream)` that the publisher holds returns
+A `Subscribe` for a `(scope, lane)` that the publisher holds returns
 `Disconnect`. The subscriber sends `Subscribe` only in `Idle`, which it reaches
-only by reading `StreamEnd`. The publisher forgets a subscription when it writes
-that `StreamEnd`. The same ordering bounds the held count: a conformant
-subscriber never has more than `MAX_OPEN_SUBS` subscriptions that the publisher
-still holds.
+only by reading `SubscriptionEnd`. The publisher forgets a subscription when it
+writes that `SubscriptionEnd`. The same ordering bounds the held count: a
+conformant subscriber never has more than `MAX_OPEN_SUBS` subscriptions that the
+publisher still holds.
 
 #### `Unsubscribe` — Subscription close, discriminator 3
 
@@ -660,20 +665,20 @@ still holds.
 - **Decode**
   - same as `Subscribe`
 - **Reservation**, at the publisher
-  - each `(scope, stream)` is held, accepted or refused
+  - each `(scope, lane)` is held, accepted or refused
 - **Capacity**
   - processing MUST NOT wait for serving workers or data-output capacity; the
-    held subscription already reserved its `StreamEnd` output
+    held subscription already reserved its `SubscriptionEnd` output
 
-For each accepted `(scope, stream)`, the publisher MUST stop queueing the
-stream's parts under that scope. It MUST cancel queued unsent parts that no
-other authorization covers. Cancellation keeps their send marks. For every
-listed `(scope, stream)`, accepted or refused, it MUST then write one
-`StreamEnd` behind every part it already queued for the subscription. It MAY
-end several subscriptions in one `StreamEnd` when it writes that message after
-all their parts.
+For each accepted `(scope, lane)`, the publisher MUST stop queueing the lane's
+parts under that scope. It MUST cancel queued unsent parts that no other
+authorization covers. Cancellation keeps their send marks. For every listed
+`(scope, lane)`, accepted or refused, it MUST then write one `SubscriptionEnd`
+behind every part it already queued for the subscription. It MAY end several
+subscriptions in one `SubscriptionEnd` when it writes that message after all
+their parts.
 
-A `(scope, stream)` that the publisher does not hold returns `Disconnect`. The
+A `(scope, lane)` that the publisher does not hold returns `Disconnect`. The
 subscriber sends exactly one `Unsubscribe` per `Subscribe`, and the publisher
 holds every subscription until that `Unsubscribe` arrives.
 
@@ -783,22 +788,23 @@ peer's traffic or establish block validity.
 - **Frame**
   - payload cap = 9,218 bytes
 - **Decode**
-  - entry count = 0..=255
-  - entry streams unique
+  - item count = 0..=255
+  - item lanes unique
   - exact consumption
 - **Verify**, when the receiver has admitted the block
-  - every entry stream appears in the block's `roots`
+  - every item lane appears in the block's `entry_peers`
 - **Cadence**
   - at most once per block per connection
 
-`Advert` carries the sender's forwarding wait and, per stream, its arrival
+`Advert` carries the sender's forwarding wait and, per lane, its arrival
 potential for the block. Section 7 defines both values. The receiver keeps each
 peer's adverts for the last `ADV_KEEP` blocks. The values are hints. A
 receiver MUST NOT treat an advertised value as a violation.
 
-An entry stream outside the block's roots returns `Disconnect`. A repeat returns
-`Disconnect` while the receiver retains the peer's adverts for the block. An
-`Advert` for an unknown or retired block follows section 3, like `BlockDone`.
+An item lane outside the block's entry peers returns `Disconnect`. A repeat
+returns `Disconnect` while the receiver retains the peer's adverts for the
+block. An `Advert` for an unknown or retired block follows section 3, like
+`BlockDone`.
 
 ### Data stream
 
@@ -825,7 +831,7 @@ An entry stream outside the block's roots returns `Disconnect`. A repeat returns
 The sender MUST send a part only when the receiver wants it: a subscription it
 accepted and has not ended covers it, a live `Want` from the receiver allows it
 with count left, or the sender is the block's proposer and the receiver is the
-part's root. The sender MUST mark a part as sent when it queues it, across
+part's entry peer. The sender MUST mark a part as sent when it queues it, across
 every path. Cancelling a queued part MUST NOT clear the mark. The sender MUST
 NOT send a part to a peer from which it received a valid copy. Section 6 lists
 the other sends a sender skips.
@@ -871,11 +877,11 @@ cannot force the receiver to accept parts.
 - **Frame**
   - payload cap = 8,196 bytes
 - **Decode**
-  - scope and streams as in `Subscribe`
+  - scope and lanes as in `Subscribe`
   - reason = `Capacity`, `UnknownBlock`, `Policy`, or `Shed`
   - exact consumption
 - **Reservation**, at the subscriber
-  - each `(scope, stream)` is `Live` or `Draining`
+  - each `(scope, lane)` is `Live` or `Draining`
   - at most one `Refuse` per subscription
 
 The publisher sends `Refuse` when it declines a new subscription or stops
@@ -883,15 +889,16 @@ pushing an accepted one (`Shed`). After `Refuse`, it queues no new parts under
 the subscription. It still holds the subscription until `Unsubscribe` arrives.
 
 A subscriber that reads `Refuse` in `Live` MUST send `Unsubscribe`. Parts
-already queued stay wanted until the resulting `StreamEnd`.
+already queued stay wanted until the resulting `SubscriptionEnd`.
 
-A `(scope, stream)` in `Idle`, or a second `Refuse` for one subscription,
+A `(scope, lane)` in `Idle`, or a second `Refuse` for one subscription,
 returns `Disconnect`. The publisher refuses only a subscription it holds, at
 most once, and the subscriber stays outside `Idle` until the publisher writes
-the subscription's `StreamEnd`.
+the subscription's `SubscriptionEnd`.
 
-After a refusal, the subscriber SHOULD avoid that publisher for the stream for
-`BAN_STEPS` learning steps. A later `Subscribe` after `StreamEnd` is legal.
+After a refusal, the subscriber SHOULD avoid that publisher for the lane for
+`BAN_STEPS` learning steps. A later `Subscribe` after `SubscriptionEnd` is
+legal.
 
 #### `WantEnd` — Response, discriminator 11
 
@@ -912,21 +919,21 @@ and section 3's attribution never counts more answers than the server sent.
 After `WantEnd`, the requester MAY ask another server for the parts it still
 lacks.
 
-#### `StreamEnd` — Response, discriminator 12
+#### `SubscriptionEnd` — Response, discriminator 12
 
 - **Frame**
   - payload cap = 8,195 bytes
 - **Decode**
-  - scope and streams as in `Subscribe`
+  - scope and lanes as in `Subscribe`
   - exact consumption
 - **Reservation**, at the subscriber
-  - each `(scope, stream)` is `Draining`
+  - each `(scope, lane)` is `Draining`
   - consumes the subscription: the state becomes `Idle`
 
-A `(scope, stream)` outside `Draining` returns `Disconnect`. The publisher
-writes `StreamEnd` only in answer to `Unsubscribe`, once per subscription. After
-`StreamEnd`, a part of that stream under that scope is unwanted unless another
-authorization covers it.
+A `(scope, lane)` outside `Draining` returns `Disconnect`. The publisher writes
+`SubscriptionEnd` only in answer to `Unsubscribe`, once per subscription. After
+`SubscriptionEnd`, a part of that lane under that scope is unwanted unless
+another authorization covers it.
 
 ## 6. Forwarding, completion, and recovery
 
@@ -950,12 +957,12 @@ parts in bounded batches. It also queues a `Have` for the part to every peer
 under section 5.
 
 The proposer SHOULD send each part of its block exactly once, to the part's
-root, in index order per root. It sends parity parts as well. It SHOULD
-interleave its roots, so every stream starts at once. It SHOULD NOT push its own
-block's parts on standing subscriptions. W2 gives the proposer no authorization
-to send spare copies beyond the seed slots, subscriptions, and `Want`s. A
-proposer that fills peers' missing parts from spare upload needs a future
-extension that makes those parts wanted.
+entry peer, in index order per entry peer. It sends parity parts as well. It
+SHOULD interleave its entry peers, so every lane starts at once. It SHOULD NOT
+push its own block's parts on standing subscriptions. W2 gives the proposer no
+authorization to send spare copies beyond the seed slots, subscriptions, and
+`Want`s. A proposer that fills peers' missing parts from spare upload needs a
+future extension that makes those parts wanted.
 
 ### Scheduler
 
@@ -973,7 +980,7 @@ section 2, the node MUST stop issuing pulls for the block and SHOULD send
 live until their `WantEnd`s arrive.
 
 After a stripe passes its re-encode check, the node MAY send the stripe's parts
-it never received to accepted subscribers of their streams. These parts obey
+it never received to accepted subscribers of their lanes. These parts obey
 the ordinary skip, send-once, and wanted rules. The node SHOULD NOT send them to
 the block's proposer.
 
@@ -1025,15 +1032,15 @@ section 8 holds its values.
 
 ### Pull first
 
-Every stream starts with no parent. A stream whose standing parent is the
+Every lane starts with no parent. A lane whose standing parent is the
 current block's proposer also counts as having no parent. The node pulls a part
 on a `Have` when all of these hold:
 
 - the announcer is not the block's proposer;
 - the node neither holds the part nor has a pending pull for it;
 - the part's stripe has not decoded;
-- the node is not the root of the part's stream;
-- the stream has no parent;
+- the node is not the entry peer of the part's lane;
+- the lane has no parent;
 - the stripe's held and pending parts number fewer than `k`;
 - the announcer has room in its pull window, within the node-wide pull cap.
 
@@ -1050,14 +1057,14 @@ neighbours instead of receiving extra bytes.
 
 ### Holes under push
 
-A stream with a parent can still miss parts. The node pulls a missing part of
-such a stream when one of these holds:
+A lane with a parent can still miss parts. The node pulls a missing part of
+such a lane when one of these holds:
 
 - the parent announced the part;
-- the parent announced a later part of the same stream within
+- the parent announced a later part of the same lane within
   `HOLE_LOOKAHEAD` positions;
 - the parent kept announcing other parts for `STARVE_MS` after its last part of
-  this stream.
+  this lane.
 
 Hole pulls share a node-wide cap across blocks.
 
@@ -1066,8 +1073,8 @@ Hole pulls share a node-wide cap across blocks.
 The node samples a part when a hash of `(block_id, index)` selects one in
 `SAMPLE_EVERY`. For a sampled part, a neighbour's lag is the arrival time of its
 copy or `Have` minus the part's first arrival at this node. A candidate's raw
-lag for a stream is the median over at least `MIN_SAMPLES` sampled parts of
-that stream in the block. The ranking lag is an EWMA of raw lags with weight
+lag for a lane is the median over at least `MIN_SAMPLES` sampled parts of
+that lane in the block. The ranking lag is an EWMA of raw lags with weight
 `LAG_EWMA`.
 
 The node runs one learning step per block, `LEARN_DELAY_MS` after it assembles
@@ -1075,20 +1082,20 @@ the block. The step waits up to `ADV_WAIT_MS` for its candidates' `Advert`s.
 
 ### Potentials and loop freedom
 
-A node's potential for a stream in a block is the median first-arrival delay,
-after `created_ms`, of the stream's sampled parts. Parts that the node
+A node's potential for a lane in a block is the median first-arrival delay,
+after `created_ms`, of the lane's sampled parts. Parts that the node
 regenerates count at decode time. The node advertises its potentials and its
 forwarding wait in `Advert`. The forwarding wait is its queued bytes over an
 EWMA of its egress rate.
 
-A candidate parent for a stream is a neighbour that is not the block's
-proposer, not this node's child for the stream, and not banned. A candidate that
+A candidate parent for a lane is a neighbour that is not the block's
+proposer, not this node's child for the lane, and not banned. A candidate that
 is not the current parent MUST advertise a lower potential than this node's for
 the learned block. Its advertised wait adds to its lag. Advertised values use
 each node's own clock, so skew between nodes biases rankings. It cannot create a
 cycle among nodes that pass this filter in the same block.
 
-When a node's parent for a stream subscribes to that stream at the node, the
+When a node's parent for a lane subscribes to that lane at the node, the
 node unsubscribes from that parent. This rule removes the cycles that form
 across blocks.
 
@@ -1097,35 +1104,35 @@ across blocks.
 After `PROMOTE_AFTER` steps with the same leading candidate, the node promotes
 the leader, provided the leader's advertised wait is below `PROMOTE_WAIT_MS`. A
 step without candidates keeps the streak. Promotion sends `Subscribe` to the new
-parent and `Unsubscribe` to the old one in the same step. The old stream stays
+parent and `Unsubscribe` to the old one in the same step. The old lane stays
 wanted while it drains.
 
 A step is late when the parent's ranking lag exceeds the best other candidate's
 raw lag plus that candidate's round-trip time plus `DEMOTE_MS`. After
-`DEMOTE_AFTER` late steps, the node unsubscribes from the parent. The stream
+`DEMOTE_AFTER` late steps, the node unsubscribes from the parent. The lane
 returns to pull.
 
-When the standing parent of a stream is the current block's proposer, the node
+When the standing parent of a lane is the current block's proposer, the node
 subscribes for this block to the best-ranked other candidate. Without one, it
-subscribes to the root itself when the root is a neighbour.
+subscribes to the entry peer itself when the entry peer is a neighbour.
 
 ### Push where cheap
 
 A publisher bounds its accepted standing subscriptions with a child budget. The
-budget counts each accepted stream at its share of a block: `1/R`, where `R` is
-the root count of the most recent admitted block that listed the stream. It
+budget counts each accepted lane at its share of a block: `1/R`, where `R` is
+the entry-peer count of the most recent admitted block that listed the lane. It
 sums the shares across children. A publisher refuses a
-subscription that would exceed `CHILD_BUDGET` blocks. Because streams are shared
+subscription that would exceed `CHILD_BUDGET` blocks. Because lanes are shared
 across proposers, the budget binds per node, not per proposer.
 
-### Proposer roots
+### Entry-peer selection
 
-The proposer SHOULD choose its roots from its neighbours by measured minimum
-round-trip time. It keeps the neighbours whose minimum is at most
-`ROOT_RTT_X` times the median minimum of its neighbours with a sample. It drops
+The proposer SHOULD choose its entry peers from its neighbours by measured
+minimum round-trip time. It keeps the neighbours whose minimum is at most
+`ENTRY_RTT_X` times the median minimum of its neighbours with a sample. It drops
 neighbours without a sample when any sample exists. It lists at most
-`MAX_ROOTS` roots in any order. Streams are keyed by root, so the order does not
-disturb learned routes.
+`MAX_ENTRY_PEERS` entry peers in any order. Lanes are keyed by entry peer, so
+the order does not disturb learned routes.
 
 ### Evaluate block outcomes
 
@@ -1156,7 +1163,7 @@ fields, trailing bytes, and lengths above these bounds before allocation.
 | `S`; `STRIPE_K`; `parity_parts(k)`; codec identifier | 65,536 bytes; 64; `ceil(k / 3)`; 2 |
 | `MAX_STRIPES`; `MAX_PARTS`; maximum proof depth | 512; 44,032; 16 siblings |
 | Maximum body | 2 GiB (`MAX_STRIPES * STRIPE_K * S`), and never above `MAX_BLOCK_BYTES` |
-| `MAX_ROOTS`; `MAX_HAVE_INDICES`; `MAX_WANTS_INFLIGHT` | 255; 4,096; 64 |
+| `MAX_ENTRY_PEERS`; `MAX_HAVE_INDICES`; `MAX_WANTS_INFLIGHT` | 255; 4,096; 64 |
 | Header bytes; key-binding bytes | 4,096; 17,413 |
 | Coinbase bytes; coinbase Merkle siblings | 16,384; 32 |
 | Control-stream frame cap; data-stream frame cap | 29,868 bytes; 66,085 bytes |
@@ -1193,7 +1200,7 @@ signature covers this transcript of `216 + 32 * R` bytes:
 ```text
 ASCII("Dogwood/metadata/2") || 00 || chain_id || u16(2) ||
 block_id || proposer_key || proposer_node || coding || part_root ||
-u64(created_ms) || u8(R) || roots
+u64(created_ms) || u8(R) || entry_peers
 ```
 
 Header admission MUST supply `block_id`; a sender-supplied identifier does not
@@ -1207,18 +1214,18 @@ The following table lists each payload's fields in transmission order.
 
 | Message | Fields |
 | --- | --- |
-| `HeaderMeta` | `u16(header_length)`, header, proposer key (32), proposer node (32), `u16(binding_length)`, binding, coding tuple (26), part root (32), `u64(created_ms)`, `u8(root_count)`, roots (32 each), signature (64) |
-| `Subscribe` | scope, `u16(count)`, streams (32 each) |
-| `Unsubscribe` | scope, `u16(count)`, streams (32 each) |
-| `Refuse` | scope, `u16(count)`, streams (32 each), `u8(reason)` |
+| `HeaderMeta` | `u16(header_length)`, header, proposer key (32), proposer node (32), `u16(binding_length)`, binding, coding tuple (26), part root (32), `u64(created_ms)`, `u8(entry_peer_count)`, entry peers (32 each), signature (64) |
+| `Subscribe` | scope, `u16(count)`, lanes (32 each) |
+| `Unsubscribe` | scope, `u16(count)`, lanes (32 each) |
+| `Refuse` | scope, `u16(count)`, lanes (32 each), `u8(reason)` |
 | `Want` | `u32(want_id)`, block identifier, `u32(stripe)`, `u16(count)`, allowed bitmap (11) |
 | `StripeDone` | block identifier, `u32(stripe)` |
 | `BlockDone` | block identifier |
-| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, entries of stream (32) and `u32(potential_us)` |
+| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `u32(potential_us)` |
 | `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`S`) |
 | `Have` | block identifier, `u16(count)`, `u32(index)` each |
 | `WantEnd` | `u32(want_id)`, `u16(sent)`, `u8(reason)` |
-| `StreamEnd` | scope, `u16(count)`, streams (32 each) |
+| `SubscriptionEnd` | scope, `u16(count)`, lanes (32 each) |
 
 The allowed bitmap encodes stripe-relative index `j` in bit `j mod 8` of byte
 `j / 8`. `Refuse` reasons are 0 `Capacity`, 1 `UnknownBlock`, 2 `Policy`, and
@@ -1247,7 +1254,7 @@ registry.
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
 | `S`; `STRIPE_K`; `parity_parts(k)` | 65,536 bytes; 64; `ceil(k / 3)` | W2 profile. Parity near one third let pulling nodes skip slow neighbours at 128 and 256 MiB. |
-| `MAX_STRIPES`; `MAX_ROOTS`; `MAX_HAVE_INDICES` | 512; 255; 4,096 | W2 syntax limits. |
+| `MAX_STRIPES`; `MAX_ENTRY_PEERS`; `MAX_HAVE_INDICES` | 512; 255; 4,096 | W2 syntax limits. |
 | `MAX_WANTS_INFLIGHT` | 64 per connection direction | W2 commitment limit. The server acts only above twice this value. |
 | `MAX_OPEN_SUBS` | 1,024 per connection direction | W2 limit on subscriptions outside `Idle`. The publisher acts only above twice this value. |
 | Publisher accept limit | `TBD`, at most `MAX_OPEN_SUBS` | Local capacity. The publisher refuses above it. |
@@ -1261,7 +1268,7 @@ registry.
 
 | Parameter | Reference value | Meaning and authority |
 | --- | --- | --- |
-| `ROOT_RTT_X` | 2.0 | Experimental proposer root rule. |
+| `ENTRY_RTT_X` | 2.0 | Experimental proposer entry-peer rule. |
 | `PULL_WINDOW`; node-wide pull cap | 64 parts per neighbour; 4,096 parts | Experimental. |
 | `PULL_TICK_MS`; `PULL_TIMEOUT_MS` | 20 ms; 500 ms | Experimental. |
 | `HOLE_LOOKAHEAD`; `STARVE_MS`; hole-pull cap | 3; 300 ms; 256 parts | Experimental. |
@@ -1270,7 +1277,7 @@ registry.
 | `PROMOTE_AFTER`; `PROMOTE_WAIT_MS` | 1 step; 50 ms | Experimental. |
 | `DEMOTE_AFTER`; `DEMOTE_MS` | 3 steps; 5 ms | Experimental. |
 | `BAN_STEPS` | 5 steps | Experimental. |
-| `CHILD_BUDGET` | `TBD` | Required before enabling push by default. The experiments capped accepted subscriptions at `1.0 * degree`, about 1.4 blocks at degree 28 and 20 roots. |
+| `CHILD_BUDGET` | `TBD` | Required before enabling push by default. The experiments capped accepted subscriptions at `1.0 * degree`, about 1.4 blocks at degree 28 and 20 entry peers. |
 | `HAVE_FLUSH_MS`; `HAVE_FLUSH_COUNT` | 2 ms; 32 indices | Experimental. |
 
 #### Recovery and retention
@@ -1313,9 +1320,10 @@ MAY use the existing unit, property, synthetic-peer, and transport test
 infrastructure that the
 [testing design](../design/property-testing.md) describes.
 
-1. Every message has legal boundary cases, canonical round trips, exact decoding,
-   payload caps, and decoded-allocation checks. Deterministic cases MUST cover
-   every message and rule; random generation MUST NOT provide the only coverage.
+1. Every message has legal boundary cases, canonical round trips, exact
+   decoding, payload caps, and decoded-allocation checks. Deterministic cases
+   MUST cover every message and rule; random generation MUST NOT provide the
+   only coverage.
 2. Layout arithmetic, padding, the transaction-count prefix, trailing bytes, the
    total block-size bound, and proofs at every depth up to 16. Body changes
    invalidate cached parity; header changes require a new signature but not a
@@ -1324,28 +1332,27 @@ infrastructure that the
    binding, signed equivocation, a layout mismatch, a failed re-encode check
    going straight to block download, and consensus-invalid bodies.
 4. The wanted set. Unsolicited parts, repeats from one peer, parts after
-   `StreamEnd` or `WantEnd`, parts beyond a `Want`'s count, parts of retired
-   blocks, retired-block counters, and early-record overflow, pausing, and replay.
-   The control stream never pauses for the early record.
+   `SubscriptionEnd` or `WantEnd`, parts beyond a `Want`'s count, parts of
+   retired blocks, retired-block counters, and early-record overflow, pausing,
+   and replay. The control stream never pauses for the early record.
 5. Subscription crossings. A reference model of both peers generates
    interleavings of the two streams: `Subscribe` against `Refuse`, `Unsubscribe`
    against `Refuse` with reason `Shed`, re-subscription after each end, and
-   block retirement on
-   either side. Conformant sequences MUST NOT produce `Disconnect`. The model
-   also checks that the receiver never attributes more parts to a `Want` than
-   the server sent.
+   block retirement on either side. Conformant sequences MUST NOT produce
+   `Disconnect`. The model also checks that the receiver never attributes more
+   parts to a `Want` than the server sent.
 6. Send-once across push, pull, repair, and regenerated parts, including
    cancellation after queueing.
-7. Capacity. Saturated verification workers, full output queues, blocked
-   `Want` serving, and connection churn pause work without a violation and
-   release resources exactly once. Control progress continues while data output
-   is blocked.
-8. Recovery. The stall resets on progress; the reconstruction deadline does
-   not. The ladder never moves backward. Block download follows repair failure,
-   a metadata conflict, or a failed re-encode check.
+7. Capacity. Saturated verification workers, full output queues, blocked `Want`
+   serving, and connection churn pause work without a violation and release
+   resources exactly once. Control progress continues while data output is
+   blocked.
+8. Recovery. The stall resets on progress; the reconstruction deadline does not.
+   The ladder never moves backward. Block download follows repair failure, a
+   metadata conflict, or a failed re-encode check.
 9. Routing. Loop freedom within a block, the cycle-break rule, a node that runs
    several blocks behind, two proposers at once, random proposer pairs, and
-   proposer changes with shared roots.
+   proposer changes with shared entry peers.
 
 Fleet experiments MUST report the block outcomes in section 7. They MUST vary
 block size, proposer placement, concurrent proposers, and asymmetric bandwidth.

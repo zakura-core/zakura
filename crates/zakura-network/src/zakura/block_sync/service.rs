@@ -1167,7 +1167,8 @@ mod regulated_frame_tests {
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
                 .with_range_source(Arc::new(EmptySource)),
-        );
+        )
+        .expect("valid block-sync config");
         let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
         let mut held_channels = Vec::new();
         let mut attach = |conn_id| {

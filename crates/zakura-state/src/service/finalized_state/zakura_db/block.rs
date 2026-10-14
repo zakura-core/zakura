@@ -259,15 +259,28 @@ impl ZakuraDb {
     /// [`block::Hash`] or [`Height`], if it exists in the finalized chain and
     /// its raw transaction data is available.
     ///
-    /// The block is assembled from the stored raw bytes — the header, the
-    /// CompactSize-encoded transaction count, and the raw transactions — so
-    /// the transactions are never deserialized.
-    ///
     /// Returns `None` if the block does not exist, or if its transaction bodies
     /// are missing because they have been pruned.
-    #[cfg(feature = "indexer")]
-    #[allow(clippy::unwrap_in_result)]
     pub fn raw_block_bytes(&self, hash_or_height: HashOrHeight) -> Option<Vec<u8>> {
+        self.raw_block_bytes_within(hash_or_height, usize::MAX)
+    }
+
+    /// Returns the serialized finalized block like [`Self::raw_block_bytes`],
+    /// unless it is longer than `max_bytes`.
+    ///
+    /// The block is assembled from the stored raw bytes — the header, the
+    /// CompactSize-encoded transaction count, and the raw transactions — so
+    /// it is never deserialized. The size check runs before the parts are
+    /// copied into the returned buffer.
+    ///
+    /// Returns `None` if the block does not exist, if its transaction bodies
+    /// are missing because they have been pruned, or if it does not fit.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn raw_block_bytes_within(
+        &self,
+        hash_or_height: HashOrHeight,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
         let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
         let tx_count = CompactSizeMessage::try_from(raw_txs.len())
@@ -282,6 +295,9 @@ impl ZakuraDb {
                 .iter()
                 .map(|raw_tx| raw_tx.raw_bytes().len())
                 .sum::<usize>();
+        if size > max_bytes {
+            return None;
+        }
 
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(raw_header.raw_bytes());

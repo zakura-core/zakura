@@ -182,7 +182,6 @@ fn test_block_db_round_trip_with(
         // The raw read path assembles exactly the bytes the block serializes
         // to, including the CompactSize transaction count and the transaction
         // order in multi-transaction blocks.
-        #[cfg(feature = "indexer")]
         assert_eq!(
             state
                 .raw_block_bytes(finalized.height.into())

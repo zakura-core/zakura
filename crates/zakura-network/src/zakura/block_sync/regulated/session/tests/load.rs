@@ -1,7 +1,6 @@
 //! Aggregate serving bounds across many sessions that share one node capacity.
 
 use super::*;
-use zakura_chain::{block, serialization::ZcashDeserializeInto};
 use zakura_test::{
     allocations::{in_isolated_process, ProcessMeasurement},
     process_stats::{cpu_seconds, memory_kib},
@@ -20,7 +19,7 @@ const STRIDE: u32 = 1_000_000;
 /// read waits for a gate permit and records how many reads run at once.
 #[derive(Debug)]
 struct LoadSource {
-    block: Arc<block::Block>,
+    block: Arc<[u8]>,
     gate: Arc<Semaphore>,
     running: Arc<[AtomicUsize; PEERS]>,
     peak: Arc<[AtomicUsize; PEERS]>,
@@ -44,7 +43,7 @@ impl Source for LoadSource {
                 gate.acquire().await?.forget();
                 if peer.is_multiple_of(2) {
                     blocks = (0..request.count)
-                        .map(|offset| (Height(request.start_height.0 + offset), block.clone()))
+                        .map(|offset| (Height(request.start_height.0 + offset), block.to_vec()))
                         .collect();
                 }
                 running[peer].fetch_sub(1, Ordering::SeqCst);
@@ -99,8 +98,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                 .unwrap();
             runtime.block_on(async { tokio::task::spawn_blocking(|| ()).await.unwrap() });
             let limits = super::super::serving_limits();
-            let block: Arc<block::Block> =
-                Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap());
+            let block = Arc::from(BLOCK_MAINNET_1_BYTES.as_slice());
             let gate = Arc::new(Semaphore::new(0));
             let source = LoadSource {
                 block,
@@ -274,7 +272,7 @@ enum ProbeShape {
 /// Answers reads with its [`ProbeShape`] after an optional delay, without gating.
 #[derive(Debug)]
 struct OpenSource {
-    block: Arc<block::Block>,
+    block: Arc<[u8]>,
     shape: ProbeShape,
     delay: Duration,
 }
@@ -293,7 +291,7 @@ impl Source for OpenSource {
             let useful = shape == ProbeShape::Useful && peer.is_multiple_of(2);
             let blocks = if request.lease.try_start() && useful {
                 (0..request.count)
-                    .map(|offset| (Height(request.start_height.0 + offset), block.clone()))
+                    .map(|offset| (Height(request.start_height.0 + offset), block.to_vec()))
                     .collect()
             } else {
                 Vec::new()
@@ -377,7 +375,7 @@ async fn maximum_sessions_continuous_serving_probe() {
     config.max_blocks_per_response = blocks;
     let advertised = super::super::serving_max_inflight_requests(&config);
     let source = OpenSource {
-        block: Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap()),
+        block: Arc::from(BLOCK_MAINNET_1_BYTES.as_slice()),
         shape,
         delay: Duration::from_millis(delay_ms),
     };

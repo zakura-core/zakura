@@ -39,8 +39,8 @@ Generate legal start/count values and check production encode/decode round trips
 minimum/maximum counts, maximum legal end height, overflow, zero count, truncation, trailing bytes,
 and mismatched discriminators. Generated cases supplement deterministic boundaries.
 
-Check response count and body-byte limits independently. A storage result or decoded representation
-may consume more memory than its encoded bodies.
+Check response count and body-byte limits independently. Serving reads return serialized bodies, so
+a storage result holds about its encoded body bytes. A decoded representation may consume more.
 
 ## Reservations and terminals
 
@@ -154,7 +154,8 @@ Manual probes reproduce the host evidence. They are ignored and gated by environ
   RTT in `ZAKURA_PROBE_RTT_MS`.
 - `getblocks_storage_read_probe` in `zakura-state` (`ZAKURA_STORAGE_PROBE_CACHE_DIR`) times the
   production block-range read against a synced database at concurrency from 1 to 76.
-  `ZAKURA_STORAGE_PROBE_ENCODE=1` adds the serving encode on a blocking thread after each read.
+  `ZAKURA_STORAGE_PROBE_ENCODE=1` adds the serving encode, which copies the read's serialized
+  bodies into frames, on a blocking thread after each read.
   `ZAKURA_PROBE_DROP_CACHES=1` starts each case with a cold page cache.
 
 Run them with the `zakura-testkit` feature and a release build for representative figures.

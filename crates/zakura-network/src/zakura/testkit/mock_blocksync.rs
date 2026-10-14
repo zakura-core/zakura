@@ -530,7 +530,10 @@ impl BlockRangeSource for CorpusBlockSource {
                     break;
                 };
                 response_bytes = total;
-                blocks.push((height, block));
+                let bytes = block
+                    .zcash_serialize_to_vec()
+                    .expect("test block serializes");
+                blocks.push((height, bytes));
             }
             self.stats.record_request(blocks.len(), response_bytes);
         }

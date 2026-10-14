@@ -1,6 +1,6 @@
 //! Storage boundary for regulated GetBlocks serving.
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use futures::future::BoxFuture;
 use zakura_chain::block;
@@ -12,6 +12,10 @@ use crate::zakura::{regulation::WorkLease, FramedSend};
 /// A dropped caller must not release capacity while its read is still running.
 pub trait BlockRangeSource: Debug + Send + Sync + 'static {
     /// Read at most the requested count and serialized body bytes, in height order.
+    ///
+    /// Return each block as its Zcash consensus serialization, which serving
+    /// sends unchanged. Check each block's size against the remaining budget
+    /// before materializing it, and stop at the first block that does not fit.
     fn read(
         &self,
         request: BlockRangeRead,
@@ -53,8 +57,8 @@ pub struct BlockRangeRead {
 /// A bounded result that drops its blocks before releasing execution capacity.
 #[derive(Debug)]
 pub struct BlockRangeReadResult {
-    /// Contiguous committed blocks, each paired with its height.
-    pub blocks: Vec<(block::Height, Arc<block::Block>)>,
+    /// Contiguous committed blocks, each serialized and paired with its height.
+    pub blocks: Vec<(block::Height, Vec<u8>)>,
     /// The same lease supplied with the read.
     pub lease: BlockRangeReadLease,
 }

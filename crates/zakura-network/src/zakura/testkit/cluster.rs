@@ -1249,9 +1249,21 @@ mod tests {
         Ok(())
     }
 
-    /// Serves the same body at every requested height, within the byte budget.
+    /// Serves the same serialized body at every requested height, within the
+    /// byte budget.
     #[derive(Debug)]
-    struct EndlessBlockSource(Arc<block::Block>);
+    struct EndlessBlockSource(Vec<u8>);
+
+    impl EndlessBlockSource {
+        /// Creates a source that serves the serialization of `block`.
+        fn new(block: &block::Block) -> Self {
+            Self(
+                block
+                    .zcash_serialize_to_vec()
+                    .expect("test block serializes"),
+            )
+        }
+    }
 
     impl crate::zakura::BlockRangeSource for EndlessBlockSource {
         fn read(
@@ -1263,7 +1275,7 @@ mod tests {
         > {
             let mut selected = Vec::new();
             if request.lease.try_start() {
-                let size = block_size(&self.0);
+                let size = u32::try_from(self.0.len()).expect("test block size fits u32");
                 let fits = request.max_body_bytes / size.max(1);
                 for offset in 0..request.count.min(fits) {
                     let height = block::Height(request.start_height.0 + offset);
@@ -1335,7 +1347,7 @@ mod tests {
                             max_blocks_per_response: 16,
                             ..ZakuraBlockSyncConfig::default()
                         })
-                        .block_range_source(Arc::new(EndlessBlockSource((*body).clone()))),
+                        .block_range_source(Arc::new(EndlessBlockSource::new(body))),
                 )
                 .await?;
             let victim = cluster.node(victim);
@@ -1534,16 +1546,25 @@ mod tests {
     /// Serves fixed bodies at fixed heights, without checking that they match.
     #[derive(Debug)]
     struct FixtureBlockSource {
-        blocks: Vec<(block::Height, Arc<block::Block>)>,
+        blocks: Vec<(block::Height, Vec<u8>)>,
         /// Counts the reads that serving starts, after it reserves output capacity.
         reads: Arc<AtomicUsize>,
     }
 
     impl FixtureBlockSource {
-        /// Creates a source for `blocks` with a zero read count.
+        /// Creates a source serving the serialization of `blocks`, with a zero
+        /// read count.
         fn new(blocks: Vec<(block::Height, Arc<block::Block>)>) -> Self {
             Self {
-                blocks,
+                blocks: blocks
+                    .into_iter()
+                    .map(|(height, block)| {
+                        let bytes = block
+                            .zcash_serialize_to_vec()
+                            .expect("test block serializes");
+                        (height, bytes)
+                    })
+                    .collect(),
                 reads: Arc::default(),
             }
         }
@@ -1561,7 +1582,7 @@ mod tests {
             let mut selected = Vec::new();
             let mut remaining = request.max_body_bytes;
             if request.lease.try_start() {
-                for (height, block) in &self.blocks {
+                for (height, bytes) in &self.blocks {
                     let height = *height;
                     if height < request.start_height {
                         continue;
@@ -1569,12 +1590,12 @@ mod tests {
                     if selected.len() >= usize::try_from(request.count).unwrap() {
                         break;
                     }
-                    let size = block_size(block);
-                    let Some(bytes) = remaining.checked_sub(size) else {
+                    let size = u32::try_from(bytes.len()).expect("test block size fits u32");
+                    let Some(left) = remaining.checked_sub(size) else {
                         break;
                     };
-                    remaining = bytes;
-                    selected.push((height, block.clone()));
+                    remaining = left;
+                    selected.push((height, bytes.clone()));
                 }
             }
             Box::pin(async move {

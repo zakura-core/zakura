@@ -474,6 +474,16 @@ impl PeerRoutine {
             self.handle_status(status);
         }
         let result = self.run_inner(&mut guard).await;
+        // Traced here rather than in the liveness check, which runs on every
+        // loop iteration.
+        if matches!(result, Err(SinkReject::Local(_)))
+            && self
+                .requester
+                .retirement_deadline(self.config.effective_liveness_timeout())
+                .is_some_and(|deadline| time::Instant::now().into_std() >= deadline)
+        {
+            self.trace_ending_timeout();
+        }
         // A transport failure can cancel the session before its queued responses
         // reach us. Validate them under the existing decode-capacity bound before
         // scoring unanswered work. Connection shutdown can still stop this drain.
@@ -1522,7 +1532,6 @@ impl PeerRoutine {
     fn check_request_liveness(&self, now: Instant) -> Result<(), SinkReject> {
         self.requester
             .check_liveness(now, self.config.effective_liveness_timeout())
-            .inspect_err(|_| self.trace_ending_timeout())
     }
 
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {

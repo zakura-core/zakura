@@ -199,7 +199,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(observed["buildVersion"], "test-" + "b" * 12)
         self.assertNotIn("sourceRevision", observed)
 
-    def test_rpc_tip_change_excludes_chain_observation(self):
+    def test_forward_tip_change_retains_the_sampled_chain_observation(self):
         original = self.rpc
         count = 0
         def moved(url, method, params=None):
@@ -213,8 +213,40 @@ class ActivationTests(unittest.TestCase):
             return original(url, method, params)
         self.feed.rpc = moved
         result = self.feed.observe(self.config["public"]["nodes"][0], self.now)
-        self.assertFalse(result["fresh"])
+        self.assertTrue(result["fresh"])
+        self.assertEqual(result["height"], self.rpc.height)
         self.assertNotIn("rules", result)
+
+    def test_replaced_sampled_block_is_rejected(self):
+        original = self.rpc
+        replaced = False
+        def reorg(url, method, params=None):
+            nonlocal replaced
+            value = original(url, method, params)
+            if method == "getinfo":
+                replaced = True
+            if replaced and method == "getblockhash" and params[0] == self.rpc.height:
+                return "f" * 64
+            return value
+        self.feed.rpc = reorg
+        observed = self.feed.observe(self.config["public"]["nodes"][0], self.now)
+        self.assertFalse(observed["fresh"])
+
+    def test_nsm_balance_belongs_to_the_sampled_height(self):
+        nodes = [self.feed.observe(n, self.now) for n in self.config["public"]["nodes"]]
+        reference = self.feed.observe(self.config["public"]["reference"], self.now, False)
+        agreement = self.feed.agreement(nodes, reference, self.now)
+        self.rpc.height += 1
+        original = self.rpc
+        def advanced(url, method, params=None):
+            value = original(url, method, params)
+            if method == "getblockchaininfo":
+                value["nsmValueBalanceZat"] = 900
+            return value
+        self.feed.rpc = advanced
+        status, _ = self.feed.public_status(nodes, agreement, self.now)
+        self.assertEqual(status["chain"]["height"], 102)
+        self.assertEqual(status["nsm"]["balanceZat"], 700)
 
     def test_process_lock_and_corrupt_state_fail_closed(self):
         with self.assertRaises(BlockingIOError):
@@ -428,7 +460,7 @@ class PublicReorgObservationTests(unittest.TestCase):
     def test_tip_moving_during_ancestry_check_cannot_count_or_advance(self):
         self.observe()
         before = copy.deepcopy(self.feed.state)
-        self.ancestor = "b" * 64
+        self.ancestor = "d" * 64
         self.tip_override = {"blocks": 104, "bestblockhash": "c" * 64}
         with self.assertRaisesRegex(ValueError, "tip moved"):
             self.observe(103, "b" * 64, 1010)

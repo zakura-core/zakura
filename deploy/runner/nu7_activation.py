@@ -172,7 +172,8 @@ class ActivationFeed:
             self.progress[node["name"]] = (*tip, changed)
             result = {"name": node["name"], "url": url, "source": node, "height": tip[0], "hash": tip[1],
                       "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
-                      "active": upgrade["status"] == "active"}
+                      "active": upgrade["status"] == "active",
+                      "nsmValueBalanceZat": info.get("nsmValueBalanceZat")}
             if include_build:
                 try:
                     version = self.rpc(url, "getinfo").get("build")
@@ -181,8 +182,8 @@ class ActivationFeed:
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
             pinned = self.rpc(url, "getblockchaininfo")
-            if (pinned["blocks"], pinned["bestblockhash"]) != tip:
-                raise ValueError("tip moved during chain observation")
+            if pinned["blocks"] < tip[0] or self.rpc(url, "getblockhash", [tip[0]]) != tip[1]:
+                raise ValueError("sampled block left the current chain")
             return result
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             # Avoid echoing URLs, credentials, or RPC response bodies.
@@ -294,8 +295,10 @@ class ActivationFeed:
         previous = self.state.get("publicReorgObservation")
         def confirm_tip():
             info = self.rpc(url, "getblockchaininfo")
-            if info["blocks"] != height or info["bestblockhash"] != block_hash:
-                raise ValueError("tip moved during reorg observation")
+            if (info["blocks"], info["bestblockhash"]) == (height, block_hash):
+                return
+            if info["blocks"] < height or self.rpc(url, "getblockhash", [height]) != block_hash:
+                raise ValueError("tip moved to a different chain during reorg observation")
         if previous is None:
             confirm_tip()
             self.state["publicReorgObservation"] = {
@@ -374,9 +377,9 @@ class ActivationFeed:
         tip = headers[-1]
         intervals = [max(0, b["time"] - a["time"]) for a, b in zip(headers, headers[1:])]
         info = self.rpc(primary["url"], "getblockchaininfo")
-        if info["blocks"] != height or info["bestblockhash"] != primary["hash"]:
-            raise ValueError("tip moved during coherent response collection")
-        balance = info.get("nsmValueBalanceZat")
+        if info["blocks"] < height or self.rpc(primary["url"], "getblockhash", [height]) != primary["hash"]:
+            raise ValueError("sampled block left the current chain during collection")
+        balance = primary.get("nsmValueBalanceZat")
         gap = max(0, headers[-1]["time"] - headers[-2]["time"]) if len(headers) > 1 else None
         reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now)
                   if agreement else {"reorgs24h": None, "since": now})

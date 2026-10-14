@@ -31,17 +31,44 @@ url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audi
 [policy.zakura]
 audit-as-crates-io = false
 
+[policy.zakura-address]
+audit-as-crates-io = true
+
+[policy.zakura-bellman]
+audit-as-crates-io = true
+
+[policy.zakura-bls12-381]
+audit-as-crates-io = true
+
 [policy.zakura-chain]
 audit-as-crates-io = false
 
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
+[policy.zakura-equihash]
+audit-as-crates-io = true
+
+[policy.zakura-halo2-gadgets]
+audit-as-crates-io = true
+
+[policy.zakura-halo2-legacy-pdqsort]
+audit-as-crates-io = true
+
+[policy.zakura-halo2-poseidon]
+audit-as-crates-io = true
+
+[policy.zakura-halo2-proofs]
+audit-as-crates-io = true
+
 [policy.zakura-header-chain]
 audit-as-crates-io = false
 
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
+
+[policy.zakura-jubjub]
+audit-as-crates-io = true
 
 [policy.zakura-mmr-tree]
 audit-as-crates-io = false
@@ -52,11 +79,41 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
+[policy.zakura-note-encryption]
+audit-as-crates-io = true
+
+[policy.zakura-orchard]
+audit-as-crates-io = true
+
+[policy.zakura-pairing]
+audit-as-crates-io = true
+
+[policy.zakura-pasta-curves]
+audit-as-crates-io = true
+
+[policy.zakura-primitives]
+audit-as-crates-io = true
+
+[policy.zakura-protocol]
+audit-as-crates-io = true
+
+[policy.zakura-reddsa]
+audit-as-crates-io = true
+
+[policy.zakura-redjubjub]
+audit-as-crates-io = true
+
 [policy.zakura-rpc]
 audit-as-crates-io = false
 
+[policy.zakura-sapling-crypto]
+audit-as-crates-io = true
+
 [policy.zakura-script]
 audit-as-crates-io = false
+
+[policy.zakura-sinsemilla]
+audit-as-crates-io = true
 
 [policy.zakura-state]
 audit-as-crates-io = false
@@ -69,6 +126,9 @@ audit-as-crates-io = false
 
 [policy.zakura-tower-fallback]
 audit-as-crates-io = false
+
+[policy.zakura-transparent]
+audit-as-crates-io = true
 
 [policy.zakura-utils]
 audit-as-crates-io = false
@@ -101,11 +161,6 @@ notes = "rustls 0.23.45, the RUSTSEC-2026-0285 fix, requires aws-lc-rs ^1.18. Za
 version = "0.45.0"
 criteria = "safe-to-deploy"
 notes = "Pulled in by aws-lc-rs 1.18.1, which rustls 0.23.45 (the RUSTSEC-2026-0285 fix) requires. Retain until the 0.42.0 to 0.45.0 delta is audited."
-
-[[exemptions.bip32]]
-version = "0.6.0"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.block-buffer]]
 version = "0.12.1"
@@ -155,11 +210,6 @@ version = "0.2.2"
 criteria = "safe-to-deploy"
 notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification. Preserve the prior audit hold for hazmat::SerializableState on [u128; N] until its status is checked against this release."
 
-[[exemptions.digest]]
-version = "0.11.3"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
-
 [[exemptions.ff]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
@@ -189,11 +239,6 @@ notes = "Patched release for RUSTSEC-2026-0258; retain this exact-version exempt
 version = "0.2.1"
 criteria = "safe-to-deploy"
 notes = "Audit held: the safe default constructor for the public Murmur3 hasher creates its [u8; 4] buffer with deprecated mem::uninitialized, which is undefined behavior because integer bytes must be initialized even when the current index prevents an immediate read. Retain the exemption pending replacement with initialized storage or MaybeUninit with a proven initialization boundary."
-
-[[exemptions.hmac]]
-version = "0.13.0"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.hybrid-array]]
 version = "0.4.15"
@@ -282,11 +327,6 @@ version = "0.8.53"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the default as-bytes feature explicitly provides unsound Pod implementations for mixed-component RGBA, BGRA, ARGB, ABGR, and GrayAlpha types. repr(C) may insert padding between independently chosen Pod component types, but the Pod contract permits that padding to be read as bytes. Retain the exemption until those implementations are removed or constrained to padding-free layouts."
 
-[[exemptions.ripemd]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
-
 [[exemptions.rustls]]
 version = "0.23.45"
 criteria = "safe-to-deploy"
@@ -305,11 +345,6 @@ notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pen
 
 [[exemptions.secp256k1-sys]]
 version = "0.14.1"
-criteria = "safe-to-deploy"
-notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
-
-[[exemptions.sha2]]
-version = "0.11.1"
 criteria = "safe-to-deploy"
 notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
@@ -385,104 +420,104 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-address]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-bellman]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-bls12-381]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-equihash]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-jubjub]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-note-encryption]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Newly adopted Common note-encryption package in the coordinated v3.0.0 release. Exact-version audit backlog entry pending direct package review; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-orchard]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-pairing]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-pasta-curves]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-primitives]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-protocol]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-reddsa]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-redjubjub]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-sinsemilla]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zakura-transparent]]
-version = "3.0.0"
+version = "3.0.0@git:13fde31eaea13c00f6e928e8ec99a07725bd998e"
 criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
+notes = "Exact Common Git revision consumed for the optional transparent wallet features (zakura-core/common#580) until they are released; carries the Common v3.0.0 fork audit backlog forward and must be repinned to the registry release. This is not an audit certification."
 
 [[exemptions.zcash_script]]
 version = "0.6.0"

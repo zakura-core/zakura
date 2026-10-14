@@ -54,8 +54,8 @@ use crate::{
     },
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer, rpc_batch::RpcBatchMiddleware,
-        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
-        rpc_tracing::RpcTracingMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_logger::RpcLoggerMiddleware,
+        rpc_metrics::RpcMetricsMiddleware, rpc_tracing::RpcTracingMiddleware,
     },
 };
 
@@ -64,6 +64,7 @@ pub mod error;
 pub mod http_request_compatibility;
 pub mod rpc_batch;
 pub mod rpc_call_compatibility;
+pub mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_tracing;
 
@@ -136,6 +137,10 @@ const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// one, and keeps them until the batch finishes. A larger batch is rejected after
 /// a shallow parse of the array, before any entry is decoded or run.
 const MAX_RPC_BATCH_REQUESTS: u32 = 1_000;
+
+/// Maximum number of characters of each request or response payload in TRACE
+/// logs.
+const MAX_RPC_LOG_CHARS: usize = 1024;
 
 impl RpcServer {
     /// Starts the primary RPC server.
@@ -278,7 +283,7 @@ impl RpcServer {
         let max_response_body_size = conf.max_response_body_size;
         let rpc_middleware = RpcServiceBuilder::new()
             .layer_fn(move |service| RpcBatchMiddleware::new(service, max_response_body_size))
-            .rpc_logger(1024)
+            .layer_fn(|service| RpcLoggerMiddleware::new(service, MAX_RPC_LOG_CHARS))
             .layer_fn(FixRpcResponseMiddleware::new)
             .layer_fn(RpcMetricsMiddleware::new)
             .layer_fn(RpcTracingMiddleware::new);

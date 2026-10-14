@@ -159,9 +159,7 @@ tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
-tower = "0.4.13"
-# jsonrpsee 0.26 takes its HTTP middleware as a tower 0.5 `ServiceBuilder`.
-tower-05 = { version = "0.5", package = "tower", default-features = false }
+tower = "0.5.3"
 tracing = "0.1.41"
 tracing-error = "0.2"
 tracing-journald = "0.3"

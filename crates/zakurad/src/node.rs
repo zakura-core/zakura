@@ -21,12 +21,11 @@ pub struct NodeServices {
     pub sync_status: crate::components::sync::SyncStatus,
     /// Buffered access to the node's mempool.
     pub mempool: tower::buffer::Buffer<
-        tower::util::BoxService<
-            zakura_node_services::mempool::Request,
-            zakura_node_services::mempool::Response,
-            crate::BoxError,
-        >,
         zakura_node_services::mempool::Request,
+        futures::future::BoxFuture<
+            'static,
+            Result<zakura_node_services::mempool::Response, crate::BoxError>,
+        >,
     >,
 }
 

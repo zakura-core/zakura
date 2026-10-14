@@ -18,7 +18,6 @@ use tokio::sync::oneshot;
 use tower::{
     buffer::Buffer,
     timeout::{error::Elapsed, Timeout},
-    util::BoxService,
     Service, ServiceExt,
 };
 use tracing::Instrument;
@@ -147,7 +146,10 @@ where
 impl<ZS>
     Verifier<
         ZS,
-        Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+        Buffer<
+            mempool::Request,
+            futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+        >,
     >
 where
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,

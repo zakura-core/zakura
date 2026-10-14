@@ -440,10 +440,10 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -600,10 +600,10 @@ pub async fn init<S, Mempool>(
     state_service: S,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -629,10 +629,10 @@ pub async fn init_with_read_state<S, R, Mempool>(
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -689,10 +689,10 @@ pub async fn init_test<S>(
     network: &Network,
     state_service: S,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -706,7 +706,10 @@ where
         network,
         state_service.clone(),
         oneshot::channel::<
-            Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+            Buffer<
+                mempool::Request,
+                futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+            >,
         >()
         .1,
     )

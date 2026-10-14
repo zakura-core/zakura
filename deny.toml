@@ -115,13 +115,6 @@ skip-tree = [
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
 
-    # wait for zebra to update tower
-    { name = "tower", version = "=0.4.13" },
-
-    # wait for zebra to update vergen
-    { name = "thiserror", version = "=1.0.69" },
-    { name = "thiserror-impl", version = "=1.0.69" },
-
     # wait for all librustzcash crates to update sha2, secp256k1, and ripemd
     { name = "sha2", version = "=0.10.9" },
     { name = "ripemd", version = "=0.1.3" },

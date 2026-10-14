@@ -5347,7 +5347,12 @@ mod zakura_header_sync_driver_tests {
             async move {
                 match request {
                     zakura_consensus::Request::Commit(block) => {
-                        checkpoint_verifier.oneshot(block).await
+                        // Boxing proves the buffered future is `Send` to the spawned driver.
+                        let commit: futures::future::BoxFuture<
+                            'static,
+                            Result<block::Hash, tower::BoxError>,
+                        > = Box::pin(checkpoint_verifier.oneshot(block));
+                        commit.await
                     }
                     request => panic!("unexpected consensus request: {request:?}"),
                 }
@@ -5515,7 +5520,12 @@ mod zakura_header_sync_driver_tests {
             async move {
                 match request {
                     zakura_consensus::Request::Commit(block) => {
-                        checkpoint_verifier.oneshot(block).await
+                        // Boxing proves the buffered future is `Send` to the spawned driver.
+                        let commit: futures::future::BoxFuture<
+                            'static,
+                            Result<block::Hash, tower::BoxError>,
+                        > = Box::pin(checkpoint_verifier.oneshot(block));
+                        commit.await
                     }
                     request => panic!("unexpected consensus request: {request:?}"),
                 }

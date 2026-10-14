@@ -255,7 +255,7 @@ impl RpcServer {
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 
-        let http_middleware = tower_05::ServiceBuilder::new().layer(http_middleware_layer);
+        let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
 
         let server_config = ServerConfig::builder()
             .http_only()

@@ -4820,6 +4820,7 @@ dependencies = [
  "tonic-reflection",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "zakura-address",
  "zakura-bls12-381",
  "zakura-chain",

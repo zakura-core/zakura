@@ -13,9 +13,9 @@ use tokio::sync::watch;
 use tower::buffer::Buffer;
 
 use crate::{
-    config::rpc::Config,
+    config::rpc::{Config, TlsConfig},
     methods::{RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
-    server::{configure_rpc_methods, primary_rpc_surface},
+    server::{configure_rpc_methods, primary_rpc_surface, MAX_RPC_BATCH_REQUESTS},
 };
 use zakura_chain::{chain_sync_status::MockSyncStatus, chain_tip::NoChainTip, parameters::Network};
 use zakura_network::address_book_peers::MockAddressBookPeers;
@@ -342,6 +342,151 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
 
     restricted_task.abort();
     admin_task.abort();
+    rpc_queue_task.abort();
+}
+
+/// Every RPC listener serves batches at the entry limit, and rejects larger
+/// batches before running any of their entries.
+#[tokio::test]
+async fn oversized_batches_are_rejected_before_dispatch() {
+    let _init_guard = zakura_test::init();
+
+    let mut ports = BTreeSet::new();
+    while ports.len() < 3 {
+        ports.insert(zakura_test::net::random_known_port());
+    }
+    let [restricted_addr, admin_addr, tls_addr]: [SocketAddr; 3] = ports
+        .into_iter()
+        .map(|port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port).into())
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("three distinct ports were chosen");
+    let cookie_dir = tempfile::tempdir().expect("temporary cookie directory should be created");
+    let conf = Config {
+        listen_addr: Some(restricted_addr),
+        admin_listen_addr: Some(admin_addr),
+        cookie_dir: cookie_dir.path().to_path_buf(),
+        cookie_file_name: "admin.cookie".to_string(),
+        enable_cookie_auth: false,
+        ..Config::default()
+    };
+    let tls_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/server/tests");
+    let tls_conf = Config {
+        listen_addr: Some(tls_addr),
+        enable_cookie_auth: false,
+        tls: Some(TlsConfig {
+            cert_file: format!("{tls_dir}/handshake-cert.pem").into(),
+            key_file: format!("{tls_dir}/handshake-key.pem").into(),
+        }),
+        ..Config::default()
+    };
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let block_verifier_router: MockService<_, _, _, BoxError> =
+        MockService::build().for_unit_tests();
+    let (_tx, rx) = watch::channel(None);
+    let (rpc_impl, rpc_queue_task) = RpcImpl::new(
+        Network::Mainnet,
+        Default::default(),
+        false,
+        "RPC batch limit test",
+        "RPC batch limit test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(block_verifier_router, 1),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    crate::indexer::server::install_tls_crypto_provider();
+    let restricted_task = RpcServer::start(rpc_impl.clone(), conf.clone())
+        .await
+        .expect("restricted RPC listener should start");
+    let admin_task = RpcServer::start_admin(rpc_impl.clone(), conf)
+        .await
+        .expect("admin RPC listener should start");
+    let tls_task = RpcServer::start(rpc_impl, tls_conf)
+        .await
+        .expect("TLS RPC listener should start");
+
+    let cookie = fs::read_to_string(cookie_dir.path().join("admin.cookie"))
+        .expect("admin listener should write its cookie");
+    let (username, password) = cookie
+        .split_once(':')
+        .expect("cookie should contain basic-auth credentials");
+    let client = Client::builder()
+        .tls_certs_only([
+            reqwest::Certificate::from_pem(include_bytes!("handshake-cert.pem"))
+                .expect("the test certificate should parse"),
+        ])
+        .resolve("localhost", tls_addr)
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("test HTTP client should build");
+    let listeners = [
+        client.post(format!("http://{restricted_addr}")),
+        client
+            .post(format!("http://{admin_addr}"))
+            .basic_auth(username, Some(password)),
+        client.post(format!("https://localhost:{}/", tls_addr.port())),
+    ];
+
+    let limit = usize::try_from(MAX_RPC_BATCH_REQUESTS).expect("the batch limit fits in usize");
+    let invalid_entries = vec!["0"; limit].join(",");
+    let full_batch = format!("[{invalid_entries}]");
+    let oversized_batch =
+        format!(r#"[{{"jsonrpc":"2.0","method":"getrawmempool","id":1}},{invalid_entries}]"#);
+
+    for listener in listeners {
+        let send = |body: &str| {
+            let request = listener
+                .try_clone()
+                .expect("a request with a string body can be cloned")
+                .header("content-type", "application/json")
+                .body(body.to_owned());
+            async move {
+                let body = request
+                    .send()
+                    .await
+                    .expect("batch request should complete")
+                    .text()
+                    .await
+                    .expect("batch response body should be readable");
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .expect("batch response should be JSON")
+            }
+        };
+
+        let full = send(&full_batch).await;
+        let full = full
+            .as_array()
+            .expect("a batch at the limit should get one response per entry");
+        assert_eq!(full.len(), limit);
+        assert!(full
+            .iter()
+            .all(|response| response["error"]["code"] == -32600));
+
+        let oversized = send(&oversized_batch).await;
+        assert_eq!(oversized["id"], serde_json::Value::Null);
+        assert_eq!(oversized["error"]["code"], -32010);
+        assert_eq!(
+            oversized["error"]["data"],
+            format!("Exceeded max limit of {limit}")
+        );
+    }
+
+    mempool.expect_no_requests().await;
+
+    restricted_task.abort();
+    admin_task.abort();
+    tls_task.abort();
     rpc_queue_task.abort();
 }
 

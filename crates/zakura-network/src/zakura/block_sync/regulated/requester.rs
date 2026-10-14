@@ -301,11 +301,66 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
-                shrink_after_peak(&mut self.next);
             }
+            // A complete range already left `next` when its last block was
+            // claimed, so shrink on every removal, not only an unfinished one.
+            shrink_after_peak(&mut self.next);
             if let Some(at) = pending.retirement_started_at {
                 self.retiring.remove(&(at, start));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::zakura::{
+        regulation::{ReservationPool, WriterFence},
+        CloseCause,
+    };
+
+    /// Ranges that end after every block arrived still return the `next`
+    /// map's peak capacity.
+    #[test]
+    fn complete_responses_shrink_the_next_hash_map() {
+        const RANGES: u32 = 256;
+        let slots = usize::try_from(RANGES).expect("256 fits usize");
+        let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+        let pool = ReservationPool::new(slots).unwrap();
+        let mut book = Requester::new(slots);
+        let hash = |index: u32| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&index.to_le_bytes());
+            Hash(bytes)
+        };
+        for index in 1..=RANGES {
+            book.reserve(
+                Range::new(Height(index), 1).unwrap(),
+                &[hash(index)],
+                100,
+                pool.try_entry().unwrap(),
+                fence.open().unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(book.next.capacity() >= slots);
+
+        for index in 1..=RANGES {
+            book.claim_block(hash(index), 3).unwrap();
+            book.finish(&Message::BlocksDone {
+                start: Height(index),
+                returned: 1,
+            })
+            .unwrap();
+        }
+        assert!(book.next.is_empty());
+        assert!(
+            book.next.capacity() <= 64,
+            "a drained map kept {} slots",
+            book.next.capacity()
+        );
     }
 }

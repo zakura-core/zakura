@@ -219,9 +219,20 @@ impl Requester {
         }
     }
 
-    /// Header-only gate for the transport, before allocating a frame payload.
+    /// Header-only gate, before allocating a frame payload.
     pub(super) fn precheck(&self, tag: u16, len: usize) -> Result<(), ClaimRefused> {
         self.reservations.precheck(tag, len)
+    }
+
+    /// The transport's gate: [`Self::precheck`], and the queue the reader
+    /// fills ahead of the routine stays within what the live ranges owe.
+    pub(super) fn admit(&mut self, tag: u16, len: usize) -> Result<(), ClaimRefused> {
+        self.reservations.admit(tag, len)
+    }
+
+    /// Release a frame the transport admitted, when the routine takes it.
+    pub(super) fn take_admitted(&mut self, len: usize) {
+        self.reservations.take_admitted(len);
     }
 
     /// Claim the hash computed from this frame's header before decoding its

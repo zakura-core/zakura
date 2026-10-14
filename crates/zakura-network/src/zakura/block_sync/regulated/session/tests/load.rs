@@ -98,14 +98,7 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                 .build()
                 .unwrap();
             runtime.block_on(async { tokio::task::spawn_blocking(|| ()).await.unwrap() });
-            // Serving::new sizes execution for the largest possible response.
-            let largest = Range {
-                start: Height::MIN,
-                count: MAX_BS_BLOCKS_PER_REQUEST,
-            }
-            .response_cap(MAX_BS_RESPONSE_BYTES)
-            .output_bytes();
-            let limits = sizing::serve_limits(largest, sizing::TARGET_RTT);
+            let limits = super::super::serving_limits();
             let block: Arc<block::Block> =
                 Arc::new(BLOCK_MAINNET_1_BYTES.zcash_deserialize_into().unwrap());
             let gate = Arc::new(Semaphore::new(0));

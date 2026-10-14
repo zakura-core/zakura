@@ -10,7 +10,7 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{ZakuraBlockSyncConfig, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
-    regulation::{sizing, CompletionId, Completions, Serve, ServeCapacity},
+    regulation::{sizing, CompletionId, Completions, Serve, ServeCapacity, ServeLimits},
     FramedSend, SinkReject, ZakuraPeerId,
 };
 
@@ -22,6 +22,31 @@ const BOOKKEEPING_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 const SESSION_ALLOWANCE_BYTES: u64 = 144 * 1024;
 /// Per-request ceiling from the lifecycle allocation regression.
 const BYTES_PER_REQUEST: u64 = 160;
+/// Node-wide read-and-encode jobs. A storage probe on cloned Mainnet and
+/// Testnet state (16 vCPUs, one block per response) reached 94% or more of
+/// peak throughput at 24 jobs using about 10 cores. More jobs only added
+/// latency and CPU, which validation needs.
+const NODE_EXECUTION: usize = 24;
+/// Read-and-encode jobs for one peer: half the node, so a stalled peer cannot
+/// hold every slot. One peer's share still exceeds one connection's throughput.
+const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
+
+/// The production GetBlocks serving limits. Execution is fixed by
+/// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
+/// the response configuration cannot inflate execution concurrency.
+pub(crate) fn serving_limits() -> ServeLimits {
+    let largest = Range {
+        start: Height::MIN,
+        count: MAX_BS_BLOCKS_PER_REQUEST,
+    }
+    .response_cap(MAX_BS_RESPONSE_BYTES)
+    .output_bytes();
+    ServeLimits {
+        node_execution: NODE_EXECUTION,
+        peer_execution: PEER_EXECUTION,
+        ..sizing::serve_limits(largest, sizing::TARGET_RTT)
+    }
+}
 
 /// The in-flight limit advertised to and enforced on regulated GetBlocks peers.
 ///
@@ -76,16 +101,7 @@ pub(crate) struct Serving {
 
 impl Serving {
     pub(crate) fn new(source: Arc<dyn Source>, config: &ZakuraBlockSyncConfig) -> Self {
-        // A smaller configured response cap must not inflate execution concurrency.
-        let largest = Range {
-            start: Height::MIN,
-            count: MAX_BS_BLOCKS_PER_REQUEST,
-        }
-        .response_cap(MAX_BS_RESPONSE_BYTES)
-        .output_bytes();
-        // Allow one target RTT for production. This is a sizing assumption,
-        // not a measured storage latency.
-        let limits = sizing::serve_limits(largest, sizing::TARGET_RTT);
+        let limits = serving_limits();
         let advertised = serving_max_inflight_requests(config);
         if !serving_sessions_fit_budget(config) {
             tracing::warn!(

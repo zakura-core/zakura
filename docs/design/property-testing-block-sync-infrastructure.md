@@ -153,10 +153,29 @@ Manual probes reproduce the host evidence. They are ignored and gated by environ
   QUIC for small and large bodies at several in-flight depths. Add delay with netem and pass the
   RTT in `ZAKURA_PROBE_RTT_MS`.
 - `getblocks_storage_read_probe` in `zakura-state` (`ZAKURA_STORAGE_PROBE_CACHE_DIR`) times the
-  production block-range read against a synced database at concurrency up to twice the node
-  execution limit. `ZAKURA_PROBE_DROP_CACHES=1` starts each case with a cold page cache.
+  production block-range read against a synced database at concurrency from 1 to 76.
+  `ZAKURA_STORAGE_PROBE_ENCODE=1` adds the serving encode on a blocking thread after each read.
+  `ZAKURA_PROBE_DROP_CACHES=1` starts each case with a cold page cache.
 
 Run them with the `zakura-testkit` feature and a release build for representative figures.
+
+The node runs at most 24 read-and-encode jobs, 12 for one peer (`NODE_EXECUTION` in
+`block_sync/regulated/session.rs`). The storage probe chose these on a 16-vCPU host against
+cloned, pruned PR-node state (Mainnet height 3,514,052 and Testnet height 4,473,088), with one
+block per response, warm cache, and the encode enabled:
+
+| Jobs | Mainnet reads/s | Mainnet p99 | Cores | Testnet reads/s |
+| --- | --- | --- | --- | --- |
+| 16 | 23,400 | 2.9 ms | 8.1 | 78,900 |
+| 24 | 28,600 | 3.8 ms | 10.3 | 76,300 |
+| 32 | 30,400 | 4.9 ms | 11.4 | 72,100 |
+| 38 | 30,200 | 5.9 ms | 11.5 | 71,300 |
+| 76 | 29,000 | 11.1 ms | 11.6 | 70,600 |
+
+At 24 jobs Mainnet reaches 94% of its peak and Testnet 97%. More jobs add latency and CPU that
+validation needs. Encoding costs about a quarter of read-only throughput (Mainnet reads alone peak
+near 38,000/s). 16-block responses level off between 24 and 48 jobs, and unavailable heights
+saturate by 4. The limits do not depend on the response configuration.
 
 The advertisement covers requests outstanding until their endings reach the requester. Size it
 from storage latency, RTT, response bytes and transport buffering, and check twice that

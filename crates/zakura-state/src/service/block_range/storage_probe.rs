@@ -1,8 +1,8 @@
 //! Manual storage evidence for regulated GetBlocks serving reads.
 //!
-//! Serving runs at most one storage read per node execution slot, however many
-//! peers are admitted, so the concurrency sweep below covers the maximum
-//! storage load that GetBlocks serving can generate.
+//! Serving runs at most one read-and-encode job per node execution slot,
+//! however many peers are admitted. The concurrency sweep below measures that
+//! job at and around the execution limit.
 
 use std::{
     sync::{
@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use zakura_chain::{block::Height, parameters::Network};
+use zakura_chain::{block::Height, parameters::Network, serialization::ZcashSerialize};
 use zakura_test::process_stats::{cpu_seconds, memory_kib};
 
 use crate::{init_read_only, Config, PruningConfig, StorageMode};
@@ -27,6 +27,29 @@ struct Tally {
     blocks: u64,
     bytes: u64,
     latencies_us: Vec<u32>,
+    encode_us: Vec<u32>,
+}
+
+/// Encode blocks the way the GetBlocks producer does: serialize each block,
+/// then copy it behind its one-byte message tag. Returns the frame bytes.
+fn encode_like_serving(blocks: &[(Height, Arc<zakura_chain::block::Block>, usize)]) -> u64 {
+    blocks
+        .iter()
+        .map(|(_, block, _)| {
+            let bytes = block
+                .zcash_serialize_to_vec()
+                .expect("stored blocks serialize");
+            let mut payload = Vec::with_capacity(bytes.len() + 1);
+            payload.push(3);
+            payload.extend_from_slice(&bytes);
+            u64::try_from(payload.len()).expect("frame length fits u64")
+        })
+        .sum()
+}
+
+/// Microseconds since `began`, saturating at `u32::MAX`.
+fn elapsed_us(began: Instant) -> u32 {
+    u32::try_from(began.elapsed().as_micros()).unwrap_or(u32::MAX)
 }
 
 /// Times production block-range reads against a synced database.
@@ -35,7 +58,8 @@ struct Tally {
 /// optionally `ZAKURA_STORAGE_PROBE_NETWORK=mainnet`. The database opens in
 /// pruned mode unless `ZAKURA_STORAGE_PROBE_ARCHIVE=1`. With
 /// `ZAKURA_PROBE_DROP_CACHES=1`, running as root, each case starts with a cold
-/// page cache.
+/// page cache. With `ZAKURA_STORAGE_PROBE_ENCODE=1`, each read is followed by
+/// the serving encode on a blocking thread, and `p50_us`/`p99_us` cover both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -52,6 +76,7 @@ async fn getblocks_storage_read_probe() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
     let drop_caches = std::env::var_os("ZAKURA_PROBE_DROP_CACHES").is_some();
+    let encode = std::env::var_os("ZAKURA_STORAGE_PROBE_ENCODE").is_some();
     let storage_mode = if std::env::var_os("ZAKURA_STORAGE_PROBE_ARCHIVE").is_some() {
         StorageMode::Archive
     } else {
@@ -100,7 +125,7 @@ async fn getblocks_storage_read_probe() {
         ("random_retained_16", 16),
         ("unavailable_above_tip", 1),
     ] {
-        for concurrency in [1_usize, 4, 19, 38, 76] {
+        for concurrency in [1_usize, 4, 8, 16, 19, 24, 32, 38, 48, 64, 76] {
             if drop_caches {
                 std::process::Command::new("sync").status().unwrap();
                 std::fs::write("/proc/sys/vm/drop_caches", "3").unwrap();
@@ -145,17 +170,25 @@ async fn getblocks_storage_read_probe() {
                                 )
                                 .await
                                 .unwrap();
-                            let elapsed = began.elapsed().as_micros();
-                            tally
-                                .latencies_us
-                                .push(u32::try_from(elapsed).unwrap_or(u32::MAX));
                             let (blocks, ()) = range.into_parts();
-                            tally.reads += 1;
                             tally.blocks += u64::try_from(blocks.len()).unwrap();
-                            tally.bytes += blocks
-                                .iter()
-                                .map(|(_, _, size)| u64::try_from(*size).unwrap())
-                                .sum::<u64>();
+                            tally.bytes += if encode {
+                                let encoding = Instant::now();
+                                let bytes = tokio::task::spawn_blocking(move || {
+                                    encode_like_serving(&blocks)
+                                })
+                                .await
+                                .unwrap();
+                                tally.encode_us.push(elapsed_us(encoding));
+                                bytes
+                            } else {
+                                blocks
+                                    .iter()
+                                    .map(|(_, _, size)| u64::try_from(*size).unwrap())
+                                    .sum::<u64>()
+                            };
+                            tally.latencies_us.push(elapsed_us(began));
+                            tally.reads += 1;
                         }
                         tally
                     })
@@ -168,28 +201,33 @@ async fn getblocks_storage_read_probe() {
                 total.blocks += tally.blocks;
                 total.bytes += tally.bytes;
                 total.latencies_us.extend(tally.latencies_us);
+                total.encode_us.extend(tally.encode_us);
             }
             let cpu = cpu_seconds().zip(cpu_start).map(|(end, start)| end - start);
             total.latencies_us.sort_unstable();
-            let percentile = |p: usize| {
-                total
-                    .latencies_us
-                    .get((total.latencies_us.len().saturating_sub(1)) * p / 100)
+            total.encode_us.sort_unstable();
+            let at = |values: &[u32], p: usize| {
+                values
+                    .get((values.len().saturating_sub(1)) * p / 100)
                     .copied()
                     .unwrap_or(0)
             };
+            let percentile = |p: usize| at(&total.latencies_us, p);
             // Float conversions are lossy only far beyond these counts.
             let per_second = |value: u64| value as f64 / seconds as f64;
             eprintln!(
                 "storage_probe shape={shape} count={count} concurrency={concurrency} \
-                 cold_cache={drop_caches} reads_per_s={:.0} blocks_per_s={:.0} mb_per_s={:.2} \
-                 p50_us={} p99_us={} max_us={} cpu_s={cpu:?} rss_kib={:?}",
+                 cold_cache={drop_caches} encode={encode} reads_per_s={:.0} blocks_per_s={:.0} \
+                 mb_per_s={:.2} p50_us={} p99_us={} max_us={} encode_p50_us={} encode_p99_us={} \
+                 cpu_s={cpu:?} rss_kib={:?}",
                 per_second(total.reads),
                 per_second(total.blocks),
                 per_second(total.bytes) / 1e6,
                 percentile(50),
                 percentile(99),
                 total.latencies_us.last().copied().unwrap_or(0),
+                at(&total.encode_us, 50),
+                at(&total.encode_us, 99),
                 memory_kib(),
             );
         }

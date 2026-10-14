@@ -34,6 +34,13 @@ impl PeerRoutine {
         });
     }
 
+    pub(super) fn trace_ending_timeout(&self) {
+        self.emit(bs_trace::BLOCK_PEER_ENDING_TIMEOUT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+        });
+    }
+
     /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
     /// now emitted in the routine that decoded it). Records the message kind only;
     /// the per-variant field detail lives on the reactor's heavier trace path.

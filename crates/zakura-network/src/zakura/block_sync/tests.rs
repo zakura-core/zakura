@@ -356,7 +356,8 @@ async fn same_epoch_verified_growth_without_successor_work_preserves_reset_epoch
     );
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let sequencer_view = handle
         .routine_wiring
         .as_ref()
@@ -462,7 +463,8 @@ async fn committed_views_are_the_sole_production_frontier_source() {
     );
     assert!(startup.header_tip.is_none());
 
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     match tokio::time::timeout(Duration::from_millis(50), actions.recv()).await {
         Err(_) => {}
         Ok(action) => panic!(
@@ -547,7 +549,8 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         snapshot_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     snapshot_tx
         .send(Some(committed_view(
@@ -634,7 +637,8 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         snapshot_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let action = next_action(&mut actions).await;
     assert!(
@@ -704,7 +708,8 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let (_snapshots, receiver) = watch::channel(Some(view));
     let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
     startup.committed_views = Some(receiver);
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let registry = &handle.routine_wiring.as_ref().unwrap().registry;
     let supplier = peer(0x54);
     let now = Instant::now();
@@ -741,7 +746,8 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     };
     startup.best_header_tip = (header.height, header.hash);
     startup.committed_views = Some(snapshot_rx);
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     handle
         .retry_body_availability(block::Hash([0x53; 32]))
@@ -870,7 +876,8 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     };
     startup.best_header_tip = (header.height, header.hash);
     startup.committed_views = Some(snapshot_rx);
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let (_supplier, inbound, _outbound) = connect_peer_with_status(
         &service,
@@ -2551,6 +2558,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
@@ -2617,6 +2625,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 600,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2652,6 +2661,7 @@ fn total_resident_plateaus_under_commit_stall() {
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2687,6 +2697,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2739,6 +2750,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
@@ -2806,6 +2818,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         applying_buffered_blocks: 990,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2885,6 +2898,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
         applying_buffered_blocks: 10,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2967,6 +2981,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
         applying_buffered_blocks: u64::from(range_blocks) - 1,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 800_000_000,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
@@ -3217,7 +3232,8 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             tip_rx,
             config.clone(),
         );
-        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let (handle, _actions, reactor_task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
         let wiring = handle.routine_wiring.as_ref().unwrap();
         let now = Instant::now();
         let mut generation = 0;
@@ -3559,7 +3575,8 @@ async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Peer serves heights 1..=4 and accepts four concurrent single-block requests.
@@ -3642,7 +3659,8 @@ async fn reactor_suppresses_duplicate_needed_block_query_until_response() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3708,7 +3726,8 @@ async fn reactor_requeries_a_height_stranded_below_higher_claimed_work() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([10; 32]);
 
     handle
@@ -3764,7 +3783,8 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3831,7 +3851,8 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Three peers, each willing to serve heights 1..=12 and accept four
@@ -3954,7 +3975,8 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Three peers, each able to serve height 1 with a single in-flight slot.
@@ -4066,7 +4088,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Two peers, both able to serve heights 1..=2 with a single in-flight slot.
@@ -4209,7 +4232,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         config.clone(),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(0x51);
@@ -4331,7 +4355,8 @@ async fn check_cold_probe_deadline(expired: bool) {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(0x53);
@@ -4461,7 +4486,8 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
         config.clone(),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let (_handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, _handle.clone());
 
     let peer = peer(0x5b);
@@ -6120,6 +6146,7 @@ fn received_body_admission_ignores_request_budget() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         // Outstanding requests have spent the entire in-flight budget.
@@ -6183,6 +6210,7 @@ proptest::proptest! {
             applying_buffered_blocks: applying_blocks,
             sequencer_input_queued_bytes: input_bytes,
             in_flight_submission_bytes: 0,
+            decoded_resident_bytes: 0,
             reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
@@ -6492,7 +6520,9 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
 
 #[tokio::test]
 async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
-    let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+    let service = Arc::new(
+        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config"),
+    );
     let registry =
         ServiceRegistry::new(vec![service]).expect("block-sync service declares unique kind");
     let peer = peer(1);
@@ -6529,7 +6559,8 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inert_reactor_parks_after_header_tip_watch_closes() {
-    let _service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+    let _service =
+        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config");
 
     let elapsed = tokio::time::timeout(Duration::from_secs(1), future::pending::<()>()).await;
 
@@ -6544,7 +6575,8 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
     let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()));
+        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()))
+            .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -6767,7 +6799,8 @@ async fn add_peer_malformed_frame_cancels_connection() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, _reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(3);
@@ -6815,7 +6848,8 @@ async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, _reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let input = &handle.routine_wiring.as_ref().unwrap().sequencer_input;
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (inbound_tx, inbound_rx) = framed_channel(4);
@@ -6990,7 +7024,8 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     );
     let trace = ZakuraTrace::noop();
     startup.trace = trace.clone();
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(40);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7127,7 +7162,8 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7271,7 +7307,8 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(73);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7434,7 +7471,8 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -7527,7 +7565,8 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
@@ -7692,7 +7731,8 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -7810,7 +7850,8 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7938,7 +7979,8 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -8125,7 +8167,8 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -8361,7 +8404,8 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Peer serves heights 1..=4 with four concurrent single-block slots.
@@ -8443,7 +8487,8 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
@@ -8556,7 +8601,8 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
         &service,
@@ -8657,7 +8703,8 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // One slot, a generous response-byte and per-request block count, so neither
@@ -8723,7 +8770,8 @@ async fn reactor_packs_small_estimates_under_peer_response_byte_cap() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let one_worst_case_response =
@@ -8789,7 +8837,8 @@ async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -8845,7 +8894,8 @@ async fn reactor_zero_pause_threshold_preserves_lag_one_downloads() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
@@ -8889,7 +8939,8 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9042,7 +9093,8 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -9180,7 +9232,8 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(64);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -9314,7 +9367,8 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     match next_action(&mut actions).await {
@@ -9389,7 +9443,8 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9482,7 +9537,8 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9604,7 +9660,8 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (old_peer, old_inbound, mut old_outbound) = connect_peer_with_status_message(
@@ -9838,7 +9895,8 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9968,7 +10026,8 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10103,7 +10162,8 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10193,7 +10253,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     // One-block ranges let height 3 arrive while height 2 is still missing.
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
@@ -10300,7 +10361,8 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10484,7 +10546,8 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(61);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -10729,7 +10792,8 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10875,7 +10939,8 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(
         immediate_body_download_config(),
         handle.clone(),
@@ -11006,7 +11071,8 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -11093,7 +11159,8 @@ async fn reactor_accepts_rapid_status_growth_without_spam_score() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer_id = peer(46);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11156,7 +11223,8 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer_id = peer(47);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11215,7 +11283,8 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(
         immediate_body_download_config(),
         handle.clone(),
@@ -11325,7 +11394,8 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Admit a peer through the production `add_peer` path with an observable
@@ -11427,7 +11497,8 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (bad_peer, bad_inbound, mut bad_outbound) = connect_peer_with_status(
         &service,
@@ -11554,7 +11625,8 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -11656,7 +11728,8 @@ async fn reactor_retries_connect_status_after_a_full_outbound_queue() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(64);
     let (_inbound_tx, inbound_rx) = framed_channel(8);
@@ -11722,7 +11795,8 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11770,7 +11844,8 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -11850,7 +11925,8 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
 async fn committed_reanchor_lowers_only_best_header_target() {
     let (snapshots, startup) =
         committed_block_sync_startup_at_heights(0, 5, 10, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
 
@@ -11894,7 +11970,8 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -11969,7 +12046,8 @@ async fn epoch_change_supersedes_stale_floor_query() {
         (4, old_target_hash),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let BlockSyncAction::QueryNeededBlocks {
@@ -12134,7 +12212,8 @@ async fn header_extension_preserves_checkpoint_pipeline() {
         (3, old_target_hash),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let BlockSyncAction::QueryNeededBlocks {
         query_id, scope, ..
@@ -12313,7 +12392,8 @@ async fn committed_body_progress_preserves_same_target_native_response() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -12415,7 +12495,8 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -12533,7 +12614,8 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
@@ -12613,7 +12695,8 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
         tip_rx,
         config,
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -12642,7 +12725,8 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id,
@@ -12692,7 +12776,8 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -12780,7 +12865,8 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -12842,7 +12928,8 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -12926,7 +13013,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     // Startup refill scans from the floor (queue empty → `max_claimed` is None).
     assert!(matches!(
@@ -12996,7 +13084,8 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -13043,7 +13132,8 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -13120,7 +13210,8 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Two misbehaving peers (ids 0x01, 0x02 sort first) and one honest peer (0x03).
@@ -13223,7 +13314,8 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -13297,7 +13389,8 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -13425,7 +13518,8 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer_id, _inbound_tx, _outbound_rx) = connect_peer_with_status(
         &service,
@@ -13525,7 +13619,8 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(77);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -13674,7 +13769,8 @@ async fn testnet_fork_body_keeps_selected_body_despite_wrong_branch_hint() {
             tip_rx,
             config.clone(),
         );
-        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let (handle, mut actions, task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         let (_, inbound_tx, mut outbound_rx) = connect_peer_with_status(
             &service,
@@ -13749,7 +13845,8 @@ async fn oversize_body_hint_keeps_the_body_without_scoring_the_supplier() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -13845,7 +13942,8 @@ async fn unsolicited_terminator_closes_the_connection() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config.clone(), handle.clone());
 
     let connection_cancel = CancellationToken::new();
@@ -13893,7 +13991,8 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Connect the probe peer with a real pipe-routine (per-peer routines) so its inbound frames
@@ -13974,7 +14073,8 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(93);
     let old_conn_id = 7;
@@ -14018,7 +14118,8 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(9);
     let conn_id = 17;
@@ -14075,7 +14176,8 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let applying = SyncServiceDemand {
         header: HeaderServiceDemand::Enabled {
             capability_epoch: LifecycleEpoch::new(1),
@@ -14229,7 +14331,8 @@ async fn committed_hint_batches_refresh_queued_work_without_resetting_it() {
     let mut changed_view = committed_view(initial.clone(), 0);
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let BlockSyncAction::QueryNeededBlocks {
         query_id, scope, ..
     } = next_action(&mut actions).await
@@ -14331,7 +14434,8 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     let mut changed_view = committed_view(initial.clone(), 0);
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let BlockSyncAction::QueryNeededBlocks { scope, .. } = next_action(&mut actions).await else {
         panic!("startup query")
     };

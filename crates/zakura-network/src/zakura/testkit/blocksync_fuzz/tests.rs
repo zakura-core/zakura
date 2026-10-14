@@ -524,18 +524,21 @@ async fn fuzz_peer_that_stops_reading_is_parked() {
     let report = invariant_report(&reader);
     capture.finish().await.expect("capture discards cleanly");
 
-    // The wedged, non-reading peer must be parked — even though our outbound to it is
-    // full (its stream unread). With the old unbounded escape this is 0 (extend forever until
-    // the ~180 s transport idle timeout): the teeth of the fix.
+    // The wedged, non-reading peer must be removed at a liveness deadline — even though
+    // our outbound to it is full (its stream unread). With the old unbounded escape this is
+    // 0 (extend forever until the ~180 s transport idle timeout): the teeth of the fix.
+    // The no-progress park and the withheld-ending deadline share one timeout. Which one
+    // fires first depends on when the routine stamped each, so either removal counts.
     assert!(
-        report.session_parks >= 1,
-        "a peer that stops reading our stream must still be parked at the liveness \
-         deadline, got {} parks",
+        report.session_parks + report.ending_timeouts >= 1,
+        "a peer that stops reading our stream must still be removed at the liveness \
+         deadline, got {} parks and {} ending timeouts",
         report.session_parks,
+        report.ending_timeouts,
     );
     assert_eq!(
         report.protocol_rejects, 0,
-        "a non-reading peer's no-progress park is not a protocol reject",
+        "a non-reading peer's liveness removal is not a protocol reject",
     );
     // It was proven when it wedged (streak past the single initial probe), so this is the
     // harder proven-peer case, not the never-proved one.

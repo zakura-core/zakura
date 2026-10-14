@@ -54,14 +54,14 @@ pub(crate) fn serving_limits() -> ServeLimits {
 /// session slots bound every session that can hold bookkeeping, including
 /// replacements still cleaning up. Each may hold `2 × limit` commitments (see
 /// `Serve`'s margin), so the limit is the configured advertisement capped at
-/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. Config
-/// validation rejects session counts that [`serving_sessions_fit_budget`]
-/// refuses; an unvalidated config keeps a limit of one and [`Serving::new`]
-/// warns. Local outbound sizing and older peers keep the configured value.
+/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. The reactor
+/// refuses to start with a config that [`serving_sessions_fit_budget`] rejects,
+/// so a served limit is never zero. Local outbound sizing and older peers keep
+/// the configured value.
 pub(crate) fn serving_max_inflight_requests(config: &ZakuraBlockSyncConfig) -> u32 {
     let configured = config.advertised_max_inflight_requests();
     budgeted_inflight_requests(serving_sessions(config))
-        .map_or(configured, |budget| configured.min(budget.max(1)))
+        .map_or(configured, |budget| configured.min(budget))
 }
 
 /// Whether even one request per session fits the bookkeeping budget, which
@@ -102,16 +102,11 @@ pub(crate) struct Serving {
 impl Serving {
     pub(crate) fn new(source: Arc<dyn Source>, config: &ZakuraBlockSyncConfig) -> Self {
         let limits = serving_limits();
+        debug_assert!(
+            serving_sessions_fit_budget(config),
+            "the reactor validates the config before serving",
+        );
         let advertised = serving_max_inflight_requests(config);
-        if !serving_sessions_fit_budget(config) {
-            tracing::warn!(
-                max_inbound_peers = config.peer_limits.max_inbound_peers,
-                max_outbound_peers = config.peer_limits.max_outbound_peers,
-                budget_bytes = BOOKKEEPING_BUDGET_BYTES,
-                "block-sync peer limits allow more serving sessions than the GetBlocks \
-                 bookkeeping budget covers; advertising one in-flight request per peer",
-            );
-        }
         Self {
             source,
             capacity: ServeCapacity::new("block-sync", &GET_BLOCKS, limits)

@@ -12,7 +12,7 @@ use zakura_chain::block;
 use super::{
     assert_core_invariants, fuzz_config, invariant_report, run_scenario, run_trace,
     CommitBurstStall, CommitProfile, Degrade, DegradeMode, FuzzOutcome, IdleGap, InvariantReport,
-    LatencyDist, PeerSpec, Scenario, ServeProfile, TipEvent, TipEventKind,
+    LateResponse, LatencyDist, PeerSpec, Scenario, ServeProfile, TipEvent, TipEventKind,
 };
 use crate::zakura::{
     ZakuraBlockSyncConfig, DESERIALIZED_MEM_FACTOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
@@ -264,13 +264,18 @@ async fn fuzz_silent_dropping_peer() {
     );
 }
 
-/// Dropping carriers cover the upper half while a fast peer covers only the lower half.
-/// Their silent drops time out and age the carriers' goodput EWMAs below 1.0, which the
+/// Unreliable carriers cover the upper half while a fast peer covers only the lower
+/// half. About 30% of the carriers' responses arrive after the request deadline, so
+/// those requests time out and age the carriers' goodput EWMAs below 1.0, which the
 /// BBR cwnd formula folds into smaller expected windows — the end-to-end proof (through
 /// the real routine) that the reliability discount engages, complementing the
 /// `bbr::bbr_tests` unit coverage. Sync still completes: the discount never latches cwnd
-/// at zero, and redundant upper-half coverage keeps clustered drops from wedging CI
+/// at zero, and redundant upper-half coverage keeps clustered timeouts from wedging CI
 /// coverage runs at the half-chain boundary.
+///
+/// The carriers answer late rather than never: a regulated session cannot retry a
+/// range on the same peer until it ends, and closes once an unended range outlives its
+/// retirement grace, so silent drops would strand the upper half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_reliability_discounts_dropping_carrier() {
     let blocks = 120;
@@ -280,7 +285,11 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
             id,
             target(blocks),
             ServeProfile {
-                drop_probability: 0.3,
+                // Past the 4 s request timeout below.
+                late: Some(LateResponse {
+                    probability: 0.3,
+                    delay: Duration::from_secs(5),
+                }),
                 ..ServeProfile::fast()
             },
         )
@@ -309,7 +318,7 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
 
     assert!(
         report.min_reliability_permille < 1000,
-        "a request-dropping carrier must lower its measured reliability (the goodput \
+        "a carrier that answers late must lower its measured reliability (the goodput \
          discount folded into its BBR cwnd), got {}/1000",
         report.min_reliability_permille,
     );
@@ -481,7 +490,11 @@ async fn fuzz_peer_that_stops_reading_is_parked() {
             bandwidth_bytes_per_sec: Some(4 * 1024 * 1024),
             degrade: Some(Degrade {
                 at: Duration::from_millis(250),
-                mode: DegradeMode::Wedge,
+                // The four requests already queued (`transport_queue_depth` below) plus
+                // two sent after its last body, which charge it for missing progress.
+                mode: DegradeMode::Wedge {
+                    drained_requests: 6,
+                },
             }),
             ..ServeProfile::fast()
         },
@@ -1174,28 +1187,74 @@ async fn fuzz_lossy_peer() {
     run_checked("fuzz_lossy_peer", scenario, 32).await;
 }
 
-/// Reverse-order serving: peers return the blocks of each multi-block response high→low,
-/// exercising out-of-order body arrival and the reorder buffer. `fuzz_config`'s
-/// `max_blocks_per_response = 16` lets the node issue multi-block ranges, so the reversal
-/// is non-trivial. The node must still commit a contiguous, hash-correct prefix to the
-/// target. Drives the `reorder` serve knob no other scenario sets.
+/// Reverse-order serving: a peer returns the blocks of each multi-block response
+/// high→low. Regulated block sync only accepts the next expected height of a live
+/// request, so the node must close that connection on the first out-of-order body,
+/// before accepting any body from it, and finish through an in-order peer.
+/// `fuzz_config`'s `max_blocks_per_response = 16` lets the node issue multi-block
+/// ranges, so the reversal is non-trivial. Drives the `reorder` serve knob no other
+/// scenario sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_reorder() {
     let blocks = 300;
-    let reorder_serve = ServeProfile {
-        reorder: true,
-        ..ServeProfile::fast()
-    };
+    let reversing = PeerSpec::with_serve(
+        1,
+        target(blocks),
+        ServeProfile {
+            reorder: true,
+            ..ServeProfile::fast()
+        },
+    );
+    let reversing_label = crate::zakura::zakura_trace_peer_label(&reversing.peer_id());
     let scenario = Scenario::new(
         blocks,
         0x57ea_000e,
         fuzz_config(),
-        vec![
-            PeerSpec::with_serve(1, target(blocks), reorder_serve),
-            PeerSpec::with_serve(2, target(blocks), reorder_serve),
-        ],
+        vec![reversing, PeerSpec::fast(2, target(blocks))],
     );
-    run_checked("fuzz_reorder", scenario, 32).await;
+
+    let (mut capture, trace) = run_trace("fuzz_reorder").expect("trace capture opens");
+    let outcome = run_scenario(&scenario, trace)
+        .await
+        .expect("scenario runs without harness error");
+    capture.flush().await;
+    let reader = capture
+        .reader()
+        .expect("trace reader loads the flushed run");
+    let report = invariant_report(&reader);
+    let reversing_rows = |event: &str| {
+        reader
+            .table("block_sync")
+            .rows()
+            .into_iter()
+            .filter(|row| row.get("event").and_then(|value| value.as_str()) == Some(event))
+            .filter(|row| {
+                row.get("peer").and_then(|value| value.as_str()) == Some(&reversing_label)
+            })
+            .count()
+    };
+    let reversing_requests = reversing_rows("block_get_blocks_sent");
+    let reversing_bodies = reversing_rows("block_body_received");
+    let reversing_disconnects = reversing_rows("block_peer_disconnected");
+    assert_core_invariants(&scenario, &outcome, &report, 32);
+    capture.finish().await.expect("capture discards cleanly");
+
+    assert!(
+        reversing_requests > 0,
+        "the reversing peer must be asked for blocks",
+    );
+    assert_eq!(
+        reversing_bodies, 0,
+        "no body from a reversed response may be accepted",
+    );
+    assert_eq!(
+        reversing_disconnects, 1,
+        "the reversing peer must be disconnected on its first out-of-order body",
+    );
+    assert_eq!(
+        report.session_parks, 0,
+        "an out-of-order response closes the connection; it is not a no-progress park",
+    );
 }
 
 /// Many peers race against a tight shared request budget.

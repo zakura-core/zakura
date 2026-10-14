@@ -57,6 +57,16 @@ pub(crate) struct IdleGap {
     pub(crate) duration: Duration,
 }
 
+/// Hold some responses back before serving them. `delay` should exceed the node's
+/// request deadline so the request times out first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LateResponse {
+    /// Probability in `[0, 1]` that a response is held back.
+    pub(crate) probability: f64,
+    /// How long a held response waits before its first block.
+    pub(crate) delay: Duration,
+}
+
 /// A mid-run change to how a peer serves, applied once the peer has been connected for
 /// `at`. Models a peer that was healthy and then degrades partway through a sync — the
 /// two cases the failure mechanism must distinguish: a peer that *wedges* (goes silent,
@@ -83,7 +93,12 @@ pub(crate) enum DegradeMode {
     /// non-reading peer avoid action until the transport idle timeout (~180 s). The
     /// node must now park its block-sync session at the liveness deadline regardless
     /// of outbound state.
-    Wedge,
+    ///
+    /// The peer first takes `drained_requests` more `GetBlocks` off the stream and drops
+    /// them, as transport buffers would before flow control blocks the writer. Regulated
+    /// block sync only charges a peer for requests that left our queue, so a peer that
+    /// never receives a request sent after its last body is never charged.
+    Wedge { drained_requests: u32 },
     /// Switch to a finite serve bandwidth (bytes/sec) behind a fixed base RTT: the peer
     /// keeps delivering but far more slowly. The node must keep it (its cwnd/params just
     /// shrink), not park it.
@@ -114,12 +129,17 @@ pub(crate) struct ServeProfile {
     /// Optional periodic stall.
     pub(crate) idle_gap: Option<IdleGap>,
     /// Probability in `[0, 1]` that a request is silently dropped (no response),
-    /// forcing the node's request timeout / re-request path.
+    /// forcing the node's request timeout / re-request path. A regulated session
+    /// closes once a dropped request outlives its retirement grace.
     pub(crate) drop_probability: f64,
+    /// Optional late answers: the request times out at the node, but the peer still
+    /// serves it in full with its ending, as a regulated peer must.
+    pub(crate) late: Option<LateResponse>,
     /// Inclusive height window this peer refuses to serve (answers `RangeUnavailable`),
     /// modelling a peer that is missing a range.
     pub(crate) withhold: Option<(block::Height, block::Height)>,
-    /// Serve the blocks of a response in reverse order, exercising the reorder buffer.
+    /// Serve the blocks of a response in reverse order. Regulated sessions require height
+    /// order, so the node closes the connection on the first out-of-order body.
     pub(crate) reorder: bool,
     /// Optional mid-run degradation (wedge or slow-down) applied once the peer has been
     /// connected for [`Degrade::at`].
@@ -135,6 +155,7 @@ impl ServeProfile {
             bandwidth_bytes_per_sec: None,
             idle_gap: None,
             drop_probability: 0.0,
+            late: None,
             withhold: None,
             reorder: false,
             degrade: None,

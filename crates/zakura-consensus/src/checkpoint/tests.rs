@@ -310,7 +310,6 @@ async fn single_item_checkpoint_list_test() -> Result<(), Report> {
     single_item_checkpoint_list().await
 }
 
-#[spandoc::spandoc]
 async fn single_item_checkpoint_list() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -343,20 +342,35 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 0
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 0
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "single_item_checkpoint_list::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "single_item_checkpoint_list::comment",
+        text = %"Set up the future for block 0"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block0.clone()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("block should verify");
+    let verify_response = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("block should verify")
+    }
+    .instrument(tracing::error_span!(
+        "single_item_checkpoint_list::comment",
+        text = %"Wait for the response for block 0"
+    ))
+    .await;
 
     assert_eq!(verify_response, hash0);
 
@@ -381,7 +395,6 @@ async fn multi_item_checkpoint_list_test() -> Result<(), Report> {
     multi_item_checkpoint_list().await
 }
 
-#[spandoc::spandoc]
 async fn multi_item_checkpoint_list() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -424,21 +437,39 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
 
     // Now verify each block
     for (block, height, hash) in checkpoint_data {
-        /// SPANDOC: Make sure the verifier service is ready
-        let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        let ready_verifier_service =
+            async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+                .instrument(tracing::error_span!(
+                    "multi_item_checkpoint_list::comment",
+                    text = %"Make sure the verifier service is ready"
+                ))
+                .await?;
 
-        /// SPANDOC: Set up the future for block {?height}
-        let verify_future = timeout(
-            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block.clone()),
-        );
-        /// SPANDOC: Wait for the response for block {?height}
+        let verify_future = tracing::error_span!(
+            "multi_item_checkpoint_list::comment",
+            ?height,
+            text = %"Set up the future for block"
+        )
+        .in_scope(|| {
+            timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                ready_verifier_service.call(block.clone()),
+            )
+        });
         // TODO(teor || jlusby): check error kind
-        let verify_response = verify_future
-            .map_err(|e| eyre!(e))
-            .await
-            .expect("timeout should not happen")
-            .expect("future should succeed");
+        let verify_response = async {
+            verify_future
+                .map_err(|e| eyre!(e))
+                .await
+                .expect("timeout should not happen")
+                .expect("future should succeed")
+        }
+        .instrument(tracing::error_span!(
+            "multi_item_checkpoint_list::comment",
+            ?height,
+            text = %"Wait for the response for block"
+        ))
+        .await;
 
         assert_eq!(verify_response, hash);
 
@@ -743,10 +774,6 @@ async fn continuous_blockchain_restart() -> Result<(), Report> {
 }
 
 /// Test a continuous blockchain on `network`, restarting verification at `restart_height`.
-//
-// This span is far too verbose for use during normal testing.
-// Turn the SPANDOC: comments into doc comments to re-enable.
-//#[spandoc::spandoc]
 async fn continuous_blockchain(
     restart_height: Option<block::Height>,
     network: Network,
@@ -784,7 +811,7 @@ async fn continuous_blockchain(
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    // SPANDOC: Verify blocks, restarting at {?restart_height} {?network}
+    // Verify blocks, restarting at the requested height on the selected network.
     {
         let initial_tip = restart_height.map(|block::Height(height)| {
             (blockchain[height as usize].1, blockchain[height as usize].2)
@@ -840,10 +867,10 @@ async fn continuous_blockchain(
             if let Some(restart_height) = restart_height {
                 if height <= restart_height {
                     let mut state_service = state_service.clone();
-                    // SPANDOC: Make sure the state service is ready for block {?height}
+                    // Make sure the state service is ready for the current block.
                     let ready_state_service = state_service.ready().map_err(|e| eyre!(e)).await?;
 
-                    // SPANDOC: Add block directly to the state {?height}
+                    // Add the current block directly to the state.
                     ready_state_service
                         .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
                             block.clone().into(),
@@ -856,16 +883,16 @@ async fn continuous_blockchain(
                 }
             }
 
-            // SPANDOC: Make sure the verifier service is ready for block {?height}
+            // Make sure the verifier service is ready for the current block.
             let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
 
-            // SPANDOC: Set up the future for block {?height}
+            // Set up the verification future for the current block.
             let verify_future = timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
                 ready_verifier_service.call(block.clone()),
             );
 
-            // SPANDOC: spawn verification future in the background for block {?height}
+            // Spawn the verification future in the background.
             let handle = tokio::spawn(verify_future.in_current_span());
             handles.push(handle);
 
@@ -911,7 +938,7 @@ async fn continuous_blockchain(
             );
         }
 
-        // SPANDOC: wait on spawned verification tasks for restart height {?restart_height} {?network}
+        // Wait on spawned verification tasks.
         while let Some(result) = handles.next().await {
             result??.map_err(|e| eyre!(e))?;
         }
@@ -942,7 +969,6 @@ async fn block_higher_than_max_checkpoint_fail_test() -> Result<(), Report> {
     block_higher_than_max_checkpoint_fail().await
 }
 
-#[spandoc::spandoc]
 async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -976,20 +1002,35 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 415000
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block415000.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 415000, and expect failure
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "block_higher_than_max_checkpoint_fail::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "block_higher_than_max_checkpoint_fail::comment",
+        text = %"Set up the future for block 415000"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block415000.clone()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let _ = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "block_higher_than_max_checkpoint_fail::comment",
+        text = %"Wait for the response for block 415000, and expect failure"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1012,7 +1053,6 @@ async fn wrong_checkpoint_hash_fail_test() -> Result<(), Report> {
     wrong_checkpoint_hash_fail().await
 }
 
-#[spandoc::spandoc]
 async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1050,14 +1090,23 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (1/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for bad block 0 (1/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (1/3)"
+        ))
+        .await?;
     // TODO(teor || jlusby): check error kind
-    let bad_verify_future_1 = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(bad_block0.clone()),
-    );
+    let bad_verify_future_1 = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for bad block 0 (1/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(bad_block0.clone()),
+        )
+    });
     // We can't await the future yet, because bad blocks aren't cleared
     // until the chain is verified
 
@@ -1074,14 +1123,23 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (2/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for bad block 0 again (2/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (2/3)"
+        ))
+        .await?;
     // TODO(teor || jlusby): check error kind
-    let bad_verify_future_2 = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(bad_block0.clone()),
-    );
+    let bad_verify_future_2 = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for bad block 0 again (2/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(bad_block0.clone()),
+        )
+    });
     // We can't await the future yet, because bad blocks aren't cleared
     // until the chain is verified
 
@@ -1098,20 +1156,35 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (3/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for good block 0 (3/3)
-    let good_verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(good_block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for good block 0, and expect success (3/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (3/3)"
+        ))
+        .await?;
+    let good_verify_future = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for good block 0 (3/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(good_block0.clone()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = good_verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("future should succeed");
+    let verify_response = async {
+        good_verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("future should succeed")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for good block 0, and expect success (3/3)"
+    ))
+    .await;
 
     assert_eq!(verify_response, good_block0_hash);
 
@@ -1130,13 +1203,19 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
 
     // Now, await the bad futures, which should have completed
 
-    /// SPANDOC: Wait for the response for block 0, and expect failure (1/3)
     // TODO(teor || jlusby): check error kind
-    let _ = bad_verify_future_1
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        bad_verify_future_1
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for block 0, and expect failure (1/3)"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1151,13 +1230,19 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Wait for the response for block 0, and expect failure again (2/3)
     // TODO(teor || jlusby): check error kind
-    let _ = bad_verify_future_2
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        bad_verify_future_2
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for block 0, and expect failure again (2/3)"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1180,7 +1265,6 @@ async fn checkpoint_drop_cancel_test() -> Result<(), Report> {
     checkpoint_drop_cancel().await
 }
 
-#[spandoc::spandoc]
 async fn checkpoint_drop_cancel() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1226,14 +1310,25 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     let mut futures = Vec::new();
     // Now collect verify futures for each block
     for (block, height, hash) in checkpoint_data {
-        /// SPANDOC: Make sure the verifier service is ready
-        let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        let ready_verifier_service =
+            async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+                .instrument(tracing::error_span!(
+                    "checkpoint_drop_cancel::comment",
+                    text = %"Make sure the verifier service is ready"
+                ))
+                .await?;
 
-        /// SPANDOC: Set up the future for block {?height}
-        let verify_future = timeout(
-            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block.clone()),
-        );
+        let verify_future = tracing::error_span!(
+            "checkpoint_drop_cancel::comment",
+            ?height,
+            text = %"Set up the future for block"
+        )
+        .in_scope(|| {
+            timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                ready_verifier_service.call(block.clone()),
+            )
+        });
 
         futures.push((verify_future, height, hash));
 
@@ -1256,11 +1351,18 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     drop(checkpoint_verifier);
 
     for (verify_future, height, hash) in futures {
-        /// SPANDOC: Check the response for block {?height}
-        let verify_response = verify_future
-            .map_err(|e| eyre!(e))
-            .await
-            .expect("timeout should not happen");
+        let verify_response = async {
+            verify_future
+                .map_err(|e| eyre!(e))
+                .await
+                .expect("timeout should not happen")
+        }
+        .instrument(tracing::error_span!(
+            "checkpoint_drop_cancel::comment",
+            ?height,
+            text = %"Check the response for block"
+        ))
+        .await;
 
         if height <= block::Height(1) {
             let verify_hash =
@@ -1280,7 +1382,6 @@ async fn hard_coded_mainnet_test() -> Result<(), Report> {
     hard_coded_mainnet().await
 }
 
-#[spandoc::spandoc]
 async fn hard_coded_mainnet() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1302,20 +1403,35 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
     );
     assert!(checkpoint_verifier.checkpoint_list.max_height() > block::Height(0));
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 0
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 0
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "hard_coded_mainnet::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "hard_coded_mainnet::comment",
+        text = %"Set up the future for block 0"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block0.clone()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("block should verify");
+    let verify_response = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("block should verify")
+    }
+    .instrument(tracing::error_span!(
+        "hard_coded_mainnet::comment",
+        text = %"Wait for the response for block 0"
+    ))
+    .await;
 
     assert_eq!(verify_response, hash0);
 

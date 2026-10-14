@@ -857,6 +857,8 @@ impl Storage {
             self.transactions()
                 .get(&tx_id.mined_id())
                 .map(|tx| &tx.transaction)
+                // The verified set is keyed by mined ID, so check the auth digest too.
+                .filter(|tx| tx.id() == tx_id)
         })
     }
 
@@ -1009,7 +1011,9 @@ impl Storage {
             TransactionDownloadVerifyError::DownloadFailed(_) |
             // If it was cancelled then a block was mined, or there was a network
             // upgrade, etc. No reason to reject it.
-            TransactionDownloadVerifyError::Cancelled => {}
+            TransactionDownloadVerifyError::Cancelled |
+            // The transaction was not verified. Another peer can still relay it.
+            TransactionDownloadVerifyError::PeerCoolingDown => {}
 
             TransactionDownloadVerifyError::PolicyRejected(error) => self.reject(
                 tx_id,

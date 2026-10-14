@@ -684,7 +684,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
-        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -700,6 +699,11 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         replace_legacy_syncer = true
         max_blocks_per_response = 5
         status_refresh_interval = "12s"
+
+        [zakura.quic]
+        recv_buffer_bytes = 16777216
+        congestion_controller = "new_reno"
+        handshake_timeout_secs = 20
         "#,
     )
     .unwrap();
@@ -708,8 +712,10 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
-    assert!(config.zakura.nat_traversal);
-    assert!(serialized.contains("nat_traversal = true"));
+    assert!(serialized.contains("[zakura.quic]"));
+    assert!(serialized.contains("recv_buffer_bytes = 16777216"));
+    assert!(serialized.contains("congestion_controller = \"new_reno\""));
+    assert!(serialized.contains("handshake_timeout_secs = 20"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
@@ -725,6 +731,36 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         !config.zakura.block_sync.replace_legacy_syncer,
         "deprecated replace_legacy_syncer config is accepted but ignored"
     );
+}
+
+#[test]
+fn zakura_nat_traversal_fails_and_names_the_transport_spec() {
+    let _init_guard = zakura_test::init();
+
+    let error = toml::from_str::<Config>("[zakura]\nnat_traversal = true\n")
+        .expect_err("nat_traversal = true must fail at startup")
+        .to_string();
+    assert!(error.contains("hole punching"), "{error}");
+    assert!(error.contains("docs/specs/zakura-quic.md"), "{error}");
+
+    let config: Config = toml::from_str("[zakura]\nnat_traversal = false\n")
+        .expect("nat_traversal = false keeps parsing");
+    assert!(!config.zakura.nat_traversal);
+}
+
+#[test]
+fn zakura_quic_out_of_range_value_fails_and_names_the_key() {
+    let _init_guard = zakura_test::init();
+
+    let error = toml::from_str::<Config>("[zakura.quic]\nidle_timeout_secs = 5\n")
+        .expect_err("an out-of-range transport value must fail at startup")
+        .to_string();
+    assert!(error.contains("idle_timeout_secs"), "{error}");
+
+    let error = toml::from_str::<Config>("[zakura.quic]\nnot_a_key = 1\n")
+        .expect_err("an unknown transport key must fail at startup")
+        .to_string();
+    assert!(error.contains("not_a_key"), "{error}");
 }
 
 #[test]
@@ -1012,12 +1048,12 @@ fn nsm_reissuance_height_is_derived_after_config_roundtrip() {
 
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
-/// every later startup, so the node's `EndpointId` is stable across restarts.
+/// every later startup, so the node's `NodeId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
 /// every call and never wrote the reserved identity key file, so two startups
-/// produced different `EndpointId`s and no key file existed.
+/// produced different `NodeId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zakura_test::init();
@@ -1053,7 +1089,7 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     }
 
     // Second startup reading the same key file (simulating a process restart)
-    // must reuse the persisted key, yielding the same `EndpointId`.
+    // must reuse the persisted key, yielding the same `NodeId`.
     let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(
@@ -1130,6 +1166,51 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
             .and_then(|name| name.to_str()),
         Some("mainnet.zakura-iroh-secret-key"),
         "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
+    );
+}
+
+/// Key files written before the move off Iroh's key type, and both text forms
+/// of the config override, must keep yielding the same node ID.
+#[test]
+fn zakura_secret_key_text_forms_keep_their_node_id() {
+    let _init_guard = zakura_test::init();
+
+    // RFC 8032 §7.1 test 1: the seed and the public key it derives.
+    const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
+    const NODE_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
+    fs::write(&key_file, format!("{SEED_HEX}\n")).expect("write existing key file");
+    let from_file = load_or_generate_zakura_secret_key(&key_file);
+    assert_eq!(from_file.public().to_string(), NODE_ID);
+    assert_eq!(
+        fs::read_to_string(&key_file).expect("read key file"),
+        format!("{SEED_HEX}\n"),
+        "loading an existing key file must not rewrite it",
+    );
+
+    for configured in [SEED_HEX, SEED_BASE32, &SEED_BASE32.to_lowercase()] {
+        let config: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
+            .expect("valid configured key parses");
+        let secret_key = config
+            .zakura_secret_key()
+            .expect("configured key should resolve");
+        assert_eq!(secret_key.public().to_string(), NODE_ID);
+    }
+
+    // A fresh key file holds 64 lowercase hex characters and reloads to the same node ID.
+    let fresh_file = key_dir.path().join("testnet.zakura-iroh-secret-key");
+    let fresh = load_or_generate_zakura_secret_key(&fresh_file);
+    let contents = fs::read_to_string(&fresh_file).expect("read fresh key file");
+    assert_eq!(contents.len(), 64);
+    assert!(contents
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_eq!(
+        load_or_generate_zakura_secret_key(&fresh_file).public(),
+        fresh.public()
     );
 }
 

@@ -19,6 +19,11 @@ pub mod sync;
 mod tests;
 
 pub use methods::types::{
-    get_block_template::{fetch_chain_info, proposal::proposal_block_from_template, MinerParams},
-    submit_block::{MinedBlockEvent, PendingBlockRegistry, PendingBlockSignal, SubmitBlockChannel},
+    get_block_template::{
+        fetch_chain_info, proposal::proposal_block_from_template, MinerAddress, MinerParams,
+    },
+    submit_block::{
+        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistration, PendingBlockRegistry,
+        PendingBlockSignal, SubmitBlockChannel,
+    },
 };

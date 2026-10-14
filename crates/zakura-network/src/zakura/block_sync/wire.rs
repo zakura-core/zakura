@@ -2,10 +2,10 @@ use super::{config::*, error::*, *};
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
-/// Capability bit for the native block-sync service.
-pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 3;
-/// Version of the native block-sync stream.
-pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 2;
+/// Capability for the regulated height-range contract on stream version 3.
+pub const ZAKURA_CAP_BLOCK_SYNC_REGULATED: u64 = 1 << 8;
+/// Version selecting bounded commitments, exact responses, and frame/cadence rules.
+pub const ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION: u16 = 3;
 
 /// Peer status advertisement.
 pub const MSG_BS_STATUS: u8 = 1;
@@ -131,9 +131,15 @@ impl BlockSyncMessage {
             MSG_BS_BLOCK => {
                 let block_start = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
-                let block = Arc::new(block::Block::zcash_deserialize(&mut reader)?);
-                let block_end = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?;
+                let mut block_bytes = &bytes[block_start..];
+                let block = Arc::new(block::Block::zcash_deserialize_from_slice(
+                    &mut block_bytes,
+                )?);
+                let block_end = bytes.len() - block_bytes.len();
+                reader.set_position(
+                    u64::try_from(block_end)
+                        .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?,
+                );
                 validate_encoded_block_len(block_end.saturating_sub(block_start))?;
                 Self::Block(block)
             }
@@ -283,3 +289,6 @@ pub(super) fn reject_trailing(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod bounded_decoding;

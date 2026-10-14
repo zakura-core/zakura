@@ -31,6 +31,20 @@
       }
     },
     {
+      "name": "getstandardfee",
+      "summary": "Returns the recommended standard fee per logical action, in zatoshis.",
+      "description": "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet",
+      "params": [],
+      "result": {
+        "name": "getstandardfee_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getnetworkinfo",
       "summary": "Returns an object containing various state info regarding P2P networking.",
       "description": "Returns an object containing various state info regarding P2P networking.\n\nzcashd reference: [`getnetworkinfo`](https://zcash.github.io/rpc/getnetworkinfo.html)\nmethod: post\ntags: network",
@@ -404,6 +418,30 @@
           "$ref": "#/components/schemas/OpenRPC%20Schema"
         }
       }
+    },
+    {
+      "description": "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.",
+      "name": "submitsolution",
+      "params": [
+        {
+          "description": "The parameters for the command.",
+          "name": "parameters",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SubmitSolutionParameters"
+          },
+          "summary": "The parameters for the command."
+        }
+      ],
+      "result": {
+        "description": "An OpenRPC document.",
+        "name": "submitsolution_result",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        },
+        "summary": "An OpenRPC document."
+      },
+      "summary": "Submits a solved header for a prepared mining candidate."
     },
     {
       "name": "getblockhash",
@@ -1019,13 +1057,31 @@
         "description": "Optional argument `jsonparametersobject` for `submitblock` RPC request\n\nSee the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.",
         "properties": {
           "workid": {
-            "description": "The workid for the block template.\n\n> If the server provided a workid, it MUST be included with submissions,\n\nRationale:\n\n> If servers allow all mutations, it may be hard to identify which job it is based on.\n> While it may be possible to verify the submission by its content, it is much easier\n> to compare it to the job issued. It is very easy for the miner to keep track of this.\n> Therefore, using a \"workid\" is a very cheap solution to enable more mutations.\n\n<https://en.bitcoin.it/wiki/BIP_0022#Rationale>",
+            "description": "The workid for the block template.\n\n> If the server provided a workid, it MUST be included with submissions,\n\nRationale:\n\n> If servers allow all mutations, it may be hard to identify which job it is based on.\n> While it may be possible to verify the submission by its content, it is much easier\n> to compare it to the job issued. It is very easy for the miner to keep track of this.\n> Therefore, using a \"workid\" is a very cheap solution to enable more mutations.\n\n<https://en.bitcoin.it/wiki/BIP_0022#Rationale>\n\nZakura accepts this field but does not read it. The verifier identifies a prepared\ncandidate by its content, so a submission reuses the prepared work whether or not the\nminer echoes the work ID back.",
             "type": [
               "string",
               "null"
             ]
           }
         },
+        "type": "object"
+      },
+      "SubmitSolutionParameters": {
+        "description": "A compact mined-block submission.",
+        "properties": {
+          "header": {
+            "$ref": "#/components/schemas/HexData",
+            "description": "The complete hex-encoded solved block header."
+          },
+          "workid": {
+            "description": "The prepared candidate identifier returned by `getblocktemplate`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workid",
+          "header"
+        ],
         "type": "object"
       }
     }

@@ -38,7 +38,7 @@ threads-required = "num-test-threads"
 [profile.all-tests]
 fail-fast = false
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=pruned_checkpoint_sync_mines_without_transparent_indexes) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention)"
 
 # The Zakura block-sync tests drive the real reactor through a real-time (wall-clock)
 # scenario harness — multi-threaded tokio with real sleeps and timeouts. Under a loaded
@@ -50,7 +50,7 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 # waits for events with a 30-second bound, so give it room beyond the default
 # slow-test warning. It keeps the package's retries below.
 [[profile.all-tests.overrides]]
-filter = 'package(zakura-network) and test(~stream_conformance::)'
+filter = 'package(zakura-network) and (test(~stream_conformance::) or test(~conformance_tests::))'
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -74,7 +74,7 @@ retries = 2
 [profile.full-tests]
 fail-fast = false
 failure-output = "immediate"
-default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_one_checkpoint_testnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention)"
+default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced_rpc_z_getsubtreesbyindex_snapshot_test) and not test(=rpc_get_block_template) and not test(=rpc_submit_block) and not test(~generate_checkpoints_) and not test(=sync_one_checkpoint_mainnet) and not test(=sync_update_mainnet) and not test(=activate_mempool_mainnet) and not test(=restart_stop_at_height) and not test(=sync_large_checkpoints_mempool_mainnet) and not test(=pruned_storage_mode_prunes_during_regtest_sync) and not test(=pruned_checkpoint_sync_mines_without_transparent_indexes) and not test(=config_tests) and not test(~zakura::testkit::cluster) and not test(~zakura::testkit::blocksync_fuzz) and not test(~service::finalized_state::zakura_db::transparent::contention::utxo_state_contention)"
 
 # Retry the real-time Zakura block-sync scenario tests under load (see the note on the
 # `all-tests` override above).
@@ -108,7 +108,7 @@ default-filter = 'package(zakura) and test(=restart_stop_at_height)'
 [profile.zakura-pruned-storage]
 slow-timeout = { period = "15m", terminate-after = 1 }
 failure-output = "immediate"
-default-filter = 'package(zakura) and test(=pruned_storage_mode_prunes_during_regtest_sync)'
+default-filter = 'package(zakura) and (test(=pruned_storage_mode_prunes_during_regtest_sync) or test(=pruned_checkpoint_sync_mines_without_transparent_indexes))'
 
 [profile.zakura-integration]
 fail-fast = false
@@ -195,6 +195,13 @@ test-threads = 1
 slow-timeout = { period = "15m", terminate-after = 2 }
 failure-output = "immediate"
 default-filter = 'package(zakura) and test(~zcashd_compat)'
+
+[profile.zcashd-compat-nu7]
+# Only the NU7 activation tests, on regtest.
+test-threads = 1
+slow-timeout = { period = "15m", terminate-after = 2 }
+failure-output = "immediate"
+default-filter = 'package(zakura) and test(~zcashd_compat_nu7)'
 
 [profile.zcashd-compat-soak]
 # Long-running local soak for the reorg churn stress test.

@@ -256,6 +256,7 @@ jobs:
           fi
           echo "path=$(dirname "$MANIFEST")/src/mainnet-frontier-grid.bin" >> "$GITHUB_OUTPUT"
 
+      # Release preparation owns end-of-support changes.
       - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
@@ -272,7 +273,8 @@ jobs:
             --bundle "$BUNDLE" \
             --resolution "$RESOLUTION" \
             ${PREVIOUS_ARGS[@]+"${PREVIOUS_ARGS[@]}"} \
-            --result-out "$RUNNER_TEMP/release-state-import.json"
+            --result-out "$RUNNER_TEMP/release-state-import.json" \
+            --no-eos-floor
           jq -r '
             "has_changes=\(.has_changes)",
             "height=\(.height)",
@@ -334,7 +336,6 @@ jobs:
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
-          crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
           if [ -n "$UNEXPECTED" ]; then
@@ -387,7 +388,7 @@ jobs:
           base: main
           title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. It also floors the end-of-support estimate.
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. End-of-support changes belong to release preparation.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`

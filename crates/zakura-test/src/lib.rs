@@ -23,6 +23,7 @@ pub mod mock_service;
 pub mod net;
 pub mod network_addr;
 pub mod prelude;
+pub mod process_stats;
 pub mod service_extensions;
 pub mod transcript;
 pub mod vectors;
@@ -130,9 +131,8 @@ pub fn init() -> impl Drop {
                     "<std::panic::AssertUnwindSafe",
                     "core::result::Result",
                     "<T as futures_util",
-                    "<tracing_futures::Instrumented",
+                    "<tracing::instrument::Instrumented",
                     "test::assert_test_result",
-                    "spandoc::",
                 ];
 
                 frames.retain(|frame| {

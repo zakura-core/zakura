@@ -265,6 +265,31 @@ fn pool_and_session_counts_bound_bookkeeping_without_byte_funding() {
 }
 
 #[test]
+fn unreceived_snapshot_stops_at_its_limit_in_height_order() {
+    let (fence, _connection) = fence();
+    let pool = ReservationPool::new(2).unwrap();
+    let mut book = Requester::new(2);
+    for (start, hashes) in [(20, [hash(4), hash(5)]), (10, [hash(1), hash(2)])] {
+        book.reserve(
+            range(start, 2),
+            &hashes,
+            100,
+            pool.try_entry().unwrap(),
+            fence.open().unwrap(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        book.unreceived_expected(3),
+        [
+            (Height(10), hash(1)),
+            (Height(11), hash(2)),
+            (Height(20), hash(4)),
+        ]
+    );
+}
+
+#[test]
 fn shortened_unavailable_ends_the_whole_requested_range() {
     let (fence, connection) = fence();
     let pool = ReservationPool::new(1).unwrap();
@@ -296,4 +321,51 @@ fn shortened_unavailable_ends_the_whole_requested_range() {
     assert_eq!(pool.held(), 0);
     assert!(fence.retire());
     assert!(!connection.is_cancelled());
+}
+
+#[test]
+fn unfinished_ranges_keep_capacity_and_do_not_extend_their_retirement_deadline() {
+    use std::time::Duration;
+
+    let (fence, _) = fence();
+    let pool = ReservationPool::new(2).unwrap();
+    let mut book = Requester::new(2);
+    for start in 1..=2 {
+        let byte = u8::try_from(start).unwrap();
+        book.reserve(
+            range(start, 1),
+            &[hash(byte)],
+            100,
+            pool.try_entry().unwrap(),
+            fence.open().unwrap(),
+        )
+        .unwrap();
+    }
+    let grace = Duration::from_secs(32);
+    book.abandon(Height(1));
+    let deadline = book.retirement_deadline(grace).unwrap();
+    book.abandon(Height(1));
+    assert_eq!(book.retirement_deadline(grace), Some(deadline));
+    book.claim_block(hash(2), 2).unwrap();
+    assert_eq!(book.retirement_deadline(grace), Some(deadline));
+    assert!(book.at_capacity());
+
+    book.claim_block(hash(1), 2).unwrap();
+    assert_eq!(book.retirement_deadline(grace), Some(deadline));
+    assert!(book.blocks_retry(Height(1)));
+    assert_eq!(book.retirement_deadline(grace), Some(deadline));
+    book.finish(&Message::BlocksDone {
+        start: Height(1),
+        returned: 1,
+    })
+    .unwrap();
+    assert!(!book.at_capacity());
+    assert!(book.retirement_deadline(grace).is_some());
+    assert!(!book.blocks_retry(Height(1)));
+    book.finish(&Message::BlocksDone {
+        start: Height(2),
+        returned: 1,
+    })
+    .unwrap();
+    assert!(book.retirement_deadline(grace).is_none());
 }

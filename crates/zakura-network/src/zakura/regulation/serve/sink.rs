@@ -212,7 +212,7 @@ impl SinkCore {
         };
         if ends {
             self.commitment
-                .as_ref()
+                .as_mut()
                 .expect("an open sink keeps its commitment")
                 .queue_ending(publish)
         } else {

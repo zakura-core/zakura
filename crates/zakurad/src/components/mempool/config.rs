@@ -34,7 +34,7 @@ pub struct Config {
     ///
     /// This corresponds to `mempoolevictionmemoryminutes` from
     /// [ZIP-401](https://zips.z.cash/zip-0401#specification).
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub eviction_memory_time: Duration,
 
     /// If the state's best chain tip has reached this height, always enable the mempool,

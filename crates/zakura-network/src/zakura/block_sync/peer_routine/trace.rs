@@ -27,7 +27,9 @@ impl PeerRoutine {
             row.bbr_cwnd = Some(saturating_usize(self.window.bbr_effective_cwnd()));
             row.available_slots = Some(saturating_usize(self.window.available_slots()));
             if let Some(last_block_at) = self.window.last_block_at {
-                row.last_block_age_ms = Some(elapsed_ms_u64(last_block_at.elapsed()));
+                row.last_block_age_ms = Some(elapsed_ms_u64(
+                    time::Instant::from_std(last_block_at).elapsed(),
+                ));
             }
         });
     }
@@ -37,6 +39,7 @@ impl PeerRoutine {
     /// the per-variant field detail lives on the reactor's heavier trace path.
     pub(super) fn trace_message_received(&self, msg: &BlockSyncMessage) {
         self.emit(bs_trace::BLOCK_MESSAGE_RECEIVED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.kind = Some(block_sync_message_label(msg));
         });
     }
@@ -227,9 +230,9 @@ impl PeerRoutine {
         });
         // Refresh the published slot diagnostics on the same cadence so the cross-peer
         // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
-        // past the horizon (→ `None` = worst floor server).
-        self.publish_outstanding();
+        // `publish_slot_diagnostics` re-reads `bbr_rtprop_ms(now)`, filtering out samples
+        // aged past the horizon (→ `None` = worst floor server).
+        self.publish_slot_diagnostics();
     }
 
     pub(super) fn trace_body_sequencer_sent(

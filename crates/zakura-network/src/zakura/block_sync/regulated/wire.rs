@@ -1,4 +1,5 @@
-//! The existing stream-6 version-2 codec, before authorization and full block decoding.
+//! The stream-6 version 3 envelope, which keeps the version 2 byte encodings, checked before
+//! authorization and full block decoding.
 
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ const fn response(message_type: u8, ends_exchange: bool, payload: PayloadLen) ->
     }
 }
 
-pub(super) const RULES: &[MessageRule] = &[
+pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
     MessageRule {
         message_type: 1,
         payload: PayloadLen::exact(53),

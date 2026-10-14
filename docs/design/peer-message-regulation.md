@@ -131,6 +131,14 @@ one response slot per 4 KiB of output budget, rounded up. This ratio is a sizing
 allocator measurement. Adoption must measure throughput for tiny responses. Requests waiting for
 output capacity retain their commitments and remain bounded by the session's commitment limit.
 
+Waiting requests do not allocate response channels. The serving task creates each channel only
+after it takes capacity, and puts its receiver in the ordered output before starting the work.
+This preserves request order without charging every waiting commitment for a channel buffer.
+Serving frames share a queue allowance across sender clones that leaves one slot for requests
+and control messages. The allowance stays held through the write, including while QUIC is blocked.
+This needs a transport queue of at least two slots and does not prioritize control ahead of bytes
+already queued on the ordered stream.
+
 A commitment is released when its ending enters the session's ordered output, before transmission.
 A conformant peer sends its next request only after it receives an ending, so it never exceeds the
 advertised limit on this node's tally. The toolkit still acts only above twice the limit: even if
@@ -236,9 +244,12 @@ Remove the mandatory push deadline. The publisher produces eligible pages when c
 and capacity are available. The subscriber can track progress and select another peer under local
 policy. Slow progress alone is not a protocol violation. Idle subscription state stays bounded.
 
-Block sync retains version-2 correlation rules. Live ranges cannot overlap on one connection because
-the wire format lacks a request ID. BlocksDone and RangeUnavailable close the matching range once.
-A separate successor protocol can improve correlation later.
+Regulated block sync negotiates version 3 with version-2 message encodings, and peers without the
+regulation capability keep the complete version 2 contract. Live ranges cannot overlap on one
+regulated connection because the wire format lacks a request ID. A separate successor protocol can
+improve correlation later. A well-formed body with a different hash can come from an honest peer on
+another chain, so it retires the connection as a local incompatibility rather than a peer fault.
+The [specification](../specs/peer-message-regulation.md) states the version 3 rules.
 
 ### Subscriptions
 

@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use iroh::endpoint::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use tokio::sync::Mutex;
+use zakura_quic::{Conn as Connection, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
@@ -12,18 +12,18 @@ use crate::{
         legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
         HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
         ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
-        ZAKURA_STREAM_HEADER_SYNC,
+        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
 
-/// Raw Iroh peer that can violate Zakura stream rules by hand.
+/// Raw QUIC peer that can violate Zakura stream rules by hand.
 #[derive(Debug)]
 pub struct HostilePeer {
-    endpoint: Endpoint,
+    endpoint: QuicEndpoint,
     connection: Connection,
     limits: ZakuraLocalLimits,
     held_streams: Vec<SendStream>,
@@ -47,16 +47,33 @@ impl HostilePeer {
         seed: u64,
         capabilities: u64,
     ) -> Result<Self, BoxError> {
+        Self::connect_native_with_transport(
+            victim,
+            seed,
+            capabilities,
+            victim.limits().quic.clone(),
+        )
+        .await
+    }
+
+    /// Connect with explicit QUIC windows for transport backpressure tests.
+    pub(crate) async fn connect_native_with_transport(
+        victim: &ZakuraTestNode,
+        seed: u64,
+        capabilities: u64,
+        quic: QuicConfig,
+    ) -> Result<Self, BoxError> {
         let limits = victim.limits().clone();
-        let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        let endpoint = LocalEndpointFactory::with_limits(&limits)
+            .quic_config(quic)
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
 
-        let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
+        let connection = endpoint.connect(victim_addr, &[P2P_V2_ALPN]).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
-        let local_peer_id = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;
+        let local_peer_id = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
         run_native_initiator_handshake(&connection, &limits, &config, &local_peer_id).await?;
 
         Ok(Self {
@@ -68,9 +85,11 @@ impl HostilePeer {
         })
     }
 
-    /// Return this peer's authenticated Iroh id as Zakura sees it.
+    /// Return this peer's authenticated node id as Zakura sees it.
     pub fn id(&self) -> Result<ZakuraPeerId, BoxError> {
-        Ok(ZakuraPeerId::new(self.endpoint.id().as_bytes().to_vec())?)
+        Ok(ZakuraPeerId::new(
+            self.endpoint.local_id().as_bytes().to_vec(),
+        )?)
     }
 
     /// Encode and send one canonical protocol-v8 header-sync message.
@@ -169,6 +188,26 @@ impl HostilePeer {
         Ok(())
     }
 
+    /// Open an ordered stream at `stream_version` and return both halves, so a
+    /// caller can write and read it concurrently.
+    #[cfg(test)]
+    pub(crate) async fn split_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(SendStream, RecvStream), BoxError> {
+        let (mut send, recv) = self.connection.open_bi().await?;
+        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+            .await?;
+        Ok((send, recv))
+    }
+
+    /// Largest frame this peer reads or writes.
+    #[cfg(test)]
+    pub(crate) fn max_frame_bytes(&self) -> u32 {
+        self.limits.max_frame_bytes
+    }
+
     /// Receive the next frame written by the victim on this ordered stream.
     pub async fn recv_ordered_frame(&self, stream_kind: u16) -> Result<Frame, BoxError> {
         self.recv_ordered_frame_with_version(stream_kind, Self::stream_version(stream_kind))
@@ -194,24 +233,6 @@ impl HostilePeer {
         Self::read_frame(recv, self.limits.max_frame_bytes).await
     }
 
-    /// Gracefully finish and forget one persistent ordered stream generation.
-    pub async fn finish_ordered_stream(
-        &self,
-        stream_kind: u16,
-        stream_version: u16,
-    ) -> Result<(), BoxError> {
-        let Some((mut send, _recv)) = self
-            .ordered_streams
-            .lock()
-            .await
-            .remove(&(stream_kind, stream_version))
-        else {
-            return Ok(());
-        };
-        send.finish()?;
-        Ok(())
-    }
-
     /// Reset and forget one persistent ordered stream generation.
     pub async fn reset_ordered_stream(
         &self,
@@ -229,37 +250,6 @@ impl HostilePeer {
         let code = VarInt::from_u32(0);
         send.reset(code)?;
         recv.stop(code)?;
-        Ok(())
-    }
-
-    /// Replace one persistent ordered stream with a fresh physical generation.
-    pub async fn reopen_ordered_stream(
-        &self,
-        stream_kind: u16,
-        stream_version: u16,
-    ) -> Result<(), BoxError> {
-        self.reset_ordered_stream(stream_kind, stream_version)
-            .await?;
-        let mut streams = self.ordered_streams.lock().await;
-        let (mut send, recv) = self.connection.open_bi().await?;
-        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
-            .await?;
-        streams.insert((stream_kind, stream_version), (send, recv));
-        Ok(())
-    }
-
-    /// Send a valid frame header with a payload shorter than its declared
-    /// length.
-    pub async fn send_truncated_frame(&self, stream_kind: u16) -> Result<(), BoxError> {
-        let (mut send, _recv) = self.connection.open_bi().await?;
-        self.write_prelude(&mut send, stream_kind).await?;
-        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
-        WriteBytesExt::write_u16::<LittleEndian>(&mut header, 1)?;
-        WriteBytesExt::write_u16::<LittleEndian>(&mut header, 0)?;
-        WriteBytesExt::write_u32::<LittleEndian>(&mut header, 8)?;
-        send.write_all(&header).await?;
-        send.write_all(&[1, 2, 3]).await?;
-        let _ = send.finish();
         Ok(())
     }
 
@@ -431,29 +421,10 @@ impl HostilePeer {
         Ok(())
     }
 
-    /// Open a stream and hold it past the victim's prelude timeout.
-    pub async fn open_and_never_send_prelude(&mut self) -> Result<(), BoxError> {
-        let (send, _recv) = self.connection.open_bi().await?;
-        self.held_streams.push(send);
-        tokio::time::sleep(self.limits.prelude_timeout + std::time::Duration::from_millis(20))
-            .await;
-        Ok(())
-    }
-
-    /// Open at most `count` streams quickly, sending valid preludes.
-    pub async fn churn_streams(&mut self, stream_kind: u16, count: usize) -> Result<(), BoxError> {
-        for _ in 0..count.min(4096) {
-            let (mut send, _recv) = self.connection.open_bi().await?;
-            self.write_prelude(&mut send, stream_kind).await?;
-            self.held_streams.push(send);
-        }
-        Ok(())
-    }
-
     /// Close the raw endpoint.
     pub async fn shutdown(self) {
         self.connection.close(VarInt::from_u32(0), b"hostile done");
-        self.endpoint.close().await;
+        self.endpoint.shutdown().await;
     }
 
     async fn write_prelude(&self, send: &mut SendStream, stream_kind: u16) -> Result<(), BoxError> {
@@ -483,18 +454,8 @@ impl HostilePeer {
             ZAKURA_STREAM_GOSSIP => LEGACY_GOSSIP_VERSION,
             ZAKURA_STREAM_DISCOVERY => ZAKURA_DISCOVERY_STREAM_VERSION,
             ZAKURA_STREAM_HEADER_SYNC => ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
             _ => 1,
-        }
-    }
-
-    /// Selected header-sync stream version for an explicit capability mask.
-    pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
-        if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
-            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
-        } else {
-            (capabilities & ZAKURA_CAP_HEADER_SYNC != 0)
-                .then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
         }
     }
 
@@ -550,7 +511,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+    use futures::future::BoxFuture;
+    use zakura_quic::{Acceptor, Admit, IncomingInfo};
 
     const TEST_ALPN: &[u8] = b"/zakura/testkit/hostile-read-frame/0";
     const MAX_FRAME_BYTES: u32 = 4096;
@@ -566,8 +528,22 @@ mod tests {
     #[derive(Clone, Debug)]
     struct OversizeResponder;
 
-    impl ProtocolHandler for OversizeResponder {
-        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+    impl Acceptor for OversizeResponder {
+        fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+            Admit::Accept
+        }
+
+        fn alpns(&self) -> Vec<Vec<u8>> {
+            vec![TEST_ALPN.to_vec()]
+        }
+
+        fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
+            Box::pin(Self::respond(connection))
+        }
+    }
+
+    impl OversizeResponder {
+        async fn respond(connection: Connection) {
             if let Ok((mut send, _recv)) = connection.open_bi().await {
                 let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
                 header.extend_from_slice(&1u16.to_le_bytes()); // message_type
@@ -579,7 +555,6 @@ mod tests {
                 // blocks here.
                 tokio::time::sleep(Duration::from_secs(8)).await;
             }
-            Ok(())
         }
     }
 
@@ -591,14 +566,12 @@ mod tests {
     async fn read_frame_rejects_oversize_declared_len_before_allocating_payload(
     ) -> Result<(), BoxError> {
         let server = LocalEndpointFactory::new().endpoint(4040).await?;
-        let router = Router::builder(server)
-            .accept(TEST_ALPN, OversizeResponder)
-            .spawn();
-        let server_addr = LocalEndpointFactory::node_addr(router.endpoint()).await;
+        server.serve(OversizeResponder)?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
         let client = LocalEndpointFactory::new().endpoint(4041).await?;
 
-        let connection = client.connect(server_addr, TEST_ALPN).await?;
+        let connection = client.connect(server_addr, &[TEST_ALPN]).await?;
 
         let (_send, mut recv) = connection.accept_bi().await?;
 
@@ -625,7 +598,8 @@ mod tests {
         );
 
         connection.close(0u32.into(), b"done");
-        client.close().await;
+        client.shutdown().await;
+        server.shutdown().await;
         Ok(())
     }
 }

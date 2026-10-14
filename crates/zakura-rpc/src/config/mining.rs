@@ -37,7 +37,9 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
-    /// Used in coinbase tx constructed in `getblocktemplate` RPC.
+    /// Used in coinbase tx constructed in `getblocktemplate` RPC. Sapling-only
+    /// addresses are unsupported. Unified addresses use their Orchard receiver
+    /// for Ironwood rewards after NU6.3, or their transparent receiver otherwise.
     #[serde(with = "miner_address")]
     pub miner_address: Option<ZcashAddress>,
 
@@ -244,15 +246,5 @@ mod tests {
         }
         assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
         assert!(toml::from_str::<Config>("miner_address = 42").is_err());
-    }
-
-    #[test]
-    fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
-        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
-        assert!(default.optimistic_block_inventory);
-
-        let disabled: Config = toml::from_str("optimistic_block_inventory = false")
-            .expect("the optimistic inventory option is valid");
-        assert!(!disabled.optimistic_block_inventory);
     }
 }

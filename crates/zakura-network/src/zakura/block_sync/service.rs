@@ -668,6 +668,20 @@ impl Service for BlockSyncService {
                 service_cancel_token.cancel();
                 return;
             }
+            // A newer connection in its reopen gap also supersedes this one.
+            // Claims only change under the peer-map lock, so this check and
+            // the removal below see the same claim.
+            if self
+                .inner
+                .session_gap_claims
+                .lock()
+                .expect("block-sync gap-claim mutex is never poisoned")
+                .get(&peer_id)
+                .is_some_and(|claim| claim.conn_id > conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
 
             // A peer registered for this direction may replace its session.
             // A connection-symmetry collision replaces the losing session with the winning stream.
@@ -1090,6 +1104,66 @@ mod regulated_frame_tests {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn an_older_connection_cannot_clear_a_newer_gap_claim() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        );
+        let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id| {
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        CancellationToken::new(),
+                    ),
+                )]),
+                CancellationToken::new(),
+                crate::zakura::CloseCause::default(),
+            ));
+            held_channels.push((in_tx, out_rx));
+        };
+        let claim_conn = |service: &BlockSyncService| {
+            service
+                .inner
+                .session_gap_claims
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .map(|claim| claim.conn_id)
+        };
+        // Connection 2's session exited and left a claim for its reopen.
+        service.inner.session_gap_claims.lock().unwrap().insert(
+            peer.clone(),
+            SessionGapClaim {
+                conn_id: 2,
+                direction: ServicePeerDirection::Outbound,
+            },
+        );
+
+        // A delayed admission for connection 1 arrives during that gap.
+        attach(1);
+        assert_eq!(service.peer_count(), 0);
+        assert_eq!(claim_conn(&service), Some(2));
+
+        attach(2);
+        assert_eq!(service.peer_count(), 1);
+        assert_eq!(claim_conn(&service), None);
     }
 
     #[tokio::test]

@@ -246,3 +246,52 @@ async fn serving_enforces_the_budgeted_limit() {
     assert!(session.admit(Height(2 * limit + 1), 1).is_err());
     cancel.cancel();
 }
+
+/// Live ranges may touch but never share a height. Each overlap is a peer
+/// fault, and a refused range leaves the admitted ranges unchanged.
+#[tokio::test]
+async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(Arc::new(Semaphore::new(0))),
+        ..Default::default()
+    });
+    let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
+    let cancel = CancellationToken::new();
+    let (send, _output) = framed_channel(4);
+    let mut session = serving.session(
+        &ZakuraPeerId::new(vec![63; 32]).unwrap(),
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        Default::default(),
+    );
+    // Heights 10..=14, then the ranges that end just below and start just above it.
+    for (start, count) in [(10, 5), (5, 5), (15, 3)] {
+        session.admit(Height(start), count).unwrap();
+    }
+    for (start, count) in [
+        (10, 5),
+        (12, 1),
+        (4, 2),
+        (9, 2),
+        (14, 2),
+        (17, 1),
+        (16, 4),
+        (1, 128),
+    ] {
+        assert!(
+            matches!(
+                session.admit(Height(start), count),
+                Err(SinkReject::Protocol(_))
+            ),
+            "{count} heights from {start} overlap a live range"
+        );
+    }
+    assert_eq!(
+        session.ranges.keys().copied().collect::<Vec<_>>(),
+        [Height(5), Height(10), Height(15)]
+    );
+    session.admit(Height(18), 1).unwrap();
+    session.admit(Height(1), 4).unwrap();
+    cancel.cancel();
+}

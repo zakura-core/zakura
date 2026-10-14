@@ -1225,6 +1225,99 @@ mod regulated_frame_tests {
         assert!(service.inner.status_senders.lock().unwrap().is_empty());
     }
 
+    /// Session replacement, session exit, and connection removal leave no
+    /// per-peer or per-connection entry behind, however often a peer reconnects.
+    #[tokio::test]
+    async fn reconnect_churn_returns_block_sync_maps_to_baseline() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        )
+        .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![43; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id, connection: &CancellationToken| {
+            let session = CancellationToken::new();
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        session.clone(),
+                    ),
+                )]),
+                connection.clone(),
+                crate::zakura::CloseCause::default(),
+            ));
+            held_channels.push((in_tx, out_rx));
+            session
+        };
+        let in_maps = |conn_id| {
+            (
+                service
+                    .inner
+                    .active_peers
+                    .lock()
+                    .unwrap()
+                    .contains_key(&peer),
+                service.inner.requester_sessions.get(&peer).is_some(),
+                service
+                    .inner
+                    .status_senders
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(peer.clone(), conn_id)),
+                service
+                    .inner
+                    .session_gap_claims
+                    .lock()
+                    .unwrap()
+                    .get(&peer)
+                    .is_some_and(|claim| claim.conn_id == conn_id),
+            )
+        };
+        for conn_id in 1..=16 {
+            let connection = CancellationToken::new();
+            attach(conn_id, &connection);
+            // A same-connection replacement keeps one entry per map.
+            let session = attach(conn_id, &connection);
+            assert_eq!(in_maps(conn_id), (true, true, true, false));
+            if conn_id % 2 == 0 {
+                // The session exits first and leaves a gap claim for its connection.
+                session.cancel();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while in_maps(conn_id) != (false, false, true, true) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the exiting session leaves only connection-scoped entries");
+            }
+            service.remove_peer(&peer, conn_id);
+            connection.cancel();
+            assert_eq!(in_maps(conn_id), (false, false, false, false));
+        }
+        assert!(service.inner.active_peers.lock().unwrap().is_empty());
+        assert!(service.inner.status_senders.lock().unwrap().is_empty());
+        assert!(service.inner.session_gap_claims.lock().unwrap().is_empty());
+        let mut seen = service.inner.requester_sessions.subscribe();
+        assert!(service
+            .inner
+            .requester_sessions
+            .snapshot(&mut seen)
+            .is_empty());
+    }
+
     use crate::zakura::{
         transport::{FrameFilter, InboundReader},
         MessageRole,

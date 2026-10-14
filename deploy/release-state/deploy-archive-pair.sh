@@ -28,17 +28,29 @@ version=$("$STAGE/zakurad" --version)
 # The publisher scripts remain host-managed. A main ancestor can still predate
 # their CLI contract. Include optional resume/cost arguments so later timer runs
 # cannot discover an incompatibility after the binaries have been replaced.
-exporter_help=$("$STAGE/zakura-checkpoints" --help)
-for option in --state-cache-dir --full-list --mainnet-frontier-output \
+require_options() {
+    local tool=$1 help=$2 option
+    shift 2
+    for option in "$@"; do
+        if ! grep -Eq -- "(^|[[:space:],])${option}([=[:space:]]|$)" <<< "$help"; then
+            echo "$tool $REVISION lacks publisher option $option; refusing deployment." >&2
+            exit 1
+        fi
+    done
+}
+require_options Exporter "$("$STAGE/zakura-checkpoints" --help)" \
+    --state-cache-dir --full-list --mainnet-frontier-output \
     --mainnet-subtree-output --mainnet-frontier-grid-output \
-    --mainnet-frontier-grid-input --frontier-grid-target-cost-ms; do
-    if ! grep -Eq -- "(^|[[:space:],])${option}([=[:space:]]|$)" <<< "$exporter_help"; then
-        echo "Exporter $REVISION lacks publisher option $option; refusing deployment." >&2
-        exit 1
-    fi
-done
+    --mainnet-frontier-grid-input --frontier-grid-target-cost-ms
+require_options "Spentness helper replay" "$("$STAGE/zakura-spentness" replay --help)" \
+    --source --destination --height --block-hash
+require_options "Spentness helper generate" "$("$STAGE/zakura-spentness" generate --help)" \
+    --state --height --block-hash --output --commitment
+require_options "Spentness helper verify" "$("$STAGE/zakura-spentness" verify --help)" \
+    --state --artifact --commitment --report
 
-# Keep concurrent deployments out until publication completes.
+# Keep concurrent deployments out until publication starts. A later deployment
+# then waits on the publisher lock and fails before changing any binary.
 exec 8>/run/zakura-release-state-deploy.lock
 flock -w 600 8
 RESUME_MARKER="$INSTALL_ROOT/deploy.resume-timer"
@@ -93,6 +105,7 @@ case "$state" in inactive|failed) ;; *) exit 1 ;; esac
 # roll back: startup may already have migrated the database to a newer format.
 install -m 755 "$STAGE/zakurad" "${BIN_PATH}.new"
 install -m 755 "$STAGE/zakura-checkpoints" "$INSTALL_ROOT/bin/zakura-checkpoints.new"
+install -m 755 "$STAGE/zakura-spentness" "$INSTALL_ROOT/bin/zakura-spentness.new"
 printf '%s\n' "$REVISION" > "$INSTALL_ROOT/EXPORTER_REVISION.new"
 # A persistent unit condition also blocks timer activation after a reboot.
 # Install the guard before recording the pause, and record the pause before
@@ -105,6 +118,7 @@ touch "$PAUSE_MARKER"
 RESTORE_TIMER=false
 systemctl stop "$NODE_SERVICE"
 mv -f "$INSTALL_ROOT/bin/zakura-checkpoints.new" "$INSTALL_ROOT/bin/zakura-checkpoints"
+mv -f "$INSTALL_ROOT/bin/zakura-spentness.new" "$INSTALL_ROOT/bin/zakura-spentness"
 mv -f "$INSTALL_ROOT/EXPORTER_REVISION.new" "$INSTALL_ROOT/EXPORTER_REVISION"
 mv -f "${BIN_PATH}.new" "$BIN_PATH"
 # Clear historical automatic restarts before measuring this deployment. Keep
@@ -147,14 +161,36 @@ cursor=$(journalctl -n 1 --show-cursor -o cat --no-pager | sed -n 's/^-- cursor:
 flock -u 9
 exec 9>&-
 
-# Type=oneshot waits for completion; the installed service has a six-hour timeout.
-# A publication failure leaves the compatible pair installed and restores the
-# timer for retries, but fails the deployment immediately.
-systemctl start "$PUBLISHER"
-[ "$(systemctl show -p Result --value "$PUBLISHER")" = success ]
-# Only accept a completion marker written after this deploy released the lock.
-# A skipped publication cannot pass using an older, still-fresh public bundle.
-journalctl -u "$PUBLISHER" --after-cursor="$cursor" -o cat --no-pager | \
-    sed -n 's/^pointer now at height \([0-9][0-9]*\)$/\1/p' > "$STAGE/published-height"
-[ "$(wc -l < "$STAGE/published-height")" -eq 1 ]
-echo "Installed node/exporter $REVISION and completed release-state publication."
+# A publication can run for days, so start it without waiting. A new invocation
+# that is still running counts as started. A publication failure leaves the
+# compatible pair installed and restores the timer for retries.
+previous_invocation=$(systemctl show -p InvocationID --value "$PUBLISHER")
+systemctl start --no-block "$PUBLISHER"
+invocation=$previous_invocation
+for ((attempt = 0; attempt < 60; attempt++)); do
+    invocation=$(systemctl show -p InvocationID --value "$PUBLISHER")
+    [ -n "$invocation" ] && [ "$invocation" != "$previous_invocation" ] && break
+    sleep 1
+done
+if [ -z "$invocation" ] || [ "$invocation" = "$previous_invocation" ]; then
+    echo "Release-state publication did not start." >&2
+    exit 1
+fi
+state=$(systemctl show -p ActiveState --value "$PUBLISHER")
+case "$state" in
+    activating|active) ;;
+    inactive)
+        # A finished run must have moved the pointer after this deploy released
+        # the lock. A skipped publication cannot pass.
+        journalctl -u "$PUBLISHER" --after-cursor="$cursor" -o cat --no-pager | \
+            grep -Eq '^pointer now at height [0-9]+$' || {
+            echo "Release-state publication exited without publishing." >&2
+            exit 1
+        }
+        ;;
+    *)
+        echo "Release-state publication failed to start (state $state)." >&2
+        exit 1
+        ;;
+esac
+echo "Installed node and publisher helpers $REVISION and started release-state publication."

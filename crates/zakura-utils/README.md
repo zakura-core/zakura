@@ -243,3 +243,16 @@ You can override the binaries the script calls using these environmental variabl
 - `$ZCASH_CLI`
 - `$DIFF`
 - `$JQ`
+
+# Spentness maintenance
+
+Build `zakura-spentness` with `--features zakura-spentness`. Its `replay`,
+`generate`, and `verify` commands produce and audit external terminal UTXO
+membership artifacts. `install` provisions an artifact only when the binary
+contains its reviewed commitment. It does not enable hinted sync.
+
+The release-state publisher runs these commands at the checkpoint that
+`zakura-checkpoints` selects.
+
+See [the spentness design](../../docs/design/spentness-hints.md) for commands,
+source-validation requirements, peer distribution, and release provenance.

@@ -14,8 +14,8 @@ name: Deploy Zakura mainnet fleet
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
 # this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
 # restarts the existing `zakurad` service, leaving the config, unit, and cache
-# untouched. The archive publisher also installs its matching exporter and
-# verifies publication. Rebuilding configs into the deployer's managed model is
+# untouched. The archive publisher also installs its matching release-state
+# helpers and starts a publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|

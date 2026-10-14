@@ -197,7 +197,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh deploy/release-state/publish-release-state.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
@@ -234,6 +234,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
 
+      - name: Release-state tooling tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .github/scripts/fetch-release-state.py --self-test
+          python3 .github/scripts/import-release-state.py --self-test
+          python3 .github/scripts/test_spentness_release.py
       # Kept deliberately while the NU7 fork tooling exists: these stdlib tests run
       # in seconds and guard the fork renderer, faucet and health endpoint.
       - name: NU7 fork tooling tests

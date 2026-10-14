@@ -678,10 +678,14 @@ impl PeerRegistry {
         drop(session_parks);
         drop(peers);
         if let Some(replaced) = replaced {
+            // Only a replaced session that could carry the floor can have made
+            // another routine defer to it.
+            let could_carry_floor = replaced.received_status && replaced.slots.available_slots > 0;
             // Drop the replaced entry's outstanding set after releasing the locks.
             drop(replaced);
-            // A routine may have deferred the floor to the replaced session.
-            self.floor_ranking_changed.notify_waiters();
+            if could_carry_floor {
+                self.floor_ranking_changed.notify_waiters();
+            }
         }
         if readmitted {
             SessionAdmission::Readmitted { generation }
@@ -1825,6 +1829,48 @@ mod floor_bias_tests {
             Some(120),
             false
         ));
+    }
+
+    #[tokio::test]
+    async fn only_replacing_a_floor_carrier_wakes_routines() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (carrier, idle) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &carrier, 0, 1000, 3, Some(10));
+        reg.admit_session(
+            &idle,
+            ServicePeerDirection::Outbound,
+            &config,
+            0,
+            Instant::now(),
+        );
+
+        let quiet = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(quiet);
+        quiet.as_mut().enable();
+        reg.admit_session(
+            &idle,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
+        assert!(
+            futures::poll!(quiet.as_mut()).is_pending(),
+            "no routine could have deferred to a session without status"
+        );
+
+        let woken = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        reg.admit_session(
+            &carrier,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
+        assert!(futures::poll!(woken.as_mut()).is_ready());
     }
 
     #[test]

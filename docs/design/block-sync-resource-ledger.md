@@ -30,15 +30,15 @@ connection; the node admits at most `zakura.max_connections` = 256 of them.
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
 | Serving encoded output | 64 MiB | 1.25 GB, 1 response slot per 4 KiB | `regulation/sizing.rs` (`peer_output_bytes`, `node_output_bytes`) |
 | Requester bookkeeping | ≤ live ranges | 32,768 ranges; ≤ 128 MiB of expected hashes | `MAX_BS_INFLIGHT_REQUESTS` request pool in `reactor.rs` |
-| Raw stream-6 frames awaiting the routine | ≤ what live reservations owe (frames + one ending each, remaining response-cap bytes); ≤ 4,096 frames | see [raw frames](#raw-frames) | `Reservations::admit` in `regulation/reservations.rs`; over-sending disconnects |
+| Raw stream-6 frames awaiting the routine | ≤ 9 frames, about 18 MB, and ≤ what live reservations owe | 4.6 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
 | Look-ahead backlog (raw) | — | `max_reorder_lookahead_bytes` = 1.5 GiB plus one range | `admission.rs` byte gate, re-checked by the sequencer on every body |
 | Decoded bodies | one transient junk decode before rejection | 401 submissions × measured decoded size | `max_submitted_block_applies`; admission charges `max(4 × wire, measured decoded)` |
 | Control state | bounded maps | 8,192 supplier cooldowns; Status keeps the latest value | `MAX_SUPPLIER_RETRIES` in `peer_registry.rs` |
 
-At defaults, block-sync application memory sums to about 8.8 GB in the worst case: 0.5 GiB
+At defaults, block-sync application memory sums to about 13.4 GB in the worst case: 0.5 GiB
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
-for real blocks), 0.13 GiB requester hashes and 5.6 GB of requested bodies (derived below).
-The raw-frame term is the exception noted under [raw frames](#raw-frames). The QUIC windows
+for real blocks), 0.13 GiB requester hashes, 4.6 GB of raw frames awaiting their routines and
+5.6 GB of requested bodies (both derived below). The QUIC windows
 add 8 + 8 GiB. They are shared with every other service on the connection and stay unchanged:
 256 connections × 32 MiB is the transport budget, not a block-sync choice.
 
@@ -95,11 +95,28 @@ the queue could hold up to 4,096 frames per connection regardless of what the no
 A range's response cap is `count × MAX_BLOCK_BYTES`, at most the peer's advertised
 `max_response_bytes`. The node requests by estimated size, so a body larger than its estimate
 is not a violation (`an_authorized_body_above_its_size_estimate_is_not_a_peer_violation`).
-The raw queue's worst case is therefore the sum of the live ranges' caps, which can exceed the
-6 GiB request byte budget when bodies run far above their estimates. Pre-NU5 bodies cannot
-grow: their txids cover every byte and the Merkle check below rejects any change. Post-NU5
-transparent signatures are outside the txid, so padding them survives until consensus checks
-the auth-data commitment. This is the loosest term in the ledger; see [open items](#open-items).
+The owed bound alone therefore grows with the request window, by about 2 MB per live one-block
+range, and reached the 4,096-frame transport depth (about 8 GB) for a large window. Pre-NU5
+bodies cannot grow: their txids cover every byte and the Merkle check below rejects any change.
+Post-NU5 transparent signatures are outside the txid, so a peer can pad a body up to its
+range's cap, and the padding survives until consensus checks the auth-data commitment.
+
+Stream 6 therefore also declares an inbound queue depth of 8 frames
+(`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). The reader holds at most those 8 and the one it is
+forwarding, so a session's raw frames stay under 9 × 2 MB, about 18 MB, whatever the window.
+That is 4.6 GB across 256 connections. Later frames wait in the 16 MiB QUIC stream receive
+window the transport already budgets. The owed check still disconnects a peer that sends more
+than it was asked for. `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe`
+pins the depth with a precheck that owes an unlimited window.
+
+The other candidate charged queued raw bytes against the request byte budget, with tolerance
+for honest bodies above their estimate. It was not chosen. That budget is node-wide, so one
+connection could still hold all 6 GiB of it. Its estimates may be untrusted size hints from
+header sync, so a tight tolerance would disconnect conformant peers, and a loose one gives no
+useful bound. A fixed depth needs neither. It slows a conformant peer only when the routine is
+already the bottleneck, and the [queue depth measurements](#queue-depth) show no throughput
+change at depths 2, 8 and 32. Depth 8 keeps headroom over the two slots regulation needs for a
+response beside requests and control.
 
 ### Decoded bodies
 
@@ -149,8 +166,7 @@ is decoded into the pipeline, and its misbehavior report does not disconnect. Co
 requirement 2 needs the decoded size tied to the requested block before the body is retained,
 which only an ingress check provides. Consensus still runs its own Merkle check.
 
-Two options were rejected because they limit throughput: a node-wide decoded-byte semaphore,
-and a stream-6 queue depth of 2. Moving the body's raw-backlog demotion into the routine was
+A node-wide decoded-byte semaphore was rejected because it limits throughput. Moving the body's raw-backlog demotion into the routine was
 also rejected: the routine's floor view can be stale, which would push re-decodes onto the
 single sequencer task.
 
@@ -170,7 +186,7 @@ LC-AVAIL-02 requires them. Each alarm episode adds four series.
 | Spec requirement | Enforcement | Evidence | Result |
 | --- | --- | --- | --- |
 | Capacity admission: an advertised limit must be fundable | Served-limit validation before reactor, service or endpoint start | `an_unfundable_config_fails_before_the_reactor_or_service_starts`, `an_unfundable_block_sync_config_fails_before_the_endpoint_binds`, `loaded_block_sync_session_slots_must_fund_one_request_each` | Closed |
-| Common requirement 6: receive buffering bounded by what was requested | `Reservations::admit` owed bound | `queued_frames_never_exceed_what_the_live_reservations_owe`, `the_transport_queue_holds_only_what_the_live_ranges_owe` | Closed |
+| Common requirement 6: receive buffering bounded by what was requested | `Reservations::admit` owed bound and the stream-6 inbound depth | `queued_frames_never_exceed_what_the_live_reservations_owe`, `the_transport_queue_holds_only_what_the_live_ranges_owe`, `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe` | Closed |
 | Frame and decode: every kind has boundary and allocation evidence | Message rows, bounded decoder | `stream_six_fixed_fixtures_cover_every_kind_and_rule` | Closed |
 | Reservation: unsolicited or overrunning data disconnects | Block precheck and `claim_block` byte check | `an_unsolicited_or_overrunning_block_disconnects_before_claim` | Closed |
 | Reservation: overlapping live ranges disconnect, adjacent ranges are legal | Session range admission | `adjacent_ranges_are_admitted_and_any_overlap_disconnects` | Closed |
@@ -253,10 +269,6 @@ run on loopback on one host, where CPU, storage reads and verification bind firs
 
 ## Open items
 
-- **Raw frames above their estimates.** The owed bound caps each connection at its live
-  ranges' response caps. A post-NU5 peer can pad transparent signatures up to that cap
-  before consensus rejects the block. Charging queued raw bytes against the request byte
-  budget, or checking the auth-data commitment in the routine, would close it.
 - **Storage probe.** `getblocks_storage_read_probe` needs a synced database. Its code is
   unchanged by this work, so it was not re-run.
 - **Fleet benchmark.** Loopback probes cannot show the multi-host operating envelope.

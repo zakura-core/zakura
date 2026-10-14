@@ -2,8 +2,8 @@ use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
-    FRAME_HEADER_BYTES,
+    SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -21,12 +21,29 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
+/// Stream-6 frames the transport reader may queue for the peer routine.
+///
+/// The live reservations' owed bound grows with the request window, at up to
+/// one 2 MB body per live range. This depth caps the queue at a constant
+/// instead: these frames plus the one the reader holds while it waits, about
+/// 18 MB per session. Later frames wait in the QUIC stream receive window, so
+/// the cap only slows a peer when the routine is already the bottleneck.
+/// Requests and control share the queue, so it keeps the two slots that
+/// regulation needs (`minimum_ordered_queue_capacity`).
+const BLOCK_SYNC_INBOUND_QUEUE_DEPTH: usize = 8;
+
 const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
     messages: Some(super::regulated::wire::RULES),
+    queue_depths: Some(StreamQueueDepths {
+        inbound: BLOCK_SYNC_INBOUND_QUEUE_DEPTH,
+        // Serving output has its own byte bound, so writes keep the
+        // transport's depth.
+        outbound: usize::MAX,
+    }),
     ..Stream::PERSISTENT
 }];
 

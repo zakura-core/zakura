@@ -78,6 +78,8 @@ struct FuzzStore {
     aux: Vec<AuxDelivery>,
     context_archive: HashMap<block::Hash, (block::Height, Arc<block::Header>)>,
     config: EngineConfig,
+    // The pre-commit integrated tip, which the oracle prefers on equal work.
+    tie_preference: Option<Frontier>,
 }
 
 impl FuzzStore {
@@ -141,6 +143,7 @@ impl FuzzStore {
             aux: Vec::new(),
             context_archive,
             config,
+            tie_preference: (mode == EngineMode::Integrated).then_some(frontier),
         }
     }
 
@@ -160,6 +163,8 @@ impl FuzzStore {
             self.context_archive
                 .insert(node.hash, (node.height, node.header.clone()));
         }
+        self.tie_preference = (self.metadata.mode == EngineMode::Integrated)
+            .then_some(self.metadata.frontiers.header_best);
         self.metadata = plan.change_set().metadata.clone();
         apply_projection(&mut self.selected, &plan.change_set().selected_projection);
         apply_projection(&mut self.verified, &plan.change_set().verified_projection);
@@ -1932,15 +1937,14 @@ fn assert_exhaustive_oracle(store: &FuzzStore) {
         .max_by_key(|(score, tip)| {
             (
                 score.suffix_work,
-                store.metadata.mode == EngineMode::Integrated
-                    && *tip == store.metadata.frontiers.header_best,
+                Some(*tip) == store.tie_preference,
                 score.tip_hash.0,
             )
         })
         .expect("the finalized anchor is independently eligible");
     assert_eq!(
         store.metadata.frontiers.header_best, expected_header_best.1,
-        "fork choice must have maximal eligible work and preserve the durable tie preference"
+        "fork choice must have maximal eligible work and preserve the pre-commit tip on equal work"
     );
     assert_eq!(
         store.metadata.header_best_score, expected_header_best.0,

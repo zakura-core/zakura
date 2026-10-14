@@ -43,7 +43,7 @@ Describes how headers are validated, how trusted checkpoints constrain acceptabl
 - **MUST** validate framing, linkage, commitments, proof of work, difficulty, and time rules before admitting a header.
 - **MUST** treat trusted anchors as absolute and fail closed without the required settled-upgrade pin on Mainnet or Testnet.
 - **MUST** select the eligible header chain with greatest cumulative work and preserve the selected eligible tip on equal work in integrated mode, with raw tip hash as the fallback.
-- **MUST NOT** let arrival order, incumbent reorg depth, peer claims, or body availability change header fork choice.
+- **MUST NOT** let incumbent reorg depth, peer claims, or body availability change header fork choice, or let arrival order change it in headers-only mode.
 - **MUST** bound retained forks and nodes without evicting the selected header or verified paths; eviction is not evidence of invalidity.
 
 **4. Full-state integration and failures**

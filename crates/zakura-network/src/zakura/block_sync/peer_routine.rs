@@ -1072,6 +1072,10 @@ impl PeerRoutine {
                     &self.peer,
                     self.window.bbr_rtprop_ms(now),
                     in_bypass,
+                    self.work
+                        .item_for_height(height)
+                        .map(|item| (item.scope, item.hash)),
+                    now,
                 )
             });
             let mut items = Vec::new();
@@ -2780,6 +2784,91 @@ mod tests {
         ));
     }
 
+    /// A slower peer takes the floor body only while the faster peer is cooled down for it.
+    #[tokio::test]
+    async fn slower_peer_takes_the_floor_body_a_faster_peer_is_cooled_down_for() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        for cooled_down in [true, false] {
+            let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+            routine.received_status = true;
+            routine.servable_low = block::Height(0);
+            routine.servable_high = block::Height(1);
+            let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+            let fast_generation = routine
+                .registry
+                .admit_session(
+                    &fast_peer,
+                    routine.session.direction(),
+                    &routine.config,
+                    0,
+                    Instant::now(),
+                )
+                .generation();
+            for (peer, generation, latency) in [
+                (&routine.peer, routine.generation, 145),
+                (&fast_peer, fast_generation, 5),
+            ] {
+                routine.registry.upsert_status(
+                    peer,
+                    generation,
+                    BlockSyncStatus {
+                        servable_low: block::Height(0),
+                        servable_high: block::Height(1),
+                        ..BlockSyncStatus::default()
+                    },
+                );
+                routine.registry.publish_slots(
+                    peer,
+                    generation,
+                    SlotDiagnostics {
+                        available_slots: 3,
+                        bbr_rtprop_ms: Some(latency),
+                        ..SlotDiagnostics::default()
+                    },
+                );
+            }
+            let scope = super::super::test_work_scope();
+            let hash = block::Hash([1; 32]);
+            routine.work.extend(
+                scope,
+                [(block::Height(1), hash, BlockSizeEstimate::Advertised(1_000))],
+            );
+            // An expired cooldown is one whose deadline has already passed.
+            let until = if cooled_down {
+                Instant::now() + Duration::from_secs(60)
+            } else {
+                Instant::now()
+            };
+            routine.registry.defer_incompatible_bodies(
+                zakura_header_chain::SourceId::from_digest(fast_peer.digest()),
+                [(scope, hash)],
+                until,
+            );
+
+            routine.try_fill().await;
+
+            if cooled_down {
+                let frame = outbound
+                    .try_recv()
+                    .expect("the slower peer must take the body the faster peer cannot serve");
+                assert!(matches!(
+                    BlockSyncMessage::decode_frame(frame).unwrap(),
+                    BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(1),
+                        count: 1
+                    }
+                ));
+            } else {
+                assert!(
+                    outbound.try_recv().is_err(),
+                    "the slower peer defers once the faster peer's cooldown expires"
+                );
+                assert!(routine.work.pending_contains(block::Height(1)));
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn floor_ranking_change_wakes_a_deferred_routine() {
         use super::super::peer_registry::SlotDiagnostics;
@@ -2867,7 +2956,9 @@ mod tests {
             block::Height(0),
             &fast_peer,
             None,
-            false
+            false,
+            None,
+            Instant::now()
         ));
 
         // The fast worker now defers to the sleeping slow worker. Only the

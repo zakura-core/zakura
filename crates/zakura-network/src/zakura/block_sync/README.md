@@ -88,8 +88,9 @@ floor work, a routine asks the shared registry
 (`floor_has_preferred_unsaturated_server`) whether another peer should take it instead —
 outside bypass, only a strictly faster (lower RTprop) unsaturated peer causes deferral;
 inside bypass an equal-RTprop peer is preferred too, so scarce bypass slots are spent
-only when nobody better can move the floor. If every servable peer is saturated, nobody
-defers and the floor still moves.
+only when nobody better can move the floor. A peer on body-retry cooldown for the floor
+body is never preferred, since it would return that body unserved. If every servable
+peer is saturated, nobody defers and the floor still moves.
 
 ## Look-ahead rules: `admit()` and the commit window
 

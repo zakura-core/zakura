@@ -183,6 +183,42 @@ impl BodyRetryKey {
     }
 }
 
+/// `PeerRegistry::is_body_retry_avoided` for callers that already hold both retry maps.
+fn body_retry_avoided_locked(
+    all_retries: &HashMap<BodyRetryKey, Instant>,
+    retries: &SupplierRetryState,
+    peer: &ZakuraPeerId,
+    scope: zakura_header_chain::BodyWorkAuthority,
+    hash: block::Hash,
+    now: Instant,
+) -> bool {
+    let source = zakura_header_chain::SourceId::from_digest(peer.digest());
+    // Check each deadline instead of sweeping: this runs once per scheduled
+    // body, and insertion and `next_body_retry_deadline` purge expired entries.
+    let current = retries
+        .current
+        .filter(|current| current.body_work_epoch == scope.body_work_epoch)
+        .unwrap_or(scope);
+    let keys = [
+        BodyRetryKey::new(current, hash),
+        BodyRetryKey::new(scope, hash),
+    ];
+    // There is at most one published alarm. Its exact body stays suppressed
+    // across compatible snapshots, including before either reader has refreshed.
+    all_retries.iter().any(|(key, until)| {
+        *until > now && key.hash == hash && key.body_work_epoch == scope.body_work_epoch
+    }) || keys.into_iter().any(|key| {
+        [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
+            .into_iter()
+            .any(|reason| {
+                retries
+                    .entries
+                    .get(&(source, key, reason))
+                    .is_some_and(|until| *until > now)
+            })
+    })
+}
+
 pub(super) fn retry_deadline_instant(deadline: chrono::DateTime<chrono::Utc>) -> Instant {
     let monotonic_now = Instant::now();
     let delay = deadline
@@ -454,33 +490,9 @@ impl PeerRegistry {
         hash: block::Hash,
         now: Instant,
     ) -> bool {
-        let source = zakura_header_chain::SourceId::from_digest(peer.digest());
         let all_retries = self.body_retry_all_lock();
         let retries = self.body_retry_lock();
-        // Check each deadline instead of sweeping: this runs once per scheduled
-        // body, and insertion and `next_body_retry_deadline` purge expired entries.
-        let current = retries
-            .current
-            .filter(|current| current.body_work_epoch == scope.body_work_epoch)
-            .unwrap_or(scope);
-        let keys = [
-            BodyRetryKey::new(current, hash),
-            BodyRetryKey::new(scope, hash),
-        ];
-        // There is at most one published alarm. Its exact body stays suppressed
-        // across compatible snapshots, including before either reader has refreshed.
-        all_retries.iter().any(|(key, until)| {
-            *until > now && key.hash == hash && key.body_work_epoch == scope.body_work_epoch
-        }) || keys.into_iter().any(|key| {
-            [BodyRetryReason::Unavailable, BodyRetryReason::Incompatible]
-                .into_iter()
-                .any(|reason| {
-                    retries
-                        .entries
-                        .get(&(source, key, reason))
-                        .is_some_and(|until| *until > now)
-                })
-        })
+        body_retry_avoided_locked(&all_retries, &retries, peer, scope, hash, now)
     }
 
     pub(super) fn next_body_retry_deadline(
@@ -1040,13 +1052,20 @@ impl PeerRegistry {
     /// never preferred over (nothing beats it), and if every servable peer is
     /// saturated this returns false and the floor still moves. Unknown RTprop is
     /// treated as worst, so a measured peer is never deferred to an unmeasured one.
+    /// A peer on body-retry cooldown for `floor_body` would return the floor
+    /// unserved, so it is never preferred.
     pub(super) fn floor_has_preferred_unsaturated_server(
         &self,
         height: block::Height,
         self_peer: &ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
+        floor_body: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash)>,
+        now: Instant,
     ) -> bool {
+        // Same lock order as `is_body_retry_avoided`, then the peer table.
+        let all_retries = self.body_retry_all_lock();
+        let retries = self.body_retry_lock();
         let peers = self.lock();
         // Rank registered peers from the same published snapshot. Mixing a fresh
         // local expiry with other peers' cached scores can make every peer defer.
@@ -1057,6 +1076,11 @@ impl PeerRegistry {
             .unwrap_or(u64::MAX);
         peers.iter().any(|(peer, entry)| {
             if peer == self_peer || !entry.can_serve_with_room(height) {
+                return false;
+            }
+            if floor_body.is_some_and(|(scope, hash)| {
+                body_retry_avoided_locked(&all_retries, &retries, peer, scope, hash, now)
+            }) {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
@@ -1808,13 +1832,22 @@ mod floor_bias_tests {
         register_with_rtprop(&reg, &config, &b, 0, 1000, 3, Some(50));
         // In the bypass region (include_equal) A defers — B can take the floor through
         // its normal capacity, so A keeps its scarce bypass slot…
-        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, Some(50), true));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            Some(50),
+            true,
+            None,
+            Instant::now()
+        ));
         // …but B itself has no other unsaturated server (A is saturated), so B bypasses.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            true
+            true,
+            None,
+            Instant::now()
         ));
     }
 
@@ -1831,14 +1864,18 @@ mod floor_bias_tests {
             block::Height(100),
             &slow,
             Some(120),
-            false
+            false,
+            None,
+            Instant::now()
         ));
         // …and the fastest carrier never defers, so the floor always lands somewhere.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &fast,
             Some(40),
-            false
+            false,
+            None,
+            Instant::now()
         ));
     }
 
@@ -1856,13 +1893,17 @@ mod floor_bias_tests {
             block::Height(100),
             &a,
             Some(50),
-            false
+            false,
+            None,
+            Instant::now()
         ));
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            false
+            false,
+            None,
+            Instant::now()
         ));
     }
 
@@ -1880,9 +1921,18 @@ mod floor_bias_tests {
             block::Height(100),
             &fast,
             None,
-            false
+            false,
+            None,
+            Instant::now()
         ));
-        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &slow, None, false));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            None,
+            false,
+            None,
+            Instant::now()
+        ));
 
         // Refreshing either cached score must leave an eligible normal carrier.
         for expired_peer in [&fast, &slow] {
@@ -1892,7 +1942,14 @@ mod floor_bias_tests {
                 .slots
                 .bbr_rtprop_ms = None;
             assert!([&fast, &slow].into_iter().any(|peer| {
-                !reg.floor_has_preferred_unsaturated_server(block::Height(100), peer, None, false)
+                !reg.floor_has_preferred_unsaturated_server(
+                    block::Height(100),
+                    peer,
+                    None,
+                    false,
+                    None,
+                    Instant::now(),
+                )
             }));
         }
     }
@@ -1997,7 +2054,9 @@ mod floor_bias_tests {
             block::Height(100),
             &fast,
             Some(40),
-            true
+            true,
+            None,
+            Instant::now()
         ));
     }
 
@@ -2008,7 +2067,14 @@ mod floor_bias_tests {
         let (a, b) = (peer(1), peer(2));
         register(&reg, &config, &a, 0, 1000, 0);
         register(&reg, &config, &b, 0, 1000, 0);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            None,
+            Instant::now()
+        ));
     }
 
     #[test]
@@ -2020,7 +2086,14 @@ mod floor_bias_tests {
         // B has a free slot but only serves heights 500..=1000 — it cannot take a floor
         // request at height 100, so A must still bypass.
         register(&reg, &config, &b, 500, 1000, 3);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            None,
+            Instant::now()
+        ));
     }
 
     #[test]

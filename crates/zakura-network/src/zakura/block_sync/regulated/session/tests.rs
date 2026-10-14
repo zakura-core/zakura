@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::Semaphore;
+use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
 
 /// Gates real serving reads while leaving response production and cleanup unchanged.
 #[derive(Debug, Default)]
@@ -20,6 +21,8 @@ struct ControlledSource {
     gates: Mutex<BTreeMap<Height, Arc<Semaphore>>>,
     default_gate: Option<Arc<Semaphore>>,
     started: AtomicUsize,
+    /// Blocks served by height. Reads return an empty prefix without them.
+    blocks: BTreeMap<Height, Arc<Block>>,
 }
 
 impl Source for ControlledSource {
@@ -32,6 +35,12 @@ impl Source for ControlledSource {
             .get(&request.start_height)
             .cloned()
             .or_else(|| self.default_gate.clone());
+        let blocks: Vec<_> = self
+            .blocks
+            .range(request.start_height..)
+            .take(usize::try_from(request.count).unwrap())
+            .map(|(height, block)| (*height, block.clone()))
+            .collect();
         Box::pin(async move {
             if request.lease.try_start() {
                 if let Some(gate) = gate {
@@ -39,11 +48,50 @@ impl Source for ControlledSource {
                 }
             }
             Ok(ReadResult {
-                blocks: Vec::new(),
+                blocks,
                 lease: request.lease,
             })
         })
     }
+}
+
+/// Mainnet blocks at `heights`, keyed by height.
+fn mainnet_blocks(heights: std::ops::RangeInclusive<u32>) -> BTreeMap<Height, Arc<Block>> {
+    heights
+        .map(|height| {
+            let bytes = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS[&height];
+            (
+                Height(height),
+                Arc::new(bytes.zcash_deserialize_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// A served message, with each block reduced to its coinbase height.
+#[derive(Debug, Eq, PartialEq)]
+enum Served {
+    Block(Height),
+    End(super::super::wire::Message),
+}
+
+/// The next served message.
+async fn served(output: &mut crate::zakura::FramedRecv) -> Served {
+    match super::super::tests::receive(output).await {
+        super::super::wire::Message::Block(bytes) => {
+            let block: Block = bytes.zcash_deserialize_into().unwrap();
+            Served::Block(block.coinbase_height().unwrap())
+        }
+        ending => Served::End(ending),
+    }
+}
+
+/// The `BlocksDone` ending of a range from `start` that returned `returned` blocks.
+fn done(start: u32, returned: u32) -> Served {
+    Served::End(super::super::wire::Message::BlocksDone {
+        start: Height(start),
+        returned,
+    })
 }
 
 /// Wait for the production completion drain to release a range.
@@ -61,7 +109,8 @@ async fn wait_completed(session: &mut ServingSession, start: Height) {
     .unwrap();
 }
 
-/// Later responses can finish behind a blocked writer without releasing a replacement twice.
+/// A later range can finish while an earlier read is blocked, without its old
+/// completion releasing a replacement.
 #[tokio::test]
 async fn completed_ranges_are_reusable_before_earlier_output_drains() {
     let source = Arc::new(ControlledSource::default());
@@ -94,7 +143,8 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
         .insert(Height(2), next_gate.clone());
     session.admit(Height(2), 1).unwrap();
     first_gate.add_permits(1);
-    for height in [1, 2] {
+    // Ready order wrote the old range 2 before range 1's read finished.
+    for height in [2, 1] {
         assert!(matches!(super::super::tests::receive(&mut output).await,
             super::super::wire::Message::RangeUnavailable(range) if range.start == Height(height)));
     }
@@ -174,6 +224,150 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     new_gate.add_permits(1);
     super::super::tests::receive(&mut output).await;
     wait_completed(&mut new, Height(1)).await;
+    cancel.cancel();
+}
+
+/// A session for `source` that serves up to four blocks per range and whose
+/// output holds `queue` frames.
+fn ready_session(
+    source: &Arc<ControlledSource>,
+    peer: u8,
+    queue: usize,
+) -> (
+    Serving,
+    ServingSession,
+    crate::zakura::FramedRecv,
+    CancellationToken,
+) {
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 4,
+        ..Default::default()
+    };
+    let serving = Serving::new(source.clone(), &config);
+    let cancel = CancellationToken::new();
+    let (send, output) = framed_channel(queue);
+    let session = serving.session(
+        &ZakuraPeerId::new(vec![peer; 32]).unwrap(),
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        Default::default(),
+    );
+    (serving, session, output, cancel)
+}
+
+/// Height 1's block and ending are written while the earlier height 2 read is blocked.
+#[tokio::test]
+async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=2),
+        ..Default::default()
+    });
+    let blocked = Arc::new(Semaphore::new(0));
+    source
+        .gates
+        .lock()
+        .unwrap()
+        .insert(Height(2), blocked.clone());
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 64, 4);
+    session.admit(Height(2), 1).unwrap();
+    session.admit(Height(1), 1).unwrap();
+    assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+    assert_eq!(served(&mut output).await, done(1, 1));
+    wait_completed(&mut session, Height(1)).await;
+    assert!(
+        session.ranges.contains_key(&Height(2)),
+        "the height 2 read is still blocked"
+    );
+    assert!(output.try_recv().is_err());
+    blocked.add_permits(1);
+    assert_eq!(served(&mut output).await, Served::Block(Height(2)));
+    assert_eq!(served(&mut output).await, done(2, 1));
+    wait_completed(&mut session, Height(2)).await;
+    cancel.cancel();
+}
+
+/// Concurrent multi-block ranges, reused every round, may interleave with each
+/// other but keep their own heights in order and end exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_ranges_keep_their_block_order_and_end_once() {
+    const RANGES: [(u32, u32); 4] = [(1, 2), (3, 3), (6, 1), (7, 4)];
+    let gate = Arc::new(Semaphore::new(0));
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(gate.clone()),
+        blocks: mainnet_blocks(1..=10),
+        ..Default::default()
+    });
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    for _round in 0..16 {
+        // Every range from the last round has ended, so each admission reuses its heights.
+        for (start, count) in RANGES {
+            session.admit(Height(start), count).unwrap();
+        }
+        gate.add_permits(RANGES.len());
+        let mut received = [0; RANGES.len()];
+        let mut ended = [false; RANGES.len()];
+        while ended.contains(&false) {
+            let served = served(&mut output).await;
+            let height = match &served {
+                Served::Block(height) => *height,
+                Served::End(super::super::wire::Message::BlocksDone { start, .. }) => *start,
+                Served::End(other) => panic!("unexpected ending {other:?}"),
+            };
+            let index = RANGES
+                .iter()
+                .position(|(start, count)| (*start..start + count).contains(&height.0))
+                .unwrap();
+            let (start, count) = RANGES[index];
+            assert!(!ended[index], "range {start} sent after its ending");
+            if served == Served::Block(height) {
+                assert_eq!(
+                    height,
+                    Height(start + received[index]),
+                    "blocks stay in order"
+                );
+                received[index] += 1;
+            } else {
+                assert_eq!(served, done(start, count));
+                assert_eq!(received[index], count);
+                ended[index] = true;
+            }
+        }
+    }
+    assert!(
+        output.try_recv().is_err(),
+        "each range's ending is its last frame"
+    );
+    session.remove_completed();
+    assert!(session.ranges.is_empty());
+    cancel.cancel();
+}
+
+/// A completed range's output is already queued ahead of anything a
+/// replacement for the same heights can send, even before it is written.
+#[tokio::test]
+async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=3),
+        ..Default::default()
+    });
+    // One transport slot that nobody reads holds the old output back.
+    let (serving, mut session, mut output, cancel) = ready_session(&source, 66, 1);
+    session.admit(Height(1), 3).unwrap();
+    wait_completed(&mut session, Height(1)).await;
+    assert!(
+        serving.capacity.node_output_held() > 0,
+        "the old range's output is not all written"
+    );
+    session.admit(Height(1), 3).unwrap();
+    for _ in 0..2 {
+        for height in 1..=3 {
+            assert_eq!(served(&mut output).await, Served::Block(Height(height)));
+        }
+        assert_eq!(served(&mut output).await, done(1, 3));
+    }
+    wait_completed(&mut session, Height(1)).await;
+    assert!(output.try_recv().is_err());
     cancel.cancel();
 }
 

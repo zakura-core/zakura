@@ -1216,35 +1216,59 @@ mod tests {
         .await
         .map_err(|_| -> BoxError { "serving production did not settle".into() })?;
         assert!(
-            settled <= bound && settled < usize::try_from(REQUESTS)?,
-            "an unread response stops new production: {settled} reads, bound {bound}"
+            settled < usize::try_from(REQUESTS)?,
+            "an unread response stops new production: {settled} reads"
         );
 
-        // Reading releases output, so every request completes in order.
+        // Reading releases output, so every request completes exactly once.
+        // GetBlocks writes responses as they are ready, so empty responses
+        // that finish before the large one are written ahead of it.
+        let mut early = None;
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut bodies = 0;
-            for request in 0..REQUESTS {
-                let (hashes, ending) =
-                    read_getblocks_response(&peer, version, "a bounded response").await?;
-                bodies += hashes.len();
-                let expected = if request == 0 {
+            let mut ended = vec![false; usize::try_from(REQUESTS)?];
+            let mut endings = 0;
+            while endings < REQUESTS {
+                let frame = peer
+                    .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                    .await?;
+                let request = match BlockSyncMessage::decode_frame(frame)? {
+                    BlockSyncMessage::Status(_) => continue,
+                    BlockSyncMessage::Block(_) => {
+                        early.get_or_insert(endings);
+                        bodies += 1;
+                        continue;
+                    }
                     BlockSyncMessage::BlocksDone {
                         start_height: block::Height(1),
                         returned: 3,
+                    } => {
+                        assert_eq!(bodies, 3, "the large response ends after its bodies");
+                        0
                     }
-                } else {
                     BlockSyncMessage::RangeUnavailable {
-                        start_height: block::Height(request + 3),
+                        start_height,
                         count: 1,
-                    }
+                    } => start_height.0 - 3,
+                    message => return Err(format!("unexpected message {message:?}").into()),
                 };
-                assert_eq!(ending, expected);
+                let request = usize::try_from(request)?;
+                assert!(!std::mem::replace(&mut ended[request], true));
+                endings += 1;
             }
             assert_eq!(bodies, 3);
             Ok::<_, BoxError>(())
         })
         .await
         .map_err(|_| -> BoxError { "reading did not resume serving".into() })??;
+        // Only responses written ahead of the stalled body released their
+        // output before reading resumed, so the rest stayed within the bound.
+        let early = usize::try_from(early.expect("the large response has bodies"))?;
+        assert!(
+            settled - early <= bound,
+            "an unread response stops new production: {settled} reads, \
+             {early} written before the stall, bound {bound}"
+        );
         assert_eq!(reads.load(Ordering::SeqCst), usize::try_from(REQUESTS)?);
         Ok(())
     }

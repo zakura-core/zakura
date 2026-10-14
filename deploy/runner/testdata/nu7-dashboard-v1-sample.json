@@ -27,7 +27,7 @@
       "medianIntervalSeconds": 25.0,
       "intervalSampleBlocks": 2,
       "timestampGapSeconds": 25,
-      "minimumDifficultyEligible": false,
+      "minimumDifficultyEligible": null,
       "minimumDifficultyBlock": null
     },
     "nsm": {
@@ -104,58 +104,7 @@
       "branchId": "77190ad9"
     }
   },
-  "rules": {
-    "atTip": {
-      "network": "Testnet",
-      "effectiveHeight": 102,
-      "networkMagic": "fa1af9bf",
-      "activationHeight": 100,
-      "branchId": "77190ad9",
-      "nu7BranchId": "77190ad9",
-      "targetSpacingSeconds": 25,
-      "difficulty": {
-        "averagingWindowBlocks": 102,
-        "minimumDifficultyGapMultiplier": 18,
-        "minimumDifficultyGapSeconds": 450,
-        "minimumDifficultyStrictlyGreater": true
-      },
-      "averagingWindowBlocks": 102,
-      "minimumDifficultyGapMultiplier": 18,
-      "minimumDifficultyGapSeconds": 450,
-      "minimumDifficultyStrictlyGreater": true,
-      "daaWindowBlocks": 102,
-      "minimumDifficulty": {
-        "gapMultiplier": 18,
-        "thresholdSeconds": 450,
-        "comparison": "strictly-greater"
-      }
-    },
-    "nextBlock": {
-      "network": "Testnet",
-      "effectiveHeight": 103,
-      "networkMagic": "fa1af9bf",
-      "activationHeight": 100,
-      "branchId": "77190ad9",
-      "nu7BranchId": "77190ad9",
-      "targetSpacingSeconds": 25,
-      "difficulty": {
-        "averagingWindowBlocks": 102,
-        "minimumDifficultyGapMultiplier": 18,
-        "minimumDifficultyGapSeconds": 450,
-        "minimumDifficultyStrictlyGreater": true
-      },
-      "averagingWindowBlocks": 102,
-      "minimumDifficultyGapMultiplier": 18,
-      "minimumDifficultyGapSeconds": 450,
-      "minimumDifficultyStrictlyGreater": true,
-      "daaWindowBlocks": 102,
-      "minimumDifficulty": {
-        "gapMultiplier": 18,
-        "thresholdSeconds": 450,
-        "comparison": "strictly-greater"
-      }
-    }
-  },
+  "rules": null,
   "capabilities": {
     "faucet": null,
     "snapshot": null

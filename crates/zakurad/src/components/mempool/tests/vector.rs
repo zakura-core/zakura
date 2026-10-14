@@ -10,7 +10,10 @@ use std::{
 
 use color_eyre::Report;
 use tokio::time::{self, timeout};
-use tower::{util::BoxCloneService, ServiceBuilder, ServiceExt};
+use tower::{
+    util::{BoxCloneService, BoxService},
+    ServiceBuilder, ServiceExt,
+};
 
 use rand::{seq::SliceRandom, thread_rng};
 use zakura_chain::{
@@ -36,7 +39,8 @@ use crate::components::{
 type MockPeerSet = MockService<zn::Request, zn::Response, PanicAssertion>;
 
 /// The unmocked Zebra state service's type.
-type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type StateService =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;

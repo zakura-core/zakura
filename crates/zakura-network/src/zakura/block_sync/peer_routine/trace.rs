@@ -230,9 +230,9 @@ impl PeerRoutine {
         });
         // Refresh the published slot diagnostics on the same cadence so the cross-peer
         // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
-        // past the horizon (→ `None` = worst floor server).
-        self.publish_outstanding();
+        // `publish_slot_diagnostics` re-reads `bbr_rtprop_ms(now)`, filtering out samples
+        // aged past the horizon (→ `None` = worst floor server).
+        self.publish_slot_diagnostics();
     }
 
     pub(super) fn trace_body_sequencer_sent(

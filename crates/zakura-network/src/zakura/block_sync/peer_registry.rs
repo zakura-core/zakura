@@ -652,6 +652,7 @@ impl PeerRegistry {
         {
             return SessionAdmission::Parked;
         }
+        let mut detached = BTreeMap::new();
 
         let generation = self
             .next_generation
@@ -665,7 +666,7 @@ impl PeerRegistry {
             .entry(peer.clone())
             .and_modify(|entry| {
                 entry.direction = direction;
-                entry.outstanding.clear();
+                detached = std::mem::take(&mut entry.outstanding);
                 entry.floor_watchdog_avoid.clear();
                 entry.generation = generation;
                 entry.conn_id = Some(conn_id);
@@ -678,6 +679,9 @@ impl PeerRegistry {
         let readmitted = session_parks
             .remove(peer)
             .is_some_and(|park| park.conn_id == Some(conn_id));
+        drop(session_parks);
+        drop(peers);
+        drop(detached);
         if readmitted {
             SessionAdmission::Readmitted { generation }
         } else {
@@ -687,7 +691,9 @@ impl PeerRegistry {
 
     /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
-        if self.lock().remove(peer).is_some() {
+        // Drop the removed entry after releasing the lock.
+        let removed = self.lock().remove(peer);
+        if removed.is_some() {
             // A routine may have deferred the floor to the removed peer.
             self.floor_ranking_changed.notify_waiters();
         }
@@ -728,32 +734,60 @@ impl PeerRegistry {
         }
     }
 
-    /// Replace the peer's outstanding height→hash set (routine-owned), but only if
-    /// the routine's `generation` still owns the entry. A write from a routine
-    /// that has been superseded by a respawn is dropped.
-    pub(super) fn set_outstanding(
+    /// Publish claims for a newly issued request (routine-owned), but only if the
+    /// routine's `generation` still owns the entry. A write from a routine that
+    /// has been superseded by a respawn is dropped. A claim replaces any stale
+    /// claim at the same height.
+    pub(super) fn insert_outstanding(
         &self,
         peer: &ZakuraPeerId,
         generation: u64,
-        outstanding: BTreeMap<block::Height, OutstandingMeta>,
+        claims: impl IntoIterator<Item = (block::Height, OutstandingMeta)>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
             if entry.generation == generation {
-                entry.outstanding = outstanding;
+                entry.outstanding.extend(claims);
+            }
+        }
+    }
+
+    /// Remove `owner`'s claims at `heights`, generation-gated as in
+    /// [`insert_outstanding`](Self::insert_outstanding). A claim from a different
+    /// owner, such as a replacement request, stays published.
+    pub(super) fn remove_outstanding_for_owner(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) {
+        let mut peers = self.lock();
+        let Some(entry) = peers.get_mut(peer) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        for height in heights {
+            if entry.outstanding.get(&height).map(|meta| meta.owner) == Some(owner) {
+                entry.outstanding.remove(&height);
             }
         }
     }
 
     /// Clear the peer's outstanding set (it has no live requests), generation-gated
-    /// as in [`set_outstanding`](Self::set_outstanding).
+    /// as in [`insert_outstanding`](Self::insert_outstanding).
     pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.outstanding.clear();
-            }
-        }
+        let detached = {
+            let mut peers = self.lock();
+            peers
+                .get_mut(peer)
+                .filter(|entry| entry.generation == generation)
+                .map(|entry| std::mem::take(&mut entry.outstanding))
+        };
+        // Drop the detached claims after releasing the lock.
+        drop(detached);
     }
 
     /// Publish the routine's download-window diagnostics, generation-gated like the
@@ -2026,10 +2060,10 @@ mod floor_bias_tests {
             ..current_owner
         };
         let height = block::Height(1);
-        reg.set_outstanding(
+        reg.insert_outstanding(
             &peer,
             generation,
-            BTreeMap::from([(
+            [(
                 height,
                 OutstandingMeta {
                     owner: current_owner,
@@ -2038,7 +2072,7 @@ mod floor_bias_tests {
                     queued_at: Instant::now(),
                     deadline: Instant::now(),
                 },
-            )]),
+            )],
         );
 
         // A same-epoch selected-header extension refreshes the committed authority
@@ -2070,6 +2104,64 @@ mod floor_bias_tests {
         assert!(reg.peer_has_outstanding_height(&peer, height));
         assert!(reg.clear_outstanding_height_for_owner(&peer, height, current_owner));
         assert!(!reg.peer_has_outstanding_height(&peer, height));
+    }
+
+    #[test]
+    fn routine_claim_removal_preserves_replacements_and_newer_sessions() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        let admit = || {
+            reg.admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation()
+        };
+        let old_generation = admit();
+        let old_owner = super::super::test_work_owner();
+        let replacement = zakura_header_chain::BodyWorkOwner {
+            request_id: std::num::NonZeroU64::new(old_owner.request_id.get() + 1)
+                .expect("the incremented test request ID is nonzero"),
+            ..old_owner
+        };
+        let meta = |owner| OutstandingMeta {
+            owner,
+            hash: block::Hash([1; 32]),
+            estimated_bytes: 100,
+            queued_at: Instant::now(),
+            deadline: Instant::now(),
+        };
+        let (first, second) = (block::Height(1), block::Height(2));
+        reg.insert_outstanding(
+            &peer,
+            old_generation,
+            [(first, meta(old_owner)), (second, meta(old_owner))],
+        );
+        // A replacement request retakes the second height.
+        reg.insert_outstanding(&peer, old_generation, [(second, meta(replacement))]);
+
+        // The old request's late retirement must not remove the replacement claim.
+        reg.remove_outstanding_for_owner(&peer, old_generation, old_owner, [first, second]);
+        assert!(!reg.peer_has_outstanding_height(&peer, first));
+        assert!(reg.peer_has_outstanding_height(&peer, second));
+        assert_eq!(reg.total_unreceived(), 1);
+
+        // A superseded routine can neither publish nor remove claims.
+        let new_generation = admit();
+        assert_eq!(reg.total_unreceived(), 0, "admission clears old claims");
+        reg.insert_outstanding(&peer, old_generation, [(first, meta(old_owner))]);
+        assert!(!reg.peer_has_outstanding_height(&peer, first));
+        reg.insert_outstanding(&peer, new_generation, [(second, meta(replacement))]);
+        reg.remove_outstanding_for_owner(&peer, old_generation, replacement, [second]);
+        assert!(reg.peer_has_outstanding_height(&peer, second));
+        reg.clear_outstanding(&peer, old_generation);
+        assert!(reg.peer_has_outstanding_height(&peer, second));
+        reg.clear_outstanding(&peer, new_generation);
+        assert!(!reg.peer_has_outstanding_height(&peer, second));
     }
 
     #[test]

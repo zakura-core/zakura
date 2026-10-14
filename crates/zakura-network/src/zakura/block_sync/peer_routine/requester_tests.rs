@@ -122,7 +122,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         BlockSyncMessage::GetBlocks { .. }
     ));
     assert_eq!(pool.held(), 1);
-    let deadline = routine.window.outstanding[0].deadline;
+    let deadline = routine.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
     assert!(routine.window.outstanding.is_empty());
     assert_eq!(
@@ -174,7 +174,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
     let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     assert_eq!(pool.held(), 1);
-    let deadline = routine.window.outstanding[0].deadline;
+    let deadline = routine.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
@@ -201,7 +201,7 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         ],
     );
     routine.try_fill().await;
-    assert_eq!(routine.window.outstanding[0].request.count, 3);
+    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 3);
     next_sent(&mut outbound).await;
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let mut payload = vec![MSG_BS_BLOCK];
@@ -331,7 +331,7 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     routine.try_fill().await;
     next_sent(&mut outbound).await;
     // A local timeout drops the window entry but keeps the written reservation.
-    let deadline = routine.window.outstanding[0].deadline;
+    let deadline = routine.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
     assert!(routine.window.outstanding.is_empty());
     assert_eq!(pool.held(), 1);
@@ -481,7 +481,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let work = Arc::clone(&routine.work);
     routine.try_fill().await;
     next_sent(&mut outbound).await;
-    assert!(routine.expire_due_timeouts(routine.window.outstanding[0].deadline));
+    assert!(routine.expire_due_timeouts(routine.window.outstanding.first().unwrap().deadline));
     // Unrelated accepted blocks can disarm the old block-progress watchdog.
     routine
         .window
@@ -631,14 +631,15 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
     routine.try_fill().await;
     outbound.recv().await.unwrap();
     assert_eq!(routine.window.outstanding.len(), 1);
-    let owner = routine.window.outstanding[0].request.owner;
+    let owner = routine.window.outstanding.first().unwrap().request.owner;
     // A central scheduler may return one height while this request still owns
     // the rest. Its wire authorization is live and has not begun retirement.
-    let returned = routine
-        .work
-        .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    let returned = routine.work.revoke_for_owner(owner, [block::Height(1)]);
     routine.budget.release(returned.released_bytes);
     assert_eq!(returned.returned_count, 1);
+    assert!(routine
+        .registry
+        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
     assert_eq!(
         routine
             .requester
@@ -653,6 +654,13 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
     );
     assert_eq!(routine.try_fill().await, None);
     assert!(routine.work.pending_contains(block::Height(1)));
+    // The request keeps its slot but stops advertising the revoked height.
+    assert!(!routine
+        .registry
+        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
+    assert!(routine
+        .registry
+        .peer_has_outstanding_height(&routine.peer, block::Height(2)));
     let before = routine.work.taken_items_for_test();
     let (_input, recv) = crate::zakura::framed_channel(4);
     routine.recv = recv;
@@ -748,7 +756,11 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
     routine.try_fill().await;
     next_sent(&mut outbound).await;
     assert_eq!(routine.window.outstanding.len(), 1);
-    routine.window.outstanding[0].deadline = Instant::now() - Duration::from_secs(1);
+    let first = routine.window.outstanding.first_key().unwrap();
+    routine
+        .window
+        .outstanding
+        .set_deadline(first, Instant::now() - Duration::from_secs(1));
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
         servable_low: block::Height(1),
@@ -772,4 +784,59 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
         routine.window.outstanding.is_empty(),
         "the overdue request timed out while frames were ready"
     );
+}
+
+/// Another peer's body ends this routine's written request reservation. Then
+/// `drop_height` removes that height from `in_flight`. The routine must withdraw
+/// its claim, because the queue no longer tracks the height under its owner.
+async fn assert_answered_elsewhere_claim_is_withdrawn(
+    drop_height: impl FnOnce(
+        &PeerRoutine,
+        zakura_header_chain::BodyWorkOwner,
+        block::Height,
+        block::Hash,
+    ) -> u64,
+) {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let height = block.coinbase_height().unwrap();
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let owner = routine.window.outstanding.first().unwrap().request.owner;
+    let released = routine
+        .work
+        .release_answered_elsewhere(owner, height)
+        .expect("the request still owns its reserved height");
+    routine.budget.release(released);
+    assert!(routine
+        .registry
+        .has_outstanding_request(height, block.hash()));
+
+    let released = drop_height(&routine, owner, height, block.hash());
+    routine.budget.release(released);
+    routine.gc_obsolete_outstanding();
+
+    assert!(routine.window.outstanding.is_empty());
+    assert!(!routine
+        .registry
+        .has_outstanding_request(height, block.hash()));
+}
+
+#[tokio::test]
+async fn a_reorg_retires_a_request_another_peer_already_answered() {
+    assert_answered_elsewhere_claim_is_withdrawn(|routine, _, _, _| {
+        routine.work.reset_above(block::Height(0))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retention_deferral_retires_a_request_another_peer_already_answered() {
+    assert_answered_elsewhere_claim_is_withdrawn(|routine, owner, height, hash| {
+        assert!(routine
+            .work
+            .defer_received_for_owner(owner, height, hash, 1, block::Height(0)));
+        0
+    })
+    .await;
 }

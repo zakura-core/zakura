@@ -39,7 +39,7 @@ use super::{
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
     state::{
-        DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
+        DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, RequestKey,
         ThroughputMeter,
     },
     work_queue::{RequestWrite, WorkItem, WorkQueue, WorkReturnOutcome},
@@ -54,7 +54,12 @@ use zakura_chain::{block, serialization::ZcashSerialize};
 
 #[cfg(test)]
 mod requester_tests;
+#[cfg(test)]
+mod scaling_tests;
 mod trace;
+
+/// Heights checked for lost ownership per work-queue lock hold.
+const OWNERSHIP_CHECK_CHUNK: usize = 1024;
 
 /// How long a routine avoids a height after returning it because of a failure.
 /// The delay lets another routine take the height first on the single-threaded
@@ -330,6 +335,9 @@ pub(super) struct PeerRoutine {
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
     last_reset_epoch: u64,
+    /// Work-queue revocation count when this routine last checked its requests
+    /// for lost ownership.
+    checked_revocations: u64,
     /// Start of the current interval in which this peer's outbound queue stayed full.
     /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
     outbound_full_since: Option<Instant>,
@@ -377,6 +385,7 @@ impl PeerRoutine {
         let source = zakura_header_chain::SourceId::from_digest(source_digest);
         let window = DownloadWindow::new(&config);
         let last_reset_epoch = sequencer_view.borrow().reset_epoch;
+        let checked_revocations = work.revocations();
         let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
@@ -422,6 +431,7 @@ impl PeerRoutine {
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
             routine_to_reactor,
+            checked_revocations,
             sequencer_view,
             last_reset_epoch,
             outbound_full_since: None,
@@ -499,8 +509,8 @@ impl PeerRoutine {
             if self
                 .window
                 .outstanding
-                .iter()
-                .any(|outstanding| outstanding.deadline <= now)
+                .earliest_deadline()
+                .is_some_and(|deadline| deadline <= now)
                 || self
                     .window
                     .block_liveness_deadline
@@ -711,7 +721,7 @@ impl PeerRoutine {
     /// Return only unreceived work still owned by this routine. A body already
     /// handed to the sequencer keeps its ownership and cannot be requeued here.
     fn return_unreceived_requests(&mut self, reason: &'static str) {
-        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
+        let outstanding_ranges = self.window.outstanding.drain();
         for outstanding in outstanding_ranges {
             self.retire_authorization(&outstanding);
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
@@ -836,8 +846,8 @@ impl PeerRoutine {
         // `reset_above`) and release their reservations exactly once.
         self.return_unreceived_requests("view_reset");
         self.retry_avoid.clear();
-        // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
-        self.publish_outstanding();
+        // `return_unreceived_requests` cleared our registry claims.
+        self.publish_slot_diagnostics();
         // A destructive reset pulled this peer's outstanding on our initiative, so its
         // no-progress probe streak must not stay charged: reset it (and clear the idle
         // liveness deadline) so an unproven peer whose only probe was in flight at the
@@ -862,12 +872,7 @@ impl PeerRoutine {
     /// arrives. Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
         let now = time::Instant::now().into_std();
-        let earliest_deadline = self
-            .window
-            .outstanding
-            .iter()
-            .map(|outstanding| outstanding.deadline)
-            .min();
+        let earliest_deadline = self.window.outstanding.earliest_deadline();
         let liveness_deadline = self.window.block_liveness_deadline;
         let local_retry_avoid = self.retry_avoid.values().min().copied();
         let floor_watchdog_avoid = self.registry.next_floor_avoid_deadline(&self.peer, now);
@@ -1297,18 +1302,18 @@ impl PeerRoutine {
                     work: claim.clone(),
                 });
             let mut published = false;
+            let mut issued = None;
             let publish = || {
                 published = claim.publish(|| {
-                    self.window.outstanding.push(OutstandingBlockRange {
+                    issued = Some(self.window.outstanding.push(OutstandingBlockRange {
                         request,
                         write_status: claim.status(),
-                        charged_for_liveness: false,
                         queued_at,
                         deadline,
                         delivery_snapshot: self.window.delivery_snapshot(queued_at),
                         delivered_bytes: 0,
                         received: ReceivedBlockTracker::default(),
-                    });
+                    }));
                     delivered = slot.send_request(frame, write_claim);
                 });
             };
@@ -1345,7 +1350,10 @@ impl PeerRoutine {
             }
             self.window
                 .arm_liveness(queued_at, self.config.effective_liveness_timeout());
-            self.publish_outstanding();
+            if let Some(key) = issued {
+                self.publish_request_claims(key);
+            }
+            self.publish_slot_diagnostics();
             self.trace_get_blocks_sent(
                 request_start_height,
                 request_count,
@@ -1487,28 +1495,29 @@ impl PeerRoutine {
         // Arbitrate due queued frames against writer startup before charging
         // failures. Keep started requests outstanding while refunding skipped
         // probes so their liveness deadline cannot be cleared as idle.
-        let mut skipped = Vec::new();
-        let mut index = 0;
-        while index < self.window.outstanding.len() {
-            let outstanding = &self.window.outstanding[index];
-            if outstanding.deadline <= now
-                && (outstanding.write_status.expire_unwritten()
-                    || outstanding.write_status.was_skipped())
-            {
-                skipped.push(self.window.retire_locally(index));
-            } else {
-                index += 1;
-            }
-        }
-        let mut timed_out = Vec::new();
-        let mut index = 0;
-        while index < self.window.outstanding.len() {
-            if self.window.outstanding[index].deadline <= now {
-                timed_out.push(self.window.outstanding.remove(index));
-            } else {
-                index += 1;
-            }
-        }
+        let (skipped_keys, timed_out_keys): (Vec<_>, Vec<_>) = self
+            .window
+            .outstanding
+            .due_at(now)
+            .into_iter()
+            .partition(|key| {
+                self.window
+                    .outstanding
+                    .get(*key)
+                    .is_some_and(|outstanding| {
+                        outstanding.write_status.expire_unwritten()
+                            || outstanding.write_status.was_skipped()
+                    })
+            });
+        // Retire skipped requests while the timed-out ones still occupy the window.
+        let skipped: Vec<_> = skipped_keys
+            .into_iter()
+            .filter_map(|key| self.window.retire_locally(key))
+            .collect();
+        let timed_out: Vec<_> = timed_out_keys
+            .into_iter()
+            .filter_map(|key| self.window.outstanding.remove(key))
+            .collect();
         if skipped.is_empty() && timed_out.is_empty() {
             return false;
         }
@@ -1517,6 +1526,7 @@ impl PeerRoutine {
         }
         for outstanding in skipped.iter().chain(&timed_out) {
             self.retire_authorization(outstanding);
+            self.withdraw_claims(outstanding);
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
@@ -1535,7 +1545,7 @@ impl PeerRoutine {
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
         self.note_retry_avoid(timed_out_heights);
         if timed_out.is_empty() {
-            self.publish_outstanding();
+            self.publish_slot_diagnostics();
         } else {
             // Trace the window and reliability this timeout cut; the sample also publishes.
             self.trace_bbr_sample();
@@ -1639,28 +1649,26 @@ impl PeerRoutine {
         let floor = self.download_floor();
         let mut released = 0u64;
         let mut removed = false;
-        let mut index = 0;
-        while index < self.window.outstanding.len() {
-            if self.window.outstanding[index].request.end_height() <= floor {
-                let outstanding = self.window.retire_locally(index);
-                self.retire_authorization(&outstanding);
-                // Release only estimates whose per-height ledger is still
-                // `Reserved`. A competing delivery changes that ledger to
-                // `Released` at receipt, so floor GC must not release it again.
-                released = released.saturating_add(self.work.release_reserved_heights_for_owner(
-                    outstanding.request.owner,
-                    unreceived_heights(&outstanding),
-                ));
-                removed = true;
-            } else {
-                index += 1;
-            }
+        for key in self.window.outstanding.ending_at_or_below(floor) {
+            let Some(outstanding) = self.window.retire_locally(key) else {
+                continue;
+            };
+            self.retire_authorization(&outstanding);
+            self.withdraw_claims(&outstanding);
+            // Release only estimates whose per-height ledger is still
+            // `Reserved`. A competing delivery changes that ledger to
+            // `Released` at receipt, so floor GC must not release it again.
+            released = released.saturating_add(self.work.release_reserved_heights_for_owner(
+                outstanding.request.owner,
+                unreceived_heights(&outstanding),
+            ));
+            removed = true;
         }
         if released > 0 {
             self.budget.release(released);
         }
         if removed {
-            self.publish_outstanding();
+            self.publish_slot_diagnostics();
             self.window.disarm_liveness_after_progress_if_idle();
         }
     }
@@ -1668,42 +1676,82 @@ impl PeerRoutine {
     /// A skipped frame ends the peer obligation independently of any received
     /// body whose owner must remain available to the sequencer.
     fn gc_skipped_outstanding(&mut self) {
-        for outstanding in &self.window.outstanding {
-            if outstanding.write_status.was_skipped() {
-                self.requester
-                    .retire(outstanding.request.start_height, true);
-            }
+        let skipped = self.window.discard_skipped_requests();
+        if skipped.is_empty() {
+            return;
         }
-        if self.window.discard_skipped_requests() {
-            self.publish_outstanding();
+        for outstanding in &skipped {
+            self.requester
+                .retire(outstanding.request.start_height, true);
+            self.withdraw_claims(outstanding);
         }
+        self.publish_slot_diagnostics();
     }
 
     /// Free request slots after the central queue retires their exact owners.
     /// Queue retirement already released their reservations.
     /// The cleanup path drops only routine-local and registry bookkeeping.
+    ///
+    /// Only a revocation by another actor can take unreceived work from a live
+    /// request, so the scan runs once after each revocation.
     fn gc_obsolete_outstanding(&mut self) {
+        let revocations = self.work.revocations();
+        if revocations == self.checked_revocations {
+            return;
+        }
+        self.checked_revocations = revocations;
+
+        let unreceived: Vec<_> = self
+            .window
+            .outstanding
+            .entries()
+            .flat_map(|(key, outstanding)| {
+                unreceived_heights(outstanding)
+                    .map(move |height| (height, (key, outstanding.request.owner)))
+            })
+            .collect();
+        let mut lost: BTreeMap<RequestKey, Vec<block::Height>> = BTreeMap::new();
+        // Bound each queue lock hold so a large window cannot stall other peers.
+        for chunk in unreceived.chunks(OWNERSHIP_CHECK_CHUNK) {
+            for (height, (key, _)) in self.work.disowned(chunk, |(_, owner)| *owner) {
+                lost.entry(key).or_default().push(height);
+            }
+        }
+
         let mut removed = false;
-        let mut index = 0;
-        while index < self.window.outstanding.len() {
-            let outstanding = &self.window.outstanding[index];
-            let owner = outstanding.request.owner;
-            let still_owned = outstanding
-                .request
-                .expected_blocks
-                .iter()
-                .filter(|expected| !outstanding.has_received(expected.height))
-                .any(|expected| self.work.owner_for_height(expected.height) == Some(owner));
-            if still_owned {
-                index += 1;
-            } else {
-                let retired = self.window.retire_locally(index);
-                self.retire_authorization(&retired);
-                removed = true;
+        let obsolete: Vec<_> = self
+            .window
+            .outstanding
+            .entries()
+            .filter(|(key, outstanding)| {
+                let lost = lost.get(key).map_or(0, Vec::len);
+                lost == unreceived_heights(outstanding).count()
+            })
+            .map(|(key, _)| key)
+            .collect();
+        for key in obsolete {
+            lost.remove(&key);
+            let Some(retired) = self.window.retire_locally(key) else {
+                continue;
+            };
+            self.retire_authorization(&retired);
+            self.withdraw_claims(&retired);
+            removed = true;
+        }
+        // A request that still owns some heights keeps its slot but stops
+        // advertising the heights it lost.
+        for (key, heights) in lost {
+            if let Some(outstanding) = self.window.outstanding.get(key) {
+                self.registry.remove_outstanding_for_owner(
+                    &self.peer,
+                    self.generation,
+                    outstanding.request.owner,
+                    heights,
+                );
             }
         }
         if removed {
-            self.publish_outstanding();
+            self.publish_slot_diagnostics();
             self.window.disarm_liveness_after_progress_if_idle();
         }
     }
@@ -1725,7 +1773,7 @@ impl PeerRoutine {
             return;
         };
 
-        let Some(index) = self.window.outstanding_index_for_height(height) else {
+        let Some(key) = self.window.outstanding_key_for_height(height) else {
             // No outstanding match — run the unmatched fallthroughs locally.
             if self
                 .accept_unmatched_queued_body(
@@ -1749,7 +1797,11 @@ impl PeerRoutine {
             );
             return;
         };
-        let outstanding = &self.window.outstanding[index];
+        let outstanding = self
+            .window
+            .outstanding
+            .get(key)
+            .expect("the key was just found in the window");
         let delivery_snapshot = outstanding.delivery_snapshot;
         if outstanding.has_received(height) {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
@@ -1780,7 +1832,7 @@ impl PeerRoutine {
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
                 .increment(1);
-            self.drop_obsolete_outstanding(index);
+            self.drop_obsolete_outstanding(key);
             return;
         }
         if !self
@@ -1792,7 +1844,7 @@ impl PeerRoutine {
                 ?height,
                 "ignoring late block-sync body for a claim cancelled by the floor watchdog"
             );
-            self.finish_outstanding_at(index, Disposition::RetryMissing);
+            self.finish_outstanding_at(key, Disposition::RetryMissing);
             return;
         }
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
@@ -1813,7 +1865,7 @@ impl PeerRoutine {
                 Ok(bytes) => bytes.len() as u64,
                 Err(error) => {
                     tracing::debug!(?error, "failed to serialize decoded block-sync body");
-                    self.finish_outstanding_at(index, Disposition::RetryOriginal);
+                    self.finish_outstanding_at(key, Disposition::RetryOriginal);
                     self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
                         .await;
                     return;
@@ -1844,7 +1896,7 @@ impl PeerRoutine {
                 serialized_bytes,
                 "block-sync body already settled by another peer; marking received"
             );
-            self.accept_already_settled_height(index, height);
+            self.accept_already_settled_height(key, height);
             return;
         };
         let decoded_attributed_memory_size_bytes =
@@ -1862,14 +1914,21 @@ impl PeerRoutine {
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
-        let mut completed = None;
-        if let Some(outstanding) = self.window.outstanding.get_mut(index) {
-            outstanding.record_body_bytes(serialized_bytes);
-            outstanding.mark_received(height);
-            if outstanding.is_complete() {
-                completed = Some(self.window.outstanding.remove(index));
-            }
-        }
+        self.window
+            .outstanding
+            .record_body_bytes(key, serialized_bytes);
+        self.window.outstanding.mark_received(key, height);
+        self.withdraw_claim(outstanding_owner, height);
+        let completed = if self
+            .window
+            .outstanding
+            .get(key)
+            .is_some_and(OutstandingBlockRange::is_complete)
+        {
+            self.window.outstanding.remove(key)
+        } else {
+            None
+        };
         if let Some(outstanding) = &completed {
             // Feed the BBR estimators on request completion: the round-trip (RTprop)
             // and the per-ack delivery rate (BtlBw) for this request's block count and
@@ -1885,7 +1944,7 @@ impl PeerRoutine {
         if let Some(outstanding) = completed {
             self.finish_detached(outstanding, Disposition::Satisfied);
         } else {
-            self.publish_outstanding();
+            self.publish_slot_diagnostics();
         }
 
         // Forward the body to the commit-pipeline task. THE ONLY blocking send in
@@ -2034,10 +2093,7 @@ impl PeerRoutine {
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(estimate) = self
-                .work
-                .release_active_reserved_height_for_owner(owner, height)
-            else {
+            let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
@@ -2106,13 +2162,17 @@ impl PeerRoutine {
         let start_height = completed.range.start;
         // Local timeouts, reorgs, and finality can retire the scheduler's work
         // while the peer's authority, already consumed above, remained live.
-        let Some(index) = self.window.outstanding_index_for_start(start_height) else {
+        let Some(key) = self.window.outstanding_key_for_start(start_height) else {
             return;
         };
         let retry = match completed.outcome {
             Outcome::Done => Disposition::RetryMissing,
             Outcome::Unavailable => {
-                let outstanding = &self.window.outstanding[index];
+                let outstanding = self
+                    .window
+                    .outstanding
+                    .get(key)
+                    .expect("the key was just found in the window");
                 self.trace_range_unavailable(
                     start_height,
                     outstanding.request.count,
@@ -2121,25 +2181,25 @@ impl PeerRoutine {
                 Disposition::RetryOriginal
             }
         };
-        let disposition = self.stale_adjusted_disposition(index, retry);
-        self.charge_short_response_reliability(index, disposition);
-        self.finish_outstanding_at(index, disposition);
+        let disposition = self.stale_adjusted_disposition(key, retry);
+        self.charge_short_response_reliability(key, disposition);
+        self.finish_outstanding_at(key, disposition);
     }
 
     /// Fold a short response into the reliability EWMA: a `BlocksDone`/`RangeUnavailable`
-    /// that leaves the outstanding request at `index` with any unreceived height is one
+    /// that leaves the outstanding request at `key` with any unreceived height is one
     /// goodput failure for the request, like a timeout — per request, not per missing height
     /// (see `penalize_short_response`). A `Satisfied` disposition means the shortfall was
     /// covered by the floor advancing (not the peer's fault), so it is not charged. Reads the
     /// outstanding *before* `finish_outstanding_at` removes it.
-    fn charge_short_response_reliability(&mut self, index: usize, disposition: Disposition) {
+    fn charge_short_response_reliability(&mut self, key: RequestKey, disposition: Disposition) {
         if disposition == Disposition::Satisfied {
             return;
         }
         let missing = self
             .window
             .outstanding
-            .get(index)
+            .get(key)
             .map(|outstanding| unreceived_heights(outstanding).count())
             .unwrap_or(0);
         self.window.penalize_short_response(missing);
@@ -2147,21 +2207,27 @@ impl PeerRoutine {
 
     /// A late response can still match after the floor moved through its prefix;
     /// mark the stale prefix satisfied and retry only the remaining suffix.
-    fn stale_adjusted_disposition(&mut self, index: usize, current: Disposition) -> Disposition {
+    fn stale_adjusted_disposition(&mut self, key: RequestKey, current: Disposition) -> Disposition {
         let tip = self.download_floor();
-        let Some(outstanding) = self.window.outstanding.get_mut(index) else {
+        let Some(outstanding) = self.window.outstanding.get(key) else {
             return current;
         };
         if outstanding.request.start_height > tip {
             return current;
         }
+        let owner = outstanding.request.owner;
         let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
-        let _ = outstanding.mark_received_through(tip);
+        let _ = self.window.outstanding.mark_received_through(key, tip);
         let released_bytes = self
             .work
-            .release_reserved_heights_for_owner(outstanding.request.owner, released_heights);
+            .release_reserved_heights_for_owner(owner, released_heights);
         self.budget.release(released_bytes);
-        if outstanding.is_complete() {
+        if self
+            .window
+            .outstanding
+            .get(key)
+            .is_some_and(OutstandingBlockRange::is_complete)
+        {
             Disposition::Satisfied
         } else {
             Disposition::RetryMissing
@@ -2170,24 +2236,23 @@ impl PeerRoutine {
 
     // ===================== outstanding lifecycle (ported) ===================
 
-    fn finish_outstanding_at(&mut self, index: usize, disposition: Disposition) {
-        if index >= self.window.outstanding.len() {
+    fn finish_outstanding_at(&mut self, key: RequestKey, disposition: Disposition) {
+        let Some(outstanding) = self.window.outstanding.remove(key) else {
             return;
-        }
-        let outstanding = self.window.outstanding.remove(index);
+        };
         self.finish_detached(outstanding, disposition);
     }
 
     /// Drop a local request after the central queue retires its work scope.
     /// The central queue already released the reservation.
     /// The cleanup path preserves any replacement item at the same height.
-    fn drop_obsolete_outstanding(&mut self, index: usize) {
-        if index >= self.window.outstanding.len() {
+    fn drop_obsolete_outstanding(&mut self, key: RequestKey) {
+        let Some(retired) = self.window.retire_locally(key) else {
             return;
-        }
-        let retired = self.window.retire_locally(index);
+        };
         self.retire_authorization(&retired);
-        self.publish_outstanding();
+        self.withdraw_claims(&retired);
+        self.publish_slot_diagnostics();
         self.window.disarm_liveness_after_progress_if_idle();
     }
 
@@ -2200,6 +2265,7 @@ impl PeerRoutine {
 
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
         self.retire_authorization(&outstanding);
+        self.withdraw_claims(&outstanding);
         match disposition {
             Disposition::Satisfied => {
                 // Every requested height was received and buffered; nothing
@@ -2237,7 +2303,7 @@ impl PeerRoutine {
                 self.note_retry_avoid(unreceived);
             }
         }
-        self.publish_outstanding();
+        self.publish_slot_diagnostics();
         if disposition == Disposition::Satisfied {
             self.window.disarm_liveness_after_progress_if_idle();
         }
@@ -2249,55 +2315,46 @@ impl PeerRoutine {
     /// received so the request can complete without re-queueing it or touching
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
-    fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
+    fn accept_already_settled_height(&mut self, key: RequestKey, height: block::Height) {
         self.window.note_block_progress(
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
-        let completed = self
-            .window
-            .outstanding
-            .get_mut(index)
-            .map(|outstanding| {
-                outstanding.mark_received(height);
-                outstanding.is_complete()
-            })
-            .unwrap_or(false);
-        if completed {
-            self.finish_outstanding_at(index, Disposition::Satisfied);
+        self.window.outstanding.mark_received(key, height);
+        let Some(outstanding) = self.window.outstanding.get(key) else {
+            return;
+        };
+        self.withdraw_claim(outstanding.request.owner, height);
+        if outstanding.is_complete() {
+            self.finish_outstanding_at(key, Disposition::Satisfied);
         } else {
-            self.publish_outstanding();
+            self.publish_slot_diagnostics();
         }
     }
 
-    /// Publish this peer's current *unreceived* in-flight height metadata to the
-    /// registry, so the producer's `!has_outstanding_request` filter and the
-    /// low-water `total_unreceived` gate read the same per-request-granularity
-    /// count (`expected_blocks.len() − received.len()`).
-    /// Received-but-uncommitted heights are excluded here because they are held in
-    /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
-    /// already keeps them out of `pending`.
-    fn publish_outstanding(&self) {
-        let mut unreceived = Vec::new();
-        for outstanding in &self.window.outstanding {
-            for expected in &outstanding.request.expected_blocks {
-                if !outstanding.has_received(expected.height) {
-                    unreceived.push((expected.height, (outstanding, expected)));
-                }
-            }
-        }
-        // Filter before combining overlapping heights so a stale request cannot
-        // hide the current owner's metadata.
-        self.work.retain_owned(&mut unreceived, |(outstanding, _)| {
-            outstanding.request.owner
-        });
-        let map = unreceived
-            .into_iter()
-            .map(|(height, (outstanding, expected))| {
+    /// Publish the unreceived heights of a newly issued request to the registry,
+    /// so the producer's `!has_outstanding_request` filter and the low-water
+    /// `total_unreceived` gate count them. Received-but-uncommitted heights stay
+    /// out of the registry because `work.in_flight` holds them.
+    ///
+    /// Another actor can revoke a height after publication checked its owner.
+    /// Rechecking after the insert withdraws such a claim. A later revocation
+    /// triggers [`gc_obsolete_outstanding`](Self::gc_obsolete_outstanding).
+    fn publish_request_claims(&self, key: RequestKey) {
+        let Some(outstanding) = self.window.outstanding.get(key) else {
+            return;
+        };
+        let owner = outstanding.request.owner;
+        let claims: Vec<_> = outstanding
+            .request
+            .expected_blocks
+            .iter()
+            .filter(|expected| !outstanding.has_received(expected.height))
+            .map(|expected| {
                 (
-                    height,
+                    expected.height,
                     super::peer_registry::OutstandingMeta {
-                        owner: outstanding.request.owner,
+                        owner,
                         hash: expected.hash,
                         estimated_bytes: expected.estimated_bytes,
                         queued_at: outstanding.queued_at,
@@ -2305,15 +2362,44 @@ impl PeerRoutine {
                     },
                 )
             })
-            .collect::<BTreeMap<_, _>>();
-        if map.is_empty() {
-            self.registry.clear_outstanding(&self.peer, self.generation);
-        } else {
-            self.registry
-                .set_outstanding(&self.peer, self.generation, map);
+            .collect();
+        self.registry
+            .insert_outstanding(&self.peer, self.generation, claims.iter().copied());
+        let disowned = self.work.disowned(&claims, |meta| meta.owner);
+        if !disowned.is_empty() {
+            self.registry.remove_outstanding_for_owner(
+                &self.peer,
+                self.generation,
+                owner,
+                disowned.into_iter().map(|(height, _)| height),
+            );
         }
-        // Publish the window diagnostics for the reactor's periodic trace row and
-        // for other routines' cross-peer floor-bias decisions.
+    }
+
+    /// Withdraw every registry claim that a request leaving the window still
+    /// holds. A replacement request's claim at the same height stays published.
+    fn withdraw_claims(&self, outstanding: &OutstandingBlockRange) {
+        self.registry.remove_outstanding_for_owner(
+            &self.peer,
+            self.generation,
+            outstanding.request.owner,
+            outstanding
+                .request
+                .expected_blocks
+                .iter()
+                .map(|expected| expected.height),
+        );
+    }
+
+    /// Withdraw the registry claim for one received height.
+    fn withdraw_claim(&self, owner: zakura_header_chain::BodyWorkOwner, height: block::Height) {
+        self.registry
+            .remove_outstanding_for_owner(&self.peer, self.generation, owner, [height]);
+    }
+
+    /// Publish the window diagnostics for the reactor's periodic trace row and
+    /// for other routines' cross-peer floor-bias decisions.
+    fn publish_slot_diagnostics(&self) {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.registry.publish_slots(
             &self.peer,
@@ -3246,7 +3332,7 @@ mod tests {
         }
         let _ = routine.try_fill().await;
 
-        let outstanding = &routine.window.outstanding[0];
+        let outstanding = routine.window.outstanding.first().unwrap();
         let base = if measurement_age == Some(Duration::ZERO) {
             routine.config.effective_floor_rescue_timeout()
         } else {
@@ -3433,7 +3519,7 @@ mod tests {
                     .note_block_progress(Instant::now(), liveness_timeout);
             }
         }
-        let first_owner = routine.window.outstanding[0].request.owner;
+        let first_owner = routine.window.outstanding.first().unwrap().request.owner;
         let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
         let deadline = routine
             .window
@@ -3492,7 +3578,10 @@ mod tests {
             // must preserve the replacement's ownership and byte charge.
             routine.try_fill().await;
             assert_eq!(routine.window.outstanding.len(), 1);
-            assert_ne!(routine.window.outstanding[0].request.owner, first_owner);
+            assert_ne!(
+                routine.window.outstanding.first().unwrap().request.owner,
+                first_owner
+            );
         }
         for (finish, writer) in started_writes {
             finish.send(()).unwrap();
@@ -3649,8 +3738,8 @@ mod tests {
         });
         routine.try_fill().await;
         assert_eq!(routine.window.outstanding.len(), 1);
-        let owner = routine.window.outstanding[0].request.owner;
-        let deadline = routine.window.outstanding[0].deadline;
+        let owner = routine.window.outstanding.first().unwrap().request.owner;
+        let deadline = routine.window.outstanding.first().unwrap().deadline;
         let queued = out_recv.recv().await.unwrap();
         assert!(registry.peer_has_outstanding_height(&peer, block::Height(2)));
 
@@ -4175,7 +4264,7 @@ mod tests {
             assert!(work.in_flight_contains(block::Height(1)));
             if expired {
                 let after_deadline =
-                    routine.window.outstanding[0].deadline + Duration::from_millis(1);
+                    routine.window.outstanding.first().unwrap().deadline + Duration::from_millis(1);
                 routine.expire_due_timeouts(after_deadline);
                 assert!(routine.window.outstanding.is_empty());
                 assert!(routine.window.block_liveness_deadline.is_some());

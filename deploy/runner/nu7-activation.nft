@@ -1,0 +1,8 @@
+table inet nu7_activation {
+    chain input {
+        type filter hook input priority -5; policy accept;
+        tcp dport 8096 iifname "lo" accept
+        ip saddr 167.99.146.155 tcp dport 8096 accept
+        tcp dport 8096 reject with tcp reset
+    }
+}

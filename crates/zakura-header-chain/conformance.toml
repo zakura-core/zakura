@@ -1,4 +1,4 @@
-spec_version = "1.7"
+spec_version = "1.8"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.
@@ -419,10 +419,10 @@ networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
 id = "LC-SELECT-03"
-name = "Raw-hash tie-breaker"
+name = "Stable integrated header selection"
 status = "implemented"
-owner = "zakura_header_chain::ChainScore::cmp"
-tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes"]
+owner = "zakura_header_chain::MemHeaderStore::select_best_header_chain"
+tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes", "DF-01::integrated_header_selection_preserves_the_first_selected_equal_work_tip"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -934,7 +934,7 @@ id = "LC-ACCEPT-01"
 name = "Complete regression coverage"
 status = "implemented"
 owner = "xtask::header_conformance::validate_acceptance_claims"
-tests = ["AUD-01::named_losing_branch_can_be_extended_past_the_incumbent", "AUD-02::shorter_higher_work_branch_replaces_a_taller_incumbent", "AUD-03::same_height_forks_are_insertion_order_independent", "AUD-04::consecutive_resets_use_exact_branch_identity", "AUD-05::retired_network_completion_has_no_effects", "AUD-06::retired_state_success_has_no_downstream_effects", "AUD-07::retired_state_failure_has_no_retry_or_peer_effects", "AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "AUD-09::generation_change_retires_every_repair_state", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-13::finalization_and_replacement_match_serial_histories", "AUD-14::every_crash_boundary_reopens_to_complete_transition", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "AUD-INCIDENT::late_completion_cannot_break_promoted_branch"]
+tests = ["AUD-01::named_losing_branch_can_be_extended_past_the_incumbent", "AUD-02::shorter_higher_work_branch_replaces_a_taller_incumbent", "AUD-03::same_height_forks_preserve_first_arrival_unless_work_increases", "AUD-04::consecutive_resets_use_exact_branch_identity", "AUD-05::retired_network_completion_has_no_effects", "AUD-06::retired_state_success_has_no_downstream_effects", "AUD-07::retired_state_failure_has_no_retry_or_peer_effects", "AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "AUD-09::generation_change_retires_every_repair_state", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-13::finalization_and_replacement_match_serial_histories", "AUD-14::every_crash_boundary_reopens_to_complete_transition", "AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "AUD-INCIDENT::late_completion_cannot_break_promoted_branch"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -942,7 +942,7 @@ id = "LC-ACCEPT-02"
 name = "Durable deterministic frontiers"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition + zakura_state::HeaderChainRuntime::apply_combined"
-tests = ["AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "DG-03::every_crash_boundary_reopens_to_complete_transition", "DG-01::same_height_forks_are_insertion_order_independent", "PW-03::complete_target_is_independent_of_page_partition", "DG-07::finalization_and_replacement_match_serial_histories", "DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
+tests = ["AUD-15::every_changed_frontier_accepts_an_exact_parent_next_child", "DG-03::every_crash_boundary_reopens_to_complete_transition", "DG-01::same_height_forks_preserve_first_arrival_unless_work_increases", "PW-03::complete_target_is_independent_of_page_partition", "DG-07::finalization_and_replacement_match_serial_histories", "DG-07::headers_only_finalizes_exactly_tip_minus_one_thousand_before_publication", "DG-07::migrated_headers_only_pin_refutation_is_durable_and_fail_closed"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

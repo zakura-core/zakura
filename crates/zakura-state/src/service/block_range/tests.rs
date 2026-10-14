@@ -20,7 +20,7 @@ use super::spawn_owned_block_range;
 const DEADLINE: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn block_ranges_serve_the_selected_header_fork_without_changing_mining_priority() {
+async fn block_ranges_preserve_equal_work_selection_until_a_stronger_fork_arrives() {
     let _guard = zakura_test::init();
     for header_runtime in [true, false] {
         timeout(DEADLINE, assert_block_range_selection(header_runtime))
@@ -30,14 +30,14 @@ async fn block_ranges_serve_the_selected_header_fork_without_changing_mining_pri
 }
 
 async fn assert_block_range_selection(header_runtime: bool) {
-    use tower::{Service, ServiceExt};
+    use tower::ServiceExt;
     use zakura_chain::chain_tip::ChainTip;
 
     use crate::{
         arbitrary::Prepare,
         service::StateService,
         tests::{setup::transaction_v4_from_coinbase, FakeChainHelper},
-        CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
+        CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse,
     };
 
     let network = Network::new_regtest(Default::default());
@@ -88,7 +88,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .unwrap();
     }
     assert_eq!(tip.best_tip_hash(), Some(a.hash()));
-    let selected = if header_runtime { &b } else { &a };
+    let selected = &a;
     assert!(matches!(
         read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
         ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == selected.hash()
@@ -111,7 +111,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .map(|(_, block, _)| block.hash())
             .collect::<Vec<_>>(),
         [genesis.hash(), parent.hash(), selected.hash()],
-        "a peer must be able to download the hash-selected body even when we mine A"
+        "serving and mining preserve the first selected equal-work body"
     );
     let owned = read_state
         .read_owned_block_range(block::Height(2), 2, u32::MAX, (), |_| false)
@@ -123,60 +123,19 @@ async fn assert_block_range_selection(header_runtime: bool) {
 
     let earlier_snapshot = read_state.block_range_snapshot().unwrap();
     if header_runtime {
-        use zakura_header_chain::{
-            Frontier, HeaderBatchInput, HeaderRules, HeaderWorkAuthority, InsertHeaders, SourceId,
-            SystemClock, TargetCompletion,
-        };
-
-        // C wins header selection, but no body for C has been committed.
-        let reader = read_state
-            .header_chain_reader_receiver
-            .borrow()
-            .clone()
-            .unwrap();
-        let lease = reader.validation_context(parent.hash()).unwrap().unwrap();
-        let batch = zakura_header_chain::prepare_headers(
-            HeaderBatchInput::new(std::slice::from_ref(&c.header)),
-            lease.parent(),
-            &HeaderRules::for_validation_lease(&lease).unwrap(),
-            &SystemClock,
+        // An equal-work header without a body must not cancel the selected download.
+        insert_header_only(
+            &mut state,
+            &read_state,
+            block::Height(1),
+            parent.hash(),
+            std::slice::from_ref(&c.header),
+            1,
         )
-        .unwrap();
-        let snapshot = read_state
-            .subscribe_header_chain_snapshots()
-            .borrow()
-            .clone()
-            .unwrap();
-        let insert = InsertHeaders {
-            owner: HeaderWorkAuthority::for_target(&snapshot, c.hash())
-                .bind(1, std::num::NonZeroU64::new(1).unwrap())
-                .into(),
-            source: SourceId::from_digest([1; 32]),
-            parent_hash: parent.hash(),
-            target_tip_hash: c.hash(),
-            completion: TargetCompletion::TargetComplete {
-                common_ancestor: Frontier::new(block::Height(1), parent.hash()),
-            },
-            batch,
-            aux: Vec::new(),
-        };
-        let response = state
-            .ready()
-            .await
-            .unwrap()
-            .call(Request::ApplyHeaderChainInsert {
-                prepared: crate::HeaderChainBodyEvidenceAuthority::new()
-                    .from_registered_header_attempt(Box::new(insert)),
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            response,
-            Response::HeaderChainInsertApplied(zakura_header_chain::ApplyResult::Committed)
-        ));
+        .await;
         assert!(matches!(
             read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
-            ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == c.hash()
+            ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == a.hash()
         ));
         let ReadResponse::Blocks(blocks) = read_state
             .clone()
@@ -191,24 +150,25 @@ async fn assert_block_range_selection(header_runtime: bool) {
         };
         assert_eq!(
             blocks.len(),
-            2,
-            "a missing selected body must not be replaced by A or B"
+            3,
+            "an equal-work header must not remove the selected body from serving"
         );
         assert_eq!(blocks[1].1.hash(), parent.hash());
         let owned = read_state
             .read_owned_block_range(block::Height(2), 1, u32::MAX, (), |_| false)
             .await
             .unwrap();
-        assert!(owned.blocks.is_empty());
+        assert_eq!(owned.blocks.len(), 1);
+        assert_eq!(owned.blocks[0].1.hash(), a.hash());
     }
 
-    // More work on A switches downloads to A's branch as well.
-    let mut child = a.make_fake_child();
+    // More work on B switches both downloads and mining to B.
+    let mut child = b.make_fake_child();
     let commitment = read_state
         .latest_non_finalized_state()
-        .find_chain(|chain| chain.contains_block_hash(a.hash()))
+        .find_chain(|chain| chain.contains_block_hash(b.hash()))
         .unwrap()
-        .history_tree(a.hash().into())
+        .history_tree(b.hash().into())
         .unwrap()
         .hash()
         .unwrap();
@@ -234,7 +194,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .iter()
             .map(|(_, block, _)| block.hash())
             .collect::<Vec<_>>(),
-        [a.hash(), child.hash()]
+        [b.hash(), child.hash()]
     );
     assert_eq!(tip.best_tip_hash(), Some(child.hash()));
     assert_eq!(
@@ -249,6 +209,125 @@ async fn assert_block_range_selection(header_runtime: bool) {
     assert!(earlier_snapshot
         .block_and_size(&read_state.db, block::Height(3))
         .is_none());
+
+    if header_runtime {
+        // A stronger header-only fork takes the selection before any of its bodies arrive.
+        let mut c_child = c.make_fake_child();
+        Arc::make_mut(&mut Arc::make_mut(&mut c_child).header).time += chrono::Duration::seconds(1);
+        let mut c_grandchild = c_child.make_fake_child();
+        Arc::make_mut(&mut Arc::make_mut(&mut c_grandchild).header).time +=
+            chrono::Duration::seconds(1);
+        insert_header_only(
+            &mut state,
+            &read_state,
+            block::Height(2),
+            c.hash(),
+            &[c_child.header.clone(), c_grandchild.header.clone()],
+            2,
+        )
+        .await;
+        assert!(matches!(
+            read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
+            ReadResponse::BestHeaderTip(Some((block::Height(4), hash))) if hash == c_grandchild.hash()
+        ));
+        let ReadResponse::Blocks(blocks) = read_state
+            .clone()
+            .oneshot(ReadRequest::BlocksByHeightRange {
+                start: block::Height(0),
+                count: 5,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected block range response");
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|(_, block, _)| block.hash())
+                .collect::<Vec<_>>(),
+            [genesis.hash(), parent.hash()],
+            "a missing selected body must not be replaced by A, B, or B's child"
+        );
+        let owned = read_state
+            .read_owned_block_range(block::Height(2), 3, u32::MAX, (), |_| false)
+            .await
+            .unwrap();
+        assert!(owned.blocks.is_empty());
+        assert_eq!(
+            tip.best_tip_hash(),
+            Some(child.hash()),
+            "header-only work does not change the mining tip"
+        );
+    }
+}
+
+/// Commit `headers` as one header-only batch on top of the retained header `parent_hash`.
+async fn insert_header_only(
+    state: &mut crate::service::StateService,
+    read_state: &crate::service::ReadStateService,
+    parent_height: block::Height,
+    parent_hash: block::Hash,
+    headers: &[Arc<block::Header>],
+    request_id: u64,
+) {
+    use tower::{Service, ServiceExt};
+    use zakura_header_chain::{
+        Frontier, HeaderBatchInput, HeaderRules, HeaderWorkAuthority, InsertHeaders, SourceId,
+        SystemClock, TargetCompletion,
+    };
+
+    use crate::{Request, Response};
+
+    let target = headers
+        .last()
+        .expect("the batch has a target header")
+        .hash();
+    let reader = read_state
+        .header_chain_reader_receiver
+        .borrow()
+        .clone()
+        .unwrap();
+    let lease = reader.validation_context(parent_hash).unwrap().unwrap();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(headers),
+        lease.parent(),
+        &HeaderRules::for_validation_lease(&lease).unwrap(),
+        &SystemClock,
+    )
+    .unwrap();
+    let snapshot = read_state
+        .subscribe_header_chain_snapshots()
+        .borrow()
+        .clone()
+        .unwrap();
+    let insert = InsertHeaders {
+        owner: HeaderWorkAuthority::for_target(&snapshot, target)
+            .bind(1, std::num::NonZeroU64::new(request_id).unwrap())
+            .into(),
+        source: SourceId::from_digest([1; 32]),
+        parent_hash,
+        target_tip_hash: target,
+        completion: TargetCompletion::TargetComplete {
+            common_ancestor: Frontier::new(parent_height, parent_hash),
+        },
+        batch,
+        aux: Vec::new(),
+    };
+    let response = state
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::ApplyHeaderChainInsert {
+            prepared: crate::HeaderChainBodyEvidenceAuthority::new()
+                .from_registered_header_attempt(Box::new(insert)),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        Response::HeaderChainInsertApplied(zakura_header_chain::ApplyResult::Committed)
+    ));
 }
 
 #[derive(Debug)]

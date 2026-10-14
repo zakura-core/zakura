@@ -87,15 +87,6 @@ skip = [
     # still resolves Rand 0.9. Remove these when the workspace converges.
     { name = "rand", version = "=0.9.4" },
     { name = "rand_chacha", version = "=0.9.0" },
-
-    # Common v3 note encryption uses RustCrypto's newer AEAD/cipher traits.
-    # Orchard/Sapling AES and FPE, plus networking's AES-GCM, still require
-    # the older traits. Skip only these exact older versions until those
-    # consumers upgrade; keep checking their dependencies and all new versions.
-    { name = "aead", version = "=0.5.2" },
-    { name = "cipher", version = "=0.4.4" },
-    { name = "inout", version = "=0.1.4" },
-    { name = "universal-hash", version = "=0.5.1" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate
@@ -115,12 +106,9 @@ skip-tree = [
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
 
-    # wait for zebra to update tower
-    { name = "tower", version = "=0.4.13" },
-
-    # wait for zebra to update vergen
-    { name = "thiserror", version = "=1.0.69" },
-    { name = "thiserror-impl", version = "=1.0.69" },
+    # wait for hdrhistogram (via tower's `load` feature and console-subscriber) to update base64;
+    # hdrhistogram 7.6 does, but it pulls in nom 8 alongside nom 7
+    { name = "hdrhistogram", version = "=7.5.4" },
 
     # wait for all librustzcash crates to update sha2, secp256k1, and ripemd
     { name = "sha2", version = "=0.10.9" },
@@ -159,9 +147,6 @@ skip-tree = [
     { name = "rand", version = "0.8" },
     { name = "rand_core", version = "0.6" },
     { name = "rand_chacha", version = "0.3" },
-
-    # wait for derive_builder to update
-    { name = "darling", version = "0.20.11" },
 
     # wait until `config` updates `convert_case`
     { name = "convert_case", version = "0.6.0" },

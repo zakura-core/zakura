@@ -25,7 +25,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use jsonrpsee::server::{
-    middleware::rpc::RpcServiceBuilder, stop_channel, Server, ServerHandle, StopHandle,
+    middleware::rpc::RpcServiceBuilder, stop_channel, Server, ServerConfig, ServerHandle,
+    StopHandle,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -52,7 +53,7 @@ use crate::{
         rpc_method_access, RpcAccess, RpcImpl, RpcServer as _, RpcSurface, RPC_METHOD_ACCESS,
     },
     server::{
-        http_request_compatibility::HttpRequestMiddlewareLayer,
+        http_request_compatibility::HttpRequestMiddlewareLayer, rpc_batch::RpcBatchMiddleware,
         rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
         rpc_tracing::RpcTracingMiddleware,
     },
@@ -61,6 +62,7 @@ use crate::{
 pub mod cookie;
 pub mod error;
 pub mod http_request_compatibility;
+pub mod rpc_batch;
 pub mod rpc_call_compatibility;
 pub mod rpc_metrics;
 pub mod rpc_tracing;
@@ -255,7 +257,18 @@ impl RpcServer {
 
         let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
 
+        let server_config = ServerConfig::builder()
+            .http_only()
+            .max_response_body_size(
+                conf.max_response_body_size
+                    .try_into()
+                    .expect("should be valid"),
+            )
+            .build();
+
+        let max_response_body_size = conf.max_response_body_size;
         let rpc_middleware = RpcServiceBuilder::new()
+            .layer_fn(move |service| RpcBatchMiddleware::new(service, max_response_body_size))
             .rpc_logger(1024)
             .layer_fn(FixRpcResponseMiddleware::new)
             .layer_fn(RpcMetricsMiddleware::new)
@@ -267,14 +280,9 @@ impl RpcServer {
             let local_addr = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(tls_config);
             let service_builder = Server::builder()
-                .http_only()
+                .set_config(server_config)
                 .set_http_middleware(http_middleware)
                 .set_rpc_middleware(rpc_middleware)
-                .max_response_body_size(
-                    conf.max_response_body_size
-                        .try_into()
-                        .expect("should be valid"),
-                )
                 .to_service_builder();
             let (stop_handle, server_handle) = stop_channel();
 
@@ -317,14 +325,9 @@ impl RpcServer {
         }
 
         let server = Server::builder()
-            .http_only()
+            .set_config(server_config)
             .set_http_middleware(http_middleware)
             .set_rpc_middleware(rpc_middleware)
-            .max_response_body_size(
-                conf.max_response_body_size
-                    .try_into()
-                    .expect("should be valid"),
-            )
             .build(listen_addr)
             .await?;
 

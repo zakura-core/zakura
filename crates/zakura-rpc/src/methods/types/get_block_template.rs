@@ -1,5 +1,7 @@
 //! Types and functions for the `getblocktemplate` RPC.
 
+mod miner_address;
+
 pub mod constants;
 pub mod parameters;
 pub mod proposal;
@@ -25,7 +27,6 @@ use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
-use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
 
 use zakura_chain::{
@@ -70,6 +71,7 @@ use constants::{
     CAPABILITIES_FIELD, MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP, MUTABLE_FIELD,
     NONCE_RANGE_FIELD, NOT_SYNCED_ERROR_CODE,
 };
+pub use miner_address::MinerAddress;
 pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
@@ -693,7 +695,7 @@ impl GetBlockTemplateResponse {
 #[derive(Clone, Debug)]
 pub struct MinerParams {
     /// Address for receiving miner subsidy and tx fees.
-    addr: Address,
+    addr: MinerAddress,
 
     /// Optional data to include in the coinbase input script.
     data: Option<PushValue>,
@@ -725,7 +727,7 @@ impl MinerParams {
     pub fn new(net: &Network, conf: config::mining::Config) -> Result<Self, MinerParamsError> {
         let addr = conf
             .miner_address
-            .map(|addr| Address::try_from_zcash_address(net, addr))
+            .map(|addr| MinerAddress::try_from_zcash_address(net, addr))
             .ok_or(MinerParamsError::MissingAddr)??;
 
         // Always tag the coinbase with the Zakura marker, even without configured
@@ -747,7 +749,7 @@ impl MinerParams {
     }
 
     /// Returns the miner address.
-    pub fn addr(&self) -> &Address {
+    pub fn addr(&self) -> &MinerAddress {
         &self.addr
     }
 
@@ -776,8 +778,8 @@ impl MinerParams {
     }
 }
 
-impl From<Address> for MinerParams {
-    fn from(addr: Address) -> Self {
+impl From<MinerAddress> for MinerParams {
+    fn from(addr: MinerAddress) -> Self {
         Self {
             addr,
             data: None,

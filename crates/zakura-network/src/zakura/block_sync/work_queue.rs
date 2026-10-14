@@ -23,7 +23,10 @@
 
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
 
 use tokio::sync::Notify;
@@ -59,6 +62,9 @@ pub(super) struct WorkItem {
     retry_after_tip: Option<block::Height>,
     /// Request reservation; received bodies use `Released`.
     pub(super) budget: BlockBudgetLedger,
+    /// Another attempt's body ended this owner's reservation. The owner's request
+    /// still claims the height, so dropping or moving the item is a revocation.
+    answered_elsewhere: bool,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -98,10 +104,47 @@ struct WorkQueueInner {
     /// item, maintained incrementally at each ledger transition so
     /// [`WorkQueue::reserved_bytes`]
     reserved_bytes: u64,
+    /// Nonzero reservations held by `in_flight` items, maintained at each
+    /// `in_flight` ledger transition so admission never scans the map.
+    in_flight_reserved: ReservedTally,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
     request_writes:
         std::collections::HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
+}
+
+/// A running count and byte sum of nonzero reservations.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct ReservedTally {
+    bytes: u64,
+    items: u64,
+}
+
+impl ReservedTally {
+    fn add(&mut self, charge: u64) {
+        if charge > 0 {
+            self.bytes = self.bytes.saturating_add(charge);
+            self.items = self.items.saturating_add(1);
+        }
+    }
+
+    fn sub(&mut self, charge: u64) {
+        if charge > 0 {
+            self.bytes = self.bytes.saturating_sub(charge);
+            self.items = self.items.saturating_sub(1);
+        }
+    }
+
+    #[cfg(test)]
+    fn add_tally(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.items = self.items.saturating_add(other.items);
+    }
+
+    fn sub_tally(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_sub(other.bytes);
+        self.items = self.items.saturating_sub(other.items);
+    }
 }
 
 impl WorkQueueInner {
@@ -138,6 +181,10 @@ fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
 pub(super) struct WorkQueue {
     inner: StdMutex<WorkQueueInner>,
     available: Notify,
+    /// Counts events that take an unreceived height from its owner without that
+    /// owner's routine retiring the request. Routines rescan their requests for
+    /// lost ownership only after this changes.
+    revocations: AtomicU64,
 }
 
 impl WorkQueue {
@@ -152,10 +199,36 @@ impl WorkQueue {
                 current_authority: None,
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
+                in_flight_reserved: ReservedTally::default(),
                 request_writes: std::collections::HashMap::new(),
             }),
             available: Notify::new(),
+            revocations: AtomicU64::new(0),
         }
+    }
+
+    /// The number of ownership revocations so far. See [`Self::revoke_for_owner`].
+    pub(super) fn revocations(&self) -> u64 {
+        self.revocations.load(Ordering::Acquire)
+    }
+
+    fn note_revocation(&self) {
+        self.revocations.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Return `owner`'s unreceived heights on behalf of another actor, such as
+    /// the floor watchdog. The owner's routine learns of the change from
+    /// [`Self::revocations`].
+    pub(super) fn revoke_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
+        let outcome = self.release_reserved_and_return_items_detailed_for_owner(owner, heights);
+        if outcome.returned_count > 0 || outcome.committed_count > 0 {
+            self.note_revocation();
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -212,6 +285,7 @@ impl WorkQueue {
                         retry_estimated_bytes: None,
                         retry_after_tip: None,
                         budget: BlockBudgetLedger::Released,
+                        answered_elsewhere: false,
                     },
                 );
                 inserted += 1;
@@ -337,6 +411,7 @@ impl WorkQueue {
         }
         for (height, item) in &taken {
             inner.pending.remove(height);
+            inner.in_flight_reserved.add(item.budget.reserved_charge());
             inner.in_flight.insert(*height, *item);
         }
         taken
@@ -444,9 +519,11 @@ impl WorkQueue {
         for (_, item) in &mut taken {
             item.owner = attempt.map(|(session, request)| item.scope.bind(session, request));
             item.provisional = attempt.is_some();
+            item.answered_elsewhere = false;
         }
         for (height, item) in &taken {
             inner.pending.remove(height);
+            inner.in_flight_reserved.add(item.budget.reserved_charge());
             inner.in_flight.insert(*height, *item);
         }
         #[cfg(test)]
@@ -466,6 +543,7 @@ impl WorkQueue {
             let mut inner = self.lock();
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
+                    inner.in_flight_reserved.sub(item.budget.reserved_charge());
                     item.owner = None;
                     if let Some(estimate) = item.retry_estimated_bytes.take() {
                         item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -497,6 +575,7 @@ impl WorkQueue {
                 continue;
             }
             if let Some(mut item) = inner.in_flight.remove(height) {
+                inner.in_flight_reserved.sub(item.budget.reserved_charge());
                 item.owner = None;
                 if let Some(estimate) = item.retry_estimated_bytes.take() {
                     item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -532,6 +611,7 @@ impl WorkQueue {
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut marked = 0u64;
+        let mut added = ReservedTally::default();
         let mut inner = self.lock();
         for height in heights {
             let Some(item) = inner.in_flight.get_mut(&height) else {
@@ -546,17 +626,19 @@ impl WorkQueue {
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.owner = owner;
             marked = marked.saturating_add(item.estimated_bytes);
+            added.add(item.estimated_bytes);
         }
         // Released (0) -> Reserved(estimate): the reserved total grows by exactly
         // the bytes just marked.
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
+        inner.in_flight_reserved.add_tally(added);
         marked
     }
 
     /// End an active request reservation at receipt.
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
-        self.release_active_reserved_height_matching(None, height)
+        self.release_active_reserved_height_matching(None, height, false)
     }
 
     /// End the receipt reservation and retire any queued request it invalidates.
@@ -566,13 +648,24 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Option<u64> {
-        self.release_active_reserved_height_matching(Some(owner), height)
+        self.release_active_reserved_height_matching(Some(owner), height, false)
+    }
+
+    /// Like [`Self::release_active_reserved_height_for_owner`], for a body that
+    /// another attempt received.
+    pub(super) fn release_answered_elsewhere(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> Option<u64> {
+        self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
     fn release_active_reserved_height_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
+        answered_elsewhere: bool,
     ) -> Option<u64> {
         let (released, claim) = {
             let mut inner = self.lock();
@@ -584,9 +677,11 @@ impl WorkQueue {
                 if !item.budget.is_reserved() {
                     return None;
                 }
+                item.answered_elsewhere = answered_elsewhere;
                 (item.budget.release_reserved(), item.owner)
             };
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            inner.in_flight_reserved.sub(released);
             let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
             (released.saturating_add(outcome.released_bytes), claim)
         };
@@ -621,7 +716,10 @@ impl WorkQueue {
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     return 0;
                 }
-                (item.budget.release_reserved(), item.owner)
+                let released = item.budget.release_reserved();
+                let owner = item.owner;
+                inner.in_flight_reserved.sub(released);
+                (released, owner)
             } else if let Some(mut item) = inner.pending.remove(&height) {
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     inner.pending.insert(height, item);
@@ -665,13 +763,16 @@ impl WorkQueue {
         heights: impl IntoIterator<Item = block::Height>,
     ) -> u64 {
         let mut released = 0u64;
+        let mut released_in_flight = ReservedTally::default();
         let mut inner = self.lock();
         for height in heights {
             if let Some(item) = inner.in_flight.get_mut(&height) {
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     continue;
                 }
-                released = released.saturating_add(item.budget.release_reserved());
+                let charge = item.budget.release_reserved();
+                released = released.saturating_add(charge);
+                released_in_flight.add(charge);
             } else if let Some(item) = inner.pending.get_mut(&height) {
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     continue;
@@ -680,6 +781,7 @@ impl WorkQueue {
             }
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        inner.in_flight_reserved.sub_tally(released_in_flight);
         released
     }
 
@@ -695,7 +797,9 @@ impl WorkQueue {
             let mut inner = self.lock();
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
-                    released = released.saturating_add(item.budget.release_reserved());
+                    let charge = item.budget.release_reserved();
+                    released = released.saturating_add(charge);
+                    inner.in_flight_reserved.sub(charge);
                     item.owner = None;
                     if let Some(estimate) = item.retry_estimated_bytes.take() {
                         item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -788,7 +892,12 @@ impl WorkQueue {
             .max(item.observed_bytes);
         item.retry_after_tip = Some(verified_tip);
         item.owner = None;
+        let revoked = std::mem::take(&mut item.answered_elsewhere);
         inner.pending.insert(height, item);
+        drop(inner);
+        if revoked {
+            self.note_revocation();
+        }
         true
     }
 
@@ -846,9 +955,9 @@ impl WorkQueue {
                     .in_flight
                     .remove(&height)
                     .expect("owned item exists because it was just checked");
-                outcome.released_bytes = outcome
-                    .released_bytes
-                    .saturating_add(item.budget.release_reserved());
+                let charge = item.budget.release_reserved();
+                inner.in_flight_reserved.sub(charge);
+                outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
                 outcome.committed_count = outcome.committed_count.saturating_add(1);
                 continue;
             }
@@ -863,9 +972,9 @@ impl WorkQueue {
                 .in_flight
                 .remove(&height)
                 .expect("reserved item exists because it was just checked");
-            outcome.released_bytes = outcome
-                .released_bytes
-                .saturating_add(item.budget.release_reserved());
+            let charge = item.budget.release_reserved();
+            inner.in_flight_reserved.sub(charge);
+            outcome.released_bytes = outcome.released_bytes.saturating_add(charge);
             item.owner = None;
             if let Some(estimate) = item.retry_estimated_bytes.take() {
                 item.estimated_bytes = estimate.max(item.observed_bytes);
@@ -905,6 +1014,7 @@ impl WorkQueue {
                 .expect("first_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
+        let mut revoked = false;
         while let Some((&height, _)) = inner.in_flight.first_key_value() {
             if height > floor {
                 break;
@@ -913,9 +1023,16 @@ impl WorkQueue {
                 .in_flight
                 .pop_first()
                 .expect("first_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            revoked |= item.budget.is_reserved() || item.answered_elsewhere;
+            let charge = item.budget.release_reserved();
+            inner.in_flight_reserved.sub(charge);
+            released = released.saturating_add(charge);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        drop(inner);
+        if revoked {
+            self.note_revocation();
+        }
         released
     }
 
@@ -952,6 +1069,7 @@ impl WorkQueue {
                 .expect("last_key_value returned Some");
             released = released.saturating_add(item.budget.release_reserved());
         }
+        let mut revoked = false;
         while let Some((&height, _)) = inner.in_flight.last_key_value() {
             if height <= floor {
                 break;
@@ -960,11 +1078,17 @@ impl WorkQueue {
                 .in_flight
                 .pop_last()
                 .expect("last_key_value returned Some");
-            released = released.saturating_add(item.budget.release_reserved());
+            revoked |= item.budget.is_reserved() || item.answered_elsewhere;
+            let charge = item.budget.release_reserved();
+            inner.in_flight_reserved.sub(charge);
+            released = released.saturating_add(charge);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
         drop(inner);
         drop(claims);
+        if revoked {
+            self.note_revocation();
+        }
         released
     }
 
@@ -984,19 +1108,33 @@ impl WorkQueue {
         self.lock().in_flight.len()
     }
 
+    /// Reserved bytes and reserved items in `in_flight` above `floor`.
+    ///
+    /// Admission reads this once per issued request, so it must not scan the
+    /// map. `in_flight` holds heights above the queue floor, which normally
+    /// matches `floor`, so only the heights between the two floors are scanned.
     pub(super) fn reserved_above(&self, floor: block::Height) -> (u64, u64) {
         let inner = self.lock();
-        inner
-            .in_flight
-            .range((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
-            .fold((0u64, 0u64), |(bytes, count), (_, item)| {
-                let charge = item.budget.reserved_charge();
-                if charge == 0 {
-                    (bytes, count)
-                } else {
-                    (bytes.saturating_add(charge), count.saturating_add(1))
-                }
-            })
+        let mut above = inner.in_flight_reserved;
+        for (_, item) in inner.in_flight.range(..=floor) {
+            above.sub(item.budget.reserved_charge());
+        }
+        debug_assert_eq!(
+            (above.bytes, above.items),
+            inner
+                .in_flight
+                .range((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
+                .fold((0u64, 0u64), |(bytes, count), (_, item)| {
+                    let charge = item.budget.reserved_charge();
+                    if charge == 0 {
+                        (bytes, count)
+                    } else {
+                        (bytes.saturating_add(charge), count.saturating_add(1))
+                    }
+                }),
+            "the in-flight reservation tally matches a scan",
+        );
+        (above.bytes, above.items)
     }
 
     /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
@@ -1158,15 +1296,19 @@ impl WorkQueue {
         self.lock().owner_for_height(height)
     }
 
-    /// Filter height metadata against current owners under one queue lock.
-    /// `Copy` prevents removed values from dropping request resources under the lock.
-    pub(super) fn retain_owned<T: Copy>(
+    /// Return the entries whose height no longer belongs to their owner, checked
+    /// under one queue lock. `Copy` keeps request resources out of the lock.
+    pub(super) fn disowned<T: Copy>(
         &self,
-        entries: &mut Vec<(block::Height, T)>,
+        entries: &[(block::Height, T)],
         owner_of: impl Fn(&T) -> zakura_header_chain::BodyWorkOwner,
-    ) {
+    ) -> Vec<(block::Height, T)> {
         let inner = self.lock();
-        entries.retain(|(height, entry)| inner.owner_for_height(*height) == Some(owner_of(entry)));
+        entries
+            .iter()
+            .filter(|(height, entry)| inner.owner_for_height(*height) != Some(owner_of(entry)))
+            .copied()
+            .collect()
     }
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {

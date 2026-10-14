@@ -34,7 +34,10 @@ type TestRpc = RpcImpl<
         zakura_test::mock_service::PanicAssertion,
         BoxError,
     >,
-    Buffer<zakura_state::ReadStateService, zakura_state::ReadRequest>,
+    Buffer<
+        zakura_state::ReadRequest,
+        <zakura_state::ReadStateService as tower::Service<zakura_state::ReadRequest>>::Future,
+    >,
     zakura_state::LatestChainTip,
     MockAddressBookPeers,
     MockService<

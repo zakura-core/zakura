@@ -1749,11 +1749,23 @@ criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source and manifest. This facade contains only cfg macros and feature-gated re-exports of separately policy-checked jsonrpsee components; it has no unsafe code, build script, I/O, or ambient capabilities of its own. The full all-feature target compiled."
 
+[[audits.jsonrpsee]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.11 -> 0.26.1"
+notes = "Reviewed the full delta. Only metadata and lints change: edition 2021 -> 2024, MSRV 1.74 -> 1.87, the jsonrpsee-* dependencies move to 0.26.1, the tokio minimum rises to 1.42, and the lint attributes move from src/lib.rs into a [lints] table. No code logic changed; the crate remains a feature-gated re-export facade with no unsafe code, build script, or I/O. It has no unit tests."
+
 [[audits.jsonrpsee-core]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source, manifest, and tests. The crate holds the shared JSON-RPC types, the method registry, and the subscription plumbing, with two unsafe expressions. Untrusted input is parsed through serde_json into borrowed request types, and the error paths return a JSON-RPC error object rather than panicking on a malformed method, id, or params. Subscription sinks are bounded by a channel whose capacity the server configures. There is no build script. All 13 library tests passed; the integration tests cannot run from the published package because they import the jsonrpsee facade crate, which depends on this one."
+
+[[audits.jsonrpsee-core]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.11 -> 0.26.1"
+notes = "Reviewed the full delta. Neither version has a build script. The manifest moves to edition 2024, bumps rand 0.8 -> 0.9, thiserror 1 -> 2 and tokio to 1.42, and adds optional tower 0.5 and pin-project for the server and client features. No new unsafe is introduced: the two existing String::from_utf8_unchecked calls still wrap serde_json output plus ASCII delimiters in the params builder and a completed BoundedWriter serialization in MethodResponse, and both results are now also re-parsed through RawValue::from_string. Most of the delta moves responses to Box<RawValue> and replaces tracing.rs with a middleware module (RpcServiceT, RpcServiceBuilder, Batch, a logger layer with char-boundary truncation). Subscription notifications are now serialized with serde instead of hand-built format! strings, and a subscription is removed only when the last sink clone drops, which also holds the subscription permit until then. The response-size BoundedWriter, the batch response length check, and http_helpers body limiting are unchanged. New expects are internal client-middleware invariants not reachable from server input. There is no new filesystem, network, process, or environment access. It builds standalone and all 18 library tests passed with all features."
 
 [[audits.jsonrpsee-proc-macros]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1761,17 +1773,35 @@ criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source, manifest, and UI fixtures. The procedural macro validates RPC trait methods, parameters, namespaces, subscriptions, aliases, and bounds before generating type-checked client and server adapters through separately policy-checked jsonrpsee APIs. It contains no unsafe code, build script, filesystem or network access, or process execution. All 4 unit tests passed."
 
+[[audits.jsonrpsee-proc-macros]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.11 -> 0.26.1"
+notes = "Reviewed the full delta. The crate still contains no unsafe code or build script, and its only compile-time environment access remains the unchanged proc_macro_crate lookup of the caller's manifest. Generated client methods are now plain fns returning impl Future + Send instead of async_trait methods, forwarding to the same ClientT calls, and a new optional namespace_separator attribute only changes the formatted method-name string. The server-side renderer is unchanged. Generated code adds no unsafe or I/O. Other changes are workspace dependency specs, rustfmt, doc examples, and updated trybuild fixtures. All 4 unit tests passed."
+
 [[audits.jsonrpsee-server]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script. It is the server side of JSON-RPC over HTTP and WebSocket, so its exposure is direct, and the limits are all present and configurable: maximum request and response body size, maximum concurrent connections enforced through a connection guard, maximum subscriptions per connection, and an explicit batch-request configuration that can disable batching or cap its length. Its test target cannot be built from the published package because it imports jsonrpsee_test_utils, a dev-dependency that does not resolve standalone; the library itself builds with all features."
 
+[[audits.jsonrpsee-server]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.11 -> 0.26.1"
+notes = "Reviewed the full delta. The crate still contains no unsafe code or build script and adds no runtime dependency crates; the manifest bumps hyper 1.5, soketto 0.8.1, thiserror 2, tower 0.5, and jsonrpsee-core/types 0.26.1 and moves to edition 2024. There is no new filesystem, process, environment, or network access beyond the existing hyper/tokio connection serving. Limit setters move to ServerConfig with unchanged defaults. Request body size (HTTP read_body and WebSocket max message size), the ConnectionGuard (also on the to_service_builder/TowerService path), subscriptions per connection, and batch disable/length checks in the shared handle_rpc_call are still enforced. Batches are now parsed up front and passed whole to RpcServiceT::batch; the root service enforces max_response_body_size through BatchResponseBuilder, but per-call middleware sees batched calls only if it implements batch, which zakura-rpc's RpcBatchMiddleware does with its own response limit. New hardening closes connections that send no request within 30 seconds and cancels in-flight WebSocket calls on disconnect. HTTP notifications now return a null body. The source matches the crates.io checksum in Cargo.lock. cargo build --all-features succeeds; the test target cannot be built from the published package because it imports the unpublished jsonrpsee-test-utils, so no tests were run."
+
 [[audits.jsonrpsee-types]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.24.11"
 notes = "Reviewed all packaged source, manifest, and tests. The crate contains typed JSON-RPC requests, responses, identifiers, errors, and borrowed parameter deserializers over caller-provided serde input. It has no unsafe code, build script, filesystem or network access, process execution, or other ambient capability. All 32 unit tests passed."
+
+[[audits.jsonrpsee-types]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.11 -> 0.26.1"
+notes = "Reviewed the full delta. The crate still contains no unsafe code or build script. Deserializers for untrusted Id, Params, TwoPointZero, ErrorObject, and Response input change only by lifetime elision, and the custom Response visitor only initializes the new non-serialized http::Extensions field; no new input-driven panics or allocations. RequestSer and NotificationSer fold into Request::borrowed/owned, InvalidRequest derives Clone, and From<Infallible> for ErrorObject is added. thiserror moves 1 -> 2 and serde_json drops its std feature request. All 30 unit tests passed."
 
 [[audits.jubjub]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -4748,7 +4778,7 @@ end = "2025-07-09"
 
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
-user-id = 169181 # Kris Nuttycombe (nuttycom)
+user-id = 169181
 start = "2024-08-12"
 end = "2027-07-10"
 
@@ -4784,24 +4814,24 @@ end = "2027-08-24"
 
 [[trusted.zcash_history]]
 criteria = "safe-to-deploy"
-user-id = 169181 # Kris Nuttycombe (nuttycom)
+user-id = 169181
 start = "2026-07-01"
 end = "2027-07-10"
 
 [[trusted.zcash_keys]]
 criteria = "safe-to-deploy"
-user-id = 169181 # Kris Nuttycombe (nuttycom)
+user-id = 169181
 start = "2024-01-15"
 end = "2027-07-10"
 
 [[trusted.zcash_primitives]]
 criteria = "safe-to-deploy"
-user-id = 169181 # Kris Nuttycombe (nuttycom)
+user-id = 169181
 start = "2024-08-20"
 end = "2027-07-10"
 
 [[trusted.zcash_proofs]]
 criteria = "safe-to-deploy"
-user-id = 169181 # Kris Nuttycombe (nuttycom)
+user-id = 169181
 start = "2024-08-20"
 end = "2027-07-10"

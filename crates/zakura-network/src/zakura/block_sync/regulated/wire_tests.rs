@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use zakura_chain::block;
 
-use super::wire::{Message, Range};
+use super::wire::{decode_control, Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{BlockSyncMessage, BlockSyncStatus},
     wire_codec::{decode_frame, encode_frame, message_suite::decode_checked},
@@ -22,14 +22,14 @@ proptest! {
         let range = Range::new(block::Height(start), count).unwrap();
         let message = match kind {
             1 => Message::Status(BlockSyncStatus {
-                servable_low: range.start,
+                servable_low: range.start(),
                 servable_high: block::Height(start + count),
                 ..Default::default()
             }),
             2 => Message::GetBlocks(range),
             3 => Message::Block(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec()),
-            4 => Message::BlocksDone { start: range.start, returned: count },
-            _ => Message::RangeUnavailable(range),
+            4 => Message::End(RangeEnding::done(range.start(), count)),
+            _ => Message::End(RangeEnding::unavailable(range.start(), range.count())),
         };
         let frame = encode_frame(&message).unwrap();
         prop_assert_eq!(decode_frame::<Message>(&frame).unwrap(), message);
@@ -221,6 +221,45 @@ fn stream_six_fixed_fixtures_cover_every_kind_and_rule() {
         assert!(
             decode_checked::<Message>(&frame(*tag, payload)).is_err(),
             "{name} is malformed"
+        );
+    }
+
+    // Production decodes controls through `decode_control`, and the public
+    // `BlockSyncMessage` decoder shares it. Both agree with the fixtures.
+    // A discriminator mismatch is an envelope fault, so those cases stay above.
+    let controls = |cases: &[(String, u16, Vec<u8>)]| {
+        cases
+            .iter()
+            .filter(|(_, tag, payload)| {
+                *tag != 3 && payload.first() == u8::try_from(*tag).ok().as_ref()
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let legal: Vec<_> = legal
+        .into_iter()
+        .map(|(name, tag, payload)| (name.to_string(), tag, payload))
+        .collect();
+    assert_eq!(controls(&legal).len(), 11);
+    assert!(controls(&malformed).len() > 20);
+    for (name, _, payload) in controls(&legal) {
+        assert!(
+            decode_control(&payload).is_ok(),
+            "{name} is a legal control"
+        );
+        assert!(
+            BlockSyncMessage::decode(&payload).is_ok(),
+            "{name} is legal through the public decoder"
+        );
+    }
+    for (name, _, payload) in controls(&malformed) {
+        assert!(
+            decode_control(&payload).is_err(),
+            "{name} is a malformed control"
+        );
+        assert!(
+            BlockSyncMessage::decode(&payload).is_err(),
+            "{name} is malformed through the public decoder"
         );
     }
 }

@@ -7,7 +7,7 @@ use zakura_chain::{
     serialization::{ZcashDeserialize, ZcashSerialize},
 };
 
-use super::wire::{Message, Range};
+use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{service::block_sync_streams, tests::fake_block_at_height, BlockSyncStatus},
     testkit::stream_conformance::{
@@ -43,16 +43,16 @@ impl StreamConformance for GetBlocksConformance {
                         .unwrap(),
                 )
             }
-            4 => Message::BlocksDone { start, returned: 1 },
-            5 => Message::RangeUnavailable(Range::new(start, 1).unwrap()),
+            4 => Message::End(RangeEnding::done(start, 1)),
+            5 => Message::End(RangeEnding::unavailable(start, 1)),
             _ => unreachable!("the stream declares only five message kinds"),
         }
     }
 
     fn exchange(message: &Message) -> u32 {
         let height = match message {
-            Message::GetBlocks(range) | Message::RangeUnavailable(range) => range.start,
-            Message::BlocksDone { start, .. } => *start,
+            Message::GetBlocks(range) => range.start(),
+            Message::End(ending) => ending.start,
             Message::Block(bytes) => {
                 block::Block::zcash_deserialize_from_slice(&mut bytes.as_slice())
                     .unwrap()

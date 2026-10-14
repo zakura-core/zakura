@@ -8,7 +8,7 @@ use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
 
 use super::{
     serving::{Read, ReadResult, Server, Source},
-    wire::{Message, Range, GET_BLOCKS},
+    wire::{Message, Range, RangeEnding, GET_BLOCKS},
 };
 use crate::zakura::{
     block_sync::{BlockSyncMessage, BlockSyncStatus},
@@ -112,18 +112,9 @@ fn envelopes_enforce_height_bounds_without_restricting_terminal_ranges() {
                 servable_high: height,
                 ..BlockSyncStatus::default()
             }),
-            Message::GetBlocks(Range {
-                start: height,
-                count: 1,
-            }),
-            Message::BlocksDone {
-                start: height,
-                returned: 128,
-            },
-            Message::RangeUnavailable(Range {
-                start: height,
-                count: 128,
-            }),
+            Message::GetBlocks(Range::unchecked(height, 1)),
+            Message::End(RangeEnding::done(height, 128)),
+            Message::End(RangeEnding::unavailable(height, 128)),
         ] {
             let encoded = encode_frame(&message);
             if height == block::Height::MAX {
@@ -152,8 +143,8 @@ fn envelopes_preserve_version_two_bytes() {
         (
             Message::GetBlocks(range),
             BlockSyncMessage::GetBlocks {
-                start_height: range.start,
-                count: range.count,
+                start_height: range.start(),
+                count: range.count(),
             },
         ),
         (
@@ -161,20 +152,17 @@ fn envelopes_preserve_version_two_bytes() {
             BlockSyncMessage::Block(block),
         ),
         (
-            Message::BlocksDone {
-                start: range.start,
-                returned: 1,
-            },
+            Message::End(RangeEnding::done(range.start(), 1)),
             BlockSyncMessage::BlocksDone {
-                start_height: range.start,
+                start_height: range.start(),
                 returned: 1,
             },
         ),
         (
-            Message::RangeUnavailable(range),
+            Message::End(RangeEnding::unavailable(range.start(), range.count())),
             BlockSyncMessage::RangeUnavailable {
-                start_height: range.start,
-                count: range.count,
+                start_height: range.start(),
+                count: range.count(),
             },
         ),
     ] {
@@ -230,10 +218,7 @@ async fn body_limit_excludes_tags_and_ending_and_stops_at_a_prefix() {
     );
     assert_eq!(
         receive(&mut recv).await,
-        Message::BlocksDone {
-            start: block::Height(1),
-            returned: 1
-        }
+        Message::End(RangeEnding::done(block::Height(1), 1))
     );
     cancel.cancel();
 }
@@ -266,12 +251,12 @@ async fn serving_stops_at_the_first_noncontiguous_or_excess_source_block() {
     let range = Range::new(block::Height(1), 2).unwrap();
     let prefix = vec![
         Message::Block(first.to_vec()),
-        Message::BlocksDone {
-            start: range.start,
-            returned: 1,
-        },
+        Message::End(RangeEnding::done(range.start(), 1)),
     ];
-    let unavailable = vec![Message::RangeUnavailable(range)];
+    let unavailable = vec![Message::End(RangeEnding::unavailable(
+        range.start(),
+        range.count(),
+    ))];
     for (source, max_blocks, expected) in [
         (vec![(1, first), (3, second)], 128, prefix.clone()),
         (vec![(1, first), (1, first)], 128, prefix.clone()),
@@ -320,7 +305,10 @@ async fn too_small_body_budget_returns_original_unavailable_range() {
     );
     let range = Range::new(block::Height(1), 128).unwrap();
     server.admit(range).unwrap();
-    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    assert_eq!(
+        receive(&mut recv).await,
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
+    );
     cancel.cancel();
 }
 
@@ -368,7 +356,10 @@ async fn cancellation_keeps_storage_execution_until_the_actual_job_finishes() {
             .is_err()
     );
     source.release.add_permits(2);
-    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    assert_eq!(
+        receive(&mut recv).await,
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
+    );
     second_cancel.cancel();
 }
 
@@ -427,7 +418,10 @@ async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
     );
     let range = Range::new(block::Height(1), 1).unwrap();
     server.admit(range).unwrap();
-    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    assert_eq!(
+        receive(&mut recv).await,
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
+    );
     assert!(!cancel.is_cancelled());
     cancel.cancel();
 }
@@ -448,14 +442,11 @@ fn envelope_allocations_are_bounded_by_the_payload() {
             Range::new(block::Height(1), 128).unwrap(),
         ))
         .unwrap(),
-        encode_frame(&Message::BlocksDone {
-            start: block::Height(1),
-            returned: 128,
-        })
-        .unwrap(),
-        encode_frame(&Message::RangeUnavailable(
-            Range::new(block::Height(1), 128).unwrap(),
-        ))
+        encode_frame(&Message::End(RangeEnding::done(block::Height(1), 128))).unwrap(),
+        encode_frame(&Message::End(RangeEnding::unavailable(
+            block::Height(1),
+            128,
+        )))
         .unwrap(),
         encode_frame(&Message::Block(BLOCK_MAINNET_1_BYTES.to_vec())).unwrap(),
         Frame {
@@ -653,10 +644,7 @@ async fn live_routine_serves_bounded_prefixes_and_allows_reuse_after_each_ending
         );
         assert_eq!(
             next_response(&mut live.output).await,
-            Message::BlocksDone {
-                start: block::Height(1),
-                returned: 1
-            }
+            Message::End(RangeEnding::done(block::Height(1), 1))
         );
         assert!(!live.cancel.is_cancelled());
     }
@@ -772,7 +760,10 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
     );
     let range = Range::new(block::Height(1), 1).unwrap();
     serving.admit(range).unwrap();
-    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    assert_eq!(
+        receive(&mut recv).await,
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
+    );
     cancel.cancel();
     drop(serving);
     tokio::time::timeout(Duration::from_secs(5), async {

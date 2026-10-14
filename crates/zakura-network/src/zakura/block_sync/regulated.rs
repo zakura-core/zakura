@@ -5,6 +5,7 @@
 //! The stream table checks frames and observes cadence before payload allocation.
 
 pub(super) mod live_requester;
+pub(super) use requester::CompletedRange;
 mod requester;
 mod serving;
 pub(super) mod session;

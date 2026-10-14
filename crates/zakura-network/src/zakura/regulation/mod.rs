@@ -25,7 +25,7 @@
 //! Main's `request` module stays until the block sync adoption replaces it.
 
 mod cadence;
-pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender};
+pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender, RowSend};
 
 mod request;
 pub(crate) use request::{

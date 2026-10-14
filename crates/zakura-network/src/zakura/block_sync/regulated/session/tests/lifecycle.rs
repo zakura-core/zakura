@@ -52,15 +52,15 @@ fn compact_session_lifecycle_peak() {
                     );
                     let fixed = measurement.snapshot();
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
                     }
                     let admitted = measurement.snapshot();
                     gate.add_permits(usize::try_from(count).unwrap());
                     for height in 1..=count {
                         assert!(
                             matches!(super::super::super::tests::receive(&mut output).await,
-                            super::super::super::wire::Message::RangeUnavailable(range)
-                                if range.start == Height(height))
+                            super::super::super::wire::Message::End(ending)
+                                if ending == super::super::super::wire::RangeEnding::unavailable(Height(height), 1))
                         );
                     }
                     while serving.capacity.node_execution_held() != 0 {
@@ -72,7 +72,7 @@ fn compact_session_lifecycle_peak() {
                     let idle = measurement.snapshot();
                     // The first new admission drains every old completion before overlap checks.
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
                     }
                     cancel.cancel();
                     drop((session, output, cancel));
@@ -88,7 +88,7 @@ fn compact_session_lifecycle_peak() {
                         Default::default(),
                     );
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
                     }
                     let replacement = measurement.snapshot();
                     cancel.cancel();

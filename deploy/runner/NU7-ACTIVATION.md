@@ -1,7 +1,8 @@
 # Automatic NU7 public-Testnet selection
 
 `zakura-cluster-status.py --nu7-activation-config <JSON>` serves `/v1/dashboard`
-as one coherent generation. Install `nu7_activation.py` beside it and use
+as one coherent generation. Install `nu7_activation.py` and
+`nu7-protocol-reference.json` beside it and use
 `nu7-activation.service` on the existing public-Testnet primary. Port 8096 is a
 read-only collector endpoint: allow only the existing API gateway and localhost
 in the host firewall. `nu7-activation-firewall.service` loads the dedicated
@@ -71,11 +72,16 @@ validator. Build metadata is reported when available; a release upgrade does
 not disable chain observation merely because the manifest revision is older.
 Update and qualify the joining manifest separately when deploying a new build.
 
-The response keeps `rules: null`: these existing RPCs do not export the full
-height-specific consensus table. Minimum-difficulty eligibility, minimum-
-difficulty block classification, and reissuance height are unavailable rather
-than inferred from separately maintained constants. NSM balances are reported
-when `getblockchaininfo` provides them; an absent balance is unavailable, not zero.
+The service combines the existing `getblockchaininfo`, `getinfo`, and
+`getblocksubsidy` responses with the versioned `nu7-protocol-reference.json`.
+It retains the full `rules.atTip` and `rules.nextBlock` table without node RPC
+changes. `rulesSource` identifies the reference revision and live fields. The
+reference applies only to its exact public-Testnet identity and NU7 branch;
+update it from reviewed protocol sources when those parameters change. Missing
+or mismatched reference data leaves `rules: null` while chain reporting continues.
+Subsidy failure leaves its amount unavailable without dropping other parameters.
+After NSM reissuance starts, total subsidy includes balance-dependent issuance,
+so the service does not label that total as the base subsidy.
 
 Capability objects are explicit: `faucet` is null or `{apiUrl, claimZat}`;
 `snapshot` is null or verified immutable snapshot metadata. Do not advertise the

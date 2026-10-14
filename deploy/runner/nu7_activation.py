@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import copy
+from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import itertools
@@ -92,6 +93,7 @@ class ActivationFeed:
         self.path = Path(self.config["stateFile"])
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.validate_config()
+        self.protocol_reference = self.load_protocol_reference()
         owner_path = self.path.with_suffix(".lock")
         previously_initialized = owner_path.exists()
         marker_path = self.path.with_suffix(".initialized")
@@ -173,7 +175,8 @@ class ActivationFeed:
             result = {"name": node["name"], "url": url, "source": node, "height": tip[0], "hash": tip[1],
                       "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                       "active": upgrade["status"] == "active",
-                      "nsmValueBalanceZat": info.get("nsmValueBalanceZat")}
+                      "nsmValueBalanceZat": info.get("nsmValueBalanceZat"),
+                      "consensus": info.get("consensus")}
             if include_build:
                 try:
                     version = self.rpc(url, "getinfo").get("build")
@@ -189,6 +192,64 @@ class ActivationFeed:
             # Avoid echoing URLs, credentials, or RPC response bodies.
             logging.warning("NU7 source %s unavailable (%s)", node["name"], type(exc).__name__)
             return {"name": node["name"], "fresh": False, "error": "Source unavailable or mismatched"}
+
+    @staticmethod
+    def load_protocol_reference():
+        """Load optional, versioned protocol data without gating chain reports."""
+        try:
+            return json.loads(Path(__file__).with_name("nu7-protocol-reference.json").read_text())
+        except (OSError, ValueError):
+            logging.warning("NU7 protocol reference unavailable; chain reporting continues")
+            return None
+
+    def consolidated_rules(self, primary):
+        """Combine reference constants with height, branch, build and subsidy RPCs."""
+        reference = self.protocol_reference
+        manifest = self.config["public"]["manifest"]["network"]
+        try:
+            if (not reference or reference["schemaVersion"] != 1
+                    or any(reference["network"][key] != manifest[key]
+                           for key in ("name", "magic", "branchId", "activationHeight"))):
+                return None
+            if (not isinstance(reference.get("sourceRevision"), str)
+                    or len(reference["sourceRevision"]) != 40
+                    or not isinstance(reference.get("sourceUrl"), str)):
+                return None
+            consensus = primary.get("consensus") or {}
+            branches = (consensus.get("chaintip"), consensus.get("nextblock"))
+            if any(branch != reference["network"]["branchId"] for branch in branches):
+                return None
+            exported = {}
+            for key, height, branch in zip(("atTip", "nextBlock"),
+                                            (primary["height"], primary["height"] + 1), branches):
+                value = copy.deepcopy(reference["parameters"])
+                value.update(schemaVersion=1, network=manifest["name"], networkMagic=manifest["magic"],
+                             effectiveHeight=height, buildVersion=primary.get("buildVersion"),
+                             activationHeight=manifest["activationHeight"], branchId=branch,
+                             nu7BranchId=manifest["branchId"], nu7Active=True, baseSubsidyZat=None)
+                try:
+                    subsidy = self.rpc(primary["url"], "getblocksubsidy", [height])
+                    amount = Decimal(str(subsidy["totalblocksubsidy"])) * 100_000_000
+                    # Before reissuance the RPC's total is the halving base subsidy.
+                    # Afterward it also contains balance-dependent issuance.
+                    if (height < value["nsmReissuanceHeight"] and amount.is_finite()
+                            and 0 <= amount <= 21_000_000 * 100_000_000
+                            and amount == amount.to_integral_value()):
+                        value["baseSubsidyZat"] = int(amount)
+                except (OSError, ValueError, KeyError, TypeError, InvalidOperation):
+                    logging.warning("NU7 subsidy unavailable; other observations retained")
+                value.update(value["difficulty"])
+                value["daaWindowBlocks"] = value["difficulty"]["averagingWindowBlocks"]
+                value["minimumDifficulty"] = {
+                    "gapMultiplier": value["difficulty"]["minimumDifficultyGapMultiplier"],
+                    "thresholdSeconds": value["difficulty"]["minimumDifficultyGapSeconds"],
+                    "comparison": "strictly-greater",
+                }
+                exported[key] = value
+            return exported
+        except (KeyError, TypeError, ValueError):
+            logging.warning("NU7 protocol reference mismatched; chain reporting continues")
+            return None
 
     def lightwallet(self, node, method, request):
         """Read bounded lightwalletd metadata through a pinned grpcurl binary."""
@@ -357,6 +418,7 @@ class ActivationFeed:
                 break
         if primary is None:
             raise ValueError("public chain quorum unavailable")
+        parameters = self.consolidated_rules(primary)
         height = primary["height"]
         manifest = self.config["public"]["manifest"]
         activation = manifest["network"]["activationHeight"]
@@ -381,19 +443,25 @@ class ActivationFeed:
             raise ValueError("sampled block left the current chain during collection")
         balance = primary.get("nsmValueBalanceZat")
         gap = max(0, headers[-1]["time"] - headers[-2]["time"]) if len(headers) > 1 else None
+        current_rules = parameters["atTip"] if parameters else None
+        threshold = current_rules["minimumDifficulty"]["thresholdSeconds"] if current_rules else None
+        limit = current_rules["powLimitCompact"] if current_rules else None
+        bits = tip.get("bits")
         reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now)
                   if agreement else {"reorgs24h": None, "since": now})
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
-            "network": {**manifest["network"], "reissuanceHeight": None, "reissuanceKnown": False},
+            "network": {**manifest["network"], "reissuanceHeight": current_rules["nsmReissuanceHeight"] if current_rules else None,
+                        "reissuanceKnown": current_rules is not None},
             "chain": {"height": height, "hash": primary["hash"], "blockTime": tip["time"],
                       "tipAgeSeconds": max(0, int(now - tip["time"])), "difficulty": tip.get("difficulty"),
                       "meanIntervalSeconds": round(statistics.mean(intervals), 1) if intervals else None,
                       "medianIntervalSeconds": round(statistics.median(intervals), 1) if intervals else None,
                       "intervalSampleBlocks": len(intervals),
                       "timestampGapSeconds": gap,
-                      "minimumDifficultyEligible": None,
-                      "minimumDifficultyBlock": None},
+                      "minimumDifficultyEligible": gap > threshold if gap is not None and threshold is not None else None,
+                      "minimumDifficultyBlock": str(bits).lower().removeprefix("0x") == str(limit).lower().removeprefix("0x")
+                      if bits is not None and limit is not None else None},
             "nsm": {"balanceZat": balance, "available": balance is not None, "seedZat": None},
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
@@ -407,7 +475,7 @@ class ActivationFeed:
                               "time": header["time"], "difficulty": header.get("difficulty")}
                              for header in reversed(headers[-8:])],
         }
-        return status, None
+        return status, parameters
 
     def envelope(self, profile, status, parameter_rules, now):
         settings = self.config["public" if profile == "public-testnet" else "staging"]
@@ -415,6 +483,14 @@ class ActivationFeed:
                 "selectionState": self.state["selectionState"], "generatedAt": now,
                 "status": status, "network": settings["manifest"], "rules": parameter_rules,
                 "capabilities": settings.get("capabilities", {"faucet": None, "snapshot": None})}
+        if profile == "public-testnet" and parameter_rules:
+            body["rulesSource"] = {
+                "kind": "protocol-reference-and-node-rpcs",
+                "protocolRevision": self.protocol_reference["sourceRevision"],
+                "protocolUrl": self.protocol_reference["sourceUrl"],
+                "liveFields": {"buildVersion": "getinfo", "baseSubsidyZat": "getblocksubsidy",
+                               "branchId": "getblockchaininfo", "effectiveHeight": "getblockchaininfo"},
+            }
         body["generation"] = hashlib.sha256(json.dumps(body, sort_keys=True, allow_nan=False).encode()).hexdigest()
         return body
 

@@ -32,7 +32,7 @@ class FakeRPC:
             raise OSError("offline")
         if method == "getblockchaininfo":
             return {"chain": "test", "blocks": self.height, "bestblockhash": f"{self.height:064x}",
-                    "nsmValueBalanceZat": 700, "upgrades": {
+                    "nsmValueBalanceZat": 700, "consensus": {"chaintip": "77190ad9", "nextblock": "77190ad9"}, "upgrades": {
                         "77190ad9": {"activationheight": 100, "status": "active" if self.height >= 100 else "pending"}}}
         if method == "getblockhash":
             if url in self.bad and params[0] >= 100:
@@ -42,6 +42,8 @@ class FakeRPC:
             return {"height": int(params[0], 16), "hash": params[0], "time": 990 - (102 - int(params[0], 16)) * 25, "difficulty": 3}
         if method == "getnetworkparameters":
             raise AssertionError("the service must use existing RPCs")
+        if method == "getblocksubsidy":
+            return {"totalblocksubsidy": 0.26041666 if params[0] <= 102 else 0.13020833}
         if method == "getinfo":
             return {"build": "test-" + "a" * 12}
         raise AssertionError(method)
@@ -66,6 +68,7 @@ class ActivationTests(unittest.TestCase):
         self.config_path = self.root / "config.json"
         self.config_path.write_text(json.dumps(self.config))
         self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+        self.feed.protocol_reference["network"] = copy.deepcopy(manifest()["network"])
 
     def tearDown(self):
         self.feed.owner.close()
@@ -107,7 +110,11 @@ class ActivationTests(unittest.TestCase):
         payload = self.feed.response()[1]
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["status"], "live")
-        self.assertIsNone(payload["rules"])
+        self.assertIsNotNone(payload["rules"])
+        self.assertEqual(payload["rules"]["atTip"]["baseSubsidyZat"], 26041666)
+        self.assertEqual(payload["rules"]["nextBlock"]["baseSubsidyZat"], 13020833)
+        self.assertEqual(payload["rules"]["atTip"]["buildVersion"], "release-" + "b" * 12)
+        self.assertEqual(payload["rulesSource"]["kind"], "protocol-reference-and-node-rpcs")
         first = payload["generatedAt"]
         self.rpc.height += 1
         self.poll()
@@ -115,6 +122,49 @@ class ActivationTests(unittest.TestCase):
         self.assertGreater(payload["generatedAt"], first)
         self.assertEqual(payload["status"]["chain"]["height"], 103)
         self.assertFalse(any(method == "getnetworkparameters" for _, method, _ in self.rpc.calls))
+
+    def test_missing_or_mismatched_reference_keeps_live_observations(self):
+        for reference in (None, {"schemaVersion": 1, "network": {}}):
+            self.feed.protocol_reference = reference
+            for _ in range(3):
+                self.poll()
+            payload = self.feed.response()[1]
+            self.assertEqual(payload["status"]["status"], "live")
+            self.assertIsNone(payload["rules"])
+
+    def test_unknown_branch_does_not_claim_reference_parameters(self):
+        primary = self.feed.observe(self.config["public"]["nodes"][0], self.now)
+        primary["consensus"]["nextblock"] = "12345678"
+        self.assertIsNone(self.feed.consolidated_rules(primary))
+
+    def test_bad_subsidy_keeps_reference_parameters_without_inventing_amount(self):
+        primary = self.feed.observe(self.config["public"]["nodes"][0], self.now)
+        original = self.rpc
+        for amount in ("NaN", "-1", "0.000000001"):
+            self.feed.rpc = lambda url, method, params=None: {"totalblocksubsidy": amount} if method == "getblocksubsidy" else original(url, method, params)
+            rules = self.feed.consolidated_rules(primary)
+            self.assertIsNone(rules["atTip"]["baseSubsidyZat"])
+            self.assertEqual(rules["atTip"]["targetSpacingSeconds"], 25)
+
+    def test_minimum_difficulty_uses_strict_block_timestamp_gap(self):
+        original = self.rpc
+        for gap, expected in ((450, False), (451, True)):
+            def headers(url, method, params=None):
+                value = original(url, method, params)
+                if method == "getblockheader":
+                    height = int(params[0], 16)
+                    value["time"] = 990 if height == 102 else 990 - gap - (101 - height) * 25
+                    value["bits"] = "2007ffff"
+                return value
+            self.feed.rpc = headers
+            self.feed.headers.clear()
+            nodes = [self.feed.observe(n, self.now) for n in self.config["public"]["nodes"]]
+            reference = self.feed.observe(self.config["public"]["reference"], self.now, False)
+            agreement = self.feed.agreement(nodes, reference, self.now)
+            status, rules = self.feed.public_status(nodes, agreement, self.now)
+            self.assertEqual(status["chain"]["minimumDifficultyEligible"], expected)
+            self.assertTrue(status["chain"]["minimumDifficultyBlock"])
+            self.assertEqual(status["network"]["reissuanceHeight"], rules["atTip"]["nsmReissuanceHeight"])
 
     def test_three_consecutive_passes_select_once(self):
         self.poll()
@@ -124,7 +174,7 @@ class ActivationTests(unittest.TestCase):
         payload = self.feed.response()[1]
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["nsm"]["balanceZat"], 700)
-        self.assertIsNone(payload["rules"])
+        self.assertIsNotNone(payload["rules"])
         self.assertEqual(payload["network"]["configSha256"], manifest()["configSha256"])
 
     def test_no_selection_before_confirmation_height(self):
@@ -319,7 +369,7 @@ class ActivationTests(unittest.TestCase):
             self.poll()
         payload = self.feed.response()[1]
         self.assertEqual(payload["status"]["status"], "live")
-        self.assertIsNone(payload["rules"])
+        self.assertIsNotNone(payload["rules"])
         self.assertEqual(self.feed.state["selectionEvidence"]["nodes"], ["1", "2"])
 
     def test_activation_hash_disagreement_does_not_select(self):
@@ -342,7 +392,7 @@ class ActivationTests(unittest.TestCase):
         payload = self.feed.response()[1]
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["chain"]["height"], 102)
-        self.assertIsNone(payload["rules"])
+        self.assertIsNotNone(payload["rules"])
 
     def test_duplicate_normalized_rpc_endpoints_are_rejected(self):
         self.feed.owner.close()

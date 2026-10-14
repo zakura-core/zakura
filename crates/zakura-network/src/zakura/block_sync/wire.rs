@@ -134,8 +134,8 @@ impl BlockSyncMessage {
         match control {
             Control::Status(status) => Self::Status(status),
             Control::GetBlocks(range) => Self::GetBlocks {
-                start_height: range.start,
-                count: range.count,
+                start_height: range.start(),
+                count: range.count(),
             },
             Control::End(RangeEnding {
                 start,
@@ -172,9 +172,9 @@ impl BlockSyncMessage {
 
     /// Decode this message and return the raw frame payload for block bodies.
     ///
-    /// The returned raw payload includes the stream-6 message type byte. Keeping
-    /// the whole payload lets the decoder move the frame allocation into the
-    /// reorder buffer without copying; consumers skip
+    /// The returned raw payload includes the stream-6 message type byte. The
+    /// decoder copies the payload once into an `Arc<[u8]>`, which the reorder
+    /// buffer then shares without further copies; consumers skip
     /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
@@ -208,8 +208,8 @@ impl BlockSyncMessage {
 
 /// Decode a `Block` payload, including its type byte, and keep the raw payload.
 ///
-/// Keeping the whole payload lets the decoder move the frame allocation into
-/// the reorder buffer without copying; consumers skip
+/// The payload is copied once into an `Arc<[u8]>`, which the reorder buffer
+/// then shares without further copies; consumers skip
 /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
 pub(super) fn decode_block_payload(
     payload: Vec<u8>,

@@ -35,12 +35,10 @@ const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 /// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
 /// the response configuration cannot inflate execution concurrency.
 pub(crate) fn serving_limits() -> ServeLimits {
-    let largest = Range {
-        start: Height::MIN,
-        count: MAX_BS_BLOCKS_PER_REQUEST,
-    }
-    .response_cap(MAX_BS_RESPONSE_BYTES)
-    .output_bytes();
+    let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
+        .expect("the protocol's largest range starts at height zero")
+        .response_cap(MAX_BS_RESPONSE_BYTES)
+        .output_bytes();
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
@@ -155,9 +153,8 @@ impl ServingSession {
     /// for storage or output capacity. Only overlapping or excessive commitments
     /// are peer faults here.
     pub(crate) fn admit(&mut self, range: Range) -> Result<(), SinkReject> {
-        let Range { start, count } = range;
+        let (start, last) = (range.start(), range.last());
         self.remove_completed();
-        let last = Height(start.0 + count - 1);
         if self
             .ranges
             .range(..=last)

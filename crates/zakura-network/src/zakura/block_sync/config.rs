@@ -246,7 +246,9 @@ pub struct ZakuraBlockSyncConfig {
     /// past it the peer gets no more work until it makes progress or the liveness
     /// deadline parks its block-sync session.
     pub max_requests_without_block_progress: u32,
-    /// How often this node sends unsolicited status refreshes after local frontier changes.
+    /// The minimum interval between `Status` messages this node sends on one connection.
+    /// The protocol's 30 s `Status` cadence applies first, so only a longer value slows
+    /// sends. The same interval also limits how often an inbound `Status` triggers a reply.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.

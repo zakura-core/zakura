@@ -112,10 +112,7 @@ fn envelopes_enforce_height_bounds_without_restricting_terminal_ranges() {
                 servable_high: height,
                 ..BlockSyncStatus::default()
             }),
-            Message::GetBlocks(Range {
-                start: height,
-                count: 1,
-            }),
+            Message::GetBlocks(Range::unchecked(height, 1)),
             Message::End(RangeEnding::done(height, 128)),
             Message::End(RangeEnding::unavailable(height, 128)),
         ] {
@@ -146,8 +143,8 @@ fn envelopes_preserve_version_two_bytes() {
         (
             Message::GetBlocks(range),
             BlockSyncMessage::GetBlocks {
-                start_height: range.start,
-                count: range.count,
+                start_height: range.start(),
+                count: range.count(),
             },
         ),
         (
@@ -155,17 +152,17 @@ fn envelopes_preserve_version_two_bytes() {
             BlockSyncMessage::Block(block),
         ),
         (
-            Message::End(RangeEnding::done(range.start, 1)),
+            Message::End(RangeEnding::done(range.start(), 1)),
             BlockSyncMessage::BlocksDone {
-                start_height: range.start,
+                start_height: range.start(),
                 returned: 1,
             },
         ),
         (
-            Message::End(RangeEnding::unavailable(range.start, range.count)),
+            Message::End(RangeEnding::unavailable(range.start(), range.count())),
             BlockSyncMessage::RangeUnavailable {
-                start_height: range.start,
-                count: range.count,
+                start_height: range.start(),
+                count: range.count(),
             },
         ),
     ] {
@@ -254,11 +251,11 @@ async fn serving_stops_at_the_first_noncontiguous_or_excess_source_block() {
     let range = Range::new(block::Height(1), 2).unwrap();
     let prefix = vec![
         Message::Block(first.to_vec()),
-        Message::End(RangeEnding::done(range.start, 1)),
+        Message::End(RangeEnding::done(range.start(), 1)),
     ];
     let unavailable = vec![Message::End(RangeEnding::unavailable(
-        range.start,
-        range.count,
+        range.start(),
+        range.count(),
     ))];
     for (source, max_blocks, expected) in [
         (vec![(1, first), (3, second)], 128, prefix.clone()),
@@ -310,7 +307,7 @@ async fn too_small_body_budget_returns_original_unavailable_range() {
     server.admit(range).unwrap();
     assert_eq!(
         receive(&mut recv).await,
-        Message::End(RangeEnding::unavailable(range.start, range.count))
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
     );
     cancel.cancel();
 }
@@ -361,7 +358,7 @@ async fn cancellation_keeps_storage_execution_until_the_actual_job_finishes() {
     source.release.add_permits(2);
     assert_eq!(
         receive(&mut recv).await,
-        Message::End(RangeEnding::unavailable(range.start, range.count))
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
     );
     second_cancel.cancel();
 }
@@ -423,7 +420,7 @@ async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
     server.admit(range).unwrap();
     assert_eq!(
         receive(&mut recv).await,
-        Message::End(RangeEnding::unavailable(range.start, range.count))
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
     );
     assert!(!cancel.is_cancelled());
     cancel.cancel();
@@ -765,7 +762,7 @@ async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
     serving.admit(range).unwrap();
     assert_eq!(
         receive(&mut recv).await,
-        Message::End(RangeEnding::unavailable(range.start, range.count))
+        Message::End(RangeEnding::unavailable(range.start(), range.count()))
     );
     cancel.cancel();
     drop(serving);

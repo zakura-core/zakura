@@ -109,7 +109,7 @@ impl Requester {
                     .skip(pending.received)
                     .map(|(offset, hash)| {
                         // A validated range contains at most 128 heights without overflow.
-                        (Height(pending.range.start.0 + offset as u32), *hash)
+                        (Height(pending.range.start().0 + offset as u32), *hash)
                     })
             })
             .take(limit)
@@ -143,7 +143,8 @@ impl Requester {
         let Some((start, pending)) = self.ranges.range_mut(..=height).next_back() else {
             return false;
         };
-        if u64::from(pending.range.start.0) + u64::from(pending.range.count) <= u64::from(height.0)
+        if u64::from(pending.range.start().0) + u64::from(pending.range.count())
+            <= u64::from(height.0)
         {
             return false;
         }
@@ -171,32 +172,32 @@ impl Requester {
             return Err(WireError::OutOfRange("response body bytes").into());
         }
         // The protocol count is at most 128 and fits usize on supported targets.
-        if expected.len() != range.count as usize || self.next.contains_key(&expected[0]) {
+        if expected.len() != range.count() as usize || self.next.contains_key(&expected[0]) {
             return Err(RequestError::ExpectedHeaders);
         }
-        let last = Height(range.start.0 + range.count - 1);
+        let last = range.last();
         if self
             .ranges
             .range(..=last)
             .next_back()
             .is_some_and(|(_, pending)| {
-                u64::from(pending.range.start.0) + u64::from(pending.range.count)
-                    > u64::from(range.start.0)
+                u64::from(pending.range.start().0) + u64::from(pending.range.count())
+                    > u64::from(range.start().0)
             })
         {
             return Err(RequestError::Overlap);
         }
         let writer = exchange.writer();
         self.reservations.reserve_fenced(
-            range.start,
+            range.start(),
             GET_BLOCKS.message_type,
             range.response_cap(max_body_bytes),
             entry,
             exchange,
         )?;
-        self.next.insert(expected[0], range.start);
+        self.next.insert(expected[0], range.start());
         self.ranges.insert(
-            range.start,
+            range.start(),
             Pending {
                 range,
                 expected: expected.into(),
@@ -295,7 +296,7 @@ impl Requester {
             && match ending.outcome {
                 Outcome::Done => ending.count as usize == pending.received,
                 Outcome::Unavailable => {
-                    pending.received == 0 && ending.count <= pending.range.count
+                    pending.received == 0 && ending.count <= pending.range.count()
                 }
             };
         if !matches {

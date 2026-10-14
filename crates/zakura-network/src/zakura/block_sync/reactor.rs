@@ -1864,15 +1864,18 @@ impl BlockSyncReactor {
                 self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
                 return false;
             }
-            Ok(blocked @ (StatusSend::Unwritten | StatusSend::QueueFull)) => {
+            // The previous Status frame is still waiting for its transport
+            // write. The queue may have free slots, so this is not a queue failure.
+            Ok(StatusSend::Unwritten) => {
                 peer_state.status_delivery.queue_full(now);
-                tracing::debug!(?peer, ?blocked, "Zakura block-sync Status queue is full");
-                let label = if blocked == StatusSend::Unwritten {
-                    "unwritten"
-                } else {
-                    "full"
-                };
-                self.trace_message_sent(peer, &msg, label, started.elapsed());
+                tracing::debug!(?peer, "previous Zakura block-sync Status is unwritten");
+                self.trace_message_sent(peer, &msg, "unwritten", started.elapsed());
+                return false;
+            }
+            Ok(StatusSend::QueueFull) => {
+                peer_state.status_delivery.queue_full(now);
+                tracing::debug!(?peer, "Zakura block-sync Status queue is full");
+                self.trace_message_sent(peer, &msg, "full", started.elapsed());
                 self.trace_queue_send_failed(
                     peer,
                     &msg,

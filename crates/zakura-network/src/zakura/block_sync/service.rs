@@ -127,8 +127,8 @@ impl BlockSyncPeerSession {
 
     /// Send a typed status advertisement.
     ///
-    /// `Full` also reports a Status that the connection's cadence deferred;
-    /// [`Self::offer_status`] distinguishes the two.
+    /// Returns `Full` when the connection's cadence defers the Status, when the
+    /// previous Status is still unwritten, or when the outbound queue is full.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
         match self.offer_status(status)? {
             StatusSend::Queued => Ok(()),
@@ -648,7 +648,7 @@ impl Service for BlockSyncService {
 
         // Production outbound block-sync frames go directly through
         // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
-        // the reactor's `try_send_status`, the serving session), so the raw transport
+        // the reactor's `offer_status`, the serving session), so the raw transport
         // sender taken from the stream here is redundant. The outbound stream stays
         // alive through the `BlockSyncPeerSession` clone the reactor holds, so
         // nothing is lost by dropping it.

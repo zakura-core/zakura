@@ -58,11 +58,9 @@ impl<S: Source + ?Sized> Produce for Server<S> {
     type Message = Message;
 
     fn response_cap(&self, range: &Range) -> ResponseCap {
-        Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        }
-        .response_cap(self.max_body_bytes)
+        range
+            .truncated(self.max_blocks)
+            .response_cap(self.max_body_bytes)
     }
 
     async fn produce(
@@ -74,15 +72,12 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        let read_range = Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        };
+        let read_range = range.truncated(self.max_blocks);
         let result = self
             .source
             .read(Read {
-                start_height: read_range.start,
-                count: read_range.count,
+                start_height: read_range.start(),
+                count: read_range.count(),
                 max_body_bytes: self.max_body_bytes,
                 lease: BlockRangeReadLease {
                     work: lease,
@@ -96,7 +91,7 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         // Encoding can be expensive. Await the actual job, even after session
         // cancellation, and keep the source's lease with its retained blocks.
         tokio::task::spawn_blocking(move || {
-            encode_response(requested, read_range.count, max_body_bytes, result, sink)
+            encode_response(requested, read_range.count(), max_body_bytes, result, sink)
         })
         .await
         .check_for_panics_with(false)
@@ -121,7 +116,7 @@ fn encode_response(
         if result.lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        if returned == max_blocks || height.0 != requested.start.0 + returned {
+        if returned == max_blocks || height.0 != requested.start().0 + returned {
             break;
         }
         let bytes = block
@@ -152,8 +147,8 @@ fn encode_response(
 
 fn ending(range: Range, returned: u32) -> Message {
     Message::End(if returned == 0 {
-        RangeEnding::unavailable(range.start, range.count)
+        RangeEnding::unavailable(range.start(), range.count())
     } else {
-        RangeEnding::done(range.start, returned)
+        RangeEnding::done(range.start(), returned)
     })
 }

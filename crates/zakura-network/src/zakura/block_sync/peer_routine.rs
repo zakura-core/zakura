@@ -2205,7 +2205,7 @@ impl PeerRoutine {
     /// retries its missing suffix; `RangeUnavailable` retries the original
     /// range even if the peer reported a smaller count.
     fn handle_ending(&mut self, completed: CompletedRange) {
-        let start_height = completed.range.start;
+        let start_height = completed.range.start();
         // Local timeouts, reorgs, and finality can retire the scheduler's work
         // while the peer's authority, already consumed above, remained live.
         let Some(key) = self.window.outstanding_key_for_start(start_height) else {

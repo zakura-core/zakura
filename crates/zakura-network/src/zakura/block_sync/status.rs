@@ -40,7 +40,8 @@ impl StatusDelivery {
         self.retry_at = at;
     }
 
-    /// Back off a blocked queue without waiting for the next cadence interval.
+    /// Back off a full queue or an unwritten previous Status without waiting
+    /// for the next cadence interval.
     pub(super) fn queue_full(&mut self, now: Instant) {
         self.retry_at = now + QUEUE_RETRY_INTERVAL;
     }
@@ -108,11 +109,9 @@ mod tests {
         let latest = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
         delivery.queued(latest);
-        delivery.deferred_until(now + Duration::from_secs(30));
-        assert_eq!(
-            delivery.next_deadline(latest, false),
-            Some(now + Duration::from_secs(30))
-        );
+        // The handshake keeps an unchanged Status due. The connection's cadence
+        // paces the resend; see the reactor test for that deferral.
+        assert_eq!(delivery.next_deadline(latest, false), Some(now));
         assert_eq!(delivery.next_deadline(latest, true), None);
     }
 

@@ -51,7 +51,7 @@ impl StreamConformance for GetBlocksConformance {
 
     fn exchange(message: &Message) -> u32 {
         let height = match message {
-            Message::GetBlocks(range) => range.start,
+            Message::GetBlocks(range) => range.start(),
             Message::End(ending) => ending.start,
             Message::Block(bytes) => {
                 block::Block::zcash_deserialize_from_slice(&mut bytes.as_slice())

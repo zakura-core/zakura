@@ -49,14 +49,42 @@ pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
     response(MSG_BS_RANGE_UNAVAILABLE, true, PayloadLen::exact(9)),
 ];
 
-/// A range whose count and last height have passed the wire checks.
+/// A range whose count and last height have passed the wire checks. Its
+/// fields are private, so every value comes from [`Range::new`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::block_sync) struct Range {
-    pub(in crate::zakura::block_sync) start: block::Height,
-    pub(in crate::zakura::block_sync) count: u32,
+    start: block::Height,
+    count: u32,
 }
 
 impl Range {
+    pub(in crate::zakura::block_sync) fn start(self) -> block::Height {
+        self.start
+    }
+
+    pub(in crate::zakura::block_sync) fn count(self) -> u32 {
+        self.count
+    }
+
+    /// The last requested height. [`Range::new`] checked that it exists.
+    pub(in crate::zakura::block_sync) fn last(self) -> block::Height {
+        block::Height(self.start.0 + (self.count - 1))
+    }
+
+    /// This range cut to at most `max_count` heights, keeping at least one.
+    pub(in crate::zakura::block_sync) fn truncated(self, max_count: u32) -> Self {
+        Self {
+            count: self.count.min(max_count.max(1)),
+            ..self
+        }
+    }
+
+    /// A range that skips the wire checks, for tests of the checks themselves.
+    #[cfg(test)]
+    pub(in crate::zakura::block_sync) fn unchecked(start: block::Height, count: u32) -> Self {
+        Self { start, count }
+    }
+
     pub(in crate::zakura::block_sync) fn new(
         start: block::Height,
         count: u32,
@@ -92,7 +120,8 @@ pub(in crate::zakura::block_sync) enum Outcome {
     Unavailable,
 }
 
-/// A structurally valid ending. It is not a requested interval: only a live
+/// An ending's start, count, and kind. The decoder checks the count, and the
+/// encoder checks it again. It is not a requested interval: only a live
 /// reservation can show that its start and count describe a real exchange.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::block_sync) struct RangeEnding {

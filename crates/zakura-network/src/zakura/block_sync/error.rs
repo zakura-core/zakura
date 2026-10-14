@@ -65,7 +65,7 @@ pub enum BlockSyncWireError {
 
     /// A control message broke the stream-6 layout or its field bounds.
     #[error("Zakura block-sync control message: {0}")]
-    Wire(crate::zakura::wire_codec::WireError),
+    Wire(#[source] crate::zakura::wire_codec::WireError),
 
     /// Zcash serialization failed.
     #[error("Zakura block-sync Zcash serialization error: {0}")]

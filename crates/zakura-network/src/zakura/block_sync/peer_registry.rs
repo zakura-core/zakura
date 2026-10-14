@@ -357,6 +357,21 @@ impl PeerRegistry {
         self.body_retry_all_lock().remove(&key);
     }
 
+    /// Like `clear_body_retry`, but keeps every supplier's `Incompatible` cooldown for the body.
+    pub(super) fn clear_body_availability_retry(
+        &self,
+        scope: zakura_header_chain::BodyWorkAuthority,
+        hash: block::Hash,
+    ) {
+        let key = BodyRetryKey::new(scope, hash);
+        self.body_retry_lock()
+            .entries
+            .retain(|(_, candidate, reason), _| {
+                *candidate != key || *reason == BodyRetryReason::Incompatible
+            });
+        self.body_retry_all_lock().remove(&key);
+    }
+
     /// Retire old work while preserving alarms and incompatibility reports from newer work.
     pub(super) fn retain_body_retry_scope(
         &self,

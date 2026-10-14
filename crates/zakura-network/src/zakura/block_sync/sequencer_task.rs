@@ -912,7 +912,16 @@ impl SequencerTask {
         let Some(failure) = outcome.retryable_mut() else {
             self.body_retries
                 .remove(owner.header_generation, owner.branch, hash);
-            self.registry.clear_body_retry(owner.authority(), hash);
+            if matches!(
+                outcome.verification(),
+                zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(_)
+            ) {
+                // The body is retried, so earlier mismatched suppliers stay avoided.
+                self.registry
+                    .clear_body_availability_retry(owner.authority(), hash);
+            } else {
+                self.registry.clear_body_retry(owner.authority(), hash);
+            }
             return;
         };
         eligible_sources.insert(source);
@@ -1368,17 +1377,26 @@ mod tests {
         input_bytes: Arc<std::sync::atomic::AtomicU64>,
         input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     ) -> SequencedBody {
+        queued_test_body_from(1, input_bytes, input_decoded_attributed_memory_bytes)
+    }
+
+    /// Queue the test block as delivered by the peer whose 32-byte ID repeats `supplier`.
+    fn queued_test_body_from(
+        supplier: u8,
+        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    ) -> SequencedBody {
         let block = test_block();
         let previous_block_hash = block.header.previous_block_hash;
         SequencedBody::new_queued(
             super::super::test_work_owner(),
-            zakura_header_chain::SourceId::from_digest([1; 32]),
+            zakura_header_chain::SourceId::from_digest([supplier; 32]),
             block::Height(1),
             block.hash(),
             previous_block_hash,
             BufferedBlockBody::from_decoded_block(block, None),
             123,
-            ZakuraPeerId::new(vec![1; 32]).expect("test peer id is valid"),
+            ZakuraPeerId::new(vec![supplier; 32]).expect("test peer id is valid"),
             Instant::now(),
             input_bytes,
             input_decoded_attributed_memory_bytes,
@@ -2354,7 +2372,8 @@ mod tests {
                     evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
                     requested: hash,
                     delivered: block::Hash([0x41; 32]),
-                    kind: zakura_header_chain::BodyCommitmentKind::TransactionMerkleRoot,
+                    // Routines reject transaction-root mismatches before the sequencer.
+                    kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
                     source: if attribution_matches {
                         source
                     } else {
@@ -2391,6 +2410,97 @@ mod tests {
                     Instant::now() + cooldown + Duration::from_millis(1),
                 ),
                 "the avoidance expires so an only supplier is retried later"
+            );
+        }
+    }
+
+    /// A second mismatched supplier for one body does not reopen the first supplier.
+    #[tokio::test]
+    async fn successive_payload_mismatches_keep_earlier_suppliers_avoided() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let registry = Arc::new(PeerRegistry::new());
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            registry.clone(),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        )
+        .with_body_mismatch_cooldown(Duration::from_secs(30));
+
+        let mut scope_and_hash = None;
+        for supplier in [1, 2] {
+            let mut body =
+                queued_test_body_from(supplier, input_bytes.clone(), input_decoded_bytes.clone());
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let mut outcome =
+                BlockApplyOutcome::payload_mismatch(zakura_header_chain::BodyPayloadMismatch {
+                    evidence: zakura_header_chain::EvidenceId::from_digest([supplier; 32]),
+                    requested: hash,
+                    delivered: block::Hash([0x41; 32]),
+                    kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+                    source,
+                });
+            task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::default())),
+            )
+            .await;
+            assert!(matches!(
+                actions_rx.recv().await,
+                Some(BlockSyncAction::Misbehavior { .. })
+            ));
+            scope_and_hash = Some((owner.authority(), hash));
+        }
+
+        let (scope, hash) = scope_and_hash.expect("both suppliers delivered the body");
+        let now = Instant::now();
+        for supplier in [1, 2] {
+            let peer = ZakuraPeerId::new(vec![supplier; 32]).expect("test peer ID is valid");
+            assert!(
+                registry.is_body_retry_avoided(&peer, scope, hash, now),
+                "supplier {supplier} stays avoided after a later mismatch for the same body"
             );
         }
     }

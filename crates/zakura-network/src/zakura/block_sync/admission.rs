@@ -46,6 +46,9 @@ pub(super) struct AdmissionSnapshot {
     /// Wire bytes of decoded submissions the driver can still retain, including
     /// bodies detached from `applying` while their completion is pending.
     pub(super) in_flight_submission_bytes: u64,
+    /// Measured heap of every decoded body: the sequencer input, the reorder
+    /// buffer, and `applying` including detached submissions.
+    pub(super) decoded_resident_bytes: u64,
     pub(super) reserved_above_floor_bytes: u64,
     pub(super) reserved_above_floor_blocks: u64,
     pub(super) budget_available: u64,
@@ -227,11 +230,13 @@ fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
         .saturating_add(snapshot.reserved_above_floor_bytes);
     // Decoded copies exist alongside their retained raw payloads, so the extra
     // decoded cost is the full decoded multiple on top of the ×1 wire charge.
-    let decoded = snapshot
+    // A block that decodes larger than the calibrated multiple is charged its
+    // measured size, so the gate follows real memory, never a lower figure.
+    let estimated = snapshot
         .sequencer_input_queued_bytes
         .saturating_add(snapshot.in_flight_submission_bytes)
         .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    serialized.saturating_add(decoded)
+    serialized.saturating_add(estimated.max(snapshot.decoded_resident_bytes))
 }
 
 fn held_blocks(snapshot: &AdmissionSnapshot) -> u64 {
@@ -526,6 +531,7 @@ mod tests {
             applying_buffered_blocks: u64::from(range_blocks) - 1,
             sequencer_input_queued_bytes: 0,
             in_flight_submission_bytes: 0,
+            decoded_resident_bytes: 0,
             reserved_above_floor_bytes: 0,
             reserved_above_floor_blocks: 0,
             budget_available: config.max_inflight_block_bytes,

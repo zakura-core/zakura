@@ -1277,15 +1277,15 @@ fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: Sequence
 /// True when two views differ in any field the reactor or per-peer routines
 /// schedule against. Ignores the observability-only committed throughput rates,
 /// which move on nearly every sample and must not, on their own, wake — or under a
-/// paused test clock, spin — the whole fleet of watchers.
+/// paused test clock, spin — the whole fleet of watchers. Admission reads the
+/// reorder and applying decoded totals, so a release there wakes gated routines;
+/// the input total and pipeline sum are sampled from an atomic and stay ignored.
 fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
     let strip_rates = |v: &SequencerView| {
         let mut v = *v;
         v.committed_bytes_per_sec = 0;
         v.committed_blocks_per_sec = 0;
         v.sequencer_input_decoded_attributed_memory_bytes = 0;
-        v.reorder_decoded_attributed_memory_bytes = 0;
-        v.applying_decoded_attributed_memory_bytes = 0;
         v.active_pipeline_decoded_attributed_memory_bytes = 0;
         v
     };

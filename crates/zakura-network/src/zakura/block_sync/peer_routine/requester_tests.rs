@@ -392,6 +392,74 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
     );
 }
 
+/// A body that keeps the expected header but not its transactions is junk that
+/// can decode far larger than the real block. The routine rejects it before it
+/// reaches the sequencer, including the duplicate-transaction Merkle malleation
+/// (CVE-2012-2459) that keeps the root.
+#[tokio::test]
+async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES);
+    let height = block.coinbase_height().unwrap();
+    assert_eq!(
+        block.transactions.len() % 2,
+        1,
+        "an odd count lets the last repeat"
+    );
+
+    let mut truncated = (*block).clone();
+    truncated.transactions.pop();
+    let mut malleated = (*block).clone();
+    malleated
+        .transactions
+        .push(malleated.transactions.last().unwrap().clone());
+    assert_eq!(
+        malleated
+            .transactions
+            .iter()
+            .collect::<block::merkle::Root>(),
+        block.header.merkle_root,
+        "the repeated last transaction keeps the Merkle root"
+    );
+
+    for junk in [truncated, malleated] {
+        let (mut routine, mut outbound, _pool, connection, mut events) =
+            requester_routine(block.hash());
+        let released = routine.work.reset_above(block::Height(0));
+        routine.budget.release(released);
+        routine.work.extend(
+            super::super::test_work_scope(),
+            [(height, block.hash(), BlockSizeEstimate::Confirmed(80_000))],
+        );
+        routine.servable_high = height;
+        let (body_sender, mut bodies) = mpsc::channel(1);
+        routine.sequencer_input = body_sender;
+        routine.try_fill().await;
+        next_sent(&mut outbound).await;
+        while events.try_recv().is_ok() {}
+
+        let error = try_deliver(&mut routine, BlockSyncMessage::Block(Arc::new(junk)))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SinkReject::Protocol(_)), "{error}");
+        assert!(
+            bodies.try_recv().is_err(),
+            "junk never reaches the sequencer"
+        );
+        let reported = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event,
+                RoutineToReactor::Misbehavior {
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                    ..
+                }
+            )
+        });
+        assert!(reported);
+        drop(routine);
+        drop(connection);
+    }
+}
+
 #[tokio::test]
 async fn a_partial_ending_requeues_only_the_missing_suffix() {
     let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);

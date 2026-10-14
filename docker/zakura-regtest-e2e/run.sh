@@ -954,7 +954,7 @@ wait_for_node2_exact_reopen() {
     logs=$(node2_logs_after "${lines_before}")
     # Drop later fields such as `finalized_tip_height=` so only the tip is compared.
     loaded_tip=$(printf '%s\n' "${logs}" \
-      | sed -n 's/.*loaded Zakura state cache chain_tip=\(.*\)$/\1/p' \
+      | sed -n 's/.*loaded Zakura state cache chain_tip=\(Some((block::Hash("[0-9a-f]\{64\}"), Height([0-9][0-9]*)))\|None\)\( .*\)\{0,1\}$/\1/p' \
       | sed 's/ [a-z_]*=.*$//' \
       | sed -n '1p')
     if [[ -n "${loaded_tip}" ]]; then

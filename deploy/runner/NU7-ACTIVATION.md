@@ -62,17 +62,19 @@ reference must have a distinct endpoint and source name. This rejects duplicate
 configured votes; independently verify host provenance because DNS aliases or
 proxies can still reach the same underlying node.
 
-Both profiles' nodes must expose the read-only `getnetworkparameters(height)`
-RPC. The feed reads current tip and next candidate rules from consensus, never
-from separately maintained website constants. Rules include `effectiveHeight`,
-`targetSpacingSeconds`, `daaWindowBlocks` and the nested `minimumDifficulty`
-object (`gapMultiplier`, `thresholdSeconds`, `comparison`). All original
-consensus export fields remain available. NSM values absent from a reference
-implementation are unavailable, rather than zero.
-Public selection requires two validators to agree on complete current and
-next-block exports at a common pinned height, as well as reference block hashes.
-Publication separately corroborates the exact displayed heights with a second
-validator, so a higher-tip parameter outlier cannot supply the dashboard rules.
+The feed uses existing RPCs: `getblockchaininfo`, `getblockhash`,
+`getblockheader`, and `getinfo`. Public selection requires two managed validators
+and an independent reference to agree on the activation block and a common
+chain height. Publication also corroborates the displayed tip with a second
+validator. Build metadata is reported when available; a release upgrade does
+not disable chain observation merely because the manifest revision is older.
+Update and qualify the joining manifest separately when deploying a new build.
+
+The response keeps `rules: null`: these existing RPCs do not export the full
+height-specific consensus table. Minimum-difficulty eligibility, minimum-
+difficulty block classification, and reissuance height are unavailable rather
+than inferred from separately maintained constants. NSM balances are reported
+when `getblockchaininfo` provides them; an absent balance is unavailable, not zero.
 
 Capability objects are explicit: `faucet` is null or `{apiUrl, claimZat}`;
 `snapshot` is null or verified immutable snapshot metadata. Do not advertise the
@@ -84,8 +86,8 @@ public-Testnet joining.
 1. Upgrade all three existing public nodes to the approved full SHA/checksum,
    validate their public identity and advancing common chain. Restrict regional
    RPC inbound traffic to the collector primary; prove other sources cannot use
-   it. Staging RPC remains loopback-only: its existing status collector embeds
-   optional pinned-tip consensus exports in /v1/status over HTTPS.
+   it. Staging RPC remains loopback-only; its existing status collector exposes
+   chain observations in /v1/status over HTTPS.
 2. Use the isolated official Zebra reference on the existing EU host,
    `http://164.92.209.78:28232/`, through the JSON-RPC adapter.
    `nu7-reference.service` uses its own database under
@@ -95,7 +97,7 @@ public-Testnet joining.
    rejected sources. The pinned official Zebra 7.0.0-rc.0 runtime reports
    protocol 170180 and public-Testnet NU7 pending at height 4465026, branch
    `77190ad9`. It provides an independent consensus implementation on a
-   Valargroup-operated host. It does not need our parameter-export RPC.
+   Valargroup-operated host. It uses the same existing chain-information RPCs.
    Verify runtime version, release provenance and schedule separately from
    chain qualification: a correct future schedule does not establish a synced
    chain. The reference must also verify checkpoint 4453700 above, agree with
@@ -111,7 +113,7 @@ public-Testnet joining.
    rehearsal before switching the website's configured endpoint.
 4. Verify fresh current node/reference observations, expected revisions, trusted
    checkpoint 4453700, matching current common hashes, the NU7 schedule and
-   consensus exports. Obtain required source/codeowner approvals and deploy the
+   chain observations. Obtain required source/codeowner approvals and deploy the
    website before arming. There is no mandatory one-hour waiting period.
    The optional read-only `nu7-public-readiness.service` receipt at
    `/var/lib/zakura-nu7-readiness/receipt.json` records sustained agreement for

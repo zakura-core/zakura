@@ -7,15 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from nu7_activation import ActivationFeed, atomic_json, rules
-
-
-def parameters(height):
-    return {"network": "Testnet", "effectiveHeight": height, "networkMagic": "fa1af9bf", "activationHeight": 100,
-            "branchId": "77190ad9", "nu7BranchId": "77190ad9", "targetSpacingSeconds": 25 if height >= 100 else 75,
-            "difficulty": {"averagingWindowBlocks": 102 if height >= 100 else 17,
-                           "minimumDifficultyGapMultiplier": 18 if height >= 100 else 6,
-                           "minimumDifficultyGapSeconds": 450, "minimumDifficultyStrictlyGreater": True}}
+from nu7_activation import ActivationFeed, atomic_json
 
 
 def manifest(magic="fa1af9bf"):
@@ -49,7 +41,7 @@ class FakeRPC:
         if method == "getblockheader":
             return {"height": int(params[0], 16), "hash": params[0], "time": 990 - (102 - int(params[0], 16)) * 25, "difficulty": 3}
         if method == "getnetworkparameters":
-            return parameters(params[0])
+            raise AssertionError("the service must use existing RPCs")
         if method == "getinfo":
             return {"build": "test-" + "a" * 12}
         raise AssertionError(method)
@@ -101,6 +93,29 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(self.feed.response()[1]["status"]["status"], "unavailable")
         self.assertEqual(self.feed.state["publicReorgObservation"], recorded)
 
+    def test_existing_rpcs_publish_after_a_release_upgrade(self):
+        original = self.rpc
+        def released_node(url, method, params=None):
+            if method == "getnetworkparameters":
+                raise ValueError("Method not found")
+            if method == "getinfo":
+                return {"build": "release-" + "b" * 12}
+            return original(url, method, params)
+        self.feed.rpc = released_node
+        for _ in range(3):
+            self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "public-testnet")
+        self.assertEqual(payload["status"]["status"], "live")
+        self.assertIsNone(payload["rules"])
+        first = payload["generatedAt"]
+        self.rpc.height += 1
+        self.poll()
+        payload = self.feed.response()[1]
+        self.assertGreater(payload["generatedAt"], first)
+        self.assertEqual(payload["status"]["chain"]["height"], 103)
+        self.assertFalse(any(method == "getnetworkparameters" for _, method, _ in self.rpc.calls))
+
     def test_three_consecutive_passes_select_once(self):
         self.poll()
         self.poll()
@@ -109,7 +124,7 @@ class ActivationTests(unittest.TestCase):
         payload = self.feed.response()[1]
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["nsm"]["balanceZat"], 700)
-        self.assertEqual(payload["rules"]["atTip"]["minimumDifficulty"]["thresholdSeconds"], 450)
+        self.assertIsNone(payload["rules"])
         self.assertEqual(payload["network"]["configSha256"], manifest()["configSha256"])
 
     def test_no_selection_before_confirmation_height(self):
@@ -174,16 +189,17 @@ class ActivationTests(unittest.TestCase):
         self.feed.clock = lambda: self.now + 61
         self.assertIsNone(self.feed.agreement(nodes, reference, self.now))
 
-    def test_manifest_revision_is_verified_against_running_binary(self):
+    def test_release_revision_does_not_disable_chain_observation(self):
         original = self.rpc
         def wrong_binary(url, method, params=None):
             return {"build": "test-" + "b" * 12} if method == "getinfo" else original(url, method, params)
         self.feed.rpc = wrong_binary
         observed = self.feed.observe(self.config["public"]["nodes"][0], self.now)
-        self.assertFalse(observed["fresh"])
+        self.assertTrue(observed["fresh"])
+        self.assertEqual(observed["buildVersion"], "test-" + "b" * 12)
         self.assertNotIn("sourceRevision", observed)
 
-    def test_rpc_tip_change_excludes_parameter_source(self):
+    def test_rpc_tip_change_excludes_chain_observation(self):
         original = self.rpc
         count = 0
         def moved(url, method, params=None):
@@ -241,7 +257,7 @@ class ActivationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum"):
             ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
 
-    def test_public_selection_persists_even_when_parameters_missing(self):
+    def test_public_selection_persists_even_when_chain_collection_fails(self):
         self.feed.public_status = mock.Mock(side_effect=ValueError("failed"))
         for _ in range(3):
             self.poll()
@@ -265,43 +281,28 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertTrue(self.feed.state["publicationDispatched"])
 
-    def test_parameter_outlier_is_excluded_from_public_rules(self):
-        original = self.rpc
-        def outlier(url, method, params=None):
-            value = original(url, method, params)
-            if url == "http://0" and method == "getnetworkparameters":
-                value["targetSpacingSeconds"] = 999
-                value["difficulty"]["averagingWindowBlocks"] = 999
-            return value
-        self.feed.rpc = outlier
+    def test_node_on_a_different_chain_is_excluded(self):
+        self.rpc.bad.add("0")
         for _ in range(3):
             self.poll()
         payload = self.feed.response()[1]
-        self.assertEqual(payload["selectedProfile"], "public-testnet")
-        self.assertEqual(payload["rules"]["atTip"]["targetSpacingSeconds"], 25)
+        self.assertEqual(payload["status"]["status"], "live")
+        self.assertIsNone(payload["rules"])
         self.assertEqual(self.feed.state["selectionEvidence"]["nodes"], ["1", "2"])
 
-    def test_two_different_parameter_exports_do_not_select(self):
-        original = self.rpc
+    def test_activation_hash_disagreement_does_not_select(self):
         self.rpc.offline.add("2")
-        def disagreement(url, method, params=None):
-            value = original(url, method, params)
-            if url == "http://0" and method == "getnetworkparameters":
-                value["difficulty"]["minimumDifficultyStrictlyGreater"] = False
-            return value
-        self.feed.rpc = disagreement
+        self.rpc.bad.add("0")
         for _ in range(3):
             self.poll()
         self.assertEqual(self.feed.state["selectedProfile"], "staging")
 
-    def test_higher_tip_outlier_cannot_publish_unmatched_rules(self):
+    def test_higher_tip_requires_corroboration_at_that_height(self):
         original = self.rpc
         def higher(url, method, params=None):
             value = original(url, method, params)
             if url == "http://0" and method == "getblockchaininfo":
                 value.update(blocks=104, bestblockhash=f"{104:064x}")
-            if url == "http://0" and method == "getnetworkparameters" and params[0] >= 104:
-                value["targetSpacingSeconds"] = 999
             return value
         self.feed.rpc = higher
         for _ in range(3):
@@ -309,7 +310,7 @@ class ActivationTests(unittest.TestCase):
         payload = self.feed.response()[1]
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["chain"]["height"], 102)
-        self.assertEqual(payload["rules"]["atTip"]["targetSpacingSeconds"], 25)
+        self.assertIsNone(payload["rules"])
 
     def test_duplicate_normalized_rpc_endpoints_are_rejected(self):
         self.feed.owner.close()
@@ -331,14 +332,6 @@ class ActivationTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.config))
         with self.assertRaisesRegex(ValueError, "distinct source name"):
             ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
-
-    def test_next_block_rule_boundary(self):
-        self.assertEqual(rules(parameters(99))["daaWindowBlocks"], 17)
-        self.assertEqual(rules(parameters(100))["daaWindowBlocks"], 102)
-        self.assertEqual(rules(parameters(100))["minimumDifficulty"]["comparison"], "strictly-greater")
-
-
-
 
 class ReferenceAdapterTests(unittest.TestCase):
     def test_compact_hash_byte_order_and_height_are_verified(self):

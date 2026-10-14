@@ -77,18 +77,6 @@ def atomic_json(path, value):
         os.close(directory)
 
 
-def rules(value):
-    result = {**value, **value["difficulty"]}
-    result["effectiveHeight"] = value["effectiveHeight"]
-    result["daaWindowBlocks"] = value["difficulty"]["averagingWindowBlocks"]
-    result["minimumDifficulty"] = {
-        "gapMultiplier": value["difficulty"]["minimumDifficultyGapMultiplier"],
-        "thresholdSeconds": value["difficulty"]["minimumDifficultyGapSeconds"],
-        "comparison": "strictly-greater" if value["difficulty"]["minimumDifficultyGapSeconds"] is not None else "disabled",
-    }
-    return result
-
-
 class ActivationFeed:
     """Poll the approved profiles and publish one locked, persistent selection.
 
@@ -162,7 +150,7 @@ class ActivationFeed:
                 < public["manifest"]["network"]["activationHeight"]):
             raise ValueError("identity checkpoint must follow staging divergence and precede public activation")
 
-    def observe(self, node, now, parameters=True):
+    def observe(self, node, now, include_build=True):
         """Verify network history and retain local progress age for every source."""
         try:
             if node.get("adapter") == "grpcurl":
@@ -185,45 +173,21 @@ class ActivationFeed:
             result = {"name": node["name"], "url": url, "source": node, "height": tip[0], "hash": tip[1],
                       "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                       "active": upgrade["status"] == "active"}
-            if parameters:
-                parameter_rules = self.parameter_rules(node, tip[0])
-                version = self.rpc(url, "getinfo").get("build")
-                expected = public["manifest"]["nodeRevision"]
-                if not isinstance(version, str) or expected[:9] not in version.lower():
-                    raise ValueError("running binary revision does not match approved manifest")
-                result["buildVersion"] = version
-                result["sourceRevision"] = expected
-                pinned = self.rpc(url, "getblockchaininfo")
-                if (pinned["blocks"], pinned["bestblockhash"]) != tip:
-                    raise ValueError("tip moved during parameter observation")
-                result["rules"] = parameter_rules
+            if include_build:
+                try:
+                    version = self.rpc(url, "getinfo").get("build")
+                    if isinstance(version, str):
+                        result["buildVersion"] = version
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+            pinned = self.rpc(url, "getblockchaininfo")
+            if (pinned["blocks"], pinned["bestblockhash"]) != tip:
+                raise ValueError("tip moved during chain observation")
             return result
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             # Avoid echoing URLs, credentials, or RPC response bodies.
             logging.warning("NU7 source %s unavailable (%s)", node["name"], type(exc).__name__)
             return {"name": node["name"], "fresh": False, "error": "Source unavailable or mismatched"}
-
-    def parameter_rules(self, node, height):
-        """Export complete rules at specified heights with public identity checks."""
-        public = self.config["public"]["manifest"]["network"]
-        exports = []
-        for effective_height in (height, height + 1):
-            value = self.rpc(node["rpcUrl"], "getnetworkparameters", [effective_height])
-            if (value["network"] != "Testnet" or value["networkMagic"] != "fa1af9bf"
-                    or value["activationHeight"] != public["activationHeight"]
-                    or value["nu7BranchId"] != public["branchId"]
-                    or value["effectiveHeight"] != effective_height):
-                raise ValueError("parameter export identity mismatch")
-            exports.append(rules(value))
-        return dict(zip(("atTip", "nextBlock"), exports))
-
-    def pinned_parameter_rules(self, observation, height):
-        """Reject exports if their source moved since its verified observation."""
-        exported = self.parameter_rules(observation["source"], height)
-        info = self.rpc(observation["url"], "getblockchaininfo")
-        if (info["blocks"], info["bestblockhash"]) != (observation["height"], observation["hash"]):
-            raise ValueError("tip moved during parameter agreement")
-        return exported
 
     def lightwallet(self, node, method, request):
         """Read bounded lightwalletd metadata through a pinned grpcurl binary."""
@@ -302,17 +266,14 @@ class ActivationFeed:
             try:
                 activation_hashes = [self.source_hash(n, activation) for n in sources]
                 common_hashes = [self.source_hash(n, common) for n in sources]
-                parameter_rules = [self.pinned_parameter_rules(n, common) for n in pair]
-                if (parameter_rules[0] == parameter_rules[1]
-                        and len(set(activation_hashes)) == len(set(common_hashes)) == 1
+                if (len(set(activation_hashes)) == len(set(common_hashes)) == 1
                         and all(0 <= self.clock() - n["observedAt"] <= 60 for n in sources)):
                     agreeing = [n["name"] for n in pair]
                     for candidate in candidates:
                         if candidate["name"] not in agreeing:
                             try:
                                 if (self.source_hash(candidate, activation) == activation_hashes[0]
-                                        and self.source_hash(candidate, common) == common_hashes[0]
-                                        and self.pinned_parameter_rules(candidate, common) == parameter_rules[0]):
+                                        and self.source_hash(candidate, common) == common_hashes[0]):
                                     agreeing.append(candidate["name"])
                             except (OSError, ValueError, KeyError, TypeError):
                                 pass
@@ -373,20 +334,18 @@ class ActivationFeed:
         return {"reorgs24h": len(events), "since": cutoff}
 
     def public_status(self, nodes, agreement, now):
-        available = [n for n in nodes if n.get("rules") and n.get("fresh")]
-        if not available:
-            raise ValueError("public parameter source unavailable")
+        available = [n for n in nodes if n.get("fresh") and n.get("active")]
         if agreement:
             available = [n for n in available if n["name"] in agreement["nodes"]]
-        # Corroborate the exact heights we publish, even when validators have
-        # different tips. Common-height agreement alone cannot attest a higher tip.
+        # A second validator must know the exact tip we publish, not just a
+        # lower common ancestor shared with an ahead or divergent node.
         primary = None
         for candidate in sorted(available, key=lambda n: n["height"], reverse=True):
             for peer in available:
-                if peer["name"] == candidate["name"]:
+                if peer["name"] == candidate["name"] or peer["height"] < candidate["height"]:
                     continue
                 try:
-                    if self.pinned_parameter_rules(peer, candidate["height"]) == candidate["rules"]:
+                    if self.source_hash(peer, candidate["height"]) == candidate["hash"]:
                         primary = candidate
                         break
                 except (OSError, ValueError, KeyError, TypeError):
@@ -394,7 +353,7 @@ class ActivationFeed:
             if primary is not None:
                 break
         if primary is None:
-            raise ValueError("public parameter quorum unavailable")
+            raise ValueError("public chain quorum unavailable")
         height = primary["height"]
         manifest = self.config["public"]["manifest"]
         activation = manifest["network"]["activationHeight"]
@@ -418,27 +377,20 @@ class ActivationFeed:
         if info["blocks"] != height or info["bestblockhash"] != primary["hash"]:
             raise ValueError("tip moved during coherent response collection")
         balance = info.get("nsmValueBalanceZat")
-        threshold = primary["rules"]["atTip"]["minimumDifficulty"]["thresholdSeconds"]
         gap = max(0, headers[-1]["time"] - headers[-2]["time"]) if len(headers) > 1 else None
-        bits = tip.get("bits")
-        limit = primary["rules"]["atTip"].get("powLimitCompact")
         reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now)
                   if agreement else {"reorgs24h": None, "since": now})
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
-            "network": {**manifest["network"], "targetSpacingSeconds": primary["rules"]["atTip"]["targetSpacingSeconds"],
-                        "daaWindowBlocks": primary["rules"]["atTip"]["daaWindowBlocks"],
-                        "reissuanceHeight": primary["rules"]["atTip"].get("nsmReissuanceHeight"),
-                        "reissuanceKnown": primary["rules"]["atTip"].get("nsmReissuanceHeight") is not None},
+            "network": {**manifest["network"], "reissuanceHeight": None, "reissuanceKnown": False},
             "chain": {"height": height, "hash": primary["hash"], "blockTime": tip["time"],
                       "tipAgeSeconds": max(0, int(now - tip["time"])), "difficulty": tip.get("difficulty"),
                       "meanIntervalSeconds": round(statistics.mean(intervals), 1) if intervals else None,
                       "medianIntervalSeconds": round(statistics.median(intervals), 1) if intervals else None,
                       "intervalSampleBlocks": len(intervals),
                       "timestampGapSeconds": gap,
-                      "minimumDifficultyEligible": (gap > threshold if gap is not None and threshold is not None else None),
-                      "minimumDifficultyBlock": (str(bits).lower().removeprefix("0x") == str(limit).lower().removeprefix("0x")
-                                                 if bits is not None and limit is not None else None)},
+                      "minimumDifficultyEligible": None,
+                      "minimumDifficultyBlock": None},
             "nsm": {"balanceZat": balance, "available": balance is not None, "seedZat": None},
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
@@ -452,7 +404,7 @@ class ActivationFeed:
                               "time": header["time"], "difficulty": header.get("difficulty")}
                              for header in reversed(headers[-8:])],
         }
-        return status, primary["rules"]
+        return status, None
 
     def envelope(self, profile, status, parameter_rules, now):
         settings = self.config["public" if profile == "public-testnet" else "staging"]
@@ -508,20 +460,7 @@ class ActivationFeed:
             else:
                 status = (self.staging_status.response()[1] if self.staging_status else
                           read_json(self.config["staging"]["statusUrl"]))
-                height = status["chain"]["height"]
-                exported = status.get("rules")
-                if exported:
-                    current, following = exported["atTip"], exported["nextBlock"]
-                elif self.config["staging"].get("rpcUrl"):
-                    current = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height])
-                    following = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height + 1])
-                else:
-                    raise ValueError("staging consensus export unavailable")
-                if (current["networkMagic"] != self.config["staging"]["manifest"]["network"]["magic"]
-                        or current["effectiveHeight"] != height
-                        or following["effectiveHeight"] != height + 1):
-                    raise ValueError("staging parameter network mismatch")
-                parameters = {"atTip": rules(current), "nextBlock": rules(following)}
+                parameters = None
             payload = self.envelope(profile, status, parameters, now)
         except (OSError, ValueError, KeyError, TypeError):
             previous = self.state.get("lastPublicEnvelope") if profile == "public-testnet" else None

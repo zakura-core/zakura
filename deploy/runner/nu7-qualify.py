@@ -28,7 +28,7 @@ receipt = {'checkedAt': time.time(), 'armed': config['armed'], 'dispatch': confi
            'referenceIdentityVerified': reference.get('fresh', False),
            'referenceHeight': reference.get('height'), 'referenceNu7Active': reference.get('active'),
            'nodeSources': [{k: n[k] for k in ('name', 'fresh', 'height', 'error', 'sourceRevision', 'buildVersion') if k in n} for n in nodes],
-           'sourceRevision': config['public']['manifest']['nodeRevision']}
+           'manifestRevision': config['public']['manifest']['nodeRevision']}
 reference_source = config['public']['reference']
 receipt['referenceNu7ScheduleVerified'] = bool(reference.get('fresh') and reference_source.get('adapter') != 'grpcurl')
 receipt['referenceTransport'] = reference_source.get('adapter', 'json-rpc')
@@ -50,6 +50,10 @@ if reference.get('fresh') and all(n.get('fresh') for n in nodes):
     hashes = [feed.source_hash(n, common) for n in sources]
     receipt.update(commonHeight=common, commonHash=hashes[0], preparedChainAgreement=len(set(hashes)) == 1)
 receipt['activationReferencePrepared'] = bool(receipt['preparedChainAgreement'] and receipt['referenceNu7ScheduleVerified'])
-receipt['prepared'] = receipt['preparedChainAgreement']
+receipt['manifestRevisionMatches'] = all(
+    config['public']['manifest']['nodeRevision'][:9] in str(n.get('buildVersion', '')).lower()
+    for n in nodes)
+receipt['prepared'] = receipt['preparedChainAgreement'] and (
+    not args.expected_revision or receipt['manifestRevisionMatches'])
 print(json.dumps(receipt, indent=2))
 sys.exit(0 if receipt['prepared'] else 1)

@@ -491,6 +491,10 @@ class MainnetTransitionTests(unittest.TestCase):
         for _ in range(3): self.poll()
         self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
         self.mainnet_wrong_chain = False
+        original = copy.deepcopy(self.feed.mainnet_protocol_reference)
+        self.feed.mainnet_protocol_reference["parameters"].pop("fees")
+        for _ in range(3): self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
         self.feed.mainnet_protocol_reference = None
         for _ in range(3): self.poll()
         self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")

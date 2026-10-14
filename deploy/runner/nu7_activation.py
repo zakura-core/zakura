@@ -258,6 +258,18 @@ class ActivationFeed:
                     or len(reference["sourceRevision"]) != 40
                     or not isinstance(reference.get("sourceUrl"), str)):
                 return None
+            required = {"targetSpacingSeconds", "minimumProtocolVersion", "nsmReissuanceHeight",
+                        "coinbaseMaturityBlocks", "fees", "difficulty", "actionLimits"}
+            parameters = reference["parameters"]
+            if not required.issubset(parameters):
+                return None
+            if (not {"minerPercent", "nsmPercent", "nsmRounding"}.issubset(parameters["fees"])
+                    or not {"globalShieldedBudget", "orchardActionsPerPool", "saplingSpendsAndOutputs", "sproutJoinSplits"}.issubset(parameters["actionLimits"])
+                    or not {"averagingTimespanSeconds", "averagingWindowBlocks", "dampingFactor",
+                            "maxAdjustDownPercent", "maxAdjustUpPercent", "medianTimeSpanBlocks",
+                            "minimumDifficultyGapMultiplier", "minimumDifficultyGapSeconds",
+                            "minimumDifficultyStrictlyGreater", "powLimit", "powLimitCompact"}.issubset(parameters["difficulty"])):
+                return None
             consensus = primary.get("consensus") or {}
             branches = (consensus.get("chaintip"), consensus.get("nextblock"))
             if any(branch != reference["network"]["branchId"] for branch in branches):
@@ -598,7 +610,7 @@ class ActivationFeed:
             self.state["consecutivePasses"] = self.state["consecutivePasses"] + 1 if agreement else 0
             if self.state["consecutivePasses"] >= 3:
                 self.select("public-testnet", agreement, now)
-        if self.state["selectedProfile"] == "public-testnet" and self.config.get("mainnet", {}).get("armed", False):
+        if self.state["selectedProfile"] == "public-testnet" and (self.config.get("mainnet") or {}).get("armed", False):
             mainnet_nodes, mainnet_agreement = self.collect("mainnet", now)
             ready = bool(mainnet_agreement and self.reference_parameters("mainnet"))
             # An activation switch must have the complete matching parameter table,

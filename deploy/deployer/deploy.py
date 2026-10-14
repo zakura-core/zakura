@@ -953,8 +953,8 @@ sysctl --load /etc/sysctl.d/60-zakura-network.conf >/dev/null
 def install_network_sysctls(node: Node, stage: str) -> None:
     """Install and load the shared network sysctls on the node's host.
 
-    The sysctls set the default UDP socket buffer sizes, so zakurad picks them
-    up the next time it opens its QUIC socket.
+    The sysctls raise the UDP socket buffer caps, so zakurad's QUIC socket gets
+    its full requested buffers the next time it is opened.
     """
     run(node.scp_to(str(NETWORK_SYSCTL_CONF), f"{stage}/zakura-network-sysctl.conf"), capture=True)
     if ssh_with_stdin(node, NETWORK_SYSCTL_SCRIPT.format(stage=shlex.quote(stage))).returncode != 0:

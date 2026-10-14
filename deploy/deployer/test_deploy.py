@@ -266,11 +266,11 @@ class NetworkSysctlTests(NodeBuilder, unittest.TestCase):
             if line.strip() and not line.startswith("#"):
                 key, value = (part.strip() for part in line.split("=", 1))
                 settings[key] = int(value)
-        # 212992 bytes is the stock Linux default for every one of these keys.
-        for key in ("rmem_default", "wmem_default", "rmem_max", "wmem_max"):
-            self.assertGreater(settings[f"net.core.{key}"], 212992)
-        self.assertLessEqual(settings["net.core.rmem_default"], settings["net.core.rmem_max"])
-        self.assertLessEqual(settings["net.core.wmem_default"], settings["net.core.wmem_max"])
+        # netwatch requests 7 MiB buffers for the QUIC socket; the caps must admit them.
+        for key in ("rmem_max", "wmem_max"):
+            self.assertGreaterEqual(settings[f"net.core.{key}"], 7 << 20)
+        self.assertNotIn("net.core.rmem_default", settings)
+        self.assertNotIn("net.core.wmem_default", settings)
         self.assertEqual(settings["net.ipv4.tcp_slow_start_after_idle"], 0)
 
     def test_deploy_installs_sysctls_before_the_node(self):

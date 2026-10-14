@@ -123,8 +123,8 @@ Host files:
 - legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
 - monitor log: `/var/log/zakura/monitor.log`
 - network sysctls: `/etc/sysctl.d/60-zakura-network.conf`, copied from
-  `deploy/sysctl/` and loaded on every deploy. The next run's `zakurad` picks
-  up the larger UDP socket buffers.
+  `deploy/sysctl/` and loaded on every deploy. The next run's `zakurad` gets
+  its full 7 MiB UDP socket buffers.
 
 ## Deployment
 

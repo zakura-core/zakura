@@ -297,7 +297,7 @@ rm -f /tmp/zakura-continuous-sync.py \
   /tmp/zakura-continuous-tmpfiles.conf \
   /tmp/zakura-network-sysctl.conf
 
-# The node picks up the UDP buffer defaults when it next opens its socket.
+# The node picks up the raised UDP buffer caps when it next opens its socket.
 sysctl --load /etc/sysctl.d/60-zakura-network.conf >/dev/null
 systemd-tmpfiles --create /etc/tmpfiles.d/zakura-continuous-sync.conf || true
 systemctl daemon-reload

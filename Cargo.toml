@@ -49,8 +49,8 @@ edition = "2021"
 # gate refers to `zakura-assets` and nothing else.
 zakura-assets = { version = "=0.3513777.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = { version = "=3.0.0", package = "zakura-orchard" }
-sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto" }
+orchard = { version = "=3.0.0", package = "zakura-orchard", default-features = false, features = ["circuit", "multicore", "std"] }
+sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto", default-features = false, features = ["circuit", "multicore"] }
 zcash_address = { version = "=3.0.0", package = "zakura-address" }
 zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
 zcash_primitives = { version = "=3.0.0", package = "zakura-primitives" }

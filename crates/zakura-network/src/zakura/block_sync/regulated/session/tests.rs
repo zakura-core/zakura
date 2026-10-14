@@ -81,29 +81,30 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
         CancellationToken::new(),
         Default::default(),
     );
-    session.admit(Height(1), 1).unwrap();
-    session.admit(Height(2), 1).unwrap();
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     wait_completed(&mut session, Height(2)).await;
     assert!(session.ranges.contains_key(&Height(1)));
-    assert!(session.admit(Height(1), 1).is_err());
+    assert!(session.admit(Range::new(Height(1), 1).unwrap()).is_err());
     let next_gate = Arc::new(Semaphore::new(0));
     source
         .gates
         .lock()
         .unwrap()
         .insert(Height(2), next_gate.clone());
-    session.admit(Height(2), 1).unwrap();
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     first_gate.add_permits(1);
     for height in [1, 2] {
         assert!(matches!(super::super::tests::receive(&mut output).await,
-            super::super::wire::Message::RangeUnavailable(range) if range.start == Height(height)));
+            super::super::wire::Message::End(ending)
+                if ending == super::super::wire::RangeEnding::unavailable(Height(height), 1)));
     }
     session.remove_completed();
     assert!(
         session.ranges.contains_key(&Height(2)),
         "old completion cannot release the replacement"
     );
-    assert!(session.admit(Height(2), 1).is_err());
+    assert!(session.admit(Range::new(Height(2), 1).unwrap()).is_err());
     next_gate.add_permits(1);
     super::super::tests::receive(&mut output).await;
     wait_completed(&mut session, Height(2)).await;
@@ -132,7 +133,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
         CancellationToken::new(),
         Default::default(),
     );
-    old.admit(Height(1), 1).unwrap();
+    old.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while source.started.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -157,7 +158,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
         CancellationToken::new(),
         Default::default(),
     );
-    new.admit(Height(1), 1).unwrap();
+    new.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     old_gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), async {
         while source.started.load(Ordering::SeqCst) < 2
@@ -170,7 +171,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     .unwrap();
     new.remove_completed();
     assert!(new.ranges.contains_key(&Height(1)));
-    assert!(new.admit(Height(1), 1).is_err());
+    assert!(new.admit(Range::new(Height(1), 1).unwrap()).is_err());
     new_gate.add_permits(1);
     super::super::tests::receive(&mut output).await;
     wait_completed(&mut new, Height(1)).await;
@@ -239,8 +240,12 @@ async fn serving_enforces_the_budgeted_limit() {
         Default::default(),
     );
     for height in 1..=2 * limit {
-        session.admit(Height(height), 1).unwrap();
+        session
+            .admit(Range::new(Height(height), 1).unwrap())
+            .unwrap();
     }
-    assert!(session.admit(Height(2 * limit + 1), 1).is_err());
+    assert!(session
+        .admit(Range::new(Height(2 * limit + 1), 1).unwrap())
+        .is_err());
     cancel.cancel();
 }

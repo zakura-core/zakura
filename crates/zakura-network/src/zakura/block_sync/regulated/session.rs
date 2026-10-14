@@ -156,10 +156,11 @@ pub(crate) struct ServingSession {
 }
 
 impl ServingSession {
-    /// Admit without waiting for storage or output capacity. Only malformed,
-    /// overlapping, or excessive commitments are peer faults.
-    pub(crate) fn admit(&mut self, start: Height, count: u32) -> Result<(), SinkReject> {
-        let range = Range::new(start, count).map_err(SinkReject::protocol)?;
+    /// Admit a range that the stream-6 codec already checked, without waiting
+    /// for storage or output capacity. Only overlapping or excessive commitments
+    /// are peer faults here.
+    pub(crate) fn admit(&mut self, range: Range) -> Result<(), SinkReject> {
+        let Range { start, count } = range;
         self.remove_completed();
         let last = Height(start.0 + count - 1);
         if self

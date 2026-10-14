@@ -1,4 +1,4 @@
-use super::super::request::BlockSizeEstimate;
+use super::super::{request::BlockSizeEstimate, MSG_BS_BLOCK};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
 use zakura_chain::serialization::ZcashDeserializeInto;

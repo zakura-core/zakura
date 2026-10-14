@@ -3,7 +3,7 @@ use zakura_chain::block::{Hash, Height};
 
 use super::{
     requester::{RequestError, Requester, ResponseError},
-    wire::{Message, Range},
+    wire::{Range, RangeEnding},
 };
 use crate::zakura::{
     regulation::{ReservationPool, WriterFence},
@@ -51,13 +51,12 @@ fn rejects_overlap_until_the_old_range_ends_even_after_abandonment() {
     ));
     assert_eq!(pool.held(), 1);
     assert!(book.claim_block(hash(1), 3).unwrap().1.abandoned);
-    let (_, ended) = book
-        .finish(&Message::BlocksDone {
-            start: Height(10),
-            returned: 1,
-        })
-        .unwrap();
-    assert!(ended.abandoned);
+    let completed = book.finish(RangeEnding::done(Height(10), 1)).unwrap();
+    assert_eq!(
+        completed.range,
+        range(10, 3),
+        "the ending names the original request"
+    );
     assert_eq!(pool.held(), 0);
     book.reserve(
         range(12, 2),
@@ -101,11 +100,7 @@ fn only_the_next_hash_can_claim_each_range() {
         Err(ResponseError::Identity)
     ));
     assert_eq!(book.claim_block(hash(2), 3).unwrap().0, Height(11));
-    book.finish(&Message::BlocksDone {
-        start: Height(10),
-        returned: 2,
-    })
-    .unwrap();
+    book.finish(RangeEnding::done(Height(10), 2)).unwrap();
     assert!(matches!(
         book.claim_block(hash(2), 3),
         Err(ResponseError::Identity)
@@ -135,11 +130,7 @@ fn rejects_body_overrun_even_if_unused_tag_allowance_would_fit_it() {
         book.claim_block(hash(2), 2),
         Err(ResponseError::BodyBytes)
     ));
-    book.finish(&Message::BlocksDone {
-        start: Height(1),
-        returned: 1,
-    })
-    .unwrap();
+    book.finish(RangeEnding::done(Height(1), 1)).unwrap();
     assert_eq!(pool.held(), 0);
 }
 
@@ -159,27 +150,13 @@ fn invalid_endings_preserve_authorization_and_started_exchange_ownership() {
         .unwrap();
     assert!(writer.publish(|| {}));
     assert!(writer.try_start(|| true));
-    assert!(book
-        .finish(&Message::RangeUnavailable(range(1, 3)))
-        .is_err());
-    assert!(book
-        .finish(&Message::BlocksDone {
-            start: Height(1),
-            returned: 1
-        })
-        .is_err());
+    assert!(book.finish(RangeEnding::unavailable(Height(1), 3)).is_err());
+    assert!(book.finish(RangeEnding::done(Height(1), 1)).is_err());
     assert_eq!(pool.held(), 1);
     assert!(!connection.is_cancelled());
     book.claim_block(hash(1), 3).unwrap();
-    assert!(book
-        .finish(&Message::RangeUnavailable(range(1, 2)))
-        .is_err());
-    assert!(book
-        .finish(&Message::BlocksDone {
-            start: Height(1),
-            returned: 2
-        })
-        .is_err());
+    assert!(book.finish(RangeEnding::unavailable(Height(1), 2)).is_err());
+    assert!(book.finish(RangeEnding::done(Height(1), 2)).is_err());
     drop(book);
     assert!(
         connection.is_cancelled(),
@@ -214,11 +191,7 @@ fn valid_ending_allows_replacement_and_failed_publication_releases_capacity() {
     assert!(writer.publish(|| {}));
     assert!(writer.try_start(|| true));
     book.claim_block(hash(1), 3).unwrap();
-    book.finish(&Message::BlocksDone {
-        start: Height(1),
-        returned: 1,
-    })
-    .unwrap();
+    book.finish(RangeEnding::done(Height(1), 1)).unwrap();
     assert!(fence.retire());
     assert!(!connection.is_cancelled());
     assert_eq!(pool.held(), 0);
@@ -307,17 +280,14 @@ fn shortened_unavailable_ends_the_whole_requested_range() {
     assert!(writer.publish(|| {}));
     assert!(writer.try_start(|| true));
     assert!(book
-        .finish(&Message::RangeUnavailable(Range {
-            start: Height(10),
-            count: 0,
-        }))
+        .finish(RangeEnding::unavailable(Height(10), 0))
         .is_err());
     assert_eq!(pool.held(), 1);
 
-    let (retry, _) = book
-        .finish(&Message::RangeUnavailable(range(10, 1)))
+    let completed = book
+        .finish(RangeEnding::unavailable(Height(10), 1))
         .unwrap();
-    assert_eq!(retry, requested);
+    assert_eq!(completed.range, requested);
     assert_eq!(pool.held(), 0);
     assert!(fence.retire());
     assert!(!connection.is_cancelled());
@@ -354,18 +324,10 @@ fn unfinished_ranges_keep_capacity_and_do_not_extend_their_retirement_deadline()
     assert_eq!(book.retirement_deadline(grace), Some(deadline));
     assert!(book.blocks_retry(Height(1)));
     assert_eq!(book.retirement_deadline(grace), Some(deadline));
-    book.finish(&Message::BlocksDone {
-        start: Height(1),
-        returned: 1,
-    })
-    .unwrap();
+    book.finish(RangeEnding::done(Height(1), 1)).unwrap();
     assert!(!book.at_capacity());
     assert!(book.retirement_deadline(grace).is_some());
     assert!(!book.blocks_retry(Height(1)));
-    book.finish(&Message::BlocksDone {
-        start: Height(2),
-        returned: 1,
-    })
-    .unwrap();
+    book.finish(RangeEnding::done(Height(2), 1)).unwrap();
     assert!(book.retirement_deadline(grace).is_none());
 }

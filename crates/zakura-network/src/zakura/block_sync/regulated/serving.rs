@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use zakura_chain::{block, diagnostic::task::CheckForPanics, serialization::ZcashSerialize};
 
-use super::wire::{Message, Range};
+use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
     regulation::{
@@ -151,12 +151,9 @@ fn encode_response(
 }
 
 fn ending(range: Range, returned: u32) -> Message {
-    if returned == 0 {
-        Message::RangeUnavailable(range)
+    Message::End(if returned == 0 {
+        RangeEnding::unavailable(range.start, range.count)
     } else {
-        Message::BlocksDone {
-            start: range.start,
-            returned,
-        }
-    }
+        RangeEnding::done(range.start, returned)
+    })
 }

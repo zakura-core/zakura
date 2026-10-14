@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use zakura_chain::block;
 
-use super::wire::{Message, Range};
+use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{BlockSyncMessage, BlockSyncStatus},
     wire_codec::{decode_frame, encode_frame, message_suite::decode_checked},
@@ -28,8 +28,8 @@ proptest! {
             }),
             2 => Message::GetBlocks(range),
             3 => Message::Block(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.to_vec()),
-            4 => Message::BlocksDone { start: range.start, returned: count },
-            _ => Message::RangeUnavailable(range),
+            4 => Message::End(RangeEnding::done(range.start, count)),
+            _ => Message::End(RangeEnding::unavailable(range.start, range.count)),
         };
         let frame = encode_frame(&message).unwrap();
         prop_assert_eq!(decode_frame::<Message>(&frame).unwrap(), message);

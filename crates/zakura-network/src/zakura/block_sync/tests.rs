@@ -34,6 +34,7 @@ use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
     trace::BlockBodySource,
+    wire_codec::WireError,
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
@@ -1785,7 +1786,7 @@ fn codec_rejects_malformed_discriminator_and_truncated_payload() {
 
     assert!(matches!(
         BlockSyncMessage::decode(&[MSG_BS_GET_BLOCKS, 1, 0]),
-        Err(BlockSyncWireError::Io(_))
+        Err(BlockSyncWireError::Wire(WireError::Truncated(_)))
     ));
 }
 
@@ -1829,7 +1830,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: 0,
         }
         .encode(),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_get_blocks = vec![MSG_BS_GET_BLOCKS];
@@ -1837,7 +1838,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_get_blocks.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_get_blocks),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_range_unavailable = vec![MSG_BS_RANGE_UNAVAILABLE];
@@ -1845,7 +1846,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_range_unavailable.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_range_unavailable),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -1854,7 +1855,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -1863,7 +1864,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -1872,7 +1873,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 }
 
@@ -1915,28 +1916,35 @@ fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
     ));
 }
 
+/// The public decoder shares the regulated Status checks instead of clamping
+/// limits that a regulated peer would be disconnected for sending.
 #[test]
-fn status_decode_clamps_peer_capacity_advertisements() {
-    let mut payload = Vec::new();
-    payload.push(MSG_BS_STATUS);
-    payload.extend_from_slice(&block::Height(1).0.to_le_bytes());
-    payload.extend_from_slice(&block::Height(2).0.to_le_bytes());
-    block::Hash([9; 32])
-        .zcash_serialize(&mut payload)
-        .expect("hash serializes");
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-
-    let BlockSyncMessage::Status(status) =
-        BlockSyncMessage::decode(&payload).expect("status decodes")
-    else {
-        panic!("expected status message");
-    };
-
-    assert_eq!(status.max_blocks_per_response, MAX_BS_BLOCKS_PER_REQUEST);
-    assert_eq!(status.max_inflight_requests, MAX_BS_INFLIGHT_REQUESTS);
-    assert_eq!(status.max_response_bytes, MAX_BS_RESPONSE_BYTES);
+fn status_decode_rejects_limits_outside_the_protocol_bounds() {
+    let valid = BlockSyncMessage::Status(status())
+        .encode()
+        .expect("message encodes");
+    assert_eq!(valid.len(), 53);
+    // Tag, two heights, and the tip hash precede the three limits.
+    for (offset, max) in [
+        (41, MAX_BS_BLOCKS_PER_REQUEST),
+        (45, MAX_BS_INFLIGHT_REQUESTS),
+        (49, MAX_BS_RESPONSE_BYTES),
+    ] {
+        for value in [0, max + 1, u32::MAX] {
+            let mut payload = valid.clone();
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                matches!(
+                    BlockSyncMessage::decode(&payload),
+                    Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
+                ),
+                "limit at byte {offset} accepted {value}"
+            );
+        }
+        let mut payload = valid.clone();
+        payload[offset..offset + 4].copy_from_slice(&max.to_le_bytes());
+        assert!(BlockSyncMessage::decode(&payload).is_ok());
+    }
 }
 
 #[test]

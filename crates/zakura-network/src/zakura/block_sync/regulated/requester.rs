@@ -8,12 +8,11 @@ use std::{
 use thiserror::Error;
 use zakura_chain::block::{Hash, Height};
 
-use super::wire::{Message, Range, GET_BLOCKS, RULES};
+use super::wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES};
 use crate::zakura::{
     block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES},
     regulation::{
-        ClaimRefused, Claimed, Ended, Exchange, ExchangeWriter, PoolEntry, Reservations,
-        ReserveRefused,
+        ClaimRefused, Claimed, Exchange, ExchangeWriter, PoolEntry, Reservations, ReserveRefused,
     },
     wire_codec::WireError,
 };
@@ -40,6 +39,14 @@ pub(super) enum ResponseError {
     BodyBytes,
     #[error("the ending does not match the consumed prefix")]
     Ending,
+}
+
+/// A consumed ending. It names the original request, not the reported count,
+/// so the scheduler reconsiders every unreceived height of that request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedRange {
+    pub(crate) range: Range,
+    pub(crate) outcome: Outcome,
 }
 
 #[derive(Debug)]
@@ -159,7 +166,6 @@ impl Requester {
         entry: PoolEntry,
         exchange: Exchange,
     ) -> Result<ExchangeWriter, RequestError> {
-        Range::new(range.start, range.count)?;
         if !(1..=MAX_BS_RESPONSE_BYTES).contains(&max_body_bytes) {
             return Err(WireError::OutOfRange("response body bytes").into());
         }
@@ -267,23 +273,30 @@ impl Requester {
 
     /// Validate the small ending payload before consuming the reservation or
     /// ending its writer fence. A rejected ending changes no authorization.
-    pub(super) fn finish(&mut self, message: &Message) -> Result<(Range, Ended), ResponseError> {
-        let (start, count, tag) = match message {
-            Message::BlocksDone { start, returned } => (*start, *returned, 4),
-            Message::RangeUnavailable(range) => (range.start, range.count, 5),
-            _ => return Err(ResponseError::Ending),
-        };
-        let pending = self.ranges.get(&start).ok_or(ResponseError::Ending)?;
+    pub(super) fn finish(&mut self, ending: RangeEnding) -> Result<CompletedRange, ResponseError> {
+        let pending = self
+            .ranges
+            .get(&ending.start)
+            .ok_or(ResponseError::Ending)?;
         // Counts fit usize on supported targets.
-        if (tag == 4 && (count == 0 || count as usize != pending.received))
-            || (tag == 5 && (pending.received != 0 || count == 0 || count > pending.range.count))
-        {
+        let matches = ending.count != 0
+            && match ending.outcome {
+                Outcome::Done => ending.count as usize == pending.received,
+                Outcome::Unavailable => {
+                    pending.received == 0 && ending.count <= pending.range.count
+                }
+            };
+        if !matches {
             return Err(ResponseError::Ending);
         }
         let range = pending.range;
-        let ended = self.reservations.claim_end(&start, tag, 9)?;
-        self.remove_range(start);
-        Ok((range, ended))
+        self.reservations
+            .claim_end(&ending.start, u16::from(ending.message_type()), 9)?;
+        self.remove_range(ending.start);
+        Ok(CompletedRange {
+            range,
+            outcome: ending.outcome,
+        })
     }
 
     fn remove_range(&mut self, start: Height) {

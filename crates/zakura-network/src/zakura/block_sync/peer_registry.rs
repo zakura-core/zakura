@@ -631,9 +631,11 @@ impl PeerRegistry {
     ///
     /// Both a new peer and a replacement session get a default entry with a fresh
     /// generation, so the new routine owns the entry. A replacement drops the old
-    /// session's status, servable range, caps, and slot diagnostics: the peer must
-    /// send `Status` on the new session before it counts as a server. The returned
-    /// generation is what the new routine must carry for its `Drop` guard. `Readmitted` marks the
+    /// session's status, servable range, caps, and slot diagnostics: the peer
+    /// counts as a server again only once the new routine publishes a status for
+    /// its own generation. On a same-connection reopen that can be the
+    /// connection's cached `Status`. The returned generation is what the new
+    /// routine must carry for its `Drop` guard. `Readmitted` marks the
     /// parked connection's one bounded re-admission; an expired park held by a
     /// different connection is cleared and admitted as `Fresh`.
     pub(super) fn admit_session(

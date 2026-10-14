@@ -257,9 +257,9 @@ impl Disposition {
 /// shared primitives. One task per connected peer; spawned at the pipe spawn point
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
-    requester: Option<super::regulated::live_requester::LiveRequester>,
+    requester: super::regulated::live_requester::LiveRequester,
     request_pool_waiting: bool,
-    serving: Option<super::regulated::session::ServingSession>,
+    serving: super::regulated::session::ServingSession,
     peer: ZakuraPeerId,
     conn_id: ZakuraConnId,
     source: zakura_header_chain::SourceId,
@@ -349,12 +349,16 @@ impl PeerRoutine {
     /// `run()` inside `spawn_supervised_pipe` so a protocol reject cancels the
     /// whole connection. `generation` is the value obtained from
     /// [`PeerRegistry::admit_session`](super::peer_registry::PeerRegistry::admit_session).
+    /// `requester` authorizes every response read from `recv`, and `serving`
+    /// admits this peer's `GetBlocks`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         peer: ZakuraPeerId,
         conn_id: ZakuraConnId,
         session: BlockSyncPeerSession,
         recv: FramedRecv,
+        requester: super::regulated::live_requester::LiveRequester,
+        serving: super::regulated::session::ServingSession,
         config: ZakuraBlockSyncConfig,
         allow_no_progress_park: bool,
         generation: u64,
@@ -388,9 +392,9 @@ impl PeerRoutine {
             window.max_inflight_requests,
         );
         PeerRoutine {
-            requester: None,
+            requester,
             request_pool_waiting: false,
-            serving: None,
+            serving,
             peer,
             conn_id,
             source,
@@ -427,22 +431,6 @@ impl PeerRoutine {
             cancel,
             trace,
         }
-    }
-
-    pub(super) fn with_requester(
-        mut self,
-        requester: Option<super::regulated::live_requester::LiveRequester>,
-    ) -> Self {
-        self.requester = requester;
-        self
-    }
-
-    pub(super) fn with_serving(
-        mut self,
-        serving: Option<super::regulated::session::ServingSession>,
-    ) -> Self {
-        self.serving = serving;
-        self
     }
 
     /// Run the pipe-routine until stream close, cancellation, or a protocol
@@ -483,10 +471,7 @@ impl PeerRoutine {
         let budget = self.budget.clone();
         let work = self.work.clone();
         let registry = Arc::clone(&self.registry);
-        let request_pool = self
-            .requester
-            .as_ref()
-            .map(|requester| requester.pool.clone());
+        let request_pool = self.requester.pool.clone();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -553,7 +538,7 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv(), if outbound_queue_has_capacity || self.serving.is_some() => {
+                frame = self.recv.recv() => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -587,12 +572,7 @@ impl PeerRoutine {
                 _ = &mut floor_ranking => {
                     self.trace_wake("floor_ranking_changed");
                 }
-                entry = async {
-                    match &request_pool {
-                        Some(pool) => pool.entry().await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.request_pool_waiting => { drop(entry); }
+                entry = request_pool.entry(), if self.request_pool_waiting => { drop(entry); }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
@@ -625,16 +605,17 @@ impl PeerRoutine {
             }
         }
 
-        let authorized_height = if let Some(requester) = &self.requester {
+        let authorized_height = {
             use super::regulated::live_requester::Authorization;
-            match requester.authorize(&frame)? {
+            match self.requester.authorize(&frame)? {
                 Authorization::Block(height) => Some(height),
                 Authorization::Control => None,
                 Authorization::IncompatibleHeader => {
                     // Height-only requests cannot identify which live range the
                     // unexpected header belongs to. Defer each still-wanted
                     // body for this supplier without delaying other suppliers.
-                    let bodies = requester
+                    let bodies = self
+                        .requester
                         .unreceived_expected(super::peer_registry::MAX_SUPPLIER_RETRIES)
                         .into_iter()
                         .filter_map(|(height, hash)| {
@@ -653,8 +634,6 @@ impl PeerRoutine {
                     ));
                 }
             }
-        } else {
-            None
         };
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
@@ -707,12 +686,9 @@ impl PeerRoutine {
                 }
             }
         }
-        if self.requester.is_some() {
-            if let Some(start) = super::regulated::live_requester::LiveRequester::ending_start(&msg)
-            {
-                if self.window.outstanding_index_for_start(start).is_none() {
-                    return Ok(());
-                }
+        if let Some(start) = super::regulated::live_requester::LiveRequester::ending_start(&msg) {
+            if self.window.outstanding_index_for_start(start).is_none() {
+                return Ok(());
             }
         }
 
@@ -721,12 +697,7 @@ impl PeerRoutine {
             BlockSyncMessage::GetBlocks {
                 start_height,
                 count,
-            } => {
-                let Some(serving) = &mut self.serving else {
-                    return Err(SinkReject::local("block-sync serving is not configured"));
-                };
-                serving.admit(start_height, count)?;
-            }
+            } => self.serving.admit(start_height, count)?,
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
                 self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
@@ -766,10 +737,7 @@ impl PeerRoutine {
     async fn reserve_body_decode_permit(
         &self,
     ) -> Result<mpsc::OwnedPermit<SequencedBody>, SinkReject> {
-        let _read_pause = self
-            .requester
-            .as_ref()
-            .map(|requester| requester.pause_reading());
+        let _read_pause = self.requester.pause_reading();
         let capacity_before = self.sequencer_input.capacity();
         let started = time::Instant::now();
         let permit = self
@@ -914,9 +882,8 @@ impl PeerRoutine {
         let earliest = [
             earliest_deadline,
             liveness_deadline,
-            self.requester.as_ref().and_then(|requester| {
-                requester.retirement_deadline(self.config.effective_liveness_timeout())
-            }),
+            self.requester
+                .retirement_deadline(self.config.effective_liveness_timeout()),
             local_retry_avoid,
             floor_watchdog_avoid,
             body_retry_avoid,
@@ -996,24 +963,19 @@ impl PeerRoutine {
                 break FillStop::CwndSaturated;
             }
             self.request_pool_waiting = false;
-            let authorization = if let Some(requester) = &self.requester {
-                // Count unanswered exchanges, including scheduler-abandoned work.
-                // The peer's u32 advertised limit fits usize on supported targets.
-                if requester.at_capacity()
-                    || requester.len() >= self.window.max_inflight_requests as usize
-                {
-                    break FillStop::CwndSaturated;
-                }
-                let Some(entry) = requester.pool.try_entry() else {
-                    self.request_pool_waiting = true;
-                    break FillStop::Budget;
-                };
-                let Some(exchange) = requester.open() else {
-                    break FillStop::SendError;
-                };
-                Some((entry, exchange))
-            } else {
-                None
+            // Count unanswered exchanges, including scheduler-abandoned work.
+            // The peer's u32 advertised limit fits usize on supported targets.
+            if self.requester.at_capacity()
+                || self.requester.len() >= self.window.max_inflight_requests as usize
+            {
+                break FillStop::CwndSaturated;
+            }
+            let Some(entry) = self.requester.pool.try_entry() else {
+                self.request_pool_waiting = true;
+                break FillStop::Budget;
+            };
+            let Some(exchange) = self.requester.open() else {
+                break FillStop::SendError;
             };
             // Reserve transport capacity before taking work or charging bytes.
             let slot = match request_sender.try_reserve_guarded() {
@@ -1173,11 +1135,7 @@ impl PeerRoutine {
             {
                 let mut timed_rejection = false;
                 let mut is_allowed = |height: &block::Height, item: &WorkItem| {
-                    if self
-                        .requester
-                        .as_ref()
-                        .is_some_and(|requester| requester.blocks_retry(*height))
-                    {
+                    if self.requester.blocks_retry(*height) {
                         return false;
                     }
                     let avoided = self.retry_avoid.contains_key(height)
@@ -1281,33 +1239,27 @@ impl PeerRoutine {
                     .collect(),
             };
 
-            let writer = if let (Some(requester), Some((entry, exchange))) =
-                (&self.requester, authorization)
-            {
-                let expected: Vec<_> = request
-                    .expected_blocks
-                    .iter()
-                    .map(|block| block.hash)
-                    .collect();
-                match requester.reserve(
-                    first_height,
-                    &expected,
-                    self.max_response_bytes,
-                    entry,
-                    exchange,
-                ) {
-                    Ok(writer) => Some(writer),
-                    Err(error) => {
-                        tracing::error!(
-                            ?error,
-                            "valid scheduler request could not reserve its response"
-                        );
-                        self.cancel.cancel();
-                        break FillStop::Internal;
-                    }
+            let expected: Vec<_> = request
+                .expected_blocks
+                .iter()
+                .map(|block| block.hash)
+                .collect();
+            let writer = match self.requester.reserve(
+                first_height,
+                &expected,
+                self.max_response_bytes,
+                entry,
+                exchange,
+            ) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    tracing::error!(
+                        ?error,
+                        "valid scheduler request could not reserve its response"
+                    );
+                    self.cancel.cancel();
+                    break FillStop::Internal;
                 }
-            } else {
-                None
             };
             let queued_at = time::Instant::now().into_std();
             let msg = BlockSyncMessage::GetBlocks {
@@ -1346,13 +1298,11 @@ impl PeerRoutine {
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
             let mut delivered = false;
-            let write_claim: Arc<dyn crate::zakura::transport::FrameWriteClaim> = match &writer {
-                Some(exchange) => Arc::new(super::regulated::live_requester::FencedRequest {
-                    exchange: exchange.clone(),
+            let write_claim: Arc<dyn crate::zakura::transport::FrameWriteClaim> =
+                Arc::new(super::regulated::live_requester::FencedRequest {
+                    exchange: writer.clone(),
                     work: claim.clone(),
-                }),
-                None => claim.clone(),
-            };
+                });
             let mut published = false;
             let publish = || {
                 published = claim.publish(|| {
@@ -1369,15 +1319,9 @@ impl PeerRoutine {
                     delivered = slot.send_request(frame, write_claim);
                 });
             };
-            if let Some(writer) = &writer {
-                writer.publish(publish);
-            } else {
-                publish();
-            }
+            writer.publish(publish);
             if !published {
-                if let Some(requester) = &self.requester {
-                    requester.retire(first_height, true);
-                }
+                self.requester.retire(first_height, true);
                 break FillStop::Internal;
             }
             if !delivered {
@@ -1389,9 +1333,7 @@ impl PeerRoutine {
                     "block request transport closed during publication"
                 );
                 claim.delivery_failed();
-                if let Some(requester) = &self.requester {
-                    requester.retire(first_height, true);
-                }
+                self.requester.retire(first_height, true);
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
@@ -1448,9 +1390,9 @@ impl PeerRoutine {
         let local = self.retry_avoid.values().min().copied();
         let floor = self.registry.next_floor_avoid_deadline(&self.peer, now);
         let body = self.registry.next_body_retry_deadline(&self.peer, now);
-        let ending = self.requester.as_ref().and_then(|requester| {
-            requester.retirement_deadline(self.config.effective_liveness_timeout())
-        });
+        let ending = self
+            .requester
+            .retirement_deadline(self.config.effective_liveness_timeout());
         let timed = [local, floor, body]
             .into_iter()
             .flatten()
@@ -1534,10 +1476,8 @@ impl PeerRoutine {
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
     fn check_request_liveness(&self, now: Instant) -> Result<(), SinkReject> {
-        if let Some(requester) = &self.requester {
-            requester.check_liveness(now, self.config.effective_liveness_timeout())?;
-        }
-        Ok(())
+        self.requester
+            .check_liveness(now, self.config.effective_liveness_timeout())
     }
 
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
@@ -1735,11 +1675,10 @@ impl PeerRoutine {
     /// A skipped frame ends the peer obligation independently of any received
     /// body whose owner must remain available to the sequencer.
     fn gc_skipped_outstanding(&mut self) {
-        if let Some(requester) = &self.requester {
-            for outstanding in &self.window.outstanding {
-                if outstanding.write_status.was_skipped() {
-                    requester.retire(outstanding.request.start_height, true);
-                }
+        for outstanding in &self.window.outstanding {
+            if outstanding.write_status.was_skipped() {
+                self.requester
+                    .retire(outstanding.request.start_height, true);
             }
         }
         if self.window.discard_skipped_requests() {
@@ -2030,10 +1969,7 @@ impl PeerRoutine {
             permit.send(body);
             true
         } else {
-            let _read_pause = self
-                .requester
-                .as_ref()
-                .map(|requester| requester.pause_reading());
+            let _read_pause = self.requester.pause_reading();
             let send_result = self.sequencer_input.send(body).await;
             send_result.is_ok()
         };
@@ -2285,11 +2221,10 @@ impl PeerRoutine {
     }
 
     fn retire_authorization(&self, outstanding: &OutstandingBlockRange) {
-        if let Some(requester) = &self.requester {
-            let unwritten = outstanding.write_status.expire_unwritten()
-                || outstanding.write_status.was_skipped();
-            requester.retire(outstanding.request.start_height, unwritten);
-        }
+        let unwritten =
+            outstanding.write_status.expire_unwritten() || outstanding.write_status.was_skipped();
+        self.requester
+            .retire(outstanding.request.start_height, unwritten);
     }
 
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
@@ -2521,9 +2456,15 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
 
+    use super::super::config::MAX_BS_INFLIGHT_REQUESTS;
     use super::super::peer_registry::PeerRegistry;
+    use super::super::regulated::{
+        live_requester::LiveRequester,
+        session::{Serving, ServingSession},
+    };
     use super::super::request::BlockSizeEstimate;
     use super::super::sequencer_task::initial_view;
+    use super::super::source::EmptyBlockRangeSource;
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::work_queue::WorkQueue;
     use super::super::{
@@ -2533,7 +2474,9 @@ mod tests {
     use super::PeerRoutine;
     use super::RoutineToReactor;
     use crate::zakura::framed_channel;
+    use crate::zakura::regulation::{ReservationPool, WriterFence};
     use crate::zakura::trace::ZakuraTrace;
+    use crate::zakura::CloseCause;
     use crate::zakura::ZakuraPeerId;
 
     fn reference_first_allowed_run(allowed: &[bool]) -> Option<std::ops::Range<usize>> {
@@ -2545,7 +2488,52 @@ mod tests {
         Some(start..start + len)
     }
 
+    /// A private pool with production's node-wide request capacity.
+    pub(super) fn test_request_pool() -> ReservationPool {
+        ReservationPool::new(usize::try_from(MAX_BS_INFLIGHT_REQUESTS).unwrap()).unwrap()
+    }
+
+    /// Production response authorization and serving for a test routine. Both
+    /// write through `session`, and the requester's fence closes `connection`.
+    pub(super) fn test_authorization(
+        session: &BlockSyncPeerSession,
+        recv: &crate::zakura::FramedRecv,
+        config: &ZakuraBlockSyncConfig,
+        pool: ReservationPool,
+        connection: &CancellationToken,
+    ) -> (LiveRequester, ServingSession) {
+        let close_cause = CloseCause::default();
+        let requester = LiveRequester::new(
+            pool,
+            WriterFence::new(connection.clone(), close_cause.clone()),
+            recv,
+            session.request_sender(),
+        );
+        let serving = Serving::new(Arc::new(EmptyBlockRangeSource), config).session(
+            session.peer_id(),
+            session.request_sender(),
+            session.cancel_token(),
+            connection.clone(),
+            close_cause,
+        );
+        (requester, serving)
+    }
+
+    /// [`status_test_routine_with`] using a private pool and connection.
     pub(super) fn status_test_routine() -> (
+        PeerRoutine,
+        crate::zakura::FramedRecv,
+        mpsc::Receiver<RoutineToReactor>,
+    ) {
+        status_test_routine_with(test_request_pool(), &CancellationToken::new())
+    }
+
+    /// An admitted routine with default config that authorizes from `pool` and
+    /// closes `connection`. Returns its outbound frames and reactor reports.
+    pub(super) fn status_test_routine_with(
+        pool: ReservationPool,
+        connection: &CancellationToken,
+    ) -> (
         PeerRoutine,
         crate::zakura::FramedRecv,
         mpsc::Receiver<RoutineToReactor>,
@@ -2568,11 +2556,15 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let (requester, serving) =
+            test_authorization(&session, &in_recv, &config, pool, connection);
         let routine = PeerRoutine::new(
             peer.clone(),
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config.clone(),
             true,
             generation,
@@ -3127,11 +3119,20 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer,
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config,
             true,
             0,
@@ -3229,11 +3230,20 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
 
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer,
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config,
             true,
             0,
@@ -3367,11 +3377,20 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer.clone(),
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config,
             true,
             generation,
@@ -3622,11 +3641,20 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer.clone(),
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config,
             true,
             generation,
@@ -3804,11 +3832,20 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
 
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer,
             0,
             session,
             in_recv,
+            requester,
+            serving,
             config,
             true,
             0,
@@ -4057,7 +4094,7 @@ mod tests {
         use crate::zakura::transport::OrderedStreamFailureCause;
         use crate::zakura::{ServicePeerDirection, SinkReject};
 
-        use zakura_chain::serialization::ZcashDeserializeInto;
+        use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
         let body: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_1_BYTES
                 .zcash_deserialize_into()
@@ -4118,11 +4155,21 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let in_recv = in_recv.with_failure_cause(cause.clone());
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer.clone(),
             0,
             session,
-            in_recv.with_failure_cause(cause.clone()),
+            in_recv,
+            requester,
+            serving,
             config.clone(),
             !readmitted,
             generation,
@@ -4212,10 +4259,14 @@ mod tests {
             BufferedResponse::MalformedBlock
             | BufferedResponse::MalformedBlockBackpressured
             | BufferedResponse::MalformedBlockAlreadyProcessing => {
+                // The requested header passes authorization, so the missing
+                // transactions fail only in body decoding.
+                let mut payload = vec![super::MSG_BS_BLOCK];
+                body.header.zcash_serialize(&mut payload).unwrap();
                 let frame = crate::zakura::Frame {
                     message_type: u16::from(super::MSG_BS_BLOCK),
                     flags: 0,
-                    payload: vec![super::MSG_BS_BLOCK],
+                    payload,
                 };
                 assert!(super::BlockSyncMessage::decode_frame(frame.clone()).is_err());
                 in_send.send(frame).await.unwrap();
@@ -4376,11 +4427,21 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let in_recv = in_recv.with_failure_cause(cause);
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
         let mut routine = PeerRoutine::new(
             peer.clone(),
             0,
             session,
-            in_recv.with_failure_cause(cause),
+            in_recv,
+            requester,
+            serving,
             config.clone(),
             true,
             generation,

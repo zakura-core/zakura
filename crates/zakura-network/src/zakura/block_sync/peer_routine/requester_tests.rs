@@ -1,9 +1,6 @@
-use super::super::{regulated::live_requester::LiveRequester, request::BlockSizeEstimate};
+use super::super::request::BlockSizeEstimate;
 use super::*;
-use crate::zakura::{
-    regulation::{ReservationPool, WriterFence},
-    CloseCause,
-};
+use crate::zakura::regulation::ReservationPool;
 use zakura_chain::serialization::ZcashDeserializeInto;
 
 /// The routine, its outbound frames, its pool, its connection and its reports to the reactor.
@@ -25,15 +22,9 @@ fn requester_routine_with_pool(
     expected_hash: block::Hash,
     pool: ReservationPool,
 ) -> RequesterRoutine {
-    let (mut routine, outbound, events) = super::tests::status_test_routine();
     let connection = CancellationToken::new();
-    let fence = WriterFence::new(connection.clone(), CloseCause::default());
-    routine.requester = Some(LiveRequester::new(
-        pool.clone(),
-        fence,
-        &routine.recv,
-        routine.session.request_sender(),
-    ));
+    let (mut routine, outbound, events) =
+        super::tests::status_test_routine_with(pool.clone(), &connection);
     routine.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(10),
@@ -140,12 +131,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         "written authorization survives scheduler timeout"
     );
     let grace = routine.config.effective_liveness_timeout();
-    let retirement = routine
-        .requester
-        .as_ref()
-        .unwrap()
-        .retirement_deadline(grace)
-        .unwrap();
+    let retirement = routine.requester.retirement_deadline(grace).unwrap();
     routine.retry_avoid.clear();
     routine.window.note_block_progress(Instant::now(), grace);
     assert_eq!(routine.try_fill().await, Some(retirement));
@@ -453,7 +439,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     let pool = ReservationPool::new(2 * SESSION_RESERVATIONS).unwrap();
     let (mut first, _outbound, _, first_connection, _) =
         requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
-    let requester = first.requester.as_ref().unwrap();
+    let requester = &first.requester;
     for index in 0..SESSION_RESERVATIONS {
         let height = u32::try_from(index + 100).unwrap();
         let mut hash = [0; 32];
@@ -504,8 +490,6 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     routine.retry_avoid.clear();
     let deadline = routine
         .requester
-        .as_ref()
-        .unwrap()
         .retirement_deadline(routine.config.effective_liveness_timeout())
         .unwrap();
     assert!(routine
@@ -555,7 +539,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         next_sent(&mut outbound).await;
         deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
-        assert!(!routine.requester.as_ref().unwrap().at_capacity());
+        assert!(!routine.requester.at_capacity());
         peers.push((routine, outbound, connection));
     }
     assert!(
@@ -566,8 +550,6 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         let grace = routine.config.effective_liveness_timeout();
         let deadline = routine
             .requester
-            .as_ref()
-            .unwrap()
             .retirement_deadline(grace)
             .expect("the last block starts the missing-ending deadline");
         assert!(routine
@@ -660,8 +642,6 @@ async fn a_live_partially_returned_range_waits_without_retry_spin() {
     assert_eq!(
         routine
             .requester
-            .as_ref()
-            .unwrap()
             .retirement_deadline(routine.config.effective_liveness_timeout()),
         None
     );

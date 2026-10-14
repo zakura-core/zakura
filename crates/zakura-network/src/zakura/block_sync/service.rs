@@ -654,13 +654,8 @@ impl Service for BlockSyncService {
         // nothing is lost by dropping it.
         drop(send);
 
-        let requester_fence = self.inner.routine_wiring.as_ref().map(|_| {
-            crate::zakura::regulation::WriterFence::new(
-                connection_cancel_token.clone(),
-                close_cause.clone(),
-            )
-        });
-        let (old_record, re_admitted_after_no_progress, routine_generation) = {
+        let routine_wiring = self.inner.routine_wiring.clone();
+        let (old_record, re_admitted_after_no_progress, routine) = {
             let mut active_peers = self
                 .inner
                 .active_peers
@@ -702,9 +697,11 @@ impl Service for BlockSyncService {
             // Admission is atomic with the park state: a park recorded by the
             // predecessor routine after the entry-point `peer_is_parked` check
             // is honored here instead of being silently bypassed.
-            let (routine_generation, re_admitted_after_no_progress) =
-                if let Some(wiring) = &self.inner.routine_wiring {
-                    match wiring.registry.admit_session(
+            // A spawned routine holds its generation and the exact fence
+            // registered in `requester_sessions`.
+            let (routine, re_admitted_after_no_progress) = match routine_wiring {
+                Some(wiring) => {
+                    let (generation, readmitted) = match wiring.registry.admit_session(
                         &peer_id,
                         peer.direction,
                         &wiring.config,
@@ -715,13 +712,18 @@ impl Service for BlockSyncService {
                             service_cancel_token.cancel();
                             return;
                         }
-                        SessionAdmission::Readmitted { generation } => (Some(generation), true),
-                        SessionAdmission::Fresh { generation } => (Some(generation), false),
-                    }
-                } else {
-                    (None, false)
-                };
-            if let Some(fence) = &requester_fence {
+                        SessionAdmission::Readmitted { generation } => (generation, true),
+                        SessionAdmission::Fresh { generation } => (generation, false),
+                    };
+                    let fence = crate::zakura::regulation::WriterFence::new(
+                        connection_cancel_token.clone(),
+                        close_cause.clone(),
+                    );
+                    (Some((wiring, generation, fence)), readmitted)
+                }
+                None => (None, false),
+            };
+            if let Some((_, _, fence)) = &routine {
                 use crate::zakura::regulation::{Current, Replacement, SessionKey};
                 if matches!(
                     self.inner.requester_sessions.replace(
@@ -740,8 +742,6 @@ impl Service for BlockSyncService {
                 ) {
                     return;
                 }
-            }
-            if requester_fence.is_some() {
                 block_sync_session.status_sender = Some(
                     self.inner
                         .status_senders
@@ -767,11 +767,7 @@ impl Service for BlockSyncService {
                     cancel_token: service_cancel_token.clone(),
                 },
             );
-            (
-                old_record,
-                re_admitted_after_no_progress,
-                routine_generation,
-            )
+            (old_record, re_admitted_after_no_progress, routine)
         };
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
@@ -815,15 +811,11 @@ impl Service for BlockSyncService {
         let pipe = {
             let connection_cancel_token = connection_cancel_token.clone();
             let close_cause = close_cause.clone();
-            let routine_wiring = self.inner.routine_wiring.clone();
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
             async move {
-                let result = match routine_wiring {
-                    Some(wiring) => {
-                        let generation = routine_generation.expect(
-                            "production block-sync wiring allocates a routine generation before spawn",
-                        );
+                let result = match routine {
+                    Some((wiring, generation, fence)) => {
                         let serving = wiring.serving.session(
                             &peer_id,
                             block_sync_session.request_sender(),
@@ -831,19 +823,19 @@ impl Service for BlockSyncService {
                             connection_cancel_token.clone(),
                             close_cause.clone(),
                         );
-                        let requester = requester_fence.map(|fence| {
-                            super::regulated::live_requester::LiveRequester::new(
-                                wiring.request_pool.clone(),
-                                fence,
-                                &recv,
-                                block_sync_session.request_sender(),
-                            )
-                        });
+                        let requester = super::regulated::live_requester::LiveRequester::new(
+                            wiring.request_pool,
+                            fence,
+                            &recv,
+                            block_sync_session.request_sender(),
+                        );
                         let routine = super::peer_routine::PeerRoutine::new(
                             peer_id,
                             conn_id,
                             block_sync_session,
                             recv,
+                            requester,
+                            serving,
                             wiring.config,
                             !re_admitted_after_no_progress,
                             generation,
@@ -858,9 +850,7 @@ impl Service for BlockSyncService {
                             wiring.view,
                             run_cancel,
                             wiring.trace,
-                        )
-                        .with_serving(Some(serving))
-                        .with_requester(requester);
+                        );
                         tokio::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),

@@ -62,6 +62,9 @@ pub(super) struct WorkItem {
     retry_after_tip: Option<block::Height>,
     /// Request reservation; received bodies use `Released`.
     pub(super) budget: BlockBudgetLedger,
+    /// Another attempt's body ended this owner's reservation. The owner's request
+    /// still claims the height, so dropping or moving the item is a revocation.
+    answered_elsewhere: bool,
 }
 
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
@@ -282,6 +285,7 @@ impl WorkQueue {
                         retry_estimated_bytes: None,
                         retry_after_tip: None,
                         budget: BlockBudgetLedger::Released,
+                        answered_elsewhere: false,
                     },
                 );
                 inserted += 1;
@@ -515,6 +519,7 @@ impl WorkQueue {
         for (_, item) in &mut taken {
             item.owner = attempt.map(|(session, request)| item.scope.bind(session, request));
             item.provisional = attempt.is_some();
+            item.answered_elsewhere = false;
         }
         for (height, item) in &taken {
             inner.pending.remove(height);
@@ -633,7 +638,7 @@ impl WorkQueue {
     /// End an active request reservation at receipt.
     #[cfg(test)]
     pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
-        self.release_active_reserved_height_matching(None, height)
+        self.release_active_reserved_height_matching(None, height, false)
     }
 
     /// End the receipt reservation and retire any queued request it invalidates.
@@ -643,13 +648,24 @@ impl WorkQueue {
         owner: zakura_header_chain::BodyWorkOwner,
         height: block::Height,
     ) -> Option<u64> {
-        self.release_active_reserved_height_matching(Some(owner), height)
+        self.release_active_reserved_height_matching(Some(owner), height, false)
+    }
+
+    /// Like [`Self::release_active_reserved_height_for_owner`], for a body that
+    /// another attempt received.
+    pub(super) fn release_answered_elsewhere(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> Option<u64> {
+        self.release_active_reserved_height_matching(Some(owner), height, true)
     }
 
     fn release_active_reserved_height_matching(
         &self,
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
+        answered_elsewhere: bool,
     ) -> Option<u64> {
         let (released, claim) = {
             let mut inner = self.lock();
@@ -661,6 +677,7 @@ impl WorkQueue {
                 if !item.budget.is_reserved() {
                     return None;
                 }
+                item.answered_elsewhere = answered_elsewhere;
                 (item.budget.release_reserved(), item.owner)
             };
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
@@ -875,7 +892,12 @@ impl WorkQueue {
             .max(item.observed_bytes);
         item.retry_after_tip = Some(verified_tip);
         item.owner = None;
+        let revoked = std::mem::take(&mut item.answered_elsewhere);
         inner.pending.insert(height, item);
+        drop(inner);
+        if revoked {
+            self.note_revocation();
+        }
         true
     }
 
@@ -1001,7 +1023,7 @@ impl WorkQueue {
                 .in_flight
                 .pop_first()
                 .expect("first_key_value returned Some");
-            revoked |= item.budget.is_reserved();
+            revoked |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);
@@ -1056,7 +1078,7 @@ impl WorkQueue {
                 .in_flight
                 .pop_last()
                 .expect("last_key_value returned Some");
-            revoked |= item.budget.is_reserved();
+            revoked |= item.budget.is_reserved() || item.answered_elsewhere;
             let charge = item.budget.release_reserved();
             inner.in_flight_reserved.sub(charge);
             released = released.saturating_add(charge);

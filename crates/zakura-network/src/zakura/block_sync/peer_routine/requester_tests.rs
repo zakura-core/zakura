@@ -785,3 +785,58 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
         "the overdue request timed out while frames were ready"
     );
 }
+
+/// Another peer's body ends this routine's written request reservation. Then
+/// `drop_height` removes that height from `in_flight`. The routine must withdraw
+/// its claim, because the queue no longer tracks the height under its owner.
+async fn assert_answered_elsewhere_claim_is_withdrawn(
+    drop_height: impl FnOnce(
+        &PeerRoutine,
+        zakura_header_chain::BodyWorkOwner,
+        block::Height,
+        block::Hash,
+    ) -> u64,
+) {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let height = block.coinbase_height().unwrap();
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let owner = routine.window.outstanding.first().unwrap().request.owner;
+    let released = routine
+        .work
+        .release_answered_elsewhere(owner, height)
+        .expect("the request still owns its reserved height");
+    routine.budget.release(released);
+    assert!(routine
+        .registry
+        .has_outstanding_request(height, block.hash()));
+
+    let released = drop_height(&routine, owner, height, block.hash());
+    routine.budget.release(released);
+    routine.gc_obsolete_outstanding();
+
+    assert!(routine.window.outstanding.is_empty());
+    assert!(!routine
+        .registry
+        .has_outstanding_request(height, block.hash()));
+}
+
+#[tokio::test]
+async fn a_reorg_retires_a_request_another_peer_already_answered() {
+    assert_answered_elsewhere_claim_is_withdrawn(|routine, _, _, _| {
+        routine.work.reset_above(block::Height(0))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retention_deferral_retires_a_request_another_peer_already_answered() {
+    assert_answered_elsewhere_claim_is_withdrawn(|routine, owner, height, hash| {
+        assert!(routine
+            .work
+            .defer_received_for_owner(owner, height, hash, 1, block::Height(0)));
+        0
+    })
+    .await;
+}

@@ -2116,10 +2116,7 @@ impl PeerRoutine {
             // another peer: this arrival ends that request's reservation instead of
             // discarding a valid body because another peer currently owns the
             // request slot.
-            let Some(estimate) = self
-                .work
-                .release_active_reserved_height_for_owner(owner, height)
-            else {
+            let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
             metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);

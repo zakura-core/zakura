@@ -26,8 +26,9 @@ const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 /// (`BufferedBlockBody::retain_for_backlog`), so they are charged at ×1; see
 /// [`estimated_resident_pipeline_bytes`].
 ///
-// The factor is a deliberately conservative calibration from the measured ~3.3–4x
-// wire→resident ratio; it is an approximation, not a true per-block size.
+// The factor is a calibration from the measured ~3.3–4x wire→resident ratio of real
+// blocks. It is an average, not a bound: a consensus-valid block can decode at about
+// 26x. Admission charges the measured decoded heap whenever it exceeds this estimate.
 pub const DESERIALIZED_MEM_FACTOR: u64 = 4;
 
 /// Pure inputs for deciding whether a block request may consume budget.

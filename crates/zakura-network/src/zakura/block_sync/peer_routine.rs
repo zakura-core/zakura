@@ -1522,6 +1522,7 @@ impl PeerRoutine {
     fn check_request_liveness(&self, now: Instant) -> Result<(), SinkReject> {
         self.requester
             .check_liveness(now, self.config.effective_liveness_timeout())
+            .inspect_err(|_| self.trace_ending_timeout())
     }
 
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {

@@ -39,7 +39,6 @@ zeroize = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 sha2 = { workspace = true }
-tempfile = { workspace = true }
 toml = { workspace = true }
 
 [lints]

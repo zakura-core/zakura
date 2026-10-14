@@ -148,9 +148,6 @@ skip-tree = [
     { name = "rand_core", version = "0.6" },
     { name = "rand_chacha", version = "0.3" },
 
-    # wait for derive_builder to update
-    { name = "darling", version = "0.20.11" },
-
     # wait until `config` updates `convert_case`
     { name = "convert_case", version = "0.6.0" },
 

@@ -13,9 +13,6 @@ categories = ["cryptography::cryptocurrencies", "network-programming"]
 [features]
 default = []
 
-# Per-connection qlog output (SPEC CTRL-25). Release builds leave it off.
-qlog = ["quinn-proto/qlog"]
-
 [dependencies]
 # SPEC DEP-2 lists every allowed direct dependency. Adding one needs a spec change.
 bytes = { workspace = true }

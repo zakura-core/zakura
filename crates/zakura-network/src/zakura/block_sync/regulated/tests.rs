@@ -442,8 +442,9 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
     let mut startup =
         super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
     startup.shutdown = cancel.clone();
-    let (handle, _actions, _task) = super::super::spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let (handle, _actions, _task) =
+        super::super::spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let service = BlockSyncService::new_with_handle(handle);
     let resources = service
         .reserve_session(ServicePeerDirection::Outbound)
         .unwrap()

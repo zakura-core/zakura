@@ -197,7 +197,8 @@ fn the_default_serving_limit_fits_the_bookkeeping_budget() {
     assert_eq!(config.advertised_max_inflight_requests(), 32_000);
 }
 
-/// Fewer sessions keep the configured limit; more sessions shrink it to at least one.
+/// Fewer sessions keep the configured limit; more sessions shrink it. Past 3,633
+/// slots nothing fits, and the reactor refuses that config before serving.
 #[test]
 fn the_serving_limit_follows_session_slots_and_configuration() {
     let with = |inbound, outbound, configured| {
@@ -215,8 +216,9 @@ fn the_serving_limit_follows_session_slots_and_configuration() {
     assert_eq!(budgeted_inflight_requests(0), None);
     assert_eq!(budgeted_inflight_requests(3633), Some(1));
     assert_eq!(budgeted_inflight_requests(3634), Some(0));
-    assert_eq!(with(3634, 0, 32_000), 1);
-    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 1);
+    assert_eq!(with(3633, 0, 32_000), 1);
+    assert_eq!(with(3634, 0, 32_000), 0);
+    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 0);
 }
 
 /// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.

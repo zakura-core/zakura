@@ -1836,7 +1836,8 @@ mod tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
             panic!("unexpected read request: {request:?}");
             #[allow(unreachable_code)]

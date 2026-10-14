@@ -519,7 +519,7 @@ impl ZakuraTestNodeBuilder {
                 .clone();
             startup.shutdown = shutdown;
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
-            let (block_handle, actions, task) = spawn_block_sync_reactor(startup);
+            let (block_handle, actions, task) = spawn_block_sync_reactor(startup)?;
             header_sync_tasks.push(task);
             block_sync_actions = Some(actions);
             block_sync_handle = Some(block_handle.clone());

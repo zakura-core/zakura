@@ -100,13 +100,23 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
 }
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
+///
+/// Validates the final config before creating any task, channel, or advertised
+/// limit, so no caller can negotiate with an unfundable config.
 pub fn spawn_block_sync_reactor(
     mut startup: BlockSyncStartup,
-) -> (
-    BlockSyncHandle,
-    mpsc::Receiver<BlockSyncAction>,
-    JoinHandle<()>,
-) {
+) -> Result<
+    (
+        BlockSyncHandle,
+        mpsc::Receiver<BlockSyncAction>,
+        JoinHandle<()>,
+    ),
+    BlockSyncStartError,
+> {
+    startup
+        .config
+        .validate()
+        .map_err(BlockSyncStartError::InvalidConfig)?;
     let body_retention = startup.body_retention.clone();
     debug_assert!(
         !startup.state_queries_enabled
@@ -305,7 +315,7 @@ pub fn spawn_block_sync_reactor(
     };
     let task = tokio::spawn(reactor.run());
 
-    (handle, actions_rx, task)
+    Ok((handle, actions_rx, task))
 }
 
 #[derive(Debug)]

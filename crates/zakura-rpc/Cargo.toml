@@ -73,6 +73,7 @@ color-eyre = { workspace = true }
 
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing"] }
 tower = { workspace = true }
+tower-05 = { workspace = true }
 
 # gRPC server dependencies
 tonic = { workspace = true }

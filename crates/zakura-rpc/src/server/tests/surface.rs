@@ -258,6 +258,31 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .expect("batch response should contain the blocked request");
     assert_eq!(blocked_batch_item["error"]["code"], -32601);
 
+    // Every call in a batch must pass through the per-call middleware, which
+    // rewrites jsonrpsee's invalid-params code to the `zcashd` legacy code.
+    let invalid_params_batch = client
+        .post(format!("http://{restricted_addr}"))
+        .header("content-type", "application/json")
+        .body(
+            r#"[{"jsonrpc":"2.0","method":"getblockcount","id":8},{"jsonrpc":"2.0","method":"getrawtransaction","params":[123],"id":9}]"#,
+        )
+        .send()
+        .await
+        .expect("invalid params batch request should complete")
+        .text()
+        .await
+        .expect("invalid params batch response body should be readable");
+    let invalid_params_batch: serde_json::Value = serde_json::from_str(&invalid_params_batch)
+        .expect("invalid params batch response should be JSON");
+    let invalid_params_item = invalid_params_batch
+        .as_array()
+        .expect("batch response should be an array")
+        .iter()
+        .find(|response| response["id"] == 9)
+        .expect("batch response should contain the invalid params request");
+    // `LegacyCode::Misc`
+    assert_eq!(invalid_params_item["error"]["code"], -1);
+
     let unauthenticated_admin = client
         .post(format!("http://{admin_addr}"))
         .header("content-type", "application/json")

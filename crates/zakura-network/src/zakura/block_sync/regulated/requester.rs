@@ -12,8 +12,8 @@ use super::wire::{Message, Range, GET_BLOCKS, RULES};
 use crate::zakura::{
     block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES},
     regulation::{
-        ClaimRefused, Claimed, Ended, Exchange, ExchangeWriter, PoolEntry, Reservations,
-        ReserveRefused,
+        shrink_after_peak, ClaimRefused, Claimed, Ended, Exchange, ExchangeWriter, PoolEntry,
+        Reservations, ReserveRefused,
     },
     wire_codec::WireError,
 };
@@ -301,6 +301,7 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
+                shrink_after_peak(&mut self.next);
             }
             if let Some(at) = pending.retirement_started_at {
                 self.retiring.remove(&(at, start));

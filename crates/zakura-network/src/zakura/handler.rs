@@ -5139,7 +5139,11 @@ async fn write_ordered_frame_with_policy(
         )
         .into());
     }
-    let frame = frame.encode(max_frame_bytes)?;
+    let encoded = frame.encode(max_frame_bytes)?;
+    // Free the payload now: the write can wait on QUIC credit, and holding
+    // both copies until then doubles every queued body.
+    drop(frame);
+    let frame = encoded;
     match write_policy {
         StreamWritePolicy::UntilCancelled => send.write_chunk(Bytes::from(frame)).await?,
         StreamWritePolicy::Timeout(duration) => {
@@ -5872,7 +5876,10 @@ async fn write_response_frame(
     if frame.payload.len() > limits.max_message_bytes as usize {
         return Err(ZakuraHandlerError::Oversize);
     }
-    let frame = frame.encode(max_frame_bytes)?;
+    let encoded = frame.encode(max_frame_bytes)?;
+    // Free the payload before a write that can wait on QUIC credit.
+    drop(frame);
+    let frame = encoded;
     timeout(
         OUTBOUND_STREAM_WRITE_TIMEOUT,
         send.write_chunk(Bytes::from(frame)),

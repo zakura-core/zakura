@@ -103,6 +103,7 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
 ///
 /// Checks the final config's serving limits before creating any task, channel,
 /// or advertised limit, so no caller can negotiate with an unfundable config.
+#[allow(clippy::unwrap_in_result)] // Its expects are local constant invariants, not config errors.
 pub fn spawn_block_sync_reactor(
     mut startup: BlockSyncStartup,
 ) -> Result<

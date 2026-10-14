@@ -368,6 +368,7 @@ impl<K: Eq + Hash> Reservations<K> {
         let Some(reservation) = self.live.remove(key) else {
             return false;
         };
+        shrink_after_peak(&mut self.live);
         self.untrack(reservation.request, reservation.remaining_bytes());
         self.owed.sub(reservation.owed());
         true
@@ -484,6 +485,7 @@ impl<K: Eq + Hash> Reservations<K> {
             .live
             .remove(key)
             .expect("charge found this reservation and nothing removed it since");
+        shrink_after_peak(&mut self.live);
         if let Some(exchange) = &mut reservation.exchange {
             exchange.end();
         }
@@ -726,5 +728,14 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+}
+
+/// Return a drained map's peak capacity, so the pool, not each session's
+/// busiest moment, bounds retained bookkeeping. Halving at a quarter keeps
+/// removals amortized O(1).
+pub(crate) fn shrink_after_peak<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 4 * map.len().max(16) {
+        map.shrink_to(2 * map.len());
     }
 }

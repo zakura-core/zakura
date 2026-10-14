@@ -478,6 +478,8 @@ class MainnetTransitionTests(unittest.TestCase):
         self.assertEqual(payload["network"]["network"]["magic"], "24e92764")
         self.assertEqual(payload["rules"]["atTip"]["network"], "Mainnet")
         self.assertEqual(payload["status"]["nsm"]["balanceZat"], 900)
+        self.assertEqual(payload["status"]["network"]["targetSpacingSeconds"], payload["rules"]["atTip"]["targetSpacingSeconds"])
+        self.assertEqual(payload["status"]["network"]["daaWindowBlocks"], payload["rules"]["atTip"]["daaWindowBlocks"])
         self.assertFalse(payload["status"]["chain"]["minimumDifficultyEligible"])
         self.assertIsNone(payload["capabilities"]["faucet"])
         self.assertIn("mainnetReorgObservation", self.feed.state)

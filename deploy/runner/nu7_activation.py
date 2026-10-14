@@ -500,7 +500,10 @@ class ActivationFeed:
                   if agreement else {"reorgs24h": None, "since": now})
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
-            "network": {**manifest["network"], "reissuanceHeight": current_rules["nsmReissuanceHeight"] if current_rules else None,
+            "network": {**manifest["network"],
+                        "targetSpacingSeconds": current_rules["targetSpacingSeconds"] if current_rules else manifest["network"].get("targetSpacingSeconds"),
+                        "daaWindowBlocks": current_rules["daaWindowBlocks"] if current_rules else manifest["network"].get("daaWindowBlocks"),
+                        "reissuanceHeight": current_rules["nsmReissuanceHeight"] if current_rules else None,
                         "reissuanceKnown": current_rules is not None},
             "chain": {"height": height, "hash": primary["hash"], "blockTime": tip["time"],
                       "tipAgeSeconds": max(0, int(now - tip["time"])), "difficulty": tip.get("difficulty"),

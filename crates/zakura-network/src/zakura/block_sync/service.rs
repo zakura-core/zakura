@@ -767,17 +767,19 @@ impl Service for BlockSyncService {
                     cancel_token: service_cancel_token.clone(),
                 },
             );
+            // The admitted session supersedes any gap claim left by its
+            // predecessor. Clearing it under the peer-map lock keeps a later
+            // session's `finish_session` claim from being removed here.
+            self.inner
+                .session_gap_claims
+                .lock()
+                .expect("block-sync gap-claim mutex is never poisoned")
+                .remove(&peer_id);
             (old_record, re_admitted_after_no_progress, routine)
         };
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }
-        // The admitted session supersedes any gap claim left by its predecessor.
-        self.inner
-            .session_gap_claims
-            .lock()
-            .expect("block-sync gap-claim mutex is never poisoned")
-            .remove(&peer_id);
 
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {

@@ -51,7 +51,8 @@ Required shape:
 ```
 
 The empty manifest objects intentionally cannot run. The checkpoint above is
-the verified public-Testnet checkpoint used by this deployment. Supply each full manifest with `nodeRevision`, `config`,
+the verified public-Testnet checkpoint used by this deployment. Supply each full
+manifest with `nodeRevision`, `config`,
 `configSha256`, and `network` (`name`, `magic`, `activationHeight`, `branchId`).
 The public manifest uses standard Testnet joining configuration without staging
 activation overrides and magic `fa1af9bf`. Verify the identity checkpoint comes
@@ -195,7 +196,10 @@ nine-character prefix in addition to the consensus export and chain identity.
 For an approved new deployment, qualify it read-only before changing the manifest:
 
 ```bash
-ssh root@167.99.103.111 'runuser -u nu7-activation -- python3 /opt/zakura-nu7-status/nu7-qualify.py --expected-revision FULL_APPROVED_SHA'
+ssh-check --command runuser root@167.99.103.111 -- \
+  runuser -u nu7-activation -- \
+  python3 /opt/zakura-nu7-status/nu7-qualify.py \
+  --expected-revision FULL_APPROVED_SHA
 ```
 
 The override applies only to that command's in-memory configuration; it never

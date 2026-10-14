@@ -65,6 +65,10 @@ fn compact_session_lifecycle_peak() {
                         else {
                             panic!("every range is unavailable");
                         };
+                        assert!(
+                            (1..=count).contains(&range.start.0),
+                            "{range:?} was not requested"
+                        );
                         let start = usize::try_from(range.start.0).unwrap();
                         assert!(!std::mem::replace(&mut ended[start], true));
                     }

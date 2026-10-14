@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_TRACKED_PARENTS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | one parent (cleared on every parent change) → `8` parents retained | [#947](https://github.com/zakura-core/zakura/pull/947) | Retain each parent's results across reorgs. Eviction retires its work-ID namespace. Returning to a forgotten height requires foreground recovery and a fresh revision. |
 | RPC `SERVER_MAX_ENTRIES` / `PROPOSAL_MAX_ENTRIES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `24` / `8` canonical candidates | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound work-ID reconstruction independently of content-keyed consensus verification; share decoded block allocations through `Arc` where possible. |
 | RPC `SERVER_MAX_BYTES` / `PROPOSAL_MAX_BYTES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `48 MiB` / `16 MiB` | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound RPC candidate and alias retention separately from the unchanged consensus cache budgets; do not retain serialized block copies. |
 | `SERVER_MAX_WORK_IDS` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `3,072` aliases | [#754](https://github.com/zakura-core/zakura/pull/754) | Retain aliases from the single-flight server preparation lane without letting client proposals evict them. |

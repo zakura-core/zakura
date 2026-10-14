@@ -40,7 +40,8 @@ fn encode_like_serving(blocks: &[(Height, Vec<u8>)]) -> u64 {
             let mut payload = Vec::with_capacity(bytes.len() + 1);
             payload.push(3);
             payload.extend_from_slice(bytes);
-            u64::try_from(payload.len()).expect("frame length fits u64")
+            // Keep the copy observable so release builds cannot elide it.
+            u64::try_from(std::hint::black_box(payload).len()).expect("frame length fits u64")
         })
         .sum()
 }

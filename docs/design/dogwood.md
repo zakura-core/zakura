@@ -166,7 +166,7 @@ validation.
 | `Want` | Ask for up to `count` parts of one stripe from an allowed set. |
 | `StripeDone` | Report `k` parts of a stripe; stop sending that stripe. |
 | `BlockDone` | Report an assembled block; stop sending that block. |
-| `Advert` | Share per-lane arrival potentials and the forwarding wait. |
+| `Advert` | Share per-lane arrival delays and the forwarding wait. |
 | `Part` | Send one part with its proof. |
 | `Have` | Announce verified parts, in band behind queued parts. |
 | `WantEnd` | End a `Want`, behind its parts. |
@@ -201,10 +201,11 @@ Demote:     Node ──Unsubscribe──> A ... A ──SubscriptionEnd──> N
 ```
 
 **Avoiding cycles.** A node accepts a parent only if the parent's advertised
-potential, its median arrival delay for the lane in that block, is lower than
-the node's own. Parents therefore always point upstream, and no cycle forms
-within a block, even under clock skew. A node also leaves a parent that
-subscribes to it for the same lane, which breaks cycles that form across blocks.
+arrival delay for the lane in that block, measured from the proposer's signed
+`created_ms`, is lower than the node's own. Parents therefore always point
+upstream, and no cycle forms within a block, even under clock skew. A node also
+leaves a parent that subscribes to it for the same lane, which breaks cycles
+that form across blocks.
 
 **Falling behind.** A node that runs several blocks behind still learns. It
 keeps each neighbour's adverts for the last 64 blocks and compares against the

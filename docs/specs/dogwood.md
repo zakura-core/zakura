@@ -146,10 +146,10 @@ body size with checked arithmetic before it allocates assembly state.
 `entry_peers` MUST be nonempty and MUST NOT repeat an identity. It MUST NOT
 contain `proposer_node`. Section 3 derives each part's lane from `entry_peers`.
 
-`created_ms` anchors the arrival potentials in section 7. Nodes MUST NOT use it
-for admission, retention, or deadlines. A skewed proposer clock shifts every
-node's potentials by the same amount, so a potential can be negative. Nodes
-saturate potentials at the bounds of `i32` microseconds.
+`created_ms` anchors the arrival delays in section 7. Nodes MUST NOT use it for
+admission, retention, or deadlines. A skewed proposer clock shifts every node's
+arrival delays by the same amount, so an arrival delay can be negative. Nodes
+saturate arrival delays at the bounds of `i32` microseconds.
 
 The block identifier is the consensus hash of `header`. The profile MUST define
 one canonical serialization for the metadata fields and one hash `T`. The
@@ -444,7 +444,7 @@ wants_out[peer][want_id]         // block, stripe, allowed set, count, spent
 wants_in[peer][want_id]          // Wants this node serves
 peer_view[peer][b]               // Haves, StripeDone, BlockDone, parts written
 early[peer]                      // messages about unknown blocks
-adverts[peer][b]                 // advertised potentials and wait
+adverts[peer][b]                 // advertised arrival delays and wait
 learner[lane]                    // parent, candidates, lags, streaks (section 7)
 retired[b][peer]                 // remaining late parts and indices per peer
 ```
@@ -800,8 +800,8 @@ peer's traffic or establish block validity.
 - **Cadence**
   - at most once per block per connection
 
-`Advert` carries the sender's forwarding wait and, per lane, its arrival
-potential for the block. Section 7 defines both values. The receiver keeps each
+`Advert` carries the sender's forwarding wait and, per lane, its arrival delay
+for the block. Section 7 defines both values. The receiver keeps each
 peer's adverts for the last `ADV_KEEP` blocks. The values are hints. A
 receiver MUST NOT treat an advertised value as a violation.
 
@@ -1084,19 +1084,19 @@ that lane in the block. The ranking lag is an EWMA of raw lags with weight
 The node runs one learning step per block, `LEARN_DELAY_MS` after it assembles
 the block. The step waits up to `ADV_WAIT_MS` for its candidates' `Advert`s.
 
-### Potentials and cycle avoidance
+### Arrival delays and cycle avoidance
 
-A node's potential for a lane in a block is the median first-arrival delay,
-after `created_ms`, of the lane's sampled parts. Parts that the node
-regenerates count at decode time. The node advertises its potentials and its
-forwarding wait in `Advert`. The forwarding wait is its queued bytes over an
-EWMA of its egress rate.
+A node's arrival delay for a lane in a block is the median time from
+`created_ms` to the first arrival of each of the lane's sampled parts. Parts
+that the node regenerates count at decode time. The node advertises its arrival
+delays and its forwarding wait in `Advert`. The forwarding wait is its queued
+bytes over an EWMA of its egress rate.
 
-A candidate parent for a lane is a neighbour that is not the block's
-proposer, not this node's child for the lane, and not banned. A candidate that
-is not the current parent MUST advertise a lower potential than this node's for
-the learned block. Its advertised wait adds to its lag. Advertised values use
-each node's own clock, so skew between nodes biases rankings. It cannot create a
+A candidate parent for a lane is a neighbour that is not the block's proposer,
+not this node's child for the lane, and not banned. A candidate that is not the
+current parent MUST advertise a lower arrival delay than this node's for the
+learned block. Its advertised wait adds to its lag. Advertised values use each
+node's own clock, so skew between nodes biases rankings. It cannot create a
 cycle among nodes that pass this filter in the same block.
 
 When a node's parent for a lane subscribes to that lane at the node, the
@@ -1230,7 +1230,7 @@ The following table lists each payload's fields in transmission order.
 | `Want` | `u32(want_id)`, block identifier, `u32(stripe)`, `u16(count)`, allowed bitmap (11) |
 | `StripeDone` | block identifier, `u32(stripe)` |
 | `BlockDone` | block identifier |
-| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `i32(potential_us)` |
+| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `i32(delay_us)` |
 | `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`S`) |
 | `Have` | block identifier, `u16(count)`, `u32(index)` each |
 | `WantEnd` | `u32(want_id)`, `u16(sent)`, `u8(reason)` |

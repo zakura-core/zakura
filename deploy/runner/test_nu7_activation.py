@@ -347,6 +347,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(self.feed.response()[1]["status"]["status"], "unavailable")
 
     def test_dispatch_failure_retries_then_stops_after_success(self):
+        self.feed.state["selectedProfile"] = "public-testnet"
         self.feed.config["dispatch"] = True
         self.feed.state["selectionId"] = "test"
         self.feed.state["lastPublicEnvelope"] = {"test": True}
@@ -361,7 +362,7 @@ class ActivationTests(unittest.TestCase):
             self.feed.dispatch()
             self.feed.dispatch()
         self.assertEqual(request.call_count, 1)
-        self.assertTrue(self.feed.state["publicationDispatched"])
+        self.assertEqual(self.feed.state["publicationDispatchedFor"], "public-testnet")
 
     def test_node_on_a_different_chain_is_excluded(self):
         self.rpc.bad.add("0")
@@ -414,6 +415,138 @@ class ActivationTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.config))
         with self.assertRaisesRegex(ValueError, "distinct source name"):
             ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+
+class MainnetTransitionTests(unittest.TestCase):
+    poll = ActivationTests.poll
+    tearDown = ActivationTests.tearDown
+    # Inherit the public-Testnet checks to verify an optional Mainnet destination
+    # does not change the existing staging-to-Testnet behavior.
+    def setUp(self):
+        ActivationTests.setUp(self)
+        reference = copy.deepcopy(self.feed.protocol_reference)
+        reference["network"].update(name="Mainnet", magic="24e92764", activationHeight=200)
+        reference["parameters"]["difficulty"].update(minimumDifficultyGapSeconds=None,
+                                                    minimumDifficultyGapMultiplier=None,
+                                                    minimumDifficultyStrictlyGreater=False)
+        path = self.root / "mainnet-reference.json"
+        path.write_text(json.dumps(reference))
+        mainnet_manifest = copy.deepcopy(manifest())
+        mainnet_manifest["network"] = copy.deepcopy(reference["network"])
+        mainnet_manifest["config"] = '[network]\nnetwork = "Mainnet"\n'
+        mainnet_manifest["configSha256"] = hashlib.sha256(mainnet_manifest["config"].encode()).hexdigest()
+        self.feed.config["mainnet"] = {"armed": False, "manifest": mainnet_manifest,
+            "protocolReferenceFile": str(path), "identityCheckpoint": {"height": 190, "hash": f"{190:064x}"},
+            "nodes": [{"name": str(i), "rpcUrl": "http://main"+str(i)} for i in range(3)],
+            "reference": {"name": "reference", "rpcUrl": "http://main-reference"}}
+        self.feed.mainnet_protocol_reference = reference
+        self.mainnet_height = 202
+        self.mainnet_offline = False
+        self.mainnet_wrong_chain = False
+        original = self.feed.rpc
+        def mainnet(url, method, params=None):
+            if not url.startswith("http://main"):
+                return original(url, method, params)
+            if self.mainnet_offline:
+                raise OSError("Mainnet unavailable")
+            if method == "getblockchaininfo":
+                return {"chain": "test" if self.mainnet_wrong_chain else "main", "blocks": self.mainnet_height,
+                    "bestblockhash": f"{self.mainnet_height:064x}", "nsmValueBalanceZat": 900,
+                    "consensus": {"chaintip": "77190ad9", "nextblock": "77190ad9"},
+                    "upgrades": {"77190ad9": {"activationheight": 200, "status": "active"}}}
+            if method == "getblockheader":
+                return {"height": int(params[0],16), "hash": params[0], "time": 990, "bits": "2007ffff", "difficulty": 5}
+            return original(url, method, params)
+        self.feed.rpc = mainnet
+        self.config_path.write_text(json.dumps(self.feed.config))
+
+    def activate_testnet(self):
+        for _ in range(3):
+            self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+
+    def test_mainnet_requires_explicit_arming_and_three_fresh_passes(self):
+        self.activate_testnet()
+        for _ in range(4):
+            self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.feed.config["mainnet"]["armed"] = True
+        self.poll(); self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "mainnet")
+        self.assertEqual(payload["network"]["network"]["magic"], "24e92764")
+        self.assertEqual(payload["rules"]["atTip"]["network"], "Mainnet")
+        self.assertEqual(payload["status"]["nsm"]["balanceZat"], 900)
+        self.assertFalse(payload["status"]["chain"]["minimumDifficultyEligible"])
+        self.assertIsNone(payload["capabilities"]["faucet"])
+        self.assertIn("mainnetReorgObservation", self.feed.state)
+
+    def test_wrong_network_or_missing_protocol_reference_prevents_switch(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        self.mainnet_wrong_chain = True
+        for _ in range(3): self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.mainnet_wrong_chain = False
+        self.feed.mainnet_protocol_reference = None
+        for _ in range(3): self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+
+    def test_mainnet_outage_and_restart_never_restore_testnet(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        for _ in range(3): self.poll()
+        self.config_path.write_text(json.dumps(self.feed.config))
+        original_rpc = self.feed.rpc
+        self.feed.owner.close()
+        self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, original_rpc)
+        self.mainnet_offline = True
+        self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "mainnet")
+        self.assertEqual(payload["status"]["status"], "unavailable")
+        self.assertEqual(payload["network"]["network"]["name"], "Mainnet")
+        self.assertEqual(payload["status"]["nsm"]["balanceZat"], 900)
+
+    def test_mainnet_disagreement_resets_confirmation_and_preserves_testnet(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        self.poll(); self.poll()
+        self.mainnet_wrong_chain = True
+        self.poll()
+        self.assertEqual(self.feed.state["mainnetConsecutivePasses"], 0)
+        self.mainnet_wrong_chain = False
+        self.poll(); self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "mainnet")
+
+    def test_mainnet_removal_after_selection_fails_without_resetting_state(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        for _ in range(3): self.poll()
+        config = copy.deepcopy(self.feed.config)
+        config.pop("mainnet")
+        self.config_path.write_text(json.dumps(config))
+        before = self.feed.path.read_text()
+        self.feed.owner.close()
+        with self.assertRaisesRegex(ValueError, "Mainnet configuration missing"):
+            ActivationFeed(self.config_path, Staging(), lambda: self.now, self.feed.rpc)
+        self.assertEqual(self.feed.path.read_text(), before)
+
+    def test_restart_resets_unfinished_mainnet_confirmation(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        self.poll(); self.poll()
+        self.config_path.write_text(json.dumps(self.feed.config))
+        original_rpc = self.feed.rpc
+        self.feed.owner.close()
+        self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, original_rpc)
+        self.poll(); self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "mainnet")
 
 class ReferenceAdapterTests(unittest.TestCase):
     def test_compact_hash_byte_order_and_height_are_verified(self):
@@ -492,9 +625,10 @@ class PublicReorgObservationTests(unittest.TestCase):
         self.assertEqual(self.observe(105, "d" * 64, 1020)["reorgs24h"], 2)
         self.assertEqual(self.observe(105, "d" * 64, 1030)["reorgs24h"], 2)
 
-    def test_height_drop_is_one_event_without_reading_nonexistent_height(self):
+    def test_lagging_primary_is_unknown_without_counting_a_chain_replacement(self):
         self.observe()
-        self.assertEqual(self.observe(100, "b" * 64, 1010)["reorgs24h"], 1)
+        self.assertIsNone(self.observe(100, "b" * 64, 1010, "lagging")["reorgs24h"])
+        self.assertEqual(self.feed.state["publicReorgObservation"]["height"], 102)
         self.assertFalse(any(call.args[1] == "getblockhash" for call in self.feed.rpc.call_args_list))
 
     def test_unavailable_ancestry_preserves_last_verified_observation(self):
@@ -518,18 +652,20 @@ class PublicReorgObservationTests(unittest.TestCase):
 
     def test_restart_retains_events_and_compares_the_persisted_tip(self):
         self.observe()
-        self.observe(100, "b" * 64, 1010)
+        self.ancestor = "b" * 64
+        self.observe(102, "b" * 64, 1010)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             atomic_json(path, self.feed.state)
             self.feed.state = json.loads(path.read_text())
-        self.assertEqual(self.observe(100, "b" * 64, 1020), {"reorgs24h": 1, "since": 1000})
+        self.assertEqual(self.observe(102, "b" * 64, 1020), {"reorgs24h": 1, "since": 1000})
 
     def test_rolling_window_expires_events_without_resetting_provenance(self):
         self.observe()
-        self.observe(100, "b" * 64, 1010)
-        self.assertEqual(self.observe(100, "b" * 64, 87410), {"reorgs24h": 1, "since": 1010})
-        self.assertEqual(self.observe(100, "b" * 64, 87411), {"reorgs24h": 0, "since": 1011})
+        self.ancestor = "b" * 64
+        self.observe(102, "b" * 64, 1010)
+        self.assertEqual(self.observe(102, "b" * 64, 87410), {"reorgs24h": 1, "since": 1010})
+        self.assertEqual(self.observe(102, "b" * 64, 87411), {"reorgs24h": 0, "since": 1011})
 
     def test_corrupt_history_and_clock_rollback_fail_without_zero(self):
         self.observe()

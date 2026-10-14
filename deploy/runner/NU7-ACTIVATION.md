@@ -222,3 +222,39 @@ read-only `systemctl is-active`; the stable unprivileged identity preserves real
 service-state observations. `DynamicUser=yes` reuses the existing identity and
 the remaining service sandbox still applies. Verify actual `/v1/miner`
 `nodeActive`, `minerActive`, and `nodeHealthy` before accepting the cutover.
+
+## Mainnet selection after public Testnet
+
+Keep the existing staging-to-public-Testnet switch. An optional `mainnet`
+configuration adds the next destination without changing the Testnet profile.
+Omit it until reviewed Mainnet artifacts are available. No live Mainnet sources
+or activation height are added by this PR, and Mainnet is never armed implicitly.
+
+The `mainnet` object uses the same `manifest`, `identityCheckpoint`, three
+`nodes`, independent `reference`, and `capabilities` fields as `public`. It also
+requires an absolute `protocolReferenceFile` path and an explicit `armed` boolean
+(default false). Its manifest must use standard `Mainnet` configuration, magic
+`24e92764`, the NU7 branch, and the actual approved activation height. Derive its
+protocol reference from the approved Mainnet node source; do not reuse Testnet
+constants, difficulty exceptions, checkpoint hashes, or joining configuration.
+A Mainnet snapshot must declare `networkId: mainnet`. Faucet capability is null.
+
+While Testnet remains selected, an armed Mainnet destination must show active
+NU7 at least two blocks after activation. Two managed nodes and the independent
+reference must agree on the activation block and a subsequent common hash.
+Three consecutive fresh passes with a complete matching parameter table select
+Mainnet. Restart or disagreement resets unfinished confirmation. Missing or
+mismatched protocol data prevents selection. Missing Mainnet configuration after
+Mainnet was selected fails closed instead of restoring Testnet.
+
+Selection, saved dashboard observations, and reorg history remain durable.
+Mainnet gets its own reorg baseline; Testnet history cannot carry over. A lower
+sampled tip from a lagging source leaves the reorg measurement unknown until
+the previous higher tip can be checked, instead of inventing a replacement.
+
+The website consumer must support the same ordered profiles before Mainnet is
+armed: staging, public Testnet, Mainnet. Its browser cache, static baseline and
+publication watcher must refuse backwards network changes. Mainnet uses ZEC and
+Mainnet joining details, and hides Testnet faucet and internal-miner controls.
+The synthetic Mainnet fixtures test switching and response shape only; they are
+not production activation parameters or evidence of Mainnet activation.

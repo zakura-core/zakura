@@ -94,6 +94,8 @@ class ActivationFeed:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.validate_config()
         self.protocol_reference = self.load_protocol_reference()
+        self.mainnet_protocol_reference = (self.load_protocol_reference(self.config["mainnet"]["protocolReferenceFile"])
+                                           if self.config.get("mainnet") else None)
         owner_path = self.path.with_suffix(".lock")
         previously_initialized = owner_path.exists()
         marker_path = self.path.with_suffix(".initialized")
@@ -108,17 +110,25 @@ class ActivationFeed:
         except Exception:
             self.owner.close()
             raise
-        if (self.state["selectedProfile"] not in ("staging", "public-testnet")
-                or (self.state["selectedProfile"] == "public-testnet"
+        if (self.state["selectedProfile"] not in ("staging", "public-testnet", "mainnet")
+                or (self.state["selectedProfile"] in ("public-testnet", "mainnet")
                     and self.state["selectionState"] != "selected")):
             self.owner.close()
             raise ValueError("invalid persisted selection")
         if self.state["selectedProfile"] == "staging":
             self.state["selectionState"] = "armed" if self.config["armed"] else "staging"
+        if self.state["selectedProfile"] == "mainnet" and not self.config.get("mainnet"):
+            self.owner.close()
+            raise ValueError("selected Mainnet configuration missing; operator repair required")
+        self.state["mainnetConsecutivePasses"] = 0
         # A restart always requires fresh consecutive observations.
         self.state["consecutivePasses"] = 0
         self.lock = threading.Lock()
         self.payload = self.state.get("lastPublicEnvelope")
+        if self.payload and (self.payload["selectedProfile"] != self.state["selectedProfile"]
+                or self.payload["network"]["network"]["magic"] != self.settings(self.state["selectedProfile"])["manifest"]["network"]["magic"]):
+            self.owner.close()
+            raise ValueError("saved observation belongs to another selected network")
         self.progress = {}
         self.headers = {}
         self.last_tips = {}
@@ -128,50 +138,83 @@ class ActivationFeed:
         atomic_json(marker_path, {"schemaVersion": 1})
 
     def validate_config(self):
-        public = self.config["public"]
-        if len(public["nodes"]) != 3 or len({n["name"] for n in public["nodes"]}) != 3:
-            raise ValueError("exactly three distinct public validators are required")
-        endpoints = [rpc_endpoint_identity(n["rpcUrl"]) for n in public["nodes"]]
-        if len(set(endpoints)) != 3:
-            raise ValueError("managed validators require distinct RPC endpoints")
-        reference = public["reference"]
-        if reference["name"] in {n["name"] for n in public["nodes"]}:
-            raise ValueError("reference requires a distinct source name")
-        if reference.get("rpcUrl") and rpc_endpoint_identity(reference["rpcUrl"]) in endpoints:
-            raise ValueError("reference must be independent of managed validators")
-        if public["manifest"]["network"]["magic"] != "fa1af9bf":
-            raise ValueError("public Testnet magic mismatch")
-        for profile in (self.config["staging"], public):
-            manifest = profile["manifest"]
+        for profile, settings in (("public-testnet", self.config["public"]),
+                                  ("mainnet", self.config.get("mainnet"))):
+            if settings is None:
+                continue
+            nodes = settings["nodes"]
+            if len(nodes) != 3 or len({n["name"] for n in nodes}) != 3:
+                raise ValueError("exactly three distinct public validators are required")
+            endpoints = [rpc_endpoint_identity(n["rpcUrl"]) for n in nodes]
+            if len(set(endpoints)) != 3:
+                raise ValueError("managed validators require distinct RPC endpoints")
+            reference = settings["reference"]
+            if reference["name"] in {n["name"] for n in nodes}:
+                raise ValueError("reference requires a distinct source name")
+            if reference.get("rpcUrl") and rpc_endpoint_identity(reference["rpcUrl"]) in endpoints:
+                raise ValueError("reference must be independent of managed validators")
+            network = settings["manifest"]["network"]
+            name, magic = ("Mainnet", "24e92764") if profile == "mainnet" else ("Testnet", "fa1af9bf")
+            if network["name"] != name or network["magic"] != magic or network["branchId"] != "77190ad9":
+                raise ValueError("public network identity mismatch")
+            if not (0 < settings["identityCheckpoint"]["height"] < network["activationHeight"]):
+                raise ValueError("identity checkpoint must precede activation")
+            if profile == "mainnet":
+                if type(settings.get("armed", False)) is not bool:
+                    raise ValueError("Mainnet armed must be a boolean")
+                if not Path(settings["protocolReferenceFile"]).is_absolute():
+                    raise ValueError("Mainnet protocol reference requires an absolute path")
+                if settings.get("capabilities", {}).get("faucet") is not None:
+                    raise ValueError("Mainnet cannot advertise a test faucet")
+                if settings.get("capabilities", {}).get("snapshot") != settings["manifest"].get("snapshot"):
+                    raise ValueError("snapshot capability differs from manifest")
+                snapshot = settings["manifest"].get("snapshot")
+                if snapshot and snapshot.get("networkId") != "mainnet":
+                    raise ValueError("Mainnet snapshot identity unverified")
+        profiles = [self.config["staging"], self.config["public"]]
+        if self.config.get("mainnet"):
+            profiles.append(self.config["mainnet"])
+        for settings in profiles:
+            manifest = settings["manifest"]
             if not re.fullmatch(r"[0-9a-f]{40}", manifest["nodeRevision"]):
                 raise ValueError("manifest requires full source revision")
             if hashlib.sha256(manifest["config"].encode()).hexdigest() != manifest["configSha256"]:
                 raise ValueError("joining configuration checksum mismatch")
+            if settings is not self.config["staging"]:
+                name = manifest["network"]["name"]
+                if (not re.search(r'^network\s*=\s*"' + name + r'"\s*$', manifest["config"], re.M)
+                        or any(key in manifest["config"] for key in ("testnet_parameters", "activation_heights", "Nu7Staging"))):
+                    raise ValueError("public profile requires standard network configuration")
         if not (self.config["staging"]["manifest"]["network"]["activationHeight"]
-                < public["identityCheckpoint"]["height"]
-                < public["manifest"]["network"]["activationHeight"]):
-            raise ValueError("identity checkpoint must follow staging divergence and precede public activation")
+                < self.config["public"]["identityCheckpoint"]["height"]):
+            raise ValueError("identity checkpoint must follow staging divergence")
 
-    def observe(self, node, now, include_build=True):
+    def settings(self, profile):
+        return self.config[{"public-testnet": "public", "mainnet": "mainnet", "staging": "staging"}[profile]]
+
+    def reference_parameters(self, profile):
+        return self.mainnet_protocol_reference if profile == "mainnet" else self.protocol_reference
+
+    def observe(self, node, now, include_build=True, profile="public-testnet"):
         """Verify network history and retain local progress age for every source."""
         try:
             if node.get("adapter") == "grpcurl":
-                return self.observe_lightwallet(node, now)
+                return self.observe_lightwallet(node, now, profile)
             url = node["rpcUrl"]
             info = self.rpc(url, "getblockchaininfo")
-            public = self.config["public"]
+            public = self.settings(profile)
             identity = public["identityCheckpoint"]
             activation = public["manifest"]["network"]["activationHeight"]
             branch = public["manifest"]["network"]["branchId"]
             upgrade = info["upgrades"].get(branch)
-            if (info["chain"] != "test" or not upgrade
+            if (info["chain"] != ("main" if profile == "mainnet" else "test") or not upgrade
                     or upgrade["activationheight"] != activation
                     or self.rpc(url, "getblockhash", [identity["height"]]) != identity["hash"]):
                 raise ValueError("public Testnet identity/upgrade mismatch")
             tip = (info["blocks"], info["bestblockhash"])
-            previous = self.progress.get(node["name"])
+            previous = self.progress.get((profile, node["name"]))
             changed = now if previous is None or previous[:2] != tip else previous[2]
-            self.progress[node["name"]] = (*tip, changed)
+            self.progress[(profile, node["name"])] = (*tip, changed)
             result = {"name": node["name"], "url": url, "source": node, "height": tip[0], "hash": tip[1],
                       "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                       "active": upgrade["status"] == "active",
@@ -194,18 +237,18 @@ class ActivationFeed:
             return {"name": node["name"], "fresh": False, "error": "Source unavailable or mismatched"}
 
     @staticmethod
-    def load_protocol_reference():
+    def load_protocol_reference(path=None):
         """Load optional, versioned protocol data without gating chain reports."""
         try:
-            return json.loads(Path(__file__).with_name("nu7-protocol-reference.json").read_text())
+            return json.loads((Path(path) if path else Path(__file__).with_name("nu7-protocol-reference.json")).read_text())
         except (OSError, ValueError):
             logging.warning("NU7 protocol reference unavailable; chain reporting continues")
             return None
 
-    def consolidated_rules(self, primary):
+    def consolidated_rules(self, primary, profile="public-testnet"):
         """Combine reference constants with height, branch, build and subsidy RPCs."""
-        reference = self.protocol_reference
-        manifest = self.config["public"]["manifest"]["network"]
+        reference = self.reference_parameters(profile)
+        manifest = self.settings(profile)["manifest"]["network"]
         try:
             if (not reference or reference["schemaVersion"] != 1
                     or any(reference["network"][key] != manifest[key]
@@ -243,7 +286,7 @@ class ActivationFeed:
                 value["minimumDifficulty"] = {
                     "gapMultiplier": value["difficulty"]["minimumDifficultyGapMultiplier"],
                     "thresholdSeconds": value["difficulty"]["minimumDifficultyGapSeconds"],
-                    "comparison": "strictly-greater",
+                    "comparison": "strictly-greater" if value["difficulty"]["minimumDifficultyStrictlyGreater"] else "disabled",
                 }
                 exported[key] = value
             return exported
@@ -294,27 +337,27 @@ class ActivationFeed:
             return self.lightwallet_hash(source, height)
         return self.rpc(source["rpcUrl"], "getblockhash", [height])
 
-    def observe_lightwallet(self, node, now):
+    def observe_lightwallet(self, node, now, profile="public-testnet"):
         """An independent Zebra-backed lightwalletd verifies public chain hashes."""
         info = self.lightwallet(node, "GetLightdInfo", {})
-        public = self.config["public"]
+        public = self.settings(profile)
         identity = public["identityCheckpoint"]
-        if (info["chainName"] != "test"
+        if (info["chainName"] != ("main" if profile == "mainnet" else "test")
                 or self.lightwallet_hash(node, identity["height"]) != identity["hash"]):
             raise ValueError("reference public chain identity mismatch")
         height = int(info["blockHeight"])
         block_hash = self.lightwallet_hash(node, height)
-        previous = self.progress.get(node["name"])
+        previous = self.progress.get((profile, node["name"]))
         tip = (height, block_hash)
         changed = now if previous is None or previous[:2] != tip else previous[2]
-        self.progress[node["name"]] = (*tip, changed)
+        self.progress[(profile, node["name"])] = (*tip, changed)
         return {"name": node["name"], "source": node, "height": height, "hash": block_hash,
                 "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                 "active": info["consensusBranchId"] == public["manifest"]["network"]["branchId"]}
 
-    def agreement(self, nodes, reference, now):
+    def agreement(self, nodes, reference, now, profile="public-testnet"):
         """Two managed nodes plus independent reference must agree through A+2."""
-        activation = self.config["public"]["manifest"]["network"]["activationHeight"]
+        activation = self.settings(profile)["manifest"]["network"]["activationHeight"]
         candidates = [n for n in nodes if n.get("fresh") and n.get("active")
                       and n.get("height", 0) >= activation + 2
                       and 0 <= now - n["observedAt"] <= 60]
@@ -345,7 +388,7 @@ class ActivationFeed:
                 continue
         return None
 
-    def record_public_reorgs(self, height, block_hash, url, now):
+    def record_public_reorgs(self, height, block_hash, url, now, profile="public-testnet"):
         """Count sampled canonical-chain replacements, never ordinary extensions.
 
         Persist the previous verified tip and event times in the selection state.
@@ -353,7 +396,8 @@ class ActivationFeed:
         The first observation establishes a baseline, not a measured zero.
         These are observed events; forks between successful polls can be missed.
         """
-        previous = self.state.get("publicReorgObservation")
+        state_key = "mainnetReorgObservation" if profile == "mainnet" else "publicReorgObservation"
+        previous = self.state.get(state_key)
         def confirm_tip():
             info = self.rpc(url, "getblockchaininfo")
             if (info["blocks"], info["bestblockhash"]) == (height, block_hash):
@@ -362,7 +406,7 @@ class ActivationFeed:
                 raise ValueError("tip moved to a different chain during reorg observation")
         if previous is None:
             confirm_tip()
-            self.state["publicReorgObservation"] = {
+            self.state[state_key] = {
                 "startedAt": now, "lastObservedAt": now, "height": height,
                 "hash": block_hash, "events": [],
             }
@@ -379,8 +423,13 @@ class ActivationFeed:
         cutoff = max(now - 86400, previous["startedAt"])
         events = [t for t in previous["events"] if t >= cutoff]
         changed = (height, block_hash) != (previous["height"], previous["hash"])
+        if changed and height < previous["height"]:
+            # A lower quorum tip can be a lagging source, not a chain replacement.
+            # Keep the higher baseline until its ancestry can be checked again.
+            confirm_tip()
+            return {"reorgs24h": None, "since": cutoff}
         if changed:
-            replaced = height < previous["height"]
+            replaced = False
             if not replaced:
                 ancestor = self.rpc(url, "getblockhash", [previous["height"]])
                 if not isinstance(ancestor, str) or not re.fullmatch(r"[0-9a-f]{64}", ancestor):
@@ -391,13 +440,13 @@ class ActivationFeed:
                     raise ValueError("public reorg observation capacity exceeded")
                 events.append(now)
         confirm_tip()
-        self.state["publicReorgObservation"] = {
+        self.state[state_key] = {
             "startedAt": previous["startedAt"], "lastObservedAt": now,
             "height": height, "hash": block_hash, "events": events,
         }
         return {"reorgs24h": len(events), "since": cutoff}
 
-    def public_status(self, nodes, agreement, now):
+    def public_status(self, nodes, agreement, now, profile="public-testnet"):
         available = [n for n in nodes if n.get("fresh") and n.get("active")]
         if agreement:
             available = [n for n in available if n["name"] in agreement["nodes"]]
@@ -418,9 +467,9 @@ class ActivationFeed:
                 break
         if primary is None:
             raise ValueError("public chain quorum unavailable")
-        parameters = self.consolidated_rules(primary)
+        parameters = self.consolidated_rules(primary, profile)
         height = primary["height"]
-        manifest = self.config["public"]["manifest"]
+        manifest = self.settings(profile)["manifest"]
         activation = manifest["network"]["activationHeight"]
         start = max(min(activation, height), height - 300)
         previous = self.last_tips.get(primary["url"])
@@ -447,7 +496,7 @@ class ActivationFeed:
         threshold = current_rules["minimumDifficulty"]["thresholdSeconds"] if current_rules else None
         limit = current_rules["powLimitCompact"] if current_rules else None
         bits = tip.get("bits")
-        reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now)
+        reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now, profile)
                   if agreement else {"reorgs24h": None, "since": now})
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
@@ -459,8 +508,8 @@ class ActivationFeed:
                       "medianIntervalSeconds": round(statistics.median(intervals), 1) if intervals else None,
                       "intervalSampleBlocks": len(intervals),
                       "timestampGapSeconds": gap,
-                      "minimumDifficultyEligible": gap > threshold if gap is not None and threshold is not None else None,
-                      "minimumDifficultyBlock": str(bits).lower().removeprefix("0x") == str(limit).lower().removeprefix("0x")
+                      "minimumDifficultyEligible": (gap > threshold if threshold is not None else False) if gap is not None and current_rules else None,
+                      "minimumDifficultyBlock": False if current_rules and threshold is None else str(bits).lower().removeprefix("0x") == str(limit).lower().removeprefix("0x")
                       if bits is not None and limit is not None else None},
             "nsm": {"balanceZat": balance, "available": balance is not None, "seedZat": None},
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
@@ -478,16 +527,16 @@ class ActivationFeed:
         return status, parameters
 
     def envelope(self, profile, status, parameter_rules, now):
-        settings = self.config["public" if profile == "public-testnet" else "staging"]
+        settings = self.settings(profile)
         body = {"schemaVersion": 1, "selectedProfile": profile,
                 "selectionState": self.state["selectionState"], "generatedAt": now,
                 "status": status, "network": settings["manifest"], "rules": parameter_rules,
                 "capabilities": settings.get("capabilities", {"faucet": None, "snapshot": None})}
-        if profile == "public-testnet" and parameter_rules:
+        if profile != "staging" and parameter_rules:
             body["rulesSource"] = {
                 "kind": "protocol-reference-and-node-rpcs",
-                "protocolRevision": self.protocol_reference["sourceRevision"],
-                "protocolUrl": self.protocol_reference["sourceUrl"],
+                "protocolRevision": self.reference_parameters(profile)["sourceRevision"],
+                "protocolUrl": self.reference_parameters(profile)["sourceUrl"],
                 "liveFields": {"buildVersion": "getinfo", "baseSubsidyZat": "getblocksubsidy",
                                "branchId": "getblockchaininfo", "effectiveHeight": "getblockchaininfo"},
             }
@@ -496,7 +545,7 @@ class ActivationFeed:
 
     def dispatch(self):
         """Idempotent notification; failed dispatch is retried on later polls."""
-        if (self.state.get("publicationDispatched") or not self.config.get("dispatch", False)
+        if (self.state["selectedProfile"] == "staging" or self.state.get("publicationDispatchedFor") == self.state["selectedProfile"] or (self.state.get("publicationDispatched") and self.state["selectedProfile"] == "public-testnet") or not self.config.get("dispatch", False)
                 or not self.state.get("lastPublicEnvelope")):
             return
         token = os.environ.get("NU7_DISPATCH_TOKEN")
@@ -506,52 +555,82 @@ class ActivationFeed:
         try:
             request = urllib.request.Request("https://api.github.com/repos/zakura-core/website/dispatches",
                 data=json.dumps({"event_type": "nu7_activated", "client_payload": {
-                    "selectedProfile": "public-testnet", "selectionId": self.state["selectionId"]}}).encode(),
+                    "selectedProfile": self.state["selectedProfile"], "selectionId": self.state["selectionId"]}}).encode(),
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                          "Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=RPC_TIMEOUT) as response:
                 if response.status != 204:
                     raise ValueError("publication dispatch rejected")
-            self.state["publicationDispatched"] = True
+            self.state["publicationDispatchedFor"] = self.state["selectedProfile"]
         except (OSError, ValueError):
             logging.warning("NU7 publication dispatch failed; retry retained")
 
-    def poll(self):
-        now = self.clock()
-        public = self.config["public"]
+    def collect(self, profile, now):
+        settings = self.settings(profile)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(self.observe, node, now) for node in public["nodes"]]
-            reference_future = executor.submit(self.observe, public["reference"], now, False)
+            futures = [executor.submit(self.observe, node, now, True, profile) for node in settings["nodes"]]
+            reference_future = executor.submit(self.observe, settings["reference"], now, False, profile)
             nodes = [f.result() for f in futures]
             reference = reference_future.result()
-        agreement = self.agreement(nodes, reference, self.clock())
-        if self.state["selectedProfile"] == "staging" and self.config["armed"]:
+        return nodes, self.agreement(nodes, reference, self.clock(), profile)
+
+    def select(self, profile, evidence, now):
+        self.state.update(selectedProfile=profile, selectionState="selected", selectedAt=now,
+                          selectionEvidence=evidence,
+                          selectionId=hashlib.sha256(json.dumps({"profile": profile, "evidence": evidence}, sort_keys=True).encode()).hexdigest())
+        # Observations and reorg baselines from another network must never become
+        # the fallback for the newly selected network.
+        self.state.pop("lastPublicEnvelope", None)
+        self.headers.clear()
+        self.last_tips.clear()
+
+    def poll(self):
+        now = self.clock()
+        selected = self.state["selectedProfile"]
+        prepared_mainnet = None
+        observation_profile = "mainnet" if selected == "mainnet" else "public-testnet"
+        nodes, agreement = self.collect(observation_profile, now)
+        if selected == "staging" and self.config["armed"]:
             self.state["selectionState"] = "armed"
             self.state["consecutivePasses"] = self.state["consecutivePasses"] + 1 if agreement else 0
             if self.state["consecutivePasses"] >= 3:
-                self.state.update(selectedProfile="public-testnet", selectionState="selected",
-                                  selectedAt=now, selectionEvidence=agreement,
-                                  selectionId=hashlib.sha256(json.dumps(agreement, sort_keys=True).encode()).hexdigest())
+                self.select("public-testnet", agreement, now)
+        if self.state["selectedProfile"] == "public-testnet" and self.config.get("mainnet", {}).get("armed", False):
+            mainnet_nodes, mainnet_agreement = self.collect("mainnet", now)
+            ready = bool(mainnet_agreement and self.reference_parameters("mainnet"))
+            # An activation switch must have the complete matching parameter table,
+            # not merely a reachable Mainnet endpoint.
+            if ready:
+                try:
+                    mainnet_status, parameters = self.public_status(mainnet_nodes, mainnet_agreement, now, "mainnet")
+                    ready = parameters is not None and 0 <= self.clock() - now <= 60
+                except (OSError, ValueError, KeyError, TypeError):
+                    ready = False
+            self.state["mainnetConsecutivePasses"] = self.state.get("mainnetConsecutivePasses", 0) + 1 if ready else 0
+            if self.state["mainnetConsecutivePasses"] >= 3:
+                self.select("mainnet", mainnet_agreement, now)
+                nodes, agreement = mainnet_nodes, mainnet_agreement
+                prepared_mainnet = (mainnet_status, parameters)
         profile = self.state["selectedProfile"]
         try:
-            if profile == "public-testnet":
-                status, parameters = self.public_status(nodes, agreement, now)
+            if profile != "staging":
+                status, parameters = prepared_mainnet or self.public_status(nodes, agreement, now, profile)
             else:
                 status = (self.staging_status.response()[1] if self.staging_status else
                           read_json(self.config["staging"]["statusUrl"]))
                 parameters = None
             payload = self.envelope(profile, status, parameters, now)
         except (OSError, ValueError, KeyError, TypeError):
-            previous = self.state.get("lastPublicEnvelope") if profile == "public-testnet" else None
+            previous = self.state.get("lastPublicEnvelope") if profile != "staging" else None
             if previous:
                 payload = copy.deepcopy(previous)
                 payload["status"]["status"] = "unavailable"
-                payload["status"]["error"] = "Public Testnet observation unavailable; showing last verified generation"
+                payload["status"]["error"] = "Selected network observation unavailable; showing last verified generation"
                 payload["generation"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             else:
                 payload = self.envelope(profile, {"schemaVersion": 1, "status": "unavailable",
                     "observedAt": now, "error": "Selected network observation unavailable"}, None, now)
-        if profile == "public-testnet":
+        if profile != "staging":
             if payload["status"]["status"] != "unavailable":
                 self.state["lastPublicEnvelope"] = payload
             self.dispatch()

@@ -260,6 +260,46 @@ In the mock harness, measured decoded bytes exceeded the 4× estimate on almost 
 check. Synthetic transactions are tiny, so they decode at about 8× their wire size. The
 look-ahead gate never closed, so the larger charge did not reduce throughput.
 
+### Queue depth
+
+The stream-6 inbound depth was measured on a second host: Apple M3 Ultra (28 cores),
+96 GiB RAM, macOS, loopback, no netem, release builds with `cargo +1.98.0`. Other work shared
+the host, so single runs dipped when it was busy. The same pass criterion applies: each
+branch range must overlap the base range.
+
+A sweep first ran the base build against one build whose stream-6 depth came from an
+environment variable, at depths 2, 8 and 32, 4 rounds each, alternating. No depth was
+consistently slower on any case below. Then base `c542425f6` and this branch (depth 8) ran 6
+alternating rounds of each probe.
+
+**Serving over native QUIC** (`regulated_getblocks_throughput_probe`, `ZAKURA_RTT_PROBE=1`,
+`ZAKURA_PROBE_SECS=10`). Body MB/s:
+
+| Body | Blocks per request | Depth | Base | Branch |
+| --- | --- | --- | --- | --- |
+| 1,617 B | 1 | 64 | 48–93 | 91–94 |
+| 1,617 B | 1 | 512 | 104–108 | 105–110 |
+| 1,617 B | 1 | 2,816 (advertised) | 109–114 | 107–114 |
+| 1,617 B | 16 | 2,816 | 115–124 | 119–126 |
+| 73,079 B | 1 | 64 | 111–144 | 128–145 |
+| 73,079 B | 1 | 512 | 90–140 | 137–150 |
+| 73,079 B | 1 | 2,816 | 115–142 | 132–147 |
+
+This probe measures the serving side. The victim's stream-6 queue carries the peer's
+`GetBlocks` requests, which now share the 8 slots with control frames.
+
+**Requesting end to end** (`zakura_mock_blocksync_throughput`, `ZAKURA_MOCK_BS_RUN=1`, 4 seeds).
+This harness sends real bodies into the depth-limited queue:
+
+| Corpus | Base blocks/s | Branch blocks/s |
+| --- | --- | --- |
+| 100,000 synthetic blocks of 1–16 transactions (default) | 858–1,442 | 707–2,559 |
+| 4,000 synthetic blocks of about 1 MB (`ZAKURA_MOCK_BS_TARGET_BLOCK_BYTES=1000000`) | 133–154 | 138–159 |
+
+The default corpus saturates one core on this host and swings with load, so its wide ranges
+reflect the host rather than either build. The 1 MB corpus puts the queue under the most byte
+pressure and stays within a few percent.
+
 ## Throughput requirement and the 10 Gbps target
 
 The specification requires that regulation not limit a conformant peer's throughput below

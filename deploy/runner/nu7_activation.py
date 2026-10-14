@@ -263,13 +263,48 @@ class ActivationFeed:
             parameters = reference["parameters"]
             if not required.issubset(parameters):
                 return None
-            if (not {"minerPercent", "nsmPercent", "nsmRounding"}.issubset(parameters["fees"])
-                    or not {"globalShieldedBudget", "orchardActionsPerPool", "saplingSpendsAndOutputs", "sproutJoinSplits"}.issubset(parameters["actionLimits"])
-                    or not {"averagingTimespanSeconds", "averagingWindowBlocks", "dampingFactor",
+            if (set(parameters["fees"]) != {"minerPercent", "nsmPercent", "nsmRounding"}
+                    or set(parameters["actionLimits"]) != {"globalShieldedBudget", "orchardActionsPerPool", "saplingSpendsAndOutputs", "sproutJoinSplits"}
+                    or set(parameters["difficulty"]) != {"averagingTimespanSeconds", "averagingWindowBlocks", "dampingFactor",
                             "maxAdjustDownPercent", "maxAdjustUpPercent", "medianTimeSpanBlocks",
                             "minimumDifficultyGapMultiplier", "minimumDifficultyGapSeconds",
-                            "minimumDifficultyStrictlyGreater", "powLimit", "powLimitCompact"}.issubset(parameters["difficulty"])):
+                            "minimumDifficultyStrictlyGreater", "powLimit", "powLimitCompact"}):
                 return None
+            def positive_integer(value):
+                return type(value) is int and 0 < value <= 9_007_199_254_740_991
+            if (set(parameters) != required
+                    or any(not positive_integer(parameters[key]) for key in
+                           ("targetSpacingSeconds", "minimumProtocolVersion", "nsmReissuanceHeight", "coinbaseMaturityBlocks"))):
+                return None
+            difficulty = parameters["difficulty"]
+            if any(not positive_integer(difficulty[key]) for key in
+                   ("averagingTimespanSeconds", "averagingWindowBlocks", "dampingFactor", "medianTimeSpanBlocks")):
+                return None
+            if difficulty["averagingTimespanSeconds"] != parameters["targetSpacingSeconds"] * difficulty["averagingWindowBlocks"]:
+                return None
+            if (not re.fullmatch(r"[0-9a-f]{64}", difficulty["powLimit"])
+                    or not re.fullmatch(r"[0-9a-f]{8}", difficulty["powLimitCompact"])):
+                return None
+            if profile == "mainnet":
+                if (difficulty["minimumDifficultyGapSeconds"] is not None
+                        or difficulty["minimumDifficultyGapMultiplier"] is not None
+                        or difficulty["minimumDifficultyStrictlyGreater"] is not False):
+                    return None
+            elif (not positive_integer(difficulty["minimumDifficultyGapSeconds"])
+                    or not positive_integer(difficulty["minimumDifficultyGapMultiplier"])
+                    or difficulty["minimumDifficultyStrictlyGreater"] is not True):
+                return None
+            fees = parameters["fees"]
+            percentages = [fees["minerPercent"], fees["nsmPercent"],
+                           difficulty["maxAdjustDownPercent"], difficulty["maxAdjustUpPercent"]]
+            if (any(type(value) is not int or not 0 <= value <= 100 for value in percentages)
+                    or fees["minerPercent"] + fees["nsmPercent"] != 100
+                    or fees["nsmRounding"] != "floor-on-block-aggregate"
+                    or any(type(value) is not int or not 0 <= value <= 9_007_199_254_740_991
+                           for value in parameters["actionLimits"].values())):
+                return None
+            # Reject non-finite or non-JSON additions before a durable selection.
+            json.dumps(reference, allow_nan=False)
             consensus = primary.get("consensus") or {}
             branches = (consensus.get("chaintip"), consensus.get("nextblock"))
             if any(branch != reference["network"]["branchId"] for branch in branches):
@@ -530,7 +565,7 @@ class ActivationFeed:
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
                             "blocks24h": None, "reorgRate24h": None, **reorgs,
-                            "scope": "Three public-Testnet validators and independent reference; reorgs are sampled canonical-chain replacements"},
+                            "scope": "Three " + manifest["network"]["name"] + " validators and independent reference; reorgs are sampled canonical-chain replacements"},
             "mining": {"operatorMinersActive": 0, "operatorMinersConfigured": 0, "remoteMiners": []},
             "nodes": [{"name": n["name"], "healthy": bool(agreement and n["name"] in agreement["nodes"]),
                        **({"height": n["height"], "hash": n["hash"]} if n.get("height") is not None else {})}

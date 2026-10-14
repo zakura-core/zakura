@@ -515,6 +515,23 @@ class MainnetTransitionTests(unittest.TestCase):
         self.assertEqual(payload["network"]["network"]["name"], "Mainnet")
         self.assertEqual(payload["status"]["nsm"]["balanceZat"], 900)
 
+    def test_invalid_protocol_values_preserve_testnet_and_its_saved_response(self):
+        self.activate_testnet()
+        self.feed.config["mainnet"]["armed"] = True
+        original = copy.deepcopy(self.feed.mainnet_protocol_reference)
+        for mutate in (lambda p:p.update(targetSpacingSeconds=0),
+                       lambda p:p.update(targetSpacingSeconds=True),
+                       lambda p:p.update(targetSpacingSeconds=2**53),
+                       lambda p:p["difficulty"].update(averagingWindowBlocks=-1),
+                       lambda p:p["fees"].update(minerPercent=float("nan"))):
+            self.feed.mainnet_protocol_reference = copy.deepcopy(original)
+            mutate(self.feed.mainnet_protocol_reference["parameters"])
+            for _ in range(3): self.poll()
+            self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+            self.assertEqual(self.feed.state["mainnetConsecutivePasses"], 0)
+            self.assertEqual(self.feed.state["lastPublicEnvelope"]["selectedProfile"], "public-testnet")
+            self.assertEqual(self.feed.response()[1]["network"]["network"]["magic"], "fa1af9bf")
+
     def test_mainnet_disagreement_resets_confirmation_and_preserves_testnet(self):
         self.activate_testnet()
         self.feed.config["mainnet"]["armed"] = True

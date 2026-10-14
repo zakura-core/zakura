@@ -625,7 +625,6 @@ dependencies = [
  "once_cell",
  "owo-colors",
  "tracing-error",
- "url",
 ]
 
 [[package]]

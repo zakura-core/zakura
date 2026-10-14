@@ -1885,7 +1885,20 @@ impl PeerRoutine {
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
                 .increment(1);
-            self.drop_obsolete_outstanding(key);
+            // Settle only this height. The rest of the request can still be
+            // owned, and `gc_obsolete_outstanding` retires it once none is.
+            self.window.outstanding.mark_received(key, height);
+            self.withdraw_claim(outstanding_owner, height);
+            if self
+                .window
+                .outstanding
+                .get(key)
+                .is_some_and(OutstandingBlockRange::is_complete)
+            {
+                self.drop_obsolete_outstanding(key);
+            } else {
+                self.gc_obsolete_outstanding();
+            }
             return;
         }
         if !self
@@ -2318,8 +2331,7 @@ impl PeerRoutine {
         self.finish_detached(outstanding, disposition);
     }
 
-    /// Drop a local request after the central queue retires its work scope.
-    /// The central queue already released the reservation.
+    /// Drop a local request that has no unreceived height left to settle.
     /// The cleanup path preserves any replacement item at the same height.
     fn drop_obsolete_outstanding(&mut self, key: RequestKey) {
         let Some(retired) = self.window.retire_locally(key) else {
@@ -3927,6 +3939,173 @@ mod tests {
                 "the cold peer can probe again"
             );
         }
+    }
+
+    /// What reaches the routine between the floor watchdog revoking height 1
+    /// and the stale height-1 body arriving.
+    #[derive(Clone, Copy, Debug)]
+    enum StalePrefixOrder {
+        /// The stale body arrives first.
+        Immediate,
+        /// The routine rescans ownership before the stale body arrives.
+        AfterRescan,
+        /// The suffix body arrives before the stale body.
+        AfterSuffix,
+    }
+
+    #[tokio::test]
+    async fn stale_prefix_body_keeps_the_owned_suffix() {
+        for order in [
+            StalePrefixOrder::Immediate,
+            StalePrefixOrder::AfterRescan,
+            StalePrefixOrder::AfterSuffix,
+        ] {
+            check_stale_prefix_keeps_owned_suffix(order).await;
+        }
+    }
+
+    /// Issue one written request for heights 1 and 2, let the floor watchdog
+    /// revoke height 1, then deliver the stale height-1 body. Height 2 must stay
+    /// outstanding until it arrives or the routine returns it.
+    async fn check_stale_prefix_keeps_owned_suffix(order: StalePrefixOrder) {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        let bodies: Vec<Arc<block::Block>> = [
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+            zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| Arc::new(bytes.zcash_deserialize_into().unwrap()))
+        .collect();
+        let config = ZakuraBlockSyncConfig {
+            max_blocks_per_response: 2,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let mut budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        work.extend(
+            super::super::test_work_scope(),
+            bodies.iter().zip(1..).map(|(body, height)| {
+                (
+                    block::Height(height),
+                    body.hash(),
+                    BlockSizeEstimate::Advertised(1_000),
+                )
+            }),
+        );
+        let peer = ZakuraPeerId::new(vec![29; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let (_in_send, in_recv) = framed_channel(4);
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let generation = registry
+            .admit_session(&peer, session.direction(), &config, 0, Instant::now())
+            .generation();
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let (reactor_input, _reactor_recv) = mpsc::channel(4);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let (requester, serving) = test_authorization(
+            &session,
+            &in_recv,
+            &config,
+            test_request_pool(),
+            &CancellationToken::new(),
+        );
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            requester,
+            serving,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            max_blocks_per_response: 2,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        assert_eq!(routine.window.outstanding.len(), 1);
+        let request = &routine.window.outstanding.first().unwrap().request;
+        assert_eq!(request.count, 2, "{order:?}");
+        let owner = request.owner;
+        out_recv
+            .recv()
+            .await
+            .unwrap()
+            .write_with(|_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        assert_eq!(budget.reserved(), 2_000);
+
+        // The floor watchdog settles only the floor height of the request.
+        assert!(registry.clear_outstanding_height_for_owner(&peer, block::Height(1), owner));
+        let revoked = work.revoke_for_owner(owner, [block::Height(1)]);
+        assert_eq!(revoked.returned_count, 1);
+        budget.release(revoked.released_bytes);
+
+        match order {
+            StalePrefixOrder::Immediate => {}
+            StalePrefixOrder::AfterRescan => routine.gc_obsolete_outstanding(),
+            StalePrefixOrder::AfterSuffix => {
+                routine
+                    .handle_body(bodies[1].clone(), None, None, None)
+                    .await;
+                assert!(sequencer_recv.try_recv().is_ok());
+            }
+        }
+        routine
+            .handle_body(bodies[0].clone(), None, None, None)
+            .await;
+        routine.window.outstanding.assert_consistent();
+        assert!(
+            sequencer_recv.try_recv().is_err(),
+            "a revoked body is not sequenced: {order:?}"
+        );
+        assert!(work.pending_contains(block::Height(1)), "{order:?}");
+        assert!(!registry.peer_has_outstanding_height(&peer, block::Height(1)));
+
+        if matches!(order, StalePrefixOrder::AfterSuffix) {
+            assert!(routine.window.outstanding.is_empty());
+            assert_eq!(budget.reserved(), 0);
+            return;
+        }
+        let outstanding = routine
+            .window
+            .outstanding
+            .first()
+            .unwrap_or_else(|| panic!("the owned suffix stays outstanding: {order:?}"));
+        assert!(outstanding.has_received(block::Height(1)));
+        assert!(!outstanding.has_received(block::Height(2)));
+        assert!(registry.peer_has_outstanding_height(&peer, block::Height(2)));
+        assert_eq!(work.owner_for_height(block::Height(2)), Some(owner));
+        assert_eq!(budget.reserved(), 1_000);
+
+        // A routine that never sees the suffix body still returns it.
+        drop(routine);
+        assert!(work.pending_contains(block::Height(2)), "{order:?}");
+        assert_eq!(budget.reserved(), 0, "{order:?}");
     }
 
     #[tokio::test]

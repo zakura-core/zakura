@@ -43,10 +43,11 @@ impl BlockRangeSnapshot {
     /// Returns the serialized block at `height` on this branch, or `None` if it
     /// is unavailable or longer than `max_bytes`.
     ///
-    /// Finalized blocks are copied from their stored bytes after the size check
-    /// and are never decoded. Non-finalized blocks exist only decoded in memory,
-    /// so each is serialized once, and that serialization is both checked and
-    /// returned.
+    /// Both stores record each block's serialized size, so a block that cannot
+    /// fit is rejected before it is read or serialized. Finalized blocks are
+    /// copied from their stored bytes and are never decoded. Non-finalized
+    /// blocks exist only decoded in memory, so each is serialized once, and
+    /// that serialization is both checked and returned.
     pub(super) fn serialized_block_within(
         &self,
         db: &ZakuraDb,
@@ -58,16 +59,21 @@ impl BlockRangeSnapshot {
         }
         // The in-memory chain only holds heights above the finalized tip, so
         // this lookup order matches `read::block_and_size`.
-        if let Some(contextual) = self
-            .chain
-            .as_ref()
-            .and_then(|chain| chain.block(height.into()))
-        {
-            let bytes = contextual
-                .block
-                .zcash_serialize_to_vec()
-                .expect("a committed block serializes because writing to a Vec is infallible");
-            return (bytes.len() <= max_bytes).then_some(bytes);
+        if let Some(chain) = self.chain.as_ref() {
+            if let Some(contextual) = chain.block(height.into()) {
+                // The chain records each block's serialized size, so a block that
+                // cannot fit is skipped before it is serialized.
+                if chain.block_info(height.into()).is_some_and(|info| {
+                    usize::try_from(info.size()).is_ok_and(|size| size > max_bytes)
+                }) {
+                    return None;
+                }
+                let bytes = contextual
+                    .block
+                    .zcash_serialize_to_vec()
+                    .expect("a committed block serializes because writing to a Vec is infallible");
+                return (bytes.len() <= max_bytes).then_some(bytes);
+            }
         }
         db.raw_block_bytes_within(height.into(), max_bytes)
     }

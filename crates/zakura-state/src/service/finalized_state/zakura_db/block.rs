@@ -270,8 +270,9 @@ impl ZakuraDb {
     ///
     /// The block is assembled from the stored raw bytes — the header, the
     /// CompactSize-encoded transaction count, and the raw transactions — so
-    /// it is never deserialized. The size check runs before the parts are
-    /// copied into the returned buffer.
+    /// it is never deserialized. The recorded block size is checked before the
+    /// transactions are read, and the exact size before the parts are copied
+    /// into the returned buffer.
     ///
     /// Returns `None` if the block does not exist, if its transaction bodies
     /// are missing because they have been pruned, or if it does not fit.
@@ -281,6 +282,14 @@ impl ZakuraDb {
         hash_or_height: HashOrHeight,
         max_bytes: usize,
     ) -> Option<Vec<u8>> {
+        // The recorded size skips a block that cannot fit before its
+        // transactions are read.
+        if self
+            .block_info(hash_or_height)
+            .is_some_and(|info| usize::try_from(info.size()).is_ok_and(|size| size > max_bytes))
+        {
+            return None;
+        }
         let (raw_header, raw_txs) = self.raw_block(hash_or_height)?;
 
         let tx_count = CompactSizeMessage::try_from(raw_txs.len())

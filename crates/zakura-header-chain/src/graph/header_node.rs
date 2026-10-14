@@ -336,9 +336,39 @@ impl HeaderNode {
         body: BodyValidationState,
         aux_delivery_ids: Vec<EvidenceId>,
     ) -> Result<Self, DurableNodeError> {
+        Self::from_hashed_durable_parts(
+            crate::HashedHeader::new(header),
+            hash,
+            parent_hash,
+            height,
+            block_work,
+            work_coordinate,
+            validation,
+            eligibility,
+            body,
+            aux_delivery_ids,
+        )
+    }
+
+    /// Like [`Self::from_durable_parts`], for a header whose hash was already computed: the
+    /// stored `hash` is compared with [`crate::HashedHeader::hash`] instead of hashing again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_hashed_durable_parts(
+        header: crate::HashedHeader,
+        hash: block::Hash,
+        parent_hash: block::Hash,
+        height: block::Height,
+        block_work: Work,
+        work_coordinate: WorkCoordinate,
+        validation: HeaderValidationState,
+        eligibility: EligibilityState,
+        body: BodyValidationState,
+        aux_delivery_ids: Vec<EvidenceId>,
+    ) -> Result<Self, DurableNodeError> {
         if header.hash() != hash {
             return Err(DurableNodeError::Hash);
         }
+        let header = header.into_header();
         if header.previous_block_hash != parent_hash {
             return Err(DurableNodeError::Parent);
         }
@@ -378,4 +408,96 @@ pub enum DurableNodeError {
     /// The row exceeded the direct eligibility-reason bound.
     #[error("durable header has too many direct eligibility reasons")]
     EligibilityReasons,
+}
+
+#[cfg(test)]
+mod hashed_parts_tests {
+    use zakura_chain::block::genesis::regtest_genesis_block;
+
+    use super::*;
+
+    fn parts(
+        header: Arc<block::Header>,
+        hash: block::Hash,
+        parent: block::Hash,
+        work: Work,
+    ) -> [Result<HeaderNode, DurableNodeError>; 2] {
+        let coordinate = WorkCoordinate::new(hash, zakura_chain::work::difficulty::U256::zero());
+        let build = |hashed: bool| {
+            let args = (
+                hash,
+                parent,
+                block::Height(1),
+                work,
+                coordinate,
+                HeaderValidationState::Valid,
+                EligibilityState::default(),
+                BodyValidationState::Unknown,
+                Vec::new(),
+            );
+            if hashed {
+                HeaderNode::from_hashed_durable_parts(
+                    crate::HashedHeader::new(header.clone()),
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    args.8,
+                )
+            } else {
+                HeaderNode::from_durable_parts(
+                    header.clone(),
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    args.7,
+                    args.8,
+                )
+            }
+        };
+        [build(false), build(true)]
+    }
+
+    #[test]
+    fn hashed_durable_parts_match_the_rehashing_constructor_and_its_errors() {
+        let header = regtest_genesis_block().header.clone();
+        let hash = header.hash();
+        let parent = header.previous_block_hash;
+        let work = header
+            .difficulty_threshold
+            .to_work()
+            .expect("the regtest genesis target has work");
+        let harder = header
+            .difficulty_threshold
+            .to_expanded()
+            .expect("the regtest genesis target expands")
+            / 2u32;
+        let other_work = harder
+            .to_compact()
+            .to_work()
+            .expect("a halved target still has work");
+        assert_ne!(other_work, work);
+
+        let [plain, hashed] = parts(header.clone(), hash, parent, work);
+        assert!(plain.is_ok());
+        assert_eq!(plain, hashed);
+
+        for (stored_hash, stored_parent, stored_work, expected) in [
+            (block::Hash([9; 32]), parent, work, DurableNodeError::Hash),
+            (hash, block::Hash([9; 32]), work, DurableNodeError::Parent),
+            (hash, parent, other_work, DurableNodeError::Work),
+        ] {
+            let [plain, hashed] = parts(header.clone(), stored_hash, stored_parent, stored_work);
+            assert_eq!(plain, Err(expected));
+            assert_eq!(hashed, Err(expected));
+        }
+    }
 }

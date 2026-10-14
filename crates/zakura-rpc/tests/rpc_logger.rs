@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     future::{ready, Future},
     io,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use futures::executor::block_on;
@@ -135,9 +135,20 @@ impl<'a> MakeWriter<'a> for Output {
     }
 }
 
+/// Held while a test's subscriber is installed, so the tests in this binary run
+/// one at a time.
+///
+/// Tracing caches whether each callsite is enabled across every live
+/// subscriber in the process, so a subscriber installed by a concurrent test
+/// can leave another test's events disabled.
+static SUBSCRIBER_LOCK: Mutex<()> = Mutex::new(());
+
 /// Runs `test` with a thread-scoped subscriber that writes events matching
 /// `filter` to `output`.
 fn with_subscriber<T>(filter: &str, output: &Output, test: impl FnOnce() -> T) -> T {
+    let _serial = SUBSCRIBER_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(filter))
         .with_writer(output.clone())

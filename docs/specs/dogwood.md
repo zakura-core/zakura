@@ -148,7 +148,8 @@ contain `proposer_node`. Section 3 derives each part's lane from `entry_peers`.
 
 `created_ms` anchors the arrival potentials in section 7. Nodes MUST NOT use it
 for admission, retention, or deadlines. A skewed proposer clock shifts every
-node's potentials by the same amount.
+node's potentials by the same amount, so a potential can be negative. Nodes
+saturate potentials at the bounds of `i32` microseconds.
 
 The block identifier is the consensus hash of `header`. The profile MUST define
 one canonical serialization for the metadata fields and one hash `T`. The
@@ -298,9 +299,12 @@ parent that pushes them, or by pulling parts that its neighbours announce.
 ### Subscriptions
 
 A subscriber asks a publisher to push a lane. The scope of a subscription is
-`Standing` or `Block(block_id)`. A standing subscription covers each part of the
-lane in every admitted block while it lasts. A block subscription covers the
-lane's parts in one admitted block.
+`Standing`, `Block(block_id)`, or `Proposer`. A standing subscription covers
+each part of the lane in every admitted block while it lasts. A block
+subscription covers the lane's parts in one admitted block. A proposer
+subscription names no lane and covers every part of each admitted block whose
+`proposer_node` is the publisher; rules below that name `(scope, lane)` apply to
+its single key `(Proposer, all)`.
 
 Each connection direction keeps one subscription state per `(scope, lane)`:
 
@@ -357,7 +361,7 @@ Each node keeps, per connection, the parts it wants from that peer. Part `i` of
 admitted block `b` is wanted from peer `p` when at least one of these holds:
 
 1. A subscription at `p` whose scope covers `b` and whose lane contains `i` is
-   `Live` or `Draining`.
+   `Live` or `Draining`. A proposer subscription contains every lane.
 2. A live `Want` sent to `p` for `b` has `i` in its allowed set and unspent
    count.
 3. `p` is `b`'s `proposer_node`, and this node is the entry peer of `i`'s lane.
@@ -558,9 +562,9 @@ charge one per-connection announcement bucket: capacity = 256 messages, refill
 = 64 messages/s, on_empty = record and forward. Floods of these small messages
 are therefore visible without risking an honest peer.
 
-A scope encodes as `u8(0)` for `Standing`, or `u8(1) || block_id[32]` for
-`Block`. A lane encodes as its entry peer's 32-byte `NodeId`. Section 8 lists
-every field in transmission order.
+A scope encodes as `u8(0)` for `Standing`, `u8(1) || block_id[32]` for `Block`,
+or `u8(2)` for `Proposer`. A lane encodes as its entry peer's 32-byte `NodeId`.
+Section 8 lists every field in transmission order.
 
 ### Control stream
 
@@ -622,8 +626,8 @@ After admission, a node that appears in `entry_peers` wants its seed slot from
 - **Frame**
   - payload cap = 8,195 bytes
 - **Decode**
-  - scope tag 0 or 1
-  - lane count = 1..=255
+  - scope tag 0, 1, or 2
+  - lane count = 1..=255, or 0 exactly when the scope is `Proposer`
   - lanes unique
   - exact consumption
 - **Reservation**, at the publisher
@@ -959,10 +963,9 @@ under section 5.
 The proposer SHOULD send each part of its block exactly once, to the part's
 entry peer, in index order per entry peer. It sends parity parts as well. It
 SHOULD interleave its entry peers, so every lane starts at once. It SHOULD NOT
-push its own block's parts on standing subscriptions. W2 gives the proposer no
-authorization to send spare copies beyond the seed slots, subscriptions, and
-`Want`s. A proposer that fills peers' missing parts from spare upload needs a
-future extension that makes those parts wanted.
+push its own block's parts on standing subscriptions. It SHOULD push every part
+of its block on its accepted proposer subscriptions, interleaved with the seed
+parts, until each subscriber's `StripeDone` or `BlockDone` stops it.
 
 ### Scheduler
 
@@ -1064,7 +1067,8 @@ such a lane when one of these holds:
 - the parent announced a later part of the same lane within
   `HOLE_LOOKAHEAD` positions;
 - the parent kept announcing other parts for `STARVE_MS` after its last part of
-  this lane.
+  this lane;
+- another neighbour announced the part at least `STARVE_MS` earlier.
 
 Hole pulls share a node-wide cap across blocks.
 
@@ -1123,16 +1127,21 @@ budget counts each accepted lane at its share of a block: `1/R`, where `R` is
 the entry-peer count of the most recent admitted block that listed the lane. It
 sums the shares across children. A publisher refuses a
 subscription that would exceed `CHILD_BUDGET` blocks. Because lanes are shared
-across proposers, the budget binds per node, not per proposer.
+across proposers, the budget binds per node, not per proposer. Proposer
+subscriptions do not count toward the child budget; a publisher accepts at most
+`MAX_PROPOSER_SUBS` of them and SHOULD prefer peers that its operator configured
+as miners.
 
 ### Entry-peer selection
 
 The proposer SHOULD choose its entry peers from its neighbours by measured
 minimum round-trip time. It keeps the neighbours whose minimum is at most
 `ENTRY_RTT_X` times the median minimum of its neighbours with a sample. It drops
-neighbours without a sample when any sample exists. It lists at most
-`MAX_ENTRY_PEERS` entry peers in any order. Lanes are keyed by entry peer, so
-the order does not disturb learned routes.
+neighbours without a sample when any sample exists. Among the kept neighbours,
+it SHOULD prefer outbound and operator-configured peers, take at most one per
+network group, and choose at random rather than by lowest round-trip time. It
+lists at most `MAX_ENTRY_PEERS` entry peers in any order. Lanes are keyed by
+entry peer, so the order does not disturb learned routes.
 
 ### Evaluate block outcomes
 
@@ -1221,7 +1230,7 @@ The following table lists each payload's fields in transmission order.
 | `Want` | `u32(want_id)`, block identifier, `u32(stripe)`, `u16(count)`, allowed bitmap (11) |
 | `StripeDone` | block identifier, `u32(stripe)` |
 | `BlockDone` | block identifier |
-| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `u32(potential_us)` |
+| `Advert` | block identifier, `u32(wait_us)`, `u16(count)`, items of lane (32) and `i32(potential_us)` |
 | `Part` | block identifier, `u32(index)`, `u8(sibling_count)`, siblings (32 each), payload (`S`) |
 | `Have` | block identifier, `u16(count)`, `u32(index)` each |
 | `WantEnd` | `u32(want_id)`, `u16(sent)`, `u8(reason)` |
@@ -1277,6 +1286,7 @@ registry.
 | `PROMOTE_AFTER`; `PROMOTE_WAIT_MS` | 1 step; 50 ms | Experimental. |
 | `DEMOTE_AFTER`; `DEMOTE_MS` | 3 steps; 5 ms | Experimental. |
 | `BAN_STEPS` | 5 steps | Experimental. |
+| `MAX_PROPOSER_SUBS` | `TBD` | Required. Accepted proposer subscriptions per node. |
 | `CHILD_BUDGET` | `TBD` | Required before enabling push by default. The experiments capped accepted subscriptions at `1.0 * degree`, about 1.4 blocks at degree 28 and 20 entry peers. |
 | `HAVE_FLUSH_MS`; `HAVE_FLUSH_COUNT` | 2 ms; 32 indices | Experimental. |
 
@@ -1351,8 +1361,9 @@ infrastructure that the
    The ladder never moves backward. Block download follows repair failure, a
    metadata conflict, or a failed re-encode check.
 9. Routing. No cycles within a block, the cycle-break rule, a node that runs
-   several blocks behind, two proposers at once, random proposer pairs, and
-   proposer changes with shared entry peers.
+   several blocks behind, two proposers at once, random proposer pairs,
+   proposer changes with shared entry peers, a parent that withholds one lane,
+   and proposer subscriptions.
 
 Fleet experiments MUST report the block outcomes in section 7. They MUST vary
 block size, proposer placement, concurrent proposers, and asymmetric bandwidth.

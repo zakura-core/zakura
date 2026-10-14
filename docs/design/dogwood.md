@@ -160,7 +160,7 @@ validation.
 | Message | Purpose |
 | --- | --- |
 | `HeaderMeta` | Announce the header, the coded body's commitment, and the entry peers. |
-| `Subscribe` | Ask a peer to push a lane, for all future blocks or one block. |
+| `Subscribe` | Ask a peer to push a lane for all future blocks or one block, or every part of its own blocks. |
 | `Unsubscribe` | Stop a pushed lane. |
 | `Refuse` | Decline a subscription, or stop pushing one. |
 | `Want` | Ask for up to `count` parts of one stripe from an allowed set. |
@@ -222,7 +222,7 @@ production value is still open.
 
 Sending a whole block to every direct peer multiplies proposer upload. Dogwood
 instead has the proposer send each part once, to one entry peer, and lets the
-entry peers' lanes spread from there. The proposer chooses as entry peers its
+entry peers' lanes spread from there. The proposer draws its entry peers from
 neighbours whose minimum round-trip time is at most twice the median. Far entry
 peers delayed whole stripes in the experiments: when a European proposer sent
 parts to Sydney, every other node waited for those parts to come back.
@@ -232,9 +232,6 @@ An entry peer therefore accepts seed parts only from that identity, and no relay
 can rewrite which entry peer carries which lane. The proposer also sends
 `BlockDone` right after `HeaderMeta`, so no neighbour forwards the block's parts
 back to it.
-
-The entry-peer list reveals the proposer's nearest peers. A miner that wants to
-hide its topology can propose through a relay it controls.
 
 A proposer with many distant neighbours still sends its parts far away. The
 worst-placed proposer in the experiments had nine slow neighbours out of 28 and
@@ -312,6 +309,56 @@ download. Recovery never moves backward.
 In the 128 and 256 MiB experiments, repair fetched 5.7–9.4% of new parts under
 learned push with low parity. With a child budget it fetched 0–1.1%, and with
 pull only none.
+
+## Adversarial neighbours
+
+Delaying a rival's block pays: a delay of `Δ` lets another miner orphan it with
+probability about `1 − e^(−Δ/T)`, which is 3% for 2.5 s at a 75 s block spacing
+and 10% at 25 s. Dogwood therefore has to deliver when many of the proposer's
+peers withhold, in three tiers:
+
+| Tier | Mechanism | Delivers while |
+| --- | --- | --- |
+| Fast path | Entry peers, lanes, pulls, and repair | Honest neighbours hold `k` parts of every stripe |
+| Latency floor | The miner mesh | Miners peer with each other directly |
+| Liveness floor | Header sync and full-block download | One honest path exists |
+
+**Withholding entry peers.** A stripe decodes from any `k` of its `k(1 + p)`
+parts, so it survives entry peers that withhold less than `p / (1 + p)` of them:
+25% at one-third parity, 50% at parity 1 for twice the proposer upload. Pulling
+nodes still stop at `k` parts per stripe, so receivers pay little for more
+parity. Beyond that share, no stripe decodes until repair starts after the 2 s
+stall. An attacker reaches the share cheaply by colocating with a pool to win
+the round-trip ranking and by filling the pool's inbound slots. The proposer
+therefore prefers outbound and configured peers, takes at most one per network
+group, and picks at random among the nearby ones.
+
+**Silent parents.** An attacker that earns a parent slot by being fast can
+withhold one lane of a chosen block and serve every other block, so a node also
+pulls a hole from any neighbour that announced it `STARVE_MS` earlier.
+
+**Miner mesh.** Every second on a stale tip wastes a miner's work, and a miner
+that builds on a block wants every other miner on that tip, so miners want to
+send, receive, and relay blocks among themselves. A proposer subscription
+carries the first hop: each miner subscribes at the miners it peers with, and a
+proposer pushes every part of its own blocks to those subscribers beside its
+entry peers until their `StripeDone`s stop it. Mesh subscribers then serve every
+lane to their neighbours, which also covers lanes that entry peers withheld.
+The entry-peer and mesh lists reveal a miner's peers, so a miner that wants to
+hide its topology can propose through a relay it controls.
+
+Open work:
+
+- **Uneven assignment.** Give trusted entry peers the source parts and random
+  ones the extra parity. `HeaderMeta` would then carry a share per entry peer.
+- **Proof of mining.** Let a miner sign its transport identity with the
+  coinbase-bound key of a recent block, so nodes can confirm mesh peers without
+  configuration.
+- **Parity.** Choose parity from the withholding share to survive, and measure
+  what it costs pushed lanes.
+- **Adversarial fleet.** The fleet had synchronized clocks, no chain, and no
+  Byzantine peers. Measure normal delivery and fallback separately under
+  realistic geography, workloads, changing capacity, and adversarial peers.
 
 ## Encoding and verification
 
@@ -402,6 +449,3 @@ with results. Wire changes require negotiation.
 - **Complete interoperability.** Select the codec construction and vectors, the
   production chain adapter, transport negotiation, and aggregate resource
   limits. W2 payload encoding alone does not complete these choices.
-- **Test without a friendly lab.** The fleet had synchronized clocks, no chain,
-  and no Byzantine peers. Measure normal delivery and fallback separately under
-  realistic geography, workloads, changing capacity, and adversarial peers.

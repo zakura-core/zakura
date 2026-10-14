@@ -5727,3 +5727,57 @@ async fn rpc_preciousblock_malformed_hash_is_an_invalid_parameter() {
     read_state.expect_no_requests().await;
     mempool.expect_no_requests().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_network_parameters_exports_rules_without_chain_state() {
+    let _init_guard = zakura_test::init();
+
+    for network in [Mainnet, Network::new_default_testnet()] {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _rpc_tx_queue) = mock_rpc(
+            network.clone(),
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            NoChainTip,
+            rx,
+        );
+        let module = rpc.into_rpc();
+        let height = NetworkUpgrade::Nu7
+            .activation_height(&network)
+            .unwrap_or(Height(0));
+        let response: serde_json::Value = module
+            .call("getnetworkparameters", [height.0])
+            .await
+            .expect("configured rules are available without a mined block");
+        assert_eq!(response["effectiveHeight"], height.0);
+        assert_eq!(response["network"], network.to_string());
+        assert_eq!(response["buildVersion"], "0.0.1");
+        assert_eq!(
+            response["nu7Active"],
+            NetworkUpgrade::is_nu7_active(&network, height)
+        );
+
+        for params in [
+            vec![],
+            vec![serde_json::json!(-1)],
+            vec![serde_json::json!("invalid")],
+            vec![serde_json::json!(u32::MAX)],
+        ] {
+            let result = module
+                .call::<_, serde_json::Value>("getnetworkparameters", params)
+                .await;
+            match result {
+                Err(jsonrpsee::core::server::MethodsError::JsonRpc(error)) => {
+                    assert_eq!(error.code(), ErrorCode::InvalidParams.code());
+                }
+                other => {
+                    panic!("invalid heights must return an invalid-parameters error: {other:?}")
+                }
+            }
+        }
+    }
+}

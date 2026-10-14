@@ -6256,6 +6256,16 @@ impl HeaderChainStore {
     }
 
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+        self.header_node_hashed(hash)
+            .map(|node| node.map(|(node, _)| node))
+    }
+
+    /// Like [`Self::header_node`], also returning the header hash computed by this read's decode,
+    /// for checks later in the same operation. It is never kept across operations.
+    fn header_node_hashed(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<(HeaderNode, zakura_header_chain::HashedHeader)>, StoreError> {
         #[cfg(test)]
         TEST_HEADER_NODE_DISK_READS.with(|reads| {
             reads.set(
@@ -6265,17 +6275,25 @@ impl HeaderChainStore {
                     .expect("test header-node disk read count stays below u64::MAX"),
             );
         });
-        let value = self
-            .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
-            .map_err(store_error)?;
+        // Same as `get_value::<HeaderNodeDisk>`, keeping the decode's header hash.
+        let value = (|| -> Result<_, HeaderChainStoreError> {
+            let cf = self.cf(HEADER_NODE_BY_HASH)?;
+            self.db
+                .raw_get_cf(&cf, hash.0.as_ref())?
+                .map(|raw| HeaderNodeDisk::decode_hashed(&raw).map_err(Into::into))
+                .transpose()
+        })()
+        .map_err(store_error)?;
         value
-            .map(|value| {
+            .map(|(value, hashed)| {
                 if value.hash != hash {
                     return Err(StoreError::Incoherent("node key/hash mismatch"));
                 }
                 let reasons = self.direct_reasons(hash).map_err(store_error)?;
+                let evidence = hashed.clone();
                 value
-                    .into_domain(reasons)
+                    .into_domain_hashed(hashed, reasons)
+                    .map(|node| (node, evidence))
                     .map_err(|_| StoreError::Incoherent("invalid durable node"))
             })
             .transpose()
@@ -6320,21 +6338,18 @@ impl HeaderChainStore {
         network: &Network,
     ) -> Result<ValidationLease, StoreError> {
         let metadata = self.metadata()?;
-        let parent_node = self
-            .header_node(parent)?
+        let (parent_node, parent_header) = self
+            .header_node_hashed(parent)?
             .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
         let parent_frontier = Frontier::new(parent_node.height, parent);
-        let mut predecessors = vec![zakura_header_chain::HeaderContextFact {
-            frontier: parent_frontier,
-            header: parent_node.header.clone(),
-        }];
+        let mut predecessors = vec![(parent_frontier, parent_header)];
         predecessors.extend(
-            authenticated_context_headers(self, parent, None)?
+            authenticated_context_headers_with_hashes(self, parent, None)?
                 .into_iter()
                 .rev()
-                .map(|context| context.fact()),
+                .map(|(context, header)| (Frontier::new(context.height, header.hash()), header)),
         );
-        Ok(ValidationLease::new(
+        Ok(ValidationLease::from_hashed_predecessors(
             parent_frontier,
             predecessors,
             network.clone(),
@@ -6465,6 +6480,24 @@ fn authenticated_context_headers(
     parent: block::Hash,
     staged_nodes: Option<&HashMap<block::Hash, &HeaderNode>>,
 ) -> Result<Vec<HeaderValidationContextDisk>, StoreError> {
+    authenticated_context_headers_with_hashes(store, parent, staged_nodes)
+        .map(|contexts| contexts.into_iter().map(|(context, _)| context).collect())
+}
+
+/// Like [`authenticated_context_headers`], and also returns each context header as a
+/// [`zakura_header_chain::HashedHeader`]: the header with the hash its integrity-checking decode
+/// computed, which this function has checked against the stored hash and the predecessor linkage.
+fn authenticated_context_headers_with_hashes(
+    store: &HeaderChainStore,
+    parent: block::Hash,
+    staged_nodes: Option<&HashMap<block::Hash, &HeaderNode>>,
+) -> Result<
+    Vec<(
+        HeaderValidationContextDisk,
+        zakura_header_chain::HashedHeader,
+    )>,
+    StoreError,
+> {
     let staged_parent = staged_nodes.and_then(|nodes| nodes.get(&parent).copied());
     let stored_parent = if staged_parent.is_none() {
         store.header_node(parent)?
@@ -6487,28 +6520,45 @@ fn authenticated_context_headers(
             .map_err(|_| StoreError::Incoherent("validation context height underflow"))?;
         let staged_node = staged_nodes.and_then(|nodes| nodes.get(&current_hash).copied());
         let stored_node = if staged_node.is_none() {
-            store.header_node(current_hash)?
+            store.header_node_hashed(current_hash)?
         } else {
             None
         };
-        let context = if let Some(node) = staged_node.or(stored_node.as_ref()) {
-            HeaderValidationContextDisk {
-                header: node.header.clone(),
-                height: node.height,
-            }
+        let (context, header) = if let Some((node, header)) = stored_node {
+            // `header_node_hashed` just decoded this node from disk; its header hash was computed
+            // from these bytes by that decode and checked against the stored hash there and in
+            // `HeaderNode::from_hashed_durable_parts`.
+            (
+                HeaderValidationContextDisk {
+                    header: node.header,
+                    height: node.height,
+                },
+                header,
+            )
+        } else if let Some(node) = staged_node {
+            // Staged nodes are caller-supplied in-memory values with public fields: hash them.
+            (
+                HeaderValidationContextDisk {
+                    header: node.header.clone(),
+                    height: node.height,
+                },
+                zakura_header_chain::HashedHeader::new(node.header.clone()),
+            )
         } else {
-            store
+            let context = store
                 .get_value::<HeaderValidationContextDisk>(HEADER_VALIDATION_CONTEXT, current_hash.0)
                 .map_err(store_error)?
-                .ok_or(StoreError::Incoherent("validation context has a gap"))?
+                .ok_or(StoreError::Incoherent("validation context has a gap"))?;
+            let header = zakura_header_chain::HashedHeader::new(context.header.clone());
+            (context, header)
         };
-        if context.header.hash() != current_hash || context.height != expected_height {
+        if header.hash() != current_hash || context.height != expected_height {
             return Err(StoreError::Incoherent(
                 "invalid immutable validation context",
             ));
         }
         current_hash = context.header.previous_block_hash;
-        contexts.push(context);
+        contexts.push((context, header));
     }
     contexts.reverse();
     Ok(contexts)

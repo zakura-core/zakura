@@ -9,10 +9,11 @@
 //! These metrics complement the OpenTelemetry tracing in `rpc_tracing.rs`,
 //! providing aggregated data suitable for dashboards and alerting.
 
-use std::time::Instant;
+use std::{future::Future, time::Instant};
 
 use jsonrpsee::{
-    server::middleware::rpc::{layer::ResponseFuture, RpcServiceT},
+    core::middleware::{Batch, Notification},
+    server::middleware::rpc::RpcServiceT,
     MethodResponse,
 };
 
@@ -35,13 +36,25 @@ impl<S> RpcMetricsMiddleware<S> {
     }
 }
 
-impl<'a, S> RpcServiceT<'a> for RpcMetricsMiddleware<S>
+impl<S> RpcServiceT for RpcMetricsMiddleware<S>
 where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S: RpcServiceT<
+            MethodResponse = MethodResponse,
+            NotificationResponse = MethodResponse,
+            BatchResponse = MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
 {
-    type Future = ResponseFuture<futures::future::BoxFuture<'a, MethodResponse>>;
+    type MethodResponse = MethodResponse;
+    type NotificationResponse = MethodResponse;
+    type BatchResponse = MethodResponse;
 
-    fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
+    fn call<'a>(
+        &self,
+        request: jsonrpsee::types::Request<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
         let method = request.method_name().to_owned();
         let start = Instant::now();
@@ -49,7 +62,7 @@ where
         // Increment active requests gauge
         metrics::gauge!("rpc.active_requests").increment(1.0);
 
-        ResponseFuture::future(Box::pin(async move {
+        async move {
             let response = service.call(request).await;
             let duration = start.elapsed().as_secs_f64();
 
@@ -86,6 +99,17 @@ where
             metrics::gauge!("rpc.active_requests").decrement(1.0);
 
             response
-        }))
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        notification: Notification<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.notification(notification)
     }
 }

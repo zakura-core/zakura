@@ -29,7 +29,8 @@ impl RetentionHarness {
         let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
             receiver,
             zakura_chain::parameters::Network::Mainnet.genesis_hash(),
-        ));
+        ))
+        .expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         Self {
             retained: Some(retained),
@@ -283,7 +284,8 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
@@ -319,7 +321,8 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
 async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
     let (handle, mut actions, task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
+        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
+            .expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let mut advertised = BlockSyncStatus {
         servable_low: block::Height(1),

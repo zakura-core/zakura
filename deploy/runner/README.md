@@ -231,6 +231,37 @@ During restart deploys, the workflows write a Unix timestamp 20 minutes in the
 future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. While that marker
 is active, new failure alerts are logged locally but not posted to Slack.
 
+## NU7 Dashboard Availability
+
+The existing fleet watchdog also checks
+`https://api.nu7.valargroup.dev/v1/dashboard` through its public HTTPS route.
+The `[[nu7_dashboard]]` target shares the service's 60-second polling,
+request timeout, 10-minute dashboard threshold, deployment suppression,
+persisted state and durable Slack delivery to `#zakura-alerts`.
+
+A response must use dashboard and observation schema version 1, contain finite,
+positive `generatedAt` and `status.observedAt` timestamps, and report `live`,
+`degraded` or `unavailable`. Both timestamps must be less than 10 minutes old
+and no more than 60 seconds ahead of the monitor's clock. Already stale data
+alerts on the first poll, using the oldest timestamp to measure its age.
+Connection errors, HTTP errors, malformed responses and explicit `unavailable`
+observations alert after 10 minutes of continuous failure. Changing failure
+reasons does not restart that timer or create another incident.
+
+Fresh `degraded` data counts as available: this lane monitors publication,
+not validator agreement or block progress. It sends one failure and one
+recovery notification per incident. Pending messages survive restarts and
+Slack delivery failures through the existing queue; webhook delivery retains
+its existing possibility of a duplicate after a crash during acknowledgement.
+Fleet deployment suppression delays delivery while polling continues.
+
+The existing monitoring package includes the lane and its synthetic tests.
+Activate it separately through the monitoring-only `fleet-deploy` path after
+review; no node restart or new service is required. Before declaring it live,
+verify the installed version and confirm labeled failure and recovery messages
+in `#zakura-alerts` through the configured webhook. This change adds no
+PagerDuty escalation or automatic remediation.
+
 ## Compatibility Monitoring
 
 The fleet watchdog also monitors the zcashd-compat pair on `zakura-compat`

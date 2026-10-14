@@ -204,6 +204,26 @@ fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>
     decoded_attributed_memory_size_bytes
 }
 
+/// Whether a body's transactions are the ones its header commits to: their
+/// Merkle root matches, and no transaction repeats (CVE-2012-2459). A conformant
+/// peer serves the block its header names, so a mismatch is unambiguous. It is
+/// checked before the body enters the pipeline, because a body of junk
+/// transactions can decode to many times the memory of the real block.
+fn transactions_match_header(block: &block::Block) -> bool {
+    let hashes: Vec<_> = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect();
+    let root: block::merkle::Root = hashes.iter().copied().collect();
+    root == block.header.merkle_root
+        && hashes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == hashes.len()
+}
+
 fn header_hash_payload_mismatch(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
@@ -454,6 +474,16 @@ impl PeerRoutine {
             self.handle_status(status);
         }
         let result = self.run_inner(&mut guard).await;
+        // Traced here rather than in the liveness check, which runs on every
+        // loop iteration.
+        if matches!(result, Err(SinkReject::Local(_)))
+            && self
+                .requester
+                .retirement_deadline(self.config.effective_liveness_timeout())
+                .is_some_and(|deadline| time::Instant::now().into_std() >= deadline)
+        {
+            self.trace_ending_timeout();
+        }
         // A transport failure can cancel the session before its queued responses
         // reach us. Validate them under the existing decode-capacity bound before
         // scoring unanswered work. Connection shutdown can still stop this drain.
@@ -692,6 +722,17 @@ impl PeerRoutine {
                 if block.coinbase_height() != Some(height) {
                     return Err(SinkReject::protocol(
                         "authorized block has a different coinbase height",
+                    ));
+                }
+                if !transactions_match_header(block) {
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::Misbehavior {
+                            peer: self.peer.clone(),
+                            reason: BlockSyncMisbehavior::InvalidBlock,
+                        });
+                    return Err(SinkReject::protocol(
+                        "authorized block's transactions do not match its header",
                     ));
                 }
             }
@@ -1423,6 +1464,11 @@ impl PeerRoutine {
                 .sequencer_input_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             in_flight_submission_bytes: view.in_flight_submission_bytes,
+            decoded_resident_bytes: self
+                .sequencer_input_decoded_attributed_memory_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(view.reorder_decoded_attributed_memory_bytes)
+                .saturating_add(view.applying_decoded_attributed_memory_bytes),
             reserved_above_floor_bytes,
             reserved_above_floor_blocks,
             budget_available: self.budget.available(),

@@ -2166,13 +2166,13 @@ pub(crate) fn service_registry(
     };
     services.push(header_sync_service.clone());
     let block_sync = match block_sync {
-        Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
+        Some(block_sync) => BlockSyncService::new_with_handle(block_sync),
         None => match header_sync.as_ref() {
             Some(header_sync) => BlockSyncService::new_with_header_tip(
                 block_sync_config,
                 header_sync.subscribe_tip(),
-            ),
-            None => BlockSyncService::new(block_sync_config),
+            )?,
+            None => BlockSyncService::new(block_sync_config)?,
         },
     };
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
@@ -3967,6 +3967,13 @@ async fn spawn_zakura_endpoint_inner(
     if config.zakura.nat_traversal {
         return Err(ZAKURA_NAT_TRAVERSAL_REMOVED.into());
     }
+    // Fail before binding or advertising anything; the block-sync reactor
+    // checks the same config again at its own construction boundary.
+    config
+        .zakura
+        .block_sync
+        .validate()
+        .map_err(super::BlockSyncStartError::InvalidConfig)?;
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
@@ -4064,7 +4071,7 @@ async fn spawn_zakura_endpoint_inner(
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
                 driver_startup.retained_block_height.clone(),
                 config.network.genesis_hash(),
-            ));
+            ))?;
             (Some(handle), Some(actions), Some(task))
         } else {
             (None, None, None)
@@ -5132,7 +5139,11 @@ async fn write_ordered_frame_with_policy(
         )
         .into());
     }
-    let frame = frame.encode(max_frame_bytes)?;
+    let encoded = frame.encode(max_frame_bytes)?;
+    // Free the payload now: the write can wait on QUIC credit, and holding
+    // both copies until then doubles every queued body.
+    drop(frame);
+    let frame = encoded;
     match write_policy {
         StreamWritePolicy::UntilCancelled => send.write_chunk(Bytes::from(frame)).await?,
         StreamWritePolicy::Timeout(duration) => {
@@ -5865,7 +5876,10 @@ async fn write_response_frame(
     if frame.payload.len() > limits.max_message_bytes as usize {
         return Err(ZakuraHandlerError::Oversize);
     }
-    let frame = frame.encode(max_frame_bytes)?;
+    let encoded = frame.encode(max_frame_bytes)?;
+    // Free the payload before a write that can wait on QUIC credit.
+    drop(frame);
+    let frame = encoded;
     timeout(
         OUTBOUND_STREAM_WRITE_TIMEOUT,
         send.write_chunk(Bytes::from(frame)),
@@ -7495,6 +7509,26 @@ mod tests {
 
         assert!(endpoint.is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unfundable_block_sync_config_fails_before_the_endpoint_binds() {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.block_sync.peer_limits.max_inbound_peers = 3_000;
+        config.zakura.block_sync.peer_limits.max_outbound_peers = 634;
+
+        let error = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await
+        .expect_err("an unfundable block-sync config must not start the endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid zakura.block_sync config"),
+            "unexpected error: {error}",
+        );
     }
 
     #[tokio::test]

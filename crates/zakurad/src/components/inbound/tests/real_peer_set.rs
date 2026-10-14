@@ -904,23 +904,29 @@ async fn setup(
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
-    Buffer<zakura_network::Client, zakura_network::Request>,
+    Buffer<
+        zakura_network::Request,
+        <zakura_network::Client as tower::Service<zakura_network::Request>>::Future,
+    >,
     // inbound service
     LoadShed<
         Buffer<
-            BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
             zakura_network::Request,
+            futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
         >,
     >,
     // outbound peer set (only has the connected peer)
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
+    Buffer<
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     // mocked services
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion, RouterError>,
@@ -1052,12 +1058,8 @@ async fn setup(
 
     // Enable the mempool
     mempool_service.enable(&mut recent_syncs).await;
-    let mempool_service = ServiceBuilder::new()
-        .buffer(10)
-        .boxed()
-        // boxed() needs this extra tiny buffer
-        .buffer(1)
-        .service(mempool_service);
+    // BoxService needs this extra tiny buffer
+    let mempool_service = Buffer::new(BoxService::new(Buffer::new(mempool_service, 10)), 1);
 
     // Initialize the inbound service
     let setup_data = InboundSetupData {

@@ -964,6 +964,18 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertIn("logrotate", rendered["zakura-monitor.service"])
         self.assertIn("maxsize 64M", rendered["logrotate"])
 
+    def test_deployment_installs_and_loads_network_sysctls(self):
+        node = deploy.load_nodes(DEPLOY_PATH.with_name("nodes.toml"), None)[0]
+        with patch.object(deploy, "run") as run, patch.object(deploy, "ssh_with_script") as ssh:
+            ssh.return_value.returncode = 0
+            result = deploy.deploy_node(node, argparse.Namespace(dry_run=False, no_start=True))
+        self.assertTrue(result[1])
+        uploads = [call.args[0][-1] for call in run.call_args_list]
+        self.assertIn(f"{node.ssh_string}:/tmp/zakura-network-sysctl.conf", uploads)
+        script = ssh.call_args.args[1]
+        self.assertLess(script.index("/etc/sysctl.d/60-zakura-network.conf"),
+                        script.index("sysctl --load /etc/sysctl.d/60-zakura-network.conf"))
+
     def test_relink_backs_up_existing_trace_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -32,7 +32,7 @@ from typing import Any, Callable
 # shipped with this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from zakura_monitoring import monitor, slack  # noqa: E402,F401 - tests patch slack limits
+from zakura_monitoring import monitor, nu7, slack  # noqa: E402,F401 - tests patch slack limits
 from zakura_monitoring.delivery import deliver_pending, queue_transitions  # noqa: E402
 from zakura_monitoring.slack import (  # noqa: E402
     bounded_text,
@@ -1124,12 +1124,14 @@ class Watchdog:
         release_state: list[ReleaseState] | None = None,
         checkpoint: Callable[[dict[str, Any]], None] | None = None,
         compatibility: list[monitor.ProbeWorker] | None = None,
+        nu7_dashboard: list[nu7.Target] | None = None,
     ):
         self.notify = lambda text, args: post_slack(text, args)
         self.checkpoint = checkpoint or (lambda state: None)
         self.fleets = fleets
         self.release_state = release_state or []
         self.compatibility = compatibility or []
+        self.nu7_dashboard = nu7_dashboard or []
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
@@ -1161,6 +1163,9 @@ class Watchdog:
             else:
                 self.commit_fleet_state(state, fleet, candidate)
 
+        for target in self.nu7_dashboard:
+            self.handle_nu7_dashboard(state, target, time.time(), suppressed)
+
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
 
@@ -1173,6 +1178,53 @@ class Watchdog:
             self.handle_compatibility(state, worker)
 
         self.reconcile_pagerduty(state, now, suppressed)
+
+    def handle_nu7_dashboard(
+        self, state: dict[str, Any], target: nu7.Target, now: float, suppressed: bool
+    ) -> None:
+        """Plan endpoint transitions using the shared durable Slack queue."""
+        queue = "nu7_dashboard_pending_delivery"
+        pending = state.setdefault(queue, {})
+        bucket = state.setdefault("nu7_dashboard", {})
+        candidate = copy.deepcopy(
+            pending[target.name]["state"] if target.name in pending else bucket.get(target.name, {})
+        )
+        try:
+            snapshot = fetch_json(target.url, self.args.request_timeout)
+            result = nu7.failure(snapshot, now, self.args.dashboard_down_after)
+        except Exception as error:
+            # Remote error text can contain response bodies or credentials.
+            result = (f"dashboard request failed ({type(error).__name__})", now)
+        reason, bad_since = result if result is not None else ("", now)
+        previous_since = coerce_float(candidate.get("bad_since"))
+        if result is not None and candidate.get("condition") == "failing" and previous_since is not None:
+            bad_since = min(bad_since, previous_since)
+        name = slack_identity(target.name, MAX_ALERT_NAME_CHARS, "unknown")
+        endpoint = slack_dashboard_url(target.url)
+        messages: list[str] = []
+        planned = {target.name: candidate}
+        update_alert_state(
+            planned, target.name, "failing" if result is not None else "ok",
+            bad_since, self.args.dashboard_down_after,
+            f":rotating_light: *Zakura {name}* dashboard unavailable for {format_duration(now - bad_since)}\n"
+            f"reason: {reason}\nendpoint: {endpoint}\n"
+            f"dashboard: {slack_dashboard_url(target.dashboard_url)}",
+            f":white_check_mark: *Zakura {name}* dashboard recovered; data is fresh\nendpoint: {endpoint}",
+            now, suppressed, self.args,
+            notify=lambda text, _args: (messages.append(text), True)[1],
+        )
+        candidate = planned[target.name]
+        if messages or target.name in pending:
+            queue_transitions(state, queue, target.name, messages, candidate, now, title=None)
+            if not suppressed:
+                deliver_pending(
+                    state, queue, target.name,
+                    post=lambda text: post_slack(text, self.args),
+                    commit=lambda entry: bucket.__setitem__(target.name, entry),
+                    checkpoint=self.checkpoint,
+                )
+        else:
+            bucket[target.name] = candidate
 
     def handle_compatibility(
         self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float | None = None
@@ -2293,6 +2345,7 @@ def main() -> int:
         fleets, args, load_release_state(args.config),
         checkpoint=lambda state: save_state(args.state_file, state),
         compatibility=compatibility,
+        nu7_dashboard=nu7.load_targets(args.config),
     )
 
     while True:

@@ -196,7 +196,7 @@ tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }
 
-color-eyre = { workspace = true, features = ["issue-url"] }
+color-eyre = { workspace = true }
 
 thiserror = { workspace = true }
 

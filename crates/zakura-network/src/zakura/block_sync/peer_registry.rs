@@ -150,10 +150,11 @@ fn collect_supplier_retries(
     })
 }
 
-/// Supplier-map size at which new incompatibility cooldowns stop being added:
-/// 64 suppliers' worth of full 128-block responses. These cooldowns outlive
+/// Supplier-map size at which new retry deferrals stop being added: 64
+/// suppliers' worth of full 128-block responses. These deferrals outlive
 /// sessions, so peer limits do not bound them, and every lookup scans the map
-/// under the shared lock. `Unavailable` entries are bounded per body instead.
+/// under the shared lock. Both reasons share the cap; skipping a deferral only
+/// allows an earlier retry.
 pub(super) const MAX_SUPPLIER_RETRIES: usize = 8_192;
 
 /// Authority and deadlines share a lock so stale routine snapshots cannot undo a refresh.
@@ -286,9 +287,13 @@ impl PeerRegistry {
             *reason != BodyRetryReason::Unavailable || *candidate != key || sources.contains(source)
         });
         for source in sources {
-            retries
-                .entries
-                .insert((source, key, BodyRetryReason::Unavailable), until);
+            let entry = (source, key, BodyRetryReason::Unavailable);
+            if retries.entries.contains_key(&entry) || retries.entries.len() < MAX_SUPPLIER_RETRIES
+            {
+                retries.entries.insert(entry, until);
+            } else {
+                metrics::counter!("sync.block.body.unavailable_cooldown_skipped").increment(1);
+            }
         }
     }
 

@@ -41,7 +41,7 @@ mod tests;
 
 pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
-pub(crate) use chain::{Chain, SpendingTransactionId};
+pub(crate) use chain::{Chain, SharedMap, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

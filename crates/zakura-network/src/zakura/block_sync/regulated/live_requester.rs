@@ -25,6 +25,18 @@ use crate::zakura::{
 // The protocol ceiling fits usize on supported targets.
 pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 2;
 
+/// Fully received ranges one session may hold while their endings are owed.
+///
+/// A peer that sends every body but withholds the ending still looks
+/// productive, so without this bound it could keep taking work until its
+/// unended exchanges fill [`SESSION_RESERVATIONS`]. An honest server queues
+/// each ending right after its body. Its ready-order output interleaves at most
+/// one body per running read-and-encode job (`PEER_EXECUTION`, 12 per peer),
+/// and one stream keeps frames in that order. So an honest session stays well
+/// below this bound, while a withholding one holds at most this many pool
+/// entries beyond the requests its window already has in flight.
+pub(crate) const MAX_PENDING_ENDINGS: usize = 64;
+
 /// The precheck may outlive the routine. Its sender retains session capacity
 /// until the authorization maps and transport reader have both been dropped.
 #[derive(Debug)]
@@ -128,6 +140,12 @@ impl LiveRequester {
 
     pub(crate) fn at_capacity(&self) -> bool {
         self.shared.lock().at_capacity()
+    }
+
+    /// Live ranges whose every body arrived but whose ending has not.
+    /// New requests wait while this is at [`MAX_PENDING_ENDINGS`].
+    pub(crate) fn pending_endings(&self) -> usize {
+        self.shared.lock().pending_endings()
     }
 
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {

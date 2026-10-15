@@ -128,6 +128,9 @@ enum FillStop {
     /// The probe-first cap: an unproven peer's single cold-start probe is in flight,
     /// so no further request is issued until it serves (or fails) a body.
     InitialBlockProbeRequestCap,
+    /// Too many fully received requests still owe their ending
+    /// (see `MAX_PENDING_ENDINGS`).
+    PendingEndings,
 }
 
 impl FillStop {
@@ -145,6 +148,7 @@ impl FillStop {
             FillStop::SendError => "send_error",
             FillStop::NoBlockProgressRequestCap => "no_block_progress_request_cap",
             FillStop::InitialBlockProbeRequestCap => "initial_block_probe_request_cap",
+            FillStop::PendingEndings => "pending_endings",
         }
     }
 }
@@ -1015,6 +1019,11 @@ impl PeerRoutine {
                 || self.requester.len() >= self.window.max_inflight_requests as usize
             {
                 break FillStop::CwndSaturated;
+            }
+            if self.requester.pending_endings()
+                >= super::regulated::live_requester::MAX_PENDING_ENDINGS
+            {
+                break FillStop::PendingEndings;
             }
             let Some(entry) = self.requester.pool.try_entry() else {
                 self.request_pool_waiting = true;

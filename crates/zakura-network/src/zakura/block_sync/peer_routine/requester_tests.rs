@@ -1,3 +1,4 @@
+use super::super::regulated::live_requester::MAX_PENDING_ENDINGS;
 use super::super::request::BlockSizeEstimate;
 use super::*;
 use crate::zakura::regulation::ReservationPool;
@@ -977,4 +978,224 @@ async fn requests_stay_single_block_for_any_advertisement() {
         );
         assert_eq!(routine.window.outstanding.len(), 4);
     }
+}
+
+/// Heights of synthesized work in the pending-ending tests. Well above
+/// [`MAX_PENDING_ENDINGS`] so the bound, not the queue, stops a withholding peer.
+const BULK_WORK: u32 = 2048;
+
+/// A routine whose peer serves `1..=BULK_WORK` and advertises the protocol's
+/// request ceiling, so only local limits bound its work. Also returns the
+/// synthesized blocks, indexed by height minus one, and the sequencer input,
+/// which holds every body without consuming it.
+fn bulk_routine() -> (
+    RequesterRoutine,
+    Vec<Arc<block::Block>>,
+    mpsc::Receiver<SequencedBody>,
+) {
+    let connection = CancellationToken::new();
+    let pool = super::tests::test_request_pool();
+    let (mut routine, outbound, events) =
+        super::tests::status_test_routine_with(pool.clone(), &connection);
+    routine.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
+        ..BlockSyncStatus::default()
+    });
+    let template = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let blocks: Vec<_> = (1..=BULK_WORK)
+        .map(|height| super::super::tests::fake_block_at_height(&template, block::Height(height)))
+        .collect();
+    routine.work.extend(
+        super::super::test_work_scope(),
+        blocks.iter().map(|block| {
+            let size = block.zcash_serialize_to_vec().unwrap().len();
+            (
+                block.coinbase_height().unwrap(),
+                block.hash(),
+                BlockSizeEstimate::Confirmed(u32::try_from(size).unwrap()),
+            )
+        }),
+    );
+    // Every body stays queued, so the input must hold all of them.
+    let (bodies, received) = mpsc::channel(usize::try_from(BULK_WORK).unwrap());
+    routine.sequencer_input = bodies;
+    (
+        (routine, outbound, pool, connection, events),
+        blocks,
+        received,
+    )
+}
+
+/// Drains the routine's outbound frames and returns the heights it requested.
+fn requested_heights(outbound: &mut FramedRecv) -> Vec<block::Height> {
+    let mut heights = Vec::new();
+    while let Ok(frame) = outbound.try_recv() {
+        if let BlockSyncMessage::GetBlocks { start_height, .. } =
+            BlockSyncMessage::decode_frame(frame).unwrap()
+        {
+            heights.push(start_height);
+        }
+    }
+    heights
+}
+
+/// Plays a peer that sends every requested body, lowest request first, and
+/// never an ending. Refills after each body, like the run loop. Stops once the
+/// routine has nothing outstanding, and returns every height it requested.
+async fn withhold_endings(
+    routine: &mut PeerRoutine,
+    outbound: &mut FramedRecv,
+    blocks: &[Arc<block::Block>],
+) -> Vec<block::Height> {
+    let mut requested = Vec::new();
+    let mut unanswered = std::collections::VecDeque::new();
+    let mut unended = 0;
+    loop {
+        routine.try_fill().await;
+        let new = requested_heights(outbound);
+        assert!(
+            new.is_empty() || unended < MAX_PENDING_ENDINGS,
+            "{} new requests went to a peer withholding {unended} endings",
+            new.len(),
+        );
+        requested.extend(&new);
+        unanswered.extend(new);
+        let Some(height) = unanswered.pop_front() else {
+            return requested;
+        };
+        let index = usize::try_from(height.0 - 1).unwrap();
+        deliver(routine, BlockSyncMessage::Block(blocks[index].clone())).await;
+        unended += 1;
+    }
+}
+
+/// A peer that returns every body but withholds every ending stops receiving
+/// requests at [`MAX_PENDING_ENDINGS`], long before it holds its session share.
+/// The missing-ending deadline still retires the gated connection.
+#[tokio::test]
+async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let requested = withhold_endings(&mut routine, &mut outbound, &blocks).await;
+
+    assert!(requested.len() >= MAX_PENDING_ENDINGS);
+    assert!(
+        requested.len() < usize::try_from(BULK_WORK).unwrap(),
+        "the bound, not the queue, stopped the peer",
+    );
+    assert_eq!(routine.requester.pending_endings(), requested.len());
+    assert_eq!(pool.held(), requested.len());
+    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.work.pending_contains(block::Height(BULK_WORK)));
+    routine.try_fill().await;
+    assert!(requested_heights(&mut outbound).is_empty());
+
+    // The gate never replaces the missing-ending deadline.
+    let deadline = routine
+        .requester
+        .retirement_deadline(routine.config.effective_liveness_timeout())
+        .expect("the first unended body starts the missing-ending deadline");
+    assert!(routine
+        .check_request_liveness(deadline - Duration::from_nanos(1))
+        .is_ok());
+    assert!(!connection.is_cancelled());
+    assert!(matches!(
+        routine.check_request_liveness(deadline),
+        Err(SinkReject::Local(_))
+    ));
+    assert!(connection.is_cancelled());
+    drop(routine);
+    assert_eq!(pool.held(), 0, "retirement returns every reservation");
+}
+
+/// Endings that arrive late reopen the gate as soon as fewer than
+/// [`MAX_PENDING_ENDINGS`] remain owed.
+#[tokio::test]
+async fn a_late_ending_below_the_bound_lets_the_peer_take_work_again() {
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let mut unended = withhold_endings(&mut routine, &mut outbound, &blocks).await;
+    unended.sort();
+
+    let mut requested = Vec::new();
+    for start_height in unended {
+        deliver(
+            &mut routine,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned: 1,
+            },
+        )
+        .await;
+        routine.try_fill().await;
+        requested = requested_heights(&mut outbound);
+        let pending = routine.requester.pending_endings();
+        if pending >= MAX_PENDING_ENDINGS {
+            assert!(requested.is_empty(), "gated with {pending} endings owed");
+        } else {
+            assert_eq!(pending, MAX_PENDING_ENDINGS - 1);
+            break;
+        }
+    }
+    assert!(!requested.is_empty(), "the reopened gate issues new work");
+    assert!(!connection.is_cancelled());
+    assert_eq!(
+        pool.held(),
+        MAX_PENDING_ENDINGS - 1 + requested.len(),
+        "only owed endings and the new requests hold reservations",
+    );
+}
+
+/// An honest peer sends each ending right after its body, but ready-order
+/// serving can interleave several responses. Bodies arriving in batches of
+/// 12 (one per serving job), with their endings in reverse order, never reach
+/// the bound, so the peer takes all the work.
+#[tokio::test]
+async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
+    const INTERLEAVED: usize = 12;
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let mut unanswered = std::collections::VecDeque::new();
+    let mut requested = 0;
+    let mut most_pending = 0;
+    loop {
+        routine.try_fill().await;
+        let new = requested_heights(&mut outbound);
+        requested += new.len();
+        unanswered.extend(new);
+        if unanswered.is_empty() {
+            break;
+        }
+        let batch: Vec<_> = unanswered
+            .drain(..INTERLEAVED.min(unanswered.len()))
+            .collect();
+        for height in &batch {
+            let index = usize::try_from(height.0 - 1).unwrap();
+            deliver(&mut routine, BlockSyncMessage::Block(blocks[index].clone())).await;
+            most_pending = most_pending.max(routine.requester.pending_endings());
+            routine.try_fill().await;
+            let new = requested_heights(&mut outbound);
+            requested += new.len();
+            unanswered.extend(new);
+        }
+        for start_height in batch.into_iter().rev() {
+            deliver(
+                &mut routine,
+                BlockSyncMessage::BlocksDone {
+                    start_height,
+                    returned: 1,
+                },
+            )
+            .await;
+            routine.try_fill().await;
+            let new = requested_heights(&mut outbound);
+            requested += new.len();
+            unanswered.extend(new);
+        }
+    }
+    assert_eq!(requested, usize::try_from(BULK_WORK).unwrap());
+    assert_eq!(most_pending, INTERLEAVED);
+    assert_eq!(routine.requester.pending_endings(), 0);
+    assert_eq!(pool.held(), 0);
+    assert!(!connection.is_cancelled());
 }

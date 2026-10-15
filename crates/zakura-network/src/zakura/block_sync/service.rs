@@ -745,7 +745,7 @@ impl Service for BlockSyncService {
                 None => (None, false),
             };
             block_sync_session.generation = routine.as_ref().map(|(_, generation, _)| *generation);
-            if let Some((_, _, fence)) = &routine {
+            if let Some((wiring, generation, fence)) = &routine {
                 use crate::zakura::regulation::{Current, Replacement, SessionKey};
                 if matches!(
                     self.inner.requester_sessions.replace(
@@ -762,6 +762,10 @@ impl Service for BlockSyncService {
                     ),
                     Replacement::Refused
                 ) {
+                    // This session never runs, so nothing would remove its
+                    // generation. The old session is on a closing connection,
+                    // so it doesn't need the entry back.
+                    wiring.registry.remove_session(&peer_id, *generation);
                     return;
                 }
                 block_sync_session.status_sender = Some(
@@ -1153,6 +1157,90 @@ mod requester_session_tests {
         );
         assert!(cancel.is_cancelled());
         assert!(fence.open().is_none());
+    }
+
+    /// A same-connection replacement refused because the old session has an
+    /// unfinished exchange sends no disconnect, so it must not leave the registry
+    /// generation it was admitted with behind.
+    #[tokio::test]
+    async fn refused_replacement_leaves_no_unowned_registry_generation() {
+        let service = BlockSyncService::new(ZakuraBlockSyncConfig::default())
+            .expect("valid block-sync config");
+        let wiring = service.inner.routine_wiring.as_ref().unwrap();
+        let peer = ZakuraPeerId::new(vec![43; 32]).unwrap();
+        let conn_id = 7;
+        let cancel = CancellationToken::new();
+        let generation = wiring
+            .registry
+            .admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &wiring.config,
+                conn_id,
+                Instant::now(),
+            )
+            .generation();
+        let connection = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        service.inner.requester_sessions.replace(
+            peer.clone(),
+            Current {
+                key: SessionKey {
+                    conn_id,
+                    session_id: 3,
+                },
+                cancel: cancel.clone(),
+                fence,
+                session: (),
+            },
+        );
+        service.inner.active_peers.lock().unwrap().insert(
+            peer.clone(),
+            BlockSyncPeerRecord {
+                conn_id,
+                session_id: 3,
+                generation: Some(generation),
+                direction: ServicePeerDirection::Outbound,
+                cancel_token: cancel,
+            },
+        );
+
+        let (_inbound_tx, inbound_rx) = crate::zakura::framed_channel(4);
+        let (outbound_tx, _outbound_rx) = crate::zakura::framed_channel(4);
+        service.add_peer(Peer::new_with_conn_id_and_direction(
+            conn_id,
+            peer.clone(),
+            None,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            ServicePeerDirection::Outbound,
+            std::collections::HashMap::from([(
+                ZAKURA_STREAM_BLOCK_SYNC,
+                (inbound_rx, outbound_tx),
+            )]),
+            CancellationToken::new(),
+        ));
+
+        assert!(
+            connection.is_cancelled(),
+            "the old session's unfinished exchange closes the connection"
+        );
+        assert_eq!(
+            service.inner.active_peers.lock().unwrap()[&peer].session_id,
+            3,
+            "the refused replacement leaves the old session's record in place"
+        );
+        assert!(
+            !wiring
+                .registry
+                .candidate_snapshot()
+                .iter()
+                .any(|(candidate, ..)| candidate == &peer),
+            "the refused replacement's generation must not outlive it"
+        );
     }
 }
 

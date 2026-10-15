@@ -1226,6 +1226,8 @@ impl ZakuraPeerHandle {
     }
 
     /// Open a request stream, write one frame, then return the response frames from the same stream.
+    ///
+    /// `started` is described on [`ZakuraOutboundFrame::Request`].
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1233,6 +1235,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
+        started: Option<oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1241,6 +1244,7 @@ impl ZakuraPeerHandle {
             message_type,
             flags,
             payload,
+            started,
             completion,
         };
         self.sender
@@ -1268,6 +1272,9 @@ pub enum ZakuraOutboundFrame {
         flags: u16,
         /// Message payload bytes.
         payload: Vec<u8>,
+        /// Fired when the connection takes this request off its queue and
+        /// starts the exchange, since it serves one request at a time.
+        started: Option<oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },
@@ -3091,6 +3098,7 @@ impl ZakuraProtocolHandler {
                             message_type,
                             flags,
                             payload,
+                            started,
                             mut completion,
                         } => {
                             let Some(stream) = self.registry.stream_for_kind(stream_kind) else {
@@ -3100,6 +3108,9 @@ impl ZakuraProtocolHandler {
                                 .into()));
                                 continue;
                             };
+                            if let Some(started) = started {
+                                let _ = started.send(());
+                            }
                             let result = tokio::select! {
                                 biased;
                                 _ = completion.closed() => {

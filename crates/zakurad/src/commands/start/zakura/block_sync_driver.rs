@@ -58,9 +58,7 @@ pub(crate) struct BlockApplyCompletion {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
-    // Retained so the disconnect capability stays wired into the driver, even
-    // though peer scoring no longer drives disconnects (misbehavior is record-only).
-    _supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
+    supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
     endpoint: Option<ZakuraEndpoint>,
     block_sync: BlockSyncHandle,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
@@ -440,8 +438,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
             }
             BlockSyncAction::Misbehavior { peer, reason } => {
-                // Record-only: peer scoring no longer drives disconnects.
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
+                supervisor
+                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .await;
             }
             BlockSyncAction::QueryNeededBlocks {
                 query_id,

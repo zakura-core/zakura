@@ -16,9 +16,9 @@
 //! `outstanding` (on issue/finish/timeout/disconnect — per *request*, never per
 //! *body*), slot diagnostics, and download-side misbehavior. The **reactor** owns
 //! entry insert/remove (admission/teardown), serving-side misbehavior, and
-//! floor-watchdog hard excludes. Misbehavior is record-only: it is observed and
-//! traced but never drives a disconnect, so the registry keeps no per-peer
-//! misbehavior state.
+//! floor-watchdog hard excludes. Misbehavior is observed and traced, and only a
+//! proven tampered body disconnects (see `BlockSyncMisbehavior::proves_tampered_body`),
+//! so the registry keeps no per-peer misbehavior state.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -634,11 +634,13 @@ impl PeerRegistry {
     /// (expired → `Readmitted`/`Fresh`) — it can never be checked before the
     /// park lands and then silently left behind after admission.
     ///
-    /// On a genuinely new peer this inserts a default entry; on a respawn (reset)
-    /// the existing entry's servable/caps/`received_status` are preserved (the
-    /// peer stays connected) but its outstanding set is cleared and its generation
-    /// bumped, so the new routine owns the entry. The returned generation is what
-    /// the new routine must carry for its `Drop` guard. `Readmitted` marks the
+    /// Both a new peer and a replacement session get a default entry with a fresh
+    /// generation, so the new routine owns the entry. A replacement drops the old
+    /// session's status, servable range, caps, and slot diagnostics: the peer
+    /// counts as a server again only once the new routine publishes a status for
+    /// its own generation. On a same-connection reopen that can be the
+    /// connection's cached `Status`. The returned generation is what the new
+    /// routine must carry for its `Drop` guard. `Readmitted` marks the
     /// parked connection's one bounded re-admission; an expired park held by a
     /// different connection is cleared and admitted as `Fresh`.
     pub(super) fn admit_session(
@@ -657,8 +659,6 @@ impl PeerRegistry {
         {
             return SessionAdmission::Parked;
         }
-        let mut detached = BTreeMap::new();
-
         let generation = self
             .next_generation
             .try_update(
@@ -667,26 +667,33 @@ impl PeerRegistry {
                 |generation| generation.checked_add(1),
             )
             .unwrap_or_else(|_| panic!("block-sync routine generation counter is exhausted"));
-        peers
-            .entry(peer.clone())
-            .and_modify(|entry| {
-                entry.direction = direction;
-                detached = std::mem::take(&mut entry.outstanding);
-                entry.floor_watchdog_avoid.clear();
-                entry.generation = generation;
-                entry.conn_id = Some(conn_id);
-            })
-            .or_insert_with(|| Entry {
+
+        // Every entry field describes the session, so a replacement starts from
+        // defaults. Keeping the old session's status, range, caps, or RTprop would
+        // let other routines defer the floor to a routine that has no status yet.
+        let replaced = peers.insert(
+            peer.clone(),
+            Entry {
                 conn_id: Some(conn_id),
                 ..Entry::new(direction, config, generation)
-            });
+            },
+        );
 
         let readmitted = session_parks
             .remove(peer)
             .is_some_and(|park| park.conn_id == Some(conn_id));
         drop(session_parks);
         drop(peers);
-        drop(detached);
+        if let Some(replaced) = replaced {
+            // Only a replaced session that could carry the floor can have made
+            // another routine defer to it.
+            let could_carry_floor = replaced.received_status && replaced.slots.available_slots > 0;
+            // Drop the replaced entry's outstanding set after releasing the locks.
+            drop(replaced);
+            if could_carry_floor {
+                self.floor_ranking_changed.notify_waiters();
+            }
+        }
         if readmitted {
             SessionAdmission::Readmitted { generation }
         } else {
@@ -1799,6 +1806,119 @@ mod floor_bias_tests {
             Some(50),
             true
         ));
+    }
+
+    #[test]
+    fn replaced_session_drops_the_old_session_floor_preference() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (fast, slow) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(10));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false
+        ));
+
+        // The fast peer opens a new session and has not sent `Status` on it yet.
+        reg.admit_session(
+            &fast,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_replacing_a_floor_carrier_wakes_routines() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (carrier, idle) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &carrier, 0, 1000, 3, Some(10));
+        reg.admit_session(
+            &idle,
+            ServicePeerDirection::Outbound,
+            &config,
+            0,
+            Instant::now(),
+        );
+
+        let quiet = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(quiet);
+        quiet.as_mut().enable();
+        reg.admit_session(
+            &idle,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
+        assert!(
+            futures::poll!(quiet.as_mut()).is_pending(),
+            "no routine could have deferred to a session without status"
+        );
+
+        let woken = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        reg.admit_session(
+            &carrier,
+            ServicePeerDirection::Outbound,
+            &config,
+            1,
+            Instant::now(),
+        );
+        assert!(futures::poll!(woken.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn replaced_session_needs_a_status_from_its_own_generation() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let a = peer(1);
+        let old_generation = reg
+            .admit_session(
+                &a,
+                ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let status = BlockSyncStatus {
+            servable_low: block::Height(0),
+            servable_high: block::Height(1000),
+            ..BlockSyncStatus::default()
+        };
+        reg.upsert_status(&a, old_generation, status);
+        assert!(reg.has_received_status(&a));
+
+        let new_generation = reg
+            .admit_session(
+                &a,
+                ServicePeerDirection::Outbound,
+                &config,
+                1,
+                Instant::now(),
+            )
+            .generation();
+        assert!(!reg.has_received_status(&a));
+
+        // A late status from the replaced routine does not count for the new session.
+        reg.upsert_status(&a, old_generation, status);
+        assert!(!reg.has_received_status(&a));
+
+        reg.upsert_status(&a, new_generation, status);
+        assert!(reg.has_received_status(&a));
     }
 
     #[test]

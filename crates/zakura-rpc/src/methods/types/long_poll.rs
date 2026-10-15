@@ -123,18 +123,7 @@ impl LongPollInput {
 ///
 /// `zcashd` IDs are currently 69 hex/decimal digits long.
 /// IDs use 46 hex/decimal digits, or 62 after the first template withdrawal.
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    CopyGetters,
-    new,
-    schemars::JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CopyGetters, new)]
 #[serde(try_from = "String", into = "String")]
 pub struct LongPollId {
     /// Template withdrawal generation. Zero preserves the legacy wire format.

@@ -1226,6 +1226,8 @@ impl ZakuraPeerHandle {
     }
 
     /// Open a request stream, write one frame, then return the response frames from the same stream.
+    ///
+    /// `started` is described on [`ZakuraOutboundFrame::Request`].
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1233,6 +1235,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
+        started: Option<oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1241,6 +1244,7 @@ impl ZakuraPeerHandle {
             message_type,
             flags,
             payload,
+            started,
             completion,
         };
         self.sender
@@ -1268,6 +1272,9 @@ pub enum ZakuraOutboundFrame {
         flags: u16,
         /// Message payload bytes.
         payload: Vec<u8>,
+        /// Fired when the connection takes this request off its queue and
+        /// starts the exchange, since it serves one request at a time.
+        started: Option<oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },
@@ -1418,6 +1425,47 @@ impl ZakuraSupervisorHandle {
             registrations,
             pending_handoffs: self.pending_handoffs.clone(),
         })
+    }
+
+    /// Apply the connection policy for one block-sync violation.
+    ///
+    /// Violations are record-only, except a body that proves tampering (see
+    /// [`crate::zakura::BlockSyncMisbehavior::proves_tampered_body`]), which disconnects
+    /// the peer.
+    /// Returns whether this call closed an active connection that wasn't
+    /// already closing.
+    pub async fn enforce_block_sync_misbehavior(
+        &self,
+        peer_id: &ZakuraPeerId,
+        reason: &crate::zakura::BlockSyncMisbehavior,
+    ) -> bool {
+        if !reason.proves_tampered_body() {
+            return false;
+        }
+        let token = {
+            let state = self.inner.lock().await;
+            state
+                .active_by_peer
+                .get(peer_id)
+                .map(|entry| entry.disconnect_token.clone())
+        };
+        // Count only connections this call closes, not a peer that already left
+        // or a connection that is already shutting down.
+        let disconnected = token.is_some_and(|token| {
+            let already_closing = token.is_cancelled();
+            token.cancel();
+            !already_closing
+        });
+        if disconnected {
+            metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
+        }
+        info!(
+            ?peer_id,
+            ?reason,
+            disconnected,
+            "disconnecting Zakura peer that served a tampered block body"
+        );
+        disconnected
     }
 
     /// Disconnect one active Zakura peer.
@@ -3091,6 +3139,7 @@ impl ZakuraProtocolHandler {
                             message_type,
                             flags,
                             payload,
+                            started,
                             mut completion,
                         } => {
                             let Some(stream) = self.registry.stream_for_kind(stream_kind) else {
@@ -3100,6 +3149,9 @@ impl ZakuraProtocolHandler {
                                 .into()));
                                 continue;
                             };
+                            if let Some(started) = started {
+                                let _ = started.send(());
+                            }
                             let result = tokio::select! {
                                 biased;
                                 _ = completion.closed() => {
@@ -8367,6 +8419,76 @@ mod tests {
         Ok(())
     }
 
+    /// Only a body that proves tampering closes the supplier's connection.
+    #[tokio::test]
+    async fn block_sync_misbehavior_disconnects_only_a_proven_tampered_body() {
+        use crate::zakura::BlockSyncMisbehavior;
+        use zakura_header_chain::BodyCommitmentKind;
+
+        let mismatch = |kind| {
+            BlockSyncMisbehavior::BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([1; 32]),
+                requested: block::Hash([2; 32]),
+                delivered: block::Hash([2; 32]),
+                kind,
+                source: zakura_header_chain::SourceId::from_digest([3; 32]),
+            })
+        };
+        let cases = [
+            (mismatch(BodyCommitmentKind::AuthDataRoot), true),
+            (
+                mismatch(BodyCommitmentKind::CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT),
+                true,
+            ),
+            (mismatch(BodyCommitmentKind::TransactionMerkleRoot), true),
+            // A different header at the requested height can be a fork response.
+            (mismatch(BodyCommitmentKind::HeaderHash), false),
+            // These depend on local trees or supplied auxiliary roots.
+            (
+                mismatch(BodyCommitmentKind::Other("final_sapling_root")),
+                false,
+            ),
+            (
+                mismatch(BodyCommitmentKind::Other("chain_history_root")),
+                false,
+            ),
+            (BlockSyncMisbehavior::InvalidBlock, false),
+            (BlockSyncMisbehavior::StatusSpam, false),
+        ];
+        let supervisor = ZakuraSupervisorHandle::new(cases.len());
+        for (index, (reason, disconnects)) in cases.into_iter().enumerate() {
+            let peer = test_peer(u8::try_from(index + 20).expect("the case count fits in u8"));
+            let disconnect_token = CancellationToken::new();
+            register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
+
+            assert_eq!(
+                supervisor
+                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .await,
+                disconnects,
+                "{reason:?}"
+            );
+            assert_eq!(disconnect_token.is_cancelled(), disconnects, "{reason:?}");
+            if disconnects {
+                assert!(
+                    !supervisor
+                        .enforce_block_sync_misbehavior(&peer, &reason)
+                        .await,
+                    "a connection already closing is not closed again: {reason:?}"
+                );
+            }
+        }
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(
+                    &test_peer(250),
+                    &mismatch(BodyCommitmentKind::AuthDataRoot)
+                )
+                .await,
+            "a peer that already left has nothing to close"
+        );
+    }
+
     /// Reopen a header-sync stream after the responder parks it on a healthy connection.
     /// The transport opening roles determine the reopen policy.
     #[test]
@@ -9916,6 +10038,150 @@ mod tests {
         )
         .await??;
         assert_eq!(frame.message_type, message_type::GET);
+        Ok(())
+    }
+
+    /// Stream 6 queues a fixed number of frames for its routine, however much
+    /// the live reservations owe. The precheck here admits every body, as a
+    /// request window of any size would, and the peer sends full-size bodies
+    /// at the largest negotiable transport depth. The reader still holds only
+    /// the declared depth plus the frame it waits to forward. The rest waits
+    /// in QUIC flow control. When the routine takes a body and holds it, the
+    /// reader admits exactly one more, so the session never holds more than
+    /// the depth plus two.
+    #[tokio::test]
+    async fn block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe(
+    ) -> Result<(), BoxError> {
+        use crate::zakura::{
+            block_sync_streams, regulation::ResponsePrecheck, LOCAL_MAX_INBOUND_QUEUE_DEPTH,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Admits every response header and counts what the reader admitted.
+        #[derive(Debug, Default)]
+        struct OwesEverything {
+            frames: AtomicUsize,
+            bytes: AtomicUsize,
+        }
+
+        impl ResponsePrecheck for OwesEverything {
+            fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+                self.frames.fetch_add(1, Ordering::SeqCst);
+                self.bytes.fetch_add(payload_len, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        // The largest `Block` payload stream 6 accepts: its tag and a
+        // 2,000,000-byte body.
+        const BODY_PAYLOAD: usize = 2_000_001;
+        const SENT: usize = 32;
+        let stream = block_sync_streams()[0];
+        let depth = stream
+            .queue_depths
+            .expect("stream 6 declares its inbound depth")
+            .inbound;
+        let held = depth + 1;
+        // The resource ledger's raw-frame term counts these and the routine's
+        // body: about 20 MB per session.
+        assert!((held + 1) * BODY_PAYLOAD < 21_000_000);
+        assert!(held < SENT, "the peer sends more than the queue holds");
+
+        const ALPN: &[u8] = b"/zakura/testkit/block-sync-queue-depth/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(83).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        server.serve(CaptureConnection {
+            alpn: ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::new().endpoint(84).await?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let connection =
+            timeout(Duration::from_secs(5), client.connect(server_addr, &[ALPN])).await??;
+        let (mut peer_send, _peer_recv) =
+            timeout(Duration::from_secs(2), connection.open_bi()).await??;
+        let writer = tokio::spawn(async move {
+            let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + BODY_PAYLOAD);
+            frame.extend_from_slice(&3u16.to_le_bytes());
+            frame.extend_from_slice(&0u16.to_le_bytes());
+            frame.extend_from_slice(&u32::try_from(BODY_PAYLOAD)?.to_le_bytes());
+            frame.push(3);
+            frame.resize(FRAME_HEADER_BYTES + BODY_PAYLOAD, 0);
+            for _ in 0..SENT {
+                peer_send.write_all(&frame).await?;
+            }
+            Ok::<_, BoxError>(peer_send)
+        });
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+
+        let mut context = tabled_context(stream.messages, 1024);
+        context.limits.idle_timeout = Duration::from_secs(30);
+        context.inbound_frame_cap = stream.frame_cap;
+        context.queue_depths = stream.queue_depths;
+        let cancel = context.connection_token.clone();
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: stream.kind,
+            stream_version: stream.version,
+            request_id: None,
+            max_frame_bytes: stream.frame_cap,
+        };
+        let mut workers = JoinSet::new();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut admitted = spawn_persistent_stream_worker(
+            &mut workers,
+            send,
+            recv,
+            stream,
+            prelude,
+            context,
+            usize::from(LOCAL_MAX_INBOUND_QUEUE_DEPTH),
+            false,
+            exit_tx,
+        );
+        let precheck = Arc::new(OwesEverything::default());
+        assert!(admitted.streams[0].recv.attach_precheck(precheck.clone()));
+
+        let admitted_frames = || precheck.frames.load(Ordering::SeqCst);
+        await_until(
+            "the reader fills its queue",
+            Duration::from_secs(10),
+            || admitted_frames() >= held,
+        )
+        .await?;
+        // Give the reader time to read past its bound if it could.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(admitted_frames(), held);
+        assert_eq!(precheck.bytes.load(Ordering::SeqCst), held * BODY_PAYLOAD);
+        assert!(!cancel.is_cancelled(), "a full queue is backpressure");
+
+        // The routine takes one body and keeps it, as it does while it waits
+        // for decode capacity. The reader admits exactly one more.
+        let frame = timeout(Duration::from_secs(2), admitted.streams[0].recv.recv())
+            .await?
+            .expect("the reader forwarded the first body");
+        assert_eq!(frame.payload.len(), BODY_PAYLOAD);
+        await_until(
+            "the reader refills one slot",
+            Duration::from_secs(10),
+            || admitted_frames() > held,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(admitted_frames(), held + 1);
+        assert!(!cancel.is_cancelled());
+
+        writer.abort();
+        cancel.cancel();
+        timeout(Duration::from_secs(2), workers.join_next()).await?;
+        connection.close(0u32.into(), b"done");
+        client.shutdown().await;
+        server.shutdown().await;
         Ok(())
     }
 

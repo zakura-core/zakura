@@ -1,6 +1,7 @@
 use super::super::request::BlockSizeEstimate;
 use super::*;
 use crate::zakura::regulation::ReservationPool;
+use crate::zakura::{CwndUnit, MAX_BS_BLOCKS_PER_REQUEST};
 use zakura_chain::serialization::ZcashDeserializeInto;
 
 /// The routine, its outbound frames, its pool, its connection and its reports to the reactor.
@@ -183,25 +184,8 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 3;
-    routine.max_blocks_per_response = 3;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [
-            (
-                block::Height(2),
-                block::Hash([2; 32]),
-                BlockSizeEstimate::Confirmed(1000),
-            ),
-            (
-                block::Height(3),
-                block::Hash([3; 32]),
-                BlockSizeEstimate::Confirmed(1000),
-            ),
-        ],
-    );
     routine.try_fill().await;
-    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 3);
+    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 1);
     next_sent(&mut outbound).await;
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let mut payload = vec![MSG_BS_BLOCK];
@@ -239,15 +223,6 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         block::Hash([1; 32]),
         Instant::now()
     ));
-    for byte in [2, 3] {
-        assert!(work.pending_contains(block::Height(u32::from(byte))));
-        assert!(registry.is_body_retry_avoided(
-            &peer,
-            super::super::test_work_scope(),
-            block::Hash([byte; 32]),
-            Instant::now()
-        ));
-    }
     assert!(!registry.is_body_retry_avoided(
         &peer,
         super::super::test_work_scope(),
@@ -258,7 +233,7 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
     assert!(!registry.is_body_retry_avoided(
         &other_peer,
         super::super::test_work_scope(),
-        block::Hash([2; 32]),
+        block::Hash([1; 32]),
         Instant::now()
     ));
 }
@@ -461,46 +436,6 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
 }
 
 #[tokio::test]
-async fn a_partial_ending_requeues_only_the_missing_suffix() {
-    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
-    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
-    let (mut routine, mut outbound, pool, connection, _) = requester_routine(first.hash());
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            second.hash(),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    let (sender, mut bodies) = mpsc::channel(2);
-    routine.sequencer_input = sender;
-    routine.try_fill().await;
-    let sent = next_sent(&mut outbound).await;
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(sent).unwrap(),
-        BlockSyncMessage::GetBlocks { count: 2, .. }
-    ));
-    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
-    assert!(bodies.try_recv().is_ok());
-    deliver(
-        &mut routine,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(1),
-            returned: 1,
-        },
-    )
-    .await;
-    assert!(!routine.work.pending_contains(block::Height(1)));
-    assert!(routine.work.pending_contains(block::Height(2)));
-    assert_eq!(pool.held(), 0);
-    drop(routine);
-    assert!(!connection.is_cancelled());
-}
-
-#[tokio::test]
 async fn local_session_share_leaves_entries_for_another_requester() {
     use super::super::regulated::live_requester::SESSION_RESERVATIONS;
 
@@ -680,71 +615,6 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         .await
         .unwrap();
     assert_eq!(pool.held(), 0);
-    assert!(!connection.is_cancelled());
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_live_partially_returned_range_waits_without_retry_spin() {
-    let (mut routine, mut outbound, _, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            block::Hash([2; 32]),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    routine.try_fill().await;
-    outbound.recv().await.unwrap();
-    assert_eq!(routine.window.outstanding.len(), 1);
-    let owner = routine.window.outstanding.first().unwrap().request.owner;
-    // A central scheduler may return one height while this request still owns
-    // the rest. Its wire authorization is live and has not begun retirement.
-    let returned = routine.work.revoke_for_owner(owner, [block::Height(1)]);
-    routine.budget.release(returned.released_bytes);
-    assert_eq!(returned.returned_count, 1);
-    assert!(routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
-    assert_eq!(
-        routine
-            .requester
-            .retirement_deadline(routine.config.effective_liveness_timeout()),
-        None
-    );
-    // Keep the connection eligible for another request. Without prior progress,
-    // the initial probe limit masks the retry loop before it touches the queue.
-    routine.window.note_block_progress(
-        time::Instant::now().into_std(),
-        routine.config.effective_liveness_timeout(),
-    );
-    assert_eq!(routine.try_fill().await, None);
-    assert!(routine.work.pending_contains(block::Height(1)));
-    // The request keeps its slot but stops advertising the revoked height.
-    assert!(!routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
-    assert!(routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(2)));
-    let before = routine.work.taken_items_for_test();
-    let (_input, recv) = crate::zakura::framed_channel(4);
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
-    let mut guard = block_sync_guard();
-    let mut running = Box::pin(routine.run_inner(&mut guard));
-    for _ in 0..100 {
-        assert!(futures::poll!(&mut running).is_pending());
-        // Let zero-duration sleeps actually fire. Pure synchronous polling cannot
-        // distinguish a timer-driven spin from a legitimately parked future.
-        time::advance(Duration::from_millis(1)).await;
-    }
-    drop(running);
-    assert!(routine.work.taken_items_for_test() - before <= 2);
-    assert_eq!(routine.window.outstanding.len(), 1);
     assert!(!connection.is_cancelled());
 }
 
@@ -957,45 +827,6 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
     assert!(connection.is_cancelled());
 }
 
-/// `RangeUnavailable` may name fewer heights than requested. The requester still
-/// returns every unreceived height, because no prefix arrived.
-#[tokio::test]
-async fn a_shortened_unavailable_requeues_the_whole_original_range() {
-    let (mut routine, mut outbound, pool, connection, mut events) =
-        requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            block::Hash([2; 32]),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    routine.try_fill().await;
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
-        BlockSyncMessage::GetBlocks { count: 2, .. }
-    ));
-    while events.try_recv().is_ok() {}
-    deliver(
-        &mut routine,
-        BlockSyncMessage::RangeUnavailable {
-            start_height: block::Height(1),
-            count: 1,
-        },
-    )
-    .await;
-    assert!(routine.work.pending_contains(block::Height(1)));
-    assert!(routine.work.pending_contains(block::Height(2)));
-    assert_eq!(pool.held(), 0);
-    assert!(!std::iter::from_fn(|| events.try_recv().ok())
-        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. })));
-    drop(routine);
-    assert!(!connection.is_cancelled());
-}
-
 /// A body is refused before it claims anything when no live range expects it,
 /// or when it exceeds the response's advertised body bytes.
 #[tokio::test]
@@ -1091,4 +922,59 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     assert!(matches!(error, SinkReject::Protocol(_)), "{error:?}");
     assert!(error.to_string().contains("coinbase height"));
     assert!(received.try_recv().is_err());
+}
+
+/// Our requester asks for one block per `GetBlocks`, whatever an old config or the
+/// peer advertises, and keeps several of those requests outstanding at once.
+#[tokio::test]
+async fn requests_stay_single_block_for_any_advertisement() {
+    for peer_max_blocks in [2, MAX_BS_BLOCKS_PER_REQUEST] {
+        let (mut routine, mut outbound, _pool, _connection, _) =
+            requester_routine_with_pool(block::Hash([1; 32]), ReservationPool::new(8).unwrap());
+        // An old config may still carry a multi-block value. It is ignored.
+        routine.config.max_blocks_per_response = Some(MAX_BS_BLOCKS_PER_REQUEST);
+        assert_eq!(routine.config.bbr_cwnd_unit, CwndUnit::Bytes);
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            max_blocks_per_response: peer_max_blocks,
+            ..BlockSyncStatus::default()
+        });
+        routine.work.extend(
+            super::super::test_work_scope(),
+            (2..=4).map(|height| {
+                (
+                    block::Height(height),
+                    block::Hash([u8::try_from(height).unwrap(); 32]),
+                    BlockSizeEstimate::Confirmed(1000),
+                )
+            }),
+        );
+        // Lift the cold-start probe limit so the fill is bounded only by the cwnd.
+        routine
+            .window
+            .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
+
+        routine.try_fill().await;
+
+        let mut requested = Vec::new();
+        while let Ok(frame) = outbound.try_recv() {
+            if let BlockSyncMessage::GetBlocks {
+                start_height,
+                count,
+            } = BlockSyncMessage::decode_frame(frame).unwrap()
+            {
+                requested.push((start_height, count));
+            }
+        }
+        requested.sort();
+        assert_eq!(
+            requested,
+            (1..=4)
+                .map(|height| (block::Height(height), 1))
+                .collect::<Vec<_>>(),
+            "peer advertised {peer_max_blocks} blocks per response",
+        );
+        assert_eq!(routine.window.outstanding.len(), 4);
+    }
 }

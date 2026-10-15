@@ -468,7 +468,7 @@ impl DownloadWindow {
     /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
     /// and advance the ProbeRtt phase machine. `delivered_bytes` is the request's total
     /// delivered body bytes — under the single-block-per-request invariant
-    /// (`DEFAULT_BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
+    /// (`BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
     /// `serialized_bytes`. Call after removing the completed request from `outstanding`,
     /// so the in-flight measure reflects the post-completion queue depth.
     pub(super) fn record_delivery(
@@ -727,8 +727,8 @@ impl DownloadWindow {
     /// ([`record_timeout`](Self::record_timeout)) and the per-request delivery credit
     /// ([`credit_late_delivery`](Self::credit_late_delivery)): the EWMA is a per-request
     /// goodput fraction, so charging one-per-missing-height would near-seal a peer for a
-    /// single protocol-legal short answer once `max_blocks_per_response > 1` (at the shipped
-    /// default of 1 the two denominations coincide). Unlike a timeout this does *not* dip the
+    /// single protocol-legal short answer to a multi-block request (our requests carry one
+    /// block, so the two denominations coincide). Unlike a timeout this does *not* dip the
     /// cwnd — a short response is a goodput, not a latency/congestion, signal — but it must
     /// still count so a peer cannot deliver one body per request to keep its
     /// liveness/no-progress accounting reset while dropping the rest.

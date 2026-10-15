@@ -345,11 +345,10 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
 
     // Apply the configured number of threads to the thread pool.
     //
-    // TODO:
-    // - set rayon panic handler to a function that takes `Box<dyn Any + Send + 'static>`,
-    //   which reports through the panic hook. If possible, use eyre's panic report for formatting.
-    // - do we also need to call this code in `zakura_consensus::init()`,
-    //   when that crate is being used by itself?
+    // Known limits, kept from earlier releases:
+    // - Rayon uses its default panic handler, which doesn't report through the panic hook.
+    // - `zakura_consensus::init()` doesn't configure this pool when that crate is used by
+    //   itself.
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.sync.parallel_cpu_threads)
         .thread_name(|thread_index| format!("rayon {thread_index}"))

@@ -174,10 +174,14 @@ class S3Store:
             raise AssetError("object storage write failed") from error
 
     def immutable(self, key, data):
-        if not self.put(key, data, create=True):
+        existing = self.get(key, len(data))
+        if existing is None:
+            if self.put(key, data, create=True):
+                return
+            # Another publisher may have created the object after our read.
             existing = self.get(key, len(data))
-            if existing is None or existing[0] != data:
-                raise AssetError("immutable published object already has different bytes")
+        if existing is None or existing[0] != data:
+            raise AssetError("immutable published object already has different bytes")
 
 
 def production_store():

@@ -131,11 +131,12 @@ const LEGACY_TRANSACTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 /// earlier requests to the same peer.
 ///
 /// A connection serves one request at a time, so three honest 4 s answers
-/// from one peer finish by 12 s. An attempt that gives up by 13 s still leaves
-/// about 7 s of the mempool's 20 s download deadline
-/// (`TRANSACTION_DOWNLOAD_TIMEOUT` in `zakurad`) for the next candidate, or
-/// about 4 s after the dual stack's 3 s legacy try
-/// (`DUAL_STACK_LEGACY_INVENTORY_TIMEOUT`).
+/// from one peer finish by 12 s. With negligible readiness and pacing delays,
+/// an attempt that gives up by 13 s leaves about 7 s of the mempool's 20 s
+/// download deadline (`TRANSACTION_DOWNLOAD_TIMEOUT` in `zakurad`) for the next
+/// candidate, or about 4 s after the dual stack's 3 s legacy try
+/// (`DUAL_STACK_LEGACY_INVENTORY_TIMEOUT`). This bounds each candidate's hold
+/// on an attempt; it does not guarantee the fallback finishes in time.
 const LEGACY_TRANSACTION_ATTEMPT_TOTAL_TIMEOUT: Duration = Duration::from_secs(13);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);

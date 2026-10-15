@@ -103,7 +103,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, global_span, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -1348,7 +1348,9 @@ impl StartCmd {
     /// If the configured metrics endpoint can't be opened.
     pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
         let runtime = new_runtime();
-        crate::components::metrics::start_endpoint(&config.metrics);
+        // The metrics endpoint is the last setup step, so it logs in the setup span.
+        global_span(&config.network.network)
+            .in_scope(|| crate::components::metrics::start_endpoint(&config.metrics));
 
         info!("Starting zakurad");
 

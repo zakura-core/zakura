@@ -1671,7 +1671,8 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 #[test]
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
-    assert_eq!(default.max_blocks_per_response, 1);
+    assert_eq!(default.max_blocks_per_response, None);
+    assert_eq!(default.advertised_max_blocks_per_response(), 1);
     assert_eq!(default.max_inflight_requests, 32000);
     assert_eq!(
         default.max_inflight_block_bytes,
@@ -1748,7 +1749,8 @@ fn block_sync_config_defaults_and_round_trips() {
 }
 
 /// Old configs that still set `max_blocks_per_response` keep loading, but block
-/// sync always advertises and requests one block per `GetBlocks`.
+/// sync always advertises and requests one block per `GetBlocks`. The value is
+/// kept, unserialized, so the reactor can warn about it.
 #[test]
 fn deprecated_max_blocks_per_response_still_loads_and_is_ignored() {
     for value in [0, 1, 2, MAX_BS_BLOCKS_PER_REQUEST, u32::MAX] {
@@ -1757,12 +1759,83 @@ fn deprecated_max_blocks_per_response_still_loads_and_is_ignored() {
         ))
         .expect("an old config with max_blocks_per_response still deserializes");
         let block_sync = &config.zakura.block_sync;
-        assert_eq!(block_sync.max_blocks_per_response, 1);
+        assert_eq!(block_sync.max_blocks_per_response, Some(value));
         assert_eq!(block_sync.advertised_max_blocks_per_response(), 1);
         assert_eq!(block_sync.initial_status().max_blocks_per_response, 1);
         assert!(!toml::to_string(&config)
             .expect("config serializes")
             .contains("max_blocks_per_response"));
+    }
+
+    let config: crate::Config =
+        toml::from_str("[zakura.block_sync]\n").expect("a config without the key deserializes");
+    assert_eq!(config.zakura.block_sync.max_blocks_per_response, None);
+}
+
+/// Only a deprecated `max_blocks_per_response` above one logs the startup warning.
+#[test]
+fn ignored_max_blocks_per_response_warns_only_above_one() {
+    /// A cloneable writer that keeps everything the test subscriber logs.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("log buffer lock is poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for (value, warns) in [
+        (None, false),
+        (Some(0), false),
+        (Some(1), false),
+        (Some(2), true),
+        (Some(MAX_BS_BLOCKS_PER_REQUEST), true),
+    ] {
+        let config = ZakuraBlockSyncConfig {
+            max_blocks_per_response: value,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        {
+            // A test-scoped subscriber is safe here because the warning is
+            // emitted synchronously on this thread and records no spans.
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            config.warn_ignored_max_blocks_per_response();
+        }
+        let output = String::from_utf8(
+            logs.0
+                .lock()
+                .expect("no code panics while holding the log buffer lock")
+                .clone(),
+        )
+        .expect("the fmt subscriber writes valid UTF-8");
+        let expected = value
+            .map(|value| format!("max_blocks_per_response = {value} is deprecated and ignored"));
+        assert_eq!(
+            expected.is_some_and(|expected| output.contains(&expected)),
+            warns,
+            "value {value:?} logged {output:?}",
+        );
+        if !warns {
+            assert!(output.is_empty(), "value {value:?} logged {output:?}");
+        }
     }
 }
 
@@ -9034,7 +9107,7 @@ async fn reactor_requests_single_blocks_and_submits_parent_first() {
     // An old config's multi-block setting is ignored, and so is the peer's
     // four-block advertisement: every request asks for one block.
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 4,
+        max_blocks_per_response: Some(4),
         ..ZakuraBlockSyncConfig::default()
     };
     let blocks = mainnet_blocks_1_to_3();

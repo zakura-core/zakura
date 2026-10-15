@@ -932,7 +932,7 @@ async fn requests_stay_single_block_for_any_advertisement() {
         let (mut routine, mut outbound, _pool, _connection, _) =
             requester_routine_with_pool(block::Hash([1; 32]), ReservationPool::new(8).unwrap());
         // An old config may still carry a multi-block value. It is ignored.
-        routine.config.max_blocks_per_response = MAX_BS_BLOCKS_PER_REQUEST;
+        routine.config.max_blocks_per_response = Some(MAX_BS_BLOCKS_PER_REQUEST);
         assert_eq!(routine.config.bbr_cwnd_unit, CwndUnit::Bytes);
         routine.handle_status(BlockSyncStatus {
             servable_low: block::Height(1),

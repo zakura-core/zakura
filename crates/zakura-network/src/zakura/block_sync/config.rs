@@ -232,15 +232,12 @@ pub struct ZakuraBlockSyncConfig {
     /// Deprecated compatibility key for older configs.
     ///
     /// Block sync always requests and advertises one block per `GetBlocks`
-    /// message (see [`BS_BLOCKS_PER_RESPONSE`]). This field is accepted but
-    /// ignored so older configs keep parsing, with a warning when it asked for
-    /// more than one block.
+    /// message (see [`BS_BLOCKS_PER_RESPONSE`]). Older configs that set this key
+    /// keep parsing. The value never affects block sync. It is kept only so the
+    /// reactor can warn about it once tracing is running.
     #[doc(hidden)]
-    #[serde(
-        skip_serializing,
-        deserialize_with = "deserialize_ignored_max_blocks_per_response"
-    )]
-    pub max_blocks_per_response: u32,
+    #[serde(default, skip_serializing)]
+    pub max_blocks_per_response: Option<u32>,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
     pub max_inflight_requests: u32,
     /// Initial per-peer BBR cwnd (cold-start point), in blocks; converges to the
@@ -339,28 +336,11 @@ where
     Ok(false)
 }
 
-/// Accept and discard a deprecated `max_blocks_per_response` value, warning when
-/// it asked for multi-block requests that block sync no longer issues.
-fn deserialize_ignored_max_blocks_per_response<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let configured = u32::deserialize(deserializer)?;
-    if configured > BS_BLOCKS_PER_RESPONSE {
-        tracing::warn!(
-            configured_max_blocks_per_response = configured,
-            "zakura.block_sync.max_blocks_per_response is deprecated and ignored; \
-             block sync always requests one block per GetBlocks message",
-        );
-    }
-    Ok(BS_BLOCKS_PER_RESPONSE)
-}
-
 impl Default for ZakuraBlockSyncConfig {
     fn default() -> Self {
         Self {
             replace_legacy_syncer: false,
-            max_blocks_per_response: BS_BLOCKS_PER_RESPONSE,
+            max_blocks_per_response: None,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
@@ -400,6 +380,23 @@ impl ZakuraBlockSyncConfig {
     /// count and how many blocks we serve per incoming request.
     pub fn advertised_max_blocks_per_response(&self) -> u32 {
         BS_BLOCKS_PER_RESPONSE
+    }
+
+    /// Warn when the deprecated `max_blocks_per_response` key asks for more
+    /// blocks than block sync requests.
+    ///
+    /// The reactor calls this when it starts, because config deserialization
+    /// runs before zakurad installs its tracing subscriber.
+    pub(super) fn warn_ignored_max_blocks_per_response(&self) {
+        if let Some(configured) = self
+            .max_blocks_per_response
+            .filter(|configured| *configured > BS_BLOCKS_PER_RESPONSE)
+        {
+            tracing::warn!(
+                "zakura.block_sync.max_blocks_per_response = {configured} is deprecated and \
+                 ignored; block sync always requests one block per GetBlocks message",
+            );
+        }
     }
 
     /// Return the locally capped in-flight advertisement for status messages.

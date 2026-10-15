@@ -21,8 +21,8 @@ struct ControlledSource {
     gates: Mutex<BTreeMap<Height, Arc<Semaphore>>>,
     default_gate: Option<Arc<Semaphore>>,
     started: AtomicUsize,
-    /// Blocks served by height. Reads return an empty prefix without them.
-    blocks: BTreeMap<Height, Arc<Block>>,
+    /// Serialized blocks served by height. Reads return an empty prefix without them.
+    blocks: BTreeMap<Height, Vec<u8>>,
 }
 
 impl Source for ControlledSource {
@@ -55,15 +55,12 @@ impl Source for ControlledSource {
     }
 }
 
-/// Mainnet blocks at `heights`, keyed by height.
-fn mainnet_blocks(heights: std::ops::RangeInclusive<u32>) -> BTreeMap<Height, Arc<Block>> {
+/// Serialized Mainnet blocks at `heights`, keyed by height.
+fn mainnet_blocks(heights: std::ops::RangeInclusive<u32>) -> BTreeMap<Height, Vec<u8>> {
     heights
         .map(|height| {
             let bytes = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS[&height];
-            (
-                Height(height),
-                Arc::new(bytes.zcash_deserialize_into().unwrap()),
-            )
+            (Height(height), bytes.to_vec())
         })
         .collect()
 }

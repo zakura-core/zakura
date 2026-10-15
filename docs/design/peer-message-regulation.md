@@ -285,8 +285,9 @@ subscription, this is header sync version 9's rule that the next `Open` clears t
 A tombstone checks only the key and the update sequence, so crossing grants have no credit window
 yet. Header sync version 9 closes that gap. Its tombstone keeps the ended subscription's granted
 and consumed totals, adds each crossing grant to the granted total, and faults one that raises
-granted above consumed plus the window. A conformant subscriber stays within that bound, because it acknowledges only pages the
-publisher sent. The tools need this check before header sync adopts them.
+granted above consumed plus the window. A conformant subscriber stays within that bound, because
+it acknowledges only pages the publisher sent. The tools need this check before header sync adopts
+them.
 
 **Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
 terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's

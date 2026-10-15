@@ -868,11 +868,18 @@ impl SequencerTask {
                             unreachable!("only rejected outcomes reach peer scoring")
                         }
                     };
-                    self.send_action(BlockSyncAction::Misbehavior {
+                    let disconnects = reason.proves_tampered_body();
+                    let action = BlockSyncAction::Misbehavior {
                         peer: applying.source_peer.clone(),
                         reason,
-                    })
-                    .await;
+                    };
+                    // The driver disconnects a proven tampering supplier, so that
+                    // record must not be dropped when the action channel is busy.
+                    if disconnects {
+                        self.send_required_action(action).await;
+                    } else {
+                        self.send_action(action).await;
+                    }
                 }
             }
             BlockApplyResult::Rejected
@@ -2274,6 +2281,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A tampered body's record waits for a busy driver instead of timing out.
+    /// The height is still reset so another supplier can serve it.
+    #[tokio::test]
+    async fn tampered_body_misbehavior_waits_for_a_busy_driver() {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions.clone(),
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_millis(20),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
+        actions
+            .send(BlockSyncAction::Misbehavior {
+                peer: busy_peer,
+                reason: BlockSyncMisbehavior::StatusSpam,
+            })
+            .await
+            .expect("the filler action fills the channel");
+        let mismatch = zakura_header_chain::BodyPayloadMismatch {
+            evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+            requested: hash,
+            delivered: hash,
+            kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            source,
+        };
+        let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+
+        let finished = {
+            let finish = task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::default())),
+            );
+            tokio::pin!(finish);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut finish)
+                    .await
+                    .is_err(),
+                "the record must outlast the 20ms bounded send timeout"
+            );
+            assert!(matches!(
+                actions_rx.recv().await,
+                Some(BlockSyncAction::Misbehavior {
+                    reason: BlockSyncMisbehavior::StatusSpam,
+                    ..
+                })
+            ));
+            finish.await
+        };
+        assert_eq!(finished, (true, true));
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                peer,
+                reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+            }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
+                && actual == mismatch
+        ));
+        assert!(!task.sequencer.applying_contains(height));
+        assert!(
+            task.sequencer.floor() < height,
+            "the height is requestable again"
+        );
     }
 
     #[tokio::test]

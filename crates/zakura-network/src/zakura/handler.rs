@@ -1420,6 +1420,31 @@ impl ZakuraSupervisorHandle {
         })
     }
 
+    /// Apply the connection policy for one block-sync violation.
+    ///
+    /// Violations are record-only, except a body that proves tampering (see
+    /// [`crate::zakura::BlockSyncMisbehavior::proves_tampered_body`]), which disconnects
+    /// the peer.
+    /// Returns whether an active connection was closed.
+    pub async fn enforce_block_sync_misbehavior(
+        &self,
+        peer_id: &ZakuraPeerId,
+        reason: &crate::zakura::BlockSyncMisbehavior,
+    ) -> bool {
+        if !reason.proves_tampered_body() {
+            return false;
+        }
+        let disconnected = self.disconnect_peer(peer_id).await;
+        metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
+        info!(
+            ?peer_id,
+            ?reason,
+            disconnected,
+            "disconnecting Zakura peer that served a tampered block body"
+        );
+        disconnected
+    }
+
     /// Disconnect one active Zakura peer.
     pub async fn disconnect_peer(&self, peer_id: &ZakuraPeerId) -> bool {
         let token = {
@@ -8365,6 +8390,59 @@ mod tests {
         reactor_shutdown.cancel();
         reactor_task.await?;
         Ok(())
+    }
+
+    /// Only a body that proves tampering closes the supplier's connection.
+    #[tokio::test]
+    async fn block_sync_misbehavior_disconnects_only_a_proven_tampered_body() {
+        use crate::zakura::BlockSyncMisbehavior;
+        use zakura_header_chain::BodyCommitmentKind;
+
+        let mismatch = |kind| {
+            BlockSyncMisbehavior::BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([1; 32]),
+                requested: block::Hash([2; 32]),
+                delivered: block::Hash([2; 32]),
+                kind,
+                source: zakura_header_chain::SourceId::from_digest([3; 32]),
+            })
+        };
+        let cases = [
+            (mismatch(BodyCommitmentKind::AuthDataRoot), true),
+            (
+                mismatch(BodyCommitmentKind::CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT),
+                true,
+            ),
+            (mismatch(BodyCommitmentKind::TransactionMerkleRoot), true),
+            // A different header at the requested height can be a fork response.
+            (mismatch(BodyCommitmentKind::HeaderHash), false),
+            // These depend on local trees or supplied auxiliary roots.
+            (
+                mismatch(BodyCommitmentKind::Other("final_sapling_root")),
+                false,
+            ),
+            (
+                mismatch(BodyCommitmentKind::Other("chain_history_root")),
+                false,
+            ),
+            (BlockSyncMisbehavior::InvalidBlock, false),
+            (BlockSyncMisbehavior::StatusSpam, false),
+        ];
+        let supervisor = ZakuraSupervisorHandle::new(cases.len());
+        for (index, (reason, disconnects)) in cases.into_iter().enumerate() {
+            let peer = test_peer(u8::try_from(index + 20).expect("the case count fits in u8"));
+            let disconnect_token = CancellationToken::new();
+            register_test_peer(&supervisor, peer.clone(), disconnect_token.clone()).await;
+
+            assert_eq!(
+                supervisor
+                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .await,
+                disconnects,
+                "{reason:?}"
+            );
+            assert_eq!(disconnect_token.is_cancelled(), disconnects, "{reason:?}");
+        }
     }
 
     /// Reopen a header-sync stream after the responder parks it on a healthy connection.

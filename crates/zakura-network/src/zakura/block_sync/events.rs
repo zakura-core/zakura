@@ -327,6 +327,15 @@ pub enum BlockSyncMisbehavior {
     StatusSpam,
 }
 
+impl BlockSyncMisbehavior {
+    /// Whether this violation proves the peer served a tampered body.
+    ///
+    /// See [`zakura_header_chain::BodyCommitmentKind::proves_tampered_body`].
+    pub fn proves_tampered_body(&self) -> bool {
+        matches!(self, Self::BodyPayloadMismatch(mismatch) if mismatch.kind.proves_tampered_body())
+    }
+}
+
 /// The shared routine→reactor channel (per-peer routines inverted data flow).
 ///
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its

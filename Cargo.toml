@@ -165,7 +165,6 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
-x25519-dalek = "2.0.1"
 zcash_note_encryption = { version = "=3.0.0", package = "zakura-note-encryption" }
 zcash_script = "0.6"
 zeroize = "1.8"

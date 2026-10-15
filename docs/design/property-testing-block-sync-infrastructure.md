@@ -39,8 +39,8 @@ Generate legal start/count values and check production encode/decode round trips
 minimum/maximum counts, maximum legal end height, overflow, zero count, truncation, trailing bytes,
 and mismatched discriminators. Generated cases supplement deterministic boundaries.
 
-Check response count and body-byte limits independently. A storage result or decoded representation
-may consume more memory than its encoded bodies.
+Check response count and body-byte limits independently. Serving reads return serialized bodies, so
+a storage result holds about its encoded body bytes. A decoded representation may consume more.
 
 ## Reservations and terminals
 
@@ -154,7 +154,8 @@ Manual probes reproduce the host evidence. They are ignored and gated by environ
   RTT in `ZAKURA_PROBE_RTT_MS`.
 - `getblocks_storage_read_probe` in `zakura-state` (`ZAKURA_STORAGE_PROBE_CACHE_DIR`) times the
   production block-range read against a synced database at concurrency from 1 to 76.
-  `ZAKURA_STORAGE_PROBE_ENCODE=1` adds the serving encode on a blocking thread after each read.
+  `ZAKURA_STORAGE_PROBE_ENCODE=1` adds the serving encode, which copies the read's serialized
+  bodies into frames, on a blocking thread after each read.
   `ZAKURA_PROBE_DROP_CACHES=1` starts each case with a cold page cache.
 
 Run them with the `zakura-testkit` feature and a release build for representative figures.
@@ -166,16 +167,17 @@ block per response, warm cache, and the encode enabled:
 
 | Jobs | Mainnet reads/s | Mainnet p99 | Cores | Testnet reads/s |
 | --- | --- | --- | --- | --- |
-| 16 | 23,400 | 2.9 ms | 8.1 | 78,900 |
-| 24 | 28,600 | 3.8 ms | 10.3 | 76,300 |
-| 32 | 30,400 | 4.9 ms | 11.4 | 72,100 |
-| 38 | 30,200 | 5.9 ms | 11.5 | 71,300 |
-| 76 | 29,000 | 11.1 ms | 11.6 | 70,600 |
+| 16 | 49,100 | 1.1 ms | 9.3 | 78,400 |
+| 24 | 53,000 | 1.7 ms | 10.7 | 71,800 |
+| 32 | 52,800 | 2.3 ms | 11.1 | 66,900 |
+| 38 | 51,600 | 2.7 ms | 11.0 | 65,900 |
+| 76 | 48,200 | 5.4 ms | 10.5 | 63,900 |
 
-At 24 jobs Mainnet reaches 94% of its peak and Testnet 97%. More jobs add latency and CPU that
-validation needs. Encoding costs about a quarter of read-only throughput (Mainnet reads alone peak
-near 38,000/s). 16-block responses level off between 24 and 48 jobs, and unavailable heights
-saturate by 4. The limits do not depend on the response configuration.
+Mainnet peaks at 24 jobs, and Testnet, whose smaller blocks are cheaper to read, reaches 92% of
+its peak there. More jobs add latency and CPU that validation needs. Serving stored bytes instead
+of decoding and re-encoding each block doubled Mainnet throughput at 24 jobs (from 23,500 reads/s)
+and roughly tripled it for 16-block responses, which level off between 24 and 32 jobs.
+Unavailable heights saturate by 4 jobs. The limits do not depend on the response configuration.
 
 The advertisement covers requests outstanding until their endings reach the requester. Size it
 from storage latency, RTT, response bytes and transport buffering, and check twice that

@@ -2,7 +2,7 @@
 //!
 //! Only this module calls quinn-proto config setters (CTRL-0).
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use quinn_proto::{
     congestion::{ControllerFactory, CubicConfig, NewRenoConfig},
@@ -81,8 +81,6 @@ pub struct QuicConfig {
     pub dial_stagger_ms: u32,
     /// Kernel drop counter poll interval in seconds, Linux only (CTRL-24).
     pub kernel_drop_poll_secs: u32,
-    /// Directory for per-connection qlog files; needs the `qlog` feature (CTRL-25).
-    pub qlog_dir: Option<PathBuf>,
 }
 
 impl Default for QuicConfig {
@@ -109,7 +107,6 @@ impl Default for QuicConfig {
             retry_threshold: Some(DEFAULT_RETRY_THRESHOLD),
             dial_stagger_ms: 250,
             kernel_drop_poll_secs: 10,
-            qlog_dir: None,
         }
     }
 }
@@ -209,12 +206,6 @@ impl QuicConfig {
         }
         check("dial_stagger_ms", self.dial_stagger_ms, 0, 5000)?;
         check("kernel_drop_poll_secs", self.kernel_drop_poll_secs, 1, 300)?;
-        if self.qlog_dir.is_some() && !cfg!(feature = "qlog") {
-            return Err(ConfigError {
-                key: "qlog_dir",
-                reason: "this build lacks the zakura-quic `qlog` feature".into(),
-            });
-        }
         Ok(())
     }
 
@@ -464,5 +455,7 @@ mod tests {
         // Keys removed with multipath and BBR refuse to parse (SPEC §17d).
         assert!(toml::from_str::<QuicConfig>("congestion_controller = \"bbr3\"\n").is_err());
         assert!(toml::from_str::<QuicConfig>("path_idle_timeout_secs = 15\n").is_err());
+        // qlog output was removed in SPEC version 0.7 (§17e).
+        assert!(toml::from_str::<QuicConfig>("qlog_dir = \"/tmp\"\n").is_err());
     }
 }

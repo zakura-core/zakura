@@ -392,6 +392,74 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
     );
 }
 
+/// A body that keeps the expected header but not its transactions is junk that
+/// can decode far larger than the real block. The routine rejects it before it
+/// reaches the sequencer, including the duplicate-transaction Merkle malleation
+/// (CVE-2012-2459) that keeps the root.
+#[tokio::test]
+async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES);
+    let height = block.coinbase_height().unwrap();
+    assert_eq!(
+        block.transactions.len() % 2,
+        1,
+        "an odd count lets the last repeat"
+    );
+
+    let mut truncated = (*block).clone();
+    truncated.transactions.pop();
+    let mut malleated = (*block).clone();
+    malleated
+        .transactions
+        .push(malleated.transactions.last().unwrap().clone());
+    assert_eq!(
+        malleated
+            .transactions
+            .iter()
+            .collect::<block::merkle::Root>(),
+        block.header.merkle_root,
+        "the repeated last transaction keeps the Merkle root"
+    );
+
+    for junk in [truncated, malleated] {
+        let (mut routine, mut outbound, _pool, connection, mut events) =
+            requester_routine(block.hash());
+        let released = routine.work.reset_above(block::Height(0));
+        routine.budget.release(released);
+        routine.work.extend(
+            super::super::test_work_scope(),
+            [(height, block.hash(), BlockSizeEstimate::Confirmed(80_000))],
+        );
+        routine.servable_high = height;
+        let (body_sender, mut bodies) = mpsc::channel(1);
+        routine.sequencer_input = body_sender;
+        routine.try_fill().await;
+        next_sent(&mut outbound).await;
+        while events.try_recv().is_ok() {}
+
+        let error = try_deliver(&mut routine, BlockSyncMessage::Block(Arc::new(junk)))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SinkReject::Protocol(_)), "{error}");
+        assert!(
+            bodies.try_recv().is_err(),
+            "junk never reaches the sequencer"
+        );
+        let reported = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(
+                event,
+                RoutineToReactor::Misbehavior {
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                    ..
+                }
+            )
+        });
+        assert!(reported);
+        drop(routine);
+        drop(connection);
+    }
+}
+
 #[tokio::test]
 async fn a_partial_ending_requeues_only_the_missing_suffix() {
     let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
@@ -839,4 +907,188 @@ async fn a_retention_deferral_retires_a_request_another_peer_already_answered() 
         0
     })
     .await;
+}
+
+/// A peer that keeps the receive arm ready cannot postpone the deadline for an
+/// ending it withholds after sending every body.
+#[tokio::test(start_paused = true)]
+async fn a_status_flood_cannot_postpone_a_withheld_ending() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, _pool, connection, _events) = requester_routine(block.hash());
+    let (bodies, mut received) = mpsc::channel(1);
+    routine.sequencer_input = bodies;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    deliver(&mut routine, BlockSyncMessage::Block(block)).await;
+    received.try_recv().unwrap();
+    let grace = routine.config.effective_liveness_timeout();
+    let retirement = routine
+        .requester
+        .retirement_deadline(grace)
+        .expect("the last block starts the missing-ending deadline");
+    // Only the missing-ending deadline is due. The other timers cannot end the routine.
+    if let Some(key) = routine.window.outstanding.first_key() {
+        routine
+            .window
+            .outstanding
+            .set_deadline(key, retirement + Duration::from_secs(3600));
+    }
+    routine.window.block_liveness_deadline = None;
+    time::advance(retirement.saturating_duration_since(time::Instant::now().into_std())).await;
+    let (input, recv) = crate::zakura::framed_channel(1024);
+    let status = BlockSyncMessage::Status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(10),
+        max_blocks_per_response: 1,
+        ..BlockSyncStatus::default()
+    })
+    .encode_frame()
+    .unwrap();
+    while input.try_send(status.clone()).is_ok() {}
+    routine.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
+    routine.sequencer_view = view_rx;
+    let mut guard = block_sync_guard();
+    let mut running = Box::pin(routine.run_inner(&mut guard));
+    assert!(matches!(
+        futures::poll!(&mut running),
+        std::task::Poll::Ready(Err(SinkReject::Local(_)))
+    ));
+    assert!(connection.is_cancelled());
+}
+
+/// `RangeUnavailable` may name fewer heights than requested. The requester still
+/// returns every unreceived height, because no prefix arrived.
+#[tokio::test]
+async fn a_shortened_unavailable_requeues_the_whole_original_range() {
+    let (mut routine, mut outbound, pool, connection, mut events) =
+        requester_routine(block::Hash([1; 32]));
+    routine.config.max_blocks_per_response = 2;
+    routine.max_blocks_per_response = 2;
+    routine.work.extend(
+        super::super::test_work_scope(),
+        [(
+            block::Height(2),
+            block::Hash([2; 32]),
+            BlockSizeEstimate::Confirmed(1000),
+        )],
+    );
+    routine.try_fill().await;
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
+        BlockSyncMessage::GetBlocks { count: 2, .. }
+    ));
+    while events.try_recv().is_ok() {}
+    deliver(
+        &mut routine,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(1),
+            count: 1,
+        },
+    )
+    .await;
+    assert!(routine.work.pending_contains(block::Height(1)));
+    assert!(routine.work.pending_contains(block::Height(2)));
+    assert_eq!(pool.held(), 0);
+    assert!(!std::iter::from_fn(|| events.try_recv().ok())
+        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. })));
+    drop(routine);
+    assert!(!connection.is_cancelled());
+}
+
+/// A body is refused before it claims anything when no live range expects it,
+/// or when it exceeds the response's advertised body bytes.
+#[tokio::test]
+async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let body_len = u32::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap();
+
+    let (mut routine, _outbound, pool, _connection, _events) = requester_routine(block.hash());
+    let (bodies, mut received) = mpsc::channel(1);
+    routine.sequencer_input = bodies;
+    assert!(matches!(
+        try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
+        Err(SinkReject::Protocol(_))
+    ));
+    assert!(received.try_recv().is_err());
+    assert_eq!(pool.held(), 0);
+    assert!(routine.work.pending_contains(block::Height(1)));
+
+    // The exact limit is accepted. One byte less overruns it.
+    for (limit, accepted) in [(body_len, true), (body_len - 1, false)] {
+        let (mut routine, mut outbound, pool, _connection, _events) =
+            requester_routine(block.hash());
+        let (bodies, mut received) = mpsc::channel(1);
+        routine.sequencer_input = bodies;
+        routine.max_response_bytes = limit;
+        routine.try_fill().await;
+        next_sent(&mut outbound).await;
+        let result = try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
+        assert_eq!(result.is_ok(), accepted, "{limit}-byte limit: {result:?}");
+        assert_eq!(received.try_recv().is_ok(), accepted);
+        if !accepted {
+            assert!(matches!(result, Err(SinkReject::Protocol(_))));
+            assert_eq!(
+                routine.requester.unreceived_expected(16),
+                [(block::Height(1), block.hash())],
+                "the refused body claims nothing"
+            );
+            assert_eq!(pool.held(), 1);
+        }
+    }
+}
+
+/// The header claim happens before the local body decode slot. When the
+/// sequencer is gone, the claim stands: the body is neither re-offered on this
+/// connection nor accepted again. The reservation stays held, because it still
+/// owes the ending, until the routine drops. The drop then frees the pool entry
+/// and returns the height to pending, because the body never reached the sequencer.
+#[tokio::test]
+async fn a_local_failure_after_a_claim_keeps_the_reservation_consumed() {
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let (mut routine, mut outbound, pool, connection, _events) = requester_routine(block.hash());
+    let (bodies, received) = mpsc::channel(1);
+    drop(received);
+    routine.sequencer_input = bodies;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    assert!(matches!(
+        try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
+        Err(SinkReject::Local(_))
+    ));
+    assert!(routine.requester.unreceived_expected(16).is_empty());
+    assert_eq!(pool.held(), 1, "the ending still owns the reservation");
+    assert!(!connection.is_cancelled());
+    // The claim advanced past this header, so a resend matches no next header.
+    // That closes the connection without a peer fault.
+    let resent = try_deliver(&mut routine, BlockSyncMessage::Block(block))
+        .await
+        .unwrap_err();
+    assert!(matches!(resent, SinkReject::Local(_)));
+    assert!(resent.to_string().contains("next expected header"));
+    assert!(connection.is_cancelled());
+    assert_eq!(pool.held(), 1);
+    let work = routine.work.clone();
+    drop(routine);
+    assert_eq!(pool.held(), 0);
+    assert!(work.pending_contains(block::Height(1)));
+}
+
+/// The header proves which hash arrived. Its coinbase must also name the
+/// height that the claim assigned to it.
+#[tokio::test]
+async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation() {
+    // Height 1 expects block 2's header, so the claim succeeds for height 1.
+    let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
+    let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
+    let (bodies, mut received) = mpsc::channel(1);
+    routine.sequencer_input = bodies;
+    routine.try_fill().await;
+    next_sent(&mut outbound).await;
+    let error = try_deliver(&mut routine, BlockSyncMessage::Block(block))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SinkReject::Protocol(_)), "{error:?}");
+    assert!(error.to_string().contains("coinbase height"));
+    assert!(received.try_recv().is_err());
 }

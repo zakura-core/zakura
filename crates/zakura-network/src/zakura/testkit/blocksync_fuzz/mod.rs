@@ -109,7 +109,8 @@ pub(crate) async fn run_scenario(
     startup.trace = trace.clone();
     startup.shutdown = shutdown.clone();
 
-    let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
+    let (handle, actions, reactor_task) =
+        crate::zakura::spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let (committed_tx, mut committed_rx) = watch::channel(initial_verified);
 
@@ -137,7 +138,6 @@ pub(crate) async fn run_scenario(
     // Attach synthetic peers through the real add_peer path; each owns its own
     // connect/serve/disconnect lifecycle (peer churn).
     let peers = Arc::new(SyntheticBlockSyncPeers::new(
-        scenario.config.clone(),
         handle.clone(),
         scenario.transport_queue_depth.unwrap_or(1024),
     ));

@@ -218,13 +218,15 @@ async fn measure(blocking_threads: usize, reserved: usize, inputs_per_transactio
                     ));
                     reads.push(start.elapsed());
                     let start = Instant::now();
-                    let response = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        probe_state.clone().oneshot(Request::Tip),
-                    )
-                    .await
-                    .expect("buffered state request must complete within one second")
-                    .unwrap();
+                    // Boxing proves the buffered future is `Send` to the spawned probe.
+                    let tip: futures::future::BoxFuture<
+                        'static,
+                        Result<Response, crate::BoxError>,
+                    > = Box::pin(probe_state.clone().oneshot(Request::Tip));
+                    let response = tokio::time::timeout(Duration::from_secs(1), tip)
+                        .await
+                        .expect("buffered state request must complete within one second")
+                        .unwrap();
                     assert!(matches!(response, Response::Tip(_)));
                     tips.push(start.elapsed());
                     let start = Instant::now();

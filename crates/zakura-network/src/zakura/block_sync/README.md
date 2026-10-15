@@ -154,8 +154,9 @@ window. Accounting therefore follows each pool's actual representation:
 | --- | --- | --- |
 | `reorder_buffered_bytes` | serialized | wire bytes |
 | unsubmitted `applying_buffered_bytes` | serialized | wire bytes |
-| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus `wire × DESERIALIZED_MEM_FACTOR` |
-| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | `wire × DESERIALIZED_MEM_FACTOR`, plus the applying wire charge while attached |
+| `sequencer_input_queued_bytes` | serialized payload plus decoded block | wire bytes plus the decoded charge below |
+| `in_flight_submission_bytes` | submitted decoded block, including detached submissions awaiting completion | the decoded charge below, plus the applying wire charge while attached |
+| `decoded_resident_bytes` | measured heap of every decoded body in the input queue, reorder buffer and apply window | decoded charge = `max((input + submissions) × DESERIALIZED_MEM_FACTOR, decoded_resident_bytes)` |
 | `reserved_above_floor_bytes` | not received yet | estimated wire bytes |
 
 Two gates, checked together in `lookahead_over_budget`:
@@ -200,9 +201,13 @@ not by budget size. Zero config values are rejected.
 ### The bound
 
 Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
-process overhead and bounded transients. At the default 401-block submission window,
-the worst-case decoded contribution is approximately
-401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB:
+process overhead and bounded transients. At the default 401-block submission window and
+a chain that decodes at about four times its wire size, the decoded contribution is
+approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. The peer
+routine rejects a body whose transactions do not match its header's Merkle root, so the
+decoded window holds the real chain's blocks; a chain that decodes larger is charged its
+measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)
+derives the whole-node bound. The plateau can still exceed the budget by:
 
 - the floor's first-item progress margin (≤ one block per request — see liveness below);
 - a single in-window response can exceed the byte gate by up to its decoded resident
@@ -260,14 +265,11 @@ borrowed a bypass slot.
 
 ## Known limitations and follow-ups
 
-- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is a calibrated approximation of the
-  measured ~3.3–4× wire→decoded ratio, not a per-block heap measure. Replacing it with
-  a precise per-block resident estimate is tracked as
-  [ZCA-750](https://linear.app/zcale/issue/ZCA-750).
-- **Decoded accounting remains approximate.** Serialized pools are charged exactly
-  at wire size, but the bounded input and submission windows still use the calibrated
-  factor rather than a precise heap measurement.
-  `estimated_resident_pipeline_bytes` is the single calibration point.
+- **Decoded-memory factor.** `DESERIALIZED_MEM_FACTOR` is an average, not a bound: real
+  Mainnet blocks decode at up to about 3.45× their wire size, the worst consensus-valid
+  block at about 26×. Admission therefore charges the larger of the factor's estimate and
+  the measured decoded heap. The factor remains a floor so the gate never loosens on
+  typical blocks. `estimated_resident_pipeline_bytes` is the single calibration point.
 - **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
   commit window costs one extra request per crossing (the price of the never-span
   rule). Irrelevant at the default of 1.

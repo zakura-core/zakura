@@ -4,6 +4,7 @@
 
 mod cookie;
 mod http_request_compatibility;
+mod rpc_metrics;
 mod surface;
 mod tls;
 mod vectors;

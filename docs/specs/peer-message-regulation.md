@@ -428,7 +428,7 @@ height and hash, 32-byte cumulative work, oldest-retained height, maximum header
 maximum subscriptions, maximum message bytes, and the auxiliary-schema mask. Removing the payload
 discriminator makes its encoded size 122 bytes.
 
-A subscription has **reached its initial target** when its receive cursor equals
+A subscription has **reached its initial target** when the hash of its receive cursor equals
 `initial_target_tip_hash`. Until then the publisher serves the path to that target. After that the
 publisher pushes direct descendants as its selected chain grows.
 
@@ -446,7 +446,8 @@ they encode to 107 bytes.
 A subscription **cursor** is the tuple `(height, hash, headers, bytes)`. The start cursor is the
 first locator's height and hash with zero counts. A page's cursor is the height and hash of its last
 header, with the cumulative header and byte credit that the subscription's pages consumed through
-that page. Both sides record each page's cursor when the page spends its credit. Each update's
+that page. Both sides record each page's cursor when the page spends its credit. The receive
+cursor is the cursor of the last page received, or the start cursor before any page. Each update's
 acknowledged fields carry one cursor in that order. The publisher compares cursors by equality of
 all four fields. It never orders them. Every cursor of one subscription is distinct, because the
 start has zero counts and each page consumes at least one header.
@@ -634,7 +635,8 @@ already passed.
 - **Reservation**
   - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
     requested schema)
-  - the first parent is a sent locator; each later parent equals the reservation receive cursor
+  - the first parent is a sent locator; each later parent equals the hash of the reservation
+    receive cursor
   - consume `header_count` and the encoded payload bytes
   - advance the receive cursor
   - require `reaches_initial_target` exactly when the final header hash equals the initial target

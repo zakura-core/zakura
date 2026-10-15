@@ -2,7 +2,8 @@
 
 > **Status: first draft.** This document describes focused tests for the
 > [design](peer-message-regulation.md) and [specification](../specs/peer-message-regulation.md).
-> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths.
+> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths,
+> and the [header sync plan](property-testing-header-sync.md) covers header subscriptions.
 
 ## Scope and claim strength
 
@@ -141,4 +142,5 @@ and load runs can execute on a schedule. Choose counts from measured runtime and
 coverage honestly.
 
 Start with existing codec and reservation tests. Add GetBlocks ownership and bidirectional cases,
-then subscription tests. Expand the harness only when a named property exposes a gap.
+then subscription tests from the [header sync plan](property-testing-header-sync.md). Expand the
+harness only when a named property exposes a gap.

@@ -271,8 +271,8 @@ write finishes. The slot also reserves that outcome's output, so spent credit an
 cannot prevent closure. A conformant subscriber holds at most `max_live` slots when its `Open`
 arrives. As with requests, the toolkit acts only above a proven margin: it admits an `Open` beyond
 `max_live` within `2 × max_live`, counts it in `zakura.p2p.subscription.over_limit`, and
-disconnects only beyond that. This departs from header sync version 9's rule that an `Open`
-without a free slot returns `Disconnect`.
+disconnects only beyond that. Header sync version 9 takes this rule with `max_live = 1`, so its
+publisher holds two slots per peer.
 
 **Tombstones.** An ended subscription leaves a tombstone. A crossing `Grant` that matches it is
 dropped and keeps it; a crossing `Close` is dropped and consumes it. A subscriber below its limit
@@ -281,10 +281,47 @@ arrive in the order the publisher ended the subscriptions. So an `Open` clears t
 tombstones until live subscriptions plus tombstones number at most `max_live - 1`. With one live
 subscription, this is header sync version 9's rule that the next `Open` clears the tombstone.
 
+A tombstone checks only the key and the update sequence, so crossing grants have no credit window
+yet. Header sync version 9 closes that gap. Its tombstone keeps the ended subscription's granted
+and consumed totals and faults a crossing grant that raises granted above consumed plus the
+window. A conformant subscriber stays within that bound, because it acknowledges only pages the
+publisher sent. The tools need this check before header sync adopts them.
+
 **Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
 terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's
 pages and outcomes from one task, so each outcome follows its pages. Each update wakes that task,
 so `Close` never waits behind a page that waits for capacity.
+
+**Cursors.** The tools compare cursors by equality only, and each tool records the consumed totals
+through every page itself. Header sync version 9 makes its cursor the four acknowledged wire
+fields: height, hash, and the cumulative header and byte counts. Equality on all four checks the
+counts against the totals both sides recorded, and the counts keep the start cursor distinct from
+every page. An implementation can store only height and hash in the sent-cursor ring and compare
+the counts against the totals already stored with each entry.
+
+### Header sync version 9
+
+The [specification](../specs/peer-message-regulation.md) states the version 9 rules. This section
+records why some of them changed from the first draft.
+
+**Status cadence.** The first draft gave `Status` a bucket of four messages that disconnects when
+empty. The layout validator rejects that row, because a one-second sender needs a capacity of
+`10 min / 1 s + 2 = 602`. `CadenceBuckets` also never disconnects. The row now records and
+forwards like block sync's `Status`. Pushed pages now deliver new tips to a subscription that has
+reached its target, so a longer sender interval could shrink the bucket. It would also delay
+recovery after `SubscriptionSuperseded`, which needs a fresh `Status`, so the interval stays at one
+second until measurements show that recovery stays acceptable.
+
+**Grant minimum.** A `Grant` that adds one byte was legal, so a subscriber could send millions of
+grants inside one 8 MiB window. Each grant now adds at least one header or one smallest legal page
+of bytes, which caps grants at about one window's worth plus fewer than three per header sent.
+The codec checks the minimum at decode because it depends only on the network. A larger minimum,
+such as an eighth of the window, would cut grants further, the way TCP receivers avoid tiny window
+updates, but it would delay acknowledgements during tip following. A cadence on the subscription
+row would not bound the flood at all, because buckets record and forward.
+
+**Compatibility.** Whether version 9 replaces version 8 in one release or runs beside it for a
+release is still open. The specification lists both paths.
 
 ## Tests and diagnostics
 
@@ -296,8 +333,9 @@ Diagnostics identify protocol violations and local failures with bounded logging
 Sampling or aggregation is allowed. Complete per-decision traces are optional test/debug output.
 No particular file name or schema is required.
 
-A new exhaustive model explorer and universal panic-recovery suite are deferred. The [testing design](property-testing.md) and
-[GetBlocks plan](property-testing-block-sync-infrastructure.md) describe the initial checks.
+A new exhaustive model explorer and universal panic-recovery suite are deferred. The
+[testing design](property-testing.md), [GetBlocks plan](property-testing-block-sync-infrastructure.md),
+and [header sync plan](property-testing-header-sync.md) describe the checks.
 
 ## Adoption order
 

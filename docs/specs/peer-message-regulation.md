@@ -584,8 +584,9 @@ acknowledged cursor. The tombstone keeps the subscription's granted and consumed
 `Grant` that would raise granted credit above consumed credit plus the window, in headers or in
 bytes, MUST return `Disconnect`. A conformant subscriber stays within that bound because it
 acknowledged only pages that the publisher sent before the end. A crossing `Grant` within the bound
-MUST return `Drop` and MUST NOT consume the tombstone. A crossing `Close` MUST return `Drop` and
-consumes the tombstone.
+MUST return `Drop` and MUST NOT consume the tombstone. Its credit still counts toward the
+tombstone's granted credit, so later crossing grants cannot reuse the same room. A crossing `Close`
+MUST return `Drop` and consumes the tombstone.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
 clears every tombstone and MUST use a different subscription ID. This rule bounds a conformant

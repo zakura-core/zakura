@@ -1,4 +1,4 @@
-//! Zakurad Abscissa Application
+//! The `zakurad` process lifecycle.
 //!
 //! This is the code that starts `zakurad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
@@ -11,29 +11,18 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use abscissa_core::{
-    application::{self, AppCell},
-    config::CfgCell,
-    status_err,
-    terminal::{component::Terminal, stderr, stdout, ColorChoice},
-    Application, Component, Configurable, FrameworkError, Shutdown, StandardPaths,
-};
+use clap::Parser;
+use color_eyre::eyre::{eyre, Report};
 use semver::{BuildMetadata, Version};
+use tokio::{runtime::Runtime, sync::watch};
 
-use tokio::sync::watch;
 use zakura_state::{state_database_format_version_in_code, state_database_format_version_on_disk};
 
-use crate::{commands::EntryPoint, components::tracing::Tracing, config::ZakuradConfig};
-
-/// See <https://docs.rs/abscissa_core/latest/src/abscissa_core/application/exit.rs.html#7-10>
-/// Print a fatal error message and exit
-fn fatal_error(app_name: String, err: &dyn std::error::Error) -> ! {
-    status_err!("{} fatal error: {}", app_name, err);
-    process::exit(1)
-}
-
-/// Application state
-pub static APPLICATION: AppCell<ZakuradApp> = AppCell::new();
+use crate::{
+    commands::EntryPoint,
+    components::{metrics, tokio::new_runtime, tracing::Tracing},
+    config::ZakuradConfig,
+};
 
 lazy_static::lazy_static! {
     /// The last log event that occurred in the application.
@@ -64,7 +53,7 @@ pub fn build_version() -> Version {
     // Docker builds do not include `.git`, so use the explicitly supplied
     // commit when `git describe` could not add build metadata.
     if version.build == BuildMetadata::EMPTY {
-        if let Some(git_commit) = ZakuradApp::git_commit() {
+        if let Some(git_commit) = git_commit() {
             let short_commit: String = git_commit.chars().take(12).collect();
             if let Ok(build) = BuildMetadata::new(&format!("g{short_commit}")) {
                 version.build = build;
@@ -163,6 +152,19 @@ fn vergen_build_version() -> Option<Version> {
     semver.parse().ok()
 }
 
+/// Returns the git commit for this build, if available.
+///
+/// # Accuracy
+///
+/// If the user makes changes, but does not commit them, the git commit will
+/// not match the compiled source code.
+pub fn git_commit() -> Option<&'static str> {
+    const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
+    const GIT_COMMIT_VERGEN: Option<&str> = option_env!("VERGEN_GIT_SHA");
+
+    GIT_COMMIT_GCLOUD.or(GIT_COMMIT_VERGEN)
+}
+
 /// The Zebra current release version, without any build metadata.
 pub fn release_version() -> Version {
     let mut release_version = build_version();
@@ -182,103 +184,73 @@ pub fn user_agent() -> String {
     format!("/Zakura:{release_version}/")
 }
 
-/// Zakurad Application
-#[derive(Debug, Default)]
-pub struct ZakuradApp {
-    /// Application configuration.
-    config: CfgCell<ZakuradConfig>,
+/// Runs `zakurad` with the process's command-line arguments, then exits the process.
+///
+/// Invalid arguments, `--help` and `--version` exit with the argument parser's status.
+/// Startup errors are printed to stderr and exit with status 1. Otherwise the command
+/// runs, its logs are flushed, and the process exits with status 0 if the command
+/// succeeded, or 1 if it failed.
+///
+/// Panics unwind through the [`Lifecycle`], which flushes logs before the process exits.
+pub fn boot() -> ! {
+    let args =
+        EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
+    let command = EntryPoint::try_parse_from(args).unwrap_or_else(|err| err.exit());
 
-    /// Application state.
-    state: application::State<Self>,
+    let status = match Lifecycle::start(&command) {
+        Ok((lifecycle, config)) => lifecycle.run(&command, config),
+        Err(error) => {
+            report_fatal_error(&error);
+            1
+        }
+    };
+
+    process::exit(status)
 }
 
-impl ZakuradApp {
-    /// Returns the git commit for this build, if available.
-    ///
-    ///
-    /// # Accuracy
-    ///
-    /// If the user makes changes, but does not commit them, the git commit will
-    /// not match the compiled source code.
-    pub fn git_commit() -> Option<&'static str> {
-        const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
-        const GIT_COMMIT_VERGEN: Option<&str> = option_env!("VERGEN_GIT_SHA");
-
-        GIT_COMMIT_GCLOUD.or(GIT_COMMIT_VERGEN)
-    }
+/// Prints an error that stopped `zakurad` from starting.
+#[allow(clippy::print_stderr)]
+fn report_fatal_error(error: &Report) {
+    eprintln!("error: {} fatal error: {error}", env!("CARGO_PKG_NAME"));
 }
 
-impl Application for ZakuradApp {
-    /// Entrypoint command for this application.
-    type Cmd = EntryPoint;
+/// The process-wide resources `zakurad` owns while it runs one command.
+///
+/// Dropping it, including while a panic unwinds after a partial startup, stops the async
+/// runtime and then flushes queued logs and telemetry, so the log lines written during
+/// shutdown are kept.
+struct Lifecycle {
+    /// The async runtime of a server command, until the command takes it.
+    runtime: Option<Runtime>,
 
-    /// Application configuration.
-    type Cfg = ZakuradConfig;
-
-    /// Paths to resources within the application.
-    type Paths = StandardPaths;
-
-    /// Accessor for application configuration.
-    fn config(&self) -> Arc<ZakuradConfig> {
-        self.config.read()
-    }
-
-    /// Borrow the application state immutably.
-    fn state(&self) -> &application::State<Self> {
-        &self.state
-    }
-
-    /// Returns the framework components used by this application.
-    fn framework_components(
-        &mut self,
-        _command: &Self::Cmd,
-    ) -> Result<Vec<Box<dyn Component<Self>>>, FrameworkError> {
-        // TODO: Open a PR in abscissa to add a TerminalBuilder for opting out
-        //       of the `color_eyre::install` part of `Terminal::new` without
-        //       ColorChoice::Never?
-
-        // The Tracing component uses stdout directly and will apply colors automatically.
-        //
-        // Note: It's important to use `ColorChoice::Never` here to avoid panicking in
-        //       `register_components()` below if `color_eyre::install()` is called
-        //       after `color_spantrace` has been initialized.
-        let terminal = Terminal::new(ColorChoice::Never);
-
-        Ok(vec![Box::new(terminal)])
-    }
-
-    /// Register all components used by this application.
+    /// The global tracing subscriber's log writer and telemetry exporter.
     ///
-    /// If you would like to add additional components to your application
-    /// beyond the default ones provided by the framework, this is the place
-    /// to do so.
-    #[allow(clippy::print_stderr)]
-    #[allow(clippy::unwrap_in_result)]
-    fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};
+    /// Flushed after the runtime stops, because runtime tasks log while they shut down.
+    tracing: Option<Tracing>,
+}
 
-        let mut components = self.framework_components(command)?;
-
-        // Load config *after* framework components so that we can
-        // report an error to the terminal if it occurs (unless used with a command that doesn't need the config).
+impl Lifecycle {
+    /// Loads the configuration for `command`, then sets up error reporting, the Rayon
+    /// thread pool and tracing. Server commands also get an async runtime and the metrics
+    /// endpoint.
+    ///
+    /// The order matches what earlier releases did, so a config error is reported before
+    /// anything else is set up, and later setup steps are logged.
+    #[allow(clippy::print_stderr, clippy::unwrap_in_result)]
+    fn start(command: &EntryPoint) -> Result<(Self, Arc<ZakuradConfig>), Report> {
         let config = match ZakuradConfig::load(command.config_path()) {
             Ok(config) => config,
             // Ignore errors loading the config for some commands.
             Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
             Err(e) => {
-                status_err!(
-                    "Zakura could not load the provided configuration file and/or environment variables.\
+                eprintln!(
+                    "error: Zakura could not load the provided configuration file and/or environment variables.\
                      This might mean you are using a deprecated format of the file, or are attempting to
                      configure deprecated or unknown fields via environment variables.\
                      You can generate a valid config by running \"zakurad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
-                // Report the configuration error through the framework.
-                let io_error = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Configuration error: {}", e),
-                );
-                return Err(FrameworkError::from(io_error));
+                return Err(eyre!("I/O operation failed: Configuration error: {e}"));
             }
         };
 
@@ -328,7 +300,7 @@ impl Application for ZakuradApp {
         // build, so they must all be optional
         let git_metadata: &[(_, Option<_>)] = &[
             ("branch", option_env!("VERGEN_GIT_BRANCH")),
-            ("git commit", Self::git_commit()),
+            ("git commit", git_commit()),
             (
                 "commit timestamp",
                 option_env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
@@ -368,8 +340,6 @@ impl Application for ZakuradApp {
             .theme(theme)
             .panic_section(metadata_section.clone());
 
-        // This MUST happen after `Terminal::new` to ensure our preferred panic
-        // handler is the last one installed
         let (panic_hook, eyre_hook) = builder.into_hooks();
         eyre_hook.install().expect("eyre_hook.install() error");
         panic_hook.install();
@@ -392,7 +362,6 @@ impl Application for ZakuradApp {
 
         // Ignore the configured tracing filter for short-lived utility commands
         let mut tracing_config = config.tracing.clone();
-        let metrics_config = config.metrics.clone();
         if is_server {
             // Override the default tracing filter based on the command-line verbosity.
             tracing_config.filter = tracing_config
@@ -403,11 +372,15 @@ impl Application for ZakuradApp {
             // Don't apply the configured filter for short-lived commands.
             tracing_config.filter = Some(default_filter.to_owned());
         }
-        components.push(Box::new(Tracing::new(
-            &config.network.network,
-            tracing_config,
-            command.cmd().uses_intro(),
-        )?));
+
+        let mut lifecycle = Self {
+            runtime: None,
+            tracing: Some(Tracing::new(
+                &config.network.network,
+                tracing_config,
+                command.cmd().uses_intro(),
+            )?),
+        };
 
         // Log git metadata and platform info when zakurad starts up
         if is_server {
@@ -442,7 +415,7 @@ impl Application for ZakuradApp {
             default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
             other_net_name => other_net_name,
         };
-        let global_span = if let Some(git_commit) = ZakuradApp::git_commit() {
+        let global_span = if let Some(git_commit) = git_commit() {
             error_span!("", zakurad = git_commit, net)
         } else {
             error_span!("", net)
@@ -459,75 +432,40 @@ impl Application for ZakuradApp {
 
         // Launch network and async endpoints only for long-running commands.
         if is_server {
-            components.push(Box::new(TokioComponent::new()?));
-            components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
+            lifecycle.runtime = Some(new_runtime());
+            metrics::start_endpoint(&config.metrics);
         }
 
-        self.state.components_mut().register(components)?;
-
-        // Fire callback to signal state in the application lifecycle
-        self.after_config(config)
+        Ok((lifecycle, Arc::new(config)))
     }
 
-    /// Load this application's configuration and initialize its components.
-    #[allow(clippy::unwrap_in_result)]
-    fn init(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        // Create and register components with the application.
-        // We do this first to calculate a proper dependency ordering before
-        // application configuration is processed
-        self.register_components(command)
-    }
-
-    /// Post-configuration lifecycle callback.
+    /// Runs `command`, then stops the runtime and flushes logs.
     ///
-    /// Called regardless of whether config is loaded to indicate this is the
-    /// time in app lifecycle when configuration would be loaded if
-    /// possible.
-    fn after_config(&mut self, config: Self::Cfg) -> Result<(), FrameworkError> {
-        // Configure components
-        self.state.components_mut().after_config(&config)?;
-        self.config.set_once(config);
+    /// Returns the process exit status. Commands report their own errors, so a failed
+    /// command only changes the status.
+    fn run(mut self, command: &EntryPoint, config: Arc<ZakuradConfig>) -> i32 {
+        let result = command.cmd().run(config, self.runtime.take());
 
-        Ok(())
-    }
+        drop(self);
 
-    fn shutdown(&self, shutdown: Shutdown) -> ! {
-        // Some OSes require a flush to send all output to the terminal.
-        // zakurad's logging uses Abscissa, so we flush its streams.
-        //
-        // TODO:
-        // - if this doesn't work, send an empty line as well
-        // - move this code to the tracing component's `before_shutdown()`
-        let _ = stdout().lock().flush();
-        let _ = stderr().lock().flush();
-
-        let shutdown_result = self.state().components().shutdown(self, shutdown);
-
-        self.state()
-            .components_mut()
-            .get_downcast_mut::<Tracing>()
-            .map(Tracing::shutdown);
-
-        if let Err(e) = shutdown_result {
-            let app_name = self.name().to_string();
-            fatal_error(app_name, &e);
-        }
-
-        match shutdown {
-            Shutdown::Graceful => process::exit(0),
-            Shutdown::Forced => process::exit(1),
-            Shutdown::Crash => process::exit(2),
+        match result {
+            Ok(()) => 0,
+            Err(_) => 1,
         }
     }
 }
 
-/// Boot the given application, parsing subcommand and options from
-/// command-line arguments, and terminating when complete.
-// <https://docs.rs/abscissa_core/0.7.0/src/abscissa_core/application.rs.html#174-178>
-pub fn boot(app_cell: &'static AppCell<ZakuradApp>) -> ! {
-    let args =
-        EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
+impl Drop for Lifecycle {
+    fn drop(&mut self) {
+        // Stop the runtime first, so the logs of its tasks are flushed below.
+        drop(self.runtime.take());
 
-    ZakuradApp::run(app_cell, args);
-    process::exit(0);
+        if let Some(mut tracing) = self.tracing.take() {
+            tracing.shutdown();
+        }
+
+        // Some OSes require a flush to send all output to the terminal.
+        let _ = std::io::stdout().lock().flush();
+        let _ = std::io::stderr().lock().flush();
+    }
 }

@@ -2,17 +2,16 @@
 
 use std::path::PathBuf;
 
-use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
 use color_eyre::eyre::Result;
 
 use zakura_chain::parameters::Network;
 use zakura_state::{PruneFinalizedStateOptions, PruneFinalizedStateSummary};
 
-use crate::prelude::APPLICATION;
+use crate::config::ZakuradConfig;
 
 /// Prune historical raw transaction data from Zebra's finalized state
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct PruneStateCmd {
     /// Number of recent finalized blocks below the tip whose raw transaction data is retained.
     #[clap(long, help = "recent finalized blocks below the tip to keep")]
@@ -41,20 +40,16 @@ pub struct PruneStateCmd {
     confirm: bool,
 }
 
-impl Runnable for PruneStateCmd {
-    /// `prune-state` sub-command entrypoint.
-    fn run(&self) {
-        let config = APPLICATION.config();
-
-        if let Err(error) = self.run_with_config(config.mirrored_state_config()) {
-            tracing::error!("Failed to prune finalized state: {error}");
-            // Exit non-zero so scripts can detect failures.
-            std::process::exit(1);
-        }
-    }
-}
-
 impl PruneStateCmd {
+    /// `prune-state` sub-command entrypoint.
+    ///
+    /// Returns an error after logging it, so `zakurad` exits non-zero and scripts can detect
+    /// the failure.
+    pub(crate) fn run(&self, config: &ZakuradConfig) -> Result<()> {
+        self.run_with_config(config.mirrored_state_config())
+            .inspect_err(|error| tracing::error!("Failed to prune finalized state: {error}"))
+    }
+
     /// Runs pruning using `state_config` as the base state configuration.
     #[allow(clippy::print_stdout)]
     pub fn run_with_config(&self, mut state_config: zakura_state::Config) -> Result<()> {

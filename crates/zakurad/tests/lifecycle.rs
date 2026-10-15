@@ -840,7 +840,8 @@ fn utility_commands_do_not_start_server_components() {
     );
 }
 
-/// A failing utility command exits with a failure status.
+/// A failing utility command logs why, and exits with a failure status after the log is
+/// flushed.
 #[test]
 fn failing_utility_command_exits_with_failure() {
     let scratch = Scratch::new();
@@ -860,7 +861,9 @@ fn failing_utility_command_exits_with_failure() {
         ]),
     );
 
-    run.assert_status(1).assert_stdout_lacks("Starting zakurad");
+    run.assert_status(1)
+        .assert_stdout_contains("Subtree-root artifact verification failed")
+        .assert_stdout_lacks("Starting zakurad");
 }
 
 /// Command-line parse errors are reported by the argument parser with its exit status.

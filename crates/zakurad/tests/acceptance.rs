@@ -1060,9 +1060,6 @@ fn invalid_generated_config() -> Result<()> {
 #[test]
 fn stored_configs_parsed_correctly() -> Result<()> {
     let old_configs_dir = configs_dir();
-    use abscissa_core::Application;
-    use zakurad::application::ZakuradApp;
-
     tracing::info!(?old_configs_dir, "testing older config parsing");
 
     for config_file in old_configs_dir
@@ -1091,9 +1088,7 @@ fn stored_configs_parsed_correctly() -> Result<()> {
             "testing old config can be parsed by current zakurad"
         );
 
-        ZakuradApp::default()
-            .load_config(&config_file_path)
-            .expect("config should parse");
+        zakurad::config::ZakuradConfig::load(Some(config_file_path)).expect("config should parse");
     }
 
     Ok(())

@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result};
 
@@ -16,10 +15,10 @@ use zakura_chain::{
 
 use zakura_state::ReadStateService;
 
-use crate::prelude::APPLICATION;
+use crate::config::ZakuradConfig;
 
 /// Print the tip block height of Zebra's chain state on disk
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct TipHeightCmd {
     /// Path to Zebra's cached state.
     #[clap(long, short, help = "path to directory with the Zakura chain state")]
@@ -30,31 +29,32 @@ pub struct TipHeightCmd {
     network: Network,
 }
 
-impl Runnable for TipHeightCmd {
+impl TipHeightCmd {
     /// `tip-height` sub-command entrypoint.
     ///
     /// Reads the chain tip height from a cache directory with Zebra's state.
+    /// A missing tip is logged, and is not a command failure.
     #[allow(clippy::print_stdout)]
-    fn run(&self) {
-        match self.load_tip_height() {
+    pub(crate) fn run(&self, config: &ZakuradConfig) -> Result<()> {
+        match self.load_tip_height(config) {
             Ok(height) => println!("{}", height.0),
             Err(error) => tracing::error!("Failed to read chain tip height from state: {error}"),
         }
-    }
-}
 
-impl TipHeightCmd {
+        Ok(())
+    }
+
     /// Load the chain tip height from the state cache directory.
-    fn load_tip_height(&self) -> Result<block::Height> {
-        self.load_read_state()?
+    fn load_tip_height(&self, config: &ZakuradConfig) -> Result<block::Height> {
+        self.load_read_state(config)?
             .best_tip()
             .map(|(height, _hash)| height)
             .ok_or_else(|| eyre!("State directory doesn't have a chain tip block"))
     }
 
     /// Starts a state service using the `cache_dir` and `network` from the provided arguments.
-    fn load_read_state(&self) -> Result<ReadStateService> {
-        let mut config = APPLICATION.config().mirrored_state_config();
+    fn load_read_state(&self, config: &ZakuradConfig) -> Result<ReadStateService> {
+        let mut config = config.mirrored_state_config();
 
         if let Some(cache_dir) = self.cache_dir.clone() {
             config.cache_dir = cache_dir;

@@ -1,11 +1,11 @@
 //! `generate` subcommand - generates a default `zakura.toml` config.
 
 use crate::config::ZakuradConfig;
-use abscissa_core::{Command, Runnable};
 use clap::Parser;
+use color_eyre::eyre::Report;
 
 /// Generate a default `zakura.toml` configuration
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct GenerateCmd {
     /// The file to write the generated config to.
     //
@@ -18,10 +18,10 @@ pub struct GenerateCmd {
     output_file: Option<String>,
 }
 
-impl Runnable for GenerateCmd {
-    /// Start the application.
-    #[allow(clippy::print_stdout)]
-    fn run(&self) {
+impl GenerateCmd {
+    /// `generate` sub-command entrypoint.
+    #[allow(clippy::print_stdout, clippy::unwrap_in_result)]
+    pub(crate) fn run(&self) -> Result<(), Report> {
         let default_config = ZakuradConfig::default();
         let mut output = r"# Default configuration for zakurad.
 #
@@ -88,6 +88,8 @@ impl Runnable for GenerateCmd {
                 println!("{output}");
             }
         }
+
+        Ok(())
     }
 }
 

@@ -1,6 +1,5 @@
 //! In-process Zakura node lifecycle.
 
-use abscissa_core::config::Override;
 use color_eyre::Report;
 use tokio_util::sync::CancellationToken;
 

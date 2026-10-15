@@ -311,7 +311,10 @@ impl Requester {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
             } else {
-                self.pending_endings -= 1;
+                self.pending_endings = self
+                    .pending_endings
+                    .checked_sub(1)
+                    .expect("claiming a range's last body counted it as owing an ending");
             }
             // A complete range already left `next` when its last block was
             // claimed, so shrink on every removal, not only an unfinished one.

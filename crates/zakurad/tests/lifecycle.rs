@@ -53,9 +53,9 @@ impl Scratch {
             .prefix("zakurad_lifecycle")
             .tempdir()
             .expect("temporary directory is created");
-        fs::create_dir_all(dir.path().join("home")).expect("home directory is created");
-        fs::create_dir_all(dir.path().join("xdg")).expect("config directory is created");
-        Self { dir }
+        let scratch = Self { dir };
+        fs::create_dir_all(scratch.preference_dir()).expect("config directory is created");
+        scratch
     }
 
     fn path(&self) -> &Path {
@@ -64,7 +64,11 @@ impl Scratch {
 
     /// The directory `zakurad` searches for an implicit config file.
     fn preference_dir(&self) -> PathBuf {
-        self.path().join("xdg")
+        if cfg!(target_os = "macos") {
+            self.path().join("home/Library/Preferences")
+        } else {
+            self.path().join("xdg")
+        }
     }
 
     /// A regtest config that keeps all state and listeners local to this directory.
@@ -98,7 +102,10 @@ impl Scratch {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_zakurad"));
+        // Archived test runs set the binary's location at runtime.
+        let zakurad = env::var_os("CARGO_BIN_EXE_zakurad")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_zakurad").into());
+        let mut command = Command::new(zakurad);
         command
             .args(args)
             .current_dir(self.path())
@@ -132,8 +139,8 @@ struct Node {
     child: Child,
     stdout_lines: mpsc::Receiver<String>,
     stdout: Arc<Mutex<Vec<String>>>,
-    stdout_reader: thread::JoinHandle<()>,
-    stderr_reader: thread::JoinHandle<String>,
+    stdout_reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<String>>,
 }
 
 impl Node {
@@ -154,8 +161,8 @@ impl Node {
             child,
             stdout_lines,
             stdout: collected,
-            stdout_reader,
-            stderr_reader,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
         }
     }
 
@@ -185,7 +192,6 @@ impl Node {
                 Ok(line) if line.contains(text) => return,
                 Ok(_) => {}
                 Err(error) => {
-                    let _ = self.child.kill();
                     let stdout = self.stdout.lock().expect("lock is not poisoned").join("\n");
                     panic!("zakurad did not log {text:?} ({error}); stdout so far:\n{stdout}");
                 }
@@ -212,14 +218,21 @@ impl Node {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
                 panic!("zakurad did not exit within {PROCESS_TIMEOUT:?}");
             }
             thread::sleep(Duration::from_millis(50));
         };
-        self.stdout_reader.join().expect("stdout reader finishes");
-        let stderr = self.stderr_reader.join().expect("stderr reader finishes");
+        self.stdout_reader
+            .take()
+            .expect("output is collected once")
+            .join()
+            .expect("stdout reader finishes");
+        let stderr = self
+            .stderr_reader
+            .take()
+            .expect("output is collected once")
+            .join()
+            .expect("stderr reader finishes");
         let stdout = self.stdout.lock().expect("lock is not poisoned").join("\n");
 
         let run = Run {
@@ -229,6 +242,16 @@ impl Node {
         };
         run.record(name, scratch.path());
         run
+    }
+}
+
+impl Drop for Node {
+    /// Kills and reaps a process that is still running, for example when a test fails.
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -802,8 +825,7 @@ fn opentelemetry_exporter_shuts_down_with_the_node() {
 
 // Utility commands
 
-/// Utility commands don't start the node, the async runtime, or the metrics endpoint,
-/// and only log warnings by default.
+/// Utility commands don't start the node or the metrics endpoint, even when verbose.
 #[test]
 fn utility_commands_do_not_start_server_components() {
     let scratch = Scratch::new();
@@ -819,6 +841,7 @@ fn utility_commands_do_not_start_server_components() {
     let run = scratch.run(
         "utility_tip_height",
         &mut scratch.command([
+            OsStr::new("-v"),
             OsStr::new("-c"),
             config.as_os_str(),
             OsStr::new("tip-height"),
@@ -832,8 +855,9 @@ fn utility_commands_do_not_start_server_components() {
     run.assert_status(0)
         .assert_stdout_lacks("Starting zakurad")
         .assert_stdout_lacks("Trying to open metrics endpoint")
+        .assert_stdout_contains("started tracing component")
         .assert_stdout_lacks("loaded node configuration")
-        .assert_stdout_lacks("initialized rayon thread pool");
+        .assert_stdout_lacks("Diagnostic metadata:");
     assert!(
         !run.stderr.contains("Thank you for running"),
         "utility commands don't print the node intro"

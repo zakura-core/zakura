@@ -91,7 +91,8 @@ fn embedded_node_leaves_host_process_state_alone() {
         .expect("a cancelled node stops without an error");
     assert!(runtime.block_on(ready_rx).is_err());
 
-    // Neither path configured the global Rayon pool.
+    // Neither path configured the global Rayon pool. A node that starts may use the pool,
+    // which makes Rayon create it with defaults, so this is only checked before startup.
     rayon::ThreadPoolBuilder::new()
         .num_threads(2)
         .build_global()

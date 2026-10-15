@@ -178,8 +178,7 @@ orchard = { workspace = true, optional = true }
 # Required for crates.io publishing, but it's only used in tests
 zakura-utils = { path = "../zakura-utils", version = "2.2.7-rc0", optional = true }
 
-abscissa_core = { workspace = true, default-features = false, features = ["application"] }
-clap = { workspace = true, features = ["cargo"] }
+clap = { workspace = true, features = ["cargo", "derive"] }
 chrono = { workspace = true }
 indexmap = { workspace = true }
 lazy_static = { workspace = true }
@@ -253,7 +252,6 @@ hex.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
-abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 jsonrpsee-types = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }

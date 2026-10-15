@@ -191,7 +191,7 @@ pub fn user_agent() -> String {
 /// runs, its logs are flushed, and the process exits with status 0 if the command
 /// succeeded, or 1 if it failed.
 ///
-/// Panics unwind through the [`Lifecycle`], which flushes logs before the process exits.
+/// Panics unwind through the private lifecycle owner, which flushes logs before the process exits.
 pub fn boot() -> ! {
     let args =
         EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());

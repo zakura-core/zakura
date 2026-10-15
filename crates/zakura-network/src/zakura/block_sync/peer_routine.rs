@@ -329,6 +329,8 @@ pub(super) struct PeerRoutine {
     /// Clamped limits last published to the registry. Request issuance uses the
     /// latest limits immediately; only publication waits for the meter.
     published_limits: (u32, u32, u32),
+    /// Whether the last slot publication showed a requester that refuses work.
+    published_requester_stopped: bool,
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -445,6 +447,7 @@ impl PeerRoutine {
             inbound_status_meter,
             status_range_bypass_available: false,
             published_limits,
+            published_requester_stopped: false,
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
@@ -826,16 +829,16 @@ impl PeerRoutine {
             super::config::clamp_advertised_response_bytes(status.max_response_bytes),
             super::config::clamp_advertised_inflight(status.max_inflight_requests),
         );
-        let was_stopped = self.requester_stop().is_some();
         // Requests must obey the peer's latest limits even while publication waits.
         (
             self.max_blocks_per_response,
             self.max_response_bytes,
             self.window.max_inflight_requests,
         ) = limits;
-        // A new in-flight limit can stop or reopen the requester. Republish
-        // before any rate-limited return so the floor ranking stays current.
-        if self.requester_stop().is_some() != was_stopped {
+        // Publish a stop before the rate limiter, so no routine keeps deferring
+        // the floor to this peer. A reopen waits for a rate-limited publication,
+        // so a Status flood cannot toggle the shared ranking on every frame.
+        if self.requester_stop().is_some() && !self.published_requester_stopped {
             self.publish_slot_diagnostics();
         }
         let limits_changed = limits != self.published_limits;
@@ -853,6 +856,9 @@ impl PeerRoutine {
             return;
         }
         self.pending_status = None;
+        if self.requester_stop().is_some() != self.published_requester_stopped {
+            self.publish_slot_diagnostics();
+        }
         // Replies have their own allowance. The reactor also retries any local
         // status that has not entered this peer's outbound queue.
         let send_reply = self.status_reply_meter.try_take(now);
@@ -2505,9 +2511,10 @@ impl PeerRoutine {
     /// for other routines' cross-peer floor-bias decisions. A routine whose
     /// requester refuses new requests publishes no free slots, so no other
     /// routine defers the floor to it.
-    fn publish_slot_diagnostics(&self) {
+    fn publish_slot_diagnostics(&mut self) {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
-        let available_slots = if self.requester_stop().is_some() {
+        self.published_requester_stopped = self.requester_stop().is_some();
+        let available_slots = if self.published_requester_stopped {
             0
         } else {
             self.window.available_slots()

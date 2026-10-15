@@ -1344,22 +1344,30 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
     ));
 }
 
-/// A status that lowers the advertised in-flight limit to what a fast peer
-/// already holds stops its requester, so a slower peer takes the floor at
-/// once instead of deferring until the next slot heartbeat. The status here
-/// is rate-limited, which still applies the new limit.
-#[tokio::test]
-async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
-    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
-        bulk_routine();
-    let limit = |max_inflight_requests| BlockSyncStatus {
+/// A `bulk_routine` status that advertises `max_inflight_requests`.
+fn inflight_limit(max_inflight_requests: u32) -> BlockSyncStatus {
+    BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(BULK_WORK),
         max_blocks_per_response: 1,
         max_inflight_requests,
         ..BlockSyncStatus::default()
-    };
-    fast.handle_status(limit(8));
+    }
+}
+
+/// A measured fast peer that advertises 8 in-flight requests and holds one
+/// exchange whose ending it withholds, and a slower peer from
+/// [`slower_floor_peer`] that defers the returned floor height to it. The last
+/// value keeps the fast peer's channels open.
+async fn fast_peer_holding_one_exchange() -> (
+    PeerRoutine,
+    PeerRoutine,
+    FramedRecv,
+    block::Height,
+    Box<dyn std::any::Any>,
+) {
+    let ((mut fast, mut fast_outbound, pool, connection, events), blocks, bodies) = bulk_routine();
+    fast.handle_status(inflight_limit(8));
     // The cold-start probe sends one request. Its body arrives, its ending does not.
     fast.try_fill().await;
     let [first] = requested_heights(&mut fast_outbound)[..] else {
@@ -1367,23 +1375,37 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     };
     let index = usize::try_from(first.0 - 1).unwrap();
     deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
-    assert!(fast.window.bbr_rtprop_ms(Instant::now()).is_some());
+    assert!(fast
+        .window
+        .bbr_rtprop_ms(time::Instant::now().into_std())
+        .is_some());
     assert_eq!(fast.requester.len(), 1);
     let floor = fast
         .work
         .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
         .unwrap();
-    let registry = Arc::clone(&fast.registry);
     let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
 
     // With room under its limit, the faster peer is the preferred floor server.
     slow.try_fill().await;
     assert!(requested_heights(&mut slow_outbound).is_empty());
+    let keep = Box::new((fast_outbound, connection, events, bodies));
+    (fast, slow, slow_outbound, floor, keep)
+}
 
+/// A status that lowers the advertised in-flight limit to what a fast peer
+/// already holds stops its requester, so a slower peer takes the floor at
+/// once instead of deferring until the next slot heartbeat. The status here
+/// is rate-limited, which still applies the new limit.
+#[tokio::test]
+async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
+    let (mut fast, mut slow, mut slow_outbound, floor, _keep) =
+        fast_peer_holding_one_exchange().await;
+    let registry = Arc::clone(&fast.registry);
     let ranking = registry.subscribe_floor_ranking().notified();
     tokio::pin!(ranking);
     ranking.as_mut().enable();
-    fast.handle_status(limit(1));
+    fast.handle_status(inflight_limit(1));
     assert!(fast.pending_status.is_some(), "the status was rate-limited");
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     slow.try_fill().await;
@@ -1392,4 +1414,40 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
         [floor],
         "the slower peer takes the floor once the fast one refuses work",
     );
+}
+
+/// A peer that alternates its in-flight limit between 1 and 2 through
+/// rate-limited statuses publishes its stop once. Reopening waits for a status
+/// the rate limiter admits, so the flood wakes routines waiting on the floor
+/// ranking once, not on every frame.
+#[tokio::test(start_paused = true)]
+async fn alternating_rate_limited_limits_publish_the_stop_once() {
+    let (mut fast, slow, _slow_outbound, floor, _keep) = fast_peer_holding_one_exchange().await;
+    let registry = Arc::clone(&fast.registry);
+    let mut notifications = 0;
+    for round in 0..16 {
+        let ranking = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(ranking);
+        ranking.as_mut().enable();
+        fast.handle_status(inflight_limit(if round % 2 == 0 { 1 } else { 2 }));
+        assert!(
+            fast.pending_status.is_some(),
+            "every status is rate-limited"
+        );
+        if futures::poll!(ranking.as_mut()).is_ready() {
+            notifications += 1;
+        }
+    }
+    assert_eq!(notifications, 1, "only the first stop is published");
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    // The next admitted status publishes the reopened requester.
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    time::advance(Duration::from_secs(1)).await;
+    fast.flush_pending_status();
+    assert!(fast.pending_status.is_none());
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
 }

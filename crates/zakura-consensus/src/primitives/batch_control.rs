@@ -104,7 +104,6 @@
 
 pub mod error;
 pub mod future;
-mod layer;
 mod message;
 mod service;
 mod worker;
@@ -130,7 +129,6 @@ impl<Req: RequestWeight> From<Req> for BatchControl<Req> {
     }
 }
 
-pub use self::layer::BatchLayer;
 pub use self::service::Batch;
 
 /// A trait for reading the weight of a request to [`BatchControl`] services.

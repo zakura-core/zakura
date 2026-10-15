@@ -1,0 +1,44 @@
+{
+  "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
+  "common_sha": "2043c595ff0995198e8ad25d5cc2db5a965b895c",
+  "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "features": "default-release-binaries",
+  "edges": "normal,build",
+  "targets": {
+    "x86_64-unknown-linux-gnu": {
+      "count": 328,
+      "removed": [
+        "bip32 0.6.0",
+        "digest 0.11.3",
+        "hmac 0.13.0",
+        "ripemd 0.2.0",
+        "sha2 0.11.1"
+      ],
+      "added": []
+    },
+    "aarch64-apple-darwin": {
+      "count": 326,
+      "removed": [
+        "bip32 0.6.0",
+        "cpufeatures 0.3.0",
+        "digest 0.11.3",
+        "hmac 0.13.0",
+        "ripemd 0.2.0",
+        "sha2 0.11.1"
+      ],
+      "added": []
+    },
+    "aarch64-unknown-linux-gnu": {
+      "count": 325,
+      "removed": [
+        "bip32 0.6.0",
+        "cpufeatures 0.3.0",
+        "digest 0.11.3",
+        "hmac 0.13.0",
+        "ripemd 0.2.0",
+        "sha2 0.11.1"
+      ],
+      "added": []
+    }
+  }
+}

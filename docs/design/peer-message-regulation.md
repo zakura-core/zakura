@@ -244,12 +244,13 @@ Remove the mandatory push deadline. The publisher produces eligible pages when c
 and capacity are available. The subscriber can track progress and select another peer under local
 policy. Slow progress alone is not a protocol violation. Idle subscription state stays bounded.
 
-Regulated block sync negotiates version 3 with version-2 message encodings, and peers without the
-regulation capability keep the complete version 2 contract. Live ranges cannot overlap on one
-regulated connection because the wire format lacks a request ID. A separate successor protocol can
-improve correlation later. A well-formed body with a different hash can come from an honest peer on
-another chain, so it retires the connection as a local incompatibility rather than a peer fault.
-The [specification](../specs/peer-message-regulation.md) states the version 3 rules.
+Regulated block sync negotiates version 3 with version-2 message encodings. Version 3 replaced
+version 2, so a peer that offers only version 2 negotiates no block sync stream. Live ranges cannot
+overlap on one regulated connection because the wire format lacks a request ID. A separate
+successor protocol can improve correlation later. A well-formed body with a different hash can
+come from an honest peer on another chain, so it retires the connection as a local incompatibility
+rather than a peer fault. The [specification](../specs/peer-message-regulation.md) states the
+version 3 rules.
 
 ### Subscriptions
 

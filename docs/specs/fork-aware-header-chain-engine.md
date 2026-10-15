@@ -422,7 +422,7 @@ An ambiguous boundary is an exception to the one-target and retained-payload rul
 
 ## 5. Native fork-discovery protocol
 
-> **Planned change.** Header sync version 9, defined in the [peer message regulation specification](peer-message-regulation.md), replaces the version 8 wire in this section when it activates. It keeps one protocol at one stream version under LC-SCOPE-09. The activation change updates this section and PW-08.
+> **Planned change.** Header sync version 9, defined in the [peer message regulation specification](peer-message-regulation.md), replaces this section's stream version, message encodings, and `GetHeaders` request rules when it activates. The other rules here keep applying except where version 9 changes them, and it keeps one protocol at one stream version under LC-SCOPE-09. The activation change updates this section and PW-08.
 
 ### 5.1 Stream version and codec
 

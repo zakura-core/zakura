@@ -19,7 +19,7 @@ use tokio_util::sync::PollSemaphore;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
-use crate::RequestWeight;
+use super::RequestWeight;
 
 use super::{
     error::{Closed, ServiceError},
@@ -40,7 +40,7 @@ pub struct Worker<T, Request: RequestWeight>
 where
     T: Service<BatchControl<Request>>,
     T::Future: Send + 'static,
-    T::Error: Into<crate::BoxError>,
+    T::Error: Into<super::BoxError>,
 {
     // Batch management
     //
@@ -99,11 +99,11 @@ impl<T, Request: RequestWeight> Worker<T, Request>
 where
     T: Service<BatchControl<Request>>,
     T::Future: Send + 'static,
-    T::Error: Into<crate::BoxError>,
+    T::Error: Into<super::BoxError>,
 {
     /// Creates a new batch worker.
     ///
-    /// See [`Batch::new()`](crate::Batch::new) for details.
+    /// See [`Batch::new()`](super::Batch::new) for details.
     pub(crate) fn new(
         service: T,
         rx: mpsc::UnboundedReceiver<Message<Request, T::Future>>,
@@ -211,7 +211,7 @@ where
 
     /// Run loop for batch requests, which implements the batch policies.
     ///
-    /// See [`Batch::new()`](crate::Batch::new) for details.
+    /// See [`Batch::new()`](super::Batch::new) for details.
     pub async fn run(mut self) {
         loop {
             // Wait on either a new message or the batch timer.
@@ -327,7 +327,7 @@ where
     /// need to communicate this to all the `Batch` handles. To do so, we wrap up the error in
     /// an `Arc`, send that `Arc<E>` to all pending requests, and store it so that subsequent
     /// requests will also fail with the same error.
-    fn failed(&mut self, error: crate::BoxError) {
+    fn failed(&mut self, error: super::BoxError) {
         tracing::debug!(?error, "batch worker error");
 
         // Note that we need to handle the case where some error_handle is concurrently trying to send us
@@ -368,7 +368,7 @@ where
 }
 
 impl ErrorHandle {
-    pub(crate) fn get_error_on_closed(&self) -> crate::BoxError {
+    pub(crate) fn get_error_on_closed(&self) -> super::BoxError {
         self.inner
             .lock()
             .expect("previous task panicked while holding the error handle mutex")
@@ -391,7 +391,7 @@ impl<T, Request: RequestWeight> PinnedDrop for Worker<T, Request>
 where
     T: Service<BatchControl<Request>>,
     T::Future: Send + 'static,
-    T::Error: Into<crate::BoxError>,
+    T::Error: Into<super::BoxError>,
 {
     fn drop(mut self: Pin<&mut Self>) {
         tracing::trace!(

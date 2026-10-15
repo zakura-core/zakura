@@ -8,13 +8,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use super::batch_control::{Batch, BatchControl, RequestWeight};
+use super::fallback::Fallback;
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use rand_10::rng as thread_rng;
 use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
 
 use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
 use zakura_chain::transaction::{SigHash, UnminedTxId};

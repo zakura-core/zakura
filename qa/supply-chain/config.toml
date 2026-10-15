@@ -64,12 +64,6 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
-[policy.zakura-tower-batch-control]
-audit-as-crates-io = false
-
-[policy.zakura-tower-fallback]
-audit-as-crates-io = false
-
 [policy.zakura-utils]
 audit-as-crates-io = false
 

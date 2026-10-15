@@ -146,9 +146,7 @@ WORKDIR ${HOME}
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
-RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batch-control \
-    --mount=type=bind,source=crates/tower-fallback,target=crates/tower-fallback \
-    --mount=type=bind,source=crates/xtask,target=crates/xtask \
+RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
     --mount=type=bind,source=crates/zakura-mmr-tree,target=crates/zakura-mmr-tree \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \

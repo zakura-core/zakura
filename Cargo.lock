@@ -4183,13 +4183,16 @@ dependencies = [
  "chrono",
  "color-eyre",
  "criterion",
+ "ed25519-zebra",
  "futures",
+ "futures-core",
  "futures-util",
  "getset",
  "hex",
  "lazy_static",
  "metrics",
  "once_cell",
+ "pin-project",
  "proptest",
  "proptest-derive",
  "rand 0.10.2",
@@ -4198,6 +4201,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "tokio-util",
  "toml",
  "tower",
  "tracing",
@@ -4214,8 +4218,6 @@ dependencies = [
  "zakura-script",
  "zakura-state",
  "zakura-test",
- "zakura-tower-batch-control",
- "zakura-tower-fallback",
  "zakura-transparent",
  "zcash_script",
 ]
@@ -4750,37 +4752,6 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "zakura-tower-batch-control"
-version = "1.4.0-rc0"
-dependencies = [
- "color-eyre",
- "ed25519-zebra",
- "futures",
- "futures-core",
- "pin-project",
- "rand 0.8.6",
- "rayon",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "zakura-test",
- "zakura-tower-fallback",
-]
-
-[[package]]
-name = "zakura-tower-fallback"
-version = "1.3.0-rc0"
-dependencies = [
- "futures-core",
- "pin-project",
- "tokio",
- "tower",
- "tracing",
- "zakura-test",
 ]
 
 [[package]]

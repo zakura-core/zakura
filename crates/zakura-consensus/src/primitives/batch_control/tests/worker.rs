@@ -7,14 +7,12 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::{error, Batch, BatchControl, RequestWeight};
 use tokio::sync::oneshot;
 use tower::{Service, ServiceExt};
-use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
 
-#[path = "worker/mock.rs"]
 mod mock;
 
-#[path = "worker/polling.rs"]
 mod polling;
 
 use polling::{ready, ready_err, Task};

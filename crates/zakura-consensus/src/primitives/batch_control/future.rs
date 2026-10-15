@@ -20,7 +20,7 @@ pub struct ResponseFuture<T> {
 #[pin_project(project = ResponseStateProj)]
 #[derive(Debug)]
 enum ResponseState<T> {
-    Failed(Option<crate::BoxError>),
+    Failed(Option<super::BoxError>),
     Rx(#[pin] message::Rx<T>),
     Poll(#[pin] T),
 }
@@ -32,7 +32,7 @@ impl<T> ResponseFuture<T> {
         }
     }
 
-    pub(crate) fn failed(err: crate::BoxError) -> Self {
+    pub(crate) fn failed(err: super::BoxError) -> Self {
         ResponseFuture {
             state: ResponseState::Failed(Some(err)),
         }
@@ -42,9 +42,9 @@ impl<T> ResponseFuture<T> {
 impl<F, T, E> Future for ResponseFuture<F>
 where
     F: Future<Output = Result<T, E>>,
-    E: Into<crate::BoxError>,
+    E: Into<super::BoxError>,
 {
-    type Output = Result<T, crate::BoxError>;
+    type Output = Result<T, super::BoxError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();

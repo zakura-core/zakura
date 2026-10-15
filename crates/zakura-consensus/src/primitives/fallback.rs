@@ -13,6 +13,9 @@
 pub mod future;
 mod service;
 
+#[cfg(test)]
+mod tests;
+
 pub use self::service::Fallback;
 
 /// A boxed type-erased `std::error::Error` that can be sent between threads.

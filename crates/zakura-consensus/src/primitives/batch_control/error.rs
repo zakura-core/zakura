@@ -1,6 +1,6 @@
 //! Error types for the `Batch` middleware.
 
-use crate::BoxError;
+use super::BoxError;
 use std::{fmt, sync::Arc};
 
 /// An error produced by a `Service` wrapped by a `Batch`.

@@ -10,14 +10,14 @@ use std::{
     sync::Arc,
 };
 
+use crate::primitives::batch_control::{Batch, BatchControl};
+use crate::primitives::fallback::Fallback;
 use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
 use tower::{buffer::Buffer, service_fn, Service, ServiceExt};
-use tower_batch_control::{Batch, BatchControl};
-use tower_fallback::Fallback;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -6724,7 +6724,7 @@ fn orchard_shielded_data_for_mutation(tx: &mut Transaction) -> &mut orchard::Shi
 /// ever see that transaction's cache entry cold.
 ///
 /// It runs on [`zakura_test::MULTI_THREADED_RUNTIME`] because it reaches a global verifier.
-/// `tower-batch-control` spawns that verifier's batch worker on whichever runtime first touches
+/// The batch middleware spawns that verifier's batch worker on whichever runtime first touches
 /// it, so a per-test runtime would leave the worker cancelled for every test that ran afterwards.
 ///
 /// The three claims, in order:

@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use tower::Service;
 
 use super::future::ResponseFuture;
-use crate::BoxedError;
+use super::BoxedError;
 
 /// Provides fallback processing on a second service if the first service returned an error.
 #[derive(Debug)]

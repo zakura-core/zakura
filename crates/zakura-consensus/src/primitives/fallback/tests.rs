@@ -1,7 +1,7 @@
-//! Tests for tower-fallback
+//! Tests for the fallback middleware.
 
+use crate::primitives::fallback::Fallback;
 use tower::{service_fn, Service, ServiceExt};
-use tower_fallback::Fallback;
 
 #[tokio::test]
 async fn fallback() {

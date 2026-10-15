@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::{Batch, BatchControl, RequestWeight};
+use crate::primitives::fallback::Fallback;
 use color_eyre::{eyre::eyre, Report};
 use ed25519_zebra::{batch, Error, Signature, SigningKey, VerificationKeyBytes};
 use futures::stream::{FuturesOrdered, StreamExt};
@@ -17,8 +19,6 @@ use futures_core::Future;
 use rand::thread_rng;
 use tokio::sync::{oneshot::error::RecvError, watch};
 use tower::{Service, ServiceExt};
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
 
 // ============ service impl ============
 

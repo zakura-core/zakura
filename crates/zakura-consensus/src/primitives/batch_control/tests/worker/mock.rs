@@ -150,7 +150,7 @@ impl<U> SendResponse<U> {
 
 #[cfg(test)]
 mod tests {
-    use crate::polling::{ready, Task};
+    use super::super::polling::{ready, Task};
     use tower::ServiceExt;
 
     use super::*;

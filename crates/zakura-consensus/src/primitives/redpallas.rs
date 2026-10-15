@@ -11,10 +11,10 @@ use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
 use rand_10::rng as thread_rng;
 
+use super::batch_control::{Batch, BatchControl, RequestWeight};
+use super::fallback::Fallback;
 use tokio::sync::watch;
 use tower::{util::ServiceFn, Service};
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
 
 use zakura_chain::primitives::reddsa::{batch, orchard, Error, Signature, VerificationKeyBytes};
 

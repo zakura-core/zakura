@@ -13,8 +13,6 @@ members = [
         "crates/zakura-node-services",
         "crates/zakura-test",
         "crates/zakura-utils",
-        "crates/tower-batch-control",
-        "crates/tower-fallback",
         "crates/xtask",
         "crates/zakura-jsonl-trace",
 ]

@@ -19,7 +19,7 @@ use tokio_util::sync::PollSemaphore;
 use tower::Service;
 use tracing::{info_span, Instrument};
 
-use crate::RequestWeight;
+use super::RequestWeight;
 
 use super::{
     future::ResponseFuture,
@@ -97,7 +97,7 @@ impl<T, Request: RequestWeight> Batch<T, Request>
 where
     T: Service<BatchControl<Request>>,
     T::Future: Send + 'static,
-    T::Error: Into<crate::BoxError>,
+    T::Error: Into<super::BoxError>,
 {
     /// Creates a new `Batch` wrapping `service`.
     ///
@@ -229,7 +229,7 @@ where
     }
 
     /// Returns the error from the batch worker's `error_handle`.
-    fn get_worker_error(&self) -> crate::BoxError {
+    fn get_worker_error(&self) -> super::BoxError {
         self.error_handle.get_error_on_closed()
     }
 
@@ -246,7 +246,7 @@ where
     /// [`poll_ready`](Service::poll_ready) call, the flush consumes it, so
     /// callers must poll readiness again before the next
     /// [`call`](Service::call).
-    pub fn try_flush(&mut self) -> Result<bool, crate::BoxError> {
+    pub fn try_flush(&mut self) -> Result<bool, super::BoxError> {
         let _permit = match self.permit.take() {
             Some(permit) => permit,
             None => match self.semaphore.clone_inner().try_acquire_owned() {
@@ -270,10 +270,10 @@ impl<T, Request: RequestWeight> Service<Request> for Batch<T, Request>
 where
     T: Service<BatchControl<Request>>,
     T::Future: Send + 'static,
-    T::Error: Into<crate::BoxError>,
+    T::Error: Into<super::BoxError>,
 {
     type Response = T::Response;
-    type Error = crate::BoxError;
+    type Error = super::BoxError;
     type Future = ResponseFuture<T::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

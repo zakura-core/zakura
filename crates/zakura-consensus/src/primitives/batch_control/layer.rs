@@ -5,7 +5,7 @@ use std::{fmt, marker::PhantomData};
 use tower::layer::Layer;
 use tower::Service;
 
-use crate::RequestWeight;
+use super::RequestWeight;
 
 use super::{service::Batch, BatchControl};
 
@@ -50,7 +50,7 @@ where
     S: Service<BatchControl<Request>> + Send + 'static,
     S::Future: Send,
     S::Response: Send,
-    S::Error: Into<crate::BoxError> + Send + Sync,
+    S::Error: Into<super::BoxError> + Send + Sync,
     Request: Send + 'static,
 {
     type Service = Batch<S, Request>;

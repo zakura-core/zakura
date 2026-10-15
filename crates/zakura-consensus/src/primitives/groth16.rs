@@ -14,8 +14,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::watch;
 use tower::util::ServiceFn;
 
-use tower_batch_control::RequestWeight;
-use tower_fallback::BoxedError;
+use super::batch_control::RequestWeight;
+use super::fallback::BoxedError;
 
 use zakura_chain::{
     primitives::{
@@ -94,7 +94,7 @@ pub static JOINSPLIT_VERIFIER: Lazy<
                 .map(|result| {
                     result
                         .map_err(|e| TransactionError::Groth16(e.to_string()))
-                        .map_err(tower_fallback::BoxedError::from)
+                        .map_err(super::fallback::BoxedError::from)
                 })
                 .boxed()
         }) as fn(_) -> _,

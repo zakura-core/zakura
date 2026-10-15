@@ -450,7 +450,7 @@ renewable, so the publisher can keep the link full without accepting an unbounde
 32-byte target hash, a `u32` acknowledged height, a 32-byte acknowledged hash, two `u64`
 acknowledged counts, a locator-count byte, up to 13 locator hashes, two `u32` credit grants, and a
 schema byte. Its maximum encoded size is 523 bytes. `Grant` and `Close` carry no locator hashes, so
-they encode to 107 bytes.
+they encode to 107 bytes. The operation byte is 0 for `Open`, 1 for `Grant`, and 2 for `Close`.
 
 A subscription **cursor** is the tuple `(height, hash, headers, bytes)`. The start cursor is the
 first locator's height and hash with zero counts. A page's cursor is the height and hash of its last
@@ -704,19 +704,20 @@ The handler MUST disconnect the peer when one of those checks fails.
 
 Each outcome is legal only in its window:
 
-| Outcome | Legal window |
-| --- | --- |
-| `NoLocatorIntersection` | Before the first page |
-| `TargetNotRetained` | Before the first page |
-| `TargetNotSelected` | Before the first page |
-| `HistoryPruned` | Before the subscription reaches the initial target |
-| `SubscriptionSuperseded` | Any time |
-| `SubscriptionClosed` | After the publisher receives `Close` |
+| Outcome | Byte | Legal window |
+| --- | --- | --- |
+| `NoLocatorIntersection` | 2 | Before the first page |
+| `TargetNotRetained` | 1 | Before the first page |
+| `TargetNotSelected` | 5 | Before the first page |
+| `HistoryPruned` | 3 | Before the subscription reaches the initial target |
+| `SubscriptionSuperseded` | 6 | Any time |
+| `SubscriptionClosed` | 7 | After the publisher receives `Close` |
 
 An outcome outside its window MUST return `Disconnect`.
 
-`Busy` is not a protocol outcome. Local capacity exhaustion MUST pause response-work admission
-under Capacity admission. A local failure after admission MUST return `LocalFault`.
+`Busy` is not a protocol outcome, and its version 8 byte, 4, MUST NOT be reused. Bytes 1 through 3
+keep their version 8 meanings. Local capacity exhaustion MUST pause response-work admission under
+Capacity admission. A local failure after admission MUST return `LocalFault`.
 `TargetNotSelected` reports
 that the publisher changed its selected chain between `Status` and `Open`. `SubscriptionSuperseded`
 reports that the publisher's selected chain stopped extending the subscription cursor. Neither is

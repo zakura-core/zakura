@@ -16,7 +16,7 @@ use futures::FutureExt;
 use hex::FromHex;
 use insta::Settings;
 use jsonrpsee::core::RpcResult as Result;
-use tower::{buffer::Buffer, util::BoxService, Service};
+use tower::{buffer::Buffer, Service};
 
 use zakura_chain::{
     block::{Block, Hash},
@@ -1014,7 +1014,10 @@ pub async fn test_mining_rpcs<State, ReadState>(
     >,
     state: State,
     read_state: ReadState,
-    block_verifier_router: Buffer<BoxService<Request, Hash, RouterError>, Request>,
+    block_verifier_router: Buffer<
+        Request,
+        futures::future::BoxFuture<'static, std::result::Result<Hash, RouterError>>,
+    >,
     settings: Settings,
 ) where
     State: Service<

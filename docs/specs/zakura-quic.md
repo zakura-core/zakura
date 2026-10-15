@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-10. Version 0.6.
+Status: draft for review, 2026-10-14. Version 0.7.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -15,7 +15,7 @@ CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
 explains it. Version 0.6 moves the crate from the noq fork to upstream
 `quinn-proto` with a Zakura-owned driver and drops Iroh compatibility; §17d
 lists each change. Version 0.5 was the draft in #1296. This version doesn't
-include it.
+include it. Version 0.7 removes qlog output (CTRL-25); §17e explains it.
 
 ## 0. Conventions
 
@@ -65,8 +65,7 @@ Terms:
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
-  and no others, with default features off. The `qlog` feature MAY be enabled
-  behind a `zakura-quic` cargo feature that release builds leave off.
+  and no others, with default features off.
 - **DEP-4.** The workspace MUST take `quinn-proto` from crates.io at version
   0.11.19 or later, the first release with the GHSA-4w2j/qfwj and GHSA-hmxj
   fixes. A git source or a `[patch]` entry for `quinn-proto` MUST NOT appear.
@@ -471,7 +470,6 @@ Rules for every key:
 | CTRL-22 | `retry_threshold` | optional u32 | 8 | 0 – CTRL-18 | endpoint (ADM-3); 0 = always Retry unvalidated sources; CTRL-18 = never | **New**. Iroh never sent Retry. With 8, spoofed sources hold at most 8 of the `max_pending_handshakes` slots, and honest peers pay one extra round trip only while 8 handshakes are pending. |
 | CTRL-23 | `dial_stagger_ms` | u32 | 250 | 0 – 5,000 | dialer (DIAL-3) | **New** |
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
-| CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_stream`, one file per connection | Only with the `qlog` cargo feature; startup MUST fail if set without it. Every admitted attempt gets a file, including one that fails before TLS, and the node never deletes them, so set it only while debugging (V12 F-64) |
 
 These keys stay in `[network.zakura]` and keep their meaning:
 `listen_addr`, `max_connections` (256), `max_connections_per_ip` (16),
@@ -484,7 +482,8 @@ that adds the direct backend deletes the Iroh backend (PLAN step 10).
 `[network.zakura] nat_traversal = true` MUST fail at startup. The error MUST say that hole punching was removed and name this spec.
 
 Version 0.6 removed `bbr3`, `max_send_rate_bytes_per_second`,
-`path_keep_alive_interval_secs` and `path_idle_timeout_secs`. A config that
+`path_keep_alive_interval_secs` and `path_idle_timeout_secs`. Version 0.7
+removed `qlog_dir`. A config that
 sets a removed key MUST fail at startup with an unknown-key error.
 
 ### 9.2 Fixed settings
@@ -810,7 +809,7 @@ this release tolerates, and keep each hard change explicit.
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
-| Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-25 |
+| Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-24 |
 | Congestion controller is Cubic when unset | CTRL-3 |
 | Stats report the controller, driver and socket counters | OBS-4, OBS-12 |
 | Metrics presence and no per-peer labels | OBS-1, OBS-2 |
@@ -825,7 +824,7 @@ this release tolerates, and keep each hard change explicit.
 Every requirement above is P0 except these:
 
 - **P1** (after the default flips, each gated by a measurement): changing the
-  CTRL-3 default, CTRL-9, CTRL-40 and the CTRL-25 qlog feature. The keys and
+  CTRL-3 default, CTRL-9 and CTRL-40. The keys and
   their mappings ship in P0; only their use waits for the measurement.
 - **P2** (on demand only): several `SO_REUSEPORT` sockets, rebinding a socket
   on a network change (SOCK-12 only notifies connections), multipath, BBR,
@@ -980,3 +979,15 @@ Changed:
 - **COMPAT-4.** Names `quinn-proto` codepoints.
 - **SEC-1, SEC-3, SEC-6, SEC-8, PLAT-2.** Follow the identity, driver and
   socket changes.
+
+## 17e. Changes in version 0.7
+
+Deleted:
+
+- **CTRL-25.** The `qlog_dir` key and the `zakura-quic` `qlog` cargo feature.
+  Nothing used them, and the feature kept `qlog` and its dependencies in the
+  lockfile. A config that sets `qlog_dir` now fails with an unknown-key error.
+
+Changed:
+
+- **DEP-3.** No longer allows the `quinn-proto` `qlog` feature.

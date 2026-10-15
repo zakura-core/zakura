@@ -1,7 +1,7 @@
 mod retention;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     future,
 };
 
@@ -99,7 +99,10 @@ fn fake_blocks_in_range(start: u32, end: u32) -> Vec<Arc<block::Block>> {
         .collect()
 }
 
-fn fake_block_at_height(template: &Arc<block::Block>, height: block::Height) -> Arc<block::Block> {
+pub(super) fn fake_block_at_height(
+    template: &Arc<block::Block>,
+    height: block::Height,
+) -> Arc<block::Block> {
     let mut block = template.as_ref().clone();
 
     let mut coinbase = block.transactions[0].clone();
@@ -352,7 +355,8 @@ async fn same_epoch_verified_growth_without_successor_work_preserves_reset_epoch
     );
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let sequencer_view = handle
         .routine_wiring
         .as_ref()
@@ -458,7 +462,8 @@ async fn committed_views_are_the_sole_production_frontier_source() {
     );
     assert!(startup.header_tip.is_none());
 
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     match tokio::time::timeout(Duration::from_millis(50), actions.recv()).await {
         Err(_) => {}
         Ok(action) => panic!(
@@ -543,7 +548,8 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         snapshot_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     snapshot_tx
         .send(Some(committed_view(
@@ -630,7 +636,8 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         snapshot_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let action = next_action(&mut actions).await;
     assert!(
@@ -689,6 +696,40 @@ fn state_is_only_frontier_publisher() {
     );
 }
 
+/// Production startup seeds cooldown authority before any routine or sequencer can run.
+#[tokio::test]
+async fn startup_body_cooldown_survives_the_first_work_refresh() {
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
+    let mut snapshot = alarmed_committed_snapshot(header);
+    snapshot.alarms.header_best_body_unavailable = None;
+    let view = committed_view(snapshot, 0);
+    let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
+    let (_snapshots, receiver) = watch::channel(Some(view));
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    startup.committed_views = Some(receiver);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let registry = &handle.routine_wiring.as_ref().unwrap().registry;
+    let supplier = peer(0x54);
+    let now = Instant::now();
+    registry.defer_incompatible_bodies(
+        zakura_header_chain::SourceId::from_digest(supplier.digest()),
+        [(scope, header.hash)],
+        now + Duration::from_secs(60),
+    );
+    let refreshed = zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: scope.header_generation.checked_next().unwrap(),
+            ..scope.header
+        },
+        ..scope
+    };
+    // No await: the spawned sequencer cannot initialize the registry for this test.
+    assert!(registry.is_body_retry_avoided(&supplier, refreshed, header.hash, now));
+    assert!(!registry.is_body_retry_avoided(&peer(0x55), refreshed, header.hash, now));
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x52; 32]));
@@ -704,7 +745,8 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     };
     startup.best_header_tip = (header.height, header.hash);
     startup.committed_views = Some(snapshot_rx);
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     handle
         .retry_body_availability(block::Hash([0x53; 32]))
@@ -833,7 +875,8 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     };
     startup.best_header_tip = (header.height, header.hash);
     startup.committed_views = Some(snapshot_rx);
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let (_supplier, inbound, _outbound) = connect_peer_with_status(
         &service,
@@ -912,7 +955,7 @@ fn persistent_body_alarm_metrics_expose_every_required_dimension() {
         .split_once("fn publish_body_unavailable_metrics")
         .expect("the body-unavailable metric publisher exists")
         .1
-        .split_once("fn clamp_served_block_count")
+        .split_once("fn node_id_from_block_peer_id")
         .expect("the metric publisher remains a focused function")
         .0;
     for required in [
@@ -973,42 +1016,6 @@ async fn next_outbound_message(outbound: &mut FramedRecv) -> BlockSyncMessage {
         .expect("outbound frame arrives")
         .expect("outbound channel is live");
     BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
-}
-
-async fn wait_for_outbound_block(outbound: &mut FramedRecv) -> Arc<block::Block> {
-    loop {
-        match next_outbound_message(outbound).await {
-            BlockSyncMessage::Block(block) => return block,
-            BlockSyncMessage::Status(_) | BlockSyncMessage::GetBlocks { .. } => {}
-            msg => panic!("unexpected outbound message before block: {msg:?}"),
-        }
-    }
-}
-
-async fn wait_for_outbound_blocks_done(outbound: &mut FramedRecv) -> (block::Height, u32) {
-    loop {
-        match next_outbound_message(outbound).await {
-            BlockSyncMessage::BlocksDone {
-                start_height,
-                returned,
-            } => return (start_height, returned),
-            BlockSyncMessage::Status(_) | BlockSyncMessage::GetBlocks { .. } => {}
-            msg => panic!("unexpected outbound message before BlocksDone: {msg:?}"),
-        }
-    }
-}
-
-async fn wait_for_outbound_range_unavailable(outbound: &mut FramedRecv) -> (block::Height, u32) {
-    loop {
-        match next_outbound_message(outbound).await {
-            BlockSyncMessage::RangeUnavailable {
-                start_height,
-                count,
-            } => return (start_height, count),
-            BlockSyncMessage::Status(_) | BlockSyncMessage::GetBlocks { .. } => {}
-            msg => panic!("unexpected outbound message before RangeUnavailable: {msg:?}"),
-        }
-    }
 }
 
 /// Read this peer's real outbound until the node sends it a `GetBlocks`, returning
@@ -1082,51 +1089,6 @@ async fn wait_for_getblocks_across(
     }
 }
 
-async fn drain_parent_first_actions(
-    actions: &mut mpsc::Receiver<BlockSyncAction>,
-    verified_tip: &mut block::Height,
-    expected_new_fork: Option<&[Arc<block::Block>]>,
-) {
-    while let Ok(Some(action)) =
-        tokio::time::timeout(Duration::from_millis(25), actions.recv()).await
-    {
-        match action {
-            BlockSyncAction::SubmitBlock { block, .. } => {
-                let height = block
-                    .coinbase_height()
-                    .expect("submitted test block has height");
-                assert_eq!(
-                    Some(height),
-                    next_height(*verified_tip),
-                    "block sync must submit only the contiguous parent-first prefix"
-                );
-                if let Some(new_fork) = expected_new_fork {
-                    let expected_hash = match height.0 {
-                        2 => new_fork[1].hash(),
-                        3 => new_fork[2].hash(),
-                        _ => panic!("unexpected post-reset submitted height: {height:?}"),
-                    };
-                    assert_eq!(
-                        block.hash(),
-                        expected_hash,
-                        "post-reset submissions must follow the re-derived fork"
-                    );
-                }
-                *verified_tip = height;
-            }
-            BlockSyncAction::Misbehavior {
-                reason:
-                    BlockSyncMisbehavior::BodyPayloadMismatch(_)
-                    | BlockSyncMisbehavior::InvalidBlock
-                    | BlockSyncMisbehavior::UnsolicitedBlock,
-                ..
-            } => {}
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action while draining body responses: {action:?}"),
-        }
-    }
-}
-
 /// Build a `DownloadWindow` (the per-peer adaptive outbound window that per-peer routines moved
 /// off `PeerBlockState` into the spawned `PeerRoutine`). The window math is the
 /// same the routine drives; these unit tests pin it in isolation.
@@ -1146,7 +1108,6 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1172,7 +1133,6 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1192,6 +1152,100 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         delivery_snapshot: test_delivery_snapshot(now),
         delivered_bytes: 0,
         received: ReceivedBlockTracker::default(),
+    }
+}
+
+/// Each indexed window query must match a scan over the requests in issue order.
+#[test]
+fn indexed_window_matches_a_linear_scan() {
+    let base = Instant::now();
+    let mut rng = 0x5eed_u64;
+    let mut next = |bound: u32| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // The shifted value is below 2^31, so it fits in u32.
+        ((rng >> 33) as u32) % bound
+    };
+    let mut window = OutstandingRequests::default();
+    let mut model: Vec<(RequestKey, OutstandingBlockRange)> = Vec::new();
+    for _ in 0..1_500 {
+        match next(4) {
+            0 | 1 => {
+                let mut request = window_request_range(1 + next(200), 1 + next(4));
+                request.deadline = base + Duration::from_millis(u64::from(next(50)));
+                let key = window.push(request.clone());
+                model.push((key, request));
+            }
+            2 if !model.is_empty() => {
+                let index = usize::try_from(next(u32::try_from(model.len()).unwrap())).unwrap();
+                let (key, request) = model.remove(index);
+                assert_eq!(window.remove(key).unwrap().request, request.request);
+                assert!(window.remove(key).is_none());
+            }
+            3 if !model.is_empty() => {
+                let index = usize::try_from(next(u32::try_from(model.len()).unwrap())).unwrap();
+                let (key, request) = &mut model[index];
+                let height = block::Height(request.request.start_height.0 + next(5));
+                if next(2) == 0 {
+                    let newly = !request.has_received(height) && request.request.contains(height);
+                    request.mark_received(height);
+                    assert_eq!(window.mark_received(*key, height), newly);
+                } else {
+                    assert_eq!(
+                        window.mark_received_through(*key, height),
+                        request.mark_received_through(height),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        window.assert_consistent();
+        assert_eq!(window.len(), model.len());
+        assert_eq!(
+            window.reserved_bytes(),
+            model
+                .iter()
+                .map(|(_, request)| request.reserved_bytes())
+                .sum::<u64>(),
+        );
+        assert_eq!(
+            window.earliest_deadline(),
+            model.iter().map(|(_, request)| request.deadline).min(),
+        );
+        let height = block::Height(next(210));
+        assert_eq!(
+            window.key_for_height(height),
+            model
+                .iter()
+                .find(|(_, request)| request.request.contains(height))
+                .map(|(key, _)| *key),
+        );
+        assert_eq!(
+            window.key_for_start(height),
+            model
+                .iter()
+                .find(|(_, request)| request.request.start_height == height)
+                .map(|(key, _)| *key),
+        );
+        assert_eq!(
+            window.ending_at_or_below(height),
+            model
+                .iter()
+                .filter(|(_, request)| request.request.end_height() <= height)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+        );
+        let now = base + Duration::from_millis(u64::from(next(60)));
+        assert_eq!(
+            window.due_at(now),
+            model
+                .iter()
+                .filter(|(_, request)| request.deadline <= now)
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -1287,7 +1341,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
 
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, Some(now + timeout));
@@ -1302,7 +1356,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, None);
@@ -1344,7 +1398,7 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
@@ -1401,7 +1455,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
 
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
@@ -1439,7 +1493,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     assert!(window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 8);
 
-    window.outstanding.clear();
+    window.outstanding.drain();
     window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
@@ -1552,7 +1606,7 @@ async fn connect_peer_with_status_message(
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -1729,6 +1783,15 @@ fn config_validate_rejects_degenerate_values() {
         bbr_reliability_weight_percent: 101,
         ..ZakuraBlockSyncConfig::default()
     };
+    assert!(config.validate().is_err());
+
+    // Above 3,633 session slots, even one request per session exceeds the
+    // GetBlocks bookkeeping budget.
+    config = ZakuraBlockSyncConfig::default();
+    config.peer_limits.max_inbound_peers = 3_000;
+    config.peer_limits.max_outbound_peers = 633;
+    assert!(config.validate().is_ok());
+    config.peer_limits.max_outbound_peers = 634;
     assert!(config.validate().is_err());
 }
 
@@ -2152,10 +2215,10 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
             Instant::now(),
         )
         .generation();
-    registry.set_outstanding(
+    registry.insert_outstanding(
         &peer,
         generation,
-        BTreeMap::from([(
+        [(
             height,
             OutstandingMeta {
                 owner,
@@ -2164,7 +2227,7 @@ fn producer_filter_keeps_live_requests_after_same_epoch_refresh() {
                 queued_at: Instant::now(),
                 deadline: Instant::now(),
             },
-        )]),
+        )],
     );
 
     queue.refresh_authority(refreshed);
@@ -2487,6 +2550,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 40_000_000,
@@ -2553,6 +2617,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 600,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2588,6 +2653,7 @@ fn total_resident_plateaus_under_commit_stall() {
         applying_buffered_blocks: 1,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2623,6 +2689,7 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2675,6 +2742,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 1_100,
         reserved_above_floor_blocks: 1,
         budget_available: 64_000_000,
@@ -2742,6 +2810,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
         applying_buffered_blocks: 990,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2821,6 +2890,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
         applying_buffered_blocks: 10,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         budget_available: 64_000_000,
@@ -2903,6 +2973,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
         applying_buffered_blocks: u64::from(range_blocks) - 1,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 800_000_000,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 4_000_000,
         reserved_above_floor_blocks: 2,
         budget_available: 2_000_000,
@@ -3153,7 +3224,8 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             tip_rx,
             config.clone(),
         );
-        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let (handle, _actions, reactor_task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
         let wiring = handle.routine_wiring.as_ref().unwrap();
         let now = Instant::now();
         let mut generation = 0;
@@ -3198,10 +3270,10 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
             CancellationToken::new(),
         );
         assert!(write.publish(|| {
-            wiring.registry.set_outstanding(
+            wiring.registry.insert_outstanding(
                 &peer(1),
                 generation,
-                BTreeMap::from([(
+                [(
                     block::Height(1),
                     OutstandingMeta {
                         owner,
@@ -3210,7 +3282,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
                         queued_at: now,
                         deadline: now,
                     },
-                )]),
+                )],
             );
         }));
         let started = matches!(write_state, WriteState::Started | WriteState::Written);
@@ -3417,7 +3489,7 @@ fn work_queue_take_does_not_clamp_high_to_floor() {
 
 #[test]
 fn work_queue_preserves_work_item_estimate_through_take_and_return() {
-    // The size estimate (feeds the SizeMismatch tolerance check) is preserved as
+    // The size estimate (feeds the size-hint tolerance check) is preserved as
     // a height moves pending → in_flight → pending. Estimator overridden so the
     // clamp is wide enough to keep the hinted size.
     let queue = work_queue_with(0, [needed(10, BlockSizeEstimate::Advertised(12_345))]);
@@ -3495,7 +3567,8 @@ async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Peer serves heights 1..=4 and accepts four concurrent single-block requests.
@@ -3578,7 +3651,8 @@ async fn reactor_suppresses_duplicate_needed_block_query_until_response() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3644,7 +3718,8 @@ async fn reactor_requeries_a_height_stranded_below_higher_claimed_work() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([10; 32]);
 
     handle
@@ -3700,7 +3775,8 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3767,7 +3843,8 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Three peers, each willing to serve heights 1..=12 and accept four
@@ -3890,7 +3967,8 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Three peers, each able to serve height 1 with a single in-flight slot.
@@ -4002,7 +4080,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Two peers, both able to serve heights 1..=2 with a single in-flight slot.
@@ -4073,6 +4152,15 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     // work rather than the whole download stalling behind the straggler.
     let healthy = peer_b.clone();
     let healthy_in = inbounds.remove(&healthy).expect("healthy peer inbound");
+    // Its opening range holds its only slot until the range ends.
+    send_inbound(
+        &healthy_in,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: offered[&healthy],
+            count: 1,
+        },
+    )
+    .await;
 
     let healthy_offers = tokio::time::timeout(Duration::from_secs(3), async {
         let mut count = 0usize;
@@ -4116,8 +4204,8 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 
 #[tokio::test]
 async fn block_liveness_parks_silent_peer_and_traces_reason() {
-    // The first no-progress deadline must retire only the block-sync session.
-    // Preserve the shared connection and make the peer ineligible during its cooldown.
+    // The first no-progress deadline parks the peer for its cooldown. Its
+    // unended request then closes the connection (see `WriterFence`).
     let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
@@ -4136,7 +4224,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         config.clone(),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(0x51);
@@ -4147,7 +4236,7 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         connection_cancel.clone(),
@@ -4193,14 +4282,18 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         Duration::from_secs(3),
         || {
             handle.peer_snapshot().outbound_peers == 0
-                && !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound)
+                && !service.wants_peer(
+                    &peer,
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                    ServicePeerDirection::Outbound,
+                )
         },
     )
     .await
     .expect("silent active peer is parked by block-progress liveness");
     assert!(
-        !connection_cancel.is_cancelled(),
-        "a first no-progress stall preserves the shared connection",
+        connection_cancel.is_cancelled(),
+        "parking a session with an unended request closes the connection",
     );
 
     capture.flush().await;
@@ -4254,7 +4347,8 @@ async fn check_cold_probe_deadline(expired: bool) {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(0x53);
@@ -4265,7 +4359,7 @@ async fn check_cold_probe_deadline(expired: bool) {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         connection_cancel.clone(),
@@ -4344,14 +4438,18 @@ async fn check_cold_probe_deadline(expired: bool) {
         Duration::from_millis(1500),
         || {
             handle.peer_snapshot().outbound_peers == 0
-                && !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound)
+                && !service.wants_peer(
+                    &peer,
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                    ServicePeerDirection::Outbound,
+                )
         },
     )
     .await
     .expect("an unproven peer is still parked at its liveness deadline");
     assert!(
-        !connection_cancel.is_cancelled(),
-        "a first no-progress stall preserves the shared connection",
+        connection_cancel.is_cancelled(),
+        "parking a session with an unended request closes the connection",
     );
 
     reactor_task.abort();
@@ -4380,7 +4478,8 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
         config.clone(),
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
-    let (_handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, _handle.clone());
 
     let peer = peer(0x5b);
@@ -4390,7 +4489,7 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -5960,7 +6059,6 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     let now = Instant::now();
     OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6040,6 +6138,7 @@ fn received_body_admission_ignores_request_budget() {
         applying_buffered_blocks: 0,
         sequencer_input_queued_bytes: 0,
         in_flight_submission_bytes: 0,
+        decoded_resident_bytes: 0,
         reserved_above_floor_bytes: 0,
         reserved_above_floor_blocks: 0,
         // Outstanding requests have spent the entire in-flight budget.
@@ -6103,6 +6202,7 @@ proptest::proptest! {
             applying_buffered_blocks: applying_blocks,
             sequencer_input_queued_bytes: input_bytes,
             in_flight_submission_bytes: 0,
+            decoded_resident_bytes: 0,
             reserved_above_floor_bytes: reserved_bytes,
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
@@ -6358,7 +6458,6 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
-        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6405,32 +6504,37 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
         .expect("block sync declares one stream");
 
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
-    assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
-    assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
+    assert_eq!(stream.version, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION);
+    assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC_REGULATED);
     assert_eq!(stream.mode, StreamMode::Persistent);
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }
 
 #[tokio::test]
 async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
-    let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+    let service = Arc::new(
+        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config"),
+    );
     let registry =
         ServiceRegistry::new(vec![service]).expect("block-sync service declares unique kind");
     let peer = peer(1);
 
     assert_eq!(
-        registry.capability_for_stream(ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_BLOCK_SYNC_STREAM_VERSION),
-        Some(ZAKURA_CAP_BLOCK_SYNC)
+        registry.capability_for_stream(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+        ),
+        Some(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
     );
     assert!(registry
         .capability_for_stream(
             ZAKURA_STREAM_BLOCK_SYNC,
-            ZAKURA_BLOCK_SYNC_STREAM_VERSION + 1
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION + 1
         )
         .is_none());
     assert_eq!(
         registry
-            .persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
+            .persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC_REGULATED)
             .iter()
             .map(|stream| stream.kind)
             .collect::<Vec<_>>(),
@@ -6439,7 +6543,7 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
     assert!(registry.persistent_streams_for_negotiated(0).is_empty());
     assert!(registry.wants_session(
         ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         &peer,
         ServicePeerDirection::Inbound,
     ));
@@ -6447,7 +6551,8 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inert_reactor_parks_after_header_tip_watch_closes() {
-    let _service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+    let _service =
+        BlockSyncService::new(ZakuraBlockSyncConfig::default()).expect("valid block-sync config");
 
     let elapsed = tokio::time::timeout(Duration::from_secs(1), future::pending::<()>()).await;
 
@@ -6455,6 +6560,30 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
         elapsed.is_err(),
         "paused-time timeout only elapses if the inert reactor has no always-ready branch"
     );
+}
+
+/// A session torn down before its connect is processed must not stay in the
+/// reactor, where its sender would hold the session's reservation.
+#[tokio::test]
+async fn reactor_drops_a_session_cancelled_before_it_connects() {
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()))
+            .expect("valid block-sync config");
+    let (send, mut outbound) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0x61), send, cancel),
+        ))
+        .await
+        .expect("the connect event queues");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while outbound.recv().await.is_some() {}
+    })
+    .await
+    .expect("the reactor drops the cancelled session and its sender");
+    reactor_task.abort();
 }
 
 #[tokio::test]
@@ -6469,7 +6598,7 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
     service.add_peer(Peer::new(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         streams,
         cancel_token,
     ));
@@ -6514,7 +6643,7 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         old_conn_id,
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (old_inbound_rx, old_outbound_tx))]),
         CancellationToken::new(),
@@ -6530,7 +6659,7 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         new_conn_id,
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (new_inbound_rx, new_outbound_tx))]),
         CancellationToken::new(),
@@ -6547,7 +6676,7 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         old_conn_id,
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         HashMap::from([(
             ZAKURA_STREAM_BLOCK_SYNC,
@@ -6621,7 +6750,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -6647,13 +6776,9 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
 }
 
 #[tokio::test]
-async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
-    // inverted inbound flow: the per-peer pipe-routine decodes inbound frames in its own
-    // task. A malformed frame is `MalformedMessage` misbehavior AND a fatal protocol
-    // reject for the whole connection (the routine returns `Err(SinkReject::protocol)`,
-    // which `handle_pipe_exit` turns into a connection cancel). With real reactor
-    // wiring the routine runs; we observe the `Misbehavior(MalformedMessage)` action
-    // and the connection-cancel.
+async fn add_peer_malformed_frame_cancels_connection() {
+    // The per-peer routine checks each frame's envelope before decoding it. A
+    // malformed frame is a fatal protocol reject for the whole connection.
     let config = ZakuraBlockSyncConfig::default();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -6666,7 +6791,8 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, _reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let peer = peer(3);
@@ -6676,9 +6802,9 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     let connection_cancel = CancellationToken::new();
 
     service.add_peer(Peer::new(
-        peer.clone(),
+        peer,
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         streams,
         connection_cancel.clone(),
     ));
@@ -6692,20 +6818,6 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         .await
         .expect("malformed inbound frame queues");
 
-    // The routine reports `MalformedMessage` (skip the connect Status mirror).
-    let reported = loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { peer: got, reason } => break (got, reason),
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before malformed-message report: {action:?}"),
-        }
-    };
-    assert_eq!(
-        reported,
-        (peer.clone(), BlockSyncMisbehavior::MalformedMessage)
-    );
-
-    // The malformed frame is a fatal protocol reject for the whole connection.
     tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
         .await
         .expect("malformed frame cancels the connection");
@@ -6715,26 +6827,25 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
 async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
     use crate::zakura::transport::{OrderedStreamFailure, OrderedStreamFailureCause};
 
-    let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let blocks = mainnet_blocks_1_to_3();
+    let config = immediate_body_download_config();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         },
-        (block::Height(0), block::Hash([0; 32])),
+        (block::Height(1), blocks[0].hash()),
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, _reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let input = &handle.routine_wiring.as_ref().unwrap().sequencer_input;
-    let held_capacity: Vec<_> = (0..input.max_capacity())
-        .map(|_| input.clone().try_reserve_owned().unwrap())
-        .collect();
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (inbound_tx, inbound_rx) = framed_channel(4);
-    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let (outbound_tx, mut outbound_rx) = framed_channel(4);
     let cause = OrderedStreamFailureCause::default();
     let streams = HashMap::from([(
         ZAKURA_STREAM_BLOCK_SYNC,
@@ -6744,20 +6855,36 @@ async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
     let remote = Peer::new(
         peer(3),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         streams,
         connection_cancel.clone(),
     );
     let session_cancel = remote.service_cancel_token();
-    inbound_tx
-        .send(Frame {
-            message_type: u16::from(MSG_BS_BLOCK),
-            flags: 0,
-            payload: vec![MSG_BS_BLOCK],
-        })
-        .await
-        .unwrap();
     service.add_peer(remote);
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            tip_hash: blocks[0].hash(),
+            ..status()
+        }),
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed blocks queue");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1)
+    );
+    // An authorized body then waits for decode capacity.
+    let held_capacity: Vec<_> = (0..input.max_capacity())
+        .map(|_| input.clone().try_reserve_owned().unwrap())
+        .collect();
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
     cause.record(OrderedStreamFailure::RemoteClose);
     session_cancel.cancel();
 
@@ -6819,12 +6946,12 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
 
     assert!(!service.wants_peer(
         &inbound_peer,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Inbound
     ));
     assert!(service.wants_peer(
         &inbound_peer,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound
     ));
 
@@ -6838,7 +6965,7 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
         service.add_peer(Peer::new_with_direction(
             peer_id.clone(),
             None,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
             streams,
             CancellationToken::new(),
@@ -6854,7 +6981,7 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
     assert_eq!(service.peer_count(), 2);
     assert!(!service.wants_peer(
         &peer(8),
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound
     ));
 
@@ -6864,7 +6991,7 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
     service.add_peer(Peer::new_with_direction(
         peer(8),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -6889,7 +7016,8 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     );
     let trace = ZakuraTrace::noop();
     startup.trace = trace.clone();
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(40);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -6899,7 +7027,7 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -7026,7 +7154,8 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7036,7 +7165,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -7086,14 +7215,15 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("block queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
 
     let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
@@ -7169,7 +7299,8 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(73);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7178,7 +7309,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -7332,7 +7463,8 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -7381,13 +7513,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
         loop {
             match next_action(&mut actions).await {
                 BlockSyncAction::SubmitBlock { block, .. } => break block.hash(),
-                // The preserved size-deviation check reports the hint mismatch but
-                // must not drop the body.
-                BlockSyncAction::Misbehavior {
-                    reason: BlockSyncMisbehavior::SizeMismatch,
-                    ..
-                }
-                | BlockSyncAction::QueryNeededBlocks { .. } => {}
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
                 action => panic!("unexpected action before submit: {action:?}"),
             }
         }
@@ -7431,7 +7557,8 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
@@ -7520,7 +7647,7 @@ fn add_outbound_block_sync_peer(
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -7596,7 +7723,8 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -7714,7 +7842,8 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -7724,7 +7853,7 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -7805,10 +7934,6 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
                 submitted_second = true;
                 break;
             }
-            BlockSyncAction::Misbehavior {
-                peer,
-                reason: BlockSyncMisbehavior::UnsolicitedBlock,
-            } if peer == peer_id => panic!("in-flight body was misclassified as unsolicited"),
             BlockSyncAction::QueryNeededBlocks { .. } | BlockSyncAction::SubmitBlock { .. } => {}
             action => panic!("unexpected action after second block: {action:?}"),
         }
@@ -7817,218 +7942,6 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
     assert!(
         submitted_second,
         "second body from the original active response should remain correlated",
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
-    let blocks = mainnet_blocks_1_to_3();
-    let config = immediate_body_download_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let peer_id = peer(142);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-
-    service.add_peer(Peer::new_with_direction(
-        peer_id.clone(),
-        None,
-        ZAKURA_CAP_BLOCK_SYNC,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(BlockSyncStatus {
-                servable_low: block::Height(2),
-                servable_high: block::Height(3),
-                tip_hash: blocks[2].hash(),
-                max_blocks_per_response: 16,
-                max_inflight_requests: 1,
-                max_response_bytes: MAX_BS_RESPONSE_BYTES,
-            })
-            .encode_frame()
-            .expect("status encodes"),
-        )
-        .await
-        .expect("status frame queues");
-
-    tip_tx
-        .send((block::Height(1), blocks[0].hash()))
-        .expect("tip watch is live");
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks { .. }
-    ) {}
-    // inverted inbound flow: the body is decoded by the peer's pipe-routine in its own
-    // task, racing the reactor's producer `work.extend`. The reactor extends the
-    // WorkQueue BEFORE publishing the candidate set, so waiting for height 1 to
-    // appear in the candidate watch deterministically confirms the work is in
-    // `pending` before we deliver the (unmatched-but-needed) body — without this
-    // the routine could decode the body before `extend` runs and wrongly score it.
-    let mut candidates = handle.subscribe_candidate_state();
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
-        .await
-        .expect("needed metadata queues");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if candidates
-                .borrow_and_update()
-                .missing_block_bodies
-                .contains(&block::Height(1))
-            {
-                return;
-            }
-            candidates.changed().await.expect("candidate watch is live");
-        }
-    })
-    .await
-    .expect("producer extends the needed height into the WorkQueue");
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("unmatched needed block queues");
-
-    let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-        loop {
-            if let BlockSyncAction::Misbehavior { reason, .. } = next_action(&mut actions).await {
-                return reason;
-            }
-        }
-    })
-    .await;
-    assert!(
-        quiet.is_err(),
-        "unmatched body for a currently needed height should not be hard misbehavior",
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
-    let blocks = mainnet_blocks_1_to_3();
-    let block1_size = block_size(&blocks[0]);
-    let block2_size = block_size(&blocks[1]);
-    let config = immediate_body_download_config();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(2), blocks[1].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    // One request slot and a response byte cap of one block-1 hint, so the single
-    // GetBlocks below covers only height 1 and height 2 stays queued without an
-    // outstanding request — the gap the unmatched-queued acceptance path fills.
-    // (The old setup starved the request on the byte budget with an oversized
-    // hint; the floor overdraft now funds a floor request regardless, so the gap
-    // is created on slots/response bytes instead.)
-    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        143,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        block1_size,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            BlockSyncBlockMeta {
-                height: block::Height(1),
-                hash: blocks[0].hash(),
-                size: BlockSizeEstimate::Advertised(block1_size),
-            },
-            BlockSyncBlockMeta {
-                height: block::Height(2),
-                hash: blocks[1].hash(),
-                size: BlockSizeEstimate::Advertised(block2_size),
-            },
-        ]))
-        .await
-        .expect("needed metadata queues");
-
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 1),
-        "the byte-capped request must cover only height 1",
-    );
-
-    // Height 2 arrives without a matching request.
-    // A pending height has no request owner.
-    // Do not enter that body into the commit pipeline.
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[1].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("unmatched queued block queues");
-
-    // Deliver height 1 through its live request.
-    // Only that owned body may enter verification.
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("matched block queues");
-
-    let submitted = loop {
-        if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
-            break block.hash();
-        }
-    };
-    assert_eq!(submitted, blocks[0].hash());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if matches!(
-                    next_action(&mut actions).await,
-                    BlockSyncAction::SubmitBlock { .. }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_err(),
-        "the ownerless height-2 body must not be submitted",
     );
 
     reactor_task.abort();
@@ -8058,7 +7971,8 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -8068,7 +7982,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -8245,7 +8159,8 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -8255,7 +8170,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -8296,14 +8211,15 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         (block::Height(1), 1)
     );
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(block.clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("block queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     let (submit_owner, submit_source, submit_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
@@ -8480,7 +8396,8 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Peer serves heights 1..=4 with four concurrent single-block slots.
@@ -8562,7 +8479,8 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
@@ -8675,7 +8593,8 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
         &service,
@@ -8776,7 +8695,8 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // One slot, a generous response-byte and per-request block count, so neither
@@ -8842,7 +8762,8 @@ async fn reactor_packs_small_estimates_under_peer_response_byte_cap() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let one_worst_case_response =
@@ -8908,7 +8829,8 @@ async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -8964,7 +8886,8 @@ async fn reactor_zero_pause_threshold_preserves_lag_one_downloads() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
@@ -9008,7 +8931,8 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9072,17 +8996,15 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         assert_eq!(service.peer_count(), 1);
     }
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 3,
-            }
-            .encode_frame()
-            .expect("BlocksDone encodes"),
-        )
-        .await
-        .expect("BlocksDone queues");
+    // A valid ending must count the bodies sent, so end the range without any.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(1),
+            count: 3,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
@@ -9163,7 +9085,8 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -9173,7 +9096,7 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -9220,10 +9143,10 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 3);
 
-    for index in [1usize, 2, 0] {
+    for block in &blocks {
         inbound_tx
             .send(
-                BlockSyncMessage::Block(blocks[index].clone())
+                BlockSyncMessage::Block(block.clone())
                     .encode_frame()
                     .expect("block encodes"),
             )
@@ -9301,7 +9224,8 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(64);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -9311,7 +9235,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -9435,7 +9359,8 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     match next_action(&mut actions).await {
@@ -9510,7 +9435,8 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9579,9 +9505,8 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         } = action
         {
             assert_ne!(
-                (action_peer, reason),
-                (peer.clone(), BlockSyncMisbehavior::UnsolicitedDone),
-                "a valid terminator after a completed block response must not be scored"
+                action_peer, peer,
+                "a valid terminator after a completed block response must not be scored as {reason:?}"
             );
         }
     }
@@ -9604,7 +9529,8 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -9704,10 +9630,6 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let metas: Vec<_> = blocks.iter().map(block_meta).collect();
     let prefix: std::collections::HashSet<_> =
         (FIRST_NEEDED..=PREFIX_END).map(block::Height).collect();
-    let sparse_above_hole: std::collections::HashSet<_> = [873, 888, 905, 920]
-        .into_iter()
-        .map(block::Height)
-        .collect();
 
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = u64::MAX;
@@ -9730,7 +9652,8 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let (old_peer, old_inbound, mut old_outbound) = connect_peer_with_status_message(
@@ -9755,15 +9678,10 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         .await
         .expect("checkpoint metadata queues after peer connection");
 
-    let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<u32>();
-    let blocks_for_feeder = blocks.clone();
+    let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<BlockSyncMessage>();
     let feeder = tokio::spawn(async move {
-        while let Some(height) = feed_rx.recv().await {
-            let index = usize::try_from(height - FIRST_NEEDED)
-                .expect("fed test height is inside block vector");
-            let frame = BlockSyncMessage::Block(blocks_for_feeder[index].clone())
-                .encode_frame()
-                .expect("block frame encodes");
+        while let Some(message) = feed_rx.recv().await {
+            let frame = message.encode_frame().expect("fed frame encodes");
             if old_inbound.send(frame).await.is_err() {
                 break;
             }
@@ -9795,11 +9713,24 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                             .0
                             .checked_add(count)
                             .expect("test request height range fits u32");
-                        for height in start_height.0..end_height {
-                            let height = block::Height(height);
-                            if height.0 <= PREFIX_END || sparse_above_hole.contains(&height) {
-                                feed_tx.send(height.0).expect("feeder task stays open");
-                            }
+                        // Serve each range in order, but leave the range that
+                        // reaches the hole partial and unended.
+                        let served = (start_height.0..end_height)
+                            .take_while(|height| !(HOLE_START..=HOLE_END).contains(height));
+                        for height in served {
+                            feed_tx
+                                .send(BlockSyncMessage::Block(block_at(height)))
+                                .expect("feeder task stays open");
+                        }
+                        if !(start_height.0..end_height)
+                            .any(|height| (HOLE_START..=HOLE_END).contains(&height))
+                        {
+                            feed_tx
+                                .send(BlockSyncMessage::BlocksDone {
+                                    start_height,
+                                    returned: count,
+                                })
+                                .expect("feeder task stays open");
                         }
                     }
                 }
@@ -9956,7 +9887,8 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10001,15 +9933,6 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         (block::Height(2), 2)
     );
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("out-of-order old-fork block queues");
-
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -10018,6 +9941,16 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         }))
         .await
         .expect("reset event queues");
+    // The old range stays live until its ending, so the peer ends it before the
+    // new fork's height 2 can be requested without overlap.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(2),
+            count: 2,
+        },
+    )
+    .await;
     // the reset (FrontierReset) and the producer are decoupled across tasks,
     // and routines re-query on a low-water ping, so several `QueryNeededBlocks`
     // can race the in-flight reset clear. Re-supply the new-fork metadata on every
@@ -10057,11 +9990,6 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
                             .await
                             .expect("new-fork needed metadata queues");
                     }
-                    // The honest in-flight height-3 body (within the peer's advertised
-                    // servable range) that races the in-place reset must NOT be scored
-                    // `UnsolicitedBlock` — `ignore_servable_range_response` drops it
-                    // quietly so a reorg does not churn honest peers. Any misbehavior
-                    // here is a regression and falls through to the panic below.
                     action => panic!("unexpected action before new fork request: {action:?}"),
                 }
             }
@@ -10090,7 +10018,8 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10225,9 +10154,10 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         72,
@@ -10271,14 +10201,10 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         .await
         .expect("forward reset event queues");
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("successor body queues");
+    // The response still starts at height 2, which the reset already verified.
+    for block in [&blocks[1], &blocks[2]] {
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    }
 
     loop {
         match next_action(&mut actions).await {
@@ -10286,15 +10212,10 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
                 assert_eq!(block.hash(), blocks[2].hash());
                 break;
             }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_ne!(
-                    (peer, reason),
-                    (peer_id.clone(), BlockSyncMisbehavior::UnsolicitedBlock),
-                    "forward reset must not drop a still-active successor request"
-                );
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                panic!("forward reset must not drop a still-active successor request: {reason:?}")
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            BlockSyncAction::QueryBlocksByHeightRange { .. } => {}
             BlockSyncAction::RecordBodyUnavailable { .. }
             | BlockSyncAction::RecordBodyInvalid { .. }
             | BlockSyncAction::RestartBodyAvailability { .. }
@@ -10309,7 +10230,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -10324,16 +10245,23 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    // One-block ranges let height 3 arrive while height 2 is still missing.
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
         &mut actions,
         73,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
+        BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            tip_hash: blocks[2].hash(),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 2,
+            max_response_bytes: u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2)
+                .unwrap_or(u32::MAX),
+        },
     )
     .await;
 
@@ -10356,30 +10284,22 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         ]))
         .await
         .expect("initial needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
-    );
+    for height in [2, 3] {
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (block::Height(height), 1)
+        );
+    }
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("successor body queues");
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(2),
-                returned: 2,
-            }
-            .encode_frame()
-            .expect("BlocksDone encodes"),
-        )
-        .await
-        .expect("BlocksDone queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[2].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(3),
+            returned: 1,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
@@ -10400,15 +10320,10 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
                 );
                 break;
             }
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_ne!(
-                    (peer, reason),
-                    (peer_id.clone(), BlockSyncMisbehavior::UnsolicitedBlock),
-                    "forward reset must not drop a buffered successor body"
-                );
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                panic!("forward reset must not drop a buffered successor body: {reason:?}")
             }
             BlockSyncAction::QueryNeededBlocks { .. }
-            | BlockSyncAction::QueryBlocksByHeightRange { .. }
             | BlockSyncAction::RecordBodyUnavailable { .. }
             | BlockSyncAction::RecordBodyInvalid { .. }
             | BlockSyncAction::RestartBodyAvailability { .. }
@@ -10438,7 +10353,8 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10464,15 +10380,16 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     );
 
     for block in blocks.iter().take(2) {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("block queues");
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
     }
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 2,
+        },
+    )
+    .await;
 
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
@@ -10538,14 +10455,15 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         );
         // Deliver the same-hash body for the re-request and assert it is dropped
         // as redundant (no SubmitBlock) — the no-double-apply guarantee.
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(blocks[1].clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("same-hash body queues");
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+        send_inbound(
+            &inbound_tx,
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(2),
+                returned: 1,
+            },
+        )
+        .await;
         let no_resubmit = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
                 match actions.recv().await {
@@ -10620,7 +10538,8 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(61);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -10629,7 +10548,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -10672,14 +10591,15 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         (block::Height(1), 1)
     );
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(block.clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("first body frame queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     let (stale_owner, stale_source, stale_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
@@ -10743,14 +10663,15 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             }
         }
     }
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(block.clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("second body frame queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     let (current_owner, current_source, current_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
@@ -10845,7 +10766,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 }
 
 #[tokio::test]
-async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget() {
+async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
         ..immediate_body_download_config()
@@ -10863,7 +10784,8 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -10908,15 +10830,6 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         (block::Height(2), 2)
     );
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("out-of-order body queues");
-
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -10925,6 +10838,15 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         }))
         .await
         .expect("fast-forward reset event queues");
+    // The abandoned range stays live until the peer ends it.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(2),
+            count: 2,
+        },
+    )
+    .await;
 
     tip_tx
         .send((block::Height(4), block::Hash([4; 32])))
@@ -10996,280 +10918,6 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
 }
 
 #[tokio::test]
-async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
-    #[derive(Copy, Clone)]
-    enum ForkBody {
-        Old(usize),
-        New(usize),
-    }
-
-    let cases = vec![
-        (
-            "stale-high-before-reset",
-            vec![3],
-            vec![],
-            vec![ForkBody::Old(2), ForkBody::New(3), ForkBody::New(2)],
-        ),
-        (
-            "old-prefix-before-reset",
-            vec![2, 1],
-            vec![],
-            vec![ForkBody::Old(3), ForkBody::New(2), ForkBody::New(3)],
-        ),
-        (
-            "stale-before-new-needed",
-            vec![2],
-            vec![3],
-            vec![ForkBody::New(2), ForkBody::Old(2), ForkBody::New(3)],
-        ),
-        (
-            "new-out-of-order-with-stale-tail",
-            vec![],
-            vec![2],
-            vec![ForkBody::New(3), ForkBody::Old(3), ForkBody::New(2)],
-        ),
-    ];
-
-    for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
-        let mut config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
-            ..fill_loop_mechanics_config()
-        };
-        config.peer_limits.outbound_queue_depth = 16;
-        let old_blocks = mainnet_blocks_1_to_3();
-        let new_blocks = vec![
-            forked_block(&old_blocks[0], 101),
-            forked_block(&old_blocks[1], 102),
-            forked_block(&old_blocks[2], 103),
-        ];
-        let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-        let startup = BlockSyncStartup::new(
-            BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(0),
-                verified_block_hash: block::Hash([0; 32]),
-            },
-            (block::Height(0), block::Hash([0; 32])),
-            tip_rx,
-            config.clone(),
-        );
-        let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-        let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-            &service,
-            &mut actions,
-            51,
-            block::Height(4),
-            old_blocks[2].hash(),
-            1,
-            u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 3).unwrap_or(u32::MAX),
-        )
-        .await;
-
-        tip_tx
-            .send((block::Height(3), old_blocks[2].hash()))
-            .expect("tip watch is live");
-        while !matches!(
-            next_action(&mut actions).await,
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(1),
-                best_header_tip: block::Height(3),
-                ..
-            }
-        ) {}
-        handle
-            .send(BlockSyncEvent::NeededBlocks(
-                old_blocks
-                    .iter()
-                    .map(|block| BlockSyncBlockMeta {
-                        height: block.coinbase_height().expect("test block has height"),
-                        hash: block.hash(),
-                        size: BlockSizeEstimate::Advertised(block_size(block)),
-                    })
-                    .collect(),
-            ))
-            .await
-            .expect("old-fork needed metadata queues");
-        assert_eq!(
-            wait_for_outbound_getblocks(&mut outbound_rx).await,
-            (block::Height(1), 3),
-            "{case}: old fork request schedules"
-        );
-
-        let mut submitted_tip = block::Height(0);
-        for height in old_before_reset {
-            inbound_tx
-                .send(
-                    BlockSyncMessage::Block(old_blocks[height - 1].clone())
-                        .encode_frame()
-                        .expect("old-fork block encodes"),
-                )
-                .await
-                .expect("old-fork block queues");
-            drain_parent_first_actions(&mut actions, &mut submitted_tip, None).await;
-        }
-
-        handle
-            .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(1),
-                verified_block_hash: new_blocks[0].hash(),
-            }))
-            .await
-            .expect("reset event queues");
-        while !matches!(
-            next_action(&mut actions).await,
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(2),
-                best_header_tip: block::Height(3),
-                ..
-            }
-        ) {}
-        submitted_tip = block::Height(1);
-
-        tip_tx
-            .send((block::Height(3), new_blocks[2].hash()))
-            .expect("tip watch is live");
-        while !matches!(
-            next_action(&mut actions).await,
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(2),
-                best_header_tip: block::Height(3),
-                ..
-            }
-        ) {}
-
-        for height in old_before_new_needed {
-            inbound_tx
-                .send(
-                    BlockSyncMessage::Block(old_blocks[height - 1].clone())
-                        .encode_frame()
-                        .expect("stale old-fork block encodes"),
-                )
-                .await
-                .expect("stale old-fork block queues");
-            drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
-        }
-
-        // reset and the producer are decoupled across tasks, so re-supply the
-        // new-fork metadata on every query until the height-2 re-fetch appears.
-        let new_fork_meta = vec![
-            BlockSyncBlockMeta {
-                height: block::Height(2),
-                hash: new_blocks[1].hash(),
-                size: BlockSizeEstimate::Advertised(block_size(&new_blocks[1])),
-            },
-            BlockSyncBlockMeta {
-                height: block::Height(3),
-                hash: new_blocks[2].hash(),
-                size: BlockSizeEstimate::Advertised(block_size(&new_blocks[2])),
-            },
-        ];
-        handle
-            .send(BlockSyncEvent::NeededBlocks(new_fork_meta.clone()))
-            .await
-            .expect("new-fork needed metadata queues");
-        loop {
-            tokio::select! {
-                biased;
-                frame = outbound_rx.recv() => {
-                    let frame = frame.expect("outbound channel is live");
-                    match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
-                        BlockSyncMessage::GetBlocks {
-                            start_height: block::Height(2),
-                            count,
-                        } => {
-                            assert_eq!(
-                                count, 2,
-                                "{case}: new fork request schedules after reset"
-                            );
-                            break;
-                        }
-                        BlockSyncMessage::GetBlocks { .. } | BlockSyncMessage::Status(_) => {}
-                        msg => panic!("{case}: unexpected outbound message before new fork re-fetch: {msg:?}"),
-                    }
-                }
-                action = actions.recv() => {
-                    match action.expect("action channel is live") {
-                        BlockSyncAction::QueryNeededBlocks { .. } => {
-                            handle
-                                .send(BlockSyncEvent::NeededBlocks(new_fork_meta.clone()))
-                                .await
-                                .expect("new-fork needed metadata queues");
-                        }
-                        BlockSyncAction::Misbehavior { .. } => {}
-                        action => panic!("{case}: unexpected action before new fork re-fetch: {action:?}"),
-                    }
-                }
-            }
-        }
-
-        for body in after_new_needed {
-            let block = match body {
-                ForkBody::Old(height) => old_blocks[height - 1].clone(),
-                ForkBody::New(height) => new_blocks[height - 1].clone(),
-            };
-            inbound_tx
-                .send(
-                    BlockSyncMessage::Block(block)
-                        .encode_frame()
-                        .expect("fork body encodes"),
-                )
-                .await
-                .expect("fork body queues");
-            drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
-        }
-        assert_eq!(
-            submitted_tip,
-            block::Height(3),
-            "{case}: new fork bodies submit parent-first through height 3"
-        );
-
-        handle
-            .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(3),
-                verified_block_hash: new_blocks[2].hash(),
-            }))
-            .await
-            .expect("post-submit grow event queues");
-        tip_tx
-            .send((block::Height(4), block::Hash([4; 32])))
-            .expect("tip watch is live");
-        while !matches!(
-            next_action(&mut actions).await,
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(4),
-                best_header_tip: block::Height(4),
-                ..
-            }
-        ) {}
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            handle.peer_snapshot().outbound_peers,
-            1,
-            "{case}: caught-up fork handling keeps the old block-sync peer available for serving",
-        );
-        assert_eq!(service.peer_count(), 1);
-        handle
-            .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
-                height: block::Height(4),
-                hash: block::Hash([4; 32]),
-                size: BlockSizeEstimate::Advertised(60_000),
-            }]))
-            .await
-            .expect("post-fuzz needed metadata queues");
-        assert_eq!(
-            wait_for_outbound_getblocks(&mut outbound_rx).await,
-            (block::Height(4), 1),
-            "{case}: byte budget returns to baseline after reset and submissions"
-        );
-
-        reactor_task.abort();
-    }
-}
-
-#[tokio::test]
 async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
@@ -11283,12 +10931,13 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(
         immediate_body_download_config(),
         handle.clone(),
     );
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         48,
@@ -11326,6 +10975,16 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         }))
         .await
         .expect("reset event queues");
+    // The old range stays live until its ending, so the peer ends it before the
+    // new fork's height 2 can be requested without overlap.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(2),
+            count: 2,
+        },
+    )
+    .await;
     // reset (`reset_above`) and the producer are decoupled, so re-supply the
     // new-fork metadata on every query until the height-2 re-fetch appears.
     let new_fork_meta = vec![BlockSyncBlockMeta {
@@ -11365,38 +11024,21 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         }
     }
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[1].clone())
-                .encode_frame()
-                .expect("old-fork body encodes"),
-        )
-        .await
-        .expect("old-fork body queues");
-
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert!(matches!(
-                    reason,
-                    BlockSyncMisbehavior::BodyPayloadMismatch(
-                        zakura_header_chain::BodyPayloadMismatch {
-                            requested,
-                            delivered,
-                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
-                            source,
-                            ..
-                        }
-                    ) if requested == block::Hash([222; 32])
-                        && delivered == blocks[1].hash()
-                        && source == zakura_header_chain::SourceId::from_digest([48; 32])
-                ));
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before stale body rejection: {action:?}"),
-        }
+    // An old-fork body for the new range is a local incompatibility: the
+    // connection retires without a misbehavior report.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    await_until(
+        "the incompatible body retires the session",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .expect("an old-fork body for the new range retires the connection");
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "an incompatible header is not reported as misbehavior: {action:?}"
+        );
     }
 
     reactor_task.abort();
@@ -11421,7 +11063,8 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -11429,7 +11072,8 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         49,
         block::Height(2),
         blocks[1].hash(),
-        1,
+        // The first request stays live until its ending, so the second needs a slot.
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).unwrap_or(u32::MAX),
     )
     .await;
@@ -11493,121 +11137,6 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 }
 
 #[tokio::test]
-async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
-    let config = immediate_body_download_config();
-    let blocks = [
-        mainnet_block(&BLOCK_MAINNET_1_BYTES),
-        mainnet_block(&BLOCK_MAINNET_2_BYTES),
-    ];
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let peer_id = peer(44);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-    service.add_peer(Peer::new_with_direction(
-        peer_id.clone(),
-        None,
-        ZAKURA_CAP_BLOCK_SYNC,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-    wait_for_outbound_status(&mut outbound_rx).await;
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(BlockSyncStatus {
-                servable_low: block::Height(1),
-                servable_high: block::Height(2),
-                tip_hash: blocks[1].hash(),
-                max_blocks_per_response: 4,
-                max_inflight_requests: 1,
-                max_response_bytes: MAX_BS_RESPONSE_BYTES,
-            })
-            .encode_frame()
-            .expect("status encodes"),
-        )
-        .await
-        .expect("status frame queues");
-
-    tip_tx
-        .send((block::Height(2), blocks[1].hash()))
-        .expect("tip watch is live");
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks { .. }
-    ) {}
-    handle
-        .send(BlockSyncEvent::NeededBlocks(
-            blocks
-                .iter()
-                .map(|block| BlockSyncBlockMeta {
-                    height: block.coinbase_height().expect("test block has height"),
-                    hash: block.hash(),
-                    size: BlockSizeEstimate::Advertised(block_size(block)),
-                })
-                .collect(),
-        ))
-        .await
-        .expect("needed metadata queues");
-
-    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
-    assert_eq!(start_height, block::Height(1));
-    assert_eq!(count, 2);
-
-    for block in [&blocks[1], &blocks[1], &blocks[0]] {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("block queues");
-    }
-
-    let mut submitted = Vec::new();
-    while submitted.len() < 2 {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
-                block
-                    .coinbase_height()
-                    .expect("submitted test block has height"),
-            ),
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                panic!("duplicate buffered body was misclassified: {reason:?}")
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before submit: {action:?}"),
-        }
-    }
-    assert_eq!(submitted, vec![block::Height(1), block::Height(2)]);
-
-    let quiet = tokio::time::timeout(Duration::from_millis(100), async {
-        while let Some(action) = actions.recv().await {
-            if let BlockSyncAction::Misbehavior { reason, .. } = action {
-                panic!("duplicate buffered body was misclassified after submit: {reason:?}");
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
 async fn reactor_accepts_rapid_status_growth_without_spam_score() {
     let config = ZakuraBlockSyncConfig::default();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
@@ -11622,7 +11151,8 @@ async fn reactor_accepts_rapid_status_growth_without_spam_score() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer_id = peer(46);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11631,7 +11161,7 @@ async fn reactor_accepts_rapid_status_growth_without_spam_score() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -11685,7 +11215,8 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer_id = peer(47);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11694,7 +11225,7 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -11732,7 +11263,7 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
 }
 
 #[tokio::test]
-async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch() {
+async fn mismatched_header_retires_the_connection_without_a_fault_report() {
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -11744,22 +11275,24 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(
         immediate_body_download_config(),
         handle.clone(),
     );
     let peer = peer(41);
+    let connection_cancel = CancellationToken::new();
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
     let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
     service.add_peer(Peer::new_with_direction(
-        peer.clone(),
+        peer,
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
-        CancellationToken::new(),
+        connection_cancel.clone(),
     ));
 
     inbound_tx
@@ -11813,28 +11346,16 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
         .await
         .expect("block queues");
 
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert!(matches!(
-                    reason,
-                    BlockSyncMisbehavior::BodyPayloadMismatch(
-                        zakura_header_chain::BodyPayloadMismatch {
-                            requested,
-                            delivered,
-                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
-                            source,
-                            ..
-                        }
-                    ) if requested == block::Hash([9; 32])
-                        && delivered == mainnet_block(&BLOCK_MAINNET_1_BYTES).hash()
-                        && source == zakura_header_chain::SourceId::from_digest([41; 32])
-                ));
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before invalid-block report: {action:?}"),
-        }
+    // Height-only requests do not commit the supplier to our chain, so this is
+    // a local incompatibility rather than a peer fault.
+    tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
+        .await
+        .expect("a header that does not match the next expected hash retires the connection");
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "an incompatible header is not reported as misbehavior: {action:?}"
+        );
     }
     reactor_task.abort();
 }
@@ -11865,7 +11386,8 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Admit a peer through the production `add_peer` path with an observable
@@ -11877,7 +11399,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
     service.add_peer(Peer::new_with_direction(
         peer.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -11967,7 +11489,8 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (bad_peer, bad_inbound, mut bad_outbound) = connect_peer_with_status(
         &service,
@@ -12069,193 +11592,6 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
 }
 
 #[tokio::test]
-async fn reactor_serves_committed_blocks_with_count_and_byte_clamps() {
-    let blocks = mainnet_blocks_1_to_3();
-    let block1_size = block_size(&blocks[0]);
-    let mut config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 2,
-        max_response_bytes: block1_size,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    config.peer_limits.outbound_queue_depth = 16;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(3),
-            verified_block_hash: blocks[2].hash(),
-        },
-        (block::Height(4), block::Hash([4; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        60,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 10,
-            }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("GetBlocks frame queues");
-
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 2);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before block range query: {action:?}"),
-        }
-    }
-
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 2,
-            blocks: vec![
-                (
-                    block::Height(1),
-                    blocks[0].clone(),
-                    usize::try_from(block1_size).expect("block size fits usize"),
-                ),
-                (
-                    block::Height(2),
-                    blocks[1].clone(),
-                    usize::try_from(block_size(&blocks[1])).expect("block size fits usize"),
-                ),
-            ],
-        })
-        .await
-        .expect("served block response queues");
-
-    assert_eq!(
-        wait_for_outbound_block(&mut outbound_rx).await.hash(),
-        blocks[0].hash()
-    );
-    assert_eq!(
-        wait_for_outbound_blocks_done(&mut outbound_rx).await,
-        (block::Height(1), 1),
-        "max_response_bytes clamps the served response to one body"
-    );
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(4),
-                count: 1,
-            }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("above-tip GetBlocks frame queues");
-
-    assert_eq!(
-        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
-        (block::Height(4), 1)
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_never_serves_reorder_buffer_bodies() {
-    let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
-    config.peer_limits.outbound_queue_depth = 16;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(3), blocks[2].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        61,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[2])]))
-        .await
-        .expect("needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(3), 1)
-    );
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block frame encodes"),
-        )
-        .await
-        .expect("block frame queues");
-
-    let quiet = tokio::time::timeout(Duration::from_millis(50), async {
-        while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
-                panic!("height 3 must stay buffered behind the height 2 gap");
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(3),
-                count: 1,
-            }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("GetBlocks frame queues");
-
-    assert_eq!(
-        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
-        (block::Height(3), 1),
-        "uncommitted reorder-buffer body must not be served"
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
 async fn reactor_schedules_gap_below_buffered_reorder_run() {
     // Regression for the mainnet stuck-at-0 deadlock: a body run received above
     // an open gap must not starve the gap below it. The state reports every
@@ -12281,7 +11617,8 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -12304,14 +11641,15 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         wait_for_outbound_getblocks(&mut outbound_rx).await,
         (block::Height(3), 1)
     );
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block frame encodes"),
-        )
-        .await
-        .expect("block frame queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[2].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(3),
+            returned: 1,
+        },
+    )
+    .await;
 
     // Height 3 is now buffered in the reorder buffer and marked covered. Drain
     // to quiescence: this both lets the reactor finish processing the body and
@@ -12365,161 +11703,12 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
 }
 
 #[tokio::test]
-async fn reactor_advertises_default_serving_tip_growth_promptly() {
-    let mut config = immediate_body_download_config();
-    config.peer_limits.outbound_queue_depth = 16;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(4), block::Hash([4; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        62,
-        block::Height(4),
-        block::Hash([4; 32]),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    // `connect_peer_with_status` already read the connect-time `Status`; the
-    // peer's first inbound `Status` now gets a reply as well.
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    for height in 1..=3 {
-        handle
-            .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(height),
-                verified_block_hash: block::Hash([height as u8; 32]),
-            }))
-            .await
-            .expect("serving frontier queues");
-        let frame = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
-            .await
-            .expect("the reactor must advertise a new block within two seconds")
-            .expect("the peer stream remains open");
-        let BlockSyncMessage::Status(status) =
-            BlockSyncMessage::decode_frame(frame).expect("the status frame decodes")
-        else {
-            panic!("a serving frontier change must advertise body availability");
-        };
-        assert_eq!(status.servable_high, block::Height(height));
-    }
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
-    let mut config = ZakuraBlockSyncConfig {
-        status_refresh_interval: Duration::from_millis(100),
-        ..immediate_body_download_config()
-    };
-    config.peer_limits.outbound_queue_depth = 16;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(4), block::Hash([4; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        62,
-        block::Height(4),
-        block::Hash([4; 32]),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    // `connect_peer_with_status` already read the connect-time `Status`; the
-    // peer's first inbound `Status` now gets a reply as well.
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    handle
-        .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }))
-        .await
-        .expect("unchanged frontier queues");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), outbound_rx.recv())
-            .await
-            .is_err(),
-        "unchanged serving range must not advertise"
-    );
-
-    handle
-        .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: block::Hash([1; 32]),
-        }))
-        .await
-        .expect("changed frontier queues");
-    match next_outbound_message(&mut outbound_rx).await {
-        BlockSyncMessage::Status(status) => {
-            assert_eq!(status.servable_high, block::Height(1));
-            assert_eq!(handle.local_status().servable_high, block::Height(1));
-        }
-        msg => panic!("expected debounced Status after serving tip change, got {msg:?}"),
-    }
-
-    for height in [2, 3] {
-        let hash_byte = u8::try_from(height).expect("test height fits in u8");
-        handle
-            .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(height),
-                verified_block_hash: block::Hash([hash_byte; 32]),
-            }))
-            .await
-            .expect("burst frontier queues");
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), outbound_rx.recv())
-            .await
-            .is_err(),
-        "rapid serving-tip changes must be debounced to one Status per window"
-    );
-
-    match next_outbound_message(&mut outbound_rx).await {
-        BlockSyncMessage::Status(status) => {
-            assert_eq!(status.servable_high, block::Height(3));
-            assert_eq!(handle.local_status().servable_high, block::Height(3));
-        }
-        msg => panic!("expected coalesced Status after debounce window, got {msg:?}"),
-    }
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_retries_status_to_peer_without_status_when_local_status_unchanged() {
+async fn reactor_retries_connect_status_after_a_full_outbound_queue() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_millis(50),
         ..immediate_body_download_config()
     };
-    config.peer_limits.outbound_queue_depth = 16;
+    config.peer_limits.outbound_queue_depth = 2;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -12531,76 +11720,27 @@ async fn reactor_retries_status_to_peer_without_status_when_local_status_unchang
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle);
-    let peer = peer(63);
-    let (_inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-
-    service.add_peer(Peer::new_with_direction(
-        peer,
-        None,
-        ZAKURA_CAP_BLOCK_SYNC,
-        ServicePeerDirection::Outbound,
-        streams,
-        CancellationToken::new(),
-    ));
-
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), outbound_rx.recv())
-            .await
-            .is_err(),
-        "initial Status send must consume the peer refresh allowance"
-    );
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_replies_to_first_status_when_connect_status_queue_was_full() {
-    let mut config = ZakuraBlockSyncConfig {
-        status_refresh_interval: Duration::from_millis(50),
-        ..immediate_body_download_config()
-    };
-    config.peer_limits.outbound_queue_depth = 1;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(64);
-    let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(1);
-    outbound_tx
-        .try_send(
-            BlockSyncMessage::Status(status())
-                .encode_frame()
-                .expect("filler status frame encodes"),
-        )
-        .expect("outbound queue starts full");
+    let (_inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(2);
+    for _ in 0..2 {
+        outbound_tx
+            .try_send(
+                BlockSyncMessage::Status(status())
+                    .encode_frame()
+                    .expect("filler status frame encodes"),
+            )
+            .expect("outbound queue starts full");
+    }
     let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
 
     service.add_peer(Peer::new_with_direction(
         peer,
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -12617,8 +11757,9 @@ async fn reactor_replies_to_first_status_when_connect_status_queue_was_full() {
     .await
     .expect("peer is admitted while outbound queue is full");
 
-    let _ = outbound_rx.recv().await.expect("filler frame drains");
-    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    for _ in 0..2 {
+        assert_eq!(wait_for_outbound_status(&mut outbound_rx).await, status());
+    }
 
     assert!(matches!(
         next_outbound_message(&mut outbound_rx).await,
@@ -12646,7 +11787,8 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -12656,22 +11798,21 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
     service.add_peer(Peer::new_with_direction(
         peer,
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
     ));
 
     wait_for_outbound_status(&mut outbound_rx).await;
-    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
-    wait_for_outbound_status(&mut outbound_rx).await;
-
-    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    for _ in 0..2 {
+        send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    }
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), outbound_rx.recv())
+        tokio::time::timeout(Duration::from_millis(100), outbound_rx.recv())
             .await
             .is_err(),
-        "a rapid second inbound Status must not trigger another Status reply"
+        "an inbound Status must not trigger a Status reply"
     );
 
     reactor_task.abort();
@@ -12695,7 +11836,8 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -12775,7 +11917,8 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
 async fn committed_reanchor_lowers_only_best_header_target() {
     let (snapshots, startup) =
         committed_block_sync_startup_at_heights(0, 5, 10, immediate_body_download_config());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
 
@@ -12819,7 +11962,8 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -12894,7 +12038,8 @@ async fn epoch_change_supersedes_stale_floor_query() {
         (4, old_target_hash),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     let BlockSyncAction::QueryNeededBlocks {
@@ -13059,7 +12204,8 @@ async fn header_extension_preserves_checkpoint_pipeline() {
         (3, old_target_hash),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let BlockSyncAction::QueryNeededBlocks {
         query_id, scope, ..
@@ -13238,7 +12384,8 @@ async fn committed_body_progress_preserves_same_target_native_response() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -13340,7 +12487,8 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
         (3, blocks[2].hash()),
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -13365,15 +12513,16 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     );
 
     for block in &blocks {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block frame encodes"),
-            )
-            .await
-            .expect("block frame queues");
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
     }
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 3,
+        },
+    )
+    .await;
 
     let mut submitted = Vec::new();
     while submitted.len() < blocks.len() {
@@ -13457,7 +12606,8 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
@@ -13537,7 +12687,8 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
         tip_rx,
         config,
     );
-    let (_handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (_handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -13566,7 +12717,8 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id,
@@ -13591,13 +12743,26 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
         .await
         .expect("fork-aware metadata completion queues");
 
-    assert!(matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks {
-            from: block::Height(2),
-            ..
+    // A timer re-query from the stale tip can race the metadata completion on a
+    // slow start. It is harmless, so skip it until the reanchored query arrives,
+    // but fail if stale re-queries keep coming instead.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    ..
+                } => break,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(3),
+                    ..
+                } => {}
+                action => panic!("expected the reanchored query from height 2, got {action:?}"),
+            }
         }
-    ));
+    })
+    .await
+    .expect("the reanchored query arrives before stale re-queries run out the deadline");
 
     reactor_task.abort();
 }
@@ -13616,7 +12781,8 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -13704,7 +12870,8 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -13766,7 +12933,8 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
         tip_rx,
         ZakuraBlockSyncConfig::default(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id: first_query_id,
@@ -13850,7 +13018,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         tip_rx,
         config,
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     // Startup refill scans from the floor (queue empty → `max_claimed` is None).
     assert!(matches!(
@@ -13920,7 +13089,8 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
         tip_rx,
         immediate_body_download_config(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     assert!(matches!(
         next_action(&mut actions).await,
@@ -13967,7 +13137,8 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -14011,49 +13182,6 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::RangeUnavailable {
-                start_height: block::Height(2),
-                count: 1,
-            }
-            .encode_frame()
-            .expect("RangeUnavailable frame encodes"),
-        )
-        .await
-        .expect("unmatched RangeUnavailable frame queues");
-
-    // routines re-query on a low-water ping, so a benign `QueryNeededBlocks`
-    // may appear; the unmatched RangeUnavailable must NOT score the peer or trigger
-    // a fresh GetBlocks for the already-in-flight range. A fresh request would land
-    // on this peer's own outbound, so watch the real wire while draining advisory
-    // queries / misbehavior off the action channel.
-    loop {
-        tokio::select! {
-            biased;
-            frame = outbound_rx.recv() => {
-                let frame = frame.expect("outbound channel is live");
-                match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
-                    BlockSyncMessage::GetBlocks { .. } => {
-                        panic!("unmatched RangeUnavailable must not trigger a fresh request")
-                    }
-                    BlockSyncMessage::Status(_) => {}
-                    msg => panic!("unexpected outbound message after unmatched RangeUnavailable: {msg:?}"),
-                }
-            }
-            action = tokio::time::timeout(Duration::from_millis(50), actions.recv()) => {
-                match action {
-                    Ok(Some(BlockSyncAction::Misbehavior { .. })) => {
-                        panic!("unmatched RangeUnavailable must not score the serving peer")
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
-                }
-            }
-        }
-    }
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
     reactor_task.abort();
 }
 
@@ -14087,7 +13215,8 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Two misbehaving peers (ids 0x01, 0x02 sort first) and one honest peer (0x03).
@@ -14190,7 +13319,8 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -14246,77 +13376,6 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
 }
 
 #[tokio::test]
-async fn reactor_backpressures_serving_slots_without_scoring_peer() {
-    let mut config = ZakuraBlockSyncConfig {
-        max_inflight_requests: 1,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    config.peer_limits.outbound_queue_depth = 16;
-    let blocks = mainnet_blocks_1_to_3();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(2), blocks[1].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        63,
-        block::Height(1),
-        blocks[0].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    for _ in 0..2 {
-        inbound_tx
-            .send(
-                BlockSyncMessage::GetBlocks {
-                    start_height: block::Height(1),
-                    count: 1,
-                }
-                .encode_frame()
-                .expect("GetBlocks frame encodes"),
-            )
-            .await
-            .expect("GetBlocks frame queues");
-    }
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryBlocksByHeightRange { .. }
-    ) {}
-
-    assert_eq!(
-        wait_for_outbound_range_unavailable(&mut outbound_rx).await,
-        (block::Height(1), 1),
-        "serving-slot saturation should backpressure the requester, not score it as spam",
-    );
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 1,
-            returned_count: 1,
-        })
-        .await
-        .expect("serving slot release queues");
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
 async fn serving_flood_cannot_consume_needed_query_retry() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = ZakuraBlockSyncConfig {
@@ -14335,7 +13394,8 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
@@ -14359,7 +13419,6 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
     )
     .await
     .expect("the valid serving peer becomes ready");
-    wait_for_outbound_status(&mut outbound_rx).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     while wiring.actions.capacity() > 0 {
         wiring
@@ -14434,9 +13493,6 @@ async fn serving_flood_cannot_consume_needed_query_retry() {
                     best_header_tip: block::Height(2),
                     ..
                 }) => break,
-                Some(BlockSyncAction::QueryBlocksByHeightRange { .. }) => {
-                    panic!("peer serving consumed the refill control reservation")
-                }
                 Some(_) => {}
                 None => panic!("the action stream closed before the refill retry"),
             }
@@ -14467,9 +13523,10 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (peer_id, _inbound_tx, _outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         63,
@@ -14491,7 +13548,6 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     )
     .await
     .expect("the peer becomes ready");
-    wait_for_outbound_status(&mut outbound_rx).await;
 
     while wiring.actions.capacity() > BS_ACTION_CONTROL_RESERVE {
         wiring
@@ -14503,32 +13559,24 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
             .expect("the test fills one unreserved action slot");
     }
 
-    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::Status(BlockSyncStatus {
-            servable_low: block::Height(1),
-            servable_high: block::Height(2),
-            tip_hash: blocks[1].hash(),
-            max_blocks_per_response: 16,
-            max_inflight_requests: 1,
-            max_response_bytes: MAX_BS_RESPONSE_BYTES,
-        }),
-    )
-    .await;
+    // Valid v3 frames cannot carry a malformed Status, so inject the routine's
+    // report directly.
+    let reports = &wiring.routine_to_reactor;
+    reports
+        .send(super::events::RoutineToReactor::Misbehavior {
+            peer: peer_id.clone(),
+            reason: BlockSyncMisbehavior::MalformedMessage,
+        })
+        .await
+        .expect("the reactor accepts routine reports");
     await_until(
-        "the download routine handles the unsolicited body before its status barrier",
+        "the reactor takes the report",
         Duration::from_secs(1),
-        || {
-            wiring.registry.candidate_snapshot().iter().any(
-                |(peer, received_status, _, servable_high)| {
-                    peer == &peer_id && *received_status && *servable_high == block::Height(2)
-                },
-            )
-        },
+        || reports.capacity() == reports.max_capacity(),
     )
     .await
-    .expect("the download routine reports the attacker-controlled body");
+    .expect("the reactor handles the report");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         wiring.actions.capacity(),
         BS_ACTION_CONTROL_RESERVE,
@@ -14562,189 +13610,6 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     reactor_task.abort();
 }
 
-/// A full per-peer serving queue must drop the serving send, never disconnect
-/// the peer.
-///
-/// The reactor serves `Status`/`Block`/`BlocksDone`/`RangeUnavailable` with
-/// non-blocking `try_send_*`. On `Full` it drops the frame and bumps a
-/// `*.serve_queue_full` metric; only a genuine send *error* cancels the peer.
-/// A regression that collapsed those two arms (cancelling on `Full`) would
-/// disconnect honest-but-slow peers under serving load — a self-inflicted DoS.
-/// This guards the distinction: a saturated serving queue leaves the peer
-/// connected, and serving resumes once the queue drains.
-#[tokio::test]
-async fn reactor_full_serving_queue_drops_without_disconnecting_peer() {
-    let blocks = mainnet_blocks_1_to_3();
-    let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 16,
-        max_response_bytes: MAX_BS_RESPONSE_BYTES,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    // Tip == verified tip: the reactor is caught up, so it only *serves* and
-    // never issues its own downloads into the tiny outbound queue below.
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(3),
-            verified_block_hash: blocks[2].hash(),
-        },
-        (block::Height(3), blocks[2].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-
-    // A two-slot outbound queue, wired by hand so we keep the peer's
-    // cancellation token: serving three bodies plus a terminator is four sends
-    // through two slots, so `try_send` is guaranteed to hit `Full`.
-    let peer_id = peer(66);
-    let cancel = CancellationToken::new();
-    let (inbound_tx, inbound_rx) = framed_channel(16);
-    let (outbound_tx, mut outbound_rx) = framed_channel(2);
-    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
-    service.add_peer(Peer::new_with_direction(
-        peer_id.clone(),
-        None,
-        ZAKURA_CAP_BLOCK_SYNC,
-        ServicePeerDirection::Outbound,
-        streams,
-        cancel.clone(),
-    ));
-    wait_for_outbound_status(&mut outbound_rx).await;
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(BlockSyncStatus {
-                servable_low: block::Height(1),
-                servable_high: block::Height(3),
-                tip_hash: blocks[2].hash(),
-                max_blocks_per_response: 16,
-                max_inflight_requests: 8,
-                max_response_bytes: MAX_BS_RESPONSE_BYTES,
-            })
-            .encode_frame()
-            .expect("status encodes"),
-        )
-        .await
-        .expect("status frame queues");
-
-    // The peer asks for the whole committed range; answer it so the reactor
-    // serves all three bodies into the saturated queue.
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 3,
-            }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("GetBlocks frame queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 3);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before block range query: {action:?}"),
-        }
-    }
-    let served: Vec<_> = blocks
-        .iter()
-        .map(|block| {
-            (
-                block.coinbase_height().expect("test block has height"),
-                block.clone(),
-                usize::try_from(block_size(block)).expect("block size fits usize"),
-            )
-        })
-        .collect();
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            blocks: served,
-        })
-        .await
-        .expect("served block response queues");
-
-    // Let the reactor finish the serve, including the sends that hit `Full`.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !cancel.is_cancelled(),
-        "a full serving queue must drop sends, not cancel the peer",
-    );
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
-    // Self-heal: drain the queue, release the serving slot, and re-request. The
-    // earlier drop neither wedged nor scored the peer, so a fresh serve lands.
-    while tokio::time::timeout(
-        Duration::from_millis(100),
-        next_outbound_message(&mut outbound_rx),
-    )
-    .await
-    .is_ok()
-    {}
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseFinished {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 3,
-            returned_count: 3,
-        })
-        .await
-        .expect("serving slot release queues");
-    inbound_tx
-        .send(
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 1,
-            }
-            .encode_frame()
-            .expect("GetBlocks frame encodes"),
-        )
-        .await
-        .expect("re-request GetBlocks frame queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
-                assert_eq!(start, block::Height(1));
-                assert_eq!(count, 1);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before re-request query: {action:?}"),
-        }
-    }
-    handle
-        .send(BlockSyncEvent::BlockRangeResponseReady {
-            peer: peer_id.clone(),
-            start_height: block::Height(1),
-            requested_count: 1,
-            blocks: vec![(
-                block::Height(1),
-                blocks[0].clone(),
-                usize::try_from(block_size(&blocks[0])).expect("block size fits usize"),
-            )],
-        })
-        .await
-        .expect("re-served block response queues");
-    assert_eq!(
-        wait_for_outbound_block(&mut outbound_rx).await.hash(),
-        blocks[0].hash(),
-        "serving resumes once the queue drains",
-    );
-    assert!(!cancel.is_cancelled());
-
-    reactor_task.abort();
-}
-
 #[tokio::test]
 async fn reactor_publishes_block_sync_candidate_gap() {
     let config = immediate_body_download_config();
@@ -14759,7 +13624,8 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer_id = peer(77);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -14768,7 +13634,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
     service.add_peer(Peer::new_with_direction(
         peer_id.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -14877,7 +13743,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
 }
 
 #[tokio::test]
-async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
+async fn testnet_fork_body_keeps_selected_body_despite_wrong_branch_hint() {
     let losing = mainnet_block(include_bytes!("tests/fixtures/testnet-4351709-losing.bin"));
     let selected = mainnet_block(include_bytes!(
         "tests/fixtures/testnet-4351709-selected.bin"
@@ -14889,9 +13755,9 @@ async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
     assert_eq!(block_size(&losing), 1_670);
     assert_eq!(block_size(&selected), 7_592);
 
-    for (size, expect_mismatch) in [
-        (BlockSizeEstimate::Advertised(block_size(&losing)), true),
-        (BlockSizeEstimate::Unknown, false),
+    for size in [
+        BlockSizeEstimate::Advertised(block_size(&losing)),
+        BlockSizeEstimate::Unknown,
     ] {
         let config = immediate_body_download_config();
         assert_eq!(config.size_deviation_tolerance, 200);
@@ -14908,7 +13774,8 @@ async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
             tip_rx,
             config.clone(),
         );
-        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let (handle, mut actions, task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
         let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         let (_, inbound_tx, mut outbound_rx) = connect_peer_with_status(
             &service,
@@ -14947,23 +13814,13 @@ async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
             )
             .await
             .expect("captured body queues");
-        let mut saw_mismatch = false;
-        let mut saw_submit = false;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !(saw_submit && saw_mismatch == expect_mismatch) {
+            loop {
                 match next_action(&mut actions).await {
                     BlockSyncAction::QueryNeededBlocks { .. } => {}
-                    BlockSyncAction::Misbehavior { reason, .. } => {
-                        assert!(
-                            expect_mismatch,
-                            "an unknown size must not report a mismatch"
-                        );
-                        assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
-                        saw_mismatch = true;
-                    }
                     BlockSyncAction::SubmitBlock { block, .. } => {
                         assert_eq!(block.hash(), selected.hash());
-                        saw_submit = true;
+                        break;
                     }
                     action => panic!("unexpected replay action: {action:?}"),
                 }
@@ -14976,7 +13833,7 @@ async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
 }
 
 #[tokio::test]
-async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
+async fn oversize_body_hint_keeps_the_body_without_scoring_the_supplier() {
     let mut config = ZakuraBlockSyncConfig {
         size_deviation_tolerance: 100,
         ..immediate_body_download_config()
@@ -14993,7 +13850,8 @@ async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -15002,7 +13860,7 @@ async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
     service.add_peer(Peer::new_with_direction(
         peer,
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         streams,
         CancellationToken::new(),
@@ -15060,46 +13918,22 @@ async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
         .await
         .expect("block queues");
 
-    let mut saw_mismatch = false;
-    let mut saw_submit = false;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !(saw_mismatch && saw_submit) {
-            match next_action(&mut actions).await {
-                BlockSyncAction::Misbehavior { reason, .. } => {
-                    assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
-                    saw_mismatch = true;
-                }
-                BlockSyncAction::SubmitBlock { .. } => saw_submit = true,
-                BlockSyncAction::QueryNeededBlocks { .. } => {}
-                action => panic!("unexpected action during size mismatch test: {action:?}"),
-            }
+    // The reservation bounds the body's bytes, so a wrong size hint does not
+    // implicate the supplier.
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { .. } => break,
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action during size mismatch test: {action:?}"),
         }
-    })
-    .await
-    .expect("the mismatch is reported and the hash-matched body is still submitted");
+    }
 
     reactor_task.abort();
 }
 
-// SECURITY AUDIT (candidate claude-block-sync-unsolicited-blocksdone-not-rejected /
-// codex-blocksync-unsolicited-blocksdone-not-rejected): SR-6/SR-7 response
-// correlation + fail-closed.
-//
-// `handle_blocks_done` reports `UnsolicitedDone` only when the peer is *unknown*.
-// For a known, active peer that sends a valid `BlocksDone` with no matching
-// outstanding request, the `if let Some(index)` body is skipped and the reactor
-// falls through to `schedule()` with no `else` reporting `UnsolicitedDone`.
-// `UnsolicitedDone` is a *hard* block-sync misbehavior (`block_sync_misbehavior_is_hard`
-// in zakurad start.rs), so the production driver `drive_block_sync_actions`
-// disconnects on the first offense -- but this branch never emits it, so an
-// admitted peer can stream uncorrelated response terminators forever and stay
-// connected.
-//
-// This test asserts the SAFE behavior (the reactor must report `UnsolicitedDone`).
-// It currently FAILS, which is the reproduction. Do not weaken it to pass; the
-// fix is to add the missing `else` branch in `handle_blocks_done`.
+/// An ending without a live request is a protocol violation that closes the connection.
 #[tokio::test]
-async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior() {
+async fn unsolicited_terminator_closes_the_connection() {
     let config = ZakuraBlockSyncConfig::default();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
@@ -15113,481 +13947,22 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-
-    // Connect a peer that advertises no downloadable work (servable_high == our
-    // verified tip), so the reactor never schedules a GetBlocks and the peer has
-    // zero outstanding requests. The peer is known/active (received_status=true).
-    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        63,
-        block::Height(1),
-        blocks[0].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    // Surprising/hostile input: a valid `BlocksDone` terminator with a start
-    // height that matches no outstanding request (there are none).
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(7),
-                returned: 1,
-            }
-            .encode_frame()
-            .expect("BlocksDone frame encodes"),
-        )
-        .await
-        .expect("BlocksDone frame queues");
-
-    // Expected safe behavior: the reactor reports `UnsolicitedDone` for this peer
-    // (which the production driver maps to a hard disconnect). Collect actions for
-    // a bounded window and assert it appears.
-    let mut saw_unsolicited_done = false;
-    while let Ok(Some(action)) = tokio::time::timeout(Duration::from_secs(1), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            if peer == peer_id && reason == BlockSyncMisbehavior::UnsolicitedDone {
-                saw_unsolicited_done = true;
-                break;
-            }
-        }
-    }
-
-    assert!(
-        saw_unsolicited_done,
-        "a known peer's unsolicited BlocksDone with no matching outstanding request \
-         must be reported as Misbehavior::UnsolicitedDone (SR-6/SR-7), but the reactor \
-         silently tolerated it and kept the peer connected",
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
-    let config = immediate_body_download_config();
-    let blocks = mainnet_blocks_1_to_3();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let mut startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(2), blocks[1].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let trace = ZakuraTrace::noop();
-    startup.trace = trace.clone();
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-
-    let (peer1, inbound1, mut outbound1) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        65,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    let (peer2, inbound2, mut outbound2) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        66,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[1])]))
-        .await
-        .expect("needed metadata queues");
-    // Which peer the routine offers the request to is nondeterministic, so observe
-    // both peers' real outbounds and learn which one was asked.
-    let (requested_peer, start_height, _count) = {
-        let mut outbound_by_peer: Vec<(ZakuraPeerId, &mut FramedRecv)> = vec![
-            (peer1.clone(), &mut outbound1),
-            (peer2.clone(), &mut outbound2),
-        ];
-        wait_for_getblocks_across(&mut outbound_by_peer).await
-    };
-    assert_eq!(start_height, block::Height(2));
-
-    // Simulate a later state snapshot that omits the active in-flight height.
-    // The scheduler retains the outstanding request for correlation, but
-    // `needed_heights` no longer contains the height, matching the production
-    // late-response race after retries/reconnects.
-    handle
-        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
-        .await
-        .expect("empty needed metadata queues");
-
-    // The peer that did NOT get the request sends the body+terminator as real
-    // inbound frames. First valid completion wins: the body is accepted even
-    // though another peer currently owns the request slot, and the later
-    // duplicate from the original owner will be dropped by the sequencer.
-    let (late_peer, late_inbound) = if requested_peer == peer1 {
-        (peer2, inbound2)
-    } else {
-        (peer1, inbound1)
-    };
-    send_inbound(&late_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
-    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match next_action(&mut actions).await {
-                BlockSyncAction::SubmitBlock { block, .. } => return block.hash(),
-                BlockSyncAction::QueryNeededBlocks { .. } => {}
-                BlockSyncAction::Misbehavior { peer, reason } => {
-                    assert_ne!(
-                        peer, late_peer,
-                        "late active body was reported as {reason:?}"
-                    );
-                }
-                action => {
-                    panic!("unexpected action while waiting for late body submit: {action:?}")
-                }
-            }
-        }
-    })
-    .await
-    .expect("late active body is accepted and submitted");
-    assert_eq!(submitted, blocks[1].hash());
-    assert_eq!(
-        trace.first_block_body_source(submitted),
-        Some(BlockBodySource::Zakura)
-    );
-
-    send_inbound(
-        &late_inbound,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(2),
-            returned: 1,
-        },
-    )
-    .await;
-
-    while let Ok(Some(action)) =
-        tokio::time::timeout(Duration::from_millis(200), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            assert_ne!(
-                peer, late_peer,
-                "late response for an active request was reported as {reason:?}"
-            );
-        }
-    }
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_ignores_duplicate_response_at_body_download_floor() {
-    let config = immediate_body_download_config();
-    let blocks = mainnet_blocks_1_to_3();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(2), blocks[1].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        65,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[1])]))
-        .await
-        .expect("needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 1)
-    );
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[1].clone())
-                .encode_frame()
-                .expect("block frame encodes"),
-        )
-        .await
-        .expect("block frame queues");
-
-    let (owner, source, token, hash) = loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock {
-                owner,
-                source,
-                token,
-                block,
-            } => break (owner, source, token, block.hash()),
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action while waiting for submit: {action:?}"),
-        }
-    };
-
-    // Simulate the verifier reporting success before the frontier mirror has
-    // delivered the matching verified-tip update. The applying entry is gone,
-    // but `body_download_floor` still proves this height was already accepted.
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
-            owner,
-            source,
-            token,
-            height: block::Height(2),
-            hash,
-            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-        })
-        .await
-        .expect("apply result queues");
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[1].clone())
-                .encode_frame()
-                .expect("duplicate block frame encodes"),
-        )
-        .await
-        .expect("duplicate block frame queues");
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(2),
-                returned: 1,
-            }
-            .encode_frame()
-            .expect("duplicate terminator frame encodes"),
-        )
-        .await
-        .expect("duplicate terminator frame queues");
-
-    while let Ok(Some(action)) =
-        tokio::time::timeout(Duration::from_millis(200), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            assert_ne!(
-                peer, peer_id,
-                "duplicate response at body_download_floor was reported as {reason:?}"
-            );
-        }
-    }
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
-    // fanout = 1: a height is requested from exactly one peer. The duplicate body
-    // that must be ignored at the floor instead arrives unsolicited from the
-    // *other* connected peer after the height has committed.
-    let blocks = mainnet_blocks_1_to_3();
-    let block2_size = block_size(&blocks[1]);
-    let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
-
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(4), block::Hash([4; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_a, inbound_a, mut outbound_a) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        66,
-        block::Height(4),
-        block::Hash([4; 32]),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-    let (peer_b, inbound_b, mut outbound_b) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        67,
-        block::Height(4),
-        block::Hash([4; 32]),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[1])]))
-        .await
-        .expect("needed metadata queues");
-    // Which peer the routine offers the request to is nondeterministic (the routines
-    // race for the shared work), so observe both peers' real outbounds and learn
-    // which one was asked.
-    let mut outbound_by_peer: Vec<(ZakuraPeerId, &mut FramedRecv)> = vec![
-        (peer_a.clone(), &mut outbound_a),
-        (peer_b.clone(), &mut outbound_b),
-    ];
-    let first_request = wait_for_getblocks_across(&mut outbound_by_peer).await;
-    assert_eq!((first_request.1, first_request.2), (block::Height(2), 1));
-    // The other peer is the one that will deliver the ignored duplicate.
-    let (other_peer, requested_inbound, other_inbound) = if first_request.0 == peer_a {
-        (peer_b.clone(), &inbound_a, &inbound_b)
-    } else {
-        (peer_a.clone(), &inbound_b, &inbound_a)
-    };
-
-    send_inbound(
-        requested_inbound,
-        BlockSyncMessage::Block(blocks[1].clone()),
-    )
-    .await;
-
-    let (owner, source, token, hash) = loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock {
-                owner,
-                source,
-                token,
-                block,
-            } => break (owner, source, token, block.hash()),
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action while waiting for submit: {action:?}"),
-        }
-    };
-    handle
-        .send(BlockSyncEvent::BlockApplyFinished {
-            owner,
-            source,
-            token,
-            height: block::Height(2),
-            hash,
-            outcome: test_block_apply_outcome(BlockApplyResult::Committed),
-        })
-        .await
-        .expect("apply result queues");
-
-    // A late duplicate body for the now-committed height arrives from the other
-    // peer as a real inbound frame; it sits at/below the body-download floor and
-    // must be ignored without permanently consuming reorder budget.
-    let _ = &other_peer;
-    send_inbound(other_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            block_meta(&blocks[2]),
-            BlockSyncBlockMeta {
-                height: block::Height(4),
-                hash: block::Hash([4; 32]),
-                size: BlockSizeEstimate::Advertised(block2_size),
-            },
-        ]))
-        .await
-        .expect("next needed metadata queues");
-
-    // The commit pipeline now runs on its own task and reports the committed
-    // floor back asynchronously, so the late duplicate can momentarily reach the
-    // unmatched-queued path and transiently reserve before the Sequencer reports
-    // it `Redundant` and releases. The invariant that still must hold is that the
-    // duplicate consumes no budget *permanently*: both remaining heights (3 and 4)
-    // must still get requested, each exactly once, within the two-block budget.
-    // Collect GetBlocks until 3 and 4 are both covered and assert no double-fetch.
-    let mut requested: Vec<block::Height> = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (peer, start, count) = wait_for_getblocks_across(&mut outbound_by_peer).await;
-            assert!(
-                peer == peer_a || peer == peer_b,
-                "request should target one of the connected peers"
-            );
-            for offset in 0..count {
-                if let Some(height) = height_after_count(start, offset) {
-                    requested.push(height);
-                }
-            }
-            if requested.contains(&block::Height(3)) && requested.contains(&block::Height(4)) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("both remaining heights are requested within the unchanged budget");
-    requested.sort_unstable();
-    let mut deduped = requested.clone();
-    deduped.dedup();
-    assert_eq!(
-        requested, deduped,
-        "a matched duplicate response at the body floor must not consume reorder budget \
-         (no height should be fetched twice)"
-    );
-    assert!(
-        requested.contains(&block::Height(3)) && requested.contains(&block::Height(4)),
-        "both needed heights must be fetched once the duplicate releases its transient reservation"
-    );
-
-    reactor_task.abort();
-}
-
-// Per-peer routines removed the reactor "late response after disconnect"
-// path that the original first half of this test exercised: a disconnected peer's
-// `FramedRecv` is closed and its routine has exited, so there is no transport for a
-// late frame and no reactor inbound demux to ignore one. The surviving, still-
-// meaningful guarantee — a connected peer's routine hard-scores an unsolicited
-// `BlocksDone` correlating to no outstanding request — is kept and exercised over a
-// real inbound frame.
-#[tokio::test]
-async fn reactor_scores_unsolicited_terminator_from_connected_peer() {
-    let config = ZakuraBlockSyncConfig::default();
-    let blocks = mainnet_blocks_1_to_3();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(1),
-            verified_block_hash: blocks[0].hash(),
-        },
-        (block::Height(1), blocks[0].hash()),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config.clone(), handle.clone());
 
-    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        64,
-        block::Height(1),
-        blocks[0].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
+    let connection_cancel = CancellationToken::new();
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(8);
+    service.add_peer(Peer::new_with_direction(
+        peer(64),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
     send_inbound(
         &inbound_tx,
         BlockSyncMessage::BlocksDone {
@@ -15597,28 +13972,16 @@ async fn reactor_scores_unsolicited_terminator_from_connected_peer() {
     )
     .await;
 
-    let mut saw_unsolicited_done = false;
-    while let Ok(Some(action)) = tokio::time::timeout(Duration::from_secs(1), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            if peer == peer_id && reason == BlockSyncMisbehavior::UnsolicitedDone {
-                saw_unsolicited_done = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        saw_unsolicited_done,
-        "an unsolicited terminator from a connected peer is hard-scored UnsolicitedDone"
-    );
+    tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
+        .await
+        .expect("an ending without a live request closes the connection");
 
     reactor_task.abort();
 }
 
-/// Misbehavior is record-only: a repeatedly-misbehaving peer is still *observed*
-/// (the reactor emits a `Misbehavior` action as a record) but is **not**
-/// disconnected. Peer scoring no longer drives disconnects, so what used to be a
-/// "soft" offense crossing the threshold-of-3 now leaves the peer connected.
+/// Misbehavior is record-only: the reactor emits a `Misbehavior` action for each
+/// report but never disconnects the peer for it. Protocol violations close the
+/// connection separately, in the routine.
 #[tokio::test]
 async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     let config = ZakuraBlockSyncConfig::default();
@@ -15633,18 +13996,19 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
     // Connect the probe peer with a real pipe-routine (per-peer routines) so its inbound frames
     // are decoded and dispatched.
     let probe = peer(7);
-    let (probe_inbound_tx, probe_inbound_rx) = framed_channel(8);
+    let (_probe_inbound_tx, probe_inbound_rx) = framed_channel(8);
     let (probe_outbound_tx, _probe_outbound_rx) = framed_channel(8);
     service.add_peer(Peer::new_with_direction(
         probe.clone(),
         None,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
         HashMap::from([(
             ZAKURA_STREAM_BLOCK_SYNC,
@@ -15660,33 +14024,33 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     .await
     .expect("probe peer connects");
 
-    // Each `GetBlocks` from a peer that has not sent a Status is `GetBlocksSpam`
-    // (formerly a "soft" offense that disconnected at a threshold of 3). Send well
-    // past the old threshold.
+    let reports = &handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring")
+        .routine_to_reactor;
     for _ in 0..8 {
-        send_inbound(
-            &probe_inbound_tx,
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 1,
-            },
-        )
-        .await;
+        reports
+            .send(super::events::RoutineToReactor::Misbehavior {
+                peer: probe.clone(),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .await
+            .expect("the reactor accepts routine reports");
     }
 
-    // The violation is still recorded: the reactor emits a best-effort
-    // `Misbehavior` action for the spamming peer.
+    // The violation is still recorded as a best-effort `Misbehavior` action.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let BlockSyncAction::Misbehavior { peer, reason } = next_action(&mut actions).await {
-                if peer == probe && reason == BlockSyncMisbehavior::GetBlocksSpam {
+                if peer == probe && reason == BlockSyncMisbehavior::InvalidBlock {
                     break;
                 }
             }
         }
     })
     .await
-    .expect("a misbehavior action is recorded for the spamming peer");
+    .expect("a misbehavior action is recorded for the reported peer");
 
     // But the peer is never torn down: misbehavior no longer cancels the session.
     // Give the reactor ample time to (not) act, then confirm the peer remains.
@@ -15714,7 +14078,8 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(93);
     let old_conn_id = 7;
@@ -15725,7 +14090,7 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
         service.session_demand(
             old_conn_id,
             &peer,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
         ),
         SessionDemand::WaitForChange(_),
@@ -15736,7 +14101,7 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
         service.session_demand(
             new_conn_id,
             &peer,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
         ),
         SessionDemand::OpenNow
@@ -15758,7 +14123,8 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(9);
     let conn_id = 17;
@@ -15767,7 +14133,7 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
     let demand = service.session_demand(
         conn_id,
         &peer,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
     );
     let SessionDemand::WaitForChange(changed) = demand else {
@@ -15789,7 +14155,7 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         service.session_demand(
             conn_id,
             &peer,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
         ),
         SessionDemand::OpenNow,
@@ -15815,7 +14181,8 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         tip_rx,
         config.clone(),
     );
-    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let applying = SyncServiceDemand {
         header: HeaderServiceDemand::Enabled {
             capability_epoch: LifecycleEpoch::new(1),
@@ -15834,7 +14201,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     let SessionDemand::WaitForChange(changed) = service.session_demand(
         conn_id,
         &peer,
-        ZAKURA_CAP_BLOCK_SYNC,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
         ServicePeerDirection::Outbound,
     ) else {
         panic!("native applying demand waits at tip after a local session park");
@@ -15854,7 +14221,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         service.session_demand(
             conn_id,
             &peer,
-            ZAKURA_CAP_BLOCK_SYNC,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
             ServicePeerDirection::Outbound,
         ),
         SessionDemand::OpenNow,
@@ -15969,7 +14336,8 @@ async fn committed_hint_batches_refresh_queued_work_without_resetting_it() {
     let mut changed_view = committed_view(initial.clone(), 0);
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let BlockSyncAction::QueryNeededBlocks {
         query_id, scope, ..
     } = next_action(&mut actions).await
@@ -16071,7 +14439,8 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     let mut changed_view = committed_view(initial.clone(), 0);
     let (snapshots, startup) =
         committed_block_sync_startup(initial, immediate_body_download_config());
-    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let (handle, mut actions, task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let BlockSyncAction::QueryNeededBlocks { scope, .. } = next_action(&mut actions).await else {
         panic!("startup query")
     };

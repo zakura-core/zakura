@@ -34,15 +34,15 @@ pub(crate) use request::{
 
 mod serve;
 pub(crate) use serve::{
-    Completion, CompletionId, Completions, Produce, Push, PushPermit, Responded, ResponseCap,
-    ResponseSink, Serve, ServeCapacity, ServeConfigError, ServeEnd, ServeLimits, ServeViolation,
-    SinkError, SinkProgress, WorkLease,
+    Completion, CompletionId, Completions, OutputOrder, Produce, Push, PushPermit, Responded,
+    ResponseCap, ResponseSink, Serve, ServeCapacity, ServeConfigError, ServeEnd, ServeLimits,
+    ServeViolation, SinkError, SinkProgress, WorkLease,
 };
 
 mod reservations;
 pub(crate) use reservations::{
-    ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot, ReservationPool,
-    Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
+    shrink_after_peak, ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot,
+    ReservationPool, Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
 };
 
 mod session_capacity;

@@ -33,3 +33,9 @@ timeout = 120
 remote_deadline = 100
 # Same as the checker default and the deployed Rust watchdog.
 height_max_drift = 10
+
+# Probe the public route as consumers see it, including frozen HTTP-200 data.
+[[nu7_dashboard]]
+name = "nu7"
+url = "https://api.nu7.valargroup.dev/v1/dashboard"
+dashboard_url = "https://zakura.com/nu7/"

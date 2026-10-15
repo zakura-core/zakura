@@ -670,6 +670,18 @@ impl Config {
             return Ok(());
         }
 
+        self.write_peer_cache(peer_list).await
+    }
+
+    /// Replaces the peer cache, including when all previous peers have been banned.
+    pub(crate) async fn write_peer_cache(
+        &self,
+        peer_list: HashSet<PeerSocketAddr>,
+    ) -> io::Result<()> {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
+            return Ok(());
+        };
+
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
             .take(MAX_PEER_DISK_CACHE_SIZE)

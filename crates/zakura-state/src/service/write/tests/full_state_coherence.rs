@@ -632,7 +632,10 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
     staged.commit_block(prepared, &finalized_state.db).unwrap();
     commit_verified_change(&writer, &mut live, staged, tied_frontier);
     let snapshot = writer.runtime.publisher().snapshot();
-    assert_eq!(snapshot.frontiers.header_best, tied_frontier);
+    assert_eq!(
+        snapshot.frontiers.header_best, incumbent,
+        "an equal-work arrival preserves the selected header"
+    );
     assert_eq!(snapshot.frontiers.verified_best, incumbent);
 
     let mut staged = live.clone();

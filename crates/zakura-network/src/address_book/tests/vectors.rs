@@ -301,3 +301,45 @@ fn test_reconnection_peers_skips_recently_updated_ip<
         assert_ne!(next_reconnection_peer, None,);
     }
 }
+
+/// An inbound peer's ephemeral source endpoint is never dialed or written to the peer
+/// cache after it disconnects, while an outbound peer's listener still is.
+#[test]
+fn disconnected_inbound_endpoint_is_not_dialed_or_cached() {
+    let _init_guard = zakura_test::init();
+
+    for is_inbound in [true, false] {
+        let addr: crate::PeerSocketAddr = "127.0.0.1:51234".parse().unwrap();
+        let mut address_book = AddressBook::new(
+            "0.0.0.0:0".parse().unwrap(),
+            &Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
+            Span::none(),
+        );
+        address_book.update(MetaAddr::new_connected(
+            addr,
+            &PeerServices::NODE_NETWORK,
+            is_inbound,
+        ));
+        address_book.update(MetaAddr::new_errored(addr, PeerServices::NODE_NETWORK));
+
+        let later =
+            crate::constants::MIN_PEER_RECONNECTION_DELAY + std::time::Duration::from_secs(1);
+        let instant_later = Instant::now() + later;
+        let chrono_later = Utc::now() + chrono::Duration::from_std(later).unwrap();
+
+        let dialable = address_book
+            .reconnection_peers(instant_later, chrono_later)
+            .any(|peer| peer.addr == addr);
+        let cached = address_book
+            .cacheable(chrono_later)
+            .iter()
+            .any(|peer| peer.addr == addr);
+
+        assert_eq!(
+            dialable, !is_inbound,
+            "inbound {is_inbound}: reconnection_peers"
+        );
+        assert_eq!(cached, !is_inbound, "inbound {is_inbound}: cacheable");
+    }
+}

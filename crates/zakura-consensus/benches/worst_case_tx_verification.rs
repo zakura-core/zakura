@@ -206,10 +206,13 @@ struct BenchmarkSummary {
     sample_seconds: Vec<f64>,
 }
 
-type BenchmarkMempool =
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+type BenchmarkMempool = Buffer<
+    mempool::Request,
+    futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+>;
 
-type TxVerifier = Buffer<BoxService<Request, tx::Response, TransactionError>, Request>;
+type TxVerifier =
+    Buffer<Request, futures::future::BoxFuture<'static, Result<tx::Response, TransactionError>>>;
 
 #[derive(Clone, Debug)]
 struct BenchmarkState;

@@ -175,9 +175,12 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
         ]
     };
     let work = f.work.clone();
-    let retained = |mut entries: Vec<(_, (BodyWorkOwner, u8))>| {
-        work.retain_owned(&mut entries, |(owner, _)| *owner);
+    let retained = |entries: Vec<(_, (BodyWorkOwner, u8))>| {
+        let disowned = work.disowned(&entries, |(owner, _)| *owner);
         entries
+            .into_iter()
+            .filter(|entry| !disowned.contains(entry))
+            .collect::<Vec<_>>()
     };
 
     assert!(retained(candidates(owner)).is_empty(), "unpublished work");

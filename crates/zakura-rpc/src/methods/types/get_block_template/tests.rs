@@ -6,7 +6,6 @@ use anyhow::anyhow;
 use std::iter;
 use zakura_chain::amount::Amount;
 
-use zcash_keys::address::Address;
 use zcash_script::script::Evaluable;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
@@ -28,7 +27,7 @@ use zakura_script::Sigops;
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::{MinerParams, TemplatePreparationQueue};
+use super::{MinerAddress, MinerParams, TemplatePreparationQueue};
 
 #[test]
 fn template_rejection_targets_work_and_ignores_old_parents() {
@@ -171,7 +170,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
 
     for net in Network::iter().chain(iter::once(regtest)) {
         let miner_params = MinerParams::from(
-            Address::decode(
+            MinerAddress::decode(
                 &net,
                 default_miner_address(net.kind(), &MinerAddressType::Transparent),
             )
@@ -207,7 +206,7 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
         .activation_height(&net)
         .expect("the default local network activates NU6.3");
     let miner_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Transparent),
         )
@@ -370,33 +369,81 @@ fn distinct_coinbase_tags_give_shared_address_miners_distinct_work() {
     );
 }
 
+/// A configured unified address with a malformed shielded receiver is rejected when the
+/// miner parameters are built, instead of panicking or failing later during coinbase
+/// construction.
+///
+/// The unified decoder checks only receiver typecodes and lengths, so this is the input
+/// shape behind
+/// [GHSA-c8w6-x74f-vmg3](https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-c8w6-x74f-vmg3).
+#[test]
+fn miner_params_reject_malformed_unified_receivers() {
+    use zcash_address::{
+        unified::{Address as UnifiedAddress, Encoding, Receiver},
+        ZcashAddress,
+    };
+    use zcash_protocol::consensus::NetworkType;
+
+    use crate::config::mining;
+
+    // 0xFF * 32 is not a canonical Jubjub `pk_d`, so this Sapling receiver does not decode.
+    let mut bad_sapling = [0u8; 43];
+    bad_sapling[..11].copy_from_slice(&[0x11; 11]);
+    bad_sapling[11..].copy_from_slice(&[0xFF; 32]);
+
+    for receivers in [
+        vec![Receiver::Sapling(bad_sapling), Receiver::P2pkh([0x7e; 20])],
+        vec![Receiver::Orchard([0xFF; 43]), Receiver::P2pkh([0x7e; 20])],
+    ] {
+        let unified = UnifiedAddress::try_from_items(receivers)
+            .expect("unified container construction does not validate receiver bytes");
+        let miner_address: ZcashAddress = unified
+            .encode(&NetworkType::Main)
+            .parse()
+            .expect("the encoded unified address parses");
+
+        let result = MinerParams::new(
+            &Network::Mainnet,
+            mining::Config {
+                miner_address: Some(miner_address),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(result, Err(super::MinerParamsError::InvalidAddr(_))),
+            "malformed unified receivers must be rejected, got {result:?}",
+        );
+    }
+}
+
 /// Sapling payouts fail explicitly, and unified addresses use transparent
 /// receivers before Ironwood activation.
 #[test]
 fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
     let net = shielded_coinbase_testnet();
     let sapling_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Sapling),
         )
         .expect("hard-coded Sapling miner address is valid"),
     );
     let unified_params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Unified),
         )
         .expect("hard-coded unified miner address is valid"),
     );
     let sapling_receiver = match sapling_params.addr() {
-        Address::Sapling(addr) => *addr,
+        MinerAddress::Sapling(addr) => *addr,
         _ => unreachable!(),
     };
-    let sapling_only_unified = MinerParams::from(Address::Unified(
-        zcash_keys::address::UnifiedAddress::from_receivers(None, Some(sapling_receiver), None)
-            .expect("a Sapling receiver forms a valid unified address"),
-    ));
+    let sapling_only_unified = MinerParams::from(MinerAddress::Unified {
+        orchard: None,
+        sapling: Some(sapling_receiver),
+        transparent: None,
+    });
     for upgrade in [
         NetworkUpgrade::Sapling,
         NetworkUpgrade::Canopy,
@@ -427,7 +474,10 @@ fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
             assert!(tx.orchard_shielded_data().is_none());
             assert!(tx.ironwood_shielded_data().is_none());
             let receiver = match unified_params.addr() {
-                Address::Unified(addr) => addr.transparent().unwrap(),
+                MinerAddress::Unified {
+                    transparent: Some(addr),
+                    ..
+                } => addr,
                 _ => unreachable!(),
             };
             let script = receiver.script().to_bytes();
@@ -451,7 +501,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
         .activation_height(&net)
         .expect("NU6.3 activation height is configured");
     let params = MinerParams::from(
-        Address::decode(
+        MinerAddress::decode(
             &net,
             default_miner_address(net.kind(), &MinerAddressType::Unified),
         )

@@ -42,10 +42,13 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-use self::{counted_set::CountedSet, index::TransparentTransfers};
+use self::{counted_set::CountedSet, height_map::HeightMap, index::TransparentTransfers};
 use super::{AddressTransfers, CreatedUtxos};
 
+#[cfg(test)]
+mod chunked_height_map_tests;
 mod counted_set;
+mod height_map;
 pub mod index;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
@@ -124,29 +127,25 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) sprout_trees_by_height:
-        BTreeMap<block::Height, Arc<sprout::tree::NoteCommitmentTree>>,
+    pub(crate) sprout_trees_by_height: HeightMap<Arc<sprout::tree::NoteCommitmentTree>>,
 
     /// The Sapling note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) sapling_trees_by_height:
-        BTreeMap<block::Height, Arc<sapling::tree::NoteCommitmentTree>>,
+    pub(crate) sapling_trees_by_height: HeightMap<Arc<sapling::tree::NoteCommitmentTree>>,
 
     /// The Orchard note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) orchard_trees_by_height:
-        BTreeMap<block::Height, Arc<orchard::tree::NoteCommitmentTree>>,
+    pub(crate) orchard_trees_by_height: HeightMap<Arc<orchard::tree::NoteCommitmentTree>>,
 
     /// The Ironwood note commitment tree for each height.
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_trees_by_height:
-        BTreeMap<block::Height, Arc<ironwood::tree::NoteCommitmentTree>>,
+    pub(crate) ironwood_trees_by_height: HeightMap<Arc<ironwood::tree::NoteCommitmentTree>>,
 
     // History trees
     //
@@ -168,7 +167,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sprout_anchors_by_height: BTreeMap<block::Height, sprout::tree::Root>,
+    pub(crate) sprout_anchors_by_height: HeightMap<sprout::tree::Root>,
 
     /// The Sapling anchors created by `blocks`.
     ///
@@ -179,7 +178,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) sapling_anchors_by_height: BTreeMap<block::Height, sapling::tree::Root>,
+    pub(crate) sapling_anchors_by_height: HeightMap<sapling::tree::Root>,
     /// A list of Sapling subtrees completed in the non-finalized state
     pub(crate) sapling_subtrees:
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
@@ -193,7 +192,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) orchard_anchors_by_height: BTreeMap<block::Height, orchard::tree::Root>,
+    pub(crate) orchard_anchors_by_height: HeightMap<orchard::tree::Root>,
     /// A list of Orchard subtrees completed in the non-finalized state
     pub(crate) orchard_subtrees:
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
@@ -212,7 +211,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip root.
     /// This extra root is removed when the first non-finalized block is committed.
-    pub(crate) ironwood_anchors_by_height: BTreeMap<block::Height, ironwood::tree::Root>,
+    pub(crate) ironwood_anchors_by_height: HeightMap<ironwood::tree::Root>,
 
     // Nullifiers
     //
@@ -652,9 +651,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.sprout_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.sprout_tree(height.into()),
@@ -854,9 +852,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.sapling_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.sapling_tree(height.into()),
@@ -1165,9 +1162,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.orchard_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.orchard_tree(height.into()),
@@ -1224,9 +1220,8 @@ impl Chain {
                 // Remove all trees and anchors at or below the removed block.
                 // This makes sure the temporary trees from finalized tip forks are removed.
                 self.ironwood_anchors_by_height
-                    .keys()
-                    .cloned()
-                    .filter(|index_height| *index_height <= height)
+                    .range(..=height)
+                    .map(|(index_height, _)| *index_height)
                     .collect(),
                 // Cache the highest (rightmost) tree before its removal.
                 self.ironwood_tree(height.into()),

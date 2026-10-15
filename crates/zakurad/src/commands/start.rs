@@ -2386,7 +2386,9 @@ mod zakura_header_sync_driver_tests {
         zakura_network::zakura::ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is valid")
     }
 
-    fn read_state_serving_blocks(
+    /// Read state for fallback driver tests. The first needed-blocks metadata
+    /// read signals `query_seen`, marking that earlier actions were handled.
+    fn fallback_read_state(
         blocks: Vec<Arc<block::Block>>,
         query_seen: Option<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
     ) -> BoxCloneService<
@@ -2399,7 +2401,7 @@ mod zakura_header_sync_driver_tests {
             let query_seen = query_seen.clone();
             async move {
                 match request {
-                    zakura_state::ReadRequest::BlocksByHeightRange { start, count } => {
+                    zakura_state::ReadRequest::MissingBlockBodyMetadata { .. } => {
                         if let Some(query_seen) = query_seen {
                             if let Some(query_seen) = query_seen
                                 .lock()
@@ -2410,17 +2412,15 @@ mod zakura_header_sync_driver_tests {
                             }
                         }
 
-                        let end = (start + i64::from(count.saturating_sub(1)))
-                            .unwrap_or(block::Height::MAX);
-                        let blocks = blocks
-                            .into_iter()
-                            .filter_map(|block| {
-                                let height = block.coinbase_height()?;
-                                (height >= start && height <= end).then_some((height, block, 0))
-                            })
-                            .collect();
-
-                        Ok(zakura_state::ReadResponse::Blocks(blocks))
+                        Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                            zakura_state::BlockSyncBodyMetadata {
+                                anchor: zakura_header_chain::Frontier::new(
+                                    block::Height(0),
+                                    block::Hash([0; 32]),
+                                ),
+                                blocks: Vec::new(),
+                            },
+                        ))
                     }
                     zakura_state::ReadRequest::FinalizedTip => {
                         let tip = blocks
@@ -2685,7 +2685,7 @@ mod zakura_header_sync_driver_tests {
     async fn wait_for_query_seen(query_seen_rx: oneshot::Receiver<()>) {
         tokio::time::timeout(Duration::from_secs(1), query_seen_rx)
             .await
-            .expect("driver handles the serving query")
+            .expect("driver handles the barrier query")
             .expect("query signal sender remains live");
     }
 
@@ -3228,7 +3228,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(1);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = panicking_read_state("persisting body retry evidence");
         let verifier = panicking_verifier("persisting body retry evidence");
         let (request_tx, mut request_rx) = mpsc::channel(1);
@@ -3300,7 +3301,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(1);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = panicking_read_state("persisting invalid-body evidence");
         let verifier = panicking_verifier("persisting invalid-body evidence");
         let (request_tx, mut request_rx) = mpsc::channel(1);
@@ -3368,7 +3370,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(1);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = panicking_read_state("refreshing invalid-body evidence");
         let verifier = panicking_verifier("refreshing invalid-body evidence");
         let (request_tx, mut request_rx) = mpsc::channel(2);
@@ -3461,7 +3464,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(1);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = panicking_read_state("fail-closing invalid-body evidence");
         let verifier = panicking_verifier("fail-closing invalid-body evidence");
         let header_chain_write =
@@ -3514,7 +3518,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
 
         let expected_metadata = Arc::new(vec![
             (block::Height(1), block1.hash(), Some(0)),
@@ -3640,7 +3645,8 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let first_query = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
             .await
             .expect("startup needed-body query arrives")
@@ -3709,7 +3715,8 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let first_query = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
             .await
             .expect("startup needed-body query arrives")
@@ -3771,7 +3778,8 @@ mod zakura_header_sync_driver_tests {
         );
         startup.trace = trace.clone();
         let (block_sync, mut reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let (probe, mut completion_rx) =
             BlocksyncThroughputProbe::new(initial_frontiers, block::Height(2));
 
@@ -3927,7 +3935,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let (verifier, mut commit_rx) = commit_channel_verifier();
         let read_state = fixed_tip_read_state(block::Height(2), block2.hash());
         let (driver, shutdown_tx) = DriverParams::default().spawn(
@@ -3947,7 +3956,7 @@ mod zakura_header_sync_driver_tests {
         action_tx
             .send(BlockSyncAction::Misbehavior {
                 peer,
-                reason: zakura_network::zakura::BlockSyncMisbehavior::SizeMismatch,
+                reason: zakura_network::zakura::BlockSyncMisbehavior::InvalidBlock,
             })
             .await
             .expect("driver action channel stays open");
@@ -3995,7 +4004,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let release_first = Arc::new(tokio::sync::Notify::new());
         let (verifier, mut commit_rx) =
             height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
@@ -4058,7 +4068,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let release_first = Arc::new(tokio::sync::Notify::new());
         let (verifier, mut commit_rx) =
             height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
@@ -4122,7 +4133,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let release_first = Arc::new(tokio::sync::Notify::new());
         let (verifier, mut commit_rx) =
             height_reporting_verifier(Arc::new(AtomicUsize::new(0)), Some(release_first.clone()));
@@ -4198,7 +4210,8 @@ mod zakura_header_sync_driver_tests {
         let mut startup = block_sync_startup_for_test();
         startup.trace = trace.clone();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let commit_count = Arc::new(AtomicUsize::new(0));
         let verifier = counting_verifier(commit_count.clone(), None);
         let handoff = super::zakura::SyncCoordinator::new();
@@ -4208,7 +4221,7 @@ mod zakura_header_sync_driver_tests {
             .expect("idle native applies yield to fallback");
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
-        let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
+        let read_state = fallback_read_state(vec![block.clone()], Some(query_seen));
         let (driver, shutdown_tx) = DriverParams {
             max_checkpoint_height: block::Height(0),
             full_apply_limit: 1,
@@ -4225,9 +4238,8 @@ mod zakura_header_sync_driver_tests {
             verifier,
         );
 
-        // Send 2 actions to the driver
-        // Submit block should be acked as abandoned.
-        // QueryBlocksByHeightRange should still be served, proving Zakura is still alive as a serving bridge.
+        // The submitted block should be acked as abandoned. The needed-blocks
+        // query that follows it marks when the driver has handled both actions.
         action_tx
             .send(BlockSyncAction::SubmitBlock {
                 owner: test_block_work_owner(),
@@ -4238,11 +4250,12 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("driver action channel stays open");
         action_tx
-            .send(BlockSyncAction::QueryBlocksByHeightRange {
-                peer: test_zakura_peer(77),
-                start: block::Height(1),
-                count: 1,
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                1,
+                block::Height(1),
+            ))
             .await
             .expect("driver action channel stays open");
         wait_for_query_seen(query_seen_rx).await;
@@ -4263,17 +4276,6 @@ mod zakura_header_sync_driver_tests {
         // The driver did not drop this submit block.
         // Instead, it marked it as abandoned.
         assert_abandoned_apply_trace_rows(&rows, [77]);
-        commit_state.assert_row(
-            cs_trace::REACTOR_EVENT_SENT,
-            &[
-                (
-                    cs_trace::ACTION,
-                    TraceValue::Str("block_range_response_ready"),
-                ),
-                (cs_trace::RANGE_START, TraceValue::U64(1)),
-                (cs_trace::RANGE_COUNT, TraceValue::U64(1)),
-            ],
-        );
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
@@ -4291,14 +4293,15 @@ mod zakura_header_sync_driver_tests {
         let mut startup = block_sync_startup_for_test();
         startup.trace = trace.clone();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let commit_count = Arc::new(AtomicUsize::new(0));
         let release_first = Arc::new(tokio::sync::Notify::new());
         let verifier = counting_verifier(commit_count.clone(), Some(release_first.clone()));
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state =
-            read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
+            fallback_read_state(vec![block1.clone(), block2.clone()], Some(query_seen));
         let handoff = super::zakura::SyncCoordinator::new();
         let drain_handoff = handoff.clone();
         let (driver, shutdown_tx) = DriverParams {
@@ -4361,11 +4364,12 @@ mod zakura_header_sync_driver_tests {
             .expect("fallback drain task exits")
             .expect("fallback acquires the lease after the apply drains");
         action_tx
-            .send(BlockSyncAction::QueryBlocksByHeightRange {
-                peer: test_zakura_peer(78),
-                start: block::Height(1),
-                count: 1,
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                1,
+                block::Height(1),
+            ))
             .await
             .expect("driver action channel stays open");
         wait_for_query_seen(query_seen_rx).await;
@@ -4397,74 +4401,6 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
-    async fn fallback_yield_still_serves_block_range_queries() {
-        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
-        let (action_tx, action_rx) = mpsc::channel(8);
-        let mut capture =
-            TraceCapture::for_test("fallback_yield_still_serves_block_range_queries").unwrap();
-        let trace = zakura_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
-        let mut startup = block_sync_startup_for_test();
-        startup.trace = trace.clone();
-        let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
-        let commit_count = Arc::new(AtomicUsize::new(0));
-        let verifier = counting_verifier(commit_count.clone(), None);
-        let (query_seen_tx, query_seen_rx) = oneshot::channel();
-        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
-        let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
-        let handoff = super::zakura::SyncCoordinator::new();
-        let _fallback_lease = handoff
-            .acquire_legacy_fallback(Duration::from_secs(1))
-            .await
-            .expect("idle native applies yield to fallback");
-        let (driver, shutdown_tx) = DriverParams {
-            max_checkpoint_height: block::Height(0),
-            full_apply_limit: 1,
-            combined_apply_limit: 1,
-            trace: trace.clone(),
-            handoff,
-            ..DriverParams::default()
-        }
-        .spawn(
-            action_rx,
-            block_sync,
-            zakura_chain::chain_tip::NoChainTip,
-            read_state,
-            verifier,
-        );
-
-        // Send a serving query to Zakura.
-        action_tx
-            .send(BlockSyncAction::QueryBlocksByHeightRange {
-                peer: test_zakura_peer(79),
-                start: block::Height(1),
-                count: 1,
-            })
-            .await
-            .expect("driver action channel stays open");
-        wait_for_query_seen(query_seen_rx).await;
-        assert_eq!(commit_count.load(Ordering::SeqCst), 0);
-
-        capture.flush().await;
-        let reader = capture.reader().unwrap();
-        reader.table(COMMIT_STATE_TABLE.table()).assert_row(
-            cs_trace::REACTOR_EVENT_SENT,
-            &[
-                (
-                    cs_trace::ACTION,
-                    TraceValue::Str("block_range_response_ready"),
-                ),
-                (cs_trace::RANGE_START, TraceValue::U64(1)),
-                (cs_trace::RANGE_COUNT, TraceValue::U64(1)),
-            ],
-        );
-
-        let _ = shutdown_tx.send(());
-        driver.await.expect("driver task exits cleanly");
-        reactor_task.abort();
-    }
-
-    #[tokio::test]
     async fn fallback_yield_handles_submit_storm_without_restarting_applies() {
         const SUBMIT_COUNT: u64 = 128;
 
@@ -4479,13 +4415,14 @@ mod zakura_header_sync_driver_tests {
         let mut startup = block_sync_startup_for_test();
         startup.trace = trace.clone();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let commit_count = Arc::new(AtomicUsize::new(0));
         let verifier = counting_verifier(commit_count.clone(), None);
         let (query_seen_tx, query_seen_rx) = oneshot::channel();
         let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
         let read_state =
-            read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
+            fallback_read_state(vec![block1.clone(), block2.clone()], Some(query_seen));
         let handoff = super::zakura::SyncCoordinator::new();
         let _fallback_lease = handoff
             .acquire_legacy_fallback(Duration::from_secs(1))
@@ -4524,13 +4461,14 @@ mod zakura_header_sync_driver_tests {
                 .expect("driver action channel stays open during submit storm");
         }
         action_tx
-            .send(BlockSyncAction::QueryBlocksByHeightRange {
-                peer: test_zakura_peer(80),
-                start: block::Height(1),
-                count: 2,
-            })
+            .send(needed_blocks_query(
+                1,
+                block::Height(1),
+                1,
+                block::Height(1),
+            ))
             .await
-            .expect("driver action channel handles serving work after submit storm");
+            .expect("driver action channel handles the barrier query after submit storm");
         wait_for_query_seen(query_seen_rx).await;
 
         assert_eq!(
@@ -4544,17 +4482,6 @@ mod zakura_header_sync_driver_tests {
         let commit_state = reader.table(COMMIT_STATE_TABLE.table());
         let rows = commit_state.rows();
         assert_abandoned_apply_trace_rows(&rows, 1..=SUBMIT_COUNT);
-        commit_state.assert_row(
-            cs_trace::REACTOR_EVENT_SENT,
-            &[
-                (
-                    cs_trace::ACTION,
-                    TraceValue::Str("block_range_response_ready"),
-                ),
-                (cs_trace::RANGE_START, TraceValue::U64(1)),
-                (cs_trace::RANGE_COUNT, TraceValue::U64(2)),
-            ],
-        );
 
         let _ = shutdown_tx.send(());
         tokio::time::timeout(Duration::from_secs(1), driver)
@@ -4571,7 +4498,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let release_first = Arc::new(tokio::sync::Notify::new());
         let commit_count = Arc::new(AtomicUsize::new(0));
         let (verifier, mut commit_rx) =
@@ -4736,7 +4664,8 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, mut reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
 
         let startup_action = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
             .await
@@ -4815,7 +4744,8 @@ mod zakura_header_sync_driver_tests {
 
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
             match request {
                 zakura_consensus::Request::Commit(block) => {
@@ -4895,7 +4825,8 @@ mod zakura_header_sync_driver_tests {
 
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
             match request {
                 zakura_consensus::Request::Commit(_block) => {
@@ -4995,7 +4926,8 @@ mod zakura_header_sync_driver_tests {
         });
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let handoff = super::zakura::SyncCoordinator::new();
         let permit = handoff
             .begin_apply()
@@ -5067,7 +4999,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let (release_commit_tx, release_commit_rx) = tokio::sync::watch::channel(false);
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let mut release_commit_rx = release_commit_rx.clone();
@@ -5176,7 +5109,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(two_checkpoint_gaps + 8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let commit_count = Arc::new(AtomicUsize::new(0));
         let (release_commits_tx, release_commits_rx) = tokio::sync::watch::channel(false);
         let verifier_count = commit_count.clone();
@@ -5268,7 +5202,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(8);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let attempts = Arc::new(AtomicUsize::new(0));
         let verifier_attempts = attempts.clone();
         let (commit_tx, mut commit_rx) = mpsc::channel(8);
@@ -5435,7 +5370,12 @@ mod zakura_header_sync_driver_tests {
             async move {
                 match request {
                     zakura_consensus::Request::Commit(block) => {
-                        checkpoint_verifier.oneshot(block).await
+                        // Boxing proves the buffered future is `Send` to the spawned driver.
+                        let commit: futures::future::BoxFuture<
+                            'static,
+                            Result<block::Hash, tower::BoxError>,
+                        > = Box::pin(checkpoint_verifier.oneshot(block));
+                        commit.await
                     }
                     request => panic!("unexpected consensus request: {request:?}"),
                 }
@@ -5445,7 +5385,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(64);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let handoff = super::zakura::SyncCoordinator::new();
         let (driver, shutdown_tx) = DriverParams {
             // Every block 0..=10 is at or below the checkpoint, so all are Checkpoint-class
@@ -5603,7 +5544,12 @@ mod zakura_header_sync_driver_tests {
             async move {
                 match request {
                     zakura_consensus::Request::Commit(block) => {
-                        checkpoint_verifier.oneshot(block).await
+                        // Boxing proves the buffered future is `Send` to the spawned driver.
+                        let commit: futures::future::BoxFuture<
+                            'static,
+                            Result<block::Hash, tower::BoxError>,
+                        > = Box::pin(checkpoint_verifier.oneshot(block));
+                        commit.await
                     }
                     request => panic!("unexpected consensus request: {request:?}"),
                 }
@@ -5613,7 +5559,8 @@ mod zakura_header_sync_driver_tests {
         let (action_tx, action_rx) = mpsc::channel(64);
         let startup = block_sync_startup_for_test();
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let (driver, shutdown_tx) = DriverParams {
             max_checkpoint_height: second_checkpoint_height,
             ..DriverParams::default()
@@ -5709,7 +5656,8 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (stale_block_sync, mut stale_actions, stale_reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
 
         let startup_action = tokio::time::timeout(Duration::from_secs(1), stale_actions.recv())
             .await
@@ -5819,7 +5767,8 @@ mod zakura_header_sync_driver_tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (_fresh_block_sync, mut fresh_actions, fresh_reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(restart_startup);
+            zakura_network::zakura::spawn_block_sync_reactor(restart_startup)
+                .expect("valid block-sync config");
         let restart_action = tokio::time::timeout(Duration::from_secs(1), fresh_actions.recv())
             .await
             .expect("fresh reactor emits startup action")

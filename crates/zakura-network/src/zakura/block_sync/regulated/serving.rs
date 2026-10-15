@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use zakura_chain::{block, serialization::ZcashSerialize};
+use zakura_chain::{block, diagnostic::task::CheckForPanics};
 
 use super::wire::{Message, Range};
 use crate::zakura::{
@@ -14,32 +13,20 @@ use crate::zakura::{
     wire_codec::WireError,
 };
 
-/// The source moves the lease into the actual blocking job and returns it with
-/// the result. Cancellation must not release execution while that job runs.
-pub(super) trait Source: Send + Sync + 'static {
-    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>>;
-}
+use super::super::source::BlockRangeReadLease;
+pub(super) use super::super::source::{
+    BlockRangeRead as Read, BlockRangeReadResult as ReadResult, BlockRangeSource as Source,
+};
 
-pub(super) struct Read {
-    pub(super) range: Range,
-    pub(super) max_body_bytes: u32,
-    pub(super) lease: WorkLease,
-}
-
-/// Blocks drop before their execution lease. The source limits the result to
-/// the requested count and body bytes before retaining it.
-pub(super) struct ReadResult {
-    pub(super) blocks: Vec<(block::Height, Arc<block::Block>)>,
-    pub(super) lease: WorkLease,
-}
-
-pub(super) struct Server<S> {
+#[derive(Debug)]
+pub(super) struct Server<S: ?Sized> {
     source: Arc<S>,
+    session: Option<crate::zakura::FramedSend>,
     max_blocks: u32,
     max_body_bytes: u32,
 }
 
-impl<S> Server<S> {
+impl<S: ?Sized> Server<S> {
     pub(super) fn new(
         source: Arc<S>,
         max_blocks: u32,
@@ -52,13 +39,21 @@ impl<S> Server<S> {
         }
         Ok(Self {
             source,
+            session: None,
             max_blocks,
             max_body_bytes,
         })
     }
 }
 
-impl<S: Source> Produce for Server<S> {
+impl<S: ?Sized> Server<S> {
+    pub(super) fn with_session(mut self, send: crate::zakura::FramedSend) -> Self {
+        self.session = Some(send);
+        self
+    }
+}
+
+impl<S: Source + ?Sized> Produce for Server<S> {
     type Request = Range;
     type Message = Message;
 
@@ -86,21 +81,27 @@ impl<S: Source> Produce for Server<S> {
         let result = self
             .source
             .read(Read {
-                range: read_range,
+                start_height: read_range.start,
+                count: read_range.count,
                 max_body_bytes: self.max_body_bytes,
-                lease,
+                lease: BlockRangeReadLease {
+                    work: lease,
+                    _session: self.session.clone(),
+                },
             })
             .await
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
         let requested = *range;
         let max_body_bytes = self.max_body_bytes;
-        // Encoding can be expensive. Await the actual job, even after session
-        // cancellation, and keep the source's lease with its retained blocks.
+        // Copying up to the response cap into frames can still take a while.
+        // Await the actual job, even after session cancellation, and keep the
+        // source's lease with its retained blocks.
         tokio::task::spawn_blocking(move || {
             encode_response(requested, read_range.count, max_body_bytes, result, sink)
         })
         .await
-        .map_err(|error| ServeEnd::LocalFault(error.to_string()))?
+        .check_for_panics_with(false)
+        .map_err(|_| ServeEnd::Cancelled)?
     }
 
     fn local_failure(&self, range: &Range, sent: SinkProgress) -> Message {
@@ -108,6 +109,8 @@ impl<S: Source> Produce for Server<S> {
     }
 }
 
+/// Send the source's serialized blocks unchanged as a contiguous prefix of
+/// `requested`, within `max_blocks` and `max_body_bytes`, then end the response.
 fn encode_response(
     requested: Range,
     max_blocks: u32,
@@ -115,18 +118,18 @@ fn encode_response(
     result: ReadResult,
     mut sink: ResponseSink<Message>,
 ) -> Result<Responded, ServeEnd> {
+    let ReadResult { blocks, lease } = result;
     let mut returned = 0;
     let mut body_bytes = 0_u64;
-    for (height, block) in &result.blocks {
-        if result.lease.is_cancelled() {
+    // Consuming the blocks drops each one once it is framed, and any unsent
+    // remainder when the loop ends, all before `lease` is released.
+    for (height, bytes) in blocks {
+        if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
         if returned == max_blocks || height.0 != requested.start.0 + returned {
             break;
         }
-        let bytes = block
-            .zcash_serialize_to_vec()
-            .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
         // usize fits u64 on the supported 64-bit targets.
         let len = bytes.len() as u64;
         if len > block::MAX_BLOCK_BYTES {
@@ -139,10 +142,11 @@ fn encode_response(
         }
         sink.send(&Message::Block(bytes))
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
+        metrics::counter!("sync.block.body.served").increment(1);
         body_bytes += len;
         returned += 1;
     }
-    if result.lease.is_cancelled() {
+    if lease.is_cancelled() {
         return Err(ServeEnd::Cancelled);
     }
     sink.finish(&ending(requested, returned))

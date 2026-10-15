@@ -1483,3 +1483,30 @@ fn activation_height_overlay_is_only_for_configured_testnets() {
         );
     }
 }
+
+/// A loaded config must fund at least one GetBlocks request per block-sync
+/// session slot: 3,633 inbound plus outbound slots load, 3,634 do not.
+#[test]
+fn loaded_block_sync_session_slots_must_fund_one_request_each() {
+    let _init_guard = zakura_test::init();
+
+    let load = |inbound: u64, outbound: u64| {
+        toml::from_str::<Config>(&format!(
+            r#"
+            [zakura.block_sync.peer_limits]
+            max_inbound_peers = {inbound}
+            max_outbound_peers = {outbound}
+            "#
+        ))
+    };
+
+    assert!(load(256, 256).is_ok(), "defaults load");
+    assert!(load(0, 0).is_ok(), "zero slots load and serve nobody");
+    assert!(load(3_000, 633).is_ok());
+    for (inbound, outbound) in [(3_000, 634), (i64::MAX as u64, i64::MAX as u64)] {
+        let error = load(inbound, outbound)
+            .expect_err("unfundable session slots must not load")
+            .to_string();
+        assert!(error.contains("at most 3,633"), "unexpected error: {error}");
+    }
+}

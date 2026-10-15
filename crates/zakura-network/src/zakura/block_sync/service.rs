@@ -2,8 +2,8 @@ use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
-    FRAME_HEADER_BYTES,
+    SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -21,15 +21,35 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
+/// Stream-6 frames the transport reader may queue for the peer routine.
+///
+/// The live reservations' owed bound grows with the request window, at up to
+/// one 2 MB body per live range. This depth caps the queue at a constant
+/// instead. A session holds these frames, the one the reader waits to forward
+/// and the one the routine is working on: 10 frames, about 20 MB. Later
+/// frames wait in the QUIC stream receive window, so
+/// the cap only slows a peer when the routine is already the bottleneck.
+/// Requests and control share the queue, so it keeps the two slots that
+/// regulation needs (`minimum_ordered_queue_capacity`).
+const BLOCK_SYNC_INBOUND_QUEUE_DEPTH: usize = 8;
+
 const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
-    version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+    version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
-    capability: ZAKURA_CAP_BLOCK_SYNC,
+    capability: ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+    messages: Some(super::regulated::wire::RULES),
+    queue_depths: Some(StreamQueueDepths {
+        inbound: BLOCK_SYNC_INBOUND_QUEUE_DEPTH,
+        // Serving output has its own byte bound, so writes keep the
+        // transport's depth.
+        outbound: usize::MAX,
+    }),
     ..Stream::PERSISTENT
 }];
 
-/// Service-declared streams for native block sync.
+/// The block-sync stream layout.
+#[cfg(test)]
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
 }
@@ -37,6 +57,7 @@ pub(crate) fn block_sync_streams() -> &'static [Stream] {
 /// Cloneable typed stream-6 sender.
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {
+    status_sender: Option<Arc<super::regulated::status_sender::StatusSender>>,
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
     send: FramedSend,
@@ -46,6 +67,7 @@ pub struct BlockSyncPeerSession {
 impl BlockSyncPeerSession {
     pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
         Self {
+            status_sender: None,
             peer_id: session.peer_id().clone(),
             direction,
             send: session.sender(),
@@ -63,6 +85,7 @@ impl BlockSyncPeerSession {
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
+            status_sender: None,
             peer_id,
             direction: ServicePeerDirection::Outbound,
             send,
@@ -73,6 +96,14 @@ impl BlockSyncPeerSession {
     /// Authenticated peer identity for this block-sync session.
     pub fn peer_id(&self) -> &ZakuraPeerId {
         &self.peer_id
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_status_for_test(mut self, status: BlockSyncStatus) -> Self {
+        let state = Arc::new(super::regulated::status_sender::StatusSender::new(u32::MAX));
+        state.record_received(status);
+        self.status_sender = Some(state);
+        self
     }
 
     /// Direction of the underlying Zakura connection.
@@ -99,14 +130,59 @@ impl BlockSyncPeerSession {
         self.send.max_capacity()
     }
 
+    /// `status` as this session sends it: regulated sessions apply their serving limit.
+    pub(super) fn wire_status(&self, status: BlockSyncStatus) -> BlockSyncStatus {
+        self.status_sender
+            .as_ref()
+            .map_or(status, |sender| sender.advertised(status))
+    }
+
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
+        if let Some(sender) = &self.status_sender {
+            return sender.try_send(status, &self.send);
+        }
         self.try_send_message(BlockSyncMessage::Status(status))
     }
 
     /// Send a typed status advertisement, waiting for transport queue capacity.
     pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::Status(status)).await
+        if self.status_sender.is_none() {
+            return self.send_message(BlockSyncMessage::Status(status)).await;
+        }
+        loop {
+            match self.try_send_status(status) {
+                Err(OrderedSendError::Full) => {
+                    let next = self
+                        .status_next_due()
+                        .unwrap_or_else(Instant::now)
+                        .max(Instant::now() + Duration::from_millis(100));
+                    tokio::select! {
+                        () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
+                        () = tokio::time::sleep_until(next.into()) => {},
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    pub(super) fn received_status(&self) -> Option<BlockSyncStatus> {
+        self.status_sender
+            .as_ref()
+            .and_then(|state| state.received())
+    }
+
+    pub(super) fn record_received_status(&self, status: BlockSyncStatus) {
+        if let Some(state) = &self.status_sender {
+            state.record_received(status);
+        }
+    }
+
+    pub(super) fn status_next_due(&self) -> Option<Instant> {
+        self.status_sender
+            .as_ref()
+            .and_then(|sender| sender.next_due())
     }
 
     /// Send a typed block range request.
@@ -119,66 +195,6 @@ impl BlockSyncPeerSession {
             start_height,
             count,
         })
-    }
-
-    /// Send one typed block body frame.
-    pub fn try_send_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::Block(block))
-    }
-
-    /// Send one typed block body frame, waiting for transport queue capacity.
-    pub async fn send_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::Block(block)).await
-    }
-
-    /// Send a typed response terminator.
-    pub fn try_send_blocks_done(
-        &self,
-        start_height: block::Height,
-        returned: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        })
-    }
-
-    /// Send a typed response terminator, waiting for transport queue capacity.
-    pub async fn send_blocks_done(
-        &self,
-        start_height: block::Height,
-        returned: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        })
-        .await
-    }
-
-    /// Send a typed unavailable-range response.
-    pub fn try_send_range_unavailable(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        })
-    }
-
-    /// Send a typed unavailable-range response, waiting for transport queue capacity.
-    pub async fn send_range_unavailable(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        })
-        .await
     }
 
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
@@ -215,6 +231,12 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
+    // Connection lifetime, not session lifetime: replacement cannot reset cadence.
+    status_senders: StdMutex<
+        HashMap<(ZakuraPeerId, ZakuraConnId), Arc<super::regulated::status_sender::StatusSender>>,
+    >,
+    requester_sessions: crate::zakura::regulation::SessionTable<()>,
+    sessions: crate::zakura::regulation::SessionCapacity,
     config: ZakuraBlockSyncConfig,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
@@ -259,6 +281,13 @@ impl BlockSyncServiceInner {
             return false;
         }
 
+        self.requester_sessions.remove(
+            peer,
+            crate::zakura::regulation::SessionKey {
+                conn_id,
+                session_id,
+            },
+        );
         let removed = active_peers
             .remove(peer)
             .expect("record exists because the ownership check just matched it");
@@ -283,13 +312,30 @@ impl BlockSyncServiceInner {
 }
 
 impl BlockSyncService {
-    pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Self {
+    pub(crate) fn new(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
         Self::new_with_startup(BlockSyncStartup::inert(config))
     }
 
-    pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
+    /// Serve with a reactor that already validated its config.
+    pub(crate) fn new_with_handle(handle: BlockSyncHandle) -> Self {
+        let config = handle
+            .routine_wiring
+            .as_ref()
+            .expect("a handle from spawn_block_sync_reactor always carries routine wiring")
+            .config
+            .clone();
+        Self::from_handle(config, handle)
+    }
+
+    fn from_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                status_senders: Default::default(),
+                requester_sessions: Default::default(),
+                sessions: crate::zakura::regulation::SessionCapacity::new(
+                    "block-sync",
+                    &config.peer_limits,
+                ),
                 config,
                 lifecycle: handle.lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
@@ -308,7 +354,7 @@ impl BlockSyncService {
     pub(crate) fn new_with_header_tip(
         config: ZakuraBlockSyncConfig,
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
-    ) -> Self {
+    ) -> Result<Self, BlockSyncStartError> {
         let best_header_tip = *header_tip.borrow();
         let startup = BlockSyncStartup::new(
             BlockSyncFrontiers {
@@ -323,24 +369,13 @@ impl BlockSyncService {
         Self::new_with_startup(startup)
     }
 
-    fn new_with_startup(startup: BlockSyncStartup) -> Self {
+    fn new_with_startup(startup: BlockSyncStartup) -> Result<Self, BlockSyncStartError> {
         let config = startup.config.clone();
-        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-        Self {
-            inner: Arc::new(BlockSyncServiceInner {
-                config,
-                lifecycle: handle.lifecycle.clone(),
-                routine_wiring: handle.routine_wiring.clone(),
-                peer_snapshot: handle.subscribe_peer_snapshot(),
-                candidates: handle.subscribe_candidate_state(),
-                active_peers: StdMutex::new(HashMap::new()),
-                session_gap_claims: StdMutex::new(HashMap::new()),
-                next_session_id: AtomicU64::new(1),
-            }),
-            service_demand: None,
-            _held_events: None,
+        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup)?;
+        Ok(Self {
             _reactor_task: Some(reactor_task),
-        }
+            ..Self::from_handle(config, handle)
+        })
     }
 
     #[cfg(test)]
@@ -361,6 +396,12 @@ impl BlockSyncService {
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
+                    status_senders: Default::default(),
+                    requester_sessions: Default::default(),
+                    sessions: crate::zakura::regulation::SessionCapacity::new(
+                        "block-sync",
+                        &config.peer_limits,
+                    ),
                     config,
                     lifecycle,
                     routine_wiring: None,
@@ -383,7 +424,7 @@ impl BlockSyncService {
         config: ZakuraBlockSyncConfig,
         handle: BlockSyncHandle,
     ) -> Self {
-        Self::new_with_handle(config, handle)
+        Self::from_handle(config, handle)
     }
 
     pub(crate) fn with_service_demand(
@@ -405,72 +446,23 @@ impl BlockSyncService {
             .len()
     }
 
-    fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
-        let peers = self
-            .inner
-            .active_peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned");
-        let count = peers
-            .values()
-            .filter(|record| record.direction == direction)
-            .count();
-        let cap = match direction {
-            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound_peers,
-            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound_peers,
-        };
-        count < cap
-    }
-
-    fn session_needs_body_work(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
-        self.inner.routine_wiring.as_ref().is_some_and(|wiring| {
-            wiring
-                .registry
-                .has_expired_session_park(peer, conn_id, Instant::now())
-        })
-    }
-
-    fn peer_is_parked(&self, peer_id: &ZakuraPeerId) -> bool {
-        self.inner
-            .routine_wiring
-            .as_ref()
-            .is_some_and(|wiring| wiring.registry.is_peer_parked(peer_id, Instant::now()))
-    }
-
-    fn peer_park_deadline(&self, peer_id: &ZakuraPeerId) -> Option<Instant> {
-        let now = Instant::now();
-        self.inner
-            .routine_wiring
-            .as_ref()
-            .and_then(|wiring| wiring.registry.peer_park_deadline(peer_id, now))
-    }
-}
-
-impl Service for BlockSyncService {
-    fn name(&self) -> &'static str {
-        "block-sync"
-    }
-
-    fn streams(&self) -> &[Stream] {
-        block_sync_streams()
-    }
-
-    fn session_policy(&self) -> SessionPolicy {
-        SessionPolicy {
-            opening: SessionOpening::EitherSide,
-            reopen: true,
-        }
-    }
-
-    fn session_demand(
+    /// Recheck local policy, skipping only capacity already owned by the session.
+    fn demand_for_session(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
-        _negotiated: u64,
         direction: ServicePeerDirection,
+        reserved: bool,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
             return SessionDemand::RetryAt(deadline);
+        }
+
+        if !reserved && self.inner.routine_wiring.is_some() {
+            let demand = self.inner.sessions.demand(direction);
+            if !matches!(demand, SessionDemand::OpenNow) {
+                return demand;
+            }
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
@@ -523,6 +515,94 @@ impl Service for BlockSyncService {
         SessionDemand::OpenNow
     }
 
+    fn peer_slots_free(&self, direction: ServicePeerDirection) -> bool {
+        let peers = self
+            .inner
+            .active_peers
+            .lock()
+            .expect("block-sync peer map mutex is never poisoned");
+        let count = peers
+            .values()
+            .filter(|record| record.direction == direction)
+            .count();
+        let cap = match direction {
+            ServicePeerDirection::Inbound => self.inner.config.peer_limits.max_inbound_peers,
+            ServicePeerDirection::Outbound => self.inner.config.peer_limits.max_outbound_peers,
+        };
+        count < cap
+    }
+
+    fn session_needs_body_work(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.inner.routine_wiring.as_ref().is_some_and(|wiring| {
+            wiring
+                .registry
+                .has_expired_session_park(peer, conn_id, Instant::now())
+        })
+    }
+
+    fn peer_is_parked(&self, peer_id: &ZakuraPeerId) -> bool {
+        self.inner
+            .routine_wiring
+            .as_ref()
+            .is_some_and(|wiring| wiring.registry.is_peer_parked(peer_id, Instant::now()))
+    }
+
+    fn peer_park_deadline(&self, peer_id: &ZakuraPeerId) -> Option<Instant> {
+        let now = Instant::now();
+        self.inner
+            .routine_wiring
+            .as_ref()
+            .and_then(|wiring| wiring.registry.peer_park_deadline(peer_id, now))
+    }
+}
+
+impl Service for BlockSyncService {
+    fn name(&self) -> &'static str {
+        "block-sync"
+    }
+
+    fn streams(&self) -> &[Stream] {
+        &BLOCK_SYNC_SERVICE_STREAMS
+    }
+
+    fn reserve_session(
+        &self,
+        direction: ServicePeerDirection,
+    ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
+        if self.inner.routine_wiring.is_some() {
+            self.inner.sessions.reserve(direction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::EitherSide,
+            reopen: true,
+        }
+    }
+
+    fn session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> SessionDemand {
+        self.demand_for_session(conn_id, peer, direction, false)
+    }
+
+    fn reserved_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> SessionDemand {
+        self.demand_for_session(conn_id, peer, direction, true)
+    }
+
     fn wants_peer(
         &self,
         peer: &ZakuraPeerId,
@@ -538,15 +618,33 @@ impl Service for BlockSyncService {
             return;
         }
 
-        let Some((recv, send)) = peer.take_stream(ZAKURA_STREAM_BLOCK_SYNC) else {
+        let Some((_, version, recv, send)) =
+            peer.take_versioned_stream_with_session_id(ZAKURA_STREAM_BLOCK_SYNC)
+        else {
             return;
         };
+        // Public in-process Peer constructors predate stream version metadata.
+        let version = if version == 0 {
+            ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+        } else {
+            version
+        };
+        // Serving needs room for a response and for requests or control.
+        if version != ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+            || (self.inner.routine_wiring.is_some()
+                && (peer.negotiated & ZAKURA_CAP_BLOCK_SYNC_REGULATED == 0
+                    || send.max_capacity() < 2))
+        {
+            peer.close_cause().record("block_sync_regulation_contract");
+            peer.cancel_token().cancel();
+            return;
+        }
 
         let peer_id = peer.id.clone();
         let session = PeerStreamSession::new(
             peer_id.clone(),
             ZAKURA_STREAM_BLOCK_SYNC,
-            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            version,
             recv,
             send,
             peer.service_cancel_token(),
@@ -554,7 +652,7 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
+        let mut block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
         let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
@@ -562,13 +660,14 @@ impl Service for BlockSyncService {
 
         // Production outbound block-sync frames go directly through
         // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
-        // the reactor's `try_send_status`/serving sends), so the raw transport
+        // the reactor's `try_send_status`, the serving session), so the raw transport
         // sender taken from the stream here is redundant. The outbound stream stays
         // alive through the `BlockSyncPeerSession` clone the reactor holds, so
         // nothing is lost by dropping it.
         drop(send);
 
-        let (old_record, re_admitted_after_no_progress, routine_generation) = {
+        let routine_wiring = self.inner.routine_wiring.clone();
+        let (old_record, re_admitted_after_no_progress, routine) = {
             let mut active_peers = self
                 .inner
                 .active_peers
@@ -577,6 +676,20 @@ impl Service for BlockSyncService {
             if active_peers
                 .get(&peer_id)
                 .is_some_and(|record| record.conn_id > conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
+            // A newer connection in its reopen gap also supersedes this one.
+            // Claims only change under the peer-map lock, so this check and
+            // the removal below see the same claim.
+            if self
+                .inner
+                .session_gap_claims
+                .lock()
+                .expect("block-sync gap-claim mutex is never poisoned")
+                .get(&peer_id)
+                .is_some_and(|claim| claim.conn_id > conn_id)
             {
                 service_cancel_token.cancel();
                 return;
@@ -610,9 +723,11 @@ impl Service for BlockSyncService {
             // Admission is atomic with the park state: a park recorded by the
             // predecessor routine after the entry-point `peer_is_parked` check
             // is honored here instead of being silently bypassed.
-            let (routine_generation, re_admitted_after_no_progress) =
-                if let Some(wiring) = &self.inner.routine_wiring {
-                    match wiring.registry.admit_session(
+            // A spawned routine holds its generation and the exact fence
+            // registered in `requester_sessions`.
+            let (routine, re_admitted_after_no_progress) = match routine_wiring {
+                Some(wiring) => {
+                    let (generation, readmitted) = match wiring.registry.admit_session(
                         &peer_id,
                         peer.direction,
                         &wiring.config,
@@ -623,12 +738,52 @@ impl Service for BlockSyncService {
                             service_cancel_token.cancel();
                             return;
                         }
-                        SessionAdmission::Readmitted { generation } => (Some(generation), true),
-                        SessionAdmission::Fresh { generation } => (Some(generation), false),
-                    }
-                } else {
-                    (None, false)
-                };
+                        SessionAdmission::Readmitted { generation } => (generation, true),
+                        SessionAdmission::Fresh { generation } => (generation, false),
+                    };
+                    let fence = crate::zakura::regulation::WriterFence::new(
+                        connection_cancel_token.clone(),
+                        close_cause.clone(),
+                    );
+                    (Some((wiring, generation, fence)), readmitted)
+                }
+                None => (None, false),
+            };
+            if let Some((_, _, fence)) = &routine {
+                use crate::zakura::regulation::{Current, Replacement, SessionKey};
+                if matches!(
+                    self.inner.requester_sessions.replace(
+                        peer_id.clone(),
+                        Current {
+                            key: SessionKey {
+                                conn_id,
+                                session_id
+                            },
+                            cancel: service_cancel_token.clone(),
+                            fence: fence.clone(),
+                            session: (),
+                        }
+                    ),
+                    Replacement::Refused
+                ) {
+                    return;
+                }
+                block_sync_session.status_sender = Some(
+                    self.inner
+                        .status_senders
+                        .lock()
+                        .expect("status sender map is not poisoned")
+                        .entry((peer_id.clone(), conn_id))
+                        .or_insert_with(|| {
+                            Arc::new(super::regulated::status_sender::StatusSender::new(
+                                super::regulated::session::serving_max_inflight_requests(
+                                    &self.inner.config,
+                                ),
+                            ))
+                        })
+                        .clone(),
+                );
+            }
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
@@ -638,21 +793,19 @@ impl Service for BlockSyncService {
                     cancel_token: service_cancel_token.clone(),
                 },
             );
-            (
-                old_record,
-                re_admitted_after_no_progress,
-                routine_generation,
-            )
+            // The admitted session supersedes any gap claim left by its
+            // predecessor. Clearing it under the peer-map lock keeps a later
+            // session's `finish_session` claim from being removed here.
+            self.inner
+                .session_gap_claims
+                .lock()
+                .expect("block-sync gap-claim mutex is never poisoned")
+                .remove(&peer_id);
+            (old_record, re_admitted_after_no_progress, routine)
         };
         if let Some(old_record) = old_record {
             old_record.cancel_token.cancel();
         }
-        // The admitted session supersedes any gap claim left by its predecessor.
-        self.inner
-            .session_gap_claims
-            .lock()
-            .expect("block-sync gap-claim mutex is never poisoned")
-            .remove(&peer_id);
 
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
@@ -686,20 +839,31 @@ impl Service for BlockSyncService {
         let pipe = {
             let connection_cancel_token = connection_cancel_token.clone();
             let close_cause = close_cause.clone();
-            let routine_wiring = self.inner.routine_wiring.clone();
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
             async move {
-                let result = match routine_wiring {
-                    Some(wiring) => {
-                        let generation = routine_generation.expect(
-                            "production block-sync wiring allocates a routine generation before spawn",
+                let result = match routine {
+                    Some((wiring, generation, fence)) => {
+                        let serving = wiring.serving.session(
+                            &peer_id,
+                            block_sync_session.request_sender(),
+                            run_cancel.clone(),
+                            connection_cancel_token.clone(),
+                            close_cause.clone(),
+                        );
+                        let requester = super::regulated::live_requester::LiveRequester::new(
+                            wiring.request_pool,
+                            fence,
+                            &recv,
+                            block_sync_session.request_sender(),
                         );
                         let routine = super::peer_routine::PeerRoutine::new(
                             peer_id,
                             conn_id,
                             block_sync_session,
                             recv,
+                            requester,
+                            serving,
                             wiring.config,
                             !re_admitted_after_no_progress,
                             generation,
@@ -726,6 +890,12 @@ impl Service for BlockSyncService {
                 handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
             }
         };
+        // Queue the connect before spawning, so the routine's teardown cannot
+        // publish its disconnect first on another worker.
+        let _ = self
+            .inner
+            .lifecycle
+            .send(BlockSyncEvent::PeerConnected(block_sync_session));
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
@@ -735,11 +905,6 @@ impl Service for BlockSyncService {
             on_panic,
             pipe,
         );
-
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
@@ -767,8 +932,10 @@ impl Service for BlockSyncService {
         else {
             return false;
         };
+        // The exiting session can still hold its reservation until its disconnect
+        // is processed, so the session-capacity gate would count it against itself.
         matches!(
-            self.session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            self.demand_for_session(conn_id, peer, direction, true),
             SessionDemand::OpenNow
         )
     }
@@ -780,8 +947,22 @@ impl Service for BlockSyncService {
                 .active_peers
                 .lock()
                 .expect("block-sync peer map mutex is never poisoned");
+            self.inner
+                .status_senders
+                .lock()
+                .expect("status sender map is not poisoned")
+                .remove(&(peer.clone(), conn_id));
             let removed = match active_peers.get(peer) {
-                Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
+                Some(record) if record.conn_id == conn_id => {
+                    self.inner.requester_sessions.remove(
+                        peer,
+                        crate::zakura::regulation::SessionKey {
+                            conn_id,
+                            session_id: record.session_id,
+                        },
+                    );
+                    active_peers.remove(peer)
+                }
                 Some(_) | None => None,
             };
             // The claim is cleared while still holding the peer-map lock so it
@@ -853,5 +1034,535 @@ async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Resul
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod requester_session_tests {
+    use super::*;
+    use crate::zakura::{
+        regulation::{Current, SessionKey, WriterFence},
+        CloseCause,
+    };
+
+    fn with_session_slots(inbound: usize, outbound: usize) -> ZakuraBlockSyncConfig {
+        let mut config = ZakuraBlockSyncConfig::default();
+        config.peer_limits.max_inbound_peers = inbound;
+        config.peer_limits.max_outbound_peers = outbound;
+        config
+    }
+
+    /// 3,633 slots fund one advertised request each; 3,634 cannot, so neither the
+    /// reactor nor the service starts and nothing is advertised.
+    #[tokio::test]
+    async fn an_unfundable_config_fails_before_the_reactor_or_service_starts() {
+        for config in [
+            with_session_slots(3_000, 634),
+            with_session_slots(usize::MAX, usize::MAX),
+        ] {
+            assert!(matches!(
+                spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone())),
+                Err(BlockSyncStartError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                BlockSyncService::new(config),
+                Err(BlockSyncStartError::InvalidConfig(_))
+            ));
+        }
+
+        let service = BlockSyncService::new(with_session_slots(3_000, 633))
+            .expect("3,633 slots fund one request each");
+        let wiring = service.inner.routine_wiring.as_ref().unwrap();
+        assert_eq!(
+            super::super::regulated::session::serving_max_inflight_requests(&wiring.config),
+            1
+        );
+    }
+
+    /// A served handle carries the config its reactor validated.
+    #[tokio::test]
+    async fn a_handle_serves_with_the_config_its_reactor_validated() {
+        let config = with_session_slots(7, 9);
+        let (handle, _actions, _task) =
+            spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()))
+                .expect("valid block-sync config");
+        let service = BlockSyncService::new_with_handle(handle);
+        assert_eq!(service.inner.config.peer_limits, config.peer_limits);
+    }
+
+    /// Zero serving slots is a valid config that admits no session in either
+    /// direction.
+    #[tokio::test]
+    async fn zero_session_slots_admit_no_serving_session() {
+        let service =
+            BlockSyncService::new(with_session_slots(0, 0)).expect("zero slots are valid");
+        let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
+        for direction in [
+            ServicePeerDirection::Inbound,
+            ServicePeerDirection::Outbound,
+        ] {
+            assert!(!service.wants_peer(&peer, 0, direction));
+            assert!(service.reserve_session(direction).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_removal_retires_and_removes_its_requester_fence() {
+        let service = BlockSyncService::new(ZakuraBlockSyncConfig::default())
+            .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![41; 32]).unwrap();
+        let connection = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        service.inner.requester_sessions.replace(
+            peer.clone(),
+            Current {
+                key: SessionKey {
+                    conn_id: 7,
+                    session_id: 3,
+                },
+                cancel: cancel.clone(),
+                fence: fence.clone(),
+                session: (),
+            },
+        );
+        service.inner.active_peers.lock().unwrap().insert(
+            peer.clone(),
+            BlockSyncPeerRecord {
+                conn_id: 7,
+                session_id: 3,
+                direction: ServicePeerDirection::Outbound,
+                cancel_token: cancel.clone(),
+            },
+        );
+        service.remove_peer(&peer, 6);
+        assert!(service.inner.requester_sessions.get(&peer).is_some());
+        assert!(
+            !connection.is_cancelled(),
+            "stale removal leaves the current fence open"
+        );
+        service.remove_peer(&peer, 7);
+        assert!(service.inner.requester_sessions.get(&peer).is_none());
+        assert!(
+            connection.is_cancelled(),
+            "removal fences the unanswered written exchange"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(fence.open().is_none());
+    }
+}
+
+#[cfg(test)]
+mod regulated_frame_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct EmptySource;
+
+    impl crate::zakura::BlockRangeSource for EmptySource {
+        fn read(
+            &self,
+            request: crate::zakura::BlockRangeRead,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::zakura::BlockRangeReadResult, crate::BoxError>,
+        > {
+            Box::pin(async move {
+                Ok(crate::zakura::BlockRangeReadResult {
+                    blocks: vec![],
+                    lease: request.lease,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_connection_cannot_clear_a_newer_gap_claim() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        )
+        .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id| {
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        CancellationToken::new(),
+                    ),
+                )]),
+                CancellationToken::new(),
+                crate::zakura::CloseCause::default(),
+            ));
+            held_channels.push((in_tx, out_rx));
+        };
+        let claim_conn = |service: &BlockSyncService| {
+            service
+                .inner
+                .session_gap_claims
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .map(|claim| claim.conn_id)
+        };
+        // Connection 2's session exited and left a claim for its reopen.
+        service.inner.session_gap_claims.lock().unwrap().insert(
+            peer.clone(),
+            SessionGapClaim {
+                conn_id: 2,
+                direction: ServicePeerDirection::Outbound,
+            },
+        );
+
+        // A delayed admission for connection 1 arrives during that gap.
+        attach(1);
+        assert_eq!(service.peer_count(), 0);
+        assert_eq!(claim_conn(&service), Some(2));
+
+        attach(2);
+        assert_eq!(service.peer_count(), 1);
+        assert_eq!(claim_conn(&service), None);
+    }
+
+    #[tokio::test]
+    async fn status_cadence_survives_session_replacement_and_ends_with_its_connection() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        )
+        .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id| {
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        CancellationToken::new(),
+                    ),
+                )]),
+                CancellationToken::new(),
+                crate::zakura::CloseCause::default(),
+            ));
+            held_channels.push((in_tx, out_rx));
+            service
+                .inner
+                .status_senders
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), conn_id))
+                .unwrap()
+                .clone()
+        };
+        let first = attach(1);
+        let received = BlockSyncStatus {
+            servable_high: block::Height(20),
+            ..Default::default()
+        };
+        first.record_received(received);
+        let replacement = attach(1);
+        assert_eq!(replacement.received(), Some(received));
+        assert!(Arc::ptr_eq(&first, &replacement));
+        // Regulated connections advertise the budgeted serving limit, not the local one.
+        let local = ZakuraBlockSyncConfig::default().initial_status();
+        assert_eq!(
+            replacement.advertised(local).max_inflight_requests,
+            super::super::regulated::session::serving_max_inflight_requests(
+                &ZakuraBlockSyncConfig::default()
+            )
+        );
+        assert!(replacement.advertised(local).max_inflight_requests < local.max_inflight_requests);
+        let new_connection = attach(2);
+        assert!(!Arc::ptr_eq(&first, &new_connection));
+        assert_eq!(new_connection.received(), None);
+        service.remove_peer(&peer, 1);
+        assert!(!service
+            .inner
+            .status_senders
+            .lock()
+            .unwrap()
+            .contains_key(&(peer.clone(), 1)));
+        assert!(service
+            .inner
+            .status_senders
+            .lock()
+            .unwrap()
+            .contains_key(&(peer.clone(), 2)));
+        service.remove_peer(&peer, 2);
+        assert!(service.inner.status_senders.lock().unwrap().is_empty());
+    }
+
+    /// Session replacement, session exit, and connection removal leave no
+    /// per-peer or per-connection entry behind, however often a peer reconnects.
+    #[tokio::test]
+    async fn reconnect_churn_returns_block_sync_maps_to_baseline() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        )
+        .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![43; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id, connection: &CancellationToken| {
+            let session = CancellationToken::new();
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_service_streams(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        0,
+                        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                        in_rx,
+                        out_tx,
+                        session.clone(),
+                    ),
+                )]),
+                connection.clone(),
+                crate::zakura::CloseCause::default(),
+            ));
+            held_channels.push((in_tx, out_rx));
+            session
+        };
+        let in_maps = |conn_id| {
+            (
+                service
+                    .inner
+                    .active_peers
+                    .lock()
+                    .unwrap()
+                    .contains_key(&peer),
+                service.inner.requester_sessions.get(&peer).is_some(),
+                service
+                    .inner
+                    .status_senders
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(peer.clone(), conn_id)),
+                service
+                    .inner
+                    .session_gap_claims
+                    .lock()
+                    .unwrap()
+                    .get(&peer)
+                    .is_some_and(|claim| claim.conn_id == conn_id),
+            )
+        };
+        for conn_id in 1..=16 {
+            let connection = CancellationToken::new();
+            attach(conn_id, &connection);
+            // A same-connection replacement keeps one entry per map.
+            let session = attach(conn_id, &connection);
+            assert_eq!(in_maps(conn_id), (true, true, true, false));
+            if conn_id % 2 == 0 {
+                // The session exits first and leaves a gap claim for its connection.
+                session.cancel();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while in_maps(conn_id) != (false, false, true, true) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the exiting session leaves only connection-scoped entries");
+            }
+            service.remove_peer(&peer, conn_id);
+            connection.cancel();
+            assert_eq!(in_maps(conn_id), (false, false, false, false));
+        }
+        assert!(service.inner.active_peers.lock().unwrap().is_empty());
+        assert!(service.inner.status_senders.lock().unwrap().is_empty());
+        assert!(service.inner.session_gap_claims.lock().unwrap().is_empty());
+        let mut seen = service.inner.requester_sessions.subscribe();
+        assert!(service
+            .inner
+            .requester_sessions
+            .snapshot(&mut seen)
+            .is_empty());
+    }
+
+    use crate::zakura::{
+        transport::{FrameFilter, InboundReader},
+        MessageRole,
+    };
+
+    #[tokio::test]
+    async fn negotiation_requires_the_regulated_capability() {
+        let service = Arc::new(
+            BlockSyncService::new_with_startup(
+                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .with_range_source(Arc::new(EmptySource)),
+            )
+            .expect("valid block-sync config"),
+        );
+        let registry = crate::zakura::ServiceRegistry::new(vec![service]).unwrap();
+        // The retired version 2 bit and the retired header-sync bit select nothing.
+        for caps in [1 << 3, 1 << 4] {
+            assert!(registry.persistent_streams_for_negotiated(caps).is_empty());
+        }
+        for caps in [
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED | (1 << 3),
+        ] {
+            let streams = registry.persistent_streams_for_negotiated(caps);
+            assert_eq!(streams.len(), 1);
+            assert_eq!(
+                streams[0].version,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+            );
+            assert!(streams[0].messages.is_some());
+        }
+        let default = BlockSyncService::new(ZakuraBlockSyncConfig::default())
+            .expect("valid block-sync config");
+        assert_eq!(default.streams(), &BLOCK_SYNC_SERVICE_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn sessions_install_fences_and_reject_version_two_or_one_slot() {
+        for (version, depth) in [(2, 2), (3, 1), (3, 2)] {
+            let service = BlockSyncService::new_with_startup(
+                BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                    .with_range_source(Arc::new(EmptySource)),
+            )
+            .expect("valid block-sync config");
+            let peer = ZakuraPeerId::new(vec![45; 32]).unwrap();
+            let connection = CancellationToken::new();
+            let (_input, recv) = crate::zakura::framed_channel(depth);
+            let (send, _output) = crate::zakura::framed_channel(depth);
+            service.add_peer(Peer::new_with_service_streams(
+                1,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    crate::zakura::transport::ServiceStream::new(
+                        1,
+                        version,
+                        recv,
+                        send,
+                        connection.child_token(),
+                    ),
+                )]),
+                connection.clone(),
+                crate::zakura::CloseCause::default(),
+            ));
+            let accepted = version == 3 && depth >= 2;
+            assert_eq!(connection.is_cancelled(), !accepted);
+            assert_eq!(
+                service.inner.requester_sessions.get(&peer).is_some(),
+                accepted
+            );
+            assert_eq!(
+                service
+                    .inner
+                    .status_senders
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(peer, 1)),
+                accepted
+            );
+            connection.cancel();
+        }
+    }
+
+    /// A reserved remote offer must retain policy checks without buying a second slot.
+    #[tokio::test]
+    async fn reserved_regulated_session_uses_the_last_slot_in_either_direction() {
+        let mut config = ZakuraBlockSyncConfig::default();
+        config.peer_limits.max_inbound_peers = 1;
+        config.peer_limits.max_outbound_peers = 1;
+        config.peer_limits.max_pending_escalations = 2;
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(config).with_range_source(Arc::new(EmptySource)),
+        )
+        .expect("valid block-sync config");
+        let peer = ZakuraPeerId::new(vec![47; 32]).unwrap();
+        for direction in [
+            ServicePeerDirection::Inbound,
+            ServicePeerDirection::Outbound,
+        ] {
+            let reserved = service.reserve_session(direction).unwrap().unwrap();
+            assert!(matches!(
+                service.session_demand(1, &peer, ZAKURA_CAP_BLOCK_SYNC_REGULATED, direction,),
+                SessionDemand::WaitForChange(_)
+            ));
+            assert!(matches!(
+                service.reserved_session_demand(
+                    1,
+                    &peer,
+                    ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                    direction,
+                ),
+                SessionDemand::OpenNow
+            ));
+            drop(reserved);
+            assert!(matches!(
+                service.session_demand(1, &peer, ZAKURA_CAP_BLOCK_SYNC_REGULATED, direction,),
+                SessionDemand::OpenNow
+            ));
+        }
+    }
+
+    #[test]
+    fn production_getblocks_layout_declares_exact_control_and_body_limits() {
+        Stream::check_layout(block_sync_streams()).unwrap();
+        let stream = &block_sync_streams()[0];
+        let filter = FrameFilter::new(stream.messages, InboundReader::Persistent);
+        for (tag, bytes) in [(1, 53), (2, 9), (3, 2_000_001), (4, 9), (5, 9)] {
+            assert_eq!(
+                filter
+                    .check_header(tag, 0, bytes, usize::try_from(stream.frame_cap).unwrap())
+                    .unwrap(),
+                bytes + FRAME_HEADER_BYTES
+            );
+            assert!(filter
+                .check_header(tag, 1, bytes, usize::try_from(stream.frame_cap).unwrap())
+                .is_err());
+        }
+        assert!(filter
+            .check_header(6, 0, 1, usize::try_from(stream.frame_cap).unwrap())
+            .is_err());
+        assert!(filter
+            .check_header(4, 0, 8, usize::try_from(stream.frame_cap).unwrap())
+            .is_err());
+        let MessageRole::Announcement { cadence } = stream.messages.unwrap()[0].role else {
+            panic!("Status is an announcement")
+        };
+        assert_eq!(cadence.capacity, 22);
+        assert_eq!(cadence.send_interval, Duration::from_secs(30));
     }
 }

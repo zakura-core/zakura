@@ -9,12 +9,15 @@
 //! These metrics complement the OpenTelemetry tracing in `rpc_tracing.rs`,
 //! providing aggregated data suitable for dashboards and alerting.
 
-use std::time::Instant;
+use std::{future::Future, time::Instant};
 
 use jsonrpsee::{
-    server::middleware::rpc::{layer::ResponseFuture, RpcServiceT},
+    core::middleware::{Batch, Notification},
+    server::middleware::rpc::RpcServiceT,
     MethodResponse,
 };
+
+use crate::methods::RPC_METHOD_ACCESS;
 
 /// Middleware that collects Prometheus metrics for each RPC request.
 ///
@@ -23,6 +26,9 @@ use jsonrpsee::{
 /// - `rpc.request.duration_seconds{method}` - Histogram of request durations
 /// - `rpc.active_requests` - Gauge of currently active requests
 /// - `rpc.errors.total{method, error_code}` - Counter of errors by method and code
+///
+/// Calls to methods that aren't registered are recorded with the `unknown`
+/// method label, so clients can't add metric series by sending new names.
 #[derive(Clone)]
 pub struct RpcMetricsMiddleware<S> {
     service: S,
@@ -35,21 +41,33 @@ impl<S> RpcMetricsMiddleware<S> {
     }
 }
 
-impl<'a, S> RpcServiceT<'a> for RpcMetricsMiddleware<S>
+impl<S> RpcServiceT for RpcMetricsMiddleware<S>
 where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S: RpcServiceT<
+            MethodResponse = MethodResponse,
+            NotificationResponse = MethodResponse,
+            BatchResponse = MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
 {
-    type Future = ResponseFuture<futures::future::BoxFuture<'a, MethodResponse>>;
+    type MethodResponse = MethodResponse;
+    type NotificationResponse = MethodResponse;
+    type BatchResponse = MethodResponse;
 
-    fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
+    fn call<'a>(
+        &self,
+        request: jsonrpsee::types::Request<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
-        let method = request.method_name().to_owned();
+        let method = method_label(request.method_name());
         let start = Instant::now();
 
         // Increment active requests gauge
         metrics::gauge!("rpc.active_requests").increment(1.0);
 
-        ResponseFuture::future(Box::pin(async move {
+        async move {
             let response = service.call(request).await;
             let duration = start.elapsed().as_secs_f64();
 
@@ -61,11 +79,11 @@ where
             };
 
             // Record request count
-            metrics::counter!("rpc.requests.total", "method" => method.clone(), "status" => status)
+            metrics::counter!("rpc.requests.total", "method" => method, "status" => status)
                 .increment(1);
 
             // Record request duration
-            metrics::histogram!("rpc.request.duration_seconds", "method" => method.clone())
+            metrics::histogram!("rpc.request.duration_seconds", "method" => method)
                 .record(duration);
 
             // Record errors with error code
@@ -86,6 +104,26 @@ where
             metrics::gauge!("rpc.active_requests").decrement(1.0);
 
             response
-        }))
+        }
     }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        notification: Notification<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.notification(notification)
+    }
+}
+
+/// Returns the metrics label for an RPC method: its name if it is a registered
+/// method, and `unknown` otherwise.
+fn method_label(method_name: &str) -> &'static str {
+    RPC_METHOD_ACCESS
+        .iter()
+        .find_map(|(name, _)| (*name == method_name).then_some(*name))
+        .unwrap_or("unknown")
 }

@@ -466,6 +466,18 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        self.validate_serving()
+    }
+
+    /// Check the limits this node promises to GetBlocks peers. The reactor
+    /// requires this of every config, validated or not, before it serves.
+    pub fn validate_serving(&self) -> Result<(), &'static str> {
+        if !super::regulated::session::serving_sessions_fit_budget(self) {
+            return Err(
+                "max_inbound_peers plus max_outbound_peers must be at most 3,633 \
+                 so GetBlocks serving fits its bookkeeping budget",
+            );
+        }
         Ok(())
     }
 
@@ -538,11 +550,4 @@ pub fn clamp_advertised_inflight(count: u32) -> u32 {
 /// Clamp an advertised response byte target to the largest stream-6 message.
 pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
     bytes.clamp(1, MAX_BS_RESPONSE_BYTES)
-}
-
-/// Maximum inbound `GetBlocks.count` this node will serve before looking at body sizes.
-pub fn inbound_get_blocks_count_limit(config: &ZakuraBlockSyncConfig) -> u32 {
-    config
-        .advertised_max_blocks_per_response()
-        .clamp(1, MAX_BS_BLOCKS_PER_REQUEST)
 }

@@ -28,7 +28,6 @@ use zakura_chain::{
 use zakura_consensus::{error::TransactionError, funding_stream_address};
 use zakura_script::Sigops;
 use zakura_state::IntoDisk;
-use zcash_keys::address::Address;
 use zcash_primitives::transaction::{
     builder::{cached_orchard_proving_key, BuildConfig, Builder},
     components::orchard::{bundle_version_for_branch, ACTION_SIZE},
@@ -47,7 +46,10 @@ use zcash_transparent::{
 mod no_sapling;
 
 use super::zec::Zec;
-use super::{super::opthex, get_block_template::MinerParams};
+use super::{
+    super::opthex,
+    get_block_template::{MinerAddress, MinerParams},
+};
 use no_sapling::NoSaplingProver;
 
 /// Transaction data and fields needed to generate blocks using the `getblocktemplate` RPC.
@@ -171,17 +173,16 @@ impl CoinbasePlan {
     ) -> Result<Self, TransactionError> {
         let upgrade = NetworkUpgrade::current(net, height);
         let miner_reward_address = match miner_params.addr() {
-            Address::Unified(addr) => {
-                let fallback = || {
-                    addr.transparent()
-                        .map(|addr| MinerRewardAddress::Transparent(*addr))
-                };
+            MinerAddress::Unified {
+                orchard,
+                transparent,
+                ..
+            } => {
+                let fallback = || transparent.map(MinerRewardAddress::Transparent);
                 // Orchard receivers are payable through Ironwood after NU6.3.
                 // Earlier templates use the transparent receiver, if present.
                 let reward_address = if upgrade >= NetworkUpgrade::Nu6_3 {
-                    addr.orchard()
-                        .map(|addr| MinerRewardAddress::Ironwood(*addr))
-                        .or_else(fallback)
+                    orchard.map(MinerRewardAddress::Ironwood).or_else(fallback)
                 } else {
                     fallback()
                 };
@@ -194,15 +195,15 @@ impl CoinbasePlan {
                     )
                 })?
             }
-            Address::Sapling(_) => {
+            MinerAddress::Sapling(_) => {
                 return Err(TransactionError::CoinbaseConstruction(
                     "Sapling coinbase construction is not supported; use a unified or \
                      transparent miner address"
                         .to_string(),
                 ));
             }
-            Address::Transparent(addr) => MinerRewardAddress::Transparent(*addr),
-            _ => {
+            MinerAddress::Transparent(addr) => MinerRewardAddress::Transparent(*addr),
+            MinerAddress::Tex(_) => {
                 return Err(TransactionError::CoinbaseConstruction(
                     "Address not supported for miner rewards".to_string(),
                 ));

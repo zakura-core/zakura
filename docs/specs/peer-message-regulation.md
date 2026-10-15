@@ -202,8 +202,11 @@ unchanged messages MUST count toward cadence.
 ## Capacity admission
 
 The receiver MUST start response work only when worker capacity and bounded output capacity are
-available. When capacity is unavailable, it MUST stop draining the affected request stream.
-Capacity release MUST resume eligible processing. Local capacity exhaustion is not a peer violation.
+available. When capacity is unavailable, it MUST stop draining the affected request stream, or
+admit each request as a bounded commitment and wait for capacity outside the reader. Under the
+second option, admitted commitments MUST stay within the protocol inflight bound, and the receiver
+MUST acquire execution and output capacity before producing each response. Capacity release MUST
+resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 - Execution slots MUST bound actual running work. Protocol inflight limits bound accepted
   commitments and MAY exceed execution slots. A sender MUST obey advertised inflight limits.
@@ -621,16 +624,30 @@ that the publisher changed its selected chain between `Status` and `Open`. `Subs
 reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
 a peer violation.
 
-### Block sync — stream 6, version 2
+### Block sync — stream 6, regulated version 3
 
-Version 2 requests bodies by height range. The requester still reserves the expected header hash for
-each height, but the wire request does not identify that hash. Competing branches can occupy the
-same height, so version 2 cannot safely overlap live ranges on one connection. A future version must
-make request and body correlation explicit.
+The regulated contract uses capability bit 8 and stream version 3. It retains version 2's
+five messages and byte encodings. Version 3 changes admission and lifetime rules, not request
+identity. Peers MUST negotiate version 3 before applying the following regulation rules.
+Negotiation MUST select the complete behavior together: the frame table and cadence, serving
+commitments, response reservations, ending checks, and Status handling. The selected stream
+MUST have at least two outbound queue slots after the negotiated connection budget is split.
 
-Block sync MUST allow discriminators `1..=5` in the frame header. Version 2 also carries the same
-one-byte discriminator at the start of each payload. The decoder MUST require both copies to match.
-Removing the payload copy requires a new stream version. The following limits apply:
+Version 3 replaces version 2 without a compatibility path. Capability bit 3, which identified
+version 2, is retired and MUST NOT be reused. A peer that offers only version 2 negotiates no block
+sync stream. Version 3 carries received Status across replacement on the same connection. Embedders
+without a storage-backed range source still negotiate version 3 and MUST end every request with
+`RangeUnavailable`.
+
+The version 2 encoding requests bodies by height range. The requester still reserves the expected
+header hash for each height, but the wire request does not identify that hash. Competing branches
+can occupy the same height, so regulated version 3 forbids overlapping live ranges on one
+connection. A future version must make request and body correlation explicit.
+
+Block sync MUST allow discriminators `1..=5` in the frame header. The version 2 encoding also
+carries the same one-byte discriminator at the start of each payload. The decoder MUST require both
+copies to match. Removing the payload copy requires a new stream version. The following limits
+apply:
 
 ```text
 MAX_BLOCKS_PER_RESPONSE  = 128
@@ -689,8 +706,17 @@ plus the initial message and one message of jitter. The sender interval remains 
   - `start_height + count - 1 <= Height::MAX`
   - exact consumption
 - **Capacity**
-  - outstanding commitments <= advertised inflight limit
+  - requester: outstanding requests <= the receiver's advertised inflight limit
+  - receiver: serve up to twice the highest inflight limit advertised on the connection
   - bounded per-peer and node-wide storage execution, retained results, and queued output
+
+The receiver counts a commitment from admission until its ending enters the session's ordered
+output, before transmission. A conformant requester sends its next request only after it receives
+an ending, so it stays within the advertised limit on that tally. As a conservative margin, the
+receiver MUST serve requests above the advertised limit up to twice that limit and MUST return
+`Disconnect` only for the request after that. The margin would also cover a receiver that released
+commitments only when an ending's write completed, because at most one further request can follow
+each ending in transit. The receiver SHOULD trace requests above the advertised limit.
 
 The handler MUST bound storage work and retained results for each range. It MAY use bounded
 sequential reads rather than retaining the whole response from one contiguous read. It MUST send
@@ -728,15 +754,22 @@ and terminal response match exactly one range despite version 2's missing reques
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
 header hashes expected by live ranges. A block that does not match the next expected hash of exactly
-one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
+one live range MUST retire the connection as a local incompatibility, without a peer-fault report or
+penalty. Height-only requests do not commit the publisher to the requester's chain. The receiver
+MUST retain the exchange fences until connection cleanup and requeue unreceived work. Local waits
+for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits MUST NOT
+release reservations or excuse a withheld ending while the reader remains active. It SHOULD briefly
+avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across
+reconnects, without delaying other suppliers. Invalid framing, excess response bytes, and invalid
+endings remain protocol violations. The publisher MUST send the blocks of a range in ascending
 height order. The reservation identity commits to a header that header sync already validated, so
 Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
 checks when the header bytes hash to the expected identity. Block sync takes that option today: it
 matches the hash at [`peer_routine`][bs-expected-hash] and leaves
 [`CheckpointVerifier::check_block`][check-block] to run downstream. Matching a known header does not
 validate its supplied body. The implementation MUST retain body-commitment checks and required
-downstream consensus validation before accepting
-the block. It SHOULD reuse those validation paths rather than add duplicate ingress checks.
+downstream consensus validation before accepting the block. It SHOULD reuse those validation paths
+rather than add duplicate ingress checks.
 
 #### `BlocksDone` — Response, discriminator 4
 
@@ -772,7 +805,7 @@ peer that serves no blocks for heights inside its advertised servable range.
   - `count` does not exceed the requested count
   - consumes the terminal part and closes the reservation
 
-Version 2 senders can report a smaller count after clamping a request to their available heights.
+A sender can report a smaller count after clamping a request to its available heights.
 The ending closes the entire original range. The handler MUST requeue every unreceived height in
 that original range, not just the reported count. A retry policy MAY avoid this peer for the
 immediate retry.
@@ -781,12 +814,13 @@ immediate retry.
 
 A successor version should identify each request with a receiver-chosen nonzero request ID and name
 each requested body by header hash. Every body and terminal response must echo the request ID. Those
-fields would remove version 2's overlap restriction and bind each body to the header chain that the
-requester selected.
+fields would remove the regulated height-range overlap restriction and bind each body to the header
+chain that the requester selected.
 
 This section is non-normative. The successor message set, encoding, caps, reservation rules, and
-work bounds remain unspecified. Implementations MUST support only version 2 until a separate change
-defines that complete wire contract.
+work bounds remain unspecified. Version 3 above only negotiates regulation of the existing
+height-range encoding. A later successor with request IDs and hash-addressed bodies MUST NOT be
+advertised until a separate change defines its complete wire contract.
 
 ## Parameters to validate
 

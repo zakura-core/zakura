@@ -44,6 +44,29 @@ host with none.
   rejects is a yanked, unreferenced version. See
   `docs/design/historical-treestate-serving.md` §5.
 
+## Asset publication during release preparation
+
+The weekly refresh and release preparation use the same publisher. Release
+preparation resolves one immutable bundle, then dispatches
+`update-release-state.yml` on `main` in `ensure-assets` mode with its metadata
+URL, digest, and a unique request ID. This mode validates the candidate before
+publication and returns a receipt without opening a state-update PR. The
+existing `crates-io-assets` environment and publishing identity remain the only
+upload path.
+
+An existing version is reused only when its grid matches the bundle. Only a
+crates.io API 404 permits an upload; access denials and conflicting bytes stop
+the run. The publisher confirms registry and Cargo visibility before issuing a
+receipt. Preparation checks that receipt against the requested bundle and
+producer run before importing and pinning the data together. It never selects
+a newer bundle midway through preparation.
+
+Branch dry runs never dispatch publication. They validate the selected bundle
+and require its matching asset to be published already. A missing or
+inaccessible asset stops the dry run; local assets do not substitute for a
+published dependency. No-op imports and explicit release-state waivers do not
+request publication.
+
 ## Why an archive node, and why it need not be stopped
 
 The exporter opens the state database as a read-only RocksDB secondary, so it

@@ -13,6 +13,7 @@ use crate::zakura::{
         stream_conformance_suite, StreamConformance, SubscriptionUpdate, UpdateOp,
     },
     wire_codec::{
+        item_suite::item_suite,
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         sample::WireSample,
     },
@@ -256,16 +257,62 @@ impl MessageSample for ExampleMessage {
 
 message_suite!(message_family, ExampleMessage);
 
+/// Whether `message_type` is a row of [`WatchMessage`].
+fn watched(message_type: u16) -> bool {
+    MessageRule::find(WatchMessage::RULES, message_type).is_some()
+}
+
+/// The example's test data, cut to the watch family's rows.
+impl MessageSample for WatchMessage {
+    fn samples() -> Vec<Self> {
+        ExampleMessage::samples()
+            .into_iter()
+            .filter(|message| watched(message.message_type()))
+            .map(Self)
+            .collect()
+    }
+
+    fn arbitrary_valid() -> BoxedStrategy<Self> {
+        ExampleMessage::arbitrary_valid()
+            .prop_filter("a row outside the watch family", |message| {
+                watched(message.message_type())
+            })
+            .prop_map(Self)
+            .boxed()
+    }
+
+    fn violations() -> Vec<Violation<Self>> {
+        ExampleMessage::violations()
+            .into_iter()
+            .filter(|violation| watched(violation.frame.message_type))
+            .map(|violation| Violation {
+                name: violation.name,
+                frame: violation.frame,
+                rejected_by: violation.rejected_by,
+            })
+            .collect()
+    }
+}
+
+message_suite!(watch_family, WatchMessage);
+
+item_suite!(status_payload, StatusPayload);
+item_suite!(watch_payload, WatchPayload);
+item_suite!(pushed_payload, PushedPayload);
+item_suite!(watch_ended_payload, WatchEndedPayload);
+
 #[test]
-fn both_layouts_carry_exactly_the_family_rows() {
+fn every_layout_carries_exactly_its_family_rows() {
     check_layout_carries_family::<ExampleMessage>(&SINGLE);
     check_layout_carries_family::<ExampleMessage>(&PAIRED);
+    check_layout_carries_family::<WatchMessage>(&WATCH_ONLY);
 }
 
 #[test]
-fn readers_follow_both_layouts() {
+fn readers_follow_every_layout() {
     check_frame_filter(&SINGLE);
     check_frame_filter(&PAIRED);
+    check_frame_filter(&WATCH_ONLY);
 }
 
 /// The conformance suite's view of the example: exchange `e` asks for the
@@ -358,10 +405,51 @@ impl StreamConformance for ExampleConformance {
             bytes: super::exchange::item_bytes(height),
         }
     }
+
+    fn read_page(message: &ExampleMessage) -> Option<(u32, u32)> {
+        let ExampleMessage::Pushed { id, height, .. } = message else {
+            return None;
+        };
+        Some((*id, height.0))
+    }
+}
+
+/// The conformance suite's view of the watch family: [`ExampleConformance`]
+/// on the family's rows.
+#[derive(Debug)]
+struct WatchConformance;
+
+impl StreamConformance for WatchConformance {
+    type Message = WatchMessage;
+
+    fn message(row: &MessageRule, exchange: u32) -> WatchMessage {
+        WatchMessage(ExampleConformance::message(row, exchange))
+    }
+
+    fn exchange(message: &WatchMessage) -> u32 {
+        ExampleConformance::exchange(&message.0)
+    }
+
+    fn update(row: &MessageRule, update: SubscriptionUpdate) -> WatchMessage {
+        WatchMessage(ExampleConformance::update(row, update))
+    }
+
+    fn read_update(message: &WatchMessage) -> Option<SubscriptionUpdate> {
+        ExampleConformance::read_update(&message.0)
+    }
+
+    fn page(row: &MessageRule, key: u32, cursor: u32) -> WatchMessage {
+        WatchMessage(ExampleConformance::page(row, key, cursor))
+    }
+
+    fn read_page(message: &WatchMessage) -> Option<(u32, u32)> {
+        ExampleConformance::read_page(&message.0)
+    }
 }
 
 stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
 stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);
+stream_conformance_suite!(watch_only_conformance, WATCH_ONLY, WatchConformance);
 
 /// A one-page credit window still exercises Close while its page waits on send capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

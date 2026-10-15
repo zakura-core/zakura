@@ -2495,8 +2495,9 @@ impl PeerRoutine {
     // ===================== misbehavior (shared count via registry) ==========
 
     async fn report_misbehavior(&self, reason: BlockSyncMisbehavior) {
-        // Misbehavior is record-only: observe and forward it, but never cancel the
-        // session. Peer scoring no longer drives disconnects.
+        // This path only records misbehavior: observe and forward it, but never
+        // cancel the session. Only a proven tampered body, reported by the
+        // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).
         metrics::counter!("sync.block.peer.violation").increment(1);
         // `Misbehavior` is best-effort: never block the routine. The reactor owns
         // action dispatch so attacker-triggered reports cannot bypass its reserved

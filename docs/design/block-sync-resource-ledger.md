@@ -62,7 +62,7 @@ is the largest fundable count; 3,634 slots fail.
 Execution slots are 24 per node and 12 per peer. A slot is held until the blocking read and
 encode actually return, including after the session is cancelled, so connection churn cannot
 multiply running reads. Each job retains the blocks it read. These are decoded blocks from
-the node's own consensus-valid state. One job holds `blocks_per_response` blocks (default 1):
+the node's own consensus-valid state. One job holds `blocks_per_response` blocks (always 1):
 at most about 53 MB decoded for the worst consensus-valid block, about 7 MB for real Mainnet
 blocks (≤ 3.45× wire). The encoder serializes one block at a time and the handler drops each
 frame right after encoding, so the transient copy is one block.

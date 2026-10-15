@@ -665,6 +665,10 @@ The requester sizes outstanding work through its existing per-peer download wind
 safety MUST NOT depend on requester adaptation. Continuous serving is legal while resources are
 available. This specification adds no per-peer serving-rate setting or artificial refill delay.
 
+Zakura's requester sends one block per `GetBlocks` and Zakura advertises a block count of 1. It
+still accepts a peer's legal request for more and answers it with the first block and
+`BlocksDone(1)`.
+
 A stream layout that pauses request intake MUST preserve response and control progress in both
 directions. Capacity admission defines that requirement independently of the concrete layout.
 

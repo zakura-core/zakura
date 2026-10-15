@@ -224,8 +224,8 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     cancel.cancel();
 }
 
-/// A session for `source` that serves up to four blocks per range and whose
-/// output holds `queue` frames.
+/// A session for `source` with the production serving limits, whose output
+/// holds `queue` frames.
 fn ready_session(
     source: &Arc<ControlledSource>,
     peer: u8,
@@ -236,11 +236,7 @@ fn ready_session(
     crate::zakura::FramedRecv,
     CancellationToken,
 ) {
-    let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 4,
-        ..Default::default()
-    };
-    let serving = Serving::new(source.clone(), &config);
+    let serving = Serving::new(source.clone(), &ZakuraBlockSyncConfig::default());
     let cancel = CancellationToken::new();
     let (send, output) = framed_channel(queue);
     let session = serving.session(
@@ -284,10 +280,12 @@ async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
     cancel.cancel();
 }
 
-/// Concurrent multi-block ranges, reused every round, may interleave with each
-/// other but keep their own heights in order and end exactly once.
+/// Concurrent multi-block requests, reused every round, are each answered with
+/// their first block and `BlocksDone(1)`, since we advertise one block per
+/// response. Ranges may interleave with each other but each ends exactly once,
+/// after its block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_ranges_keep_their_block_order_and_end_once() {
+async fn concurrent_multi_block_requests_get_one_block_prefixes() {
     const RANGES: [(u32, u32); 4] = [(1, 2), (3, 3), (6, 1), (7, 4)];
     let gate = Arc::new(Semaphore::new(0));
     let source = Arc::new(ControlledSource {
@@ -315,18 +313,14 @@ async fn concurrent_ranges_keep_their_block_order_and_end_once() {
                 .iter()
                 .position(|(start, count)| (*start..start + count).contains(&height.0))
                 .unwrap();
-            let (start, count) = RANGES[index];
+            let (start, _count) = RANGES[index];
             assert!(!ended[index], "range {start} sent after its ending");
             if served == Served::Block(height) {
-                assert_eq!(
-                    height,
-                    Height(start + received[index]),
-                    "blocks stay in order"
-                );
+                assert_eq!(height, Height(start), "only the first block is served");
                 received[index] += 1;
             } else {
-                assert_eq!(served, done(start, count));
-                assert_eq!(received[index], count);
+                assert_eq!(served, done(start, 1));
+                assert_eq!(received[index], 1);
                 ended[index] = true;
             }
         }
@@ -358,10 +352,8 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
     );
     session.admit(Height(1), 3).unwrap();
     for _ in 0..2 {
-        for height in 1..=3 {
-            assert_eq!(served(&mut output).await, Served::Block(Height(height)));
-        }
-        assert_eq!(served(&mut output).await, done(1, 3));
+        assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+        assert_eq!(served(&mut output).await, done(1, 1));
     }
     wait_completed(&mut session, Height(1)).await;
     assert!(output.try_recv().is_err());

@@ -118,6 +118,7 @@ pub fn spawn_block_sync_reactor(
         .config
         .validate_serving()
         .map_err(BlockSyncStartError::InvalidConfig)?;
+    startup.config.warn_ignored_max_blocks_per_response();
     let body_retention = startup.body_retention.clone();
     debug_assert!(
         !startup.state_queries_enabled
@@ -2163,8 +2164,9 @@ impl BlockSyncReactor {
     }
 
     async fn report_misbehavior(&mut self, peer: ZakuraPeerId, reason: BlockSyncMisbehavior) {
-        // Misbehavior is record-only: trace and forward it, but never cancel the
-        // session. Peer scoring no longer drives disconnects.
+        // This path only records misbehavior: trace and forward it, but never
+        // cancel the session. Only a proven tampered body, reported by the
+        // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).
         metrics::counter!("sync.block.peer.violation").increment(1);
         // The Misbehavior action carries the violation to the driver as a record.
         // Deliver it without ever blocking the reactor: awaiting a full `actions`

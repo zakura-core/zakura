@@ -125,10 +125,7 @@ async fn fuzz_steady_bytes_unit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_one_slow_peer_hol() {
     let blocks = 300;
-    let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
-        ..fuzz_config()
-    };
+    let config = ZakuraBlockSyncConfig { ..fuzz_config() };
     // 64 KiB/s with an 80 ms base RTT ⇒ ~0.5 s per 32 KiB body and a measured RTprop far
     // above the carriers', so the normal-path floor preference defers the floor to them.
     let slow = PeerSpec::with_serve(
@@ -231,10 +228,7 @@ async fn fuzz_idle_peers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_silent_dropping_peer() {
     let blocks = 300;
-    let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
-        ..retry_config()
-    };
+    let config = ZakuraBlockSyncConfig { ..retry_config() };
     // A flaky carrier: full-range and otherwise fast, but drops half its requests on the
     // floor — exactly the silent-on-the-floor peer that stalls the contiguous head.
     let flaky = PeerSpec::with_serve(
@@ -265,7 +259,7 @@ async fn fuzz_silent_dropping_peer() {
 }
 
 /// Unreliable carriers cover the upper half while a fast peer covers only the lower
-/// half. About 30% of the carriers' responses arrive after the request deadline, so
+/// half. About 5% of the carriers' responses arrive after the request deadline, so
 /// those requests time out and age the carriers' goodput EWMAs below 1.0, which the
 /// BBR cwnd formula folds into smaller expected windows — the end-to-end proof (through
 /// the real routine) that the reliability discount engages, complementing the
@@ -275,7 +269,9 @@ async fn fuzz_silent_dropping_peer() {
 ///
 /// The carriers answer late rather than never: a regulated session cannot retry a
 /// range on the same peer until it ends, and closes once an unended range outlives its
-/// retirement grace, so silent drops would strand the upper half.
+/// retirement grace, so silent drops would strand the upper half. The mock serves each
+/// peer's single-block requests in order, so one held response also delays every
+/// request queued behind it. At a 30% late rate the carriers never caught up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_reliability_discounts_dropping_carrier() {
     let blocks = 120;
@@ -287,7 +283,7 @@ async fn fuzz_reliability_discounts_dropping_carrier() {
             ServeProfile {
                 // Past the 4 s request timeout below.
                 late: Some(LateResponse {
-                    probability: 0.3,
+                    probability: 0.05,
                     delay: Duration::from_secs(5),
                 }),
                 ..ServeProfile::fast()
@@ -333,7 +329,6 @@ async fn fuzz_silent_peer_request_cap() {
     let probe_requests = 1;
     let request_cap = 8;
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
         request_timeout: Duration::from_millis(100),
         floor_rescue_timeout: Duration::from_millis(25),
         initial_block_probe_requests: probe_requests,
@@ -379,7 +374,6 @@ async fn fuzz_silent_peer_request_cap() {
 /// REQUESTS`) elapses well inside the run once a peer stops delivering.
 fn degrade_config() -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
         request_timeout: Duration::from_millis(100),
         floor_rescue_timeout: Duration::from_millis(25),
         initial_block_probe_requests: 1,
@@ -588,7 +582,6 @@ async fn fuzz_peer_slows_radically_is_kept() {
     // cwnd unit so the window's shrink is observable in `bbr_cwnd_bytes`.
     let config = ZakuraBlockSyncConfig {
         bbr_cwnd_unit: crate::zakura::CwndUnit::Bytes,
-        max_blocks_per_response: 1,
         request_timeout: Duration::from_secs(2),
         ..fuzz_config()
     };
@@ -648,7 +641,6 @@ async fn fuzz_range_unavailable_penalizes_reliability() {
     // the reliability signal to the short-response (RangeUnavailable) charge alone — a
     // floor-rescue timeout would otherwise also age reliability and mask it.
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
         request_timeout: Duration::from_secs(25),
         floor_rescue_timeout: Duration::from_secs(25),
         ..fuzz_config()
@@ -770,15 +762,12 @@ async fn fuzz_large_to_small() {
 /// request-count cap: a `min_cwnd_bytes` floor chosen below `max_inflight × body`, with
 /// the generous `fuzz_config` byte budget.
 ///
-/// Forces **one block per request** (`max_blocks_per_response = 1`), the regime the byte
-/// controller is designed for and the production default — with multi-block ranges a
-/// single request can reserve many bodies at once, so the per-request byte cwnd would no
-/// longer bound the in-flight bytes (the request *count* is what the cwnd gates).
+/// Block sync requests one block per `GetBlocks`, the regime the byte controller is
+/// designed for: each request reserves one body, so the byte cwnd bounds in-flight bytes.
 fn byte_window_config(min_cwnd_bytes: u64) -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
         bbr_cwnd_unit: crate::zakura::CwndUnit::Bytes,
         bbr_min_cwnd_bytes: min_cwnd_bytes,
-        max_blocks_per_response: 1,
         ..fuzz_config()
     }
 }
@@ -886,7 +875,6 @@ async fn fuzz_commit_stall() {
     let resident_budget = byte_ceiling * DESERIALIZED_MEM_FACTOR;
     let config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_bytes: resident_budget,
-        max_blocks_per_response: 1,
         ..fuzz_config()
     };
     let mut scenario = Scenario::new(
@@ -969,7 +957,6 @@ async fn fuzz_commit_stall_resident_plateau() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64 * 1024 * 1024,
         max_reorder_lookahead_bytes: resident_budget,
-        max_blocks_per_response: 1,
         ..fuzz_config()
     };
     let mut scenario = Scenario::new(
@@ -1034,94 +1021,6 @@ async fn fuzz_commit_stall_resident_plateau() {
         resident_budget,
         window_slack,
         "commit_stall resident-plateau observation",
-    );
-}
-
-/// The resident plateau with **multi-block responses** (the fuzz-default 16 blocks per
-/// request, unlike the single-block pin above). Multi-block takes are the regime where a
-/// take whose admission-checked start is inside the commit window could carry
-/// above-window heights past a full resident gate if the take geometry were sized by the
-/// in-flight budget instead of clamped at the window top (`admit`'s never-span-the-
-/// boundary rule). This is end-to-end coverage of the multi-block regime; the bound's
-/// commit-window slack is larger than a per-crossing overshoot at this block size, so
-/// the *pin* for the take geometry itself is the unit test
-/// `exempt_take_never_spans_the_commit_window_boundary` and the `admit` proptest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fuzz_commit_stall_resident_plateau_multiblock() {
-    let blocks = 1_200;
-    let body_bytes = 32 * 1024usize;
-    let resident_budget: u64 = 8 * 1024 * 1024;
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64 * 1024 * 1024,
-        max_reorder_lookahead_bytes: resident_budget,
-        // Deliberately NOT pinned to 1: fuzz_config()'s 16-block responses exercise
-        // window-crossing take geometry.
-        ..fuzz_config()
-    };
-    let mut scenario = Scenario::new(
-        blocks,
-        0x57ea_000e,
-        config,
-        vec![
-            PeerSpec::fast(1, target(blocks)),
-            PeerSpec::fast(2, target(blocks)),
-        ],
-    );
-    scenario.target_block_bytes = Some(body_bytes);
-    scenario.commit = CommitProfile {
-        per_commit_delay: Duration::from_millis(1),
-        burst: Some(CommitBurstStall {
-            every_commits: 40,
-            duration: Duration::from_millis(120),
-        }),
-    };
-    scenario.deadline = Duration::from_secs(120);
-    let (_, report) = run_checked(
-        "fuzz_commit_stall_resident_plateau_multiblock",
-        scenario,
-        64,
-    )
-    .await;
-
-    // Same bound as the single-block plateau: budget + one commit window of exempt
-    // bodies + a small request-boundary margin. A take-geometry regression (an exempt
-    // multi-block take extending above the window sized by the in-flight budget) drives
-    // retention toward the full ~150 MB resident chain instead.
-    // `usize → u64` widenings are lossless on all supported (64-bit) targets.
-    let window_slack = (MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64)
-        .saturating_mul(body_bytes as u64)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let margin = (body_bytes as u64)
-        .saturating_mul(16)
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let peak_retained_resident = report
-        .peak_retained_pipeline_wire_bytes
-        .saturating_mul(DESERIALIZED_MEM_FACTOR);
-    let bound = resident_budget
-        .saturating_add(window_slack)
-        .saturating_add(margin);
-    assert!(
-        peak_retained_resident <= bound,
-        "peak retained resident cost {} must stay within the {} B budget \
-         (+{} B commit-window slack, +{} B margin) with multi-block responses",
-        peak_retained_resident,
-        resident_budget,
-        window_slack,
-        margin,
-    );
-    assert!(
-        peak_retained_resident >= resident_budget / 2,
-        "the commit stall should have created real retained-memory pressure \
-         (retained {} of the {} B budget)",
-        peak_retained_resident,
-        resident_budget,
-    );
-    tracing::info!(
-        peak_retained_pipeline_wire_bytes = report.peak_retained_pipeline_wire_bytes,
-        peak_retained_resident,
-        resident_budget,
-        window_slack,
-        "commit_stall multi-block resident-plateau observation",
     );
 }
 
@@ -1190,76 +1089,6 @@ async fn fuzz_lossy_peer() {
     run_checked("fuzz_lossy_peer", scenario, 32).await;
 }
 
-/// Reverse-order serving: a peer returns the blocks of each multi-block response
-/// high→low. Regulated block sync only accepts the next expected height of a live
-/// request, so the node must close that connection on the first out-of-order body,
-/// before accepting any body from it, and finish through an in-order peer.
-/// `fuzz_config`'s `max_blocks_per_response = 16` lets the node issue multi-block
-/// ranges, so the reversal is non-trivial. Drives the `reorder` serve knob no other
-/// scenario sets.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fuzz_reorder() {
-    let blocks = 300;
-    let reversing = PeerSpec::with_serve(
-        1,
-        target(blocks),
-        ServeProfile {
-            reorder: true,
-            ..ServeProfile::fast()
-        },
-    );
-    let reversing_label = crate::zakura::zakura_trace_peer_label(&reversing.peer_id());
-    let scenario = Scenario::new(
-        blocks,
-        0x57ea_000e,
-        fuzz_config(),
-        vec![reversing, PeerSpec::fast(2, target(blocks))],
-    );
-
-    let (mut capture, trace) = run_trace("fuzz_reorder").expect("trace capture opens");
-    let outcome = run_scenario(&scenario, trace)
-        .await
-        .expect("scenario runs without harness error");
-    capture.flush().await;
-    let reader = capture
-        .reader()
-        .expect("trace reader loads the flushed run");
-    let report = invariant_report(&reader);
-    let reversing_rows = |event: &str| {
-        reader
-            .table("block_sync")
-            .rows()
-            .into_iter()
-            .filter(|row| row.get("event").and_then(|value| value.as_str()) == Some(event))
-            .filter(|row| {
-                row.get("peer").and_then(|value| value.as_str()) == Some(&reversing_label)
-            })
-            .count()
-    };
-    let reversing_requests = reversing_rows("block_get_blocks_sent");
-    let reversing_bodies = reversing_rows("block_body_received");
-    let reversing_disconnects = reversing_rows("block_peer_disconnected");
-    assert_core_invariants(&scenario, &outcome, &report, 32);
-    capture.finish().await.expect("capture discards cleanly");
-
-    assert!(
-        reversing_requests > 0,
-        "the reversing peer must be asked for blocks",
-    );
-    assert_eq!(
-        reversing_bodies, 0,
-        "no body from a reversed response may be accepted",
-    );
-    assert_eq!(
-        reversing_disconnects, 1,
-        "the reversing peer must be disconnected on its first out-of-order body",
-    );
-    assert_eq!(
-        report.session_parks, 0,
-        "an out-of-order response closes the connection; it is not a no-progress park",
-    );
-}
-
 /// Many peers race against a tight shared request budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_multi_peer_tight_budget() {
@@ -1269,7 +1098,6 @@ async fn fuzz_multi_peer_tight_budget() {
     let byte_ceiling: u64 = 3 * 1024 * 1024;
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: byte_ceiling,
-        max_blocks_per_response: 1,
         ..fuzz_config()
     };
     let peers: Vec<_> = (1u8..=8)

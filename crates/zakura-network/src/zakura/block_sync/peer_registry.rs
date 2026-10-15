@@ -17,9 +17,9 @@
 //! *body*), slot diagnostics, and download-side misbehavior. The **service** inserts
 //! an entry at admission and closes its generation when the session ends. The
 //! **reactor** removes closed entries and owns serving-side misbehavior and
-//! floor-watchdog hard excludes. Misbehavior is record-only: it is observed and
-//! traced but never drives a disconnect, so the registry keeps no per-peer
-//! misbehavior state.
+//! floor-watchdog hard excludes. Misbehavior is observed and traced, and only a
+//! proven tampered body disconnects (see `BlockSyncMisbehavior::proves_tampered_body`),
+//! so the registry keeps no per-peer misbehavior state.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},

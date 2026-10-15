@@ -831,12 +831,19 @@ impl BlockSyncReactor {
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the registry entry.
         // A session reopened on the same connection is admitted before this
-        // event arrives, so only state owned by the ended session is removed.
-        let owns_serving_handle =
-            self.state.peers.get(&peer).is_some_and(|state| {
-                generation.is_none() || state.session.generation() == generation
-            });
-        if owns_serving_handle {
+        // event arrives, so a newer session's handle is kept. An older handle is
+        // removed: admitting a replacement cancels its predecessor, which then
+        // sends no disconnect, and the reactor skips a replacement that ended
+        // before its connect was handled.
+        let removes_serving_handle = self.state.peers.get(&peer).is_some_and(|state| {
+            generation.is_none_or(|ended| {
+                state
+                    .session
+                    .generation()
+                    .is_none_or(|stored| stored <= ended)
+            })
+        });
+        if removes_serving_handle {
             self.state.peers.remove(&peer);
             set_block_reactor_active_connection_gauge(self.state.peers.len());
             self.trace_peer_disconnected(

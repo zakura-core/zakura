@@ -6728,88 +6728,79 @@ async fn stale_disconnect_after_replacement_connect_keeps_replacement_session() 
     check_stale_disconnect_keeps_replacement(true).await;
 }
 
+/// A disconnect for a replacement whose connect the reactor skipped, because the
+/// replacement already ended, must still remove the older session's handle. The
+/// older session was replaced, so it sends no disconnect of its own.
+#[tokio::test]
+async fn disconnect_of_a_skipped_replacement_removes_the_older_handle() {
+    let (handle, service, mut lifecycle_rx, reactor_task) = spawn_relayed_block_sync();
+    let mut snapshots = handle.subscribe_peer_snapshot();
+    let peer = peer(96);
+
+    let (_old_inbound_tx, old_inbound_rx) = framed_channel(4);
+    let (old_outbound_tx, _old_outbound_rx) = framed_channel(4);
+    service.add_peer(regulated_outbound_peer(
+        21,
+        &peer,
+        old_inbound_rx,
+        old_outbound_tx,
+    ));
+    let connected = next_lifecycle(&mut lifecycle_rx).await;
+    assert_eq!(relay(&handle, &mut snapshots, connected).await, 1);
+
+    // A newer connection replaces the old session, which no longer owns the
+    // active record and so sends no disconnect.
+    let (_new_inbound_tx, new_inbound_rx) = framed_channel(4);
+    let (new_outbound_tx, _new_outbound_rx) = framed_channel(4);
+    service.add_peer(regulated_outbound_peer(
+        22,
+        &peer,
+        new_inbound_rx,
+        new_outbound_tx,
+    ));
+    let BlockSyncEvent::PeerConnected(replacement) = next_lifecycle(&mut lifecycle_rx).await else {
+        panic!("the replacement session should connect");
+    };
+
+    // The replacement ends before the reactor handles its connect.
+    replacement.cancel_token().cancel();
+    let disconnect = next_lifecycle(&mut lifecycle_rx).await;
+    assert!(matches!(
+        disconnect,
+        BlockSyncEvent::PeerDisconnected { .. }
+    ));
+    // The reactor skips the cancelled connect without republishing its snapshot.
+    handle
+        .lifecycle
+        .send(BlockSyncEvent::PeerConnected(replacement))
+        .expect("the reactor is live");
+    assert_eq!(
+        relay(&handle, &mut snapshots, disconnect).await,
+        0,
+        "the replaced session's handle must not outlive its replacement",
+    );
+    assert!(!registry_has_peer(&handle, &peer));
+
+    reactor_task.abort();
+}
+
 /// End a session, reopen the stream on the same connection, then let the reactor
 /// see the old session's disconnect after the replacement was admitted. The
 /// replacement must stay visible until its own disconnect removes it.
 async fn check_stale_disconnect_keeps_replacement(replacement_connect_first: bool) {
-    /// Receive the next lifecycle event the service published.
-    async fn next_lifecycle(
-        events: &mut mpsc::UnboundedReceiver<BlockSyncEvent>,
-    ) -> BlockSyncEvent {
-        tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await
-            .expect("block-sync lifecycle event should arrive")
-            .expect("block-sync lifecycle channel should stay open")
-    }
-
-    /// Relay one lifecycle event to the reactor and return its admitted
-    /// outbound peer count once the reactor has handled it.
-    async fn relay(
-        handle: &BlockSyncHandle,
-        snapshots: &mut watch::Receiver<ServicePeerSnapshot>,
-        event: BlockSyncEvent,
-    ) -> usize {
-        snapshots.borrow_and_update();
-        handle.lifecycle.send(event).expect("the reactor is live");
-        // Every peer lifecycle handler republishes the peer snapshot.
-        tokio::time::timeout(Duration::from_secs(1), snapshots.changed())
-            .await
-            .expect("the reactor should handle the relayed event")
-            .expect("the reactor peer snapshot should stay open");
-        snapshots.borrow().outbound_peers
-    }
-
-    let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    // The test relays service lifecycle events, so it decides when the reactor sees them.
-    let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
-    let service = BlockSyncService::new_with_handle_for_test(
-        config,
-        BlockSyncHandle {
-            lifecycle: lifecycle_tx,
-            ..handle.clone()
-        },
-    );
-    let registry = &handle
-        .routine_wiring
-        .as_ref()
-        .expect("the spawned reactor exposes its shared test wiring")
-        .registry;
-    let in_registry = || {
-        registry
-            .candidate_snapshot()
-            .iter()
-            .any(|(candidate, ..)| candidate == &peer(95))
-    };
+    let (handle, service, mut lifecycle_rx, reactor_task) = spawn_relayed_block_sync();
     let mut snapshots = handle.subscribe_peer_snapshot();
+    let peer = peer(95);
     let conn_id = 21;
-    let open_session = |inbound_rx, outbound_tx| {
-        Peer::new_with_conn_id_and_direction(
-            conn_id,
-            peer(95),
-            None,
-            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
-            ServicePeerDirection::Outbound,
-            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
-            CancellationToken::new(),
-        )
-    };
 
     let (old_inbound_tx, old_inbound_rx) = framed_channel(4);
     let (old_outbound_tx, _old_outbound_rx) = framed_channel(4);
-    service.add_peer(open_session(old_inbound_rx, old_outbound_tx));
+    service.add_peer(regulated_outbound_peer(
+        conn_id,
+        &peer,
+        old_inbound_rx,
+        old_outbound_tx,
+    ));
     let connected = next_lifecycle(&mut lifecycle_rx).await;
     assert!(matches!(connected, BlockSyncEvent::PeerConnected(_)));
     assert_eq!(relay(&handle, &mut snapshots, connected).await, 1);
@@ -6825,10 +6816,15 @@ async fn check_stale_disconnect_keeps_replacement(replacement_connect_first: boo
     // The connection reopens its stream before the reactor sees the disconnect.
     let (new_inbound_tx, new_inbound_rx) = framed_channel(4);
     let (new_outbound_tx, _new_outbound_rx) = framed_channel(4);
-    service.add_peer(open_session(new_inbound_rx, new_outbound_tx));
+    service.add_peer(regulated_outbound_peer(
+        conn_id,
+        &peer,
+        new_inbound_rx,
+        new_outbound_tx,
+    ));
     let replacement = next_lifecycle(&mut lifecycle_rx).await;
     assert!(matches!(replacement, BlockSyncEvent::PeerConnected(_)));
-    assert!(in_registry());
+    assert!(registry_has_peer(&handle, &peer));
 
     if replacement_connect_first {
         assert_eq!(relay(&handle, &mut snapshots, replacement).await, 1);
@@ -6840,13 +6836,13 @@ async fn check_stale_disconnect_keeps_replacement(replacement_connect_first: boo
     } else {
         assert_eq!(relay(&handle, &mut snapshots, stale_disconnect).await, 0);
         assert!(
-            in_registry(),
+            registry_has_peer(&handle, &peer),
             "a stale disconnect must not remove the replacement's registry entry",
         );
         assert_eq!(relay(&handle, &mut snapshots, replacement).await, 1);
     }
     assert!(
-        in_registry(),
+        registry_has_peer(&handle, &peer),
         "a stale disconnect must not remove the replacement's registry entry",
     );
 
@@ -6858,9 +6854,97 @@ async fn check_stale_disconnect_keeps_replacement(replacement_connect_first: boo
         BlockSyncEvent::PeerDisconnected { .. }
     ));
     assert_eq!(relay(&handle, &mut snapshots, disconnect).await, 0);
-    assert!(!in_registry());
+    assert!(!registry_has_peer(&handle, &peer));
 
     reactor_task.abort();
+}
+
+/// Spawn a reactor and a service whose lifecycle events go to the returned
+/// receiver instead, so a test decides when the reactor sees each one.
+fn spawn_relayed_block_sync() -> (
+    BlockSyncHandle,
+    BlockSyncService,
+    mpsc::UnboundedReceiver<BlockSyncEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let service = BlockSyncService::new_with_handle_for_test(
+        config,
+        BlockSyncHandle {
+            lifecycle: lifecycle_tx,
+            ..handle.clone()
+        },
+    );
+    (handle, service, lifecycle_rx, reactor_task)
+}
+
+/// A regulated outbound block-sync stream for `peer` on connection `conn_id`.
+fn regulated_outbound_peer(
+    conn_id: crate::zakura::ZakuraConnId,
+    peer: &ZakuraPeerId,
+    inbound_rx: FramedRecv,
+    outbound_tx: FramedSend,
+) -> Peer {
+    Peer::new_with_conn_id_and_direction(
+        conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+        CancellationToken::new(),
+    )
+}
+
+/// Whether the reactor's shared registry has an entry for `peer`.
+fn registry_has_peer(handle: &BlockSyncHandle, peer: &ZakuraPeerId) -> bool {
+    handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring")
+        .registry
+        .candidate_snapshot()
+        .iter()
+        .any(|(candidate, ..)| candidate == peer)
+}
+
+/// Receive the next lifecycle event the service published.
+async fn next_lifecycle(events: &mut mpsc::UnboundedReceiver<BlockSyncEvent>) -> BlockSyncEvent {
+    tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("block-sync lifecycle event should arrive")
+        .expect("block-sync lifecycle channel should stay open")
+}
+
+/// Relay one lifecycle event to the reactor and return its admitted outbound
+/// peer count once the reactor has handled it.
+async fn relay(
+    handle: &BlockSyncHandle,
+    snapshots: &mut watch::Receiver<ServicePeerSnapshot>,
+    event: BlockSyncEvent,
+) -> usize {
+    snapshots.borrow_and_update();
+    handle.lifecycle.send(event).expect("the reactor is live");
+    // Every handled peer lifecycle event republishes the peer snapshot.
+    tokio::time::timeout(Duration::from_secs(1), snapshots.changed())
+        .await
+        .expect("the reactor should handle the relayed event")
+        .expect("the reactor peer snapshot should stay open");
+    snapshots.borrow().outbound_peers
 }
 
 #[tokio::test]

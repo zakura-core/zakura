@@ -558,7 +558,7 @@ subscription's total granted credit within the credit its pages consumed plus on
 
 `sent_headers` and `sent_bytes` count the pages the publisher sent on that subscription. Before any
 page, the bound is 9,332 updates on Mainnet and Testnet and 35,895 on Regtest. Each sent header
-raises it by fewer than three. A conformant subscriber can always meet the minimum. Once it
+raises it by at most three. A conformant subscriber can always meet the minimum. Once it
 accepts every received page and its unspent credit cannot fit a page, its window has room for at
 least one header or at least `P` bytes.
 

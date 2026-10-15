@@ -315,7 +315,7 @@ second until measurements show that recovery stays acceptable.
 
 **Grant minimum.** A `Grant` that adds one byte was legal, so a subscriber could send millions of
 grants inside one 8 MiB window. Each grant now adds at least one header or one smallest legal page
-of bytes, which caps grants at about one window's worth plus fewer than three per header sent.
+of bytes, which caps grants at about one window's worth plus at most three per header sent.
 The codec checks the minimum at decode because it depends only on the network. A larger minimum,
 such as an eighth of the window, would cut grants further, the way TCP receivers avoid tiny window
 updates, but it would delay acknowledgements during tip following. A cadence on the subscription

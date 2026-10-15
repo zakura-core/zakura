@@ -24,11 +24,13 @@ use crate::zakura::{
 /// Live GetBlocks exchanges one session may hold from the node pool.
 ///
 /// Two sessions hold at most a quarter of the pool, so peers that grow large
-/// windows and then stop answering cannot starve every other session. An
-/// honest session never needs more. Requests already stop at the server's
-/// advertised in-flight limit, 2,816 for a default Zakura node
-/// (`serving_max_inflight_requests`), and the integrated header lead keeps
-/// distinct missing heights within 4,000 (`INTEGRATED_HEADER_BODY_WINDOW_V1`).
+/// windows and then stop answering cannot starve every other session. Normal
+/// sync stays below it: a default Zakura server advertises 2,816 in-flight
+/// requests (`serving_max_inflight_requests`), and the integrated header lead
+/// keeps distinct missing heights within 4,000
+/// (`INTEGRATED_HEADER_BODY_WINDOW_V1`). Exchanges abandoned after GC or a
+/// reorg, or a larger custom advertisement, can briefly reach it, and the
+/// session then waits for endings before it requests more.
 pub(crate) const SESSION_RESERVATIONS: usize = 4_096;
 
 // The protocol ceiling fits usize on supported targets.

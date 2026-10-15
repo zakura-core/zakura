@@ -1425,7 +1425,8 @@ impl ZakuraSupervisorHandle {
     /// Violations are record-only, except a body that proves tampering (see
     /// [`crate::zakura::BlockSyncMisbehavior::proves_tampered_body`]), which disconnects
     /// the peer.
-    /// Returns whether an active connection was closed.
+    /// Returns whether this call closed an active connection that wasn't
+    /// already closing.
     pub async fn enforce_block_sync_misbehavior(
         &self,
         peer_id: &ZakuraPeerId,
@@ -1434,8 +1435,23 @@ impl ZakuraSupervisorHandle {
         if !reason.proves_tampered_body() {
             return false;
         }
-        let disconnected = self.disconnect_peer(peer_id).await;
-        metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
+        let token = {
+            let state = self.inner.lock().await;
+            state
+                .active_by_peer
+                .get(peer_id)
+                .map(|entry| entry.disconnect_token.clone())
+        };
+        // Count only connections this call closes, not a peer that already left
+        // or a connection that is already shutting down.
+        let disconnected = token.is_some_and(|token| {
+            let already_closing = token.is_cancelled();
+            token.cancel();
+            !already_closing
+        });
+        if disconnected {
+            metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
+        }
         info!(
             ?peer_id,
             ?reason,
@@ -8442,7 +8458,24 @@ mod tests {
                 "{reason:?}"
             );
             assert_eq!(disconnect_token.is_cancelled(), disconnects, "{reason:?}");
+            if disconnects {
+                assert!(
+                    !supervisor
+                        .enforce_block_sync_misbehavior(&peer, &reason)
+                        .await,
+                    "a connection already closing is not closed again: {reason:?}"
+                );
+            }
         }
+        assert!(
+            !supervisor
+                .enforce_block_sync_misbehavior(
+                    &test_peer(250),
+                    &mismatch(BodyCommitmentKind::AuthDataRoot)
+                )
+                .await,
+            "a peer that already left has nothing to close"
+        );
     }
 
     /// Reopen a header-sync stream after the responder parks it on a healthy connection.

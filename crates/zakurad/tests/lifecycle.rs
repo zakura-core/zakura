@@ -2,12 +2,13 @@
 //! errors, and shuts down.
 //!
 //! Each test runs the real `zakurad` binary in a scratch directory with a cleared
-//! environment, and checks its exit status and output streams.
+//! environment, and checks its exit status and output streams. Commands that exit on
+//! their own without starting a node run through [`TestChild`]. Commands that start a
+//! node run through [`Node`], which reads both output streams while the node runs, so a
+//! test can wait for a log line or send a signal.
 //!
 //! Set `ZAKURAD_LIFECYCLE_RECORD_DIR` to also write each run's exit status and
-//! output to a JSON file in that directory, so two builds can be compared. Recorded
-//! output has temporary paths, timestamps, versions, commits and ports replaced with
-//! placeholders.
+//! output to a JSON file in that directory, so two builds can be compared.
 
 #![allow(clippy::unwrap_in_result)]
 
@@ -24,10 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use regex::Regex;
 use tempfile::TempDir;
 use zakura_chain::parameters::Network;
 use zakura_state::{PruningConfig, StorageMode};
+use zakura_test::command::{CommandExt, TestChild};
 use zakurad::config::ZakuradConfig;
 
 /// How long a node may take to log a startup milestone or exit.
@@ -122,23 +123,53 @@ impl Scratch {
         command
     }
 
-    /// Runs a command that is expected to exit on its own.
+    /// Runs a command that exits on its own without starting a node.
+    ///
+    /// [`TestChild`] reads the output after the process exits, so the command must
+    /// write less than a pipe buffer of output.
     fn run(&self, name: &str, command: &mut Command) -> Run {
-        let node = Node::spawn(command);
-        node.wait(name, self)
+        let child: TestChild<()> = command.spawn2((), "zakurad").expect("zakurad starts");
+        let output = child
+            .wait_with_output_or_timeout(PROCESS_TIMEOUT)
+            .expect("zakurad exits in time")
+            .output;
+        let run = Run {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        run.record(name, self.path());
+        run
+    }
+
+    /// Runs a command that starts a node and is expected to exit on its own.
+    fn run_node(&self, name: &str, command: &mut Command) -> Run {
+        self.spawn(command).wait(name, self)
     }
 
     /// Starts a long-running command.
     fn spawn(&self, command: &mut Command) -> Node {
         Node::spawn(command)
     }
+
+    /// A regtest config that the node rejects as soon as it opens its state, after it
+    /// has logged its configuration.
+    fn rejected_state_config(&self) -> ZakuradConfig {
+        let mut config = self.regtest_config();
+        config.state.storage_mode = StorageMode::Pruned(PruningConfig { tx_retention: 1 });
+        config
+    }
 }
 
-/// A running `zakurad` process whose output is collected in the background.
+/// A running `zakurad` node whose output is collected in the background.
+///
+/// Dropping it kills a process that is still running, for example when a test fails.
 struct Node {
     child: Child,
+    /// Each stdout line as it is read, including a final line without a newline.
     stdout_lines: mpsc::Receiver<String>,
-    stdout: Arc<Mutex<Vec<String>>>,
+    /// All stdout bytes read so far.
+    stdout: Arc<Mutex<Vec<u8>>>,
     stdout_reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<String>>,
 }
@@ -169,21 +200,29 @@ impl Node {
     fn read_lines(
         stdout: ChildStdout,
         lines_tx: mpsc::Sender<String>,
-        collected: Arc<Mutex<Vec<String>>>,
+        collected: Arc<Mutex<Vec<u8>>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
+            let mut stdout = BufReader::new(stdout);
+            let mut line = Vec::new();
+            while matches!(stdout.read_until(b'\n', &mut line), Ok(1..)) {
                 collected
                     .lock()
                     .expect("no reader panics while holding the lock")
-                    .push(line.clone());
-                let _ = lines_tx.send(line);
+                    .extend_from_slice(&line);
+                let _ = lines_tx.send(String::from_utf8_lossy(&line).into_owned());
+                line.clear();
             }
         })
     }
 
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.stdout.lock().expect("lock is not poisoned")).into_owned()
+    }
+
     /// Waits until a stdout line contains `text`, or panics with the output so far.
+    ///
+    /// The deadline applies even if the node stops writing output.
     fn wait_for_stdout(&mut self, text: &str) {
         let deadline = Instant::now() + PROCESS_TIMEOUT;
         loop {
@@ -191,10 +230,10 @@ impl Node {
             match self.stdout_lines.recv_timeout(remaining) {
                 Ok(line) if line.contains(text) => return,
                 Ok(_) => {}
-                Err(error) => {
-                    let stdout = self.stdout.lock().expect("lock is not poisoned").join("\n");
-                    panic!("zakurad did not log {text:?} ({error}); stdout so far:\n{stdout}");
-                }
+                Err(error) => panic!(
+                    "zakurad did not log {text:?} ({error}); stdout so far:\n{}",
+                    self.stdout()
+                ),
             }
         }
     }
@@ -210,7 +249,7 @@ impl Node {
         assert!(status.success(), "signal {signal} is delivered");
     }
 
-    /// Waits for the process to exit and returns its output.
+    /// Waits for the process to exit and returns all of its output.
     fn wait(mut self, name: &str, scratch: &Scratch) -> Run {
         let deadline = Instant::now() + PROCESS_TIMEOUT;
         let status = loop {
@@ -218,7 +257,10 @@ impl Node {
                 break status;
             }
             if Instant::now() >= deadline {
-                panic!("zakurad did not exit within {PROCESS_TIMEOUT:?}");
+                panic!(
+                    "zakurad did not exit within {PROCESS_TIMEOUT:?}; stdout so far:\n{}",
+                    self.stdout()
+                );
             }
             thread::sleep(Duration::from_millis(50));
         };
@@ -233,7 +275,7 @@ impl Node {
             .expect("output is collected once")
             .join()
             .expect("stderr reader finishes");
-        let stdout = self.stdout.lock().expect("lock is not poisoned").join("\n");
+        let stdout = self.stdout();
 
         let run = Run {
             status,
@@ -246,7 +288,6 @@ impl Node {
 }
 
 impl Drop for Node {
-    /// Kills and reaps a process that is still running, for example when a test fails.
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
             let _ = self.child.kill();
@@ -334,10 +375,11 @@ impl Run {
         };
         let record = serde_json::json!({
             "name": name,
+            "scratch": scratch,
             "status": self.status.code(),
             "signal": signal_of(&self.status),
-            "stdout": normalize(&self.stdout, scratch),
-            "stderr": normalize(&self.stderr, scratch),
+            "stdout": self.stdout,
+            "stderr": self.stderr,
         });
         let path = PathBuf::from(dir).join(format!("{name}.json"));
         fs::write(
@@ -357,43 +399,6 @@ fn signal_of(status: &ExitStatus) -> Option<i32> {
 #[cfg(not(unix))]
 fn signal_of(_status: &ExitStatus) -> Option<i32> {
     None
-}
-
-/// Replaces values that differ between runs and builds with placeholders.
-fn normalize(output: &str, scratch: &Path) -> Vec<String> {
-    let replacements = [
-        (r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z", "<time>"),
-        (
-            r"\b\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?\b",
-            "<version>",
-        ),
-        (r"\b[0-9a-f]{7,40}\b", "<commit>"),
-        (r"(127\.0\.0\.1|0\.0\.0\.0|\[::\]|\[::1\]):\d+", "$1:<port>"),
-        (
-            r"(commit timestamp|branch|rust release date): .*",
-            "$1: <build>",
-        ),
-        (r"ThreadId\(\d+\)", "ThreadId(<id>)"),
-        (r"\d+(\.\d+)?(ns|µs|ms|s)\b", "<duration>"),
-    ]
-    .map(|(pattern, replacement)| {
-        (
-            Regex::new(pattern).expect("normalization patterns are valid"),
-            replacement,
-        )
-    });
-
-    let scratch = scratch.to_string_lossy();
-    output
-        .lines()
-        .map(|line| {
-            let mut line = line.replace(scratch.as_ref(), "<scratch>");
-            for (pattern, replacement) in &replacements {
-                line = pattern.replace_all(&line, *replacement).into_owned();
-            }
-            line
-        })
-        .collect()
 }
 
 /// Returns a local TCP address that stays occupied while the listener is alive.
@@ -515,6 +520,110 @@ fn explicit_config_environment_and_cli_overrides_take_precedence() {
         .assert_stdout_contains("filter=\"info,zakurad=debug\"");
 }
 
+/// When both config files are in the preference directory, `zakura.toml` is used, and the
+/// legacy file is neither read nor mentioned.
+#[test]
+fn zakura_toml_wins_over_legacy_config() {
+    let scratch = Scratch::new();
+    let config_path = scratch.write_config(scratch.preference_dir().join("zakura.toml"), &{
+        let mut config = scratch.rejected_state_config();
+        config.network.peerset_initial_target_size = 31;
+        config
+    });
+    // Reading this file would stop startup with a config error.
+    scratch.write_file(
+        scratch.preference_dir().join("zebrad.toml"),
+        "[network]\nnot_a_real_field = 1\n",
+    );
+
+    let run = scratch.run_node("both_config_files", &mut scratch.command(["start"]));
+
+    run.assert_status(1)
+        .assert_stdout_contains(&format!("Using config file at: {config_path:?}"))
+        .assert_stdout_contains("peerset_initial_target_size=31")
+        .assert_no_output_contains("zebrad.toml");
+}
+
+/// Config sources apply in order: defaults, then the file, then `ZEBRA_` environment
+/// variables, then `ZAKURA_` environment variables, then command-line tracing filters.
+#[test]
+fn config_sources_apply_in_precedence_order() {
+    let scratch = Scratch::new();
+    let config = scratch.write_config("zakura.toml", &{
+        let mut config = scratch.rejected_state_config();
+        config.network.peerset_initial_target_size = 47;
+        config.tracing.filter = Some("error".to_string());
+        config
+    });
+    let command = |filters: &[&str]| {
+        let mut args = vec![OsStr::new("-c"), config.as_os_str(), OsStr::new("start")];
+        args.extend(filters.iter().map(OsStr::new));
+        let mut command = scratch.command(args);
+        command
+            .env("ZEBRA_NETWORK__PEERSET_INITIAL_TARGET_SIZE", "53")
+            .env("ZAKURA_NETWORK__PEERSET_INITIAL_TARGET_SIZE", "59")
+            .env("ZEBRA_TRACING__FILTER", "info");
+        command
+    };
+
+    // The file overrides the default ephemeral state setting, `ZEBRA_` overrides the
+    // file's filter, and `ZAKURA_` overrides `ZEBRA_`.
+    let run = scratch.run_node("config_precedence_environment", &mut command(&[]));
+    run.assert_status(1)
+        .assert_stdout_contains("filter=\"info\"")
+        .assert_stdout_contains("peerset_initial_target_size=59")
+        .assert_stdout_contains("ephemeral_state=true");
+
+    // Command-line filters override every configured filter.
+    let mut with_cli_filter = command(&["info,zakurad=info"]);
+    with_cli_filter.env("ZAKURA_TRACING__FILTER", "warn");
+    let run = scratch.run_node("config_precedence_command_line", &mut with_cli_filter);
+    run.assert_status(1)
+        .assert_stdout_contains("filter=\"info,zakurad=info\"")
+        .assert_stdout_contains("peerset_initial_target_size=59");
+}
+
+/// Tracing filters given before any subcommand apply to the implicit `start`.
+#[test]
+fn implicit_start_applies_top_level_filters() {
+    let scratch = Scratch::new();
+    let config_path = scratch.write_config(
+        scratch.preference_dir().join("zakura.toml"),
+        &scratch.rejected_state_config(),
+    );
+
+    let run = scratch.run_node(
+        "implicit_start_filters",
+        &mut scratch.command(["--filters", "info,zakurad=info"]),
+    );
+
+    run.assert_status(1)
+        .assert_stdout_contains(&format!("Using config file at: {config_path:?}"))
+        .assert_stdout_contains("filter=\"info,zakurad=info\"")
+        .assert_stdout_contains("Starting zakurad");
+}
+
+/// `--verbose` makes `start` log at debug level when no filter is configured.
+#[test]
+fn verbose_start_uses_debug_filter() {
+    let scratch = Scratch::new();
+    let config = scratch.write_config("zakura.toml", &scratch.rejected_state_config());
+
+    let run = scratch.run_node(
+        "verbose_start",
+        &mut scratch.command([
+            OsStr::new("--verbose"),
+            OsStr::new("--config"),
+            config.as_os_str(),
+            OsStr::new("start"),
+        ]),
+    );
+
+    run.assert_status(1)
+        .assert_stdout_contains(&format!("Using config file at: {config:?}"))
+        .assert_stdout_contains("filter=\"debug\"");
+}
+
 // Configuration errors
 
 /// A config file that is not valid TOML stops startup with the loader error.
@@ -607,14 +716,22 @@ fn sensitive_environment_override_is_rejected_without_printing_it() {
     let scratch = Scratch::new();
     let config = scratch.write_config("zakura.toml", &scratch.regtest_config());
 
-    let mut command = scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]);
-    command.env("ZAKURA_RPC__PASSWORD", SYNTHETIC_CREDENTIAL);
-    let run = scratch.run("sensitive_env_override", &mut command);
+    for (name, variable) in [
+        ("sensitive_env_override", "ZAKURA_RPC__PASSWORD"),
+        ("sensitive_legacy_env_override", "ZEBRA_RPC__PASSWORD"),
+    ] {
+        let mut command =
+            scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]);
+        command.env(variable, SYNTHETIC_CREDENTIAL);
+        let run = scratch.run(name, &mut command);
 
-    run.assert_status(1)
-        .assert_stderr_contains("zakura fatal error: I/O operation failed: Configuration error:")
-        .assert_stderr_contains("ZAKURA_RPC__PASSWORD")
-        .assert_no_output_contains(SYNTHETIC_CREDENTIAL);
+        run.assert_status(1)
+            .assert_stderr_contains(
+                "zakura fatal error: I/O operation failed: Configuration error:",
+            )
+            .assert_stderr_contains(variable)
+            .assert_no_output_contains(SYNTHETIC_CREDENTIAL);
+    }
 }
 
 /// A command-line flag that conflicts with the config stops startup before the node starts.
@@ -666,19 +783,37 @@ fn invalid_config_combination_is_rejected() {
     );
 }
 
+/// A log file that can't be opened stops startup before the node starts.
+#[test]
+fn tracing_setup_failure_is_reported() {
+    let scratch = Scratch::new();
+    let config = scratch.write_config("zakura.toml", &{
+        let mut config = scratch.regtest_config();
+        // A directory can't be opened as a log file.
+        config.tracing.log_file = Some(scratch.path().to_path_buf());
+        config
+    });
+
+    let run = scratch.run(
+        "tracing_setup_failure",
+        &mut scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]),
+    );
+
+    run.assert_status(1)
+        .assert_stdout_contains("Sending logs to")
+        .assert_stderr_contains("error: zakura fatal error: I/O operation failed:")
+        .assert_stdout_lacks("Starting zakurad");
+}
+
 // Startup and shutdown
 
 /// An error returned by the running node stops it with a failure status, after logging why.
 #[test]
 fn runtime_error_exits_with_failure() {
     let scratch = Scratch::new();
-    let config = scratch.write_config("zakura.toml", &{
-        let mut config = scratch.regtest_config();
-        config.state.storage_mode = StorageMode::Pruned(PruningConfig { tx_retention: 1 });
-        config
-    });
+    let config = scratch.write_config("zakura.toml", &scratch.rejected_state_config());
 
-    let run = scratch.run(
+    let run = scratch.run_node(
         "runtime_error",
         &mut scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]),
     );
@@ -690,7 +825,7 @@ fn runtime_error_exits_with_failure() {
         .assert_stdout_lacks(STOPPED);
 }
 
-/// An occupied P2P listener port stops the node with a failure status.
+/// An occupied P2P listener port stops the node with a panic.
 #[test]
 fn occupied_p2p_listener_exits_with_failure() {
     let scratch = Scratch::new();
@@ -701,13 +836,13 @@ fn occupied_p2p_listener_exits_with_failure() {
         config
     });
 
-    let run = scratch.run(
+    let run = scratch.run_node(
         "occupied_p2p_listener",
         &mut scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]),
     );
 
-    assert!(!run.status.success(), "an occupied listener stops the node");
-    run.assert_stdout_contains("Starting zakurad")
+    run.assert_status(101)
+        .assert_stdout_contains("Starting zakurad")
         .assert_stdout_lacks(STOPPED);
 }
 
@@ -724,7 +859,7 @@ fn occupied_metrics_listener_panics_after_partial_startup() {
         config
     });
 
-    let run = scratch.run(
+    let run = scratch.run_node(
         "occupied_metrics_listener",
         &mut scratch.command([OsStr::new("-c"), config.as_os_str(), OsStr::new("start")]),
     );
@@ -864,6 +999,146 @@ fn utility_commands_do_not_start_server_components() {
     );
 }
 
+/// `tip-height` is quiet unless `-v` or `--verbose` is given.
+#[test]
+fn utility_command_verbosity_flags() {
+    let scratch = Scratch::new();
+    let config = scratch.write_config("zakura.toml", &scratch.regtest_config());
+    let empty_state = scratch.path().join("empty-state");
+
+    for (name, verbosity) in [
+        ("utility_quiet", None),
+        ("utility_short_verbose", Some("-v")),
+        ("utility_long_verbose", Some("--verbose")),
+    ] {
+        let mut args: Vec<&OsStr> = verbosity.into_iter().map(OsStr::new).collect();
+        args.extend([
+            OsStr::new("-c"),
+            config.as_os_str(),
+            OsStr::new("tip-height"),
+            OsStr::new("--network"),
+            OsStr::new("Testnet"),
+            OsStr::new("--cache-dir"),
+            empty_state.as_os_str(),
+        ]);
+        let run = scratch.run(name, &mut scratch.command(args));
+
+        run.assert_status(0)
+            .assert_stdout_contains("Failed to read chain tip height from state");
+        if verbosity.is_some() {
+            run.assert_stdout_contains("started tracing component");
+        } else {
+            run.assert_stdout_lacks("started tracing component");
+        }
+    }
+}
+
+/// `generate --output-file` writes the same config `generate` prints, and that config
+/// loads.
+#[test]
+fn generated_config_file_round_trips() {
+    let scratch = Scratch::new();
+    let generated = scratch.path().join("generated.toml");
+
+    let printed = scratch.run("generate_stdout", &mut scratch.command(["generate"]));
+    printed.assert_status(0);
+    assert_eq!(printed.stderr, "", "generate writes nothing to stderr");
+
+    let written = scratch.run(
+        "generate_file",
+        &mut scratch.command([
+            OsStr::new("generate"),
+            OsStr::new("-o"),
+            generated.as_os_str(),
+        ]),
+    );
+    written.assert_status(0);
+    assert_eq!(
+        written.stdout, "",
+        "generate writes the config only to the file"
+    );
+    assert_eq!(written.stderr, "", "generate writes nothing to stderr");
+
+    let file = fs::read_to_string(&generated).expect("generated config is readable");
+    assert!(file.starts_with("# Default configuration for zakurad."));
+    assert_eq!(printed.stdout, format!("{file}\n"));
+
+    let empty_state = scratch.path().join("empty-state");
+    let run = scratch.run(
+        "generated_config_loads",
+        &mut scratch.command([
+            OsStr::new("-c"),
+            generated.as_os_str(),
+            OsStr::new("tip-height"),
+            OsStr::new("--network"),
+            OsStr::new("Testnet"),
+            OsStr::new("--cache-dir"),
+            empty_state.as_os_str(),
+        ]),
+    );
+    run.assert_status(0);
+    assert_eq!(run.stderr, "", "the generated config loads without errors");
+}
+
+/// The stored config fixtures load in the real binary.
+#[test]
+fn stored_config_fixtures_load() {
+    let scratch = Scratch::new();
+    let empty_state = scratch.path().join("empty-state");
+    let configs = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").into())
+        .join("tests/common/configs");
+
+    let mut fixtures: Vec<PathBuf> = fs::read_dir(&configs)
+        .expect("config fixture directory is readable")
+        .map(|entry| entry.expect("config fixture entry is readable").path())
+        .filter(|path| path.extension() == Some(OsStr::new("toml")))
+        .collect();
+    fixtures.sort();
+    assert!(!fixtures.is_empty(), "{configs:?} has config fixtures");
+
+    for fixture in fixtures {
+        let name = fixture
+            .file_stem()
+            .expect("fixtures have file names")
+            .to_string_lossy()
+            .replace(['.', '-'], "_");
+        let run = scratch.run(
+            &format!("stored_config_{name}"),
+            &mut scratch.command([
+                OsStr::new("-c"),
+                fixture.as_os_str(),
+                OsStr::new("tip-height"),
+                OsStr::new("--network"),
+                OsStr::new("Testnet"),
+                OsStr::new("--cache-dir"),
+                empty_state.as_os_str(),
+            ]),
+        );
+
+        run.assert_status(0);
+        assert_eq!(run.stderr, "", "{fixture:?} loads without errors");
+    }
+}
+
+/// `generate` panics with its usual report when it can't create the output file.
+#[test]
+fn generate_reports_file_creation_failure() {
+    let scratch = Scratch::new();
+    let output = scratch.path().join("missing-dir").join("zakura.toml");
+
+    let run = scratch.run(
+        "generate_file_creation_failure",
+        &mut scratch.command([OsStr::new("generate"), OsStr::new("-o"), output.as_os_str()]),
+    );
+
+    run.assert_status(101)
+        .assert_stderr_contains("must be able to open output file")
+        .assert_stdout_lacks("# Default configuration for zakurad.");
+    assert!(!output.exists(), "no config file is written");
+}
+
 /// A failing utility command logs why, and exits with a failure status after the log is
 /// flushed.
 #[test]
@@ -902,4 +1177,77 @@ fn command_line_parse_errors_use_parser_exit_status() {
 
     run.assert_status(2)
         .assert_stderr_contains("unexpected argument '--not-a-real-flag'");
+}
+
+/// Help and version output exits successfully.
+#[test]
+fn help_and_version_are_printed() {
+    let scratch = Scratch::new();
+
+    let mut help_args = vec![
+        ("help_top_level", vec!["--help"]),
+        ("help_subcommand", vec!["help"]),
+    ];
+    for subcommand in [
+        "audit-historical-treestates",
+        "generate",
+        "prune-state",
+        "rollback-state",
+        "start",
+        "tip-height",
+        "verify-historical-treestates",
+    ] {
+        help_args.push((subcommand, vec![subcommand, "--help"]));
+    }
+
+    for (name, args) in help_args {
+        let run = scratch.run(&format!("help_{name}"), &mut scratch.command(args));
+        run.assert_status(0).assert_stdout_contains("Usage:");
+        assert_eq!(run.stderr, "", "help writes nothing to stderr");
+    }
+
+    for (name, flag) in [("version_long", "--version"), ("version_short", "-V")] {
+        let run = scratch.run(name, &mut scratch.command([flag]));
+        run.assert_status(0);
+        assert!(
+            run.stdout.starts_with("zakurad "),
+            "unexpected version output {:?}",
+            run.stdout
+        );
+        assert_eq!(run.stderr, "", "version writes nothing to stderr");
+    }
+}
+
+/// Missing option values and required arguments are reported by the argument parser.
+#[test]
+fn missing_arguments_use_parser_exit_status() {
+    let scratch = Scratch::new();
+
+    for (name, args, expected) in [
+        (
+            "missing_config_value",
+            &["-c"][..],
+            "a value is required for '--config <CONFIG>'",
+        ),
+        (
+            "missing_rollback_height",
+            &["rollback-state"][..],
+            "--height <HEIGHT>",
+        ),
+        (
+            "missing_prune_retention",
+            &["prune-state"][..],
+            "--tx-retention <TX_RETENTION>",
+        ),
+        (
+            "missing_subtree_input",
+            &["verify-historical-treestates"][..],
+            "--subtree-input <SUBTREE_INPUT>",
+        ),
+    ] {
+        let run = scratch.run(name, &mut scratch.command(args));
+
+        run.assert_status(2).assert_stderr_contains(expected);
+        assert_eq!(run.stdout, "", "parse errors write nothing to stdout");
+    }
 }

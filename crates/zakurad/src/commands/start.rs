@@ -83,9 +83,7 @@ use std::{
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
-    pin,
-    runtime::Runtime,
-    select,
+    pin, select,
     sync::{mpsc, oneshot, watch},
     task::{AbortHandle, JoinHandle},
 };
@@ -111,7 +109,7 @@ use crate::{
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
-        tokio::RuntimeRun,
+        tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
     },
     config::ZakuradConfig,
@@ -1340,11 +1338,18 @@ fn config_error(error: impl std::fmt::Display) -> Report {
 }
 
 impl StartCmd {
-    /// Runs the node on `runtime` until a shutdown signal or a fatal error, then stops
-    /// the runtime.
+    /// Creates the async runtime and starts the metrics endpoint, then runs the node until
+    /// a shutdown signal or a fatal error, then stops the runtime.
     ///
     /// Returns the node's error after logging it.
-    pub(crate) fn run(&self, config: Arc<ZakuradConfig>, runtime: Runtime) -> Result<(), Report> {
+    ///
+    /// # Panics
+    ///
+    /// If the configured metrics endpoint can't be opened.
+    pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
+        let runtime = new_runtime();
+        crate::components::metrics::start_endpoint(&config.metrics);
+
         info!("Starting zakurad");
 
         runtime.run_with_graceful_shutdown(|shutdown, shutdown_cleanup_required| {

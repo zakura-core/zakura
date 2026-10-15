@@ -3,7 +3,6 @@
 use std::{path::PathBuf, sync::Arc};
 
 use color_eyre::eyre::Report;
-use tokio::runtime::Runtime;
 
 use zakura_chain::common::preference_dir;
 
@@ -141,24 +140,15 @@ impl ZakuradCmd {
 
     /// Runs this command with the loaded `config`.
     ///
-    /// Server commands need the async `runtime`; utility commands ignore it.
     /// A command reports its own failure before returning an error, so callers only need
     /// to turn the error into an exit status.
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn run(
-        &self,
-        config: Arc<ZakuradConfig>,
-        runtime: Option<Runtime>,
-    ) -> Result<(), Report> {
+    pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
         match self {
             AuditHistoricalTreestates(cmd) => cmd.run(&config),
             Generate(cmd) => cmd.run(),
             PruneState(cmd) => cmd.run(&config),
             RollbackState(cmd) => cmd.run(&config),
-            Start(cmd) => cmd.run(
-                config,
-                runtime.expect("the lifecycle creates a runtime for every server command"),
-            ),
+            Start(cmd) => cmd.run(config),
             TipHeight(cmd) => cmd.run(&config),
             VerifyHistoricalTreestates(cmd) => cmd.run(),
         }

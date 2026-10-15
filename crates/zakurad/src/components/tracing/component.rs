@@ -39,6 +39,9 @@ use super::non_blocking::{non_blocking, WorkerGuard};
 // paste -d "\0" logo.utf8 heart.utf8 > zakura.utf8
 static ZAKURA_ART: [u8; include_bytes!("zakura.utf8").len()] = *include_bytes!("zakura.utf8");
 
+#[cfg(all(test, feature = "opentelemetry"))]
+mod tests;
+
 /// Returns a tracing setup error, with the prefix `zakurad` has always printed for it.
 fn io_error(error: std::io::Error) -> Report {
     eyre!("I/O operation failed: {error}")
@@ -314,6 +317,9 @@ impl Tracing {
 
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
+    ///
+    /// Shuts down the OpenTelemetry exporter first, so its errors are logged. Calling this
+    /// more than once, or dropping `Tracing` afterwards, does nothing more.
     pub fn shutdown(&mut self) {
         #[cfg(feature = "opentelemetry")]
         if let Some(provider) = self.otel_provider.take() {
@@ -323,6 +329,17 @@ impl Tracing {
         }
 
         self._guard.take();
+    }
+}
+
+impl Drop for Tracing {
+    /// Shuts down tracing, then flushes the standard output streams.
+    fn drop(&mut self) {
+        self.shutdown();
+
+        // Some OSes require a flush to send all output to the terminal.
+        let _ = std::io::stdout().lock().flush();
+        let _ = std::io::stderr().lock().flush();
     }
 }
 

@@ -20,6 +20,14 @@ pub struct GenerateCmd {
 
 impl GenerateCmd {
     /// `generate` sub-command entrypoint.
+    ///
+    /// # Panics
+    ///
+    /// If the output file can't be created or written.
+    //
+    // A file error panics, as it always has: the panic report names the failed step and
+    // exits with status 101. Returning it would only exit with status 1, because the
+    // caller turns errors into statuses without printing them.
     #[allow(clippy::print_stdout, clippy::unwrap_in_result)]
     pub(crate) fn run(&self) -> Result<(), Report> {
         let default_config = ZakuradConfig::default();

@@ -138,7 +138,11 @@ async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
 #[ignore = "manual scaling probe; run in release with --nocapture"]
 #[allow(clippy::print_stderr)] // Report the per-event cost with --nocapture.
 async fn request_bookkeeping_scaling() {
-    for window in [1_000u32, 2_000, 4_000, 8_000, 16_000] {
+    use super::super::regulated::live_requester::SESSION_RESERVATIONS;
+
+    // One session holds at most its pool share, so the largest window is that share.
+    let largest = u32::try_from(SESSION_RESERVATIONS).expect("the session share fits u32");
+    for window in [largest / 8, largest / 4, largest / 2, largest] {
         let Probe {
             mut routine,
             mut outbound,

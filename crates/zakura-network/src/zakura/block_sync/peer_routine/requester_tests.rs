@@ -1288,3 +1288,49 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
     assert!(futures::poll!(ranking.as_mut()).is_ready());
 }
+
+/// Two sessions that open every request their window allows and then withhold
+/// every ending hold at most a quarter of the node pool together, so a third
+/// session can still reserve.
+#[tokio::test]
+async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
+    use super::super::config::MAX_BS_INFLIGHT_REQUESTS;
+    use super::super::regulated::live_requester::SESSION_RESERVATIONS;
+
+    // Wider than the session share used to be, so only the share stops each window.
+    const WINDOW: u32 = MAX_BS_INFLIGHT_REQUESTS / 2 + 64;
+    let pool = super::tests::test_request_pool();
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let mut probe = super::scaling_tests::probe_in(WINDOW, pool.clone());
+        loop {
+            probe.routine.try_fill().await;
+            if requested_heights(&mut probe.outbound).is_empty() {
+                break;
+            }
+        }
+        // Answered bodies leave the window but keep their reservations.
+        for block in probe.blocks.iter().take(MAX_PENDING_ENDINGS) {
+            deliver(&mut probe.routine, BlockSyncMessage::Block(block.clone())).await;
+        }
+        probe.routine.try_fill().await;
+        assert!(requested_heights(&mut probe.outbound).is_empty());
+        assert_eq!(probe.routine.requester.len(), SESSION_RESERVATIONS);
+        sessions.push(probe);
+    }
+    // The protocol ceiling fits usize on supported targets.
+    let node_pool = MAX_BS_INFLIGHT_REQUESTS as usize;
+    assert!(
+        pool.held() <= node_pool / 4,
+        "two sessions hold {} of {node_pool} entries",
+        pool.held(),
+    );
+
+    let (mut third, mut outbound, ..) =
+        requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
+    third.try_fill().await;
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
+        BlockSyncMessage::GetBlocks { .. }
+    ));
+}

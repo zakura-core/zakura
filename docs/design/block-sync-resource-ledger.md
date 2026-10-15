@@ -79,8 +79,10 @@ needed.
 
 ### Requester bookkeeping
 
-The node-wide request pool holds 32,768 live ranges. Each range keeps at most 128 expected
-hashes, so hashes total at most 128 MiB. Range maps release their excess capacity after a
+The node-wide request pool holds 32,768 live ranges. One session holds at most 4,096 of them
+(`SESSION_RESERVATIONS`), so two sessions take at most a quarter of the pool, and it stops
+issuing while 64 fully received ranges still owe an ending (`MAX_PENDING_ENDINGS`). Each range
+keeps at most 128 expected hashes, so hashes total at most 128 MiB. Range maps release their excess capacity after a
 peak (`shrink_after_peak`), so a burst does not pin its high-water allocation.
 
 ### Raw frames

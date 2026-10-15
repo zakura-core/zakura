@@ -21,9 +21,18 @@ use crate::zakura::{
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
 };
 
-/// Leave at least half the node pool for other sessions, including draining ones.
+/// Live GetBlocks exchanges one session may hold from the node pool.
+///
+/// Two sessions hold at most a quarter of the pool, so peers that grow large
+/// windows and then stop answering cannot starve every other session. An
+/// honest session never needs more. Requests already stop at the server's
+/// advertised in-flight limit, 2,816 for a default Zakura node
+/// (`serving_max_inflight_requests`), and the integrated header lead keeps
+/// distinct missing heights within 4,000 (`INTEGRATED_HEADER_BODY_WINDOW_V1`).
+pub(crate) const SESSION_RESERVATIONS: usize = 4_096;
+
 // The protocol ceiling fits usize on supported targets.
-pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 2;
+const _: () = assert!(2 * SESSION_RESERVATIONS <= MAX_BS_INFLIGHT_REQUESTS as usize / 4);
 
 /// Fully received ranges one session may hold while their endings are owed.
 ///

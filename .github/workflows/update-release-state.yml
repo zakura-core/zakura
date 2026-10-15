@@ -1,6 +1,8 @@
 # Publish a complete release-state set before advertising readiness.
 # Keep this filename: crates.io Trusted Publishing authorizes this entrypoint.
 # Adoption and human review live in adopt-release-state.yml.
+# TEMPORARY: the reviewed branch can qualify only at the explicitly authorized SHA.
+# Remove this exception and its repository variable after qualification.
 name: Update Mainnet release state
 on:
   workflow_dispatch:
@@ -23,10 +25,10 @@ jobs:
     name: Resolve one immutable release-state bundle
     if: >-
       github.repository == 'zakura-core/zakura' &&
-      (github.ref == 'refs/heads/main' || inputs.dry_run) &&
+      (github.ref == 'refs/heads/main' || inputs.dry_run || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/qualify-release-state-assets' && vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA == github.sha)) &&
       (github.event_name == 'workflow_dispatch' || vars.MAINNET_RELEASE_STATE_PUBLICATION_ENABLED == 'true')
     runs-on: ubuntu-latest
-    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
+    environment: ${{ (inputs.dry_run || github.ref != 'refs/heads/main') && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
     outputs:
@@ -114,7 +116,7 @@ jobs:
     needs: [resolve, validate]
     # The repository guard matches publish-crates.yml: a staging fork must never reach the real
     # registry, and failing before the OIDC exchange keeps its logs honest.
-    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura' }}
+    if: ${{ !inputs.dry_run && github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/qualify-release-state-assets' && vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA == github.sha)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io-assets
@@ -181,6 +183,7 @@ jobs:
         if: steps.existing.outputs.needed == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RELEASE_STATE_QUALIFICATION_SHA: ${{ vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA }}
         run: python3 .github/scripts/release-state-assets.py publish --state "$RUNNER_TEMP/release-state"
 
       - name: Verify Cargo availability
@@ -189,7 +192,7 @@ jobs:
   promote:
     name: Promote the verified set to immutable ready storage
     needs: [resolve, validate, publish-assets]
-    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura' }}
+    if: ${{ !inputs.dry_run && github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/qualify-release-state-assets' && vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA == github.sha)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release-state-storage
@@ -212,6 +215,7 @@ jobs:
           path: ${{ runner.temp }}/release-state/
       - name: Verify public bytes and advance readiness conditionally
         env:
+          RELEASE_STATE_QUALIFICATION_SHA: ${{ vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA }}
           RELEASE_STATE_R2_ACCESS_KEY_ID: ${{ secrets.RELEASE_STATE_R2_ACCESS_KEY_ID }}
           RELEASE_STATE_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_STATE_R2_SECRET_ACCESS_KEY }}
         run: python3 .github/scripts/ready-release-state.py promote --state "$RUNNER_TEMP/release-state"

@@ -19,8 +19,13 @@ def main(*, store_factory=production_store):
     args = parser.parse_args()
     state = args.state.resolve()
     if args.operation == "promote":
+        # Temporary qualification exception: one branch, one dispatched commit.
+        qualified = (os.environ.get("GITHUB_REF") == "refs/heads/codex/qualify-release-state-assets"
+                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                     and len(os.environ.get("GITHUB_SHA", "")) == 40
+                     and os.environ.get("RELEASE_STATE_QUALIFICATION_SHA") == os.environ.get("GITHUB_SHA"))
         if (os.environ.get("GITHUB_REPOSITORY") != "zakura-core/zakura"
-                or os.environ.get("GITHUB_REF") != "refs/heads/main"):
+                or (os.environ.get("GITHUB_REF") != "refs/heads/main" and not qualified)):
             raise AssetError("storage promotion is restricted to canonical main")
         manifest = promote(state, store_factory())
         (state / "promoted-ready.json").write_text(json.dumps(manifest, indent=2) + "\n")

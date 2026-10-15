@@ -139,8 +139,13 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             print(f"needed={str(needed).lower()}", file=output)
     elif args.operation == "publish":
+        # Temporary qualification exception: one branch, one dispatched commit.
+        qualified = (os.environ.get("GITHUB_REF") == "refs/heads/codex/qualify-release-state-assets"
+                     and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                     and len(os.environ.get("GITHUB_SHA", "")) == 40
+                     and os.environ.get("RELEASE_STATE_QUALIFICATION_SHA") == os.environ.get("GITHUB_SHA"))
         if (os.environ.get("GITHUB_REPOSITORY") != "zakura-core/zakura"
-                or os.environ.get("GITHUB_REF") != "refs/heads/main"):
+                or (os.environ.get("GITHUB_REF") != "refs/heads/main" and not qualified)):
             raise AssetError("crate publication is restricted to canonical main")
         publish(ROOT, json.loads((state / "publication.json").read_text())["needed"])
     elif args.operation == "verify":

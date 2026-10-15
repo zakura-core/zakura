@@ -518,6 +518,8 @@ interval, so parameter evidence must measure that recovery first.
   - granted minus acknowledged header credit <= 4,000
   - granted minus acknowledged byte credit <= 8 MiB
   - on a tombstone match, granted credit <= consumed credit + the window, in headers and bytes
+  - a tombstone records whether the publisher received `Close` before the end, and then every
+    matching update returns `Disconnect`
   - terminal tombstones <= `HS_PUBLISHER_SLOTS`
 - **Capacity**
   - a conformant subscriber holds one live or closing subscription per peer
@@ -564,8 +566,9 @@ least one header or at least `P` bytes.
 
 `Close` MUST carry no locator hashes or added credit. The publisher MUST stop producing new pages
 when it receives `Close`. It MUST send `HeadersOutcome(SubscriptionClosed)` after every page already
-queued unless it already queued a terminal outcome. While the publisher still holds a subscription
-that matched a `Close`, a further `Grant` or `Close` on it MUST return `Disconnect`.
+queued unless it already queued a terminal outcome. After a `Close` matches a live subscription, a
+further `Grant` or `Close` on that subscription MUST return `Disconnect`, both before and after the
+subscription ends.
 
 A subscription holds a publisher slot from `Open` until its terminal outcome's transport write
 finishes. The slot also reserves that outcome's output, so exhausted data credit and busy output
@@ -580,13 +583,20 @@ Ending a subscription leaves a terminal tombstone. The publisher MUST retain it 
 crossing `Close` or the next `Open`. The tombstone prevents a conformant update that crossed the
 terminal outcome from causing a violation. A tombstone match validates the subscription ID and the
 update sequence, which continues from the last update the publisher applied. It does not check the
-acknowledged cursor. The tombstone keeps the subscription's granted and consumed credit. A crossing
-`Grant` that would raise granted credit above consumed credit plus the window, in headers or in
-bytes, MUST return `Disconnect`. A conformant subscriber stays within that bound because it
-acknowledged only pages that the publisher sent before the end. A crossing `Grant` within the bound
-MUST return `Drop` and MUST NOT consume the tombstone. Its credit still counts toward the
-tombstone's granted credit, so later crossing grants cannot reuse the same room. A crossing `Close`
-MUST return `Drop` and consumes the tombstone.
+acknowledged cursor.
+
+A tombstone records whether the publisher received `Close` before the subscription ended. A
+conformant subscriber sends nothing on a subscription after its `Close`, so an update that matches
+such a tombstone MUST return `Disconnect`. The remaining rules apply to a tombstone that the
+publisher's own terminal outcome left, where updates can honestly cross that outcome.
+
+The tombstone keeps the subscription's granted and consumed credit. A crossing `Grant` that would
+raise granted credit above consumed credit plus the window, in headers or in bytes, MUST return
+`Disconnect`. A conformant subscriber stays within that bound because it acknowledged only pages
+that the publisher sent before the end. A crossing `Grant` within the bound MUST return `Drop` and
+MUST NOT consume the tombstone. Its credit still counts toward the tombstone's granted credit, so
+later crossing grants cannot reuse the same room. A crossing `Close` MUST return `Drop` and consumes
+the tombstone.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
 clears every tombstone and MUST use a different subscription ID. This rule bounds a conformant

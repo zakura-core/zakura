@@ -64,9 +64,10 @@ Record the local subscription and its credit before sending Open or Grant. Exerc
    already passed, and sequence gaps.
 3. Credit exhaustion and the next Grant, with each page spending its exact header and byte credit,
    and 4,000 unacknowledged one-header pages within the cursor history.
-4. Close with pages queued, followed by SubscriptionClosed, and a Grant or second Close after it.
-5. Grant and Close crossing SubscriptionSuperseded or HistoryPruned, a crossing Grant beyond the
-   tombstone window, and the next Open.
+4. Close with pages queued, followed by SubscriptionClosed, and a Grant or second Close after it,
+   both before and after the subscription ends.
+5. Grant and Close crossing SubscriptionSuperseded or HistoryPruned, repeated crossing Grants up to
+   and beyond the tombstone window, and the next Open.
 6. A second Open while one slot is held, a third, and a reused subscription ID.
 7. Unsolicited pages and outcomes, a first page that extends no sent locator, broken linkage, a
    second target marker, a schema mismatch, and each outcome outside its window.

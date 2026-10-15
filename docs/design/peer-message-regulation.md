@@ -283,11 +283,13 @@ tombstones until live subscriptions plus tombstones number at most `max_live - 1
 subscription, this is header sync version 9's rule that the next `Open` clears the tombstone.
 
 A tombstone checks only the key and the update sequence, so crossing grants have no credit window
-yet. Header sync version 9 closes that gap. Its tombstone keeps the ended subscription's granted
-and consumed totals, adds each crossing grant to the granted total, and faults one that raises
-granted above consumed plus the window. A conformant subscriber stays within that bound, because
-it acknowledges only pages the publisher sent. The tools need this check before header sync adopts
-them.
+yet, and a tombstone does not record why its subscription ended. Header sync version 9 closes both
+gaps. Its tombstone keeps the ended subscription's granted and consumed totals, adds each crossing
+grant to the granted total, and faults one that raises granted above consumed plus the window. A
+conformant subscriber stays within that bound, because it acknowledges only pages the publisher
+sent. The tombstone also records whether the publisher received `Close` before the end. No
+conformant update follows a `Close`, so every update on such a tombstone faults. The tools need
+both checks before header sync adopts them.
 
 **Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
 terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's

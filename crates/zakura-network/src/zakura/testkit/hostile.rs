@@ -1,6 +1,6 @@
 //! Raw peer harness for adversarial Zakura tests.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tokio::sync::Mutex;
@@ -363,6 +363,29 @@ impl HostilePeer {
         prelude
             .request_id
             .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        self.held_streams.push(send);
+        Ok(())
+    }
+
+    /// Accept the next request stream, send the frames built from its request id
+    /// `gap` apart, and keep the response side open without finishing it.
+    pub async fn trickle_next_request_without_finishing(
+        &mut self,
+        gap: Duration,
+        build_frames: impl FnOnce(u64) -> Vec<Frame>,
+    ) -> Result<(), BoxError> {
+        let (mut send, mut recv) = self.connection.accept_bi().await?;
+        let prelude = Self::read_prelude(&mut recv).await?;
+        let request_id = prelude
+            .request_id
+            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        for (index, frame) in build_frames(request_id).into_iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(gap).await;
+            }
+            send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+                .await?;
+        }
         self.held_streams.push(send);
         Ok(())
     }

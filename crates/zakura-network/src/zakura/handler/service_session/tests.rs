@@ -1286,7 +1286,6 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
         PING.message_type,
         0,
         vec![0; 8],
-        None,
     );
     let responder = async {
         let (mut send, mut recv) = remote.accept_bi().await?;

@@ -14,12 +14,11 @@ use std::{
     time::Duration,
 };
 
-use futures::stream::{FuturesUnordered, StreamExt as _};
 use indexmap::IndexSet;
 use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
     time::{sleep, timeout, Instant},
 };
 use tower::{Service, ServiceExt};
@@ -116,13 +115,17 @@ const LEGACY_GOSSIP_EXPENSIVE_ATTEMPT: Duration = Duration::from_secs(1);
 /// inventory before a genuine re-advertisement may retry.
 const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a transaction request attempt may go without a response frame, counted from when it is sent and then from each frame, before the
-/// next peer is tried alongside it. The slow attempt keeps running with the full
-/// request timeout, so a slow but honest peer can still answer.
-const LEGACY_REQUEST_HEDGE_DELAY: Duration = Duration::from_secs(3);
-/// How long such an attempt may run unfinished, however steadily it streams,
-/// before the next peer is tried alongside it.
-const LEGACY_REQUEST_HEDGE_LIMIT: Duration = Duration::from_secs(8);
+/// How long one transaction request attempt may run, counted from when it
+/// passes the client's pacing wait, before the next candidate peer is tried.
+///
+/// Every Zakura peer's inbound service gives up after 5 s
+/// (`MAX_INBOUND_RESPONSE_TIME` in `zakurad`), so an honest answer arrives
+/// well inside this, while a silent or trickling peer cannot hold the request
+/// past it. Two attempts fit inside the mempool's 20 s download deadline
+/// (`TRANSACTION_DOWNLOAD_TIMEOUT` in `zakurad`), even after the dual stack's
+/// 3 s legacy try (`DUAL_STACK_LEGACY_INVENTORY_TIMEOUT`), so a fallback peer
+/// is still tried after a silent source.
+const LEGACY_TRANSACTION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Distinct peers a block or transaction request tries: the primary and up to
@@ -2204,62 +2207,17 @@ impl ZakuraRequestClient {
             &mut OsRng,
         );
 
-        // Only a transaction is fully bound to its request: its id commits to
-        // all of its bytes. A block hash does not commit to every byte of the
-        // body, and discovery answers are not bound at all, so a peer started
-        // alongside a slow one could win with a forged answer and cancel the
-        // honest one. Other kinds try peers one at a time.
-        let hedges = request_kind == LegacyRequestKind::Transactions;
-        let mut remaining = candidates.iter();
-        let mut attempts = FuturesUnordered::new();
-        let mut hedge = None;
-        let mut start_next = true;
         let mut missing_response = None;
         let mut last_error = None;
-        loop {
-            if start_next {
-                if let Some(handle) = remaining.next() {
-                    let mut progress = None;
-                    if hedges {
-                        let (dispatched, dispatched_rx) = oneshot::channel();
-                        let (frames, frames_rx) = watch::channel(());
-                        progress = Some(AttemptProgress { dispatched, frames });
-                        // Try the next peer alongside this one if it stalls,
-                        // without giving up on it.
-                        hedge = Some(Box::pin(attempt_stalled(dispatched_rx, frames_rx)));
-                    }
-                    attempts.push(self.request_one(
-                        handle.clone(),
-                        frame.clone(),
-                        request_kind,
-                        progress,
-                    ));
-                }
+        for handle in &candidates {
+            match self
+                .request_one(handle.clone(), frame.clone(), request_kind)
+                .await
+            {
+                Ok(response) if !all_inventory_missing(&response) => return Ok(response),
+                Ok(response) => missing_response = Some(response),
+                Err(error) => last_error = Some(error),
             }
-            if attempts.is_empty() {
-                break;
-            }
-            // Start the next peer after any attempt that ends without a usable
-            // answer, or when the latest attempt is slow to start answering.
-            start_next = tokio::select! {
-                Some(result) = attempts.next() => {
-                    match result {
-                        Ok(response) if !all_inventory_missing(&response) => return Ok(response),
-                        Ok(response) => missing_response = Some(response),
-                        Err(error) => last_error = Some(error),
-                    }
-                    true
-                }
-                no_answer_yet = async {
-                    match hedge.as_mut() {
-                        Some(hedge) => hedge.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hedge = None;
-                    no_answer_yet
-                }
-            };
         }
 
         match (missing_response, last_error, candidates.as_slice()) {
@@ -2288,7 +2246,7 @@ impl ZakuraRequestClient {
         for _ in 0..SOURCE_INVENTORY_MISSING_RETRIES {
             sleep(SOURCE_INVENTORY_MISSING_RETRY_DELAY).await;
             match self
-                .request_one(handle.clone(), frame.clone(), request_kind, None)
+                .request_one(handle.clone(), frame.clone(), request_kind)
                 .await
             {
                 Ok(response) if !all_inventory_missing(&response) => return Ok(response),
@@ -2318,20 +2276,13 @@ impl ZakuraRequestClient {
         .map_err(|_| -> BoxError { "no ready Zakura peer for legacy inventory request".into() })?
     }
 
-    /// Sends one request to `handle` and decodes its response, reporting
-    /// `progress` as it goes.
     async fn request_one(
         &self,
         handle: ZakuraPeerHandle,
         frame: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
-        progress: Option<AttemptProgress>,
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
-        let frames = progress.map(|progress| {
-            let _ = progress.dispatched.send(());
-            progress.frames
-        });
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
         // so the response can be bound to IDs we actually asked for.
@@ -2355,15 +2306,20 @@ impl ZakuraRequestClient {
             )
         });
         let started_at = Instant::now();
+        let attempt_timeout = match request_kind {
+            LegacyRequestKind::Transactions => {
+                self.request_timeout.min(LEGACY_TRANSACTION_ATTEMPT_TIMEOUT)
+            }
+            _ => self.request_timeout,
+        };
         let response = match timeout(
-            self.request_timeout,
+            attempt_timeout,
             handle.request(
                 ZAKURA_STREAM_LEGACY_REQUESTS,
                 request_id,
                 frame.message_type,
                 frame.flags,
                 frame.payload,
-                frames,
             ),
         )
         .await
@@ -2445,40 +2401,6 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
     stream_open_rate_per_second
         .max(1)
         .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
-}
-
-/// Signals one request attempt sends while it runs, so `request` can decide
-/// when to try the next peer alongside it.
-struct AttemptProgress {
-    /// Sent once the attempt has passed the client's pacing wait.
-    dispatched: oneshot::Sender<()>,
-    /// Notified on every response frame.
-    frames: watch::Sender<()>,
-}
-
-/// Resolves to `true` once a dispatched attempt goes
-/// [`LEGACY_REQUEST_HEDGE_DELAY`] without a response frame, or runs past
-/// [`LEGACY_REQUEST_HEDGE_LIMIT`] unfinished; resolves to `false` if the attempt
-/// ends first.
-async fn attempt_stalled(
-    dispatched: oneshot::Receiver<()>,
-    mut frames: watch::Receiver<()>,
-) -> bool {
-    if dispatched.await.is_err() {
-        return false;
-    }
-    let stalled = async {
-        loop {
-            match timeout(LEGACY_REQUEST_HEDGE_DELAY, frames.changed()).await {
-                Err(_) => return true,
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return false,
-            }
-        }
-    };
-    timeout(LEGACY_REQUEST_HEDGE_LIMIT, stalled)
-        .await
-        .unwrap_or(true)
 }
 
 /// Orders the ready peers for one request: the preferred peer first, then the
@@ -3630,6 +3552,61 @@ mod tests {
         }
     }
 
+    /// Records every request it accepts and never answers any.
+    #[derive(Clone, Debug)]
+    struct RecordingSilentResponder {
+        requests: Arc<std::sync::Mutex<Vec<Request>>>,
+    }
+
+    impl Service<Request> for RecordingSilentResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Pending<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            self.requests
+                .lock()
+                .expect("no test thread panics while holding the request log")
+                .push(request);
+            std::future::pending()
+        }
+    }
+
+    /// Returns a handle whose requests are answered with `answer` after
+    /// `delay`, or held open forever when `answer` is `None`.
+    fn scripted_peer_handle(delay: Duration, answer: Option<Response>) -> ZakuraPeerHandle {
+        let peer = ZakuraPeerId::new(vec![1; 32]).expect("32-byte node id is valid");
+        let (sender, mut receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                let crate::zakura::ZakuraOutboundFrame::Request {
+                    request_id,
+                    completion,
+                    ..
+                } = frame;
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let Some(answer) = answer else {
+                        // Keep the completion alive so the request stays open.
+                        let _completion = completion;
+                        return std::future::pending().await;
+                    };
+                    sleep(delay).await;
+                    let cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
+                        .expect("the protocol message limit fits in u32");
+                    let frames = LegacyResponseCodec::encode_response(request_id, answer, cap, cap)
+                        .map_err(BoxError::from);
+                    let _ = completion.send(frames);
+                });
+            }
+        });
+        ZakuraPeerHandle::new_for_tests(peer, sender)
+    }
+
     /// Declines every request, so the sink resets the stream and the requester
     /// sees a response with no frames.
     #[derive(Clone, Debug)]
@@ -3667,122 +3644,6 @@ mod tests {
         fn call(&mut self, _request: Request) -> Self::Future {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(Response::Nil))
-        }
-    }
-
-    /// Counts every request it accepts and never answers any.
-    #[derive(Clone, Debug)]
-    struct CountingSilentResponder {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl Service<Request> for CountingSilentResponder {
-        type Response = Response;
-        type Error = BoxError;
-        type Future = std::future::Pending<Result<Response, BoxError>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _request: Request) -> Self::Future {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            std::future::pending()
-        }
-    }
-
-    /// Accepts every request and never answers it.
-    #[derive(Clone, Debug)]
-    struct SilentResponder;
-
-    impl Service<Request> for SilentResponder {
-        type Response = Response;
-        type Error = BoxError;
-        type Future = std::future::Pending<Result<Response, BoxError>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _request: Request) -> Self::Future {
-            std::future::pending()
-        }
-    }
-
-    /// Answers block requests with its block after `delay`.
-    #[derive(Clone, Debug)]
-    struct DelayedBlockResponder {
-        block: Arc<Block>,
-        delay: Duration,
-    }
-
-    impl Service<Request> for DelayedBlockResponder {
-        type Response = Response;
-        type Error = BoxError;
-        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _request: Request) -> Self::Future {
-            let (block, delay) = (self.block.clone(), self.delay);
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Ok(Response::Blocks(vec![InventoryResponse::Available((
-                    block, None,
-                ))]))
-            })
-        }
-    }
-
-    /// Answers transaction requests with its transaction after `delay`.
-    #[derive(Clone, Debug)]
-    struct DelayedTransactionResponder {
-        transaction: UnminedTx,
-        delay: Duration,
-    }
-
-    impl Service<Request> for DelayedTransactionResponder {
-        type Response = Response;
-        type Error = BoxError;
-        type Future = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _request: Request) -> Self::Future {
-            let (transaction, delay) = (self.transaction.clone(), self.delay);
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Ok(Response::Transactions(vec![InventoryResponse::Available(
-                    (transaction, None),
-                )]))
-            })
-        }
-    }
-
-    /// Reports every requested transaction as missing.
-    #[derive(Clone, Debug)]
-    struct MissingTransactionResponder;
-
-    impl Service<Request> for MissingTransactionResponder {
-        type Response = Response;
-        type Error = BoxError;
-        type Future = std::future::Ready<Result<Response, BoxError>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, request: Request) -> Self::Future {
-            let Request::TransactionsById(ids) = request else {
-                return std::future::ready(Err("only transaction requests are expected".into()));
-            };
-            std::future::ready(Ok(Response::Transactions(
-                ids.into_iter().map(InventoryResponse::Missing).collect(),
-            )))
         }
     }
 
@@ -5096,6 +4957,249 @@ mod tests {
         Ok(())
     }
 
+    /// F-47: a silent source holds a transaction request only for the attempt
+    /// timeout, so a working peer still answers well inside a mempool
+    /// download's 20 s deadline, and the silent peer stays connected.
+    #[tokio::test]
+    async fn request_adapter_moves_past_a_silent_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let transaction = UnminedTx::from(empty_v5_transaction(5));
+        let txid = transaction.id();
+        let silent = ZakuraTestNode::builder(86)
+            .service_from_supervisor(|supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    RecordingSilentResponder {
+                        requests: Default::default(),
+                    },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let (honest, _honest_requests) = recording_inventory_node(87, Some(transaction)).await?;
+        let requester = ZakuraTestNode::builder(88)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
+        requester.connect_native(&honest, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&requester, 2).await?;
+        let silent_id = node_peer_id(&silent).await?;
+        let mut peer_set = requester.supervisor().subscribe();
+        peer_set.borrow_and_update();
+
+        // The silent peer is the source, so it is always tried first.
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+        let started = Instant::now();
+        let response = adapter
+            .request_from_source(
+                Request::TransactionsById(HashSet::from([txid])),
+                Some(PeerSource::Zakura(silent_id)),
+            )
+            .await?;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                &response,
+                Response::Transactions(transactions)
+                    if matches!(transactions.as_slice(), [InventoryResponse::Available((received, _))] if received.id() == txid)
+            ),
+            "the working peer must serve the transaction; got {response:?}"
+        );
+        assert!(
+            elapsed >= LEGACY_TRANSACTION_ATTEMPT_TIMEOUT
+                && elapsed < LEGACY_TRANSACTION_ATTEMPT_TIMEOUT + Duration::from_secs(5),
+            "the silent peer held the request for {elapsed:?}"
+        );
+        assert!(
+            !peer_set.has_changed()?,
+            "a silent peer is skipped, not disconnected"
+        );
+
+        silent.shutdown().await;
+        honest.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// Sends the first `chunks` chunk frames of a transaction `gap` apart in
+    /// answer to a request for it, never finishing the response, and returns
+    /// how long the request took to fail.
+    async fn partial_transaction_response_duration(
+        seed: u64,
+        chunks: usize,
+        gap: Duration,
+    ) -> Result<Duration, BoxError> {
+        let node = ZakuraTestNode::builder(seed).spawn().await?;
+        let mut hostile = HostilePeer::connect_native(&node, seed + 1).await?;
+        wait_registered_count(&node, 1).await?;
+        let transaction = UnminedTx::from(empty_v5_transaction(7));
+        let txid = transaction.id();
+        let hostile_id = hostile.id()?;
+
+        let adapter = LegacyRequestAdapter::new(node.supervisor());
+        let started = Instant::now();
+        let request = async {
+            let result = adapter
+                .request_from_source(
+                    Request::TransactionsById(HashSet::from([txid])),
+                    Some(PeerSource::Zakura(hostile_id)),
+                )
+                .await;
+            (result, started.elapsed())
+        };
+        let trickle = hostile.trickle_next_request_without_finishing(gap, |request_id| {
+            // Tiny chunks, so the transaction spans more frames than are sent.
+            let frames = LegacyResponseCodec::encode_response(
+                request_id,
+                Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+                u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)
+                    .expect("the protocol message limit fits in u32"),
+                u32::try_from(RESPONSE_CHUNK_HEADER_BYTES + 2)
+                    .expect("a small chunk size fits in u32"),
+            )
+            .expect("a small transaction encodes");
+            assert!(frames.len() > chunks, "the response stays unfinished");
+            frames.into_iter().take(chunks).collect()
+        });
+        let (request, trickle) = futures::join!(request, trickle);
+        trickle?;
+        let (result, elapsed) = request;
+        let error = result.expect_err("an unfinished response cannot succeed");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        hostile.shutdown().await;
+        node.shutdown().await;
+        Ok(elapsed)
+    }
+
+    /// A transaction source that sends one frame and withholds the rest is cut
+    /// off at the attempt timeout, not left running for the request timeout.
+    #[tokio::test]
+    async fn withheld_transaction_response_is_cut_off() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let elapsed = partial_transaction_response_duration(100, 1, Duration::ZERO).await?;
+        assert!(
+            elapsed >= LEGACY_TRANSACTION_ATTEMPT_TIMEOUT
+                && elapsed < LEGACY_TRANSACTION_ATTEMPT_TIMEOUT + Duration::from_secs(5),
+            "a withheld response held the request for {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    /// A transaction source that keeps trickling frames is still cut off at
+    /// the attempt timeout, which covers the whole attempt.
+    #[tokio::test]
+    async fn trickled_transaction_response_is_cut_off() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let elapsed =
+            partial_transaction_response_duration(102, 6, Duration::from_millis(1250)).await?;
+        assert!(
+            elapsed >= LEGACY_TRANSACTION_ATTEMPT_TIMEOUT
+                && elapsed < LEGACY_TRANSACTION_ATTEMPT_TIMEOUT + Duration::from_secs(5),
+            "a trickled response held the request for {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    /// Block and discovery requests keep waiting on one peer at a time past
+    /// the transaction attempt timeout, while a transaction request moves on
+    /// to the second peer.
+    #[tokio::test]
+    async fn only_transaction_attempts_end_at_the_attempt_timeout() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut responders = Vec::new();
+        for seed in [94, 95] {
+            let requests = requests.clone();
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .max_connections_per_ip(8)
+                    .service_from_supervisor(move |supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(
+                            RecordingSilentResponder { requests },
+                            supervisor,
+                        ))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+
+        // A connection serves one outbound request at a time, so each request
+        // gets its own requester to keep the attempts independent.
+        let mut requesters = Vec::new();
+        let mut pending = Vec::new();
+        for (seed, request) in [
+            (
+                96,
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+            ),
+            (97, Request::BlocksByHash(IndexSet::from([block_hash(2)]))),
+            (
+                98,
+                Request::TransactionsById(HashSet::from([legacy_tx_id(3)])),
+            ),
+        ] {
+            let requester = ZakuraTestNode::builder(seed)
+                .max_connections_per_ip(8)
+                .spawn()
+                .await?;
+            for responder in &responders {
+                requester
+                    .connect_native(responder, TEST_NET_TIMEOUT)
+                    .await?;
+            }
+            wait_registered_count(&requester, 2).await?;
+            let adapter = LegacyRequestAdapter::new(requester.supervisor());
+            pending.push(tokio::spawn(async move {
+                adapter.request_from_source(request, None).await
+            }));
+            requesters.push(requester);
+        }
+        sleep(LEGACY_TRANSACTION_ATTEMPT_TIMEOUT + Duration::from_secs(2)).await;
+        for request in &pending {
+            assert!(!request.is_finished(), "every request is still running");
+            request.abort();
+        }
+
+        let requests = requests
+            .lock()
+            .expect("no test thread panics while holding the request log")
+            .clone();
+        let count = |kind: fn(&Request) -> bool| requests.iter().filter(|r| kind(r)).count();
+        assert_eq!(
+            count(|r| matches!(r, Request::FindBlocks { .. })),
+            1,
+            "FindBlocks waits on its first peer"
+        );
+        assert_eq!(
+            count(|r| matches!(r, Request::BlocksByHash(_))),
+            1,
+            "a block request waits on its first peer"
+        );
+        assert_eq!(
+            count(|r| matches!(r, Request::TransactionsById(_))),
+            2,
+            "a transaction request moves on to its second peer"
+        );
+
+        for requester in requesters {
+            requester.shutdown().await;
+        }
+        for responder in responders {
+            responder.shutdown().await;
+        }
+        Ok(())
+    }
+
     /// An empty discovery answer is normal at the tip, so it keeps a single
     /// fallback, while a block request that finds nothing tries three peers.
     #[tokio::test]
@@ -5153,301 +5257,6 @@ mod tests {
         for responder in responders {
             responder.shutdown().await;
         }
-        requester.shutdown().await;
-        Ok(())
-    }
-
-    /// F-47: a silent peer delays a transaction request only by the hedge
-    /// delay, so it reaches a working peer well inside a caller's 20 s
-    /// deadline, and the silent peer stays connected.
-    #[tokio::test]
-    async fn request_adapter_moves_past_a_silent_peer() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let transaction = UnminedTx::from(empty_v5_transaction(5));
-        let txid = transaction.id();
-        let silent = ZakuraTestNode::builder(86)
-            .service_from_supervisor(|supervisor| {
-                Arc::new(LegacyGossipSink::spawn(SilentResponder, supervisor))
-            })
-            .spawn()
-            .await?;
-        let (honest, _honest_requests) = recording_inventory_node(87, Some(transaction)).await?;
-        let requester = ZakuraTestNode::builder(88)
-            .max_connections_per_ip(8)
-            .spawn()
-            .await?;
-        requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
-        requester.connect_native(&honest, TEST_NET_TIMEOUT).await?;
-        wait_registered_count(&requester, 2).await?;
-        let silent_id = node_peer_id(&silent).await?;
-        let mut peer_set = requester.supervisor().subscribe();
-        peer_set.borrow_and_update();
-
-        // The silent peer is the source, so it is always tried first.
-        let adapter = LegacyRequestAdapter::new(requester.supervisor());
-        let started = Instant::now();
-        let response = adapter
-            .request_from_source(
-                Request::TransactionsById(HashSet::from([txid])),
-                Some(PeerSource::Zakura(silent_id)),
-            )
-            .await?;
-        let elapsed = started.elapsed();
-
-        assert!(
-            matches!(
-                &response,
-                Response::Transactions(transactions)
-                    if matches!(transactions.as_slice(), [InventoryResponse::Available((received, _))] if received.id() == txid)
-            ),
-            "the working peer must serve the transaction; got {response:?}"
-        );
-        assert!(
-            elapsed < LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(5),
-            "the silent peer held the request for {elapsed:?}"
-        );
-        assert!(
-            !peer_set.has_changed()?,
-            "a silent peer is skipped, not disconnected"
-        );
-
-        silent.shutdown().await;
-        honest.shutdown().await;
-        requester.shutdown().await;
-        Ok(())
-    }
-
-    /// Only transaction requests start a peer alongside a stalled one. A block
-    /// or discovery request waits on one peer at a time, so a forged answer from
-    /// a fast peer cannot cancel an honest slow one.
-    #[tokio::test]
-    async fn only_transaction_requests_start_a_second_peer() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut responders = Vec::new();
-        for seed in [94, 95] {
-            let calls = calls.clone();
-            responders.push(
-                ZakuraTestNode::builder(seed)
-                    .service_from_supervisor(move |supervisor| {
-                        Arc::new(LegacyGossipSink::spawn(
-                            CountingSilentResponder { calls },
-                            supervisor,
-                        ))
-                    })
-                    .spawn()
-                    .await?,
-            );
-        }
-        let requester = ZakuraTestNode::builder(96)
-            .max_connections_per_ip(8)
-            .spawn()
-            .await?;
-        for responder in &responders {
-            requester
-                .connect_native(responder, TEST_NET_TIMEOUT)
-                .await?;
-        }
-        wait_registered_count(&requester, 2).await?;
-        let adapter = LegacyRequestAdapter::new(requester.supervisor());
-
-        for (request, expected_peers) in [
-            (
-                Request::FindBlocks {
-                    known_blocks: vec![block_hash(1)],
-                    stop: None,
-                },
-                1,
-            ),
-            (Request::BlocksByHash(IndexSet::from([block_hash(2)])), 1),
-            (
-                Request::TransactionsById(HashSet::from([legacy_tx_id(3)])),
-                2,
-            ),
-        ] {
-            calls.store(0, Ordering::SeqCst);
-            let pending = tokio::spawn({
-                let adapter = adapter.clone();
-                let request = request.clone();
-                async move { adapter.request_from_source(request, None).await }
-            });
-            sleep(LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(1)).await;
-            pending.abort();
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                expected_peers,
-                "peers asked for {request:?} after the hedge delay"
-            );
-        }
-
-        for responder in responders {
-            responder.shutdown().await;
-        }
-        requester.shutdown().await;
-        Ok(())
-    }
-
-    /// A slow source that holds the only copy of a transaction still answers
-    /// when a peer tried alongside it reports the transaction missing.
-    #[tokio::test]
-    async fn slow_source_still_answers_after_a_missing_fallback() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let transaction = UnminedTx::from(empty_v5_transaction(6));
-        let txid = transaction.id();
-        let delay = LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(1);
-        let slow = ZakuraTestNode::builder(91)
-            .service_from_supervisor(move |supervisor| {
-                Arc::new(LegacyGossipSink::spawn(
-                    DelayedTransactionResponder { transaction, delay },
-                    supervisor,
-                ))
-            })
-            .spawn()
-            .await?;
-        let missing = ZakuraTestNode::builder(92)
-            .service_from_supervisor(|supervisor| {
-                Arc::new(LegacyGossipSink::spawn(
-                    MissingTransactionResponder,
-                    supervisor,
-                ))
-            })
-            .spawn()
-            .await?;
-        let requester = ZakuraTestNode::builder(93)
-            .max_connections_per_ip(8)
-            .spawn()
-            .await?;
-        requester.connect_native(&slow, TEST_NET_TIMEOUT).await?;
-        requester.connect_native(&missing, TEST_NET_TIMEOUT).await?;
-        wait_registered_count(&requester, 2).await?;
-        let slow_id = node_peer_id(&slow).await?;
-
-        let adapter = LegacyRequestAdapter::new(requester.supervisor());
-        let response = adapter
-            .request_from_source(
-                Request::TransactionsById(HashSet::from([txid])),
-                Some(PeerSource::Zakura(slow_id)),
-            )
-            .await?;
-
-        assert!(
-            matches!(
-                &response,
-                Response::Transactions(transactions)
-                    if matches!(transactions.as_slice(), [InventoryResponse::Available((received, _))] if received.id() == txid)
-            ),
-            "the slow source must still deliver the transaction; got {response:?}"
-        );
-
-        slow.shutdown().await;
-        missing.shutdown().await;
-        requester.shutdown().await;
-        Ok(())
-    }
-
-    /// A fast peer serving a block's genuine header with a forged body cannot
-    /// cancel a slow honest source, because block requests are not hedged.
-    #[tokio::test]
-    async fn forged_block_body_does_not_cancel_a_slow_source() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let block = Arc::new(Block::zcash_deserialize(
-            BLOCK_TESTNET_141042_BYTES.as_slice(),
-        )?);
-        let hash = block.hash();
-        let forged = Arc::new(Block {
-            header: block.header.clone(),
-            transactions: Vec::new(),
-        });
-        assert_eq!(
-            forged.hash(),
-            hash,
-            "the forged block keeps the real header"
-        );
-        let delay = LEGACY_REQUEST_HEDGE_DELAY + Duration::from_secs(1);
-        let slow = ZakuraTestNode::builder(97)
-            .service_from_supervisor(move |supervisor| {
-                Arc::new(LegacyGossipSink::spawn(
-                    DelayedBlockResponder { block, delay },
-                    supervisor,
-                ))
-            })
-            .spawn()
-            .await?;
-        let forger = ZakuraTestNode::builder(98)
-            .service_from_supervisor(move |supervisor| {
-                Arc::new(LegacyGossipSink::spawn(
-                    SubstitutingBlockResponder { block: forged },
-                    supervisor,
-                ))
-            })
-            .spawn()
-            .await?;
-        let requester = ZakuraTestNode::builder(99)
-            .max_connections_per_ip(8)
-            .spawn()
-            .await?;
-        requester.connect_native(&slow, TEST_NET_TIMEOUT).await?;
-        requester.connect_native(&forger, TEST_NET_TIMEOUT).await?;
-        wait_registered_count(&requester, 2).await?;
-        let slow_id = node_peer_id(&slow).await?;
-
-        let adapter = LegacyRequestAdapter::new(requester.supervisor());
-        let response = adapter
-            .request_from_source(
-                Request::BlocksByHash(IndexSet::from([hash])),
-                Some(PeerSource::Zakura(slow_id)),
-            )
-            .await?;
-
-        assert!(
-            matches!(
-                &response,
-                Response::Blocks(blocks)
-                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if !received.transactions.is_empty())
-            ),
-            "the slow source's full block must be returned; got {response:?}"
-        );
-
-        slow.shutdown().await;
-        forger.shutdown().await;
-        requester.shutdown().await;
-        Ok(())
-    }
-
-    /// A slow attempt keeps the full request timeout: trying another peer
-    /// alongside it does not cut it off, here because no other peer exists.
-    #[tokio::test]
-    async fn slow_attempt_keeps_the_full_request_timeout() -> Result<(), BoxError> {
-        let _guard = zakura_test::init();
-        let silent = ZakuraTestNode::builder(89)
-            .service_from_supervisor(|supervisor| {
-                Arc::new(LegacyGossipSink::spawn(SilentResponder, supervisor))
-            })
-            .spawn()
-            .await?;
-        let requester = ZakuraTestNode::builder(90).spawn().await?;
-        requester.connect_native(&silent, TEST_NET_TIMEOUT).await?;
-        wait_registered_count(&requester, 1).await?;
-
-        let request_timeout = LEGACY_REQUEST_HEDGE_DELAY * 2;
-        let adapter =
-            LegacyRequestAdapter::new_with_timeout(requester.supervisor(), request_timeout);
-        let started = Instant::now();
-        let result = adapter
-            .request_from_source(
-                Request::TransactionsById(HashSet::from([legacy_tx_id(4)])),
-                None,
-            )
-            .await;
-
-        assert!(result.is_err(), "a silent peer cannot answer");
-        assert!(
-            started.elapsed() >= request_timeout,
-            "the attempt gave up after {:?}, before the request timeout",
-            started.elapsed()
-        );
-
-        silent.shutdown().await;
         requester.shutdown().await;
         Ok(())
     }
@@ -6251,67 +6060,106 @@ mod tests {
         }
     }
 
-    /// An attempt counts as stalled after the hedge delay without a frame,
-    /// restarting that clock at each frame, and after the hedge limit however
-    /// steadily frames arrive; an attempt that ends or is never sent does not.
+    /// A silent transaction attempt ends at the attempt timeout, while block,
+    /// discovery and mempool-listing attempts keep the full request timeout.
     #[tokio::test(start_paused = true)]
-    async fn attempt_stalled_tracks_frame_gaps_and_the_limit() {
-        let dispatched_attempt = || {
-            let (dispatched, dispatched_rx) = oneshot::channel();
-            dispatched
-                .send(())
-                .expect("the receiver is held until the attempt resolves");
-            let (frames, frames_rx) = watch::channel(());
-            (frames, attempt_stalled(dispatched_rx, frames_rx))
-        };
+    async fn attempt_timeout_depends_on_the_request_kind() -> Result<(), BoxError> {
+        for (request, expected) in [
+            (
+                Request::TransactionsById(HashSet::from([legacy_tx_id(1)])),
+                LEGACY_TRANSACTION_ATTEMPT_TIMEOUT,
+            ),
+            (
+                Request::BlocksByHash(IndexSet::from([block_hash(2)])),
+                LEGACY_REQUEST_TIMEOUT,
+            ),
+            (
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(3)],
+                    stop: None,
+                },
+                LEGACY_REQUEST_TIMEOUT,
+            ),
+            (Request::MempoolTransactionIds, LEGACY_REQUEST_TIMEOUT),
+        ] {
+            let client = ZakuraRequestClient::new(ZakuraSupervisorHandle::new(1));
+            let frame = LegacyRequestFrame::from_request(request)?;
+            let kind = frame.kind();
+            let started = Instant::now();
+            let result = client
+                .request_one(scripted_peer_handle(Duration::ZERO, None), frame, kind)
+                .await;
+            assert!(
+                result.is_err_and(|error| error.to_string().contains("timed out")),
+                "a silent {kind:?} attempt times out"
+            );
+            assert_eq!(started.elapsed(), expected, "{kind:?} attempt timeout");
+        }
+        Ok(())
+    }
+
+    /// The transaction attempt timeout starts once the attempt has passed the
+    /// client's pacing wait, so a pacing backlog does not use it up.
+    #[tokio::test(start_paused = true)]
+    async fn transaction_attempt_timeout_starts_after_the_pacing_wait() -> Result<(), BoxError> {
+        let client = ZakuraRequestClient::new(ZakuraSupervisorHandle::new(1));
+        let backlog = Duration::from_secs(5);
+        *client.next_request_at.lock().await = Instant::now() + backlog;
+        let frame = LegacyRequestFrame::from_request(Request::TransactionsById(HashSet::from([
+            legacy_tx_id(1),
+        ])))?;
 
         let started = Instant::now();
-        let (_frames, stalled) = dispatched_attempt();
-        assert!(stalled.await, "no frame at all is a stall");
-        assert_eq!(started.elapsed(), LEGACY_REQUEST_HEDGE_DELAY);
+        let result = client
+            .request_one(
+                scripted_peer_handle(Duration::ZERO, None),
+                frame,
+                LegacyRequestKind::Transactions,
+            )
+            .await;
 
-        let started = Instant::now();
-        let (frames, stalled) = dispatched_attempt();
-        let stalled = tokio::spawn(stalled);
-        sleep(Duration::from_secs(1)).await;
-        frames.send_replace(());
-        assert!(stalled.await.expect("the stall task does not panic"));
+        assert!(result.is_err(), "a silent peer cannot answer");
         assert_eq!(
             started.elapsed(),
-            Duration::from_secs(1) + LEGACY_REQUEST_HEDGE_DELAY,
-            "a frame restarts the stall clock"
+            backlog + LEGACY_TRANSACTION_ATTEMPT_TIMEOUT
         );
+        Ok(())
+    }
+
+    /// A transaction source that answers inside a Zakura server's 5 s inbound
+    /// response limit (`MAX_INBOUND_RESPONSE_TIME` in `zakurad`) is not cut off.
+    #[tokio::test(start_paused = true)]
+    async fn transaction_answer_inside_the_server_limit_is_not_cut_off() -> Result<(), BoxError> {
+        let server_limit = Duration::from_secs(5);
+        assert!(LEGACY_TRANSACTION_ATTEMPT_TIMEOUT > server_limit);
+        let delay = Duration::from_secs(4);
+        let transaction = UnminedTx::from(empty_v5_transaction(5));
+        let txid = transaction.id();
+        let handle = scripted_peer_handle(
+            delay,
+            Some(Response::Transactions(vec![InventoryResponse::Available(
+                (transaction, None),
+            )])),
+        );
+        let client = ZakuraRequestClient::new(ZakuraSupervisorHandle::new(1));
+        let frame =
+            LegacyRequestFrame::from_request(Request::TransactionsById(HashSet::from([txid])))?;
 
         let started = Instant::now();
-        let (frames, stalled) = dispatched_attempt();
-        let stalled = tokio::spawn(async move { (stalled.await, started.elapsed()) });
-        while !stalled.is_finished() {
-            sleep(Duration::from_secs(2)).await;
-            frames.send_replace(());
-        }
-        let (stalled, elapsed) = stalled.await.expect("the stall task does not panic");
-        assert!(stalled);
-        assert_eq!(
-            elapsed, LEGACY_REQUEST_HEDGE_LIMIT,
-            "steady frames stall only at the limit"
-        );
+        let response = client
+            .request_one(handle, frame, LegacyRequestKind::Transactions)
+            .await?;
 
-        let (frames, stalled) = dispatched_attempt();
-        let stalled = tokio::spawn(stalled);
-        sleep(Duration::from_secs(1)).await;
-        drop(frames);
         assert!(
-            !stalled.await.expect("the stall task does not panic"),
-            "an attempt that ends is not a stall"
+            matches!(
+                &response,
+                Response::Transactions(transactions)
+                    if matches!(transactions.as_slice(), [InventoryResponse::Available((received, _))] if received.id() == txid)
+            ),
+            "the slow source must deliver the transaction; got {response:?}"
         );
-
-        let (dispatched, dispatched_rx) = oneshot::channel::<()>();
-        let (_frames, frames_rx) = watch::channel(());
-        drop(dispatched);
-        assert!(
-            !attempt_stalled(dispatched_rx, frames_rx).await,
-            "an attempt that is never sent is not a stall"
-        );
+        assert_eq!(started.elapsed(), delay);
+        Ok(())
     }
 
     /// A request cancelled while waiting for its slot gives the slot back

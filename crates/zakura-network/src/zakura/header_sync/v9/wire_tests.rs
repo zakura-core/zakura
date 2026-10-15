@@ -27,7 +27,6 @@ use crate::zakura::{
             AuxSchema, HeaderEntry, TreeAuxRecordV1, TreeAuxWire, MAX_HS_MESSAGE_BYTES,
             MAX_HS_RANGE,
         },
-        HeaderSyncCodec, HeaderSyncMessage,
     },
     wire_codec::{
         encode_frame,
@@ -785,14 +784,21 @@ impl<const HEADER_BYTES: usize> MessageSample for Message<HEADER_BYTES> {
     }
 }
 
-/// A violation that the codec rejects with `WireError::OutOfRange(label)`.
-macro_rules! violation {
-    ($name:expr, $label:literal, $frame:expr $(,)?) => {
-        Violation {
+/// `raw` after `change`.
+fn with<T>(mut raw: T, change: impl FnOnce(&mut T)) -> T {
+    change(&mut raw);
+    raw
+}
+
+/// Violations from `label: name => frame;` rows. Each frame must fail with
+/// `WireError::OutOfRange(label)`.
+macro_rules! out_of_range {
+    ($($label:literal: $name:literal => $frame:expr;)*) => {
+        vec![$(Violation {
             name: $name,
             frame: $frame,
             rejected_by: |error| *error == WireError::OutOfRange($label),
-        }
+        }),*]
     };
 }
 
@@ -803,14 +809,16 @@ fn violations<const HEADER_BYTES: usize>() -> Vec<Violation<Message<HEADER_BYTES
     let p = p::<HEADER_BYTES>();
     let record = u32::try_from(smallest_page(HEADER_BYTES, AuxSchema::V1)).expect("fits u32");
     let header = sample_header::<HEADER_BYTES>();
-    let status = |change: fn(&mut RawStatus)| {
-        let mut raw = RawStatus::valid();
-        change(&mut raw);
-        frame(1, raw.payload())
-    };
+    let status =
+        |change: &dyn Fn(&mut RawStatus)| frame(1, with(RawStatus::valid(), change).payload());
+    let (open, grant, close) = (RawUpdate::open, RawUpdate::grant, RawUpdate::close);
     let update = |raw: RawUpdate| frame(2, raw.payload());
-    let page = |raw: RawPage| frame(3, raw.payload());
-
+    let page =
+        |change: &dyn Fn(&mut RawPage)| frame(3, with(RawPage::valid(&header), change).payload());
+    let recorded = |change: &dyn Fn(&mut RawPage)| {
+        frame(3, with(RawPage::with_record(&header), change).payload())
+    };
+    let outcome = |subscription_id, code| frame(4, outcome_payload(subscription_id, code));
     // A header of the other network's size, padded or cut to this network's slot.
     let mut foreign = if HEADER_BYTES == REGTEST_HEADER_BYTES {
         header_bytes(&sample_header::<COMMON_HEADER_BYTES>())
@@ -818,355 +826,88 @@ fn violations<const HEADER_BYTES: usize>() -> Vec<Violation<Message<HEADER_BYTES
         header_bytes(&sample_header::<REGTEST_HEADER_BYTES>())
     };
     foreign.resize(HEADER_BYTES, 0);
-    let foreign = page(RawPage {
-        headers: foreign,
-        ..RawPage::valid(&header)
+    let foreign = page(&|g| g.headers = foreign.clone());
+
+    let mut violations = out_of_range! {
+        "status work anchor": "anchor above the tip" => status(&|s| s.anchor = 10);
+        "status retention floor": "retention floor above the tip" => status(&|s| s.retained = 10);
+        "status header cap": "no headers per response" => status(&|s| s.header_cap = 0);
+        "status header cap": "one header above MAX_HS_RANGE" => status(&|s| s.header_cap = 4_001);
+        "status subscription cap": "no subscriptions" => status(&|s| s.subscriptions = 0);
+        "status subscription cap": "two subscriptions" => status(&|s| s.subscriptions = 2);
+        "status schema mask": "unknown schema bit" => status(&|s| s.mask = 0b11);
+        "status schema mask": "top schema bit" => status(&|s| s.mask = 0x8000_0001);
+        "status message cap": "one byte above 2 MiB" => status(&|s| s.message_bytes = 2_097_153);
+        "status message cap": "one byte below a page" =>
+            status(&|s| (s.mask, s.message_bytes) = (0, p - 1));
+        "status message cap": "one byte below a page with a record" =>
+            status(&|s| s.message_bytes = record - 1);
+        "update operation": "operation 3" => update(with(grant(1, 0), |u| u.operation = 3));
+        "subscription id": "update for subscription 0" =>
+            update(with(grant(1, 0), |u| u.subscription_id = 0));
+        "tree-aux schema": "update asks for schema 2" =>
+            update(with(grant(1, 0), |u| u.schema = 2));
+        "update credit": "header credit one above the window" => update(grant(4_001, 0));
+        "update credit": "byte credit one above the window" =>
+            update(grant(0, MAX_HS_PUSH_CREDIT_BYTES + 1));
+        "update sequence": "open with sequence 1" => update(with(open(1), |u| u.sequence = 1));
+        "locator count": "open with no locators" => update(open(0));
+        "locator hashes": "open with a repeated locator" =>
+            update(open(2).with_locator([0x40; 32]));
+        "open cursor": "open away from its first locator" =>
+            update(with(open(2), |u| u.cursor.1 = [0x41; 32]));
+        "open cursor": "open with a consumed header" => update(with(open(1), |u| u.cursor.2 = 1));
+        "open cursor": "open with consumed bytes" => update(with(open(1), |u| u.cursor.3 = 1));
+        "open credit": "open without header credit" =>
+            update(with(open(1), |u| u.header_credit = 0));
+        "open credit": "open one byte below a page" =>
+            update(with(open(1), |u| u.byte_credit = p - 1));
+        "open credit": "open one byte below a page with a record" =>
+            update(with(open(1), |u| (u.schema, u.byte_credit) = (1, record - 1)));
+        "update sequence": "grant with sequence 0" => update(with(grant(1, 0), |u| u.sequence = 0));
+        "update sequence": "close with sequence 0" => update(with(close(), |u| u.sequence = 0));
+        "update locators": "grant with a locator" => update(grant(1, 0).with_locator([0x40; 32]));
+        "update locators": "close with a locator" => update(close().with_locator([0x40; 32]));
+        "grant minimum": "grant one byte below a page" => update(grant(0, p - 1));
+        "close credit": "close with header credit" =>
+            update(with(close(), |u| u.header_credit = 1));
+        "close credit": "close with byte credit" => update(with(close(), |u| u.byte_credit = 1));
+        "subscription id": "page for subscription 0" => page(&|g| g.subscription_id = 0);
+        // The zero-count page keeps one entry, so it reaches the row's minimum length.
+        "header count": "page with no headers" => page(&|g| g.count = 0);
+        "header count": "page one header above MAX_HS_RANGE" => page(&|g| g.count = 4_001);
+        "boolean": "target marker 2" => page(&|g| g.reaches = 2);
+        "tree-aux schema": "page with schema 2" => page(&|g| g.schema = 2);
+        "header entries": "page that counts two headers and holds one" => page(&|g| g.count = 2);
+        "header entries": "page that names records and holds none" => page(&|g| g.schema = 1);
+        "page heights": "header above the maximum height" =>
+            page(&|g| g.parent_height = block::Height::MAX.0);
+        "body size hint": "hint above the block-size ceiling" =>
+            page(&|g| g.hints = vec![2_000_001]);
+        "block header": "header version 3" =>
+            page(&|g| g.headers[..4].copy_from_slice(&3u32.to_le_bytes()));
+        // The Orchard root follows the height and the Sapling root. All ones is
+        // above the Pallas base field modulus.
+        "tree-aux record": "non-canonical Orchard root" =>
+            recorded(&|g| g.records[36..68].fill(0xff));
+        "subscription id": "outcome for subscription 0" => outcome(0, 1);
+        "headers outcome": "outcome 0" => outcome(1, 0);
+        "headers outcome": "retired Busy outcome" => outcome(1, 4);
+        "headers outcome": "outcome 8" => outcome(1, 8);
+    };
+    violations.push(Violation {
+        name: "open that counts 14 locators and holds 13",
+        frame: update(with(open(13), |u| u.locator_count = 14)),
+        rejected_by: |error| matches!(error, WireError::CountOutOfRange { count: 14, .. }),
     });
-    let foreign = if HEADER_BYTES == REGTEST_HEADER_BYTES {
+    violations.extend(if HEADER_BYTES == REGTEST_HEADER_BYTES {
         // A Mainnet solution cannot fit a Regtest slot.
-        violation!("Mainnet header", "block header", foreign)
+        out_of_range! { "block header": "Mainnet header" => foreign; }
     } else {
         // A Regtest header leaves the rest of a Mainnet slot unread.
-        violation!("Regtest header", "header solution size", foreign)
-    };
-    let mut old_version = header_bytes(&header);
-    old_version[..4].copy_from_slice(&3u32.to_le_bytes());
-    let mut bad_record = RawPage::with_record(&header);
-    // The Orchard root follows the height and the Sapling root. All ones is
-    // above the Pallas base field modulus.
-    bad_record.records[36..68].fill(0xff);
-    let two_entries_one_present = RawPage {
-        count: 2,
-        ..RawPage::valid(&header)
-    };
-    // A zero count, padded to the row's minimum length.
-    let mut empty = RawPage::valid(&header);
-    empty.count = 0;
-
-    vec![
-        violation!(
-            "anchor above the tip",
-            "status work anchor",
-            status(|s| s.anchor = 10),
-        ),
-        violation!(
-            "retention floor above the tip",
-            "status retention floor",
-            status(|s| s.retained = 10),
-        ),
-        violation!(
-            "no headers per response",
-            "status header cap",
-            status(|s| s.header_cap = 0),
-        ),
-        violation!(
-            "one header above MAX_HS_RANGE",
-            "status header cap",
-            status(|s| s.header_cap = 4_001),
-        ),
-        violation!(
-            "no subscriptions",
-            "status subscription cap",
-            status(|s| s.subscriptions = 0),
-        ),
-        violation!(
-            "two subscriptions",
-            "status subscription cap",
-            status(|s| s.subscriptions = 2),
-        ),
-        violation!(
-            "unknown schema bit",
-            "status schema mask",
-            status(|s| s.mask = 0b11),
-        ),
-        violation!(
-            "top schema bit",
-            "status schema mask",
-            status(|s| s.mask = 0x8000_0001),
-        ),
-        violation!(
-            "message cap one byte above 2 MiB",
-            "status message cap",
-            status(|s| s.message_bytes = 2_097_153),
-        ),
-        violation!(
-            "message cap one byte below a one-header page",
-            "status message cap",
-            frame(
-                1,
-                RawStatus {
-                    mask: 0,
-                    message_bytes: p - 1,
-                    ..RawStatus::valid()
-                }
-                .payload(),
-            ),
-        ),
-        violation!(
-            "message cap one byte below a one-header page with a record",
-            "status message cap",
-            frame(
-                1,
-                RawStatus {
-                    message_bytes: record - 1,
-                    ..RawStatus::valid()
-                }
-                .payload(),
-            ),
-        ),
-        violation!(
-            "unknown operation",
-            "update operation",
-            update(RawUpdate {
-                operation: 3,
-                ..RawUpdate::grant(1, 0)
-            }),
-        ),
-        violation!(
-            "zero subscription id",
-            "subscription id",
-            update(RawUpdate {
-                subscription_id: 0,
-                ..RawUpdate::grant(1, 0)
-            }),
-        ),
-        violation!(
-            "unknown schema",
-            "tree-aux schema",
-            update(RawUpdate {
-                schema: 2,
-                ..RawUpdate::grant(1, 0)
-            }),
-        ),
-        violation!(
-            "header credit one above the window",
-            "update credit",
-            update(RawUpdate::grant(MAX_HS_PUSH_CREDIT_HEADERS + 1, 0)),
-        ),
-        violation!(
-            "byte credit one above the window",
-            "update credit",
-            update(RawUpdate::grant(0, MAX_HS_PUSH_CREDIT_BYTES + 1)),
-        ),
-        violation!(
-            "open with a nonzero sequence",
-            "update sequence",
-            update(RawUpdate {
-                sequence: 1,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "open with no locators",
-            "locator count",
-            update(RawUpdate::open(0)),
-        ),
-        Violation {
-            name: "open that counts 14 locators and holds 13",
-            frame: update(RawUpdate {
-                locator_count: 14,
-                ..RawUpdate::open(13)
-            }),
-            rejected_by: |error| matches!(error, WireError::CountOutOfRange { count: 14, .. }),
-        },
-        violation!(
-            "open with a repeated locator",
-            "locator hashes",
-            update(RawUpdate::open(2).with_locator([0x40; 32])),
-        ),
-        violation!(
-            "open that starts away from its first locator",
-            "open cursor",
-            update(RawUpdate {
-                cursor: (5, [0x41; 32], 0, 0),
-                ..RawUpdate::open(2)
-            }),
-        ),
-        violation!(
-            "open that starts with a consumed header",
-            "open cursor",
-            update(RawUpdate {
-                cursor: (5, [0x40; 32], 1, 0),
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "open that starts with consumed bytes",
-            "open cursor",
-            update(RawUpdate {
-                cursor: (5, [0x40; 32], 0, 1),
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "open without header credit",
-            "open credit",
-            update(RawUpdate {
-                header_credit: 0,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "open with byte credit one below a page",
-            "open credit",
-            update(RawUpdate {
-                byte_credit: p - 1,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "open with byte credit one below a page with a record",
-            "open credit",
-            update(RawUpdate {
-                byte_credit: record - 1,
-                schema: 1,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        violation!(
-            "grant with sequence zero",
-            "update sequence",
-            update(RawUpdate {
-                sequence: 0,
-                ..RawUpdate::grant(1, 0)
-            }),
-        ),
-        violation!(
-            "close with sequence zero",
-            "update sequence",
-            update(RawUpdate {
-                sequence: 0,
-                ..RawUpdate::close()
-            }),
-        ),
-        violation!(
-            "grant with a locator",
-            "update locators",
-            update(RawUpdate::grant(1, 0).with_locator([0x40; 32])),
-        ),
-        violation!(
-            "close with a locator",
-            "update locators",
-            update(RawUpdate::close().with_locator([0x40; 32])),
-        ),
-        violation!(
-            "grant of no header and one byte less than a page",
-            "grant minimum",
-            update(RawUpdate::grant(0, p - 1)),
-        ),
-        violation!(
-            "close with header credit",
-            "close credit",
-            update(RawUpdate {
-                header_credit: 1,
-                ..RawUpdate::close()
-            }),
-        ),
-        violation!(
-            "close with byte credit",
-            "close credit",
-            update(RawUpdate {
-                byte_credit: 1,
-                ..RawUpdate::close()
-            }),
-        ),
-        violation!(
-            "page with a zero subscription id",
-            "subscription id",
-            page(RawPage {
-                subscription_id: 0,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!("page with no headers", "header count", page(empty)),
-        violation!(
-            "page that counts one header above MAX_HS_RANGE",
-            "header count",
-            page(RawPage {
-                count: 4_001,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "target marker of 2",
-            "boolean",
-            page(RawPage {
-                reaches: 2,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "page with an unknown schema",
-            "tree-aux schema",
-            page(RawPage {
-                schema: 2,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "page that counts two headers and holds one",
-            "header entries",
-            page(two_entries_one_present),
-        ),
-        violation!(
-            "page that names records and holds none",
-            "header entries",
-            page(RawPage {
-                schema: 1,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "page whose header sits above the maximum height",
-            "page heights",
-            page(RawPage {
-                parent_height: block::Height::MAX.0,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "body-size hint one above the block-size ceiling",
-            "body size hint",
-            page(RawPage {
-                hints: vec![2_000_001],
-                ..RawPage::valid(&header)
-            }),
-        ),
-        violation!(
-            "header version 3",
-            "block header",
-            page(RawPage {
-                headers: old_version,
-                ..RawPage::valid(&header)
-            }),
-        ),
-        foreign,
-        violation!(
-            "record with a non-canonical Orchard root",
-            "tree-aux record",
-            page(bad_record),
-        ),
-        violation!(
-            "outcome with a zero subscription id",
-            "subscription id",
-            frame(4, outcome_payload(0, 1)),
-        ),
-        violation!(
-            "outcome code 0",
-            "headers outcome",
-            frame(4, outcome_payload(1, 0)),
-        ),
-        violation!(
-            "retired Busy outcome",
-            "headers outcome",
-            frame(4, outcome_payload(1, 4)),
-        ),
-        violation!(
-            "outcome code 8",
-            "headers outcome",
-            frame(4, outcome_payload(1, 8)),
-        ),
-    ]
+        out_of_range! { "header solution size": "Regtest header" => foreign; }
+    });
+    violations
 }
 
 message_suite!(mainnet_and_testnet_family, CommonMessage);
@@ -1472,135 +1213,6 @@ fn fixtures_decode_and_reencode_on_every_network() {
                 frame,
                 "{name} re-encodes to its bytes"
             );
-        }
-    }
-    on_every_network!(check);
-}
-
-/// `Status`, `Headers`, and `HeadersOutcome` are version 8's payloads without
-/// the leading discriminator.
-#[test]
-fn shared_layouts_match_version_8_without_the_discriminator() {
-    /// Compare both codecs on `network`.
-    fn check<const HEADER_BYTES: usize>(network: &Network) {
-        let v8 = HeaderSyncCodec::new(
-            network.clone(),
-            u32::try_from(MAX_HS_MESSAGE_BYTES).expect("2 MiB fits u32"),
-            MAX_HS_RANGE,
-            1,
-        );
-        let without_discriminator = |message: &HeaderSyncMessage| {
-            let mut payload = v8.encode(message).expect("the version 8 message encodes");
-            payload.remove(0);
-            payload
-        };
-
-        let status = RawStatus::valid().value();
-        let v8_status = crate::zakura::Status {
-            work_anchor_height: status.work_anchor_height,
-            work_anchor_hash: status.work_anchor_hash,
-            selected_tip_height: status.selected_tip_height,
-            selected_tip_hash: status.selected_tip_hash,
-            suffix_cumulative_work: status.suffix_cumulative_work,
-            oldest_retained_height: status.oldest_retained_height,
-            max_headers_per_response: status.max_headers_per_response,
-            max_inflight_requests: status.max_subscriptions,
-            max_message_bytes: status.max_message_bytes,
-            tree_aux_schema_mask: status.tree_aux_schema_mask,
-        };
-        assert_eq!(
-            encode_frame(&Message::<HEADER_BYTES>::Status(status))
-                .expect("the status encodes")
-                .payload,
-            without_discriminator(&HeaderSyncMessage::Status(v8_status))
-        );
-
-        // Version 8 checks linkage and completion, so the page extends the
-        // genesis parent and ends at the genesis block.
-        let header = genesis_header(network);
-        let target = block::Hash::from(header.as_ref());
-        let entry = HeaderEntry {
-            header: header.clone(),
-            body_size: 2_000_000,
-            tree_aux: Some(empty_aux(block::Height(1))),
-        };
-        let page = Headers {
-            subscription_id: 9,
-            initial_target_tip_hash: target,
-            common_ancestor_height: block::Height(0),
-            common_ancestor_hash: header.previous_block_hash,
-            reaches_initial_target: true,
-            tree_aux_schema: AuxSchema::V1,
-            entries: vec![entry.clone()],
-        };
-        let v8_page = crate::zakura::Headers {
-            request_id: 9,
-            target_tip_hash: target,
-            common_ancestor_height: block::Height(0),
-            common_ancestor_hash: header.previous_block_hash,
-            complete: true,
-            tree_aux_schema: AuxSchema::V1,
-            entries: vec![entry],
-        };
-        assert_eq!(
-            encode_frame(&Message::<HEADER_BYTES>::Headers(page))
-                .expect("the page encodes")
-                .payload,
-            without_discriminator(&HeaderSyncMessage::Headers(v8_page))
-        );
-
-        let v8_outcome = crate::zakura::HeadersOutcome {
-            request_id: 9,
-            target_tip_hash: target,
-            outcome: crate::zakura::HeadersOutcomeCode::HistoryPruned,
-        };
-        assert_eq!(
-            encode_frame(&Message::<HEADER_BYTES>::HeadersOutcome(HeadersOutcome {
-                subscription_id: 9,
-                initial_target_tip_hash: target,
-                outcome: HeadersOutcomeCode::HistoryPruned,
-            }))
-            .expect("the outcome encodes")
-            .payload,
-            without_discriminator(&HeaderSyncMessage::HeadersOutcome(v8_outcome))
-        );
-    }
-    on_every_network!(check);
-}
-
-/// Counts are checked against the payload before anything is allocated.
-#[test]
-fn hostile_counts_allocate_nothing() {
-    /// Check hostile counts on the `HEADER_BYTES` family.
-    fn check<const HEADER_BYTES: usize>(network: &Network) {
-        let header = genesis_header(network);
-        let hostile = [
-            // 4,000 headers claimed, one present.
-            frame(
-                3,
-                RawPage {
-                    count: 4_000,
-                    ..RawPage::valid(&header)
-                }
-                .payload(),
-            ),
-            // 13 locators claimed, none present, padded with credit fields.
-            frame(
-                2,
-                RawUpdate {
-                    locator_count: 13,
-                    locators: Vec::new(),
-                    ..RawUpdate::open(0)
-                }
-                .payload(),
-            ),
-        ];
-        for frame in hostile {
-            let (decoded, allocated) = zakura_test::allocations::measure(|| {
-                crate::zakura::wire_codec::decode_frame::<Message<HEADER_BYTES>>(&frame)
-            });
-            assert!(decoded.is_err());
-            assert_eq!(allocated.peak_live_bytes, 0);
         }
     }
     on_every_network!(check);

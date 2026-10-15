@@ -162,14 +162,6 @@ jobs:
             "meta_sha256=\(.meta_sha256)"
           ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
 
-      - name: Validate the imported release state
-        if: steps.release-state-import.outputs.has_changes == 'true'
-        run: |
-          set -euo pipefail
-          .github/scripts/validate-checkpoints.sh \
-            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
-
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         id: toolchain
         with:
@@ -179,6 +171,20 @@ jobs:
           # Release preparation consumes existing build caches without
           # replacing caches warmed by regular CI.
           cache-save-if: false
+
+      - name: Pin the published frontier grid for the imported state
+        if: steps.release-state-import.outputs.has_changes == 'true'
+        run: |
+          python3 .github/scripts/pin-release-state-assets.py \
+            --import-result "$RUNNER_TEMP/release-state-import.json"
+
+      - name: Validate the imported release state
+        if: steps.release-state-import.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          .github/scripts/validate-checkpoints.sh \
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
 
       # Read the registry-baseline rustdoc JSON warmed by semver-checks.yml.
       # Release preparation never saves or replaces this cache. Entries are

@@ -1187,7 +1187,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
 dependencies = [
  "ff",
- "memuse",
  "rand_core 0.10.1",
  "subtle",
 ]
@@ -1800,12 +1799,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "memuse"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d97bbf43eb4f088f8ca469930cde17fa036207c9a5e02ccc5107c4e8b17c964"
 
 [[package]]
 name = "metrics"
@@ -4011,7 +4004,7 @@ dependencies = [
 [[package]]
 name = "zakura-address"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bech32",
  "blake2b_simd",
@@ -4029,7 +4022,7 @@ checksum = "60071ee65e6185a033507fbb27f886e1df42eaeb5649d2cd75986151d4fa2cc0"
 [[package]]
 name = "zakura-bellman"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bitvec",
  "blake2s_simd",
@@ -4044,7 +4037,7 @@ dependencies = [
 [[package]]
 name = "zakura-bls12-381"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "ff",
  "group",
@@ -4167,17 +4160,16 @@ dependencies = [
 [[package]]
 name = "zakura-equihash"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "blake2b_simd",
- "corez",
  "libc",
 ]
 
 [[package]]
 name = "zakura-halo2-gadgets"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "arrayvec",
  "ff",
@@ -4191,12 +4183,12 @@ dependencies = [
 [[package]]
 name = "zakura-halo2-legacy-pdqsort"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 
 [[package]]
 name = "zakura-halo2-poseidon"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bitvec",
  "ff",
@@ -4207,7 +4199,7 @@ dependencies = [
 [[package]]
 name = "zakura-halo2-proofs"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -4250,7 +4242,7 @@ dependencies = [
 [[package]]
 name = "zakura-jubjub"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bitvec",
  "ff",
@@ -4332,7 +4324,7 @@ dependencies = [
 [[package]]
 name = "zakura-note-encryption"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "chacha20",
  "chacha20poly1305",
@@ -4344,7 +4336,7 @@ dependencies = [
 [[package]]
 name = "zakura-orchard"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bitvec",
  "blake2b_simd",
@@ -4355,7 +4347,6 @@ dependencies = [
  "hex",
  "incrementalmerkletree",
  "maybe-rayon",
- "memuse",
  "nonempty",
  "once_cell",
  "rand 0.10.2",
@@ -4370,13 +4361,12 @@ dependencies = [
  "zakura-reddsa",
  "zakura-sinsemilla",
  "zcash_spec",
- "zip32",
 ]
 
 [[package]]
 name = "zakura-pairing"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "group",
 ]
@@ -4384,7 +4374,7 @@ dependencies = [
 [[package]]
 name = "zakura-pasta-curves"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "blake2b_simd",
  "cc",
@@ -4400,14 +4390,12 @@ dependencies = [
 [[package]]
 name = "zakura-primitives"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "blake2b_simd",
- "corez",
  "ff",
  "hex",
  "incrementalmerkletree",
- "memuse",
  "nonempty",
  "rand_core 0.10.1",
  "sha2",
@@ -4425,11 +4413,10 @@ dependencies = [
 [[package]]
 name = "zakura-protocol"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "corez",
  "hex",
- "memuse",
  "nonempty",
 ]
 
@@ -4461,7 +4448,7 @@ dependencies = [
 [[package]]
 name = "zakura-reddsa"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "blake2b_simd",
  "group",
@@ -4475,7 +4462,7 @@ dependencies = [
 [[package]]
 name = "zakura-redjubjub"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "rand_core 0.10.1",
  "serde",
@@ -4554,7 +4541,7 @@ dependencies = [
 [[package]]
 name = "zakura-sapling-crypto"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bitvec",
  "blake2b_simd",
@@ -4565,7 +4552,6 @@ dependencies = [
  "group",
  "hex",
  "incrementalmerkletree",
- "memuse",
  "once_cell",
  "rand 0.10.2",
  "rand_core 0.10.1",
@@ -4577,7 +4563,6 @@ dependencies = [
  "zakura-note-encryption",
  "zakura-redjubjub",
  "zcash_spec",
- "zip32",
 ]
 
 [[package]]
@@ -4599,7 +4584,7 @@ dependencies = [
 [[package]]
 name = "zakura-sinsemilla"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "group",
  "once_cell",
@@ -4680,10 +4665,9 @@ dependencies = [
 [[package]]
 name = "zakura-transparent"
 version = "3.0.0"
-source = "git+https://github.com/zakura-core/common?rev=2043c595ff0995198e8ad25d5cc2db5a965b895c#2043c595ff0995198e8ad25d5cc2db5a965b895c"
+source = "git+https://github.com/zakura-core/common?rev=ee20524f0465d2624d92bfbe878a1478ef6d96de#ee20524f0465d2624d92bfbe878a1478ef6d96de"
 dependencies = [
  "bs58",
- "corez",
  "getset",
  "hex",
  "nonempty",
@@ -4695,7 +4679,6 @@ dependencies = [
  "zakura-protocol",
  "zcash_script",
  "zcash_spec",
- "zip32",
 ]
 
 [[package]]
@@ -4780,19 +4763,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "zip32"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b64bf5186a8916f7a48f2a98ef599bf9c099e2458b36b819e393db1c0e768c4b"
-dependencies = [
- "bech32",
- "blake2b_simd",
- "memuse",
- "subtle",
- "zcash_spec",
 ]
 
 [[package]]

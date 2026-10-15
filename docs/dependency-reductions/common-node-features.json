@@ -1,0 +1,133 @@
+{
+  "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
+  "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "features": "default-release-binaries",
+  "edges": "normal,build",
+  "baseline_pr": "https://github.com/zakura-core/zakura/pull/1436",
+  "baseline_common": "2043c595ff0995198e8ad25d5cc2db5a965b895c",
+  "final_common": "ee20524f0465d2624d92bfbe878a1478ef6d96de",
+  "layers": [
+    {
+      "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
+      "common_sha": "954cbd8d5f8f6adeced423e73116fc85a3dccc3c",
+      "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "features": "default-release-binaries",
+      "edges": "normal,build",
+      "common_pr": "https://github.com/zakura-core/common/pull/586",
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "count": 327,
+          "removed": [
+            "corez 0.1.1"
+          ],
+          "added": []
+        },
+        "aarch64-apple-darwin": {
+          "count": 325,
+          "removed": [
+            "corez 0.1.1"
+          ],
+          "added": []
+        },
+        "aarch64-unknown-linux-gnu": {
+          "count": 324,
+          "removed": [
+            "corez 0.1.1"
+          ],
+          "added": []
+        }
+      }
+    },
+    {
+      "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
+      "common_sha": "f01d51e52922a021e3fdae17f0ab7ef917149681",
+      "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "features": "default-release-binaries",
+      "edges": "normal,build",
+      "common_pr": "https://github.com/zakura-core/common/pull/587",
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "count": 326,
+          "removed": [
+            "zip32 0.2.1"
+          ],
+          "added": []
+        },
+        "aarch64-apple-darwin": {
+          "count": 324,
+          "removed": [
+            "zip32 0.2.1"
+          ],
+          "added": []
+        },
+        "aarch64-unknown-linux-gnu": {
+          "count": 323,
+          "removed": [
+            "zip32 0.2.1"
+          ],
+          "added": []
+        }
+      }
+    },
+    {
+      "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
+      "common_sha": "96db26498bde6a158ce399b787ac337d8ba2f26a",
+      "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "features": "default-release-binaries",
+      "edges": "normal,build",
+      "common_pr": "https://github.com/zakura-core/common/pull/588",
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "count": 325,
+          "removed": [
+            "memuse 0.2.2"
+          ],
+          "added": []
+        },
+        "aarch64-apple-darwin": {
+          "count": 323,
+          "removed": [
+            "memuse 0.2.2"
+          ],
+          "added": []
+        },
+        "aarch64-unknown-linux-gnu": {
+          "count": 322,
+          "removed": [
+            "memuse 0.2.2"
+          ],
+          "added": []
+        }
+      }
+    }
+  ],
+  "final_targets": {
+    "x86_64-unknown-linux-gnu": {
+      "count": 325,
+      "removed": [
+        "corez 0.1.1",
+        "memuse 0.2.2",
+        "zip32 0.2.1"
+      ],
+      "added": []
+    },
+    "aarch64-apple-darwin": {
+      "count": 323,
+      "removed": [
+        "corez 0.1.1",
+        "memuse 0.2.2",
+        "zip32 0.2.1"
+      ],
+      "added": []
+    },
+    "aarch64-unknown-linux-gnu": {
+      "count": 322,
+      "removed": [
+        "corez 0.1.1",
+        "memuse 0.2.2",
+        "zip32 0.2.1"
+      ],
+      "added": []
+    }
+  }
+}

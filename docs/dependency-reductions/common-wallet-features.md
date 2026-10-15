@@ -32,3 +32,8 @@ These are resolved dependency graph results. They do not by themselves prove
 compilation, runtime behavior, vulnerability remediation, or a speedup. The
 focused RPC library and chain test targets compiled against this revision;
 full CI, runtime regression tests, and policy checks remain acceptance gates.
+
+The draft uses exact-revision cargo-vet exemptions for the Common pins. The
+existing v3.0.0 audit backlog remains, and changes since publication require
+review before deployment. Passing the policy check with these exemptions is
+not an audit certification.

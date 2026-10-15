@@ -52,7 +52,9 @@ Status is the only row with a cadence. Check its capacity against the one-second
 derivation. On a paused clock, a sender at the floor never exhausts the bucket, and the initial
 message plus a ten-minute outage burst fits. A flood exhausts it, and the reader records the
 exhaustion and forwards every message. Unchanged messages count toward the bucket. Local read
-pauses add tokens.
+pauses add tokens. Check that each side sends Status immediately on open, within two seconds of
+each committed change, and at least once per refresh interval while idle, and that two idle
+peers on a new connection both open subscriptions.
 
 ## Subscriptions and outcomes
 

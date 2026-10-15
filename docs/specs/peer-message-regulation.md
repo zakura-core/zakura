@@ -482,11 +482,17 @@ target hash, and a one-byte outcome.
   - refill = 2 messages/s
   - on_empty = record and forward (exhaustion is not a violation)
 
-The sender MUST coalesce changes to at most one `Status` per second. It MAY send one immediate
-`Status` when the session opens. The handler MUST retain bounded latest-status state and SHOULD
-suppress redundant target-selection work. It need not maintain a separate relevance snapshot.
-`work_anchor_height` is the height of the sender's finality anchor. `oldest_retained_height` is
-the lowest height for which the sender retains headers.
+`Status` keeps the publication rules of version 8. Each side MUST send its current `Status`
+immediately after the session opens, because `Open` selects its target from a received `Status`.
+Each side MUST send an updated `Status` after any committed transition that changes its selected
+tip, work anchor, retention floor, or advertised serving caps. It MUST refresh at least once per
+configured `status_refresh_interval`, 30 seconds by default, as a liveness signal. It MAY coalesce
+rapid changes, but it MUST send the newest snapshot within two seconds of its commit. It MUST NOT
+send two `Status` messages less than one second apart. Silence or a stale `Status` is grounds for
+local rescheduling, never a protocol violation. The handler MUST retain bounded latest-status state
+and SHOULD suppress redundant target-selection work. It need not maintain a separate relevance
+snapshot. `work_anchor_height` is the height of the sender's finality anchor.
+`oldest_retained_height` is the lowest height for which the sender retains headers.
 
 The receiver capacity allows 600 messages buffered over the maximum ten-minute transport outage,
 plus the initial message and one message of jitter. The refill runs at twice the sender rate.
@@ -499,8 +505,9 @@ peer. In version 9, a subscription that has reached its initial target receives 
 pages. `Status` still selects peers and targets, and it names the next target after
 `SubscriptionSuperseded`. A longer sender interval is therefore an option, not a decision. A
 five-second sender would need capacity 122 and a refill under five seconds, and a 30-second sender
-would match block sync's row. Any longer interval delays reorganization recovery by up to that
-interval, so parameter evidence must measure that recovery first.
+would match block sync's row. Any longer interval would also loosen the two-second freshness
+bound and delay reorganization recovery by up to that interval, so parameter evidence must
+measure that recovery first.
 
 #### `SubscribeHeaders` — Request, discriminator 2
 

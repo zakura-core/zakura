@@ -5214,7 +5214,7 @@ mod tests {
     }
 
     /// A connection serves one request at a time, so three transaction
-    /// requests to a peer that takes 4 s each finish at about 4, 8 and 12 s.
+    /// requests to a peer that takes 3 s each finish at about 3, 6 and 9 s.
     /// The attempt timeout counts from when each exchange starts, so the
     /// queued ones are not cut off.
     #[tokio::test]
@@ -5222,7 +5222,7 @@ mod tests {
         let _guard = zakura_test::init();
         let transaction = UnminedTx::from(empty_v5_transaction(8));
         let txid = transaction.id();
-        let delay = Duration::from_secs(4);
+        let delay = Duration::from_secs(3);
         let slow = ZakuraTestNode::builder(103)
             .service_from_supervisor(move |supervisor| {
                 Arc::new(LegacyGossipSink::spawn(

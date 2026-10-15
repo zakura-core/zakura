@@ -16,9 +16,9 @@
 //! `outstanding` (on issue/finish/timeout/disconnect — per *request*, never per
 //! *body*), slot diagnostics, and download-side misbehavior. The **reactor** owns
 //! entry insert/remove (admission/teardown), serving-side misbehavior, and
-//! floor-watchdog hard excludes. Misbehavior is record-only: it is observed and
-//! traced but never drives a disconnect, so the registry keeps no per-peer
-//! misbehavior state.
+//! floor-watchdog hard excludes. Misbehavior is observed and traced, and only a
+//! proven tampered body disconnects (see `BlockSyncMisbehavior::proves_tampered_body`),
+//! so the registry keeps no per-peer misbehavior state.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},

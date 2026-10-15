@@ -1199,3 +1199,92 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
 }
+
+/// A fast peer gated on owed endings publishes no free slots, so a slower peer
+/// takes the floor height instead of deferring it to a peer that cannot
+/// request it. Once the endings arrive, the fast peer is the preferred floor
+/// server again and deferred routines are woken to re-rank.
+#[tokio::test]
+async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
+    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
+        bulk_routine();
+    let mut unended = withhold_endings(&mut fast, &mut fast_outbound, &blocks).await;
+    assert!(
+        fast.window.bbr_rtprop_ms(Instant::now()).is_some(),
+        "the fast peer has a measured RTprop"
+    );
+    let registry = Arc::clone(&fast.registry);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .expect("the gated peer left work behind");
+
+    // The slower peer shares the registry and work. It has no RTprop yet,
+    // which ranks below any measured peer, and its floor is the missing height.
+    let connection = CancellationToken::new();
+    let (mut slow, mut slow_outbound, _slow_events) =
+        super::tests::status_test_routine_with(pool.clone(), &connection);
+    slow.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
+    slow.registry = Arc::clone(&registry);
+    slow.generation = registry
+        .admit_session(
+            &slow.peer,
+            slow.session.direction(),
+            &slow.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    slow.work = Arc::clone(&fast.work);
+    let mut view = *slow.sequencer_view.borrow();
+    view.download_floor = block::Height(floor.0 - 1);
+    let (_view, view_rx) = watch::channel(view);
+    slow.sequencer_view = view_rx;
+    let (bodies, _slow_bodies) = mpsc::channel(1);
+    slow.sequencer_input = bodies;
+    slow.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
+        ..BlockSyncStatus::default()
+    });
+
+    slow.try_fill().await;
+    assert_eq!(
+        requested_heights(&mut slow_outbound),
+        [floor],
+        "the slower peer takes the floor from the gated one",
+    );
+
+    // Endings down to the bound keep the fast peer gated, and the next one
+    // reopens it. Only that change wakes routines that wait on the ranking.
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    unended.sort();
+    let mut endings = unended.into_iter();
+    while fast.requester.pending_endings() > MAX_PENDING_ENDINGS {
+        let start_height = endings.next().unwrap();
+        deliver(
+            &mut fast,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned: 1,
+            },
+        )
+        .await;
+    }
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(futures::poll!(ranking.as_mut()).is_pending());
+    deliver(
+        &mut fast,
+        BlockSyncMessage::BlocksDone {
+            start_height: endings.next().unwrap(),
+            returned: 1,
+        },
+    )
+    .await;
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+}

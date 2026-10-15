@@ -651,7 +651,14 @@ impl PeerRoutine {
 
         let authorized_height = {
             use super::regulated::live_requester::Authorization;
-            match self.requester.authorize(&frame)? {
+            let was_stopped = self.requester_stop().is_some();
+            let authorization = self.requester.authorize(&frame)?;
+            // A last body or an ending can close or open the requester. Other
+            // routines must re-rank the floor now, not at this window's next change.
+            if self.requester_stop().is_some() != was_stopped {
+                self.publish_slot_diagnostics();
+            }
+            match authorization {
                 Authorization::Block(height) => Some(height),
                 Authorization::Control => None,
                 Authorization::IncompatibleHeader => {
@@ -1013,17 +1020,8 @@ impl PeerRoutine {
                 break FillStop::CwndSaturated;
             }
             self.request_pool_waiting = false;
-            // Count unanswered exchanges, including scheduler-abandoned work.
-            // The peer's u32 advertised limit fits usize on supported targets.
-            if self.requester.at_capacity()
-                || self.requester.len() >= self.window.max_inflight_requests as usize
-            {
-                break FillStop::CwndSaturated;
-            }
-            if self.requester.pending_endings()
-                >= super::regulated::live_requester::MAX_PENDING_ENDINGS
-            {
-                break FillStop::PendingEndings;
+            if let Some(stop) = self.requester_stop() {
+                break stop;
             }
             let Some(entry) = self.requester.pool.try_entry() else {
                 self.request_pool_waiting = true;
@@ -2481,17 +2479,40 @@ impl PeerRoutine {
             .remove_outstanding_for_owner(&self.peer, self.generation, owner, [height]);
     }
 
+    /// Why the live requester refuses another request, whatever the window allows.
+    fn requester_stop(&self) -> Option<FillStop> {
+        // Count unanswered exchanges, including scheduler-abandoned work.
+        // The peer's u32 advertised limit fits usize on supported targets.
+        if self.requester.at_capacity()
+            || self.requester.len() >= self.window.max_inflight_requests as usize
+        {
+            return Some(FillStop::CwndSaturated);
+        }
+        if self.requester.pending_endings() >= super::regulated::live_requester::MAX_PENDING_ENDINGS
+        {
+            return Some(FillStop::PendingEndings);
+        }
+        None
+    }
+
     /// Publish the window diagnostics for the reactor's periodic trace row and
-    /// for other routines' cross-peer floor-bias decisions.
+    /// for other routines' cross-peer floor-bias decisions. A routine whose
+    /// requester refuses new requests publishes no free slots, so no other
+    /// routine defers the floor to it.
     fn publish_slot_diagnostics(&self) {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
+        let available_slots = if self.requester_stop().is_some() {
+            0
+        } else {
+            self.window.available_slots()
+        };
         self.registry.publish_slots(
             &self.peer,
             self.generation,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
-                available_slots: self.window.available_slots(),
+                available_slots,
                 outstanding_requests: self.window.outstanding.len(),
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer

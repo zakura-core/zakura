@@ -213,6 +213,11 @@ class CompleteSetTests(unittest.TestCase):
         self.assertEqual(self.services.objects[ready.STORAGE_PREFIX + "/latest.json"], before)
         self.assertEqual(first["generated_at"], self.selection["generated_at"])
 
+    def test_identical_retry_verifies_existing_objects_without_upload_attempts(self):
+        self.promote()
+        with patch.object(self.store, "put", side_effect=AssertionError("identical retry must reuse existing objects")):
+            self.assertEqual(self.promote()["height"], 2)
+
     def test_failure_after_each_immutable_write_never_advertises_partial_data(self):
         base = self.promote(self.states[1])
         old = self.services.objects[ready.STORAGE_PREFIX + "/latest.json"]

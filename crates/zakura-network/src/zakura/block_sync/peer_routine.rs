@@ -4050,9 +4050,9 @@ mod tests {
         let request = &routine.window.outstanding.first().unwrap().request;
         assert_eq!(request.count, 2, "{order:?}");
         let owner = request.owner;
-        out_recv
-            .recv()
+        tokio::time::timeout(Duration::from_secs(5), out_recv.recv())
             .await
+            .expect("the filled request reaches the outbound queue")
             .unwrap()
             .write_with(|_| async { Ok::<_, ()>(()) })
             .await

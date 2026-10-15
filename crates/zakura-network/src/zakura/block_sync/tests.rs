@@ -14661,3 +14661,200 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
 }
+
+/// Runs the native sequencer through a forged checkpoint body and its resubmission.
+///
+/// The test submits checkpoint range `1..=range_end` plus `later_pending` bodies from the next
+/// range. The verifier rejects height 1, and the stranded heights `range_end - stranded + 1..=
+/// range_end` never complete, because the state never answers them. The later-range bodies also
+/// stay pending, because their range waits for this one. Every other descendant gets a
+/// retryable error. The sequencer then receives fresh bodies for the whole range.
+///
+/// Returns the fresh range heights that the sequencer submits. The checkpoint verifier needs every
+/// height in the range before it forwards any of them.
+async fn resubmitted_checkpoint_heights_after_stranding(
+    range_end: u32,
+    stranded: u32,
+    later_pending: u32,
+) -> Vec<block::Height> {
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(200);
+
+    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+    let initial_count = range_end + later_pending;
+    assert!(
+        usize::try_from(initial_count).expect("count fits usize") <= submission_limit,
+        "the initial submissions fit in one window",
+    );
+    let blocks = fake_sequential_blocks(initial_count);
+    let frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    };
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(submission_limit * 2);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit * 4);
+    let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), submission_limit),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        body_rx,
+        control_rx,
+        body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
+        view_tx,
+        CHANNEL_TIMEOUT,
+        ZakuraTrace::noop(),
+    );
+    let task = tokio::spawn(task.run());
+
+    let send_bodies = |heights: std::ops::RangeInclusive<u32>| {
+        let body_tx = body_tx.clone();
+        let blocks = blocks.clone();
+        let body_input_bytes = body_input_bytes.clone();
+        let decoded = body_input_decoded_attributed_memory_bytes.clone();
+        async move {
+            for height in heights {
+                let block = &blocks[usize::try_from(height - 1).expect("height fits usize")];
+                body_tx
+                    .send(SequencedBody::new_queued(
+                        test_work_owner(),
+                        zakura_header_chain::SourceId::from_digest([1; 32]),
+                        block::Height(height),
+                        block.hash(),
+                        block.header.previous_block_hash,
+                        BufferedBlockBody::from_decoded_block(
+                            block.clone(),
+                            Some(raw_block_payload(block)),
+                        ),
+                        u64::from(block_size(block)),
+                        peer(1),
+                        Instant::now(),
+                        body_input_bytes.clone(),
+                        decoded.clone(),
+                    ))
+                    .await
+                    .expect("sequencer body channel remains live");
+            }
+        }
+    };
+
+    let finish = |token, block: &Arc<block::Block>, result| SequencerControlInput::ApplyFinished {
+        owner: Box::new(test_work_owner()),
+        source: zakura_header_chain::SourceId::from_digest([1; 32]),
+        token,
+        height: block.coinbase_height().expect("test block has height"),
+        hash: block.hash(),
+        outcome: test_block_apply_outcome(result),
+        eligible_sources: BTreeSet::new(),
+        persisted_availability: None,
+        semantic_completion: Some((
+            test_work_owner(),
+            zakura_header_chain::StateVersion::default(),
+        )),
+    };
+
+    send_bodies(1..=initial_count).await;
+    let mut initial = Vec::new();
+    while initial.len() < usize::try_from(initial_count).expect("count fits usize") {
+        if let BlockSyncAction::SubmitBlock { token, block, .. } =
+            time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+                .await
+                .expect("initial submission arrives")
+                .expect("sequencer action channel remains live")
+        {
+            initial.push((token, block));
+        }
+    }
+
+    // The forged body fails its commitment. `Rejected` releases every height from 1 upward
+    // and rolls the download floor back.
+    let (forged_token, forged_block) = &initial[0];
+    control_tx
+        .send(finish(
+            *forged_token,
+            forged_block,
+            BlockApplyResult::Rejected,
+        ))
+        .expect("control channel remains live");
+
+    // Descendants that reached the writer get `AncestorBodyRejected`, a retryable error.
+    let first_stranded = range_end - stranded + 1;
+    for (token, block) in &initial[1..usize::try_from(first_stranded - 1).expect("fits usize")] {
+        control_tx
+            .send(finish(*token, block, BlockApplyResult::Unavailable))
+            .expect("control channel remains live");
+    }
+
+    let expected_in_flight = u64::from(stranded + later_pending);
+    time::timeout(CHANNEL_TIMEOUT, async {
+        loop {
+            let view = *view_rx.borrow_and_update();
+            if view.applying_len == 0 && view.in_flight_submission_count == expected_in_flight {
+                break;
+            }
+            view_rx
+                .changed()
+                .await
+                .expect("sequencer view remains live");
+        }
+    })
+    .await
+    .expect("only stranded and later-range submissions stay in flight");
+
+    // Block sync downloads the whole range again.
+    send_bodies(1..=range_end).await;
+    let mut resubmitted = Vec::new();
+    while let Ok(Some(action)) = time::timeout(MISSING_SUBMISSION_TIMEOUT, actions_rx.recv()).await
+    {
+        if let BlockSyncAction::SubmitBlock { block, .. } = action {
+            resubmitted.push(block.coinbase_height().expect("test block has height"));
+        }
+    }
+
+    task.abort();
+    resubmitted
+}
+
+/// Root cause A on native block sync: submissions that the state strands never finish, so they
+/// keep their slots in the 401-block checkpoint submission window. A resubmitted 400-block range
+/// then cannot be fully in flight, and the checkpoint verifier never forwards any of it.
+#[tokio::test]
+async fn stranded_checkpoint_submissions_starve_a_resubmitted_full_range() {
+    let _init_guard = zakura_test::init();
+
+    // No stranding: the window holds the whole range again.
+    let heights = resubmitted_checkpoint_heights_after_stranding(400, 0, 1).await;
+    assert_eq!(heights.len(), 400, "{heights:?}");
+
+    // One stranded submission plus one pending next-range body leaves 399 slots.
+    let heights = resubmitted_checkpoint_heights_after_stranding(400, 1, 1).await;
+    assert_eq!(heights.len(), 399);
+    assert_eq!(heights.last(), Some(&block::Height(399)));
+
+    // The natural-scheduling reproduction strands about 390 descendants.
+    let heights = resubmitted_checkpoint_heights_after_stranding(400, 390, 1).await;
+    assert_eq!(heights.len(), 10);
+}
+
+/// A shorter checkpoint range still fits after stranding, so this condition needs a wide range.
+#[tokio::test]
+async fn stranded_checkpoint_submissions_leave_room_for_a_short_range() {
+    let _init_guard = zakura_test::init();
+
+    let heights = resubmitted_checkpoint_heights_after_stranding(200, 2, 1).await;
+    assert_eq!(heights.len(), 200);
+
+    let heights = resubmitted_checkpoint_heights_after_stranding(200, 199, 1).await;
+    assert_eq!(heights.len(), 200);
+}

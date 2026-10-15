@@ -540,3 +540,326 @@ fn await_block_info_rejection_is_not_classified_as_a_forged_body_descendant() {
 
     assert!(!error.is_descendant_of_auth_commitment_mismatch());
 }
+
+/// Holds checkpoint commits for chosen hashes until a chosen commit finishes.
+#[derive(Clone, Default)]
+struct CommitGate {
+    holds: Arc<Mutex<Vec<(HashSet<block::Hash>, watch::Receiver<bool>)>>>,
+    triggers: Arc<Mutex<Vec<(block::Hash, bool, watch::Sender<bool>)>>>,
+}
+
+impl CommitGate {
+    /// Holds the next commit of each hash in `held` until `trigger` commits with
+    /// `trigger_ok` success.
+    fn hold(
+        &self,
+        held: impl IntoIterator<Item = block::Hash>,
+        trigger: block::Hash,
+        trigger_ok: bool,
+    ) {
+        let (sender, receiver) = watch::channel(false);
+        self.holds
+            .lock()
+            .expect("lock is not poisoned")
+            .push((held.into_iter().collect(), receiver));
+        self.triggers
+            .lock()
+            .expect("lock is not poisoned")
+            .push((trigger, trigger_ok, sender));
+    }
+
+    fn wait(&self, hash: block::Hash) -> BoxFuture<'static, ()> {
+        let receiver = self
+            .holds
+            .lock()
+            .expect("lock is not poisoned")
+            .iter_mut()
+            .find_map(|(held, receiver)| held.remove(&hash).then(|| receiver.clone()));
+        Box::pin(async move {
+            if let Some(mut receiver) = receiver {
+                receiver
+                    .wait_for(|released| *released)
+                    .await
+                    .expect("the gate keeps the sender");
+            }
+        })
+    }
+
+    fn finished(&self, hash: block::Hash, ok: bool) {
+        for (trigger, trigger_ok, sender) in
+            self.triggers.lock().expect("lock is not poisoned").iter()
+        {
+            if *trigger == hash && *trigger_ok == ok {
+                sender.send_replace(true);
+            }
+        }
+    }
+}
+
+fn gated_state<S>(
+    state: S,
+    gate: CommitGate,
+) -> impl Service<
+    zs::Request,
+    Response = zs::Response,
+    Error = zs::BoxError,
+    Future = BoxFuture<'static, Result<zs::Response, zs::BoxError>>,
+> + Clone
+       + Send
+       + 'static
+where
+    S: Service<zs::Request, Response = zs::Response, Error = zs::BoxError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    tower::service_fn(move |request: zs::Request| {
+        let state = state.clone();
+        let gate = gate.clone();
+        let future: BoxFuture<'static, _> = Box::pin(async move {
+            let commit_hash = match &request {
+                zs::Request::CommitCheckpointVerifiedBlock(block) => Some(block.hash),
+                _ => None,
+            };
+            if let Some(hash) = commit_hash {
+                gate.wait(hash).await;
+            }
+            let response: Result<zs::Response, zs::BoxError> = state.oneshot(request).await;
+            if let Some(hash) = commit_hash {
+                gate.finished(hash, response.is_ok());
+            }
+            response
+        });
+        future
+    })
+}
+
+/// Spawns a verifier call, so the test can check later whether it ever finished.
+async fn spawn_submit<V>(
+    verifier: &mut V,
+    block: Arc<Block>,
+) -> tokio::task::JoinHandle<Result<block::Hash, VerifyCheckpointError>>
+where
+    V: Service<Arc<Block>, Response = block::Hash, Error = VerifyCheckpointError>,
+    V::Future: Send + 'static,
+{
+    tokio::spawn(submit(verifier, block).await)
+}
+
+/// Waits briefly, then splits `handles` into finished results and still-pending heights.
+async fn settle(
+    handles: Vec<(
+        u32,
+        tokio::task::JoinHandle<Result<block::Hash, VerifyCheckpointError>>,
+    )>,
+) -> (
+    BTreeMap<u32, Result<block::Hash, VerifyCheckpointError>>,
+    Vec<(
+        u32,
+        tokio::task::JoinHandle<Result<block::Hash, VerifyCheckpointError>>,
+    )>,
+) {
+    tokio::time::sleep(STRANDED_AFTER).await;
+    let mut finished = BTreeMap::new();
+    let mut pending = Vec::new();
+    for (height, handle) in handles {
+        if handle.is_finished() {
+            finished.insert(height, handle.await.expect("verifier calls do not panic"));
+        } else {
+            pending.push((height, handle));
+        }
+    }
+    (finished, pending)
+}
+
+/// Native block sync resubmits a whole checkpoint range after a forged body. That recovery
+/// commits the range but leaks never-answered commits into the state queue.
+///
+/// After the honest copy of the forged block commits, the state drains the old stranded copies of
+/// its descendants, because they are still keyed by their parent hashes. A fresh copy of the same
+/// height that reaches the state after that drain is keyed by a parent the state has already sent,
+/// so it never drains and never gets a response. Native block sync keeps each such submission in
+/// its 401-block window, so repeated attacks shrink the window until a range no longer fits.
+#[tokio::test(flavor = "multi_thread")]
+async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    const FORGED: u32 = 3;
+    const SLOW: u32 = 5;
+
+    // The range ends at a checkpoint below the final checkpoint, so no handoff clears the queue.
+    let fixture = PoisonFixture::new(30, &[10, 20, 30])?;
+    let state = fixture.state().await?;
+    let gate = CommitGate::default();
+    gate.hold([fixture.hash(SLOW)], fixture.hash(FORGED), false);
+    let mut verifier = CheckpointVerifier::from_list(
+        fixture.checkpoints.clone(),
+        &fixture.network,
+        None,
+        gated_state(state.clone(), gate.clone()),
+    )?;
+
+    let genesis = submit(&mut verifier, fixture.blocks[0].clone()).await;
+    timeout(STRANDED_AFTER, genesis).await??;
+
+    let mut first = Vec::new();
+    for height in 1..=10 {
+        let block = if height == FORGED {
+            fixture.forge(FORGED)
+        } else {
+            fixture.blocks[height as usize].clone()
+        };
+        first.push((height, spawn_submit(&mut verifier, block).await));
+    }
+    let (finished, old_stranded) = settle(first).await;
+    assert_eq!(
+        finished.keys().copied().collect::<Vec<_>>(),
+        (1..SLOW).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        old_stranded
+            .iter()
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>(),
+        (SLOW..=10).collect::<Vec<_>>(),
+    );
+
+    // Block sync downloads the whole range again. The fresh descendants reach the state after the
+    // honest copy of the forged block's child commits.
+    gate.hold(
+        (SLOW..=10).map(|height| fixture.hash(height)),
+        fixture.hash(SLOW - 1),
+        true,
+    );
+    let mut fresh = Vec::new();
+    for height in FORGED..=10 {
+        fresh.push((
+            height,
+            spawn_submit(&mut verifier, fixture.blocks[height as usize].clone()).await,
+        ));
+    }
+    let (fresh_finished, fresh_stranded) = settle(fresh).await;
+    for height in FORGED..SLOW {
+        assert!(
+            matches!(&fresh_finished.get(&height), Some(Ok(hash)) if *hash == fixture.hash(height)),
+            "fresh height {height} commits: {:?}",
+            fresh_finished.get(&height),
+        );
+    }
+
+    // The old stranded copies commit the range.
+    let (old_finished, old_still_stranded) = settle(old_stranded).await;
+    assert!(old_still_stranded.is_empty());
+    for (height, result) in &old_finished {
+        assert!(
+            matches!(result, Ok(hash) if *hash == fixture.hash(*height)),
+            "old copy of height {height} commits once its parent commits: {result:?}",
+        );
+    }
+    let tip = state.clone().oneshot(zs::Request::Tip).await;
+    assert!(
+        matches!(tip, Ok(zs::Response::Tip(Some((height, _)))) if height == block::Height(10)),
+        "{tip:?}",
+    );
+
+    // Every fresh copy of a stranded height is now a never-answered commit.
+    assert_eq!(
+        fresh_stranded
+            .iter()
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>(),
+        (SLOW..=10).collect::<Vec<_>>(),
+    );
+
+    // Later ranges still commit, and the leaked commits stay pending.
+    let mut next = Vec::new();
+    for height in 11..=20 {
+        next.push((
+            height,
+            spawn_submit(&mut verifier, fixture.blocks[height as usize].clone()).await,
+        ));
+    }
+    let (next_finished, next_pending) = settle(next).await;
+    assert!(next_pending.is_empty());
+    assert!(
+        next_finished.values().all(Result::is_ok),
+        "{next_finished:?}"
+    );
+    let (_, fresh_still_stranded) = settle(fresh_stranded).await;
+    assert_eq!(
+        fresh_still_stranded.len(),
+        (SLOW..=10).count(),
+        "the leaked commits never resolve before the checkpoint handoff",
+    );
+
+    Ok(())
+}
+
+/// Measures native-sync slot leaks without any injected delay.
+///
+/// Each trial forges height 2 of a 400-block range and, if descendants strand, resubmits the whole
+/// range as native block sync does. It reports old stranded copies and fresh copies that never
+/// resolve. Run with `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn range_resubmission_leak_rate_under_natural_scheduling() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    const RANGE_END: u32 = 400;
+    const FORGED: u32 = 2;
+    let trials: usize = std::env::var("POISON_TRIALS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+
+    let fixture = PoisonFixture::new(2 * RANGE_END, &[RANGE_END, 2 * RANGE_END])?;
+
+    let mut report = Vec::new();
+    for _ in 0..trials {
+        let state = fixture.state().await?;
+        let mut verifier = CheckpointVerifier::from_list(
+            fixture.checkpoints.clone(),
+            &fixture.network,
+            None,
+            state.clone(),
+        )?;
+        let genesis = submit(&mut verifier, fixture.blocks[0].clone()).await;
+        timeout(STRANDED_AFTER, genesis).await??;
+
+        let mut first = Vec::new();
+        for height in 1..=RANGE_END {
+            let block = if height == FORGED {
+                fixture.forge(FORGED)
+            } else {
+                fixture.blocks[height as usize].clone()
+            };
+            first.push((height, spawn_submit(&mut verifier, block).await));
+        }
+        let (_, old_stranded) = settle(first).await;
+        if old_stranded.is_empty() {
+            report.push((0, 0, 0));
+            continue;
+        }
+
+        let mut fresh = Vec::new();
+        for height in FORGED..=RANGE_END {
+            fresh.push((
+                height,
+                spawn_submit(&mut verifier, fixture.blocks[height as usize].clone()).await,
+            ));
+        }
+        let (_, fresh_stranded) = settle(fresh).await;
+        let old_stranded_count = old_stranded.len();
+        let (_, old_still_stranded) = settle(old_stranded).await;
+        let old_count = old_still_stranded.len();
+        report.push((old_stranded_count, old_count, fresh_stranded.len()));
+    }
+
+    #[allow(clippy::print_stderr)]
+    {
+        eprintln!(
+            "(old copies stranded, old copies still stranded after resubmission, fresh copies leaked) per trial; \
+             (0, 0, 0) means nothing stranded: {report:?}"
+        );
+    }
+
+    Ok(())
+}

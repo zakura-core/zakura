@@ -270,6 +270,13 @@ impl<A: StreamConformance> LayoutSession<A> {
             .row(frame.message_type)
             .ok_or_else(|| format!("no row for message type {}", frame.message_type))?;
         shared.handled.fetch_add(1, Ordering::Relaxed);
+        if let Some((_, handled)) = shared
+            .handled_rows
+            .iter()
+            .find(|(handled, _)| *handled == row.message_type)
+        {
+            handled.fetch_add(1, Ordering::Relaxed);
+        }
         let len = frame.payload.len();
         match row.role {
             MessageRole::Request { .. } => {
@@ -347,6 +354,8 @@ pub(crate) struct LayoutShared<A: StreamConformance> {
     pub(crate) pool: ReservationPool,
     /// Frames that reached this node's handler.
     pub(crate) handled: AtomicU64,
+    /// Frames that reached this node's handler, per row of the layout.
+    handled_rows: Vec<(u16, AtomicU64)>,
     /// Violations this node disconnected a peer for.
     pub(crate) violations: Mutex<Vec<String>>,
     /// While true, session tasks stop reading.
@@ -376,6 +385,14 @@ impl<A: StreamConformance> LayoutShared<A> {
             .iter()
             .position(|plan| plan.row.message_type == subscription_type)
             .expect("the plan lists every subscription row of the layout")
+    }
+
+    /// Frames of `message_type` that reached this node's handler.
+    pub(crate) fn handled_of(&self, message_type: u16) -> u64 {
+        self.handled_rows
+            .iter()
+            .find(|(row, _)| *row == message_type)
+            .map_or(0, |(_, handled)| handled.load(Ordering::Relaxed))
     }
 
     /// The violations this node disconnected a peer for.
@@ -446,6 +463,11 @@ impl<A: StreamConformance> LayoutService<A> {
                 published_ended: AtomicU64::new(0),
                 pool,
                 handled: AtomicU64::new(0),
+                handled_rows: layout
+                    .iter()
+                    .flat_map(|member| member.messages.into_iter().flatten())
+                    .map(|row| (row.message_type, AtomicU64::new(0)))
+                    .collect(),
                 violations: Mutex::new(Vec::new()),
                 paused: watch::channel(false).0,
             }),

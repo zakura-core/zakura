@@ -731,18 +731,34 @@ pub(crate) async fn paused_siblings<A: StreamConformance>(
     a.siblings[supported].pause(true);
     floods.push(b.siblings[supported].flood(&a.id())?);
     wait_filled(&b.siblings[supported]).await?;
-    // One request and one `Open`, for each kind of row the layout has.
+    // The stalled exchanges' rows: the first request row and the first
+    // subscription row, with the frames the peer handled on each so far.
     let plan = &a.shared().plan;
-    let first_frames =
-        u64::from(!plan.requests.is_empty()) + u64::from(!plan.subscriptions.is_empty());
-    let handled = b.shared().handled.load(Ordering::Relaxed) + first_frames;
+    let stalled: Vec<_> = plan
+        .requests
+        .first()
+        .map(|request| request.row.message_type)
+        .into_iter()
+        .chain(
+            plan.subscriptions
+                .first()
+                .map(|subscription| subscription.row.message_type),
+        )
+        .map(|row| (row, b.shared().handled_of(row)))
+        .collect();
     let resume = async {
-        // Let each request and `Open` reach the peer before credit returns,
-        // so the responses are the part that waits.
+        // Let the request and the `Open` both reach the peer before credit
+        // returns, so the responses are the part that waits. A
+        // subscription's later updates follow its `Open`, so a new frame on
+        // its row means the `Open` arrived.
         await_until(
             "the stalled exchanges' first frames",
             CONFORMANCE_DEADLINE,
-            || b.shared().handled.load(Ordering::Relaxed) >= handled,
+            || {
+                stalled
+                    .iter()
+                    .all(|&(row, before)| b.shared().handled_of(row) > before)
+            },
         )
         .await?;
         floods.clear();

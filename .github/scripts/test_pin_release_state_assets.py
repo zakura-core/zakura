@@ -83,6 +83,25 @@ class PinAssetsTests(unittest.TestCase):
         self.assertLess(pin_at, validate_at)
         self.assertLess(validate_at, build_at)
 
+    def test_branch_runs_require_dry_run_and_check_out_selected_ref(self):
+        workflow = (Path(__file__).parents[1] / "workflows/prepare-release-pr.yml").read_text()
+        self.assertIn("    if: github.ref == 'refs/heads/main' || inputs.dry_run\n", workflow)
+        self.assertIn("          ref: ${{ github.ref }}\n", workflow)
+        self.assertNotIn("          ref: main\n", workflow)
+        self.assertIn(
+            "    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}\n",
+            workflow,
+        )
+
+    def test_dry_runs_cannot_obtain_publishing_token_or_open_release_pr(self):
+        workflow = (Path(__file__).parents[1] / "workflows/prepare-release-pr.yml").read_text()
+        for step in ("Create release GitHub App token", "Open or update the draft pull request"):
+            guard = workflow.split(f"      - name: {step}\n", 1)[1].splitlines()[0]
+            self.assertEqual(
+                guard,
+                "        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}",
+            )
+
     def test_resolution_failure_stops_preparation(self):
         with patch.object(MODULE.urllib.request, "urlopen", return_value=self.archive()), \
                 patch.object(MODULE.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "cargo")):

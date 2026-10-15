@@ -11,7 +11,9 @@
 # create-release.yml re-validates everything after merge.
 #
 # Re-running with the same tag recreates the release/v* branch from the
-# current main HEAD, which is how the PR stays rebased.
+# current main HEAD, which is how the PR stays rebased. Dry runs can also
+# validate the selected branch without opening a PR or accessing the release
+# environment.
 #
 # Unlike semver-checks.yml (crates.io baselines gating every PR), bump levels
 # here are computed against BASE_TAG as a git baseline: the version at the
@@ -52,26 +54,26 @@ on:
 permissions: {}
 
 concurrency:
-  group: prepare-release-pr
+  group: prepare-release-pr-${{ inputs.dry_run && github.ref || 'main' }}
   cancel-in-progress: false
 
 jobs:
   prepare:
     name: Prepare release PR
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || inputs.dry_run
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    environment: release-automation
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
     steps:
       # fetch-depth: 0 — tag resolution, per-crate diffs against BASE_TAG, and
       # cargo-semver-checks --baseline-rev all need full history.
-      - name: Checkout main
+      - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          ref: main
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Resolve parameters
@@ -484,7 +486,7 @@ jobs:
             ${{ runner.temp }}/pr-body.md
 
       - name: Create release GitHub App token
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
         with:
@@ -496,7 +498,7 @@ jobs:
       # Never hotfix/*: that namespace is reserved for the embargoed hotfix
       # process (docs/security-hotfix-release.md).
       - name: Open or update the draft pull request
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}

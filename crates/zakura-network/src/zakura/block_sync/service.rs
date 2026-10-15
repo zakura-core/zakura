@@ -58,6 +58,7 @@ pub(crate) fn block_sync_streams() -> &'static [Stream] {
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {
     status_sender: Option<Arc<super::regulated::status_sender::StatusSender>>,
+    generation: Option<u64>,
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
     send: FramedSend,
@@ -68,6 +69,7 @@ impl BlockSyncPeerSession {
     pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
         Self {
             status_sender: None,
+            generation: None,
             peer_id: session.peer_id().clone(),
             direction,
             send: session.sender(),
@@ -86,6 +88,7 @@ impl BlockSyncPeerSession {
     ) -> Self {
         Self {
             status_sender: None,
+            generation: None,
             peer_id,
             direction: ServicePeerDirection::Outbound,
             send,
@@ -104,6 +107,11 @@ impl BlockSyncPeerSession {
         state.record_received(status);
         self.status_sender = Some(state);
         self
+    }
+
+    /// Registry generation admitted for this session, or `None` without routine wiring.
+    pub(super) fn generation(&self) -> Option<u64> {
+        self.generation
     }
 
     /// Direction of the underlying Zakura connection.
@@ -259,6 +267,7 @@ struct BlockSyncServiceInner {
 struct BlockSyncPeerRecord {
     conn_id: ZakuraConnId,
     session_id: u64,
+    generation: Option<u64>,
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
 }
@@ -735,6 +744,7 @@ impl Service for BlockSyncService {
                 }
                 None => (None, false),
             };
+            block_sync_session.generation = routine.as_ref().map(|(_, generation, _)| *generation);
             if let Some((_, _, fence)) = &routine {
                 use crate::zakura::regulation::{Current, Replacement, SessionKey};
                 if matches!(
@@ -775,6 +785,7 @@ impl Service for BlockSyncService {
                 BlockSyncPeerRecord {
                     conn_id,
                     session_id,
+                    generation: block_sync_session.generation,
                     direction: peer.direction,
                     cancel_token: service_cancel_token.clone(),
                 },
@@ -796,11 +807,15 @@ impl Service for BlockSyncService {
             let lifecycle = self.inner.lifecycle.clone();
             let peer_id = peer_id.clone();
             let inner = self.inner.clone();
+            let generation = block_sync_session.generation;
             move || {
                 let should_notify = inner.finish_session(&peer_id, conn_id, session_id);
 
                 if should_notify {
-                    let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected(peer_id));
+                    let _ = lifecycle.send(BlockSyncEvent::PeerDisconnected {
+                        peer: peer_id,
+                        generation,
+                    });
                 }
             }
         };
@@ -976,10 +991,10 @@ impl Service for BlockSyncService {
         };
 
         record.cancel_token.cancel();
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
+        let _ = self.inner.lifecycle.send(BlockSyncEvent::PeerDisconnected {
+            peer: peer.clone(),
+            generation: record.generation,
+        });
     }
 
     fn deliver_frame(
@@ -1119,6 +1134,7 @@ mod requester_session_tests {
             BlockSyncPeerRecord {
                 conn_id: 7,
                 session_id: 3,
+                generation: None,
                 direction: ServicePeerDirection::Outbound,
                 cancel_token: cancel.clone(),
             },

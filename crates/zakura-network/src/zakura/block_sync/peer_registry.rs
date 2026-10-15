@@ -704,6 +704,24 @@ impl PeerRegistry {
         }
     }
 
+    /// Remove the peer's entry only while `generation` still owns it, so a late
+    /// teardown of a replaced session leaves the replacement's entry in place.
+    pub(super) fn remove_session(&self, peer: &ZakuraPeerId, generation: u64) {
+        let removed = {
+            let mut peers = self.lock();
+            if peers
+                .get(peer)
+                .is_none_or(|entry| entry.generation != generation)
+            {
+                return;
+            }
+            peers.remove(peer)
+        };
+        drop(removed);
+        // A routine may have deferred the floor to the removed peer.
+        self.floor_ranking_changed.notify_waiters();
+    }
+
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow
     /// servable range, clamp the advertised caps, and mark the peer as having sent
     /// a status. Generation-gated like the other routine writers so a superseded

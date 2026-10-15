@@ -652,7 +652,9 @@ impl BlockSyncReactor {
             .emit_event(|| BlockEventReceived::new(&event));
         match event {
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
-            BlockSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
+            BlockSyncEvent::PeerDisconnected { peer, generation } => {
+                self.handle_peer_disconnected(peer, generation)
+            }
             BlockSyncEvent::RetryBodyAvailability { hash } => self.retry_body_availability(hash),
             #[cfg(any(test, feature = "proptest-impl"))]
             BlockSyncEvent::HeaderTipChanged { height, hash } => {
@@ -798,7 +800,7 @@ impl BlockSyncReactor {
             );
             self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
-            self.registry.remove(&peer);
+            self.remove_registry_session(&peer, session.generation());
             self.publish_peer_snapshot();
             self.publish_candidate_state();
             return;
@@ -823,12 +825,19 @@ impl BlockSyncReactor {
         // a status and work.
     }
 
-    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId) {
+    fn handle_peer_disconnected(&mut self, peer: ZakuraPeerId, generation: Option<u64>) {
         // The pipe-routine cancels on the session token (transport disconnect);
         // its `Drop` guard returns its unreceived outstanding heights to
         // `work.pending` and releases their budget. The reactor only drops its
         // thin serving handle and the registry entry.
-        if self.state.peers.remove(&peer).is_some() {
+        // A session reopened on the same connection is admitted before this
+        // event arrives, so only state owned by the ended session is removed.
+        let owns_serving_handle =
+            self.state.peers.get(&peer).is_some_and(|state| {
+                generation.is_none() || state.session.generation() == generation
+            });
+        if owns_serving_handle {
+            self.state.peers.remove(&peer);
             set_block_reactor_active_connection_gauge(self.state.peers.len());
             self.trace_peer_disconnected(
                 &peer,
@@ -836,11 +845,20 @@ impl BlockSyncReactor {
                 self.state.peers.len(),
             );
         }
-        self.registry.remove(&peer);
+        self.remove_registry_session(&peer, generation);
         self.state.parked_peers.remove(&peer);
         self.flush_status_refresh();
         self.publish_peer_snapshot();
         self.publish_candidate_state();
+    }
+
+    /// Remove `peer`'s registry entry if the session with `generation` still owns it.
+    /// `None` (a session without routine wiring) removes it unconditionally.
+    fn remove_registry_session(&self, peer: &ZakuraPeerId, generation: Option<u64>) {
+        match generation {
+            Some(generation) => self.registry.remove_session(peer, generation),
+            None => self.registry.remove(peer),
+        }
     }
 
     fn registry_received_status(&self, peer: &ZakuraPeerId) -> bool {

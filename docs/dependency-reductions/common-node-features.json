@@ -5,7 +5,7 @@
   "edges": "normal,build",
   "baseline_pr": "https://github.com/zakura-core/zakura/pull/1436",
   "baseline_common": "2043c595ff0995198e8ad25d5cc2db5a965b895c",
-  "final_common": "ee20524f0465d2624d92bfbe878a1478ef6d96de",
+  "final_common": "276ec402a394e30f422a965646fb335f3f892461",
   "layers": [
     {
       "node_base": "c2d644cf7cff597cb718fc22e5d3ab0e7e37b78c",
@@ -129,5 +129,11 @@
       ],
       "added": []
     }
+  },
+  "validation": {
+    "focused_node_tests": 64,
+    "tested_node_revision": "c4348311419f18185aa940938294221b8d71a721",
+    "tested_common_revision": "ee20524f0465d2624d92bfbe878a1478ef6d96de",
+    "repin_note": "The latest Common revision changes only changelog whitespace; crate source, manifests, lockfile, and toolchain are identical. Final-head rerun follows the repin."
   }
 }

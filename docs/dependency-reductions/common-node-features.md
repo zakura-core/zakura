@@ -43,8 +43,9 @@ cargo +1.97.1 tree --locked -p zakura --features default-release-binaries \
 
 These are graph measurements. They do not establish compilation on all three
 targets, runtime behavior, vulnerability remediation, or a speedup. RPC library
-checks have passed through each source layer. Focused runtime validation,
-full CI, and review remain acceptance gates.
+checks have passed through each source layer. Sixty-four focused node tests passed, including transparent coinbase generation,
+Sapling and Orchard proof validation, and a real Ironwood coinbase proof.
+Full CI and independent review remain acceptance gates.
 
 Exact-revision cargo-vet exemptions carry the existing Common audit backlog and
 the unpublished changes under review. They are not audit certifications. This

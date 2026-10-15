@@ -212,12 +212,9 @@ class PinTests(unittest.TestCase):
         assets.pin_assets(self.root, {"has_changes": False}, fetch=lambda *a: self.fail("no fetch expected"))
         self.assertEqual(self.manifest.read_text(), self.original)
 
-    def test_receipt_from_another_bundle_or_request_is_rejected(self):
-        for changed in (dict(height=1), dict(request_id="another-request"), dict(outcome="failed")):
-            receipt = {**self.fixture.identity, "schema_version": 1, "request_id": "prepare-1-1", "outcome": "reused", **changed}
-            with self.subTest(changed=changed), self.assertRaises(assets.AssetError):
-                assets.pin_assets(self.root, self.imported, receipt=receipt, selected=self.fixture.identity,
-                                  request_id="prepare-1-1", fetch=self.fixture.fetch)
+    def test_ready_archive_checksum_must_match(self):
+        with self.assertRaisesRegex(assets.AssetError, "ready manifest"):
+            assets.pin_assets(self.root, self.imported, expected_checksum="0" * 64, fetch=self.fixture.fetch)
         self.assertEqual(self.manifest.read_text(), self.original)
 
 

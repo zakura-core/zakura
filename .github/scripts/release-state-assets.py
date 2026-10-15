@@ -8,7 +8,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -100,47 +99,25 @@ def validate_candidate(root: Path, bundle: Path, selected: dict) -> None:
 
 
 def fetch_candidate(output: Path) -> None:
-    mode = os.environ.get("MODE") or "update"
-    meta_url, meta_sha = os.environ.get("META_URL", ""), os.environ.get("META_SHA256", "")
-    request = os.environ.get("REQUEST_ID", "")
+    latest = os.environ.get("LATEST_URL", "")
+    if not latest:
+        raise AssetError("MAINNET_RELEASE_STATE_LATEST_URL must be set")
     output.mkdir(parents=True, exist_ok=True)
-    if mode == "ensure-assets":
-        if not meta_url or not meta_sha or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", request):
-            raise AssetError("ensure-assets requires immutable metadata URL, digest, and request ID")
-        FETCH.resolve_pinned_bundle(meta_url, meta_sha, output / "bundle", output / "resolution.json")
-    elif mode == "update":
-        if meta_url or meta_sha or request:
-            raise AssetError("pinned metadata and request ID require ensure-assets mode")
-        latest = os.environ.get("LATEST_URL", "")
-        if not latest:
-            raise AssetError("MAINNET_RELEASE_STATE_LATEST_URL must be set")
-        FETCH.resolve_bundle(latest, output / "bundle", output / "resolution.json")
-    else:
-        raise AssetError("unknown release-state mode")
+    FETCH.resolve_bundle(latest, output / "bundle", output / "resolution.json")
 
 
-def publish(root: Path, needed: bool) -> None:
+def publish(root: Path, needed: bool, *, command_env=None, fixture_registry=False) -> None:
     if needed is not True:
         raise AssetError("publication requires an explicit absent-version decision")
-    subprocess.run(["cargo", "publish", "--manifest-path", "crates/zakura-assets/Cargo.toml",
-                    "--allow-dirty", "--no-verify"], cwd=root, check=True, timeout=600)
-
-
-def require_existing(state: Path, selected: dict) -> None:
-    # Package into scratch space so a dry run never changes the checked-out crate manifest.
-    with tempfile.TemporaryDirectory(prefix="zakura-dry-run-asset-") as scratch:
-        crate = Path(scratch) / "crate"
-        shutil.copytree(ROOT / "crates/zakura-assets", crate)
-        packed = PACK.pack(state / "bundle" / PACK.GRID_NAME, crate, 0)
-        if packed["sha256"] != selected["grid_sha256"] or packed["version"] != selected["version"]:
-            raise AssetError("packaged dry-run asset differs from the selection")
-    if publication_needed(selected):
-        raise AssetError("non-publishing dry run requires the matching asset to be published through Update Mainnet release state")
+    args = ["cargo", "publish", "--manifest-path", "crates/zakura-assets/Cargo.toml", "--allow-dirty", "--no-verify"]
+    if fixture_registry:
+        args += ["--registry", "fixture"]
+    subprocess.run(args, cwd=root, check=True, timeout=600, **({"env": command_env} if command_env else {}))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("fetch", "select", "validate", "check", "publish", "verify", "require-existing"))
+    parser.add_argument("operation", choices=("fetch", "select", "validate", "check", "publish", "verify"))
     parser.add_argument("--state", type=Path, required=True)
     args = parser.parse_args()
     state = args.state.resolve()
@@ -152,9 +129,9 @@ def main():
         (state / "selection.json").write_text(json.dumps(selected, indent=2) + "\n")
         return
     selected = json.loads((state / "selection.json").read_text())
-    if args.operation == "require-existing":
-        require_existing(state, selected)
-    elif args.operation == "validate":
+    from ready_release_state import fresh
+    fresh(selected["generated_at"])
+    if args.operation == "validate":
         validate_candidate(ROOT, state / "bundle", selected)
     elif args.operation == "check":
         needed = publication_needed(selected)
@@ -162,19 +139,12 @@ def main():
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             print(f"needed={str(needed).lower()}", file=output)
     elif args.operation == "publish":
+        if (os.environ.get("GITHUB_REPOSITORY") != "zakura-core/zakura"
+                or os.environ.get("GITHUB_REF") != "refs/heads/main"):
+            raise AssetError("crate publication is restricted to canonical main")
         publish(ROOT, json.loads((state / "publication.json").read_text())["needed"])
     elif args.operation == "verify":
         verify_visible(selected)
-        receipt = {key: selected[key] for key in (
-            "meta_url", "meta_sha256", "height", "name", "version", "grid_sha256")}
-        needed = json.loads((state / "publication.json").read_text())["needed"]
-        receipt.update(schema_version=1,
-                       request_id=os.environ.get("REQUEST_ID") or f'update-{os.environ["GITHUB_RUN_ID"]}-{os.environ["GITHUB_RUN_ATTEMPT"]}',
-                       outcome="published" if needed else "reused",
-                       producer_run_id=int(os.environ["GITHUB_RUN_ID"]),
-                       producer_sha=os.environ["GITHUB_SHA"],
-                       producer_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]))
-        (state / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
 
 if __name__ == "__main__":

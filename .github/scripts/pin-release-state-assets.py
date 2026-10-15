@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""Pin the verified, published grid matching an imported release-state bundle."""
+"""Pin the verified asset from the preserved ready release-state set."""
 
 import argparse
 import json
 from pathlib import Path
 
-from release_state_assets import pin_assets
+from ready_release_state import RESOLUTION_KEYS, verify_ready_snapshot
+from release_state_assets import AssetError, pin_assets
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--import-result", type=Path, required=True)
-    parser.add_argument("--selection", type=Path)
-    parser.add_argument("--receipt", type=Path)
-    parser.add_argument("--request-id")
+    parser.add_argument("--state", type=Path, required=True)
     args = parser.parse_args()
-    if len({bool(args.selection), bool(args.receipt), bool(args.request_id)}) != 1:
-        parser.error("--selection, --receipt, and --request-id must be supplied together")
-    pin_assets(Path.cwd(), json.loads(args.import_result.read_text()),
-               receipt=json.loads(args.receipt.read_text()) if args.receipt else None, request_id=args.request_id,
-               selected=json.loads(args.selection.read_text()) if args.selection else None)
+    manifest = verify_ready_snapshot(args.state)
+    imported = json.loads(args.import_result.read_text())
+    if any(imported[key] != manifest[key] for key in RESOLUTION_KEYS):
+        raise AssetError("imported data does not match the preserved ready set")
+    if imported["has_changes"] and imported["frontier_grid_sha256"] != manifest["asset"]["grid_sha256"]:
+        raise AssetError("imported grid does not match the ready asset")
+    pin_assets(Path.cwd(), imported, expected_checksum=manifest["asset"]["checksum"])
 
 
 if __name__ == "__main__":

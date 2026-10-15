@@ -1,37 +1,16 @@
-# Refresh the embedded Mainnet checkpoint list, VCT frontier, and subtree roots from one
-# immutable, digest-verified R2 bundle produced by the release-state publisher
-# (deploy/release-state/), publish that bundle's historical frontier grid to crates.io, and
-# open a draft PR for human review. Checkpoints are consensus-critical: nothing merges or
-# ships from this workflow directly, and release creation never consults the moving R2 pointer.
-# See docs/design/verified-commitment-trees.md, section 16.
-#
-# The frontier grid is not committed. Cargo can only resolve a version that already exists, so
-# the grid is published before the pull request that pins it is opened, and a candidate the
-# reviewer rejects is a yanked, unreferenced version. Only the publish job holds an OIDC token,
-# and its environment carries no other secrets.
+# Publish a complete release-state set before advertising readiness.
+# Keep this filename: crates.io Trusted Publishing authorizes this entrypoint.
+# Adoption and human review live in adopt-release-state.yml.
 name: Update Mainnet release state
-run-name: ${{ inputs.mode == 'ensure-assets' && format('Ensure release-state assets {0}', inputs.request_id) || 'Update Mainnet release state' }}
-
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Update the state PR, or only ensure the selected asset is published"
-        type: choice
-        options: [update, ensure-assets]
-        default: update
-      meta_url:
-        description: "ensure-assets: immutable bundle metadata URL"
-        type: string
-      meta_sha256:
-        description: "ensure-assets: SHA-256 of that metadata"
-        type: string
-      request_id:
-        description: "ensure-assets: unique caller request ID"
-        type: string
+      dry_run:
+        description: "Validate the candidate without publishing or promoting storage"
+        type: boolean
+        default: false
   schedule:
-    # Weekly refresh; the publisher exports daily on its own timer.
-    - cron: "0 6 * * 1"
+    - cron: "0 7 * * *"
 
 permissions: {}
 
@@ -42,9 +21,12 @@ concurrency:
 jobs:
   resolve:
     name: Resolve one immutable release-state bundle
-    if: github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura'
+    if: >-
+      github.repository == 'zakura-core/zakura' &&
+      (github.ref == 'refs/heads/main' || inputs.dry_run) &&
+      (github.event_name == 'workflow_dispatch' || vars.MAINNET_RELEASE_STATE_PUBLICATION_ENABLED == 'true')
     runs-on: ubuntu-latest
-    environment: release-automation
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
     outputs:
@@ -67,11 +49,7 @@ jobs:
 
       - name: Fetch one immutable bundle
         env:
-          MODE: ${{ inputs.mode || 'update' }}
           LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
-          META_URL: ${{ inputs.meta_url }}
-          META_SHA256: ${{ inputs.meta_sha256 }}
-          REQUEST_ID: ${{ inputs.request_id }}
         run: |
           python3 .github/scripts/release-state-assets.py fetch --state "$RUNNER_TEMP/release-state"
           python3 .github/scripts/release-state-assets.py select --state "$RUNNER_TEMP/release-state"
@@ -97,7 +75,6 @@ jobs:
   validate:
     name: Validate the candidate before publication
     needs: [resolve]
-    if: needs.resolve.outputs.has_changes == 'true' || inputs.mode == 'ensure-assets'
     runs-on: ubuntu-latest
     timeout-minutes: 70
     permissions:
@@ -118,13 +95,26 @@ jobs:
           path: ${{ runner.temp }}/release-state/
       - name: Verify append-only history and prove subtree roots
         run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
+      - name: Package and verify an already published asset for the dry run
+        if: inputs.dry_run
+        run: |
+          set -euo pipefail
+          python3 scripts/pack-assets-crate.py \
+            --grid "$RUNNER_TEMP/release-state/bundle/mainnet-frontier-grid.bin" \
+            --result-out "$RUNNER_TEMP/release-state/pack.json"
+          python3 .github/scripts/release-state-assets.py check --state "$RUNNER_TEMP/release-state"
+          if [ "$(jq -r '.needed' "$RUNNER_TEMP/release-state/publication.json")" = "true" ]; then
+            echo "Publication prerequisite: the matching crate must be published from main before this dry run can pass." >&2
+            exit 1
+          fi
+          python3 .github/scripts/release-state-assets.py verify --state "$RUNNER_TEMP/release-state"
 
   publish-assets:
     name: Publish the frontier grid to crates.io
     needs: [resolve, validate]
     # The repository guard matches publish-crates.yml: a staging fork must never reach the real
     # registry, and failing before the OIDC exchange keeps its logs honest.
-    if: github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura'
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: crates-io-assets
@@ -193,230 +183,40 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: python3 .github/scripts/release-state-assets.py publish --state "$RUNNER_TEMP/release-state"
 
-      - name: Verify Cargo availability and issue the publication receipt
-        env:
-          REQUEST_ID: ${{ inputs.request_id }}
+      - name: Verify Cargo availability
         run: python3 .github/scripts/release-state-assets.py verify --state "$RUNNER_TEMP/release-state"
 
-      - name: Upload the verified publication receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
-        with:
-          name: release-state-assets
-          path: ${{ runner.temp }}/release-state/receipt.json
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
-
-  open-pr:
-    name: Import the release state and open the draft pull request
-    needs: [resolve, publish-assets]
-    if: needs.resolve.outputs.has_changes == 'true' && inputs.mode != 'ensure-assets'
+  promote:
+    name: Promote the verified set to immutable ready storage
+    needs: [resolve, validate, publish-assets]
+    if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && github.repository == 'zakura-core/zakura' }}
     runs-on: ubuntu-latest
-    environment: release-automation
+    timeout-minutes: 15
+    environment: release-state-storage
     permissions:
       contents: read
     steps:
-      - name: Checkout main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - uses: ./.github/actions/setup-zakura-build
-
-      - name: Restore the validated bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
+          cache: false
+      - name: Install the pinned storage client
+        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-state.txt
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
         with:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
-
-      # The append-only check compares against the grid this repository currently pins, which
-      # lives in the registry rather than the tree, so it has to be materialised first.
-      - name: Materialise the currently pinned frontier grid
-        id: pinned
+      - name: Verify public bytes and advance readiness conditionally
         env:
-          NAME: ${{ needs.publish-assets.outputs.crate_name }}
-        run: |
-          set -euo pipefail
-          cargo fetch --locked
-          MANIFEST=$(cargo metadata --format-version 1 --locked \
-            | jq -r --arg n "$NAME" 'first(.packages[] | select(.name == $n) | .manifest_path)')
-          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "null" ]; then
-            echo "path=" >> "$GITHUB_OUTPUT"
-            echo "No pinned ${NAME} to extend; importing without an append-only comparison."
-            exit 0
-          fi
-          echo "path=$(dirname "$MANIFEST")/src/mainnet-frontier-grid.bin" >> "$GITHUB_OUTPUT"
-
-      # Release preparation owns end-of-support changes.
-      - name: Import checkpoints, frontier, subtrees, and provenance
-        id: import
-        env:
-          BUNDLE: ${{ runner.temp }}/release-state/bundle
-          RESOLUTION: ${{ runner.temp }}/release-state/resolution.json
-          PREVIOUS_GRID: ${{ steps.pinned.outputs.path }}
-        run: |
-          set -euo pipefail
-          PREVIOUS_ARGS=()
-          if [ -n "$PREVIOUS_GRID" ]; then
-            PREVIOUS_ARGS=(--previous-frontier-grid "$PREVIOUS_GRID")
-          fi
-          python3 .github/scripts/import-release-state.py \
-            --bundle "$BUNDLE" \
-            --resolution "$RESOLUTION" \
-            ${PREVIOUS_ARGS[@]+"${PREVIOUS_ARGS[@]}"} \
-            --result-out "$RUNNER_TEMP/release-state-import.json" \
-            --no-eos-floor
-          jq -r '
-            "has_changes=\(.has_changes)",
-            "height=\(.height)",
-            "block_hash=\(.block_hash)",
-            "generated_at=\(.generated_at)",
-            "meta_url=\(.meta_url)",
-            "meta_sha256=\(.meta_sha256)",
-            "frontier_grid_sha256=\(.frontier_grid_sha256)",
-            "frontier_grid_entries=\(.frontier_grid_entries)"
-          ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
-
-      # `--precise` is surgical: it moves this one package and leaves the rest of the resolution
-      # alone, which a bare `cargo update` would not.
-      - name: Pin the published frontier grid
-        if: steps.import.outputs.has_changes == 'true'
-        env:
-          NAME: ${{ needs.publish-assets.outputs.crate_name }}
-          VERSION: ${{ needs.publish-assets.outputs.crate_version }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, re, pathlib
-          version = os.environ["VERSION"]
-          path = pathlib.Path("Cargo.toml")
-          text = path.read_text(encoding="utf-8")
-          pattern = re.compile(r'^(zakura-assets = \{[^}]*version = ")=[^"]+(")', re.MULTILINE)
-          text, count = pattern.subn(rf'\g<1>={version}\g<2>', text, count=1)
-          if count != 1:
-              raise SystemExit("Cargo.toml does not carry a zakura-assets pin to bump")
-          path.write_text(text, encoding="utf-8")
-          PY
-          cargo update -p "$NAME" --precise "$VERSION"
-
-      - name: Validate the imported release state
-        if: steps.import.outputs.has_changes == 'true'
-        run: |
-          set -euo pipefail
-          .github/scripts/validate-checkpoints.sh \
-            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
-
-      - name: Re-prove the checkpoint/frontier pairing in cargo
-        if: steps.import.outputs.has_changes == 'true'
-        run: |
-          cargo test -p zakura-state --lib -- frontier sprout_change
-
-      - name: Restrict the generated diff to release-state files
-        if: steps.import.outputs.has_changes == 'true'
-        run: |
-          set -euo pipefail
-          {
-            git diff --name-only HEAD
-            git ls-files --others --exclude-standard
-          } | sort -u > "$RUNNER_TEMP/actual-files"
-          sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
-          Cargo.lock
-          Cargo.toml
-          crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
-          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
-          EOF
-          UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
-          if [ -n "$UNEXPECTED" ]; then
-            echo "Import changed files outside the release-state allowlist:" >&2
-            echo "$UNEXPECTED" >&2
-            exit 1
-          fi
-
-          # The checkpoint diff must be append-only.
-          REMOVED=$(git diff --numstat HEAD -- \
-            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
-          if [ "${REMOVED:-0}" != "0" ]; then
-            echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
-            exit 1
-          fi
-
-          # The pin bump must move one package. A wider lockfile churn means the resolution
-          # drifted for reasons this workflow is not reviewing.
-          LOCK_PACKAGES=$(git diff -U0 HEAD -- Cargo.lock | grep -c '^[+-]name = ' || true)
-          if [ "${LOCK_PACKAGES}" -gt 2 ]; then
-            echo "Cargo.lock changed ${LOCK_PACKAGES} package names; expected one pin bump." >&2
-            git diff HEAD -- Cargo.lock >&2
-            exit 1
-          fi
-
-          git diff --stat HEAD
-
-      - name: Create release GitHub App token
-        if: steps.import.outputs.has_changes == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+          RELEASE_STATE_R2_ACCESS_KEY_ID: ${{ secrets.RELEASE_STATE_R2_ACCESS_KEY_ID }}
+          RELEASE_STATE_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_STATE_R2_SECRET_ACCESS_KEY }}
+        run: python3 .github/scripts/ready-release-state.py promote --state "$RUNNER_TEMP/release-state"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Choose the dated update branch
-        if: steps.import.outputs.has_changes == 'true'
-        id: update-branch
-        run: echo "name=release/checkpoint-update-$(date -u +%F)" >> "$GITHUB_OUTPUT"
-
-      - name: Open or update the draft pull request
-        id: pull-request
-        if: steps.import.outputs.has_changes == 'true'
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          branch: ${{ steps.update-branch.outputs.name }}
-          base: main
-          title: "chore(chain): update Mainnet release state"
-          body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. End-of-support changes belong to release preparation.
-
-            - Finalized height: `${{ steps.import.outputs.height }}`
-            - Finalized hash: `${{ steps.import.outputs.block_hash }}`
-            - Generated at: `${{ steps.import.outputs.generated_at }}`
-            - Bundle meta: `${{ steps.import.outputs.meta_url }}`
-            - Meta SHA-256: `${{ steps.import.outputs.meta_sha256 }}`
-            - Frontier grid: `${{ needs.publish-assets.outputs.crate_name }} ${{ needs.publish-assets.outputs.crate_version }}`, ${{ steps.import.outputs.frontier_grid_entries }} entries, SHA-256 `${{ steps.import.outputs.frontier_grid_sha256 }}`
-
-            The checkpoint diff is append-only over the committed list, the frontier grid extends the previously published one byte for byte, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
-          commit-message: "chore(chain): update Mainnet release state"
-          sign-commits: true
-          draft: always-true
-          delete-branch: true
-
-      - name: Add missing release labels once
-        if: steps.pull-request.outputs.pull-request-number != ''
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import subprocess
-          number = os.environ["PR_NUMBER"]
-          result = subprocess.run(["gh", "pr", "view", number, "--json", "labels"],
-              check=True, capture_output=True, text=True, timeout=30)
-          existing = {label["name"] for label in json.loads(result.stdout)["labels"]}
-          missing = [label for label in ("A-release", "A-release-state") if label not in existing]
-          if missing:
-              subprocess.run(["gh", "pr", "edit", number, "--add-label", ",".join(missing)],
-                  check=True, timeout=30)
-          PYTHON
+          name: published-release-state
+          path: ${{ runner.temp }}/release-state/promoted-ready.json
+          if-no-files-found: error

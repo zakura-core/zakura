@@ -17,7 +17,6 @@ from pathlib import Path
 
 GRID_LIMIT = 32 * 1024 * 1024
 ARCHIVE_LIMIT = GRID_LIMIT + 8 * 1024 * 1024
-IDENTITY_KEYS = ("meta_url", "meta_sha256", "height", "name", "version", "grid_sha256")
 PIN = re.compile(r'^(zakura-assets = \{[^}]*version = ")=[^"]+("[^}]*\})$', re.MULTILINE)
 
 
@@ -107,23 +106,34 @@ def publication_needed(identity: dict, fetch=download) -> bool:
     return False
 
 
-def cargo_grid(identity: dict, *, timeout: float = 120) -> None:
+def cargo_grid(identity: dict, *, timeout: float = 120, registry_index=None, command_env=None) -> None:
     """Resolve the asset in isolation, without touching the workspace lockfile."""
     with tempfile.TemporaryDirectory(prefix="zakura-asset-resolution-") as scratch:
         root = Path(scratch)
         (root / "src").mkdir()
         (root / "src/lib.rs").write_text("")
+        registry_args = []
+        registry_field = ""
+        expected_source = "registry+https://github.com/rust-lang/crates.io-index"
+        if registry_index is not None:
+            from urllib.parse import urlsplit
+            if urlsplit(registry_index).hostname != "127.0.0.1":
+                raise AssetError("fixture registry must be loopback-only")
+            registry_args = ["--config", f'registries.fixture.index="sparse+{registry_index}"']
+            registry_field = ', registry = "fixture"'
+            expected_source = "sparse+" + registry_index
         (root / "Cargo.toml").write_text(
             '[package]\nname = "zakura-asset-probe"\nversion = "0.0.0"\nedition = "2021"\n'
-            f'[dependencies]\n{identity["name"]} = "={identity["version"]}"\n'
+            f'[dependencies]\n{identity["name"]} = {{ version = "={identity["version"]}"{registry_field} }}\n'
         )
         result = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(root / "Cargo.toml")],
+            ["cargo", *registry_args, "metadata", "--format-version", "1", "--manifest-path", str(root / "Cargo.toml")],
             capture_output=True, text=True, check=True, timeout=timeout,
+            **({"env": command_env} if command_env else {}),
         )
         packages = [p for p in json.loads(result.stdout)["packages"]
                     if p["name"] == identity["name"] and p["version"] == identity["version"]]
-        if len(packages) != 1 or packages[0].get("source") != "registry+https://github.com/rust-lang/crates.io-index":
+        if len(packages) != 1 or packages[0].get("source") != expected_source:
             raise AssetError("Cargo did not resolve the expected crates.io package")
         grid = Path(packages[0]["manifest_path"]).parent / "src/mainnet-frontier-grid.bin"
         with grid.open("rb") as handle:
@@ -168,20 +178,8 @@ def verify_visible(identity: dict, *, fetch=download, resolve=cargo_grid,
             sleep(min(15, remaining))
 
 
-def validate_receipt(receipt: dict, selected: dict, request_id: str, run: dict) -> None:
-    expected = {key: selected[key] for key in IDENTITY_KEYS}
-    expected.update(schema_version=1, request_id=request_id,
-                    producer_run_id=run["id"], producer_sha=run["head_sha"],
-                    producer_attempt=run["run_attempt"])
-    if any(receipt.get(key) != value for key, value in expected.items()):
-        raise AssetError("publication receipt does not match the selected bundle or producer run")
-    if receipt.get("outcome") not in ("published", "reused"):
-        raise AssetError("publication receipt has no successful outcome")
-    check_identity(receipt)
-
-
-def pin_assets(root: Path, imported: dict, *, receipt: dict | None = None,
-               selected: dict | None = None, request_id: str | None = None, fetch=download) -> None:
+def pin_assets(root: Path, imported: dict, *, expected_checksum: str | None = None, fetch=download,
+               cargo_resolve=None, source="registry+https://github.com/rust-lang/crates.io-index", command_env=None) -> None:
     if not imported["has_changes"]:
         return
     manifest = root / "Cargo.toml"
@@ -191,16 +189,12 @@ def pin_assets(root: Path, imported: dict, *, receipt: dict | None = None,
                 "version": f'0.{imported["height"]}.0',
                 "grid_sha256": imported["frontier_grid_sha256"]}
     check_identity(identity)
-    if receipt is not None:
-        if (selected is None or not request_id or receipt.get("request_id") != request_id
-                or receipt.get("schema_version") != 1 or receipt.get("outcome") not in ("published", "reused")
-                or any(receipt.get(k) != identity[k] or selected.get(k) != identity[k]
-                       for k in IDENTITY_KEYS)):
-            raise AssetError("receipt, selection, and imported state do not agree")
     try:
         checksum = registry_grid(identity, fetch)
     except NotPublished as error:
         raise AssetError("matching asset is unavailable; publication through Update Mainnet release state is required") from error
+    if expected_checksum is not None and checksum != expected_checksum:
+        raise AssetError("ready manifest and pinned archive checksums disagree")
     updated, count = PIN.subn(lambda match: f'{match[1]}={identity["version"]}{match[2]}', text)
     if count != 1:
         raise AssetError("Cargo.toml must carry exactly one exact zakura-assets pin")
@@ -208,7 +202,7 @@ def pin_assets(root: Path, imported: dict, *, receipt: dict | None = None,
     before = tomllib.loads(lock.read_text(encoding="utf-8"))
     manifest.write_text(updated, encoding="utf-8")
     subprocess.run(["cargo", "update", "-p", identity["name"], "--precise", identity["version"]],
-                   cwd=root, check=True, timeout=300)
+                   cwd=root, check=True, timeout=300, **({"env": command_env} if command_env else {}))
     after = tomllib.loads(lock.read_text(encoding="utf-8"))
     def unrelated(value):
         return {**value, "package": [p for p in value["package"] if p["name"] != identity["name"]]}
@@ -216,7 +210,7 @@ def pin_assets(root: Path, imported: dict, *, receipt: dict | None = None,
         raise AssetError("asset pin update changed unrelated locked dependencies")
     matches = [p for p in after["package"] if p["name"] == identity["name"]]
     if (len(matches) != 1 or matches[0]["version"] != identity["version"]
-            or matches[0].get("source") != "registry+https://github.com/rust-lang/crates.io-index"
+            or matches[0].get("source") != source
             or matches[0].get("checksum") != checksum):
         raise AssetError("lockfile does not select exactly the verified crates.io asset")
-    cargo_grid(identity)
+    (cargo_resolve or cargo_grid)(identity)

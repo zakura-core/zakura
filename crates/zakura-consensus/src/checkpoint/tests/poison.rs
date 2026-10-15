@@ -478,7 +478,7 @@ async fn forged_body_strand_rate_under_natural_scheduling() -> Result<(), Report
 
     let fixture = PoisonFixture::new(RANGE_END, &[RANGE_END])?;
 
-    for forged_height in [2, 200, 399] {
+    for forged_height in [2, 5, 10, 25, 50, 200, 399] {
         let mut stranded_trials = 0;
         let mut stranded_blocks = Vec::new();
         for _ in 0..trials {

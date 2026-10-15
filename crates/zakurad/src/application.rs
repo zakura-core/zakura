@@ -231,7 +231,9 @@ fn report_fatal_error(error: &Report) {
 /// thread pool and tracing. Server commands also get the metrics endpoint.
 ///
 /// The order matches what earlier releases did, so a config error is reported before
-/// anything else is set up, and later setup steps are logged.
+/// anything else is set up, and later setup steps are logged. The one change is that
+/// `start` now builds its async runtime after the metrics endpoint opens, which logs
+/// nothing.
 #[allow(clippy::print_stderr, clippy::unwrap_in_result)]
 fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> {
     let config = match ZakuradConfig::load(command.config_path()) {

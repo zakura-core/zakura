@@ -42,8 +42,7 @@ use crate::{
     BoxError,
 };
 
-/// An exchange's key: its request or subscription row, and the exchange or
-/// subscription key.
+/// A reservation's key: the request row and the exchange.
 pub(crate) type ExchangeKey = (u16, u32);
 
 /// Serves one request row with the adapter's messages: one part, if the row
@@ -102,8 +101,12 @@ pub(crate) struct LayoutSession<A: StreamConformance> {
     /// The connection's token.
     pub(crate) connection: CancellationToken,
     pub(crate) close_cause: CloseCause,
-    /// Every exchange and subscription this session ended, in order.
+    /// Every exchange this session ended, in order.
     pub(crate) ended: watch::Sender<Vec<ExchangeKey>>,
+    /// Every subscription of this node's that ended, as its subscription row
+    /// and key, in order. Kept apart from `ended`, so a download counts its
+    /// endings without scanning.
+    pub(crate) subscriptions_ended: watch::Sender<Vec<(u16, u32)>>,
 }
 
 /// One subscription row's publications on a session, shared with the task
@@ -235,7 +238,7 @@ impl<A: StreamConformance> LayoutSession<A> {
                 .lock()
                 .claim_end(&key)
                 .map_err(|fault| fault.to_string())?;
-            self.ended
+            self.subscriptions_ended
                 .send_modify(|ended| ended.push((subscription_type, key)));
             return Ok(());
         }
@@ -750,6 +753,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             connection: peer.cancel_token(),
             close_cause: peer.close_cause(),
             ended: watch::channel(Vec::new()).0,
+            subscriptions_ended: watch::channel(Vec::new()).0,
         });
         let current = Current {
             key,

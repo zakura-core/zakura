@@ -7,9 +7,8 @@ use zakura_chain::parameters::Network;
 use zakura_quic::{NodeAddr, QuicEndpoint};
 
 use super::{
-    service::{ExchangeKey, LayoutShared},
-    LayoutService, LayoutSession, SiblingService, StreamConformance, CONFORMANCE_DEADLINE,
-    SIBLINGS,
+    service::LayoutShared, LayoutService, LayoutSession, SiblingService, StreamConformance,
+    CONFORMANCE_DEADLINE, SIBLINGS,
 };
 use crate::{
     zakura::{
@@ -191,19 +190,12 @@ impl<A: StreamConformance> LayoutNode<A> {
         let limit = usize::try_from(plan.max_in_flight).expect("a small limit fits usize");
         let mut ended = session.ended.subscribe();
         let before = ended.borrow().len();
-        // A subscription on the same session may end meanwhile.
-        let ends = |ended: &[ExchangeKey]| {
-            ended[before..]
-                .iter()
-                .filter(|(row, _)| *row == plan.row.message_type)
-                .count()
-        };
         let mut sent = 0usize;
         for exchange in exchanges {
             let needed = (sent + 1).saturating_sub(limit);
             tokio::time::timeout(
                 CONFORMANCE_DEADLINE,
-                ended.wait_for(|ended| ends(ended) >= needed),
+                ended.wait_for(|ended| ended.len() - before >= needed),
             )
             .await
             .map_err(|_| "timed out waiting for an ending")??;
@@ -214,7 +206,7 @@ impl<A: StreamConformance> LayoutNode<A> {
         }
         tokio::time::timeout(
             CONFORMANCE_DEADLINE,
-            ended.wait_for(|ended| ends(ended) >= sent),
+            ended.wait_for(|ended| ended.len() - before >= sent),
         )
         .await
         .map_err(|_| "timed out waiting for the last endings")??;
@@ -237,7 +229,7 @@ impl<A: StreamConformance> LayoutNode<A> {
         let row = plan.row.message_type;
         let key = session.next_key();
         let mut accepted = session.pages.subscribe();
-        let mut ended = session.ended.subscribe();
+        let mut ended = session.subscriptions_ended.subscribe();
         let before = ended.borrow().len();
         self.service
             .subscribe(peer, row, key, plan.credit())

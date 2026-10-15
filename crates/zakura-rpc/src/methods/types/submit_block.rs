@@ -21,7 +21,7 @@ use crate::methods::GetBlockTemplateHandler;
 /// Optional argument `jsonparametersobject` for `submitblock` RPC request
 ///
 /// See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct SubmitBlockParameters {
     /// The workid for the block template.
     ///
@@ -44,9 +44,7 @@ pub struct SubmitBlockParameters {
 }
 
 /// A compact mined-block submission.
-#[derive(
-    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SubmitSolutionParameters {
     /// The prepared candidate identifier returned by `getblocktemplate`.
     #[serde(rename = "workid")]

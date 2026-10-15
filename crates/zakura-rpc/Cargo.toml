@@ -90,7 +90,6 @@ hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive"] }
 
 # For openrpc
-schemars = { workspace = true }
 
 orchard = { workspace = true }
 sapling-crypto = { workspace = true }

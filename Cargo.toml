@@ -142,7 +142,6 @@ semver = "1.0.26"
 serde = "1.0.219"
 serde_json = "1.0.140"
 sha2 = "0.10"
-schemars = "1"
 socket2 = "0.6"
 sinsemilla = { version = "=3.0.0", package = "zakura-sinsemilla" }
 anyhow = "1.0"

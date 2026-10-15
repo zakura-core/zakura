@@ -826,12 +826,18 @@ impl PeerRoutine {
             super::config::clamp_advertised_response_bytes(status.max_response_bytes),
             super::config::clamp_advertised_inflight(status.max_inflight_requests),
         );
+        let was_stopped = self.requester_stop().is_some();
         // Requests must obey the peer's latest limits even while publication waits.
         (
             self.max_blocks_per_response,
             self.max_response_bytes,
             self.window.max_inflight_requests,
         ) = limits;
+        // A new in-flight limit can stop or reopen the requester. Republish
+        // before any rate-limited return so the floor ranking stays current.
+        if self.requester_stop().is_some() != was_stopped {
+            self.publish_slot_diagnostics();
+        }
         let limits_changed = limits != self.published_limits;
         if self.inbound_status_meter.try_take(now) {
             self.status_range_bypass_available = true;

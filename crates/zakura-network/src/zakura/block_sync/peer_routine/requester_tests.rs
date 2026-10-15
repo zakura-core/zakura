@@ -1200,6 +1200,44 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
     assert!(!connection.is_cancelled());
 }
 
+/// A second peer that shares `fast`'s registry and work, reserves from `pool`
+/// and serves `1..=BULK_WORK`. It has no RTprop, which ranks below any
+/// measured peer, and its download floor sits just below `floor`, so `floor`
+/// is the height its floor arm contests.
+fn slower_floor_peer(
+    fast: &PeerRoutine,
+    pool: ReservationPool,
+    floor: block::Height,
+) -> (PeerRoutine, FramedRecv) {
+    let (mut slow, outbound, _events) =
+        super::tests::status_test_routine_with(pool, &CancellationToken::new());
+    slow.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
+    slow.registry = Arc::clone(&fast.registry);
+    slow.generation = slow
+        .registry
+        .admit_session(
+            &slow.peer,
+            slow.session.direction(),
+            &slow.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    slow.work = Arc::clone(&fast.work);
+    let mut view = *slow.sequencer_view.borrow();
+    view.download_floor = block::Height(floor.0 - 1);
+    // Fill only borrows the view, so its sender need not outlive this setup.
+    slow.sequencer_view = watch::channel(view).1;
+    slow.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
+        ..BlockSyncStatus::default()
+    });
+    (slow, outbound)
+}
+
 /// A fast peer gated on owed endings publishes no free slots, so a slower peer
 /// takes the floor height instead of deferring it to a peer that cannot
 /// request it. Once the endings arrive, the fast peer is the preferred floor
@@ -1219,36 +1257,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
         .expect("the gated peer left work behind");
 
-    // The slower peer shares the registry and work. It has no RTprop yet,
-    // which ranks below any measured peer, and its floor is the missing height.
-    let connection = CancellationToken::new();
-    let (mut slow, mut slow_outbound, _slow_events) =
-        super::tests::status_test_routine_with(pool.clone(), &connection);
-    slow.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
-    slow.registry = Arc::clone(&registry);
-    slow.generation = registry
-        .admit_session(
-            &slow.peer,
-            slow.session.direction(),
-            &slow.config,
-            0,
-            Instant::now(),
-        )
-        .generation();
-    slow.work = Arc::clone(&fast.work);
-    let mut view = *slow.sequencer_view.borrow();
-    view.download_floor = block::Height(floor.0 - 1);
-    let (_view, view_rx) = watch::channel(view);
-    slow.sequencer_view = view_rx;
-    let (bodies, _slow_bodies) = mpsc::channel(1);
-    slow.sequencer_input = bodies;
-    slow.handle_status(BlockSyncStatus {
-        servable_low: block::Height(1),
-        servable_high: block::Height(BULK_WORK),
-        max_blocks_per_response: 1,
-        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
-        ..BlockSyncStatus::default()
-    });
+    let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
 
     slow.try_fill().await;
     assert_eq!(
@@ -1333,4 +1342,54 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
         BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
         BlockSyncMessage::GetBlocks { .. }
     ));
+}
+
+/// A status that lowers the advertised in-flight limit to what a fast peer
+/// already holds stops its requester, so a slower peer takes the floor at
+/// once instead of deferring until the next slot heartbeat. The status here
+/// is rate-limited, which still applies the new limit.
+#[tokio::test]
+async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
+    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
+        bulk_routine();
+    let limit = |max_inflight_requests| BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests,
+        ..BlockSyncStatus::default()
+    };
+    fast.handle_status(limit(8));
+    // The cold-start probe sends one request. Its body arrives, its ending does not.
+    fast.try_fill().await;
+    let [first] = requested_heights(&mut fast_outbound)[..] else {
+        panic!("the cold-start probe sends one request");
+    };
+    let index = usize::try_from(first.0 - 1).unwrap();
+    deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
+    assert!(fast.window.bbr_rtprop_ms(Instant::now()).is_some());
+    assert_eq!(fast.requester.len(), 1);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .unwrap();
+    let registry = Arc::clone(&fast.registry);
+    let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
+
+    // With room under its limit, the faster peer is the preferred floor server.
+    slow.try_fill().await;
+    assert!(requested_heights(&mut slow_outbound).is_empty());
+
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    fast.handle_status(limit(1));
+    assert!(fast.pending_status.is_some(), "the status was rate-limited");
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    slow.try_fill().await;
+    assert_eq!(
+        requested_heights(&mut slow_outbound),
+        [floor],
+        "the slower peer takes the floor once the fast one refuses work",
+    );
 }

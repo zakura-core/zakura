@@ -218,6 +218,7 @@ jobs:
           RELEASE_STATE_QUALIFICATION_SHA: ${{ vars.MAINNET_RELEASE_STATE_QUALIFICATION_SHA }}
           RELEASE_STATE_R2_ACCESS_KEY_ID: ${{ secrets.RELEASE_STATE_R2_ACCESS_KEY_ID }}
           RELEASE_STATE_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_STATE_R2_SECRET_ACCESS_KEY }}
+          RELEASE_STATE_R2_SESSION_TOKEN: ${{ secrets.RELEASE_STATE_R2_SESSION_TOKEN }}
         run: python3 .github/scripts/ready-release-state.py promote --state "$RUNNER_TEMP/release-state"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:

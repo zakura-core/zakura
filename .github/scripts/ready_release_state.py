@@ -186,6 +186,7 @@ def production_store():
     return S3Store(boto3.client("s3", endpoint_url=R2_ENDPOINT, region_name="auto",
                               aws_access_key_id=os.environ["RELEASE_STATE_R2_ACCESS_KEY_ID"],
                               aws_secret_access_key=os.environ["RELEASE_STATE_R2_SECRET_ACCESS_KEY"],
+                              aws_session_token=os.environ.get("RELEASE_STATE_R2_SESSION_TOKEN"),
                               config=Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 0},
                                             request_checksum_calculation="when_required")), R2_BUCKET)
 

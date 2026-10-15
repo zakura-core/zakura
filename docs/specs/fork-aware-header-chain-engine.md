@@ -422,6 +422,8 @@ An ambiguous boundary is an exception to the one-target and retained-payload rul
 
 ## 5. Native fork-discovery protocol
 
+> **Planned change.** Header sync version 9, defined in the [peer message regulation specification](peer-message-regulation.md), replaces the version 8 wire in this section when it activates. It keeps one protocol at one stream version under LC-SCOPE-09. The activation change updates this section and PW-08.
+
 ### 5.1 Stream version and codec
 
 Header sync runs on one ordered Zakura v2 P2P stream at exactly one supported stream version, `8`. That number is a compatibility barrier, not a selector: it exists so that a node speaking the obsolete predecessor format (native stream version 7, or the draft version 1.2 16-byte work field) cannot open a header-sync stream at all. There is no negotiation among header-sync codecs, no per-stream codec enum, and no fallback path.

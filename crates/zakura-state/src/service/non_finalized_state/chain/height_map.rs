@@ -14,16 +14,12 @@ const HEIGHTS_PER_CHUNK: u32 = 64;
 #[derive(Debug)]
 pub(crate) struct HeightMap<V> {
     chunks: BTreeMap<u32, Arc<BTreeMap<Height, V>>>,
-    // BTreeMap range checks depend on whether its root has ever been allocated,
-    // even after its last entry is removed. Cloning an empty map resets that root.
-    root_allocated: bool,
 }
 
 impl<V> Default for HeightMap<V> {
     fn default() -> Self {
         Self {
             chunks: BTreeMap::new(),
-            root_allocated: false,
         }
     }
 }
@@ -32,7 +28,6 @@ impl<V> Clone for HeightMap<V> {
     fn clone(&self) -> Self {
         Self {
             chunks: self.chunks.clone(),
-            root_allocated: !self.chunks.is_empty(),
         }
     }
 }
@@ -69,25 +64,26 @@ impl<V> HeightMap<V> {
     pub(super) fn iter(&self) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
         self.chunks.values().flat_map(|chunk| chunk.iter())
     }
+    /// Returns entries in height order within `bounds`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the start exceeds the end, or if equal bounds are both excluded,
+    /// even when the map is empty.
     pub(super) fn range<R: RangeBounds<Height>>(
         &self,
         bounds: R,
     ) -> impl DoubleEndedIterator<Item = (&Height, &V)> {
         let start = bounds.start_bound().cloned();
         let end = bounds.end_bound().cloned();
-        // Preserve ordered-map rejection of reversed or doubly excluded equal bounds.
-        if self.root_allocated {
-            if let (
-                Bound::Included(a) | Bound::Excluded(a),
-                Bound::Included(b) | Bound::Excluded(b),
-            ) = (&start, &end)
-            {
-                assert!(a <= b, "range start exceeds range end");
-                assert!(
-                    a != b || !matches!((&start, &end), (Bound::Excluded(_), Bound::Excluded(_))),
-                    "equal range bounds cannot both be excluded"
-                );
-            }
+        if let (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) =
+            (&start, &end)
+        {
+            assert!(a <= b, "range start exceeds range end");
+            assert!(
+                a != b || !matches!((&start, &end), (Bound::Excluded(_), Bound::Excluded(_))),
+                "equal range bounds cannot both be excluded"
+            );
         }
         let chunk_bound = |bound: &Bound<Height>| match bound {
             Bound::Unbounded => Bound::Unbounded,
@@ -104,7 +100,6 @@ impl<V> HeightMap<V> {
 
 impl<V: Clone> HeightMap<V> {
     pub(super) fn insert(&mut self, height: Height, value: V) -> Option<V> {
-        self.root_allocated = true;
         let chunk = self.chunks.entry(height.0 / HEIGHTS_PER_CHUNK).or_default();
         Arc::make_mut(chunk).insert(height, value)
     }
@@ -402,13 +397,11 @@ mod tests {
         let mut actual = HeightMap::default();
         actual.insert(Height(63), 7);
         let sibling = actual.clone();
-        let flat = BTreeMap::from([(Height(63), 7)]);
         for bounds in [
             (Bound::Included(Height(64)), Bound::Included(Height(63))),
             (Bound::Excluded(Height(63)), Bound::Excluded(Height(63))),
         ] {
             assert!(catch_unwind(|| actual.range(bounds).count()).is_err());
-            assert!(catch_unwind(|| flat.range(bounds).count()).is_err());
         }
         assert!(catch_unwind(AssertUnwindSafe(|| {
             actual
@@ -432,72 +425,78 @@ mod tests {
     }
 
     #[test]
-    fn empty_range_checks_match_fresh_removed_cloned_and_entry_histories() {
+    fn range_contract_is_independent_of_map_history() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
-        let bounds = [
-            (Bound::Included(Height(64)), Bound::Included(Height(63))),
-            (Bound::Excluded(Height(63)), Bound::Excluded(Height(63))),
-            (Bound::Included(Height(63)), Bound::Included(Height(63))),
-            (Bound::Unbounded, Bound::Unbounded),
-        ];
-        fn compare(
-            actual: &HeightMap<u64>,
-            expected: &BTreeMap<Height, u64>,
-            bounds: &[(Bound<Height>, Bound<Height>)],
-        ) {
-            for bounds in bounds {
-                let actual_result = catch_unwind(|| actual.range(*bounds).count());
-                let expected_result = catch_unwind(|| expected.range(*bounds).count());
-                assert_eq!(actual_result.is_err(), expected_result.is_err());
-                if let (Ok(actual), Ok(expected)) = (actual_result, expected_result) {
-                    assert_eq!(actual, expected);
+
+        fn check(actual: &HeightMap<u64>) {
+            for (lower, upper) in [(64, 63), (65, 64), (u32::MAX, 0)] {
+                for start in [
+                    Bound::Included(Height(lower)),
+                    Bound::Excluded(Height(lower)),
+                ] {
+                    for end in [
+                        Bound::Included(Height(upper)),
+                        Bound::Excluded(Height(upper)),
+                    ] {
+                        assert!(catch_unwind(|| actual.range((start, end))).is_err());
+                    }
                 }
             }
+            for height in [0, 63, 64, u32::MAX] {
+                let excluded = Bound::Excluded(Height(height));
+                assert!(catch_unwind(|| actual.range((excluded, excluded))).is_err());
+            }
+
+            let expected: BTreeMap<_, _> =
+                actual.iter().map(|(key, value)| (*key, *value)).collect();
+            for bounds in [
+                (Bound::Included(Height(63)), Bound::Included(Height(63))),
+                (Bound::Included(Height(63)), Bound::Excluded(Height(63))),
+                (Bound::Excluded(Height(63)), Bound::Included(Height(63))),
+                (Bound::Unbounded, Bound::Unbounded),
+            ] {
+                assert_eq!(
+                    actual.range(bounds).collect::<Vec<_>>(),
+                    expected.range(bounds).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    actual.range(bounds).rev().collect::<Vec<_>>(),
+                    expected.range(bounds).rev().collect::<Vec<_>>()
+                );
+            }
         }
+
         let mut actual = HeightMap::default();
-        let mut expected = BTreeMap::new();
-        compare(&actual, &expected, &bounds);
-        assert_eq!(actual.remove(&Height(63)), expected.remove(&Height(63)));
-        compare(&actual, &expected, &bounds);
-        // Looking up or abandoning an entry does not allocate a fresh map's root.
+        check(&actual);
+        check(&actual.clone());
+        assert_eq!(actual.remove(&Height(63)), None);
+        check(&actual);
         let _ = actual.entry(Height(63));
-        let _ = expected.entry(Height(63));
-        compare(&actual, &expected, &bounds);
+        check(&actual);
         assert!(catch_unwind(AssertUnwindSafe(|| {
             actual
                 .entry(Height(63))
                 .or_insert_with(|| panic!("entry construction rejected"));
         }))
         .is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| {
-            expected
-                .entry(Height(63))
-                .or_insert_with(|| panic!("entry construction rejected"));
-        }))
-        .is_err());
-        compare(&actual, &expected, &bounds);
+        check(&actual);
         for raw in [63, 64, u32::MAX] {
             actual.insert(Height(raw), 7);
-            expected.insert(Height(raw), 7);
         }
+        check(&actual);
+        let sibling = actual.clone();
+        check(&sibling);
         for raw in [63, 64, u32::MAX] {
             actual.remove(&Height(raw));
-            expected.remove(&Height(raw));
         }
-        compare(&actual, &expected, &bounds);
-        // Empty logical equality ignores the retained root; empty clone resets it.
-        assert_eq!(actual, HeightMap::default());
-        compare(&actual.clone(), &expected.clone(), &bounds);
-        let mut retained = actual.clone();
-        let mut retained_model = expected.clone();
-        retained.insert(Height(63), 7);
-        retained_model.insert(Height(63), 7);
-        retained.retain(|_, _| false);
-        retained_model.retain(|_, _| false);
-        compare(&retained, &retained_model, &bounds);
-        // Resetting to default, like clearing BTreeMap, releases the root.
-        actual = HeightMap::default();
-        expected.clear();
-        compare(&actual, &expected, &bounds);
+        assert!(actual.is_empty());
+        check(&actual);
+        check(&actual.clone());
+        check(&sibling);
+        actual.insert(Height(63), 7);
+        actual.retain(|_, _| false);
+        assert!(actual.is_empty());
+        check(&actual);
+        check(&actual.clone());
     }
 }

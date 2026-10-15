@@ -21,7 +21,7 @@
 //! - `pr-gate`: a trimmed PR/merge-queue confidence gate that derives a short
 //!   checkpoint list, forces a from-zero kind-6 catch-up across a checkpoint to
 //!   full-verifier handoff, runs the trace oracle as a primary assertion layer,
-//!   and writes a compact `timeline.jsonl` artifact.
+//!   and writes a compact `timeline.csv` artifact.
 //! - `checkpoint-long`: mines a 4,000-block Regtest chain and derives
 //!   checkpoints every 400 blocks before node2's from-zero catch-up.
 //! - `no-checkpoint-long`: mines the same long chain but configures node2 with

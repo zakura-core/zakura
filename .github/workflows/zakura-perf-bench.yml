@@ -214,6 +214,8 @@ jobs:
             /tmp/run.env \
             .github/workflows/scripts/perf-bench-run.sh \
             scripts/zakura-bench-digest.py \
+            scripts/zakura_trace.py \
+            crates/zakura-jsonl-trace/schema.json \
             scripts/zakura-metrics-dashboard.py \
             "root@${IP}:/root/"
           rm -f /tmp/run.env

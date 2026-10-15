@@ -10,7 +10,10 @@ durable halt marker. Disk pressure retries after cleanup; other failures require
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
+import fcntl
+import gzip
 import hashlib
 import json
 import math
@@ -720,14 +723,94 @@ def sample_status(config: Config) -> dict[str, Any]:
     return status
 
 
+TRACE_LOCK_SECONDS = 0.5
+
+
+@contextlib.contextmanager
+def trace_directory_lock(traces: Path):
+    """Hold the node writer's `.trace.lock`, which it holds for every batch.
+
+    Yields False when the lock stays busy, so the caller retries at the next
+    poll. The node gives up on the lock after two seconds, so callers hold it
+    only for renames.
+    """
+    descriptor = os.open(traces / ".trace.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        deadline = time.monotonic() + TRACE_LOCK_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.01)
+        yield True
+    finally:
+        os.close(descriptor)
+
+
+def trace_segment_path(trace: Path, index: int) -> Path:
+    return trace.with_name(f"{trace.name}.{index}.gz")
+
+
+def place_trace_segment(config: Config, trace: Path, compressed: Path) -> None:
+    """Shift older segments and make `compressed` the newest segment."""
+    with trace_directory_lock(trace.parent) as locked:
+        if not locked:
+            return
+        oldest = trace_segment_path(trace, config.policy.trace_segments)
+        oldest.unlink(missing_ok=True)
+        for index in range(config.policy.trace_segments - 1, 0, -1):
+            source = trace_segment_path(trace, index)
+            if source.exists():
+                source.rename(trace_segment_path(trace, index + 1))
+        compressed.rename(trace_segment_path(trace, 1))
+
+
+def compress_trace_segment(config: Config, trace: Path) -> None:
+    """Compress a detached segment and place it; resumes after a crash."""
+    detached = trace.with_name(f"{trace.name}.rotating")
+    compressed = trace.with_name(f"{trace.name}.rotating.gz")
+    if detached.exists():
+        with detached.open("rb") as source, compressed.open("wb") as target:
+            # Level 6 matches the gzip default that logrotate used.
+            with gzip.GzipFile(fileobj=target, mode="wb", compresslevel=6) as encoder:
+                shutil.copyfileobj(source, encoder, 1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        detached.unlink()
+    if compressed.exists():
+        place_trace_segment(config, trace, compressed)
+
+
+def rotate_trace(config: Config, trace: Path) -> None:
+    """Detach an oversized CSV table under the node writer's directory lock.
+
+    The node runs with `ZAKURA_TRACE_FILE_SEGMENTS=0`. It holds the lock for
+    each batch and reopens a table whose file was renamed. A rename under the
+    lock therefore never splits a batch, and the node's next append starts a
+    new file with a header. Compression happens after the lock is released.
+    """
+    compress_trace_segment(config, trace)
+    if trace.is_symlink() or not trace.is_file() or trace.stat().st_size < config.policy.trace_file_bytes:
+        return
+    with trace_directory_lock(trace.parent) as locked:
+        if not locked:
+            return
+        trace.rename(trace.with_name(f"{trace.name}.rotating"))
+    compress_trace_segment(config, trace)
+
+
 def rotate_run_logs(config: Config, run_dir: Path) -> None:
     """Keep trace and node-log rotations inside the run that produced them."""
+    traces = run_dir / "traces"
+    if traces.is_dir() and not traces.is_symlink():
+        for trace in sorted(traces.glob("*.csv")):
+            rotate_trace(config, trace)
     rotation_config = run_dir / ".trace-logrotate.conf"
     rotation_config.write_text(
-        f'{json.dumps(str(run_dir / "traces" / "*.jsonl"))} {{\n'
-        f"    size {config.policy.trace_file_bytes}\n"
-        f"    rotate {config.policy.trace_segments}\n"
-        "    missingok\n    notifempty\n    copytruncate\n    compress\n}\n"
         f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
         "    size 64M\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
         encoding="utf-8",

@@ -243,6 +243,7 @@ pub(crate) async fn unsolicited_response_disconnects<A: StreamConformance>(
     }
     for (offset, subscription) in (50..).zip(&plan.subscriptions) {
         let (mut raw, _) = raw_peer(&victim, layout, seed + offset).await?;
+        let session = victim.wait_session(&raw.id()).await?;
         let credit = subscription.credit();
         victim
             .service
@@ -259,8 +260,11 @@ pub(crate) async fn unsolicited_response_disconnects<A: StreamConformance>(
             )
             .await?;
         }
+        // `handled` counts a frame before the handler spends its credit, so
+        // wait for the accepted pages. Otherwise the reader could still see
+        // credit for the extra page.
         await_until("the pages within the credit", CONFORMANCE_DEADLINE, || {
-            victim.shared().handled.load(Ordering::Relaxed) == handled
+            *session.pages.borrow() == u64::from(pages)
         })
         .await?;
         // The victim may close before the page is written.

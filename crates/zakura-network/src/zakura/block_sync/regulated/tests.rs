@@ -11,7 +11,7 @@ use super::{
     wire::{Message, Range, GET_BLOCKS},
 };
 use crate::zakura::{
-    block_sync::{BlockSyncMessage, BlockSyncStatus},
+    block_sync::{BlockSyncMessage, BlockSyncStatus, MAX_BS_RESPONSE_BYTES},
     framed_channel,
     regulation::{ServeCapacity, ServeLimits},
     wire_codec::{decode_frame, encode_frame, WireMessage},
@@ -20,21 +20,26 @@ use crate::zakura::{
 
 #[derive(Debug)]
 struct Store {
-    blocks: Vec<(block::Height, Arc<block::Block>)>,
+    blocks: Vec<(block::Height, Vec<u8>)>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     fail: bool,
+    panic: bool,
 }
 
 impl Source for Store {
     fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
         let blocks = self.blocks.clone();
         let fail = self.fail;
+        let panic = self.panic;
         let started = self.started.clone();
         let release = self.release.clone();
         Box::pin(async move {
             if fail {
                 return Err("storage failure".into());
+            }
+            if panic {
+                panic!("injected serving panic");
             }
             Ok(tokio::task::spawn_blocking(move || {
                 if !request.lease.try_start() {
@@ -58,21 +63,59 @@ impl Source for Store {
 }
 
 fn store(blocks: &[&[u8]], open: bool) -> Arc<Store> {
-    Arc::new(Store {
-        blocks: blocks
+    stored_at(
+        blocks
             .iter()
             .enumerate()
             .map(|(index, bytes)| {
                 (
                     block::Height(u32::try_from(index + 1).unwrap()),
-                    Arc::new(bytes.zcash_deserialize_into().unwrap()),
+                    bytes.to_vec(),
                 )
             })
             .collect(),
+        open,
+    )
+}
+
+/// Builds a store that returns `blocks` as stored, whatever their heights.
+fn stored_at(blocks: Vec<(block::Height, Vec<u8>)>, open: bool) -> Arc<Store> {
+    Arc::new(Store {
+        blocks,
         started: Arc::new(Semaphore::new(0)),
         release: Arc::new(Semaphore::new(if open { 128 } else { 0 })),
         fail: false,
+        panic: false,
     })
+}
+
+/// Serves `range` once from `source` and returns the frames up to the ending.
+async fn serve_once(source: Arc<Store>, max_body_bytes: u32, range: Range) -> Vec<Message> {
+    let capacity = capacity(max_body_bytes);
+    let (send, mut recv) = framed_channel(4);
+    let cancel = CancellationToken::new();
+    let server = capacity.session(
+        Arc::new(Server::new(source, 128, max_body_bytes).unwrap()),
+        &ZakuraPeerId::new(vec![6; 32]).unwrap(),
+        2,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    server.admit(range).unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let message = receive(&mut recv).await;
+        let ended = !matches!(message, Message::Block(_));
+        frames.push(message);
+        if ended {
+            break;
+        }
+    }
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+    frames
 }
 
 fn capacity(body_bytes: u32) -> ServeCapacity {
@@ -243,16 +286,12 @@ fn store_at(blocks: &[(u32, &[u8])]) -> Arc<Store> {
     Arc::new(Store {
         blocks: blocks
             .iter()
-            .map(|(height, bytes)| {
-                (
-                    block::Height(*height),
-                    Arc::new(bytes.zcash_deserialize_into().unwrap()),
-                )
-            })
+            .map(|(height, bytes)| (block::Height(*height), bytes.to_vec()))
             .collect(),
         started: Arc::new(Semaphore::new(0)),
         release: Arc::new(Semaphore::new(128)),
         fail: false,
+        panic: false,
     })
 }
 
@@ -301,6 +340,63 @@ async fn serving_stops_at_the_first_noncontiguous_or_excess_source_block() {
         );
         cancel.cancel();
     }
+}
+
+#[tokio::test]
+async fn served_block_frames_carry_the_stored_bytes_unchanged() {
+    // Not a decodable block, so any decode or reserialization would change it.
+    let stored = vec![0xa5; 64];
+    let frames = serve_once(
+        store(&[&BLOCK_MAINNET_1_BYTES, &stored], true),
+        MAX_BS_RESPONSE_BYTES,
+        Range::new(block::Height(1), 2).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        frames,
+        [
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec()),
+            Message::Block(stored),
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 2
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_height_gap_from_the_source_ends_the_prefix() {
+    let frames = serve_once(
+        stored_at(
+            vec![
+                (block::Height(1), BLOCK_MAINNET_1_BYTES.to_vec()),
+                (block::Height(3), BLOCK_MAINNET_2_BYTES.to_vec()),
+            ],
+            true,
+        ),
+        MAX_BS_RESPONSE_BYTES,
+        Range::new(block::Height(1), 3).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        frames,
+        [
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec()),
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 1
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_stored_block_over_the_block_byte_limit_is_not_served() {
+    let oversized = vec![0; usize::try_from(block::MAX_BLOCK_BYTES).unwrap() + 1];
+    let range = Range::new(block::Height(1), 1).unwrap();
+    let frames = serve_once(store(&[&oversized], true), MAX_BS_RESPONSE_BYTES, range).await;
+    assert_eq!(frames, [Message::RangeUnavailable(range)]);
 }
 
 #[tokio::test]
@@ -601,13 +697,14 @@ async fn live_serving_session_cancellation_releases_the_slot_without_closing_the
     assert!(!live.cancel.is_cancelled());
 }
 
-/// An encoder panic must reach the production connection token, with no download fence involved.
+/// A serving panic must reach the production connection token, with no download fence involved.
+///
+/// The encoder copies stored bytes and has no data-dependent panic, so the
+/// source injects the panic inside the producer instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_serving_encoder_panic_closes_the_connection_without_downloads() {
+async fn live_serving_panic_closes_the_connection_without_downloads() {
     let mut source = store(&[&BLOCK_MAINNET_1_BYTES], true);
-    let block = Arc::make_mut(&mut Arc::get_mut(&mut source).unwrap().blocks[0].1);
-    // Exercise the serializer's timestamp invariant in the real blocking encode job.
-    Arc::make_mut(&mut block.header).time = chrono::DateTime::from_timestamp(-1, 0).unwrap();
+    Arc::get_mut(&mut source).unwrap().panic = true;
     let live = live_serving(source, super::super::MAX_BS_RESPONSE_BYTES);
     live.input
         .send(

@@ -1132,8 +1132,9 @@ mod tests {
             mainnet_block(&BLOCK_MAINNET_2_BYTES),
             mainnet_block(&BLOCK_MAINNET_3_BYTES),
         ];
-        // The first response carries 3 bodies larger than the requester's
-        // stream window. Every later request is for an unavailable height.
+        // The first request asks for 3 bodies. Serving answers with one, which
+        // is larger than the requester's stream window. Every later request is
+        // for an unavailable height.
         let large = mainnet_block(&BLOCK_MAINNET_1046401_BYTES);
         let source = FixtureBlockSource::new(
             (1..=3)
@@ -1154,7 +1155,6 @@ mod tests {
                     Some((block::Height(3), blocks[2].hash())),
                 )
                 .block_sync_config(ZakuraBlockSyncConfig {
-                    max_blocks_per_response: 3,
                     max_response_bytes: RESPONSE_BYTES,
                     ..ZakuraBlockSyncConfig::default()
                 })
@@ -1216,42 +1216,78 @@ mod tests {
         .await
         .map_err(|_| -> BoxError { "serving production did not settle".into() })?;
         assert!(
-            settled <= bound && settled < usize::try_from(REQUESTS)?,
-            "an unread response stops new production: {settled} reads, bound {bound}"
+            settled < usize::try_from(REQUESTS)?,
+            "an unread response stops new production: {settled} reads"
         );
 
-        // Reading releases output, so every request completes in order.
+        // Reading releases output, so every request completes exactly once.
+        // GetBlocks writes responses as they are ready, so empty responses
+        // that finish before the large one are written ahead of it.
+        let mut early = None;
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut bodies = 0;
-            for request in 0..REQUESTS {
-                let (hashes, ending) =
-                    read_getblocks_response(&peer, version, "a bounded response").await?;
-                bodies += hashes.len();
-                let expected = if request == 0 {
+            let mut ended = vec![false; usize::try_from(REQUESTS)?];
+            let mut endings = 0;
+            while endings < REQUESTS {
+                let frame = peer
+                    .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                    .await?;
+                let request = match BlockSyncMessage::decode_frame(frame)? {
+                    BlockSyncMessage::Status(_) => continue,
+                    BlockSyncMessage::Block(_) => {
+                        early.get_or_insert(endings);
+                        bodies += 1;
+                        continue;
+                    }
                     BlockSyncMessage::BlocksDone {
                         start_height: block::Height(1),
-                        returned: 3,
+                        returned: 1,
+                    } => {
+                        assert_eq!(bodies, 1, "the large response ends after its body");
+                        0
                     }
-                } else {
                     BlockSyncMessage::RangeUnavailable {
-                        start_height: block::Height(request + 3),
+                        start_height,
                         count: 1,
-                    }
+                    } => start_height.0 - 3,
+                    message => return Err(format!("unexpected message {message:?}").into()),
                 };
-                assert_eq!(ending, expected);
+                let request = usize::try_from(request)?;
+                assert!(!std::mem::replace(&mut ended[request], true));
+                endings += 1;
             }
-            assert_eq!(bodies, 3);
+            assert_eq!(bodies, 1, "a three-block request gets a one-block prefix");
             Ok::<_, BoxError>(())
         })
         .await
         .map_err(|_| -> BoxError { "reading did not resume serving".into() })??;
+        // Only responses written ahead of the stalled body released their
+        // output before reading resumed, so the rest stayed within the bound.
+        let early = usize::try_from(early.expect("the large response has bodies"))?;
+        assert!(
+            settled - early <= bound,
+            "an unread response stops new production: {settled} reads, \
+             {early} written before the stall, bound {bound}"
+        );
         assert_eq!(reads.load(Ordering::SeqCst), usize::try_from(REQUESTS)?);
         Ok(())
     }
 
-    /// Serves the same body at every requested height, within the byte budget.
+    /// Serves the same serialized body at every requested height, within the
+    /// byte budget.
     #[derive(Debug)]
-    struct EndlessBlockSource(Arc<block::Block>);
+    struct EndlessBlockSource(Vec<u8>);
+
+    impl EndlessBlockSource {
+        /// Creates a source that serves the serialization of `block`.
+        fn new(block: &block::Block) -> Self {
+            Self(
+                block
+                    .zcash_serialize_to_vec()
+                    .expect("test block serializes"),
+            )
+        }
+    }
 
     impl crate::zakura::BlockRangeSource for EndlessBlockSource {
         fn read(
@@ -1263,7 +1299,7 @@ mod tests {
         > {
             let mut selected = Vec::new();
             if request.lease.try_start() {
-                let size = block_size(&self.0);
+                let size = u32::try_from(self.0.len()).expect("test block size fits u32");
                 let fits = request.max_body_bytes / size.max(1);
                 for offset in 0..request.count.min(fits) {
                     let height = block::Height(request.start_height.0 + offset);
@@ -1315,7 +1351,6 @@ mod tests {
             (&small, 1_u32, 64_u32),
             (&small, 1, 512),
             (&small, 1, u32::MAX),
-            (&small, 16, u32::MAX),
             (&large, 1, 64),
             (&large, 1, 512),
             (&large, 1, u32::MAX),
@@ -1331,11 +1366,7 @@ mod tests {
             let victim = cluster
                 .spawn_node_with_builder(
                     getblocks_victim(limits, None)
-                        .block_sync_config(ZakuraBlockSyncConfig {
-                            max_blocks_per_response: 16,
-                            ..ZakuraBlockSyncConfig::default()
-                        })
-                        .block_range_source(Arc::new(EndlessBlockSource((*body).clone()))),
+                        .block_range_source(Arc::new(EndlessBlockSource::new(body))),
                 )
                 .await?;
             let victim = cluster.node(victim);
@@ -1473,10 +1504,6 @@ mod tests {
         let victim = cluster
             .spawn_node_with_builder(
                 getblocks_victim(limits, Some((block::Height(3), blocks[2].hash())))
-                    .block_sync_config(ZakuraBlockSyncConfig {
-                        max_blocks_per_response: 3,
-                        ..ZakuraBlockSyncConfig::default()
-                    })
                     .block_range_source(Arc::new(FixtureBlockSource::new(served))),
             )
             .await?;
@@ -1516,15 +1543,14 @@ mod tests {
                 &format!("the response after a {burst}-Status burst"),
             )
             .await?;
-            assert_eq!(
-                hashes,
-                blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
-            );
+            // Serving advertises one block per response, so a three-block
+            // request gets a one-block prefix.
+            assert_eq!(hashes, vec![blocks[0].hash()]);
             assert_eq!(
                 ending,
                 BlockSyncMessage::BlocksDone {
                     start_height: block::Height(1),
-                    returned: 3,
+                    returned: 1,
                 }
             );
         }
@@ -1534,16 +1560,25 @@ mod tests {
     /// Serves fixed bodies at fixed heights, without checking that they match.
     #[derive(Debug)]
     struct FixtureBlockSource {
-        blocks: Vec<(block::Height, Arc<block::Block>)>,
+        blocks: Vec<(block::Height, Vec<u8>)>,
         /// Counts the reads that serving starts, after it reserves output capacity.
         reads: Arc<AtomicUsize>,
     }
 
     impl FixtureBlockSource {
-        /// Creates a source for `blocks` with a zero read count.
+        /// Creates a source serving the serialization of `blocks`, with a zero
+        /// read count.
         fn new(blocks: Vec<(block::Height, Arc<block::Block>)>) -> Self {
             Self {
-                blocks,
+                blocks: blocks
+                    .into_iter()
+                    .map(|(height, block)| {
+                        let bytes = block
+                            .zcash_serialize_to_vec()
+                            .expect("test block serializes");
+                        (height, bytes)
+                    })
+                    .collect(),
                 reads: Arc::default(),
             }
         }
@@ -1561,7 +1596,7 @@ mod tests {
             let mut selected = Vec::new();
             let mut remaining = request.max_body_bytes;
             if request.lease.try_start() {
-                for (height, block) in &self.blocks {
+                for (height, bytes) in &self.blocks {
                     let height = *height;
                     if height < request.start_height {
                         continue;
@@ -1569,12 +1604,12 @@ mod tests {
                     if selected.len() >= usize::try_from(request.count).unwrap() {
                         break;
                     }
-                    let size = block_size(block);
-                    let Some(bytes) = remaining.checked_sub(size) else {
+                    let size = u32::try_from(bytes.len()).expect("test block size fits u32");
+                    let Some(left) = remaining.checked_sub(size) else {
                         break;
                     };
-                    remaining = bytes;
-                    selected.push((height, block.clone()));
+                    remaining = left;
+                    selected.push((height, bytes.clone()));
                 }
             }
             Box::pin(async move {
@@ -1677,7 +1712,8 @@ mod tests {
         let served_blocks: Vec<_> = (1..=3)
             .map(|height| (block::Height(height), large.clone()))
             .collect();
-        let served_hashes = vec![large.hash(); served_blocks.len()];
+        // Serving answers the hostile peer's three-block request with one block.
+        let served_hashes = vec![large.hash()];
 
         let limits = ZakuraLocalLimits {
             message_rate_per_second: 64,
@@ -1686,7 +1722,6 @@ mod tests {
         };
 
         let block_sync_config = ZakuraBlockSyncConfig {
-            max_blocks_per_response: 3,
             max_inflight_block_bytes: u64::MAX,
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
@@ -1755,10 +1790,12 @@ mod tests {
             .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_BLOCK_SYNC,
                 version,
+                // Serve only height 1, so the victim's single request is the
+                // only one interleaved ahead of its unread serving response.
                 BlockSyncMessage::Status(BlockSyncStatus {
                     servable_low: block::Height(1),
-                    servable_high: block::Height(3),
-                    tip_hash: blocks[2].hash(),
+                    servable_high: block::Height(1),
+                    tip_hash: blocks[0].hash(),
                     max_blocks_per_response: 3,
                     max_inflight_requests: 1,
                     max_response_bytes: MAX_BS_RESPONSE_BYTES,
@@ -1792,7 +1829,10 @@ mod tests {
         })??;
 
         assert_eq!(start_height, block::Height(1));
-        assert_eq!(count, 3);
+        assert_eq!(
+            count, 1,
+            "the peer's three-block advertisement still gets one"
+        );
         assert!(
             submitted
                 .lock()
@@ -1810,7 +1850,7 @@ mod tests {
                 version,
                 BlockSyncMessage::GetBlocks {
                     start_height,
-                    count,
+                    count: 3,
                 }
                 .encode_frame()?,
             )
@@ -1890,7 +1930,7 @@ mod tests {
             ending,
             BlockSyncMessage::BlocksDone {
                 start_height,
-                returned: count,
+                returned: 1,
             }
         );
 

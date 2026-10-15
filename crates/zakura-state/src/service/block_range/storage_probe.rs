@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use zakura_chain::{block::Height, parameters::Network, serialization::ZcashSerialize};
+use zakura_chain::{block::Height, parameters::Network};
 use zakura_test::process_stats::{cpu_seconds, memory_kib};
 
 use crate::{init_read_only, Config, PruningConfig, StorageMode};
@@ -30,19 +30,18 @@ struct Tally {
     encode_us: Vec<u32>,
 }
 
-/// Encode blocks the way the GetBlocks producer does: serialize each block,
-/// then copy it behind its one-byte message tag. Returns the frame bytes.
-fn encode_like_serving(blocks: &[(Height, Arc<zakura_chain::block::Block>, usize)]) -> u64 {
+/// Encode blocks the way the GetBlocks producer does: copy each block's
+/// serialized bytes from the read behind its one-byte message tag. Returns
+/// the frame bytes.
+fn encode_like_serving(blocks: &[(Height, Vec<u8>)]) -> u64 {
     blocks
         .iter()
-        .map(|(_, block, _)| {
-            let bytes = block
-                .zcash_serialize_to_vec()
-                .expect("stored blocks serialize");
+        .map(|(_, bytes)| {
             let mut payload = Vec::with_capacity(bytes.len() + 1);
             payload.push(3);
-            payload.extend_from_slice(&bytes);
-            u64::try_from(payload.len()).expect("frame length fits u64")
+            payload.extend_from_slice(bytes);
+            // Keep the copy observable so release builds cannot elide it.
+            u64::try_from(std::hint::black_box(payload).len()).expect("frame length fits u64")
         })
         .sum()
 }
@@ -58,8 +57,10 @@ fn elapsed_us(began: Instant) -> u32 {
 /// optionally `ZAKURA_STORAGE_PROBE_NETWORK=mainnet`. The database opens in
 /// pruned mode unless `ZAKURA_STORAGE_PROBE_ARCHIVE=1`. With
 /// `ZAKURA_PROBE_DROP_CACHES=1`, running as root, each case starts with a cold
-/// page cache. With `ZAKURA_STORAGE_PROBE_ENCODE=1`, each read is followed by
-/// the serving encode on a blocking thread, and `p50_us`/`p99_us` cover both.
+/// page cache. Reads return serialized bytes, so finalized blocks are never
+/// decoded. With `ZAKURA_STORAGE_PROBE_ENCODE=1`, each read is followed by the
+/// serving encode on a blocking thread, which copies those bytes into frames,
+/// and `p50_us`/`p99_us` cover both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -184,7 +185,7 @@ async fn getblocks_storage_read_probe() {
                             } else {
                                 blocks
                                     .iter()
-                                    .map(|(_, _, size)| u64::try_from(*size).unwrap())
+                                    .map(|(_, bytes)| u64::try_from(bytes.len()).unwrap())
                                     .sum::<u64>()
                             };
                             tally.latencies_us.push(elapsed_us(began));

@@ -9919,6 +9919,150 @@ mod tests {
         Ok(())
     }
 
+    /// Stream 6 queues a fixed number of frames for its routine, however much
+    /// the live reservations owe. The precheck here admits every body, as a
+    /// request window of any size would, and the peer sends full-size bodies
+    /// at the largest negotiable transport depth. The reader still holds only
+    /// the declared depth plus the frame it waits to forward. The rest waits
+    /// in QUIC flow control. When the routine takes a body and holds it, the
+    /// reader admits exactly one more, so the session never holds more than
+    /// the depth plus two.
+    #[tokio::test]
+    async fn block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe(
+    ) -> Result<(), BoxError> {
+        use crate::zakura::{
+            block_sync_streams, regulation::ResponsePrecheck, LOCAL_MAX_INBOUND_QUEUE_DEPTH,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Admits every response header and counts what the reader admitted.
+        #[derive(Debug, Default)]
+        struct OwesEverything {
+            frames: AtomicUsize,
+            bytes: AtomicUsize,
+        }
+
+        impl ResponsePrecheck for OwesEverything {
+            fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+                self.frames.fetch_add(1, Ordering::SeqCst);
+                self.bytes.fetch_add(payload_len, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        // The largest `Block` payload stream 6 accepts: its tag and a
+        // 2,000,000-byte body.
+        const BODY_PAYLOAD: usize = 2_000_001;
+        const SENT: usize = 32;
+        let stream = block_sync_streams()[0];
+        let depth = stream
+            .queue_depths
+            .expect("stream 6 declares its inbound depth")
+            .inbound;
+        let held = depth + 1;
+        // The resource ledger's raw-frame term counts these and the routine's
+        // body: about 20 MB per session.
+        assert!((held + 1) * BODY_PAYLOAD < 21_000_000);
+        assert!(held < SENT, "the peer sends more than the queue holds");
+
+        const ALPN: &[u8] = b"/zakura/testkit/block-sync-queue-depth/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(83).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        server.serve(CaptureConnection {
+            alpn: ALPN,
+            connection_tx: conn_tx,
+            stream_tx,
+        })?;
+        let client = LocalEndpointFactory::new().endpoint(84).await?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let connection =
+            timeout(Duration::from_secs(5), client.connect(server_addr, &[ALPN])).await??;
+        let (mut peer_send, _peer_recv) =
+            timeout(Duration::from_secs(2), connection.open_bi()).await??;
+        let writer = tokio::spawn(async move {
+            let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + BODY_PAYLOAD);
+            frame.extend_from_slice(&3u16.to_le_bytes());
+            frame.extend_from_slice(&0u16.to_le_bytes());
+            frame.extend_from_slice(&u32::try_from(BODY_PAYLOAD)?.to_le_bytes());
+            frame.push(3);
+            frame.resize(FRAME_HEADER_BYTES + BODY_PAYLOAD, 0);
+            for _ in 0..SENT {
+                peer_send.write_all(&frame).await?;
+            }
+            Ok::<_, BoxError>(peer_send)
+        });
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+
+        let mut context = tabled_context(stream.messages, 1024);
+        context.limits.idle_timeout = Duration::from_secs(30);
+        context.inbound_frame_cap = stream.frame_cap;
+        context.queue_depths = stream.queue_depths;
+        let cancel = context.connection_token.clone();
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: stream.kind,
+            stream_version: stream.version,
+            request_id: None,
+            max_frame_bytes: stream.frame_cap,
+        };
+        let mut workers = JoinSet::new();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut admitted = spawn_persistent_stream_worker(
+            &mut workers,
+            send,
+            recv,
+            stream,
+            prelude,
+            context,
+            usize::from(LOCAL_MAX_INBOUND_QUEUE_DEPTH),
+            false,
+            exit_tx,
+        );
+        let precheck = Arc::new(OwesEverything::default());
+        assert!(admitted.streams[0].recv.attach_precheck(precheck.clone()));
+
+        let admitted_frames = || precheck.frames.load(Ordering::SeqCst);
+        await_until(
+            "the reader fills its queue",
+            Duration::from_secs(10),
+            || admitted_frames() >= held,
+        )
+        .await?;
+        // Give the reader time to read past its bound if it could.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(admitted_frames(), held);
+        assert_eq!(precheck.bytes.load(Ordering::SeqCst), held * BODY_PAYLOAD);
+        assert!(!cancel.is_cancelled(), "a full queue is backpressure");
+
+        // The routine takes one body and keeps it, as it does while it waits
+        // for decode capacity. The reader admits exactly one more.
+        let frame = timeout(Duration::from_secs(2), admitted.streams[0].recv.recv())
+            .await?
+            .expect("the reader forwarded the first body");
+        assert_eq!(frame.payload.len(), BODY_PAYLOAD);
+        await_until(
+            "the reader refills one slot",
+            Duration::from_secs(10),
+            || admitted_frames() > held,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(admitted_frames(), held + 1);
+        assert!(!cancel.is_cancelled());
+
+        writer.abort();
+        cancel.cancel();
+        timeout(Duration::from_secs(2), workers.join_next()).await?;
+        connection.close(0u32.into(), b"done");
+        client.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn message_tables_apply_before_payload_reads() -> Result<(), BoxError> {
         use crate::zakura::{block_sync_streams, MessageRole, PayloadLen};

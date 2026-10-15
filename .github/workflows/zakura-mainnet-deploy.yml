@@ -132,7 +132,7 @@ jobs:
           fetch-depth: 0
       - name: Download candidate built for this deployment
         if: inputs.mac_operation == 'deploy' && inputs.mac_candidate_run_id == ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: zakura-mac-cranelift-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/mac-candidate
@@ -249,7 +249,7 @@ jobs:
 
       - name: Upload monitoring evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-monitoring-${{ inputs.monitoring_stage }}-${{ github.run_id }}
           path: ${{ runner.temp }}/monitoring-evidence.json
@@ -944,7 +944,7 @@ jobs:
 
       - name: Upload failure logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-mainnet-deploy-logs-${{ github.run_id }}
           path: deploy/deployer/logs/

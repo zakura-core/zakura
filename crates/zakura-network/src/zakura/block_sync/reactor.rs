@@ -118,6 +118,7 @@ pub fn spawn_block_sync_reactor(
         .config
         .validate_serving()
         .map_err(BlockSyncStartError::InvalidConfig)?;
+    startup.config.warn_ignored_max_blocks_per_response();
     let body_retention = startup.body_retention.clone();
     debug_assert!(
         !startup.state_queries_enabled

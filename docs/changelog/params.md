@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` | `crates/zakura-network/src/zakura/block_sync/service.rs` | transport depth (up to 4,096 frames) → `8` frames | [#1410](https://github.com/zakura-core/zakura/pull/1410) | Bound a session's queued raw block bodies at about 20 MB, independent of the request window. Probes showed no throughput change at depths 2, 8 and 32. |
 | `MAX_RPC_BATCH_REQUESTS` | `crates/zakura-rpc/src/server.rs` | unlimited → `1,000` entries per batch | [#1407](https://github.com/zakura-core/zakura/pull/1407) | jsonrpsee 0.26 decodes every batch entry before running the first one and keeps them until the batch finishes; 1,000 is above every batch in this repository's tests and tooling. |
 | RPC `SERVER_MAX_ENTRIES` / `PROPOSAL_MAX_ENTRIES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `24` / `8` canonical candidates | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound work-ID reconstruction independently of content-keyed consensus verification; share decoded block allocations through `Arc` where possible. |
 | RPC `SERVER_MAX_BYTES` / `PROPOSAL_MAX_BYTES` | `crates/zakura-rpc/src/methods/types/get_block_template/prepared_candidates.rs` | new → `48 MiB` / `16 MiB` | [#754](https://github.com/zakura-core/zakura/pull/754) | Bound RPC candidate and alias retention separately from the unchanged consensus cache budgets; do not retain serialized block copies. |

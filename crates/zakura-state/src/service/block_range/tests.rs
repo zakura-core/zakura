@@ -14,6 +14,9 @@ use zakura_chain::{
     parameters::Network,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
+use zakura_test::vectors::{
+    BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+};
 
 use super::spawn_owned_block_range;
 
@@ -117,8 +120,11 @@ async fn assert_block_range_selection(header_runtime: bool) {
         .read_owned_block_range(block::Height(2), 2, u32::MAX, (), |_| false)
         .await
         .unwrap();
-    assert_eq!(owned.blocks.len(), 1);
-    assert_eq!(owned.blocks[0].1.hash(), selected.hash());
+    assert_eq!(
+        owned.blocks,
+        [(block::Height(2), selected.zcash_serialize_to_vec().unwrap())],
+        "a non-finalized block is served as its serialization"
+    );
     assert_eq!(tip.best_tip_hash(), Some(a.hash()));
 
     let earlier_snapshot = read_state.block_range_snapshot().unwrap();
@@ -158,8 +164,10 @@ async fn assert_block_range_selection(header_runtime: bool) {
             .read_owned_block_range(block::Height(2), 1, u32::MAX, (), |_| false)
             .await
             .unwrap();
-        assert_eq!(owned.blocks.len(), 1);
-        assert_eq!(owned.blocks[0].1.hash(), a.hash());
+        assert_eq!(
+            owned.blocks,
+            [(block::Height(2), a.zcash_serialize_to_vec().unwrap())]
+        );
     }
 
     // More work on B switches both downloads and mining to B.
@@ -188,13 +196,24 @@ async fn assert_block_range_selection(header_runtime: bool) {
         .read_owned_block_range(block::Height(2), 3, u32::MAX, (), |_| false)
         .await
         .unwrap();
+    let b_bytes = b.zcash_serialize_to_vec().unwrap();
+    let child_bytes = child.zcash_serialize_to_vec().unwrap();
     assert_eq!(
-        owned
-            .blocks
-            .iter()
-            .map(|(_, block, _)| block.hash())
-            .collect::<Vec<_>>(),
-        [b.hash(), child.hash()]
+        owned.blocks,
+        [
+            (block::Height(2), b_bytes.clone()),
+            (block::Height(3), child_bytes.clone())
+        ]
+    );
+    let one_byte_short = u32::try_from(b_bytes.len() + child_bytes.len() - 1).unwrap();
+    let owned = read_state
+        .read_owned_block_range(block::Height(2), 3, one_byte_short, (), |_| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        owned.blocks,
+        [(block::Height(2), b_bytes)],
+        "a non-finalized block that would cross the byte budget ends the prefix"
     );
     assert_eq!(tip.best_tip_hash(), Some(child.hash()));
     assert_eq!(
@@ -358,21 +377,12 @@ fn resources() -> (DropSignal, Arc<AtomicUsize>, oneshot::Receiver<()>) {
     )
 }
 
-fn genesis() -> Arc<block::Block> {
-    Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .expect("the genesis fixture is a serialized block"),
-    )
-}
-
 #[tokio::test]
 async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let block = genesis();
-    let reads = Arc::new(AtomicUsize::new(0));
-    let worker_reads = reads.clone();
+    let budgets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker_budgets = budgets.clone();
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
@@ -382,10 +392,10 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
             resources,
             |_| false,
             move || {
-                Ok(move |_| {
-                    worker_reads.fetch_add(1, Ordering::SeqCst);
-                    // Synthetic sizes isolate the response cap from fixture size.
-                    Some((block.clone(), 2))
+                Ok(move |_, remaining| {
+                    worker_budgets.lock().unwrap().push(remaining);
+                    // Synthetic bytes isolate the response cap from fixture size.
+                    Some(vec![7; 2])
                 })
             },
         ),
@@ -393,14 +403,17 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
     assert_eq!(
-        result
-            .blocks
-            .iter()
-            .map(|(height, _, _)| *height)
-            .collect::<Vec<_>>(),
-        [block::Height(1), block::Height(2)]
+        *budgets.lock().unwrap(),
+        [5, 3, 1],
+        "each lookup sees the budget left by the blocks before it"
+    );
+    assert_eq!(
+        result.blocks,
+        [
+            (block::Height(1), vec![7; 2]),
+            (block::Height(2), vec![7; 2])
+        ]
     );
     assert_eq!(result.resources.drops.load(Ordering::SeqCst), 0);
     let (blocks, resources) = result.into_parts();
@@ -422,7 +435,7 @@ async fn cancellation_before_the_first_lookup_skips_the_range() {
             10,
             resources,
             |_| true,
-            || Ok(|_| panic!("cancelled work must not reach its first lookup")),
+            || Ok(|_, _| panic!("cancelled work must not reach its first lookup")),
         ),
     )
     .await
@@ -440,7 +453,6 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     let (resources, drops, _finished) = resources();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
-    let block = genesis();
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
@@ -450,9 +462,9 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
             resources,
             move |_| cancelled.load(Ordering::SeqCst),
             move || {
-                Ok(move |_| {
+                Ok(move |_, _| {
                     assert!(!worker_cancelled.swap(true, Ordering::SeqCst));
-                    Some((block.clone(), 2))
+                    Some(vec![7; 2])
                 })
             },
         ),
@@ -497,7 +509,6 @@ fn blocked_read() -> (
     let (started_tx, started) = oneshot::channel();
     let mut started_tx = Some(started_tx);
     let (resume, blocked) = mpsc::sync_channel(1);
-    let block = genesis();
     let job = spawn_owned_block_range(
         block::Height(1),
         1,
@@ -505,10 +516,10 @@ fn blocked_read() -> (
         resources,
         |_| false,
         move || {
-            Ok(move |_| {
+            Ok(move |_, _| {
                 started_tx.take().unwrap().send(()).unwrap();
                 blocked.recv_timeout(DEADLINE).unwrap();
-                Some((block.clone(), 2))
+                Some(vec![7; 2])
             })
         },
     );
@@ -557,7 +568,7 @@ async fn a_panicking_read_releases_resources_once() {
         10,
         resources,
         |_| false,
-        || Ok(|_| panic!("injected database panic")),
+        || Ok(|_, _| panic!("injected database panic")),
     );
     let outcome = timeout(DEADLINE, AssertUnwindSafe(job).catch_unwind())
         .await
@@ -592,11 +603,10 @@ async fn the_state_api_returns_an_owned_empty_range() {
 async fn the_state_api_returns_committed_blocks_with_their_resources() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let block = genesis();
-    let size = block.zcash_serialized_size();
+    let bytes = BLOCK_MAINNET_GENESIS_BYTES.to_vec();
     let (_state, mut read_state, _tip, _change) = timeout(
         DEADLINE,
-        crate::populated_state([block.clone()], &Network::Mainnet),
+        crate::populated_state([fixture_block(&bytes)], &Network::Mainnet),
     )
     .await
     .unwrap();
@@ -605,7 +615,7 @@ async fn the_state_api_returns_committed_blocks_with_their_resources() {
         read_state.read_owned_block_range(
             block::Height(0),
             2,
-            u32::try_from(size).unwrap(),
+            u32::try_from(bytes.len()).unwrap(),
             resources,
             |_| false,
         ),
@@ -613,10 +623,86 @@ async fn the_state_api_returns_committed_blocks_with_their_resources() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result.blocks, [(block::Height(0), block, size)]);
+    assert_eq!(result.blocks, [(block::Height(0), bytes)]);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// Decodes a block fixture for committing it to a test state.
+fn fixture_block(bytes: &[u8]) -> Arc<block::Block> {
+    Arc::new(
+        bytes
+            .zcash_deserialize_into()
+            .expect("the fixture is a serialized block"),
+    )
+}
+
+#[tokio::test]
+async fn finalized_ranges_return_stored_bytes_and_stop_at_the_byte_budget() {
+    let _guard = zakura_test::init();
+    let stored = [
+        BLOCK_MAINNET_GENESIS_BYTES.to_vec(),
+        BLOCK_MAINNET_1_BYTES.to_vec(),
+        BLOCK_MAINNET_2_BYTES.to_vec(),
+    ];
+    let (_state, mut read_state, _tip, _change) = timeout(
+        DEADLINE,
+        crate::populated_state(
+            stored.iter().map(|bytes| fixture_block(bytes)),
+            &Network::Mainnet,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read_state.latest_best_chain().is_none(),
+        "checkpoint commits leave every block finalized"
+    );
+    let expected: Vec<_> = stored
+        .iter()
+        .enumerate()
+        .map(|(height, bytes)| (block::Height(u32::try_from(height).unwrap()), bytes.clone()))
+        .collect();
+
+    let all = read_state
+        .read_owned_block_range(block::Height(0), 4, u32::MAX, (), |_| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.blocks, expected,
+        "stored bytes come back in height order"
+    );
+
+    let two = u32::try_from(stored[0].len() + stored[1].len()).unwrap();
+    for budget in [
+        two,
+        two + 1,
+        two + u32::try_from(stored[2].len()).unwrap() - 1,
+    ] {
+        let prefix = read_state
+            .read_owned_block_range(block::Height(0), 3, budget, (), |_| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            prefix.blocks,
+            expected[..2],
+            "budget {budget} ends the prefix before the block that does not fit"
+        );
+    }
+
+    // The finalized lookup itself rejects a block that does not fit before
+    // copying its stored parts into a response buffer.
+    let snapshot = read_state.block_range_snapshot().unwrap();
+    let size = stored[2].len();
+    assert_eq!(
+        snapshot.serialized_block_within(&read_state.db, block::Height(2), size),
+        Some(stored[2].clone())
+    );
+    assert_eq!(
+        snapshot.serialized_block_within(&read_state.db, block::Height(2), size - 1),
+        None
+    );
 }
 
 #[tokio::test]
@@ -648,7 +734,7 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
 #[test]
 fn block_range_response_stops_before_crossing_its_byte_limit() {
     let sizes = [3usize, 2, 4];
-    let exact = super::collect_bounded_height_range(block::Height(10), 3, 5, |height| {
+    let exact = super::collect_bounded_height_range(block::Height(10), 3, 5, |height, _| {
         let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
         sizes.get(index).copied().map(|size| (index, size))
     });
@@ -658,20 +744,22 @@ fn block_range_response_stops_before_crossing_its_byte_limit() {
         "the exact-fit prefix is returned and the first over-limit block is excluded",
     );
 
-    let one_byte_short = super::collect_bounded_height_range(block::Height(10), 3, 4, |height| {
-        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
-        sizes.get(index).copied().map(|size| (index, size))
-    });
+    let one_byte_short =
+        super::collect_bounded_height_range(block::Height(10), 3, 4, |height, _| {
+            let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+            sizes.get(index).copied().map(|size| (index, size))
+        });
     assert_eq!(
         one_byte_short,
         vec![(block::Height(10), 0, 3)],
         "a prefix that would cross the cap by one byte stops before that block",
     );
 
-    let first_too_large = super::collect_bounded_height_range(block::Height(10), 3, 2, |height| {
-        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
-        sizes.get(index).copied().map(|size| (index, size))
-    });
+    let first_too_large =
+        super::collect_bounded_height_range(block::Height(10), 3, 2, |height, _| {
+            let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+            sizes.get(index).copied().map(|size| (index, size))
+        });
     assert!(
         first_too_large.is_empty(),
         "a first block larger than the response budget is not retained",
@@ -682,11 +770,38 @@ fn block_range_response_stops_before_crossing_its_byte_limit() {
 fn block_range_response_includes_a_maximum_size_first_block() {
     let maximum = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
     let cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
-    let result = super::collect_bounded_height_range(block::Height(10), 2, cap, |height| {
+    let result = super::collect_bounded_height_range(block::Height(10), 2, cap, |height, _| {
         Some((height, maximum))
     });
     assert_eq!(
         result,
         vec![(block::Height(10), block::Height(10), maximum)]
+    );
+}
+
+#[test]
+fn block_range_lookups_skip_materializing_a_block_that_does_not_fit() {
+    let sizes = [3usize, 2, 4];
+    let mut materialized = Vec::new();
+    let result =
+        super::collect_bounded_height_range(block::Height(10), 3, 6, |height, remaining| {
+            let size = *sizes.get(usize::try_from(height.0.checked_sub(10)?).ok()?)?;
+            if size > remaining {
+                return None;
+            }
+            materialized.push(height);
+            Some((height, size))
+        });
+    assert_eq!(
+        result,
+        vec![
+            (block::Height(10), block::Height(10), 3),
+            (block::Height(11), block::Height(11), 2)
+        ]
+    );
+    assert_eq!(
+        materialized,
+        [block::Height(10), block::Height(11)],
+        "the block past the budget is never materialized"
     );
 }

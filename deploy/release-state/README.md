@@ -80,11 +80,16 @@ Branch dry runs are read-only with respect to publishing, storage, and PRs.
 
 ### Production qualification and activation
 
-The new schedules stay disabled until these steps complete:
+The schedules are controlled by repository activation variables. Complete
+storage setup and qualification before enabling them. They may be configured
+before merge after an authorized branch qualification; the new schedules only
+run once these workflows reach `main`.
 
-1. Issue a dedicated object read/write credential restricted to the existing
-   `zakura-release-state` bucket. Create it in the generator's existing
-   Infisical project/environment before use; do not copy its host credential.
+1. Use a dedicated object read/write credential from the generator's existing
+   Infisical project/environment; do not copy its host credential. Restrict it
+   to the existing `zakura-release-state` bucket where possible. Reusing an
+   existing credential with broader bucket access needs explicit operator
+   authorization.
 2. Configure the `release-state-storage` GitHub environment with no per-run
    reviewer gate, deployment restricted to `main`, and only
    `RELEASE_STATE_R2_ACCESS_KEY_ID` and `RELEASE_STATE_R2_SECRET_ACCESS_KEY`.
@@ -92,9 +97,11 @@ The new schedules stay disabled until these steps complete:
 3. Audit bucket lifecycle rules to exclude `release-state/published/` from
    expiry. Configure the custom domain to bypass caching for the published
    pointer and to avoid caching missing objects under the published prefix.
-4. After authorized merge and publication, manually run the publisher from
-   `main`. Confirm registry availability, Cargo resolution, every public
-   bundle file, and the conditional pointer update. Rerun to verify reuse.
+4. Qualify publication, registry availability, Cargo resolution, every public
+   bundle file, and pointer advancement. Rerun to verify reuse. Authorized
+   branch qualification keeps its temporary publishing exceptions separate
+   from the PR and removes them afterward. After merge, inspect the first
+   publication from `main` to confirm the merged configuration.
 5. Set `MAINNET_RELEASE_STATE_READY_URL` to
    `https://zakura-release.valargroup.dev/release-state/published/latest.json`.
    Keep `MAINNET_RELEASE_STATE_LATEST_URL` pointing at the candidate pointer.

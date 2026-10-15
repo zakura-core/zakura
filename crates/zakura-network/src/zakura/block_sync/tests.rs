@@ -6711,6 +6711,187 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     drop(new_inbound_tx);
 }
 
+/// How the first session ends in [`stale_disconnect_keeps_replacement_registry_entry`].
+#[derive(Clone, Copy, Debug)]
+enum FirstSessionEnd {
+    /// The stream closes and reopens on the same connection.
+    StreamReopened,
+    /// The connection closes and the peer returns on a new connection.
+    Reconnected,
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reopened_stream_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::StreamReopened).await;
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reconnected_peer_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::Reconnected).await;
+}
+
+/// Wait for the next lifecycle event the service queued for the reactor.
+async fn next_lifecycle_event(
+    events: &mut mpsc::UnboundedReceiver<BlockSyncEvent>,
+) -> BlockSyncEvent {
+    tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .expect("lifecycle event arrives")
+        .expect("lifecycle channel stays open")
+}
+
+/// Admit a replacement session before the reactor handles the first session's
+/// disconnect. The stale disconnect must leave the replacement's registry entry
+/// in place, so the replacement's `Status` still reaches the registry.
+async fn stale_disconnect_keeps_replacement_registry_entry(end: FirstSessionEnd) {
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let registry = handle
+        .routine_wiring
+        .as_ref()
+        .expect("a spawned reactor wires peer routines")
+        .registry
+        .clone();
+    // The test forwards each lifecycle event, so it decides when the reactor sees it.
+    let (held_tx, mut held_rx) = mpsc::unbounded_channel();
+    let service = BlockSyncService::new_with_handle_for_test(
+        config,
+        BlockSyncHandle {
+            lifecycle: held_tx,
+            ..handle.clone()
+        },
+    );
+    let peer = peer(0x52);
+    let first_conn_id = 1;
+
+    let (first_inbound_tx, first_inbound_rx) = framed_channel(4);
+    let (first_outbound_tx, _first_outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        first_conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            (first_inbound_rx, first_outbound_tx),
+        )]),
+        CancellationToken::new(),
+    ));
+    let connected = next_lifecycle_event(&mut held_rx).await;
+    assert!(
+        matches!(&connected, BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer)
+    );
+    handle
+        .send_control(connected)
+        .expect("the reactor is running");
+    await_until(
+        "the reactor admits the first session",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 1,
+    )
+    .await
+    .expect("the first session is admitted");
+
+    let second_conn_id = match end {
+        FirstSessionEnd::StreamReopened => {
+            drop(first_inbound_tx);
+            first_conn_id
+        }
+        FirstSessionEnd::Reconnected => {
+            service.remove_peer(&peer, first_conn_id);
+            first_conn_id + 1
+        }
+    };
+    let disconnected = next_lifecycle_event(&mut held_rx).await;
+    assert!(matches!(&disconnected, BlockSyncEvent::PeerDisconnected(gone) if gone == &peer));
+
+    // The replacement is admitted before the reactor handles that disconnect.
+    let (second_inbound_tx, second_inbound_rx) = framed_channel(4);
+    let (second_outbound_tx, _second_outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        second_conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            (second_inbound_rx, second_outbound_tx),
+        )]),
+        CancellationToken::new(),
+    ));
+    let replacement = next_lifecycle_event(&mut held_rx).await;
+    assert!(
+        matches!(&replacement, BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer)
+    );
+
+    handle
+        .send_control(disconnected)
+        .expect("the reactor is running");
+    await_until(
+        "the reactor handles the stale disconnect",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 0,
+    )
+    .await
+    .expect("the stale disconnect is handled");
+    handle
+        .send_control(replacement)
+        .expect("the reactor is running");
+    await_until(
+        "the reactor admits the replacement",
+        Duration::from_secs(3),
+        || handle.peer_snapshot().outbound_peers == 1,
+    )
+    .await
+    .expect("the replacement is admitted");
+    assert!(
+        registry
+            .candidate_snapshot()
+            .iter()
+            .any(|(candidate, ..)| candidate == &peer),
+        "a stale disconnect must not remove the replacement's registry entry",
+    );
+
+    second_inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+    await_until(
+        "the replacement's status reaches the registry",
+        Duration::from_secs(3),
+        || registry.has_received_status(&peer),
+    )
+    .await
+    .expect("the replacement routine publishes its peer's status");
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let mut config = ZakuraBlockSyncConfig::default();

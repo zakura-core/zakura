@@ -1,10 +1,12 @@
 use super::{error::*, wire::*, *};
 
-/// Default number of blocks advertised per response.
+/// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
-/// Keep block-body ranges narrow so a missing response only holds one height at
-/// the body-download floor.
-pub const DEFAULT_BS_BLOCKS_PER_RESPONSE: u32 = 1;
+/// Fixed at one. Multi-block requests don't raise throughput, they blunt
+/// per-block congestion control, and a missing response would hold several
+/// heights at the body-download floor. Serving still answers a peer's legal
+/// multi-block request with a one-block prefix.
+pub const BS_BLOCKS_PER_RESPONSE: u32 = 1;
 /// Default advertised hard cap on concurrent in-flight block requests per peer.
 ///
 /// This is the safety ceiling the BBR-lite cwnd is clamped to, **not** the
@@ -205,7 +207,7 @@ impl Default for BlockSyncStatus {
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
             tip_hash: block::Hash([0; 32]),
-            max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
+            max_blocks_per_response: BS_BLOCKS_PER_RESPONSE,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
         }
@@ -227,7 +229,17 @@ pub struct ZakuraBlockSyncConfig {
         deserialize_with = "deserialize_ignored_replace_legacy_syncer"
     )]
     pub replace_legacy_syncer: bool,
-    /// Maximum blocks this node advertises per `GetBlocks` response.
+    /// Deprecated compatibility key for older configs.
+    ///
+    /// Block sync always requests and advertises one block per `GetBlocks`
+    /// message (see [`BS_BLOCKS_PER_RESPONSE`]). This field is accepted but
+    /// ignored so older configs keep parsing, with a warning when it asked for
+    /// more than one block.
+    #[doc(hidden)]
+    #[serde(
+        skip_serializing,
+        deserialize_with = "deserialize_ignored_max_blocks_per_response"
+    )]
     pub max_blocks_per_response: u32,
     /// Maximum concurrent `GetBlocks` requests this node advertises per peer.
     pub max_inflight_requests: u32,
@@ -327,11 +339,28 @@ where
     Ok(false)
 }
 
+/// Accept and discard a deprecated `max_blocks_per_response` value, warning when
+/// it asked for multi-block requests that block sync no longer issues.
+fn deserialize_ignored_max_blocks_per_response<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let configured = u32::deserialize(deserializer)?;
+    if configured > BS_BLOCKS_PER_RESPONSE {
+        tracing::warn!(
+            configured_max_blocks_per_response = configured,
+            "zakura.block_sync.max_blocks_per_response is deprecated and ignored; \
+             block sync always requests one block per GetBlocks message",
+        );
+    }
+    Ok(BS_BLOCKS_PER_RESPONSE)
+}
+
 impl Default for ZakuraBlockSyncConfig {
     fn default() -> Self {
         Self {
             replace_legacy_syncer: false,
-            max_blocks_per_response: DEFAULT_BS_BLOCKS_PER_RESPONSE,
+            max_blocks_per_response: BS_BLOCKS_PER_RESPONSE,
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
@@ -365,9 +394,12 @@ impl Default for ZakuraBlockSyncConfig {
 }
 
 impl ZakuraBlockSyncConfig {
-    /// Return the clamped block-count advertisement for wire status messages.
+    /// Return the block-count advertisement for wire status messages.
+    ///
+    /// Always [`BS_BLOCKS_PER_RESPONSE`]. It caps both our outbound request
+    /// count and how many blocks we serve per incoming request.
     pub fn advertised_max_blocks_per_response(&self) -> u32 {
-        clamp_advertised_blocks(self.max_blocks_per_response)
+        BS_BLOCKS_PER_RESPONSE
     }
 
     /// Return the locally capped in-flight advertisement for status messages.

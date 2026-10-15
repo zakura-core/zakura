@@ -185,18 +185,6 @@ impl BlockSyncPeerSession {
             .and_then(|sender| sender.next_due())
     }
 
-    /// Send a typed block range request.
-    pub fn try_send_get_blocks(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::GetBlocks {
-            start_height,
-            count,
-        })
-    }
-
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
         let frame = msg
             .encode_frame()
@@ -659,7 +647,7 @@ impl Service for BlockSyncService {
             session.into_parts();
 
         // Production outbound block-sync frames go directly through
-        // `BlockSyncPeerSession` (the per-peer routine's `try_send_get_blocks` /
+        // `BlockSyncPeerSession` (the per-peer routine's `GetBlocks` send /
         // the reactor's `try_send_status`, the serving session), so the raw transport
         // sender taken from the stream here is redundant. The outbound stream stays
         // alive through the `BlockSyncPeerSession` clone the reactor holds, so

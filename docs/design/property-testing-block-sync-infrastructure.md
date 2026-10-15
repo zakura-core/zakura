@@ -181,10 +181,10 @@ Unavailable heights saturate by 4 jobs. The limits do not depend on the response
 
 The advertisement covers requests outstanding until their endings reach the requester. Size it
 from storage latency, RTT, response bytes and transport buffering, and check twice that
-advertisement against the node budget. Execution concurrency alone does not determine it. With the
-default of one block per response, per-connection throughput for small bodies is capped near
+advertisement against the node budget. Execution concurrency alone does not determine it. With
+one block per response, per-connection throughput for small bodies is capped near
 `limit × body bytes / RTT`; at 500 ms the 2,816 limit gives about 7 MB/s for 1.6 KB bodies, below
-the QUIC window. Raising it needs a larger bookkeeping budget or response batching. Any dynamic
+the QUIC window. Raising it needs a larger bookkeeping budget. Any dynamic
 advertisement must keep capacity for its highest outstanding promise, because lowering a Status
 value does not release old commitments.
 

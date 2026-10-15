@@ -15,10 +15,13 @@ use color_eyre::eyre::{eyre, Report};
 use semver::{BuildMetadata, Version};
 use tokio::sync::watch;
 
-use zakura_chain::parameters::Network;
 use zakura_state::{state_database_format_version_in_code, state_database_format_version_on_disk};
 
-use crate::{commands::EntryPoint, components::tracing::Tracing, config::ZakuradConfig};
+use crate::{
+    commands::EntryPoint,
+    components::{metrics, tracing::Tracing},
+    config::ZakuradConfig,
+};
 
 lazy_static::lazy_static! {
     /// The last log event that occurred in the application.
@@ -225,7 +228,7 @@ fn report_fatal_error(error: &Report) {
 }
 
 /// Loads the configuration for `command`, then sets up error reporting, the Rayon
-/// thread pool and tracing.
+/// thread pool and tracing. Server commands also get the metrics endpoint.
 ///
 /// The order matches what earlier releases did, so a config error is reported before
 /// anything else is set up, and later setup steps are logged.
@@ -399,8 +402,18 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
     }
 
     // Activate the global span, so it's visible when we load the other
-    // components.
-    let global_span = global_span(&config.network.network);
+    // components. Space is at a premium here, so we use an empty message,
+    // short commit hash, and the unique part of the network name.
+    let net = config.network.network.to_string();
+    let net = match net.as_str() {
+        default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
+        other_net_name => other_net_name,
+    };
+    let global_span = if let Some(git_commit) = git_commit() {
+        error_span!("", zakurad = git_commit, net)
+    } else {
+        error_span!("", net)
+    };
 
     let global_guard = global_span.enter();
     // leak the global span, to make sure it stays active
@@ -411,22 +424,11 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
         "initialized rayon thread pool for CPU-bound tasks",
     );
 
-    Ok((Arc::new(config), tracing))
-}
-
-/// Returns the span that `zakurad` logs its setup steps in.
-///
-/// Space is at a premium here, so it has an empty message, the short commit hash, and the
-/// unique part of the network name.
-pub(crate) fn global_span(network: &Network) -> tracing::Span {
-    let net = network.to_string();
-    let net = match net.as_str() {
-        default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
-        other_net_name => other_net_name,
-    };
-    if let Some(git_commit) = git_commit() {
-        error_span!("", zakurad = git_commit, net)
-    } else {
-        error_span!("", net)
+    // Start the metrics endpoint while the global span is still open, so its logs are in
+    // that span, as in earlier releases.
+    if is_server {
+        metrics::start_endpoint(&config.metrics);
     }
+
+    Ok((Arc::new(config), tracing))
 }

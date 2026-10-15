@@ -103,7 +103,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, global_span, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -1338,19 +1338,12 @@ fn config_error(error: impl std::fmt::Display) -> Report {
 }
 
 impl StartCmd {
-    /// Creates the async runtime and starts the metrics endpoint, then runs the node until
-    /// a shutdown signal or a fatal error, then stops the runtime.
+    /// Creates the async runtime, runs the node on it until a shutdown signal or a fatal
+    /// error, then stops the runtime.
     ///
     /// Returns the node's error after logging it.
-    ///
-    /// # Panics
-    ///
-    /// If the configured metrics endpoint can't be opened.
     pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
         let runtime = new_runtime();
-        // The metrics endpoint is the last setup step, so it logs in the setup span.
-        global_span(&config.network.network)
-            .in_scope(|| crate::components::metrics::start_endpoint(&config.metrics));
 
         info!("Starting zakurad");
 

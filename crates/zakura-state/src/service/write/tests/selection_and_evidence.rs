@@ -189,12 +189,19 @@ fn same_lower_forward_resets_use_identical_branch_path() {
         reference(4, 14),
     ];
 
-    let (cause, changed_path) = classify_verified_change(&old, &direct_growth);
+    let hashes = |path: &[VerifiedHeaderRef]| {
+        path.iter()
+            .map(|header| header.hash)
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    let (cause, changed_start) = classify_verified_change(hashes(&old), hashes(&direct_growth));
     assert_eq!(cause, VerifiedChangeCause::Grow);
-    assert_eq!(changed_path, &direct_growth[old.len()..]);
+    assert_eq!(&direct_growth[changed_start..], &direct_growth[old.len()..]);
 
     for reset in [&lower, &same_height, &forward] {
-        let (cause, changed_path) = classify_verified_change(&old, reset);
+        let (cause, changed_start) = classify_verified_change(hashes(&old), hashes(reset));
+        let changed_path = &reset[changed_start..];
         assert_eq!(
             cause,
             VerifiedChangeCause::Reset,

@@ -33,7 +33,7 @@ use zakura_header_chain::{
 
 use crate::{
     constants::MAX_BLOCK_REORG_HEIGHT,
-    request::FinalizableBlock,
+    request::{ContextuallyVerifiedBlock, FinalizableBlock},
     service::{
         check,
         finalized_state::{
@@ -1041,16 +1041,25 @@ impl HeaderChainWriter {
 }
 
 fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
+    verified_blocks(state).map(verified_header_ref).collect()
+}
+
+/// The best chain's blocks, lowest height first, without copying their headers.
+fn verified_blocks(
+    state: &NonFinalizedState,
+) -> impl DoubleEndedIterator<Item = &Arc<ContextuallyVerifiedBlock>> + ExactSizeIterator + '_ {
     state
         .best_chain()
-        .into_iter()
-        .flat_map(|chain| chain.blocks.values())
-        .map(|block| VerifiedHeaderRef {
-            height: block.height,
-            hash: block.hash,
-            header: block.block.header.clone(),
-        })
-        .collect()
+        .map(|chain| chain.blocks.values())
+        .unwrap_or_default()
+}
+
+fn verified_header_ref(block: &Arc<ContextuallyVerifiedBlock>) -> VerifiedHeaderRef {
+    VerifiedHeaderRef {
+        height: block.height,
+        hash: block.hash,
+        header: block.block.header.clone(),
+    }
 }
 
 fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
@@ -1213,19 +1222,19 @@ fn full_state_evidence(
     EvidenceId::from_digest(hasher.finalize().into())
 }
 
-fn classify_verified_change<'a>(
-    old_path: &[VerifiedHeaderRef],
-    new_path: &'a [VerifiedHeaderRef],
-) -> (VerifiedChangeCause, &'a [VerifiedHeaderRef]) {
-    let grows = new_path.len() > old_path.len()
-        && new_path
-            .iter()
-            .zip(old_path)
-            .all(|(new, old)| new.hash == old.hash);
+/// Classifies a verified-path change from the old and new path hashes, lowest height first.
+///
+/// Returns the index in the new path where the changed suffix starts.
+fn classify_verified_change(
+    old_path: impl ExactSizeIterator<Item = block::Hash>,
+    new_path: impl ExactSizeIterator<Item = block::Hash>,
+) -> (VerifiedChangeCause, usize) {
+    let old_len = old_path.len();
+    let grows = new_path.len() > old_len && new_path.zip(old_path).all(|(new, old)| new == old);
     if grows {
-        (VerifiedChangeCause::Grow, &new_path[old_path.len()..])
+        (VerifiedChangeCause::Grow, old_len)
     } else {
-        (VerifiedChangeCause::Reset, new_path)
+        (VerifiedChangeCause::Reset, 0)
     }
 }
 
@@ -1236,8 +1245,6 @@ fn verified_request(
     accepted: Frontier,
 ) -> Result<(EvidenceId, Vec<VerifiedHeaderRef>, TransitionRequest), HeaderChainStoreError> {
     let snapshot = writer.runtime.publisher().snapshot();
-    let old_path = verified_path(before);
-    let new_path = verified_path(after);
     let old_frontier = verified_frontier(before, snapshot.frontiers.finalized);
     if old_frontier != snapshot.frontiers.verified_best {
         return Err(HeaderChainStoreError::VerifiedFrontierMismatch {
@@ -1245,12 +1252,19 @@ fn verified_request(
             actual: snapshot.frontiers.verified_best,
         });
     }
-    let best_changed =
-        old_path.last().map(|header| header.hash) != new_path.last().map(|header| header.hash);
+    // Compare hashes in place: copying every retained header reference is most of this cost.
+    let best_changed = verified_blocks(before).next_back().map(|block| block.hash)
+        != verified_blocks(after).next_back().map(|block| block.hash);
     let event_path;
     let event = if best_changed {
-        let (cause, changed_path) = classify_verified_change(&old_path, &new_path);
-        event_path = changed_path.to_vec();
+        let (cause, changed_start) = classify_verified_change(
+            verified_blocks(before).map(|block| block.hash),
+            verified_blocks(after).map(|block| block.hash),
+        );
+        event_path = verified_blocks(after)
+            .skip(changed_start)
+            .map(verified_header_ref)
+            .collect::<Vec<_>>();
         let evidence = full_state_evidence(
             match cause {
                 VerifiedChangeCause::Grow => b"grow",
@@ -1371,7 +1385,6 @@ fn commit_contextual_finalization(
         .snapshot()
         .frontiers
         .verified_best;
-    let new_verified_path = verified_path(&staged);
     finalized_state.commit_finalized_direct_with(
         finalizable,
         prev_note_commitment_trees,
@@ -1381,7 +1394,8 @@ fn commit_contextual_finalization(
             PreparedFullStateTransition::new(
                 evidence,
                 old_frontier,
-                new_verified_path,
+                // Finalization keeps the selected verified tip, so the verified suffix is empty.
+                Vec::new(),
                 staged,
                 Some(batch),
                 request,

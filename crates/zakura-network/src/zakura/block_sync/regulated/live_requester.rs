@@ -21,7 +21,8 @@ use crate::zakura::{
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
 };
 
-/// Live GetBlocks exchanges one session may hold from the node pool.
+/// Live GetBlocks exchanges one session may hold from the node pool: an eighth
+/// of the pool, so the share follows the pool size.
 ///
 /// Two sessions hold at most a quarter of the pool, so peers that grow large
 /// windows and then stop answering cannot starve every other session. Normal
@@ -31,10 +32,8 @@ use crate::zakura::{
 /// (`INTEGRATED_HEADER_BODY_WINDOW_V1`). Exchanges abandoned after GC or a
 /// reorg, or a larger custom advertisement, can briefly reach it, and the
 /// session then waits for endings before it requests more.
-pub(crate) const SESSION_RESERVATIONS: usize = 4_096;
-
 // The protocol ceiling fits usize on supported targets.
-const _: () = assert!(2 * SESSION_RESERVATIONS <= MAX_BS_INFLIGHT_REQUESTS as usize / 4);
+pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 8;
 
 /// Fully received ranges one session may hold while their endings are owed.
 ///

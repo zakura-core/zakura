@@ -1132,8 +1132,9 @@ mod tests {
             mainnet_block(&BLOCK_MAINNET_2_BYTES),
             mainnet_block(&BLOCK_MAINNET_3_BYTES),
         ];
-        // The first response carries 3 bodies larger than the requester's
-        // stream window. Every later request is for an unavailable height.
+        // The first request asks for 3 bodies. Serving answers with one, which
+        // is larger than the requester's stream window. Every later request is
+        // for an unavailable height.
         let large = mainnet_block(&BLOCK_MAINNET_1046401_BYTES);
         let source = FixtureBlockSource::new(
             (1..=3)
@@ -1154,7 +1155,6 @@ mod tests {
                     Some((block::Height(3), blocks[2].hash())),
                 )
                 .block_sync_config(ZakuraBlockSyncConfig {
-                    max_blocks_per_response: 3,
                     max_response_bytes: RESPONSE_BYTES,
                     ..ZakuraBlockSyncConfig::default()
                 })
@@ -1241,9 +1241,9 @@ mod tests {
                     }
                     BlockSyncMessage::BlocksDone {
                         start_height: block::Height(1),
-                        returned: 3,
+                        returned: 1,
                     } => {
-                        assert_eq!(bodies, 3, "the large response ends after its bodies");
+                        assert_eq!(bodies, 1, "the large response ends after its body");
                         0
                     }
                     BlockSyncMessage::RangeUnavailable {
@@ -1256,7 +1256,7 @@ mod tests {
                 assert!(!std::mem::replace(&mut ended[request], true));
                 endings += 1;
             }
-            assert_eq!(bodies, 3);
+            assert_eq!(bodies, 1, "a three-block request gets a one-block prefix");
             Ok::<_, BoxError>(())
         })
         .await
@@ -1351,7 +1351,6 @@ mod tests {
             (&small, 1_u32, 64_u32),
             (&small, 1, 512),
             (&small, 1, u32::MAX),
-            (&small, 16, u32::MAX),
             (&large, 1, 64),
             (&large, 1, 512),
             (&large, 1, u32::MAX),
@@ -1367,10 +1366,6 @@ mod tests {
             let victim = cluster
                 .spawn_node_with_builder(
                     getblocks_victim(limits, None)
-                        .block_sync_config(ZakuraBlockSyncConfig {
-                            max_blocks_per_response: 16,
-                            ..ZakuraBlockSyncConfig::default()
-                        })
                         .block_range_source(Arc::new(EndlessBlockSource::new(body))),
                 )
                 .await?;
@@ -1509,10 +1504,6 @@ mod tests {
         let victim = cluster
             .spawn_node_with_builder(
                 getblocks_victim(limits, Some((block::Height(3), blocks[2].hash())))
-                    .block_sync_config(ZakuraBlockSyncConfig {
-                        max_blocks_per_response: 3,
-                        ..ZakuraBlockSyncConfig::default()
-                    })
                     .block_range_source(Arc::new(FixtureBlockSource::new(served))),
             )
             .await?;
@@ -1552,15 +1543,14 @@ mod tests {
                 &format!("the response after a {burst}-Status burst"),
             )
             .await?;
-            assert_eq!(
-                hashes,
-                blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
-            );
+            // Serving advertises one block per response, so a three-block
+            // request gets a one-block prefix.
+            assert_eq!(hashes, vec![blocks[0].hash()]);
             assert_eq!(
                 ending,
                 BlockSyncMessage::BlocksDone {
                     start_height: block::Height(1),
-                    returned: 3,
+                    returned: 1,
                 }
             );
         }
@@ -1722,7 +1712,8 @@ mod tests {
         let served_blocks: Vec<_> = (1..=3)
             .map(|height| (block::Height(height), large.clone()))
             .collect();
-        let served_hashes = vec![large.hash(); served_blocks.len()];
+        // Serving answers the hostile peer's three-block request with one block.
+        let served_hashes = vec![large.hash()];
 
         let limits = ZakuraLocalLimits {
             message_rate_per_second: 64,
@@ -1731,7 +1722,6 @@ mod tests {
         };
 
         let block_sync_config = ZakuraBlockSyncConfig {
-            max_blocks_per_response: 3,
             max_inflight_block_bytes: u64::MAX,
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
@@ -1800,10 +1790,12 @@ mod tests {
             .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_BLOCK_SYNC,
                 version,
+                // Serve only height 1, so the victim's single request is the
+                // only one interleaved ahead of its unread serving response.
                 BlockSyncMessage::Status(BlockSyncStatus {
                     servable_low: block::Height(1),
-                    servable_high: block::Height(3),
-                    tip_hash: blocks[2].hash(),
+                    servable_high: block::Height(1),
+                    tip_hash: blocks[0].hash(),
                     max_blocks_per_response: 3,
                     max_inflight_requests: 1,
                     max_response_bytes: MAX_BS_RESPONSE_BYTES,
@@ -1837,7 +1829,10 @@ mod tests {
         })??;
 
         assert_eq!(start_height, block::Height(1));
-        assert_eq!(count, 3);
+        assert_eq!(
+            count, 1,
+            "the peer's three-block advertisement still gets one"
+        );
         assert!(
             submitted
                 .lock()
@@ -1855,7 +1850,7 @@ mod tests {
                 version,
                 BlockSyncMessage::GetBlocks {
                     start_height,
-                    count,
+                    count: 3,
                 }
                 .encode_frame()?,
             )
@@ -1935,7 +1930,7 @@ mod tests {
             ending,
             BlockSyncMessage::BlocksDone {
                 start_height,
-                returned: count,
+                returned: 1,
             }
         );
 

@@ -385,7 +385,6 @@ impl FuzzOutcome {
 /// replaced it.
 pub(crate) fn fuzz_config() -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
-        max_blocks_per_response: 16,
         max_inflight_requests: 256,
         max_inflight_block_bytes: u64::MAX,
         request_timeout: Duration::from_secs(30),

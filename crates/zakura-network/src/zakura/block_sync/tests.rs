@@ -154,11 +154,10 @@ fn status() -> BlockSyncStatus {
     }
 }
 
+/// The default block-sync config, from a helper so tests can adjust fields after
+/// construction without tripping `clippy::field_reassign_with_default`.
 fn immediate_body_download_config() -> ZakuraBlockSyncConfig {
-    ZakuraBlockSyncConfig {
-        max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST,
-        ..ZakuraBlockSyncConfig::default()
-    }
+    ZakuraBlockSyncConfig::default()
 }
 
 /// Config for tests that exercise fill-loop, budget-rotation and retry mechanics on
@@ -1010,6 +1009,23 @@ async fn send_inbound(inbound_tx: &FramedSend, msg: BlockSyncMessage) {
         .expect("inbound frame queues onto the peer stream");
 }
 
+/// Answer a single-block `GetBlocks` at `height` with `block` and its `BlocksDone`.
+async fn send_single_block_response(
+    inbound_tx: &FramedSend,
+    height: block::Height,
+    block: &Arc<block::Block>,
+) {
+    send_inbound(inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    send_inbound(
+        inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: height,
+            returned: 1,
+        },
+    )
+    .await;
+}
+
 async fn next_outbound_message(outbound: &mut FramedRecv) -> BlockSyncMessage {
     let frame = tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
@@ -1020,7 +1036,7 @@ async fn next_outbound_message(outbound: &mut FramedRecv) -> BlockSyncMessage {
 
 /// Read this peer's real outbound until the node sends it a `GetBlocks`, returning
 /// the requested range. The peer is implicit in `outbound` (the node→peer stream
-/// the routine writes its real `try_send_get_blocks` to), so unlike the old
+/// the routine writes its real `GetBlocks` to), so unlike the old
 /// mirror-based `wait_for_getblocks` there is no `peer` to return: a test that
 /// needs to assert *which* peer was asked reads that peer's own `outbound`. Skips
 /// `Status` frames, which interleave with requests as status refreshes.
@@ -1655,7 +1671,8 @@ fn block_meta(block: &Arc<block::Block>) -> BlockSyncBlockMeta {
 #[test]
 fn block_sync_config_defaults_and_round_trips() {
     let default = ZakuraBlockSyncConfig::default();
-    assert_eq!(default.max_blocks_per_response, 1);
+    assert_eq!(default.max_blocks_per_response, None);
+    assert_eq!(default.advertised_max_blocks_per_response(), 1);
     assert_eq!(default.max_inflight_requests, 32000);
     assert_eq!(
         default.max_inflight_block_bytes,
@@ -1729,6 +1746,97 @@ fn block_sync_config_defaults_and_round_trips() {
         config.zakura.block_sync.submitted_apply_limit(),
         MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     );
+}
+
+/// Old configs that still set `max_blocks_per_response` keep loading, but block
+/// sync always advertises and requests one block per `GetBlocks`. The value is
+/// kept, unserialized, so the reactor can warn about it.
+#[test]
+fn deprecated_max_blocks_per_response_still_loads_and_is_ignored() {
+    for value in [0, 1, 2, MAX_BS_BLOCKS_PER_REQUEST, u32::MAX] {
+        let config: crate::Config = toml::from_str(&format!(
+            "[zakura.block_sync]\nmax_blocks_per_response = {value}\n"
+        ))
+        .expect("an old config with max_blocks_per_response still deserializes");
+        let block_sync = &config.zakura.block_sync;
+        assert_eq!(block_sync.max_blocks_per_response, Some(value));
+        assert_eq!(block_sync.advertised_max_blocks_per_response(), 1);
+        assert_eq!(block_sync.initial_status().max_blocks_per_response, 1);
+        assert!(!toml::to_string(&config)
+            .expect("config serializes")
+            .contains("max_blocks_per_response"));
+    }
+
+    let config: crate::Config =
+        toml::from_str("[zakura.block_sync]\n").expect("a config without the key deserializes");
+    assert_eq!(config.zakura.block_sync.max_blocks_per_response, None);
+}
+
+/// Only a deprecated `max_blocks_per_response` above one logs the startup warning.
+#[test]
+fn ignored_max_blocks_per_response_warns_only_above_one() {
+    /// A cloneable writer that keeps everything the test subscriber logs.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("log buffer lock is poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for (value, warns) in [
+        (None, false),
+        (Some(0), false),
+        (Some(1), false),
+        (Some(2), true),
+        (Some(MAX_BS_BLOCKS_PER_REQUEST), true),
+    ] {
+        let config = ZakuraBlockSyncConfig {
+            max_blocks_per_response: value,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        {
+            // A test-scoped subscriber is safe here because the warning is
+            // emitted synchronously on this thread and records no spans.
+            let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+            config.warn_ignored_max_blocks_per_response();
+        }
+        let output = String::from_utf8(
+            logs.0
+                .lock()
+                .expect("no code panics while holding the log buffer lock")
+                .clone(),
+        )
+        .expect("the fmt subscriber writes valid UTF-8");
+        let expected = value
+            .map(|value| format!("max_blocks_per_response = {value} is deprecated and ignored"));
+        assert_eq!(
+            expected.is_some_and(|expected| output.contains(&expected)),
+            warns,
+            "value {value:?} logged {output:?}",
+        );
+        if !warns {
+            assert!(output.is_empty(), "value {value:?} logged {output:?}");
+        }
+    }
 }
 
 #[test]
@@ -7544,7 +7652,6 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
     // pipeline is enough to (before the fix) satisfy it. The default 4 GiB byte
     // budget stays far from binding for these tiny blocks.
     config.max_inflight_requests = 1;
-    config.max_blocks_per_response = 1;
 
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -7892,17 +7999,9 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
 
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
+        (block::Height(1), 1)
     );
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("first block queues");
+    send_single_block_response(&inbound_tx, block::Height(1), &blocks[0]).await;
 
     loop {
         match next_action(&mut actions).await {
@@ -7911,6 +8010,10 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
             action => panic!("unexpected action before first submit: {action:?}"),
         }
     }
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 1)
+    );
 
     handle
         .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[2])]))
@@ -8025,20 +8128,16 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
         ]))
         .await
         .expect("needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 2)
-    );
-
-    for block in blocks.iter().take(2) {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("block queues");
+    // The peer's two-block advertisement still gets one block per request.
+    for (height, block) in [
+        (block::Height(1), &blocks[0]),
+        (block::Height(2), &blocks[1]),
+    ] {
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
 
     let mut submitted = Vec::new();
@@ -8465,7 +8564,6 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
-    config.max_blocks_per_response = 1;
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
@@ -8670,19 +8768,17 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
 async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     // The issuance path (`try_fill`) reserves the advertised size hint per block,
     // NOT `BS_PER_BLOCK_WORST_CASE_BYTES`. The global byte budget = 3 worst-case
-    // blocks; the peer advertises a generous slot/response/block-count budget and
-    // tiny 1 KiB size hints. Under the old worst-case reservation the budget would
-    // bound the request to 3 blocks; because the reservation now honors the 1 KiB
-    // hints, the full 16-block range fits under the budget and the request is the
-    // whole 16-block range.
+    // blocks and every height has a 1 KiB hint. Under a worst-case reservation only
+    // 3 single-block requests would fit. Because the reservation honors the hints,
+    // all 12 are outstanding at once under the default byte cwnd.
     let budget_blocks = 3u32;
+    let heights = 12u32;
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
-        // Generous per-request block count (the default is 1) so the count cap is
-        // not the binding constraint — the byte budget is.
-        max_blocks_per_response: 16,
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
+    assert_eq!(config.bbr_cwnd_unit, CwndUnit::Bytes);
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -8699,19 +8795,18 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
-    // One slot, a generous response-byte and per-request block count, so neither
-    // the slot count, the peer's response-byte cap, nor the block-count cap is the
-    // binding constraint — only the per-peer byte cap is.
+    // Generous slot, response-byte and block-count advertisements, so only the
+    // byte budget could limit how many requests go out.
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
         &mut actions,
         51,
         BlockSyncStatus {
             servable_low: block::Height(1),
-            servable_high: block::Height(16),
+            servable_high: block::Height(heights),
             tip_hash: block::Hash([16; 32]),
-            max_blocks_per_response: 16,
-            max_inflight_requests: 1,
+            max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST,
+            max_inflight_requests: heights,
             max_response_bytes: MAX_BS_RESPONSE_BYTES,
         },
     )
@@ -8719,12 +8814,10 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
 
     handle
         .send(BlockSyncEvent::NeededBlocks(
-            (1..=16)
+            (1..=heights)
                 .map(|height| BlockSyncBlockMeta {
                     height: block::Height(height),
-                    hash: block::Hash([height as u8; 32]),
-                    // Tiny hint: if the reservation honored this instead of the
-                    // worst case, the whole 16-block range would fit under the cap.
+                    hash: block::Hash([u8::try_from(height).expect("test height fits u8"); 32]),
                     size: BlockSizeEstimate::Advertised(1_000),
                 })
                 .collect(),
@@ -8732,89 +8825,32 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
         .await
         .expect("needed metadata queues");
 
-    let (_start_height, count) = wait_for_outbound_getblocks(&mut outbound).await;
+    let mut requested = Vec::new();
+    for _ in 1..=heights {
+        requested.push(wait_for_outbound_getblocks(&mut outbound).await);
+    }
+    requested.sort();
     assert_eq!(
-        count, 16,
-        "the request must cover the full 16-block range: the 1 KiB size hints (not a \
-         worst-case-per-block reservation) drive the budget, so all 16 fit under a \
-         {budget_blocks}-worst-case-block budget",
+        requested,
+        (1..=heights)
+            .map(|height| (block::Height(height), 1))
+            .collect::<Vec<_>>(),
+        "every height gets its own concurrent single-block request: the 1 KiB size \
+         hints (not a worst-case-per-block reservation) drive the budget, so all \
+         {heights} fit under a {budget_blocks}-worst-case-block budget",
     );
 
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn reactor_packs_small_estimates_under_peer_response_byte_cap() {
-    let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 4 * BS_PER_BLOCK_WORST_CASE_BYTES,
-        max_blocks_per_response: 4,
-        ..ZakuraBlockSyncConfig::default()
-    };
-
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-
-    let one_worst_case_response =
-        u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).expect("worst-case block size fits u32");
-    let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
-        &service,
-        &mut actions,
-        52,
-        BlockSyncStatus {
-            servable_low: block::Height(1),
-            servable_high: block::Height(4),
-            tip_hash: block::Hash([4; 32]),
-            max_blocks_per_response: 4,
-            max_inflight_requests: 1,
-            max_response_bytes: one_worst_case_response,
-        },
-    )
-    .await;
-
-    handle
-        .send(BlockSyncEvent::NeededBlocks(
-            (1..=4)
-                .map(|height| BlockSyncBlockMeta {
-                    height: block::Height(height),
-                    hash: block::Hash([height as u8; 32]),
-                    size: BlockSizeEstimate::Advertised(1_000),
-                })
-                .collect(),
-        ))
-        .await
-        .expect("needed metadata queues");
-
-    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound).await;
-    assert_eq!(start_height, block::Height(1));
-    assert_eq!(
-        count, 4,
-        "small advertised estimates should pack more than the one worst-case block \
-         allowed by the peer response byte cap",
-    );
-
-    reactor_task.abort();
-}
-
-#[tokio::test]
-async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
-    // A global budget of one worst-case block (2 MB) now holds many tiny-hint
-    // bodies, because each reserves its size hint (clamped to the 1 KiB floor),
-    // not a worst-case share. All 4 advertised heights fit in one request.
+async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
+    // A global budget of one worst-case block (2 MB) holds many tiny-hint
+    // requests, because each reserves its size hint (clamped to the 1 KiB floor),
+    // not a worst-case share. All 4 advertised heights are requested at once.
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
-        max_blocks_per_response: 4,
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
 
@@ -8842,7 +8878,7 @@ async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
             servable_high: block::Height(4),
             tip_hash: block::Hash([4; 32]),
             max_blocks_per_response: 4,
-            max_inflight_requests: 1,
+            max_inflight_requests: 4,
             max_response_bytes: MAX_BS_RESPONSE_BYTES,
         },
     )
@@ -8861,11 +8897,17 @@ async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
         .await
         .expect("needed metadata queues");
 
-    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound).await;
-    assert_eq!(start_height, block::Height(1));
+    let mut requested = Vec::new();
+    for _ in 1..=4 {
+        requested.push(wait_for_outbound_getblocks(&mut outbound).await);
+    }
+    requested.sort();
     assert_eq!(
-        count, 4,
-        "all 4 tiny-hint heights pack into one worst-case-block budget, because each \
+        requested,
+        (1..=4)
+            .map(|height| (block::Height(height), 1))
+            .collect::<Vec<_>>(),
+        "all 4 tiny-hint heights fit one worst-case-block budget, because each \
          reserves its 1 KiB-floored size hint rather than a worst-case share",
     );
 
@@ -8978,10 +9020,12 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         .expect("needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
+        (block::Height(1), 1)
     );
 
-    for height in [block::Height(1), block::Height(2)] {
+    // Catch up while the request is still outstanding, so no lower height is
+    // left to re-request.
+    for height in [block::Height(1), block::Height(2), block::Height(3)] {
         let hash_byte = u8::try_from(height.0).expect("test height fits in u8");
         handle
             .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
@@ -9001,19 +9045,10 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         &inbound_tx,
         BlockSyncMessage::RangeUnavailable {
             start_height: block::Height(1),
-            count: 3,
+            count: 1,
         },
     )
     .await;
-
-    handle
-        .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(3),
-            verified_block_hash: block::Hash([3; 32]),
-        }))
-        .await
-        .expect("caught-up frontier event queues");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         handle.peer_snapshot().outbound_peers,
@@ -9060,7 +9095,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         .expect("new needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(4), 3),
+        (block::Height(4), 1),
         "the retained block-sync peer should be reused after later header growth",
     );
 
@@ -9068,9 +9103,11 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
 }
 
 #[tokio::test]
-async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
+async fn reactor_requests_single_blocks_and_submits_parent_first() {
+    // An old config's multi-block setting is ignored, and so is the peer's
+    // four-block advertisement: every request asks for one block.
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 4,
+        max_blocks_per_response: Some(4),
         ..ZakuraBlockSyncConfig::default()
     };
     let blocks = mainnet_blocks_1_to_3();
@@ -9139,19 +9176,13 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
         .await
         .expect("needed metadata queues");
 
-    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
-    assert_eq!(start_height, block::Height(1));
-    assert_eq!(count, 3);
-
     for block in &blocks {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("block queues");
+        let height = block.coinbase_height().expect("test block has height");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
 
     let mut submitted = Vec::new();
@@ -9163,7 +9194,7 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
                     .expect("submitted test block has height"),
             ),
             BlockSyncAction::Misbehavior { reason, .. } => {
-                panic!("honest multi-block response was misclassified: {reason:?}")
+                panic!("honest single-block response was misclassified: {reason:?}")
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action before all submits: {action:?}"),
@@ -9202,7 +9233,8 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     let tip = blocks.last().expect("flood is non-empty").clone();
     let tip_height = tip.coinbase_height().expect("tip has height");
 
-    let mut config = immediate_body_download_config();
+    // Open the probe cap so the whole flood can be requested at once.
+    let mut config = fill_loop_mechanics_config();
     // One-slot wire queue: a pump that outruns the reactor by more than one
     // frame must backpressure, never drop.
     config.peer_limits.inbound_queue_depth = 1;
@@ -9248,7 +9280,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
                 servable_high: tip_height,
                 tip_hash: tip.hash(),
                 max_blocks_per_response: FLOOD,
-                max_inflight_requests: 1,
+                max_inflight_requests: FLOOD,
                 max_response_bytes: MAX_BS_RESPONSE_BYTES,
             })
             .encode_frame()
@@ -9266,10 +9298,16 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<u32>();
     let feeder = tokio::spawn(async move {
         while let Some(height) = feed_rx.recv().await {
-            let frame = BlockSyncMessage::Block(feed_blocks[(height - 1) as usize].clone())
+            let block = BlockSyncMessage::Block(feed_blocks[(height - 1) as usize].clone())
                 .encode_frame()
                 .expect("block frame encodes");
-            if inbound_tx.send(frame).await.is_err() {
+            let done = BlockSyncMessage::BlocksDone {
+                start_height: block::Height(height),
+                returned: 1,
+            }
+            .encode_frame()
+            .expect("ending frame encodes");
+            if inbound_tx.send(block).await.is_err() || inbound_tx.send(done).await.is_err() {
                 break;
             }
         }
@@ -9393,7 +9431,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
         .expect("needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3),
+        (block::Height(1), 1),
         "restart from genesis must schedule scratch body sync from height 1"
     );
 
@@ -9514,93 +9552,6 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
     reactor_task.abort();
 }
 
-#[tokio::test]
-async fn reactor_retries_missing_heights_after_partial_blocks_done() {
-    let config = immediate_body_download_config();
-    let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (_peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        69,
-        block::Height(3),
-        blocks[2].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
-
-    tip_tx
-        .send((block::Height(3), blocks[2].hash()))
-        .expect("tip watch is live");
-    while !matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks { .. }
-    ) {}
-    handle
-        .send(BlockSyncEvent::NeededBlocks(
-            blocks.iter().map(block_meta).collect(),
-        ))
-        .await
-        .expect("needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
-    );
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("block queues");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => {
-                assert_eq!(block.hash(), blocks[0].hash());
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before first submit: {action:?}"),
-        }
-    }
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 1,
-            }
-            .encode_frame()
-            .expect("BlocksDone encodes"),
-        )
-        .await
-        .expect("BlocksDone queues");
-
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2),
-        "partial responses must retry the contiguous missing suffix"
-    );
-
-    reactor_task.abort();
-}
-
 // `reactor_does_not_retry_missing_height_already_in_flight` was a fanout=2 test:
 // it required the same range to be assigned to two peers and asserted that a
 // partial response from one did not re-request heights the *other* still held.
@@ -9611,8 +9562,7 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
 
 #[tokio::test]
 async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer() {
-    // Worst-case reservation caps a request at ~16 blocks (down from 128), so the
-    // priming prefix is kept short enough to submit within the priming window
+    // The priming prefix is kept short enough to submit within the priming window
     // while still placing the hole behind several scheduled requests.
     const FIRST_NEEDED: u32 = 801;
     const PREFIX_END: u32 = 864;
@@ -9630,15 +9580,22 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let metas: Vec<_> = blocks.iter().map(block_meta).collect();
     let prefix: std::collections::HashSet<_> =
         (FIRST_NEEDED..=PREFIX_END).map(block::Height).collect();
+    // Single-block requests cover the hole one height at a time.
+    let covers_hole = |requests: &[(block::Height, u32)]| {
+        (HOLE_START..=HOLE_END).all(|height| {
+            requests
+                .iter()
+                .any(|(start, count)| start.0 <= height && height < start.0.saturating_add(*count))
+        })
+    };
 
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = u64::MAX;
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
-    // Worst-case reservation caps a request at ~16 blocks, so the prefix needs
-    // more concurrent requests; keep the outbound queue wide enough that a fill
-    // pass never overflows it and cancels the peer.
+    // Keep the outbound queue wide enough that a fill pass never overflows it
+    // and cancels the peer.
     config.peer_limits.outbound_queue_depth = 128;
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(BEST_HEADER_TIP), block::Hash([10; 32])));
@@ -9665,9 +9622,8 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
             servable_high: block::Height(LAST_METADATA),
             tip_hash: block_at(LAST_METADATA).hash(),
             max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST,
-            // Worst-case reservation caps a request at `max_response_bytes /
-            // MAX_BLOCK_BYTES` (~16) blocks, so allow more concurrent requests to
-            // cover the checkpoint prefix within the priming window.
+            // One slot per hole height, so the unanswered hole requests can all be
+            // outstanding at once.
             max_inflight_requests: 8,
             max_response_bytes: MAX_BS_RESPONSE_BYTES,
         },
@@ -9691,11 +9647,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let mut requests: Vec<(block::Height, u32)> = Vec::new();
     let mut submitted = std::collections::HashSet::new();
     let primed = tokio::time::timeout(Duration::from_secs(40), async {
-        while !prefix.is_subset(&submitted)
-            || !requests.iter().any(|(start, count)| {
-                *start <= block::Height(HOLE_START) && start.0.saturating_add(*count) > HOLE_END
-            })
-        {
+        while !prefix.is_subset(&submitted) || !covers_hole(&requests) {
             // The old peer's `GetBlocks` arrive on its own real outbound (reading
             // that stream proves they targeted it); needed-block queries and
             // submissions come over the action channel.
@@ -9713,7 +9665,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                             .0
                             .checked_add(count)
                             .expect("test request height range fits u32");
-                        // Serve each range in order, but leave the range that
+                        // Serve each range in order, but leave any range that
                         // reaches the hole partial and unended.
                         let served = (start_height.0..end_height)
                             .take_while(|height| !(HOLE_START..=HOLE_END).contains(height));
@@ -9777,10 +9729,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     );
 
     assert!(
-        requests
-            .iter()
-            .any(|(start, count)| *start <= block::Height(HOLE_START)
-                && start.0.saturating_add(*count) > HOLE_END),
+        covers_hole(&requests),
         "the initial in-flight requests must cover the missing checkpoint hole"
     );
 
@@ -9930,7 +9879,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         .expect("old-fork needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
     );
 
     handle
@@ -9947,7 +9896,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         &inbound_tx,
         BlockSyncMessage::RangeUnavailable {
             start_height: block::Height(2),
-            count: 2,
+            count: 1,
         },
     )
     .await;
@@ -10053,17 +10002,9 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         .expect("initial needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
     );
-
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[1].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("contiguous body queues");
+    send_single_block_response(&inbound_tx, block::Height(2), &blocks[1]).await;
     loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock { block, .. } => {
@@ -10075,14 +10016,11 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         }
     }
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[2].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("successor body queues");
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(3), 1)
+    );
+    send_single_block_response(&inbound_tx, block::Height(3), &blocks[2]).await;
     let (successor_owner, successor_source, successor_token) = loop {
         match next_action(&mut actions).await {
             BlockSyncAction::SubmitBlock {
@@ -10137,9 +10075,10 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 
 #[tokio::test]
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
+    // Open the probe cap so heights 2 and 3 are both outstanding at the reset.
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -10163,7 +10102,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         72,
         block::Height(3),
         blocks[2].hash(),
-        1,
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
     )
     .await;
@@ -10187,9 +10126,14 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         ]))
         .await
         .expect("initial needed metadata queues");
-    assert_eq!(
+    let mut requested = vec![
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+    ];
+    requested.sort();
+    assert_eq!(
+        requested,
+        vec![(block::Height(2), 1), (block::Height(3), 1)]
     );
 
     handle
@@ -10201,10 +10145,9 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         .await
         .expect("forward reset event queues");
 
-    // The response still starts at height 2, which the reset already verified.
-    for block in [&blocks[1], &blocks[2]] {
-        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
-    }
+    // The height-2 response arrives after the reset already verified it.
+    send_single_block_response(&inbound_tx, block::Height(2), &blocks[1]).await;
+    send_single_block_response(&inbound_tx, block::Height(3), &blocks[2]).await;
 
     loop {
         match next_action(&mut actions).await {
@@ -10374,22 +10317,16 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         ]))
         .await
         .expect("initial needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 2)
-    );
-
-    for block in blocks.iter().take(2) {
-        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+    for (height, block) in [
+        (block::Height(1), &blocks[0]),
+        (block::Height(2), &blocks[1]),
+    ] {
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(1),
-            returned: 2,
-        },
-    )
-    .await;
 
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
@@ -10827,7 +10764,7 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
         .expect("initial needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
     );
 
     handle
@@ -10843,7 +10780,7 @@ async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
         &inbound_tx,
         BlockSyncMessage::RangeUnavailable {
             start_height: block::Height(2),
-            count: 2,
+            count: 1,
         },
     )
     .await;
@@ -10964,7 +10901,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         .expect("old fork metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
     );
 
     handle
@@ -10981,7 +10918,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         &inbound_tx,
         BlockSyncMessage::RangeUnavailable {
             start_height: block::Height(2),
-            count: 2,
+            count: 1,
         },
     )
     .await;
@@ -11364,7 +11301,7 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
 //
 // Production (and now all) block-sync scheduling sends outbound `GetBlocks`
 // *directly* through `BlockSyncPeerSession` (the per-peer routine's
-// `try_send_get_blocks`). There is no per-peer action-pump "source" mirroring the
+// `GetBlocks` send). There is no per-peer action-pump "source" mirroring the
 // send onto a second path, so a single scheduled request can never produce more
 // than one outbound frame.
 //
@@ -11441,7 +11378,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
     // Drain the outbound stream for a bounded idle window and count `GetBlocks`
     // frames. A single scheduled request must produce exactly one outbound
     // `GetBlocks`: the authoritative direct send through `BlockSyncPeerSession`
-    // (the per-peer routine's `try_send_get_blocks`). There is no longer any
+    // (the per-peer routine's `GetBlocks` send). There is no longer any
     // per-peer source action pump that could (double-)send a second copy.
     let mut get_blocks = 0usize;
     let mut frames = 0usize;
@@ -11948,7 +11885,8 @@ async fn committed_reanchor_lowers_only_best_header_target() {
 #[tokio::test]
 async fn committed_reanchor_requeries_while_downloads_in_flight() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    // Open the probe cap so all three heights are outstanding at the reanchor.
+    let mut config = fill_loop_mechanics_config();
     config.max_inflight_block_bytes =
         BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
     config.request_timeout = Duration::from_secs(300);
@@ -11971,7 +11909,7 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         67,
         block::Height(3),
         blocks[2].hash(),
-        1,
+        3,
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
@@ -11982,14 +11920,23 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         ))
         .await
         .expect("needed metadata queues");
+    let mut requested = Vec::new();
+    for _ in &blocks {
+        requested.push(wait_for_outbound_getblocks(&mut outbound_rx).await);
+    }
+    requested.sort();
     assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
+        requested,
+        vec![
+            (block::Height(1), 1),
+            (block::Height(2), 1),
+            (block::Height(3), 1)
+        ]
     );
 
-    // Reanchor the header tip below the in-flight range while the GetBlocks is
-    // still outstanding. The forced post-reset producer query must fire even if
-    // the registry still briefly counts those outstanding heights.
+    // Reanchor the header tip below the in-flight heights while their GetBlocks
+    // are still outstanding. The forced post-reset producer query must fire even
+    // if the registry still briefly counts those outstanding heights.
     snapshots
         .send(Some(committed_view(
             test_committed_snapshot(
@@ -12070,21 +12017,14 @@ async fn epoch_change_supersedes_stale_floor_query() {
         })
         .await
         .expect("initial needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
-    );
     for block in &blocks {
-        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+        let height = block.coinbase_height().expect("test block has height");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(1),
-            returned: 3,
-        },
-    )
-    .await;
     let mut submitted = 0usize;
     while submitted < blocks.len() {
         match next_action(&mut actions).await {
@@ -12232,21 +12172,14 @@ async fn header_extension_preserves_checkpoint_pipeline() {
         })
         .await
         .expect("initial metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
-    );
     for block in &blocks[1..] {
-        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+        let height = block.coinbase_height().expect("test block has height");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(2),
-            returned: 2,
-        },
-    )
-    .await;
     let mut submissions = Vec::new();
     while submissions.len() < 2 {
         match next_action(&mut actions).await {
@@ -12370,7 +12303,8 @@ async fn header_extension_preserves_checkpoint_pipeline() {
 #[tokio::test]
 async fn committed_body_progress_preserves_same_target_native_response() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    // Open the probe cap so all three heights are outstanding when height 1 commits.
+    let mut config = fill_loop_mechanics_config();
     config.max_inflight_block_bytes =
         BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
     config.request_timeout = Duration::from_secs(300);
@@ -12393,7 +12327,7 @@ async fn committed_body_progress_preserves_same_target_native_response() {
         68,
         block::Height(3),
         blocks[2].hash(),
-        1,
+        3,
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
@@ -12404,9 +12338,18 @@ async fn committed_body_progress_preserves_same_target_native_response() {
         ))
         .await
         .expect("needed metadata queues");
+    let mut requested = Vec::new();
+    for _ in &blocks {
+        requested.push(wait_for_outbound_getblocks(&mut outbound_rx).await);
+    }
+    requested.sort();
     assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
+        requested,
+        vec![
+            (block::Height(1), 1),
+            (block::Height(2), 1),
+            (block::Height(3), 1)
+        ]
     );
 
     snapshots
@@ -12431,26 +12374,9 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     .expect("committed frontier should advance");
 
     for block in &blocks {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block frame encodes"),
-            )
-            .await
-            .expect("block frame queues");
+        let height = block.coinbase_height().expect("test block has height");
+        send_single_block_response(&inbound_tx, height, block).await;
     }
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 3,
-            }
-            .encode_frame()
-            .expect("BlocksDone frame encodes"),
-        )
-        .await
-        .expect("BlocksDone frame queues");
 
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
@@ -12473,7 +12399,7 @@ async fn committed_body_progress_preserves_same_target_native_response() {
 async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    // Worst-case reservation: budget for exactly the three in-flight bodies.
+    // Worst-case reservation: budget for all three bodies.
     config.max_inflight_block_bytes =
         BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
     config.request_timeout = Duration::from_secs(300);
@@ -12507,22 +12433,14 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
         ))
         .await
         .expect("needed metadata queues");
-    assert_eq!(
-        wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 3)
-    );
-
     for block in &blocks {
-        send_inbound(&inbound_tx, BlockSyncMessage::Block(block.clone())).await;
+        let height = block.coinbase_height().expect("test block has height");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(1),
-            returned: 3,
-        },
-    )
-    .await;
 
     let mut submitted = Vec::new();
     while submitted.len() < blocks.len() {
@@ -12580,7 +12498,7 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     let (got_start, got_count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(got_start, block::Height(1));
     assert_eq!(
-        got_count, 3,
+        got_count, 1,
         "reanchored headers must release old submitted bodies and request them again",
     );
 
@@ -12628,18 +12546,13 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
         ))
         .await
         .expect("needed metadata queues");
-    let (_start, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
-    assert_eq!(count, 4);
-
     for block in &blocks {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block frame encodes"),
-            )
-            .await
-            .expect("block frame queues");
+        let height = block.coinbase_height().expect("test block has height");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        send_single_block_response(&inbound_tx, height, block).await;
     }
 
     let mut submitted = Vec::new();
@@ -12673,7 +12586,6 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
     let best_header_tip = block::Height(50_000);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([50; 32])));
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
         max_inflight_requests: 1,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -13004,7 +12916,6 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
     // low-water = peers(1) * max_inflight(4) * max_blocks(1) = 4, fanout = 8. Three
     // claimed heights sit below low-water, so the next refill fires immediately.
     let config = ZakuraBlockSyncConfig {
-        max_blocks_per_response: 1,
         max_inflight_requests: 4,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -13151,23 +13062,21 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     )
     .await;
 
+    // Only height 1 is needed, so the retry has no other height to take first.
     handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            block_meta(&blocks[0]),
-            block_meta(&blocks[1]),
-        ]))
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
         .await
         .expect("needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 2)
+        (block::Height(1), 1)
     );
 
     inbound_tx
         .send(
             BlockSyncMessage::RangeUnavailable {
                 start_height: block::Height(1),
-                count: 2,
+                count: 1,
             }
             .encode_frame()
             .expect("RangeUnavailable frame encodes"),
@@ -13177,7 +13086,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 2),
+        (block::Height(1), 1),
         "matched RangeUnavailable should retry the original range without scoring the serving peer",
     );
     assert_eq!(handle.peer_snapshot().outbound_peers, 1);
@@ -13342,7 +13251,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
         .expect("needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(1), 2)
+        (block::Height(1), 1)
     );
 
     handle
@@ -13358,7 +13267,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
         .send(
             BlockSyncMessage::RangeUnavailable {
                 start_height: block::Height(1),
-                count: 2,
+                count: 1,
             }
             .encode_frame()
             .expect("RangeUnavailable frame encodes"),
@@ -13369,7 +13278,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
         (block::Height(2), 1),
-        "late RangeUnavailable must not retry the already verified prefix",
+        "late RangeUnavailable must not retry the already verified height",
     );
 
     reactor_task.abort();

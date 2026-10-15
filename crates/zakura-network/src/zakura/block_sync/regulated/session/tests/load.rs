@@ -372,14 +372,16 @@ async fn maximum_sessions_continuous_serving_probe() {
         "each session's outstanding heights must fit its height stride"
     );
     config.max_inflight_requests = window;
-    config.max_blocks_per_response = blocks;
     let advertised = super::super::serving_max_inflight_requests(&config);
     let source = OpenSource {
         block: Arc::from(BLOCK_MAINNET_1_BYTES.as_slice()),
         shape,
         delay: Duration::from_millis(delay_ms),
     };
-    let serving = Serving::new(Arc::new(source), &config);
+    let mut serving = Serving::new(Arc::new(source), &config);
+    // Production serves one block per response. The probe can still measure
+    // larger responses by lifting the session limit directly.
+    serving.max_blocks = blocks;
     let baseline = memory_kib();
     let cancel = CancellationToken::new();
     let mut sessions: Vec<_> = (0..peers)

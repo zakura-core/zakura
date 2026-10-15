@@ -697,7 +697,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.block_sync]
         replace_legacy_syncer = true
-        max_blocks_per_response = 5
         status_refresh_interval = "12s"
 
         [zakura.quic]
@@ -724,7 +723,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
-    assert!(serialized.contains("max_blocks_per_response = 5"));
     assert!(serialized.contains("status_refresh_interval = \"12s\""));
     assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     assert!(

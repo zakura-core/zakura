@@ -29,11 +29,6 @@ jobs:
     environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
-    outputs:
-      has_changes: ${{ steps.advance.outputs.has_changes }}
-      height: ${{ steps.advance.outputs.height }}
-      meta_url: ${{ steps.advance.outputs.meta_url }}
-      meta_sha256: ${{ steps.advance.outputs.meta_sha256 }}
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -53,16 +48,6 @@ jobs:
         run: |
           python3 .github/scripts/release-state-assets.py fetch --state "$RUNNER_TEMP/release-state"
           python3 .github/scripts/release-state-assets.py select --state "$RUNNER_TEMP/release-state"
-
-      - name: Export the selected bundle identity
-        id: advance
-        run: |
-          jq -r '
-            "has_changes=\(.has_changes)",
-            "height=\(.height)",
-            "meta_url=\(.meta_url)",
-            "meta_sha256=\(.meta_sha256)"
-          ' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
 
       - name: Preserve the verified candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
@@ -121,9 +106,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    outputs:
-      crate_name: ${{ steps.pack.outputs.name }}
-      crate_version: ${{ steps.pack.outputs.version }}
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -144,7 +126,6 @@ jobs:
           path: ${{ runner.temp }}/release-state/
 
       - name: Pack the asset crate
-        id: pack
         env:
           BUNDLE: ${{ runner.temp }}/release-state/bundle
         run: |
@@ -162,8 +143,6 @@ jobs:
               if packed[key] != selected[selected_key]:
                   raise SystemExit("packed asset differs from validated selection")
           PYTHON
-          jq -r '"name=\(.name)", "version=\(.version)", "sha256=\(.sha256)"' \
-            "$RUNNER_TEMP/release-state/pack.json" >> "$GITHUB_OUTPUT"
 
       - name: Check or refuse the existing asset version
         id: existing

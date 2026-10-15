@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -74,7 +75,12 @@ def registry_grid(identity: dict, fetch=download) -> str:
     archive = fetch(f"https://static.crates.io/crates/{name}/{name}-{version}.crate", ARCHIVE_LIMIT)
     if hashlib.sha256(archive).hexdigest() != checksum:
         raise AssetError("published archive checksum differs from registry metadata")
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r|gz") as package:
+    # Count every decompressed byte before tarfile can allocate extended-header metadata.
+    with gzip.GzipFile(fileobj=io.BytesIO(archive)) as compressed:
+        expanded = compressed.read(ARCHIVE_LIMIT + 1)
+    if len(expanded) > ARCHIVE_LIMIT:
+        raise AssetError("expanded asset archive exceeds its size limit")
+    with tarfile.open(fileobj=io.BytesIO(expanded), mode="r|") as package:
         count, total, digest = 0, 0, None
         for entry in package:
             count += 1

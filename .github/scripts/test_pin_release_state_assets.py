@@ -1,5 +1,6 @@
 """Offline regression coverage for registry verification and release-state pinning."""
 
+import gzip
 import hashlib
 import io
 import json
@@ -112,6 +113,28 @@ class RegistryTests(unittest.TestCase):
         for kind, duplicate in ((tarfile.SYMTYPE, False), (tarfile.REGTYPE, True)):
             self.fixture.set_archive(self.fixture.grid, kind=kind, duplicate=duplicate)
             with self.assertRaises(assets.AssetError):
+                assets.registry_grid(self.identity, self.fixture.fetch)
+
+    def test_decompressed_archive_bound_includes_extended_headers(self):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+            entry = tarfile.TarInfo("zakura-assets-0.3517272.0/src/mainnet-frontier-grid.bin")
+            entry.size = len(self.fixture.grid)
+            entry.pax_headers = {"comment": "x" * (64 * 1024)}
+            archive.addfile(entry, io.BytesIO(self.fixture.grid))
+        self.fixture.archive = output.getvalue()
+        self.fixture.record["checksum"] = hashlib.sha256(self.fixture.archive).hexdigest()
+        self.assertLess(len(self.fixture.archive), 16 * 1024)
+        with patch.object(assets, "ARCHIVE_LIMIT", 16 * 1024):
+            with self.assertRaisesRegex(assets.AssetError, "expanded asset archive"):
+                assets.registry_grid(self.identity, self.fixture.fetch)
+
+    def test_decompressed_archive_accepts_the_exact_bound(self):
+        expanded_size = len(gzip.decompress(self.fixture.archive))
+        with patch.object(assets, "ARCHIVE_LIMIT", expanded_size):
+            self.assertEqual(assets.registry_grid(self.identity, self.fixture.fetch), self.fixture.checksum)
+        with patch.object(assets, "ARCHIVE_LIMIT", expanded_size - 1):
+            with self.assertRaisesRegex(assets.AssetError, "expanded asset archive"):
                 assets.registry_grid(self.identity, self.fixture.fetch)
 
     def test_index_propagation_is_bounded_and_resolves_the_exact_package(self):

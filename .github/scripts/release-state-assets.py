@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 from release_state_assets import AssetError, check_identity, publication_needed, verify_visible
+from ready_release_state import fresh, validate_checkpoint_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -68,6 +69,9 @@ def validate_candidate(root: Path, bundle: Path, selected: dict) -> None:
         for name in FETCH.FILE_LIMITS:
             if (bundle / name).read_bytes() != (scratch / "verified" / name).read_bytes():
                 raise AssetError(f"preserved bundle file differs from verified metadata: {name}")
+        validate_checkpoint_identity(bundle, resolution)
+        subprocess.run(["bash", str(ROOT / ".github/scripts/validate-checkpoints.sh"),
+                        str(bundle / IMPORT.CHECKPOINTS.name)], check=True, timeout=30)
         old_grid = previous_grid(root, selected["name"])
         committed_height = IMPORT._checkpoint_height((root / IMPORT.CHECKPOINTS).read_bytes(), "committed list")
         if selected["height"] < committed_height:
@@ -129,7 +133,6 @@ def main():
         (state / "selection.json").write_text(json.dumps(selected, indent=2) + "\n")
         return
     selected = json.loads((state / "selection.json").read_text())
-    from ready_release_state import fresh
     fresh(selected["generated_at"])
     if args.operation == "validate":
         validate_candidate(ROOT, state / "bundle", selected)

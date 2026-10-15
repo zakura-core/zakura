@@ -152,7 +152,6 @@ jobs:
       - name: Record whether the selected bundle advances committed state
         id: selection
         run: |
-          python3 .github/scripts/release-state-assets.py select --state "$RUNNER_TEMP/release-state"
           jq -r '"has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
 
       - name: Preserve the selected release-state bundle

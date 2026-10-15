@@ -64,6 +64,14 @@ def parse_ready(data: bytes, url: str, *, now=None, check_age=True) -> dict:
     return value
 
 
+def validate_checkpoint_identity(bundle: Path, resolution: dict) -> None:
+    """Require the checkpoint file to end at the selected height and block hash."""
+    checkpoints = (bundle / "main-checkpoints.txt").read_bytes()
+    expected = f'{resolution["height"]} {resolution["block_hash"]}'.encode("ascii")
+    if not checkpoints.endswith(b"\n") or checkpoints.splitlines()[-1] != expected:
+        raise AssetError("bundle terminal checkpoint does not match the selected height and block hash")
+
+
 def resolve_ready(url: str, output: Path, *, fetch=FETCH._download, registry_fetch=None,
                   cargo_resolve=None, now=None) -> dict:
     """Resolve once, verify all bytes and Cargo, then expose a complete local snapshot."""
@@ -79,6 +87,7 @@ def resolve_ready(url: str, output: Path, *, fetch=FETCH._download, registry_fet
         for key in ("height", "block_hash", "generated_at"):
             if resolution[key] != manifest[key]:
                 raise AssetError("ready manifest and bundle metadata disagree")
+        validate_checkpoint_identity(scratch / "bundle", resolution)
         asset_identity = {**resolution, **manifest["asset"]}
         kwargs = {}
         if registry_fetch is not None:
@@ -124,6 +133,7 @@ def verify_snapshot(state: Path, *, now=None) -> tuple[dict, dict]:
                                                 scratch / "bundle", scratch / "resolution.json", fetch=local_fetch)
     if any(selected[key] != resolution[key] for key in RESOLUTION_KEYS):
         raise AssetError("preserved resolution differs from the selected bundle")
+    validate_checkpoint_identity(state / "bundle", resolution)
     if hashlib.sha256((state / "bundle/mainnet-frontier-grid.bin").read_bytes()).hexdigest() != selected["grid_sha256"]:
         raise AssetError("preserved grid differs from the selection")
     return selected, meta
@@ -202,7 +212,7 @@ def promote(state: Path, store: S3Store, *, public_base=PUBLIC_BASE, fetch=FETCH
     checksum = registry_grid(selected, **registry_args)
     # A separate prefix means candidate cleanup can never delete an advertised set.
     prefix = STORAGE_PREFIX + f'/v1/{selected["height"]}'
-    for name, record in meta["files"].items():
+    for name in meta["files"]:
         store.immutable(f"{prefix}/{name}", (state / "bundle" / name).read_bytes())
     store.immutable(f"{prefix}/meta.json", (state / "bundle/meta.json").read_bytes())
     published_meta = f'{public_base}/v1/{selected["height"]}/meta.json'
@@ -218,6 +228,12 @@ def promote(state: Path, store: S3Store, *, public_base=PUBLIC_BASE, fetch=FETCH
     encoded = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
     parse_ready(encoded, pointer_url, now=now)
     pointer_key = STORAGE_PREFIX + "/latest.json"
+    def verify_public_pointer():
+        visible = fetch(pointer_url, FETCH.LATEST_MAX_BYTES)
+        if parse_ready(visible, pointer_url, now=now) != manifest:
+            raise AssetError("public ready pointer did not expose the committed identity; check cache configuration")
+        return manifest
+
     for _ in range(3):
         current = store.get(pointer_key, FETCH.LATEST_MAX_BYTES)
         if current:
@@ -227,12 +243,9 @@ def promote(state: Path, store: S3Store, *, public_base=PUBLIC_BASE, fetch=FETCH
             if old["height"] == manifest["height"]:
                 if old != manifest:
                     raise AssetError("same-height ready set has a conflicting identity")
-                return old
+                return verify_public_pointer()
         fresh(manifest["generated_at"], now)
         if store.put(pointer_key, encoded, etag=current[1] if current else None,
                      create=current is None, cache="no-store, max-age=0"):
-            visible = fetch(pointer_url, FETCH.LATEST_MAX_BYTES)
-            if parse_ready(visible, pointer_url, now=now) != manifest:
-                raise AssetError("public ready pointer did not expose the committed identity; check cache configuration")
-            return manifest
+            return verify_public_pointer()
     raise AssetError("ready pointer changed concurrently; retry publication")

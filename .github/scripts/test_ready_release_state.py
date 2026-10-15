@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -218,6 +219,53 @@ class CompleteSetTests(unittest.TestCase):
         with patch.object(self.store, "put", side_effect=AssertionError("identical retry must reuse existing objects")):
             self.assertEqual(self.promote()["height"], 2)
 
+    def test_conflicting_checkpoint_identity_is_never_published_or_consumed(self):
+        self.promote()
+        before = copy.deepcopy(self.services.objects)
+        with tempfile.TemporaryDirectory() as scratch:
+            state = Path(scratch) / "candidate"
+            shutil.copytree(self.state, state)
+            meta = json.loads((state / "bundle/meta.json").read_text())
+            meta["block_hash"] = "0" * 64
+            meta_bytes = json.dumps(meta).encode()
+            (state / "bundle/meta.json").write_bytes(meta_bytes)
+            selection = {**self.selection, "block_hash": meta["block_hash"],
+                         "meta_sha256": hashlib.sha256(meta_bytes).hexdigest()}
+            (state / "selection.json").write_text(json.dumps(selection))
+            (state / "resolution.json").write_text(json.dumps({k: selection[k] for k in ready.RESOLUTION_KEYS}))
+            with self.assertRaisesRegex(assets.AssetError, "terminal checkpoint"):
+                self.promote(state=state)
+            self.assertEqual(self.services.objects, before)
+            # Even a self-consistent pointer/meta digest must not hide a conflicting checkpoint.
+            pointer_key = ready.STORAGE_PREFIX + "/latest.json"
+            pointer = json.loads(self.services.objects[pointer_key][0])
+            pointer.update(block_hash=selection["block_hash"], meta_sha256=selection["meta_sha256"])
+            self.services.objects[pointer_key] = json.dumps(pointer).encode(), '"changed"', ""
+            self.services.objects[ready.STORAGE_PREFIX + "/v1/2/meta.json"] = meta_bytes, '"changed"', ""
+            output = Path(scratch) / "consumer"
+            with self.assertRaisesRegex(assets.AssetError, "terminal checkpoint"):
+                self.consume(output)
+            self.assertFalse(output.exists())
+
+    def test_identical_retry_requires_a_publicly_readable_pointer(self):
+        self.services.hide_public = lambda key: key.endswith("/latest.json")
+        for _attempt in range(2):
+            with self.assertRaises(assets.NotPublished):
+                self.promote()
+        self.services.hide_public = None
+        self.assertEqual(self.promote()["height"], 2)
+
+    def test_identical_retry_rejects_a_cached_older_pointer(self):
+        self.promote(self.states[1])
+        cached = self.services.objects[ready.STORAGE_PREFIX + "/latest.json"][0]
+        def fetch(url, limit):
+            return cached if url.endswith("/published/latest.json") else self.services.request(url, limit)
+        for _attempt in range(2):
+            with self.assertRaisesRegex(assets.AssetError, "public ready pointer"):
+                ready.promote(self.state, self.store, fetch=fetch, verify=self.verify,
+                              registry_fetch=self.services.request)
+        self.assertEqual(self.promote()["height"], 2)
+
     def test_failure_after_each_immutable_write_never_advertises_partial_data(self):
         base = self.promote(self.states[1])
         old = self.services.objects[ready.STORAGE_PREFIX + "/latest.json"]
@@ -303,12 +351,15 @@ class CompleteSetTests(unittest.TestCase):
         manifest = ready.parse_ready(self.services.objects[ready.STORAGE_PREFIX + "/latest.json"][0], ready.PUBLIC_BASE + "/latest.json")
         self.assertEqual(manifest["height"], 2)
 
-    def test_candidate_cleanup_cannot_delete_advertised_set(self):
+    def test_consumption_survives_removal_of_candidate_objects(self):
+        for height, state in self.states.items():
+            for file in (state / "bundle").iterdir():
+                self.store.immutable(f"release-state/v1/{height}/{file.name}", file.read_bytes())
         self.promote()
-        # The existing exporter only removes release-state/v1/*, never published/v1/*.
-        for key in list(self.services.objects):
-            if key.startswith("release-state/v1/"):
-                del self.services.objects[key]
+        candidates = [key for key in self.services.objects if key.startswith("release-state/v1/")]
+        self.assertTrue(candidates)
+        for key in candidates:
+            del self.services.objects[key]
         with tempfile.TemporaryDirectory() as scratch:
             self.assertEqual(self.consume(Path(scratch) / "ready")["height"], 2)
 

@@ -51,7 +51,8 @@ publishes or verifies the matching grid crate, confirms Cargo resolution,
 and promotes the complete set into `release-state/published/v1/<height>/`.
 Only then does it conditionally advance `release-state/published/latest.json`.
 Existing immutable objects must match byte for byte. Concurrent or delayed
-runs cannot replace a newer pointer with an older one.
+runs cannot replace a newer pointer with an older one. Identical retries also
+verify that the public ready pointer is readable and identifies the selected set.
 
 The published prefix is retained without automatic expiry. The archive
 exporter's four-candidate cleanup only visits `release-state/v1/`; it cannot
@@ -63,7 +64,10 @@ The ready pointer uses schema version 2: the original bundle identity plus an
 `asset` record containing `name`, `version`, `checksum` (the crate archive), and
 `grid_sha256`. Candidate pointers remain schema version 1. Consumers use
 `MAINNET_RELEASE_STATE_READY_URL`, never fall back to the candidate pointer,
-and verify the bundle and crate together. A set older than 48 hours is
+and verify the bundle and crate together. Checkpoint metadata must match the
+final checkpoint height and hash before publication or consumption; checkpoint
+format checks run before publication. Registry archives are bounded before and
+after decompression, including their metadata headers. A set older than 48 hours is
 rejected, including waived imports. Republishing does not reset generation
 time. This age check does not independently measure the archive node's lag
 behind the live chain.

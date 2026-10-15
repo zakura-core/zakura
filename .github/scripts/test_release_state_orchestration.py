@@ -27,12 +27,14 @@ TOOLS = load("asset_tools", "release-state-assets.py")
 
 class CandidateTests(unittest.TestCase):
     def setUp(self):
+        self.committed = ("0 " + "0" * 64 + "\n1 " + "a" * 64 + "\n").encode()
+        self.checkpoints = self.committed + ("2 " + "b" * 64 + "\n").encode()
         self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name) / "checkout"
         self.bundle = Path(self.scratch.name) / "bundle"
         self.bundle.mkdir()
-        for relative, data in ((TOOLS.IMPORT.CHECKPOINTS, b"1 aa\n"),
+        for relative, data in ((TOOLS.IMPORT.CHECKPOINTS, self.committed),
                                (TOOLS.IMPORT.FRONTIER, b"old"),
                                (TOOLS.IMPORT.SUBTREES, self.subtrees(1)),
                                (TOOLS.IMPORT.PROVENANCE, b"{}")):
@@ -45,14 +47,14 @@ class CandidateTests(unittest.TestCase):
         self.grid = Path(self.scratch.name) / "previous-grid.bin"
         self.grid.write_bytes(TOOLS.PACK._build_grid(heights=[0], last_checkpoint=1))
         self.original = {
-            "main-checkpoints.txt": b"1 aa\n2 bb\n",
+            "main-checkpoints.txt": self.checkpoints,
             "mainnet-frontier.bin": b"new",
             "mainnet-treestate-subtrees.bin": self.subtrees(2),
             "mainnet-frontier-grid.bin": TOOLS.PACK._build_grid(heights=[0, 1], last_checkpoint=2),
         }
         for name, data in self.original.items():
             (self.bundle / name).write_bytes(data)
-        self.resolution = dict(height=2, block_hash="bb", generated_at="2026-10-15T00:00:00Z",
+        self.resolution = dict(height=2, block_hash="b" * 64, generated_at="2026-10-15T00:00:00Z",
                                meta_url="https://zakura-release.valargroup.dev/release-state/v1/2/meta.json",
                                meta_sha256="a" * 64)
         self.selected = TOOLS.select(self.root, self.bundle, self.resolution)
@@ -71,11 +73,16 @@ class CandidateTests(unittest.TestCase):
         return self.resolution
 
     def validate(self, verifier=None):
+        original_run = subprocess.run
+        def run_verifier(*args, **kwargs):
+            if args[0][0] != "cargo":
+                return original_run(*args, **kwargs)
+            return verifier(*args, **kwargs) if verifier else subprocess.CompletedProcess(args[0], 0)
         with patch.object(TOOLS.FETCH, "resolve_pinned_bundle", side_effect=self.fetch), \
                 patch.object(TOOLS, "previous_grid", return_value=self.grid), \
-                patch.object(TOOLS.subprocess, "run", side_effect=verifier) as run:
+                patch.object(TOOLS.subprocess, "run", side_effect=run_verifier) as calls:
             TOOLS.validate_candidate(self.root, self.bundle, self.selected)
-            return run
+            return calls
 
     def test_candidate_validation_uses_scratch_and_proves_subtree_roots(self):
         before = (self.root / TOOLS.IMPORT.CHECKPOINTS).read_bytes()
@@ -84,9 +91,21 @@ class CandidateTests(unittest.TestCase):
         self.assertIn("verify-historical-treestates", run.call_args.args[0])
 
     def test_rewritten_checkpoint_history_is_rejected_before_semantic_verification(self):
-        self.original["main-checkpoints.txt"] = b"1 cc\n2 bb\n"
+        self.original["main-checkpoints.txt"] = self.checkpoints.replace(b"a" * 64, b"c" * 64)
         (self.bundle / "main-checkpoints.txt").write_bytes(self.original["main-checkpoints.txt"])
         with self.assertRaisesRegex(TOOLS.IMPORT.BundleImportError, "byte-for-byte"):
+            self.validate(lambda *a, **kw: self.fail("semantic verification must not run"))
+
+    def test_conflicting_terminal_hash_is_rejected_before_semantic_verification(self):
+        self.resolution["block_hash"] = "c" * 64
+        self.selected = TOOLS.select(self.root, self.bundle, self.resolution)
+        with self.assertRaisesRegex(AssetError, "terminal checkpoint"):
+            self.validate(lambda *a, **kw: self.fail("semantic verification must not run"))
+
+    def test_malformed_checkpoint_entry_is_rejected_before_semantic_verification(self):
+        self.original["main-checkpoints.txt"] = self.committed + b"malformed checkpoint\n" + self.checkpoints[len(self.committed):]
+        (self.bundle / "main-checkpoints.txt").write_bytes(self.original["main-checkpoints.txt"])
+        with self.assertRaises(subprocess.CalledProcessError):
             self.validate(lambda *a, **kw: self.fail("semantic verification must not run"))
 
     def test_rewritten_grid_is_rejected_before_publication(self):

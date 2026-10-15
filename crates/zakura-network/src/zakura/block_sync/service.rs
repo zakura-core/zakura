@@ -1212,6 +1212,81 @@ mod requester_session_tests {
             BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
         ));
     }
+
+    /// A same-connection replacement refused because the old session has a
+    /// started exchange closes the connection and keeps the old record. The
+    /// replacement's unused registry generation must not outlive the old
+    /// session's disconnect.
+    #[tokio::test]
+    async fn a_refused_replacement_leaves_no_registry_entry_after_the_old_session_ends() {
+        let mut relayed =
+            super::super::tests::RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
+        let service = &relayed.service;
+        let wiring = service.inner.routine_wiring.as_ref().unwrap();
+        let peer = ZakuraPeerId::new(vec![44; 32]).unwrap();
+        let (conn_id, session_id) = (7, 3);
+        let generation = wiring
+            .registry
+            .admit_session(
+                &peer,
+                ServicePeerDirection::Outbound,
+                &wiring.config,
+                conn_id,
+                Instant::now(),
+            )
+            .generation();
+        let connection = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        let cancel = CancellationToken::new();
+        service.inner.requester_sessions.replace(
+            peer.clone(),
+            Current {
+                key: SessionKey {
+                    conn_id,
+                    session_id,
+                },
+                cancel: cancel.clone(),
+                fence,
+                session: (),
+            },
+        );
+        service.inner.active_peers.lock().unwrap().insert(
+            peer.clone(),
+            BlockSyncPeerRecord {
+                conn_id,
+                session_id,
+                direction: ServicePeerDirection::Outbound,
+                cancel_token: cancel,
+                generation: Some(generation),
+            },
+        );
+
+        let _stream = relayed.add_outbound(conn_id, &peer);
+        assert!(
+            connection.is_cancelled(),
+            "the started exchange closes the connection"
+        );
+        assert_eq!(
+            service.inner.active_peers.lock().unwrap()[&peer].session_id,
+            session_id,
+            "the old record stays until its teardown",
+        );
+
+        // The old session's teardown queues the first lifecycle event, since the
+        // refused replacement queued no connect.
+        service.inner.finish_session(&peer, conn_id, session_id);
+        let disconnect = relayed.next_event().await;
+        assert!(matches!(&disconnect, BlockSyncEvent::PeerDisconnected(gone) if gone == &peer));
+        assert_eq!(relayed.relay(disconnect).await, 0);
+        assert!(
+            !relayed.has_entry(&peer),
+            "the refused replacement's generation must not outlive the old session",
+        );
+    }
 }
 
 #[cfg(test)]

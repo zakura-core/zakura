@@ -395,6 +395,10 @@ renew validity. The handler MUST NOT suppress renewal merely because service val
 
 ### Header sync — stream 5, version 9
 
+Header sync version 9 uses capability bit 9. It replaces version 8 without a compatibility path.
+Capability bit 5, which identified version 8, is retired and MUST NOT be reused. A peer that offers
+only version 8 negotiates no header sync stream.
+
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
 and 177 bytes on Regtest. For a selected auxiliary schema, let `A` equal 156 bytes for V1 and zero
@@ -452,23 +456,6 @@ start has zero counts and each page consumes at least one header.
 `reaches_initial_target` is true exactly on the page whose last header is the initial target and is
 false on every other page. `HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial
 target hash, and a one-byte outcome.
-
-#### Compatibility (open question)
-
-> **Open question.** This draft does not yet choose how version 9 replaces version 8.
-
-- **Hard cut.** Version 9 uses a new capability bit 9. Bit 5, which identifies version 8, is retired
-  and MUST NOT be reused. A peer that offers only version 8 negotiates no header sync stream. This
-  mirrors block sync's move to version 3. One codec and one reactor remain, and every header sync
-  session is regulated. Until most peers upgrade, upgraded and older nodes cannot exchange headers
-  over native header sync.
-- **Dual stack for one release.** A node offers bits 5 and 9. The registry already selects the
-  highest version that both peers offer for a stream kind, so two upgraded peers negotiate version
-  9 and an older peer negotiates version 8 under its current rules. The next release retires bit 5.
-  Upgrades keep native header sync working, but the version 8 path stays unregulated for that
-  release, and both reactors need tests and maintenance.
-
-The rules below apply to version 9 under either choice.
 
 #### `Status` — Announcement, discriminator 1
 

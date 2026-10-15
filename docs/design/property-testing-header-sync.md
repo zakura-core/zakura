@@ -13,8 +13,8 @@ Add only the seams needed to control chain growth, header validation, storage co
 capacity, and delivery.
 
 This work introduces no Work bucket, refund, mandatory push deadline, or serving query-result
-timer. It reuses the subscription tools and their tests rather than a new model. Version 8 tests
-stay or retire with the compatibility choice that the specification leaves open.
+timer. It reuses the subscription tools and their tests rather than a new model. Version 9
+replaces version 8 without a compatibility path, so version 8 tests retire at activation.
 
 The checks land in stages after this plan:
 
@@ -213,14 +213,16 @@ host, network, round trip, and peer count with each figure.
 
 ## Compatibility and activation
 
-The checks depend on the open compatibility choice.
+Version 9 replaces version 8 without a compatibility path. Activation switches the stream
+declaration, the capability, and the reactor together. Check that:
 
-- **Hard cut.** A node advertises bit 9 and not bit 5. A peer that offers only version 8 negotiates
-  no header sync stream, and the connection stays usable for other services. The matrix shows the
-  expected result for released Zakura.
-- **Dual stack.** Two upgraded peers negotiate version 9, and a mixed pair negotiates version 8.
-  Version 8 keeps its tests for that release. The matrix covers each pair.
+- Header sync declares one stream, version 9 on capability bit 9. This replaces
+  `declares_only_capability_bit_five_at_stream_version_eight`.
+- A node never advertises bit 5, and bit 5 joins the retired bits listed in `zakura.rs`.
+- A peer that offers only version 8 negotiates no header sync stream, and the connection stays
+  usable for other services. The matrix shows this for released Zakura.
+- A stream 5 frame at version 8 is refused like any unnegotiated version, as in P7.
 
-Activation switches the stream declaration, the capability, and the reactor together. Before it,
-the codec and module tests run against dormant version 9 code. After it, an honest multi-node
-Regtest sync on version 9 produces no protocol-violation result.
+Before activation, the codec and module tests run against dormant version 9 code. Activation
+removes the version 8 codec, reactor paths, and their tests. After it, an honest multi-node Regtest
+sync on version 9 produces no protocol-violation result.

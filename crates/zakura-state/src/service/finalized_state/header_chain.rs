@@ -1131,6 +1131,18 @@ impl RetainedPathReservation {
         self.active = false;
         Ok(outcome)
     }
+    /// Gives up reserve admission for a path that only ordinary capacity can serve.
+    ///
+    /// See [`RetainedPathLeaseRegistry::reject_beyond_reserve`] for the returned signal.
+    fn reject_beyond_reserve(mut self) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let outcome = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reject_beyond_reserve(self.peer, self.reservation_id);
+        self.active = false;
+        Ok(outcome)
+    }
 }
 
 impl Drop for RetainedPathReservation {
@@ -1164,10 +1176,9 @@ impl RetainedPathLeaseRegistry {
         Some(cursor)
     }
 
-    fn notify_capacity(&mut self) {
-        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
-        let general_count = self
-            .by_peer
+    /// Counts reservations and leases admitted to ordinary capacity.
+    fn general_count(&self) -> usize {
+        self.by_peer
             .values()
             .filter(|cursor| cursor.capacity == RetainedPathCapacity::General)
             .count()
@@ -1175,7 +1186,12 @@ impl RetainedPathLeaseRegistry {
                 .reservations
                 .values()
                 .filter(|(_, class, _)| *class == RetainedPathCapacity::General)
-                .count();
+                .count()
+    }
+
+    fn notify_capacity(&mut self) {
+        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
+        let general_count = self.general_count();
         if general_count < RetainedPathCapacity::General.limit() {
             if let Some(signal) = self.general_capacity.take() {
                 signal.release();
@@ -1207,16 +1223,7 @@ impl RetainedPathLeaseRegistry {
         }
         // Ordinary transfers count only against ordinary slots, so a reserve lease never
         // consumes one of them. A bounded request uses the reserve only when they are full.
-        let general_count = self
-            .by_peer
-            .values()
-            .filter(|cursor| cursor.capacity == RetainedPathCapacity::General)
-            .count()
-            + self
-                .reservations
-                .values()
-                .filter(|(_, class, _)| *class == RetainedPathCapacity::General)
-                .count();
+        let general_count = self.general_count();
         let admitted_capacity = if general_count < RetainedPathCapacity::General.limit() {
             RetainedPathCapacity::General
         } else if capacity == RetainedPathCapacity::Bounded
@@ -1257,6 +1264,19 @@ impl RetainedPathLeaseRegistry {
             }
             self.notify_capacity();
         }
+    }
+
+    /// Releases a reserve admission whose path needs ordinary capacity and returns the ordinary
+    /// capacity signal, already released when an ordinary slot freed after admission.
+    fn reject_beyond_reserve(
+        &mut self,
+        peer: SourceId,
+        reservation_id: u64,
+    ) -> RetainedPathLeaseOutcome {
+        self.release_reservation(peer, reservation_id);
+        let signal = self.general_capacity.get_or_insert_default().clone();
+        self.notify_capacity();
+        RetainedPathLeaseOutcome::CapacityBusy(signal)
     }
 
     fn commit_reservation(
@@ -2297,7 +2317,7 @@ impl HeaderChainReader {
                     return Ok(RetainedPathLeaseOutcome::HistoryPruned)
                 }
                 serving_snapshot::RetainedAncestry::BeyondReserve => {
-                    return Ok(RetainedPathLeaseOutcome::Busy)
+                    return reservation.reject_beyond_reserve()
                 }
             },
             None => Vec::new(),
@@ -2339,7 +2359,7 @@ impl HeaderChainReader {
             && RetainedPathCapacity::for_range(common_ancestor, target)
                 != RetainedPathCapacity::Bounded
         {
-            return Ok(RetainedPathLeaseOutcome::Busy);
+            return reservation.reject_beyond_reserve();
         }
         let retained_path: Arc<[block::Hash]> = path
             .iter()

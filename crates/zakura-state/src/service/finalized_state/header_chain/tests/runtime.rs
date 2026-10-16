@@ -3550,31 +3550,32 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
         ordinary_leases.push(lease);
     }
     let owner = SourceId::from_digest([0xc2; 32]);
-    assert_eq!(
-        reader
-            .acquire_retained_path(
-                owner,
-                1,
-                ordinary_target.hash,
-                &[genesis.hash],
-                ordinary_scope
-            )
-            .unwrap(),
-        RetainedPathLeaseOutcome::Busy
-    );
-    assert_eq!(
-        reader
-            .acquire_retained_path(
-                owner,
-                1,
-                ordinary_target.hash,
-                &[block::Hash([0xee; 32])],
-                ordinary_scope
-            )
-            .unwrap(),
-        RetainedPathLeaseOutcome::Busy,
-        "reserve traversal stops at the range limit before resolving a missing locator"
-    );
+    let RetainedPathLeaseOutcome::CapacityBusy(long_wait) = reader
+        .acquire_retained_path(
+            owner,
+            1,
+            ordinary_target.hash,
+            &[genesis.hash],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("a long path rejected from the reserve waits for ordinary capacity");
+    };
+    assert!(!long_wait.is_released());
+    let RetainedPathLeaseOutcome::CapacityBusy(missing_locator_wait) = reader
+        .acquire_retained_path(
+            owner,
+            1,
+            ordinary_target.hash,
+            &[block::Hash([0xee; 32])],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("reserve traversal stops at the range limit before resolving a missing locator");
+    };
+    assert_eq!(missing_locator_wait, long_wait);
 
     // Each two-header repair uses the reserve and stops at its admitted target.
     for (target, ancestor) in [
@@ -3636,10 +3637,15 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
         ),
         "a completed page releases the reserve"
     );
+    assert!(!long_wait.is_released());
     let released = ordinary_leases.pop().unwrap();
     assert!(reader
         .release_retained_path(released.peer, 1, released.lease_id, ordinary_scope)
         .unwrap());
+    assert!(
+        long_wait.is_released(),
+        "a freed ordinary slot wakes long paths rejected from the reserve"
+    );
     assert!(
         matches!(
             reader
@@ -3716,12 +3722,13 @@ async fn retained_path_long_transfers_use_ordinary_capacity_across_finality() {
             ));
         }
         let repair_owner = SourceId::from_digest([0xc5; 32]);
-        assert_eq!(
-            reader
-                .acquire_retained_path(repair_owner, 1, target.hash, &[genesis.hash], scope)
-                .unwrap(),
-            RetainedPathLeaseOutcome::Busy
-        );
+        let RetainedPathLeaseOutcome::CapacityBusy(long_wait) = reader
+            .acquire_retained_path(repair_owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap()
+        else {
+            panic!("a long path waits for ordinary capacity in either storage band");
+        };
+        assert!(!long_wait.is_released());
         assert!(
             matches!(
                 reader
@@ -3782,6 +3789,49 @@ fn retained_path_reservations_keep_capacity_classes_separate() {
             RetainedPathCapacity::Bounded
         )
         .is_err());
+}
+
+#[test]
+fn reserve_rejection_reports_an_ordinary_slot_freed_after_admission() {
+    let mut registry = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let peers: Vec<_> = (0..MAX_RETAINED_PATH_LEASES)
+        .map(|marker| SourceId::from_digest([u8::try_from(marker).unwrap(); 32]))
+        .collect();
+    let reservations: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            registry
+                .reserve(*peer, now, RetainedPathCapacity::Bounded)
+                .unwrap()
+        })
+        .collect();
+    let (reserve_id, class) = *reservations.last().unwrap();
+    assert_eq!(class, RetainedPathCapacity::Bounded);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(reserve_wait)) = registry.reserve(
+        SourceId::from_digest([0xfe; 32]),
+        now,
+        RetainedPathCapacity::Bounded,
+    ) else {
+        panic!("the reserve is occupied");
+    };
+
+    // An ordinary slot frees while the reserve-admitted request walks its ancestry.
+    registry.release_reservation(peers[0], reservations[0].0);
+    let RetainedPathLeaseOutcome::CapacityBusy(ordinary_wait) =
+        registry.reject_beyond_reserve(*peers.last().unwrap(), reserve_id)
+    else {
+        panic!("a reserve rejection returns the ordinary capacity signal");
+    };
+    assert!(
+        ordinary_wait.is_released(),
+        "the requester must not wait for a slot that is already free"
+    );
+    assert!(
+        reserve_wait.is_released(),
+        "freeing any slot wakes bounded waiters"
+    );
+    assert!(!registry.reservations.contains_key(peers.last().unwrap()));
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! linkage, the target marker, and each outcome's window.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -83,11 +83,23 @@ fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot
 }
 
 /// A header tree, the leases issued on it, and scripted replies.
+///
+/// Like state, it holds one lease per peer, refuses a second for capacity
+/// until the first ends, and keeps a peer's continuation after each partial
+/// read, which a later lease toward the same target from the last header
+/// read reuses without walking the ancestry.
 #[derive(Default)]
 struct Store {
     tree: HeaderTree,
     next_lease: u64,
-    leases: HashSet<u64>,
+    /// Each live lease's peer and the signal its end releases.
+    leases: HashMap<u64, (SourceId, ServingCapacitySignal)>,
+    /// Each peer's target and last header read, after a partial read.
+    continuations: HashMap<SourceId, (block::Hash, Frontier)>,
+    /// Leases that walked the ancestry instead of reusing a continuation.
+    walks: usize,
+    /// The next release fails and leaves its lease held.
+    leak_release: bool,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
     read_script: VecDeque<Result<ReadPathReply, PortError>>,
     /// Headers without a schema-1 record.
@@ -106,21 +118,42 @@ impl Store {
         if let Some(reply) = self.acquire_script.pop_front() {
             return reply;
         }
+        if let Some((_, signal)) = self
+            .leases
+            .values()
+            .find(|(peer, _)| *peer == request.source)
+        {
+            return Ok(AcquirePathReply::CapacityBusy(signal.clone()));
+        }
         let Some(&(target, _)) = self.tree.nodes.get(&request.target_tip_hash) else {
             return Ok(AcquirePathReply::TargetNotRetained);
         };
-        let mut current = target;
-        while !request.locator_hashes.contains(&current.hash) {
-            current = match self.tree.parent(current) {
-                Some(parent) => parent,
-                None if current.height == block::Height(0) => {
-                    return Ok(AcquirePathReply::NoLocatorIntersection)
+        let current = match self.continuations.remove(&request.source) {
+            Some((continued, last))
+                if continued == target.hash && request.locator_hashes == [last.hash] =>
+            {
+                last
+            }
+            _ => {
+                self.walks += 1;
+                let mut current = target;
+                while !request.locator_hashes.contains(&current.hash) {
+                    current = match self.tree.parent(current) {
+                        Some(parent) => parent,
+                        None if current.height == block::Height(0) => {
+                            return Ok(AcquirePathReply::NoLocatorIntersection)
+                        }
+                        None => return Ok(AcquirePathReply::HistoryPruned),
+                    };
                 }
-                None => return Ok(AcquirePathReply::HistoryPruned),
-            };
-        }
+                current
+            }
+        };
         self.next_lease += 1;
-        self.leases.insert(self.next_lease);
+        self.leases.insert(
+            self.next_lease,
+            (request.source, ServingCapacitySignal::default()),
+        );
         Ok(AcquirePathReply::Acquired(Box::new(
             RetainedHeaderPath::from_adapter(
                 key,
@@ -134,6 +167,14 @@ impl Store {
         )))
     }
 
+    /// End lease `id`, release its signal, and return its peer, if it was
+    /// live.
+    fn end_lease(&mut self, id: u64) -> Option<SourceId> {
+        let (peer, signal) = self.leases.remove(&id)?;
+        signal.release();
+        Some(peer)
+    }
+
     /// Read one page and consume the lease, as state does.
     fn read(
         &mut self,
@@ -142,12 +183,14 @@ impl Store {
     ) -> Result<ReadPathReply, PortError> {
         if let Some(reply) = self.read_script.pop_front() {
             if matches!(reply, Ok(ReadPathReply::Unavailable)) {
-                self.leases.remove(&path.handle_id());
+                self.end_lease(path.handle_id());
             }
             return reply;
         }
-        if !self.leases.remove(&path.handle_id()) || request.after_hash != path.common_ancestor.hash
-        {
+        let Some(peer) = self.end_lease(path.handle_id()) else {
+            return Ok(ReadPathReply::Unavailable);
+        };
+        if request.after_hash != path.common_ancestor.hash {
             return Ok(ReadPathReply::Unavailable);
         }
         let mut headers = Vec::new();
@@ -166,6 +209,14 @@ impl Store {
         let count = usize::try_from(request.max_header_count).unwrap_or(usize::MAX);
         let complete = headers.len() <= count;
         headers.truncate(count);
+        if !complete {
+            let height = path.common_ancestor.height.0 + u32::try_from(count).unwrap_or(0);
+            let last = headers.last().expect("a partial read has a header").hash();
+            self.continuations.insert(
+                peer,
+                (path.target.hash, Frontier::new(block::Height(height), last)),
+            );
+        }
         let finalized_tree_aux = headers
             .iter()
             .zip(1..)
@@ -309,7 +360,11 @@ impl Port for FakePort {
         path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
-            self.store().leases.remove(&path.handle_id());
+            let mut store = self.store();
+            if std::mem::take(&mut store.leak_release) {
+                return Err(PortError::Unavailable { source: None });
+            }
+            store.end_lease(path.handle_id());
             Ok(())
         })
     }
@@ -768,6 +823,9 @@ async fn path_pages_carry_one_marker_then_follow_the_tip() {
         pages(&received),
         [(h(6), h(9), false), (h(9), h(10), false)]
     );
+    // Each run toward one target walks the ancestry once, and later pages
+    // reuse state's continuation.
+    assert_eq!(port.store().walks, 2);
     harness.check_quiet().await;
 }
 

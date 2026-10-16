@@ -338,7 +338,6 @@ jobs:
             git \
             libclang-dev \
             pkg-config \
-            protobuf-compiler \
             python3
 
       - name: Start SSH agent when deploy key is configured

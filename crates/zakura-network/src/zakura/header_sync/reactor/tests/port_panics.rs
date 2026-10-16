@@ -17,6 +17,7 @@ struct PanickingPort {
 impl port::Port for PanickingPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
@@ -377,6 +378,7 @@ struct StalledLocatorPort {
 impl port::Port for StalledLocatorPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,

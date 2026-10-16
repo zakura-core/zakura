@@ -1930,7 +1930,10 @@ pub enum ReadRequest {
     HeaderChainSnapshot,
 
     /// Returns the exact committed selected-header locator after semantic handoff.
-    HeaderLocator,
+    HeaderLocator {
+        /// Retained by the blocking read even if its caller times out.
+        permit: zakura_node_services::header_chain::LocatorReadPermit,
+    },
 
     /// Return the exact immutable branch context for preparing children of `parent_hash`.
     HeaderValidationLease {
@@ -2265,7 +2268,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
-            ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::HeaderLocator { .. } => "header_locator",
             ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
             ReadRequest::VctRepairContext { .. } => "vct_repair_context",
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
@@ -2423,5 +2426,55 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod locator_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_locator_keeps_permit_after_caller_drop_until_exit_or_panic() {
+        for panic in [false, true] {
+            let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let request = ReadRequest::HeaderLocator {
+                permit: zakura_node_services::header_chain::LocatorReadPermit::new(
+                    capacity.clone().try_acquire_owned().unwrap(),
+                ),
+            };
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let result = TimedSpan::new(
+                CodeTimer::start_desc("locator_capacity_test"),
+                tracing::Span::none(),
+            )
+            .spawn_blocking(move || {
+                let ReadRequest::HeaderLocator { permit: _permit } = request else {
+                    unreachable!();
+                };
+                started.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                assert!(!panic, "test accepted locator panic");
+                Ok(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(result);
+            assert_eq!(capacity.available_permits(), 0);
+            release.send(()).unwrap();
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                capacity.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(permit);
+            assert_eq!(capacity.available_permits(), 1);
+        }
     }
 }

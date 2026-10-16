@@ -22,11 +22,12 @@ use zakura_quic::NodeId;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Flow, FramedRecv, FramedSend, HeaderSyncHandle, Peer, PeerStreamSession, Pipe,
-    Service, ServiceAdmissionDecision, ServicePeerDirection, SessionDemand, SessionOpening,
-    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, Peer, PeerStreamSession,
+    Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SessionDemand, SessionOpening,
+    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES,
     ZAKURA_CAP_DISCOVERY,
 };
+use crate::BoxError;
 
 use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
@@ -36,6 +37,7 @@ use super::protocol::{
 };
 use super::requester::{reservation_pool, Queries, QueryUnsent};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity};
+use super::trace::{DiscoveryViolationEvent, ViolationStage};
 use super::wire::{PEERS_MAX_BYTES, RULES, SEND_INTERVAL};
 use crate::zakura::regulation::{CadenceSendError, CadenceSender, ReservationPool, WriterFence};
 
@@ -109,6 +111,7 @@ pub struct DiscoveryService {
     serving: ServingCapacity,
     /// Node-wide reservations for this node's queries.
     query_pool: ReservationPool,
+    trace: ZakuraTrace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,14 +245,17 @@ impl DiscoveryService {
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             serving: ServingCapacity::new(),
             query_pool: reservation_pool(),
+            trace: ZakuraTrace::default(),
         }
     }
 
-    /// Builds a discovery service with header-sync and block-sync summary providers.
+    /// Builds a discovery service with header-sync and block-sync summary
+    /// providers, which writes its violations to `trace`.
     pub(crate) fn with_sync_services(
         handle: ZakuraDiscoveryHandle,
         header_sync: HeaderSyncHandle,
         block_sync: Option<BlockSyncHandle>,
+        trace: ZakuraTrace,
     ) -> Self {
         Self {
             handle,
@@ -259,6 +265,7 @@ impl DiscoveryService {
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             serving: ServingCapacity::new(),
             query_pool: reservation_pool(),
+            trace,
         }
     }
 
@@ -396,6 +403,7 @@ impl Service for DiscoveryService {
         let block_sync = self.block_sync.clone();
         let serving = self.serving.clone();
         let query_pool = self.query_pool.clone();
+        let trace = self.trace.clone();
         let session_states = self.session_states.clone();
         let connection_owners = self
             .connection_owners
@@ -464,6 +472,7 @@ impl Service for DiscoveryService {
                     connection_cancel,
                     close_cause,
                     session_states,
+                    trace,
                 });
             },
         );
@@ -498,6 +507,7 @@ struct DiscoveryExchangeStart {
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
     session_states: Arc<StdMutex<SessionStateMap>>,
+    trace: ZakuraTrace,
 }
 
 fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
@@ -517,6 +527,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel,
         close_cause,
         session_states,
+        trace,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
     let progress = Arc::new(DiscoveryExchangeProgress::default());
@@ -552,6 +563,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         conn_id,
         session_id,
         progress: progress.clone(),
+        trace,
     };
     let sink_service_cancel = service_cancel.clone();
     let reject_connection_cancel = connection_cancel.clone();
@@ -680,6 +692,8 @@ struct DiscoverySink {
     conn_id: ZakuraConnId,
     session_id: u64,
     progress: Arc<DiscoveryExchangeProgress>,
+    /// Records each violation before the connection closes.
+    trace: ZakuraTrace,
 }
 
 async fn run_discovery_pipe(
@@ -698,34 +712,66 @@ async fn run_discovery_pipe(
     }
 }
 
-/// Runs each frame through the pipe and handles each decoded message, until
-/// the stream ends.
+/// Reads frames until the stream ends, and traces the violation that ends it
+/// early.
 async fn read_discovery_messages(
     pipe: &mut Pipe<DsLocal, DsEnv>,
     mut recv: FramedRecv,
     sink: &DiscoverySink,
 ) -> Result<(), SinkReject> {
     while let Some(frame) = recv.recv().await {
-        // An answer claims its query before its payload is decoded.
-        let asked = sink
-            .queries
-            .claim(frame.message_type, frame.payload.len())
-            .map_err(SinkReject::protocol)?;
-        match pipe.run_one(frame) {
-            Flow::Continue(()) | Flow::Done => {}
-            Flow::Reject(reject) => return Err(reject),
-        }
-        if let Some(message) = pipe.local_mut().take_decoded() {
-            if let Some(asked) = asked {
-                asked.check(&message).map_err(SinkReject::protocol)?;
+        let message_type = frame.message_type;
+        if let Err((stage, reject)) = read_frame(pipe, frame, sink).await {
+            if let SinkReject::Protocol(error) = &reject {
+                sink.trace_violation(message_type, stage, error);
             }
-            sink.handle_message(message).await?;
+            return Err(reject);
         }
     }
     Ok(())
 }
 
+/// Runs one frame through the pipe and handles its decoded message. An error
+/// names the stage that rejected the frame.
+async fn read_frame(
+    pipe: &mut Pipe<DsLocal, DsEnv>,
+    frame: Frame,
+    sink: &DiscoverySink,
+) -> Result<(), (ViolationStage, SinkReject)> {
+    // An answer claims its query before its payload is decoded.
+    let asked = sink
+        .queries
+        .claim(frame.message_type, frame.payload.len())
+        .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?;
+    if let Flow::Reject(reject) = pipe.run_one(frame) {
+        return Err((ViolationStage::Decode, reject));
+    }
+    let Some(message) = pipe.local_mut().take_decoded() else {
+        return Ok(());
+    };
+    if let Some(asked) = asked {
+        asked
+            .check(&message)
+            .map_err(|error| (ViolationStage::Answer, SinkReject::protocol(error)))?;
+    }
+    sink.handle_message(message)
+        .await
+        .map_err(|reject| (ViolationStage::Handle, reject))
+}
+
 impl DiscoverySink {
+    fn trace_violation(&self, message_type: u16, stage: ViolationStage, error: &BoxError) {
+        self.trace.emit_event(|| {
+            DiscoveryViolationEvent::new(
+                self.session.peer_id(),
+                self.session_id,
+                message_type,
+                stage,
+                error,
+            )
+        });
+    }
+
     /// Handles one decoded message. An answer already passed its query's
     /// checks.
     async fn handle_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
@@ -1291,6 +1337,7 @@ mod tests {
             discovery_handle,
             header_sync,
             Some(block_sync.clone()),
+            ZakuraTrace::default(),
         );
         let peer_node_id = NodeSecretKey::from_bytes(&[25u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -1543,6 +1590,7 @@ mod tests {
             discovery_handle.clone(),
             header_sync.clone(),
             None,
+            ZakuraTrace::default(),
         );
         let peer_secret = NodeSecretKey::from_bytes(&[43u8; 32]);
         let peer_node_id = peer_secret.public();
@@ -1698,6 +1746,7 @@ mod tests {
             conn_id,
             session_id,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
+            trace: ZakuraTrace::default(),
         };
         (sink, recv)
     }
@@ -1977,6 +2026,76 @@ mod tests {
             let node_id = NodeSecretKey::from_bytes(&[seed; 32]).public();
             assert_eq!(handle.record_for(node_id).await, None, "nothing imports");
         }
+        Ok(())
+    }
+
+    /// A violation writes one `discovery_violation` row that names the
+    /// rejecting stage and the frame's message type.
+    #[tokio::test]
+    async fn violation_is_traced_with_its_stage() -> Result<(), crate::BoxError> {
+        use crate::zakura::{
+            discovery::wire::PEERS,
+            testkit::{TraceCapture, TraceValue},
+            trace::{discovery_trace as d_trace, peer_label, DISCOVERY_TABLE},
+        };
+
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[60u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[61u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        handle
+            .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+            .await;
+        let mut capture = TraceCapture::for_test("discovery_violation_is_traced")?;
+        let (mut sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        sink.trace = ZakuraTrace::new(capture.tracer(), "violation-test");
+
+        // A `Peers` that answers no `GetPeers` fails its claim.
+        let (to_sink, recv) = framed_channel(4);
+        let reader = tokio::spawn({
+            let peer_id = peer_id.clone();
+            async move {
+                let mut pipe = discovery_pipe(peer_id);
+                run_discovery_pipe(&mut pipe, recv, sink).await
+            }
+        });
+        to_sink
+            .send(discovery_frame(DiscoveryMessage::Peers {
+                records: Vec::new(),
+            })?)
+            .await?;
+        let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
+        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+
+        capture.flush().await;
+        let reader = capture.reader()?;
+        reader.table(DISCOVERY_TABLE.table()).assert_row(
+            d_trace::DISCOVERY_VIOLATION,
+            &[
+                (d_trace::PEER, TraceValue::Str(&peer_label(&peer_id))),
+                (d_trace::SESSION_ID, TraceValue::U64(1)),
+                (
+                    d_trace::MESSAGE_TYPE,
+                    TraceValue::U64(u64::from(PEERS.message_type)),
+                ),
+                (d_trace::STAGE, TraceValue::Str("claim")),
+            ],
+        );
+        capture.finish().await?;
         Ok(())
     }
 
@@ -3200,6 +3319,7 @@ mod tests {
             discovery_handle.clone(),
             header_sync.clone(),
             None,
+            ZakuraTrace::default(),
         );
         let header_service = Arc::new(HeaderSyncService::new(header_sync.clone()));
         service.set_connection_owners(vec![header_service.clone()]);

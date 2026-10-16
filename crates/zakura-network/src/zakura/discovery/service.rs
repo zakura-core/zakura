@@ -1670,7 +1670,20 @@ mod tests {
         conn_id: ZakuraConnId,
         session_id: u64,
     ) -> (DiscoverySink, FramedRecv) {
-        let (send, recv) = framed_channel(8);
+        discovery_sink_with_send_capacity(handle, peer_id, peer_node_id, conn_id, session_id, 8)
+    }
+
+    /// Build a sink as [`discovery_sink_for_session`] does, whose stream
+    /// holds `capacity` unread frames.
+    fn discovery_sink_with_send_capacity(
+        handle: &ZakuraDiscoveryHandle,
+        peer_id: &ZakuraPeerId,
+        peer_node_id: NodeId,
+        conn_id: ZakuraConnId,
+        session_id: u64,
+        capacity: usize,
+    ) -> (DiscoverySink, FramedRecv) {
+        let (send, recv) = framed_channel(capacity);
         let cancel = CancellationToken::new();
         let serving = ServingCapacity::new().session(
             PeerSampler {
@@ -1816,6 +1829,50 @@ mod tests {
         drop(state);
         next_peers(&mut recv).await?;
         next_peers(&mut recv).await?;
+        Ok(())
+    }
+
+    /// A peer that stops reading holds at most two unsent answers. Its next
+    /// requests wait, and a request past the commitment margin soon breaks
+    /// it.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_breaks_the_margin_after_two_unsent_answers(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[54u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[55u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        // The stream holds one unread answer; the peer never reads it.
+        let (sink, _recv) =
+            discovery_sink_with_send_capacity(&handle, &peer_id, peer_node_id, 0, 1, 1);
+        let query = || GetPeers {
+            limit: 1,
+            wanted_services: Vec::new(),
+            exclude_node_ids: Vec::new(),
+        };
+
+        // At most: the stream takes one answer, two wait unsent, and two
+        // more requests wait within the margin of one open request.
+        let mut admitted = 0;
+        while sink.serving.get_peers.admit(query()).is_ok() {
+            admitted += 1;
+            assert!(admitted <= 5, "a peer that stops reading is never cut off");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         Ok(())
     }
 

@@ -379,16 +379,19 @@ impl Shared {
 
     /// End every subscription that is closing or has an outcome queued, in
     /// order, and return each terminal frame with its permit.
+    ///
+    /// An outcome this node already queued wins over `SubscriptionClosed`,
+    /// as the specification requires.
     fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<(u64, Frame, TerminalPermit)> {
         let due: Vec<(u64, HeadersOutcomeCode)> = self
             .subscriptions
             .iter()
-            .filter_map(|(&id, subscription)| {
-                if self.publications.is_closing(&id) {
+            .filter_map(|(&id, subscription)| match subscription.end {
+                Some(outcome) => Some((id, outcome)),
+                None if self.publications.is_closing(&id) => {
                     Some((id, HeadersOutcomeCode::SubscriptionClosed))
-                } else {
-                    subscription.end.map(|outcome| (id, outcome))
                 }
+                None => None,
             })
             .collect();
         due.into_iter()

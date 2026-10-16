@@ -1129,6 +1129,38 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
     harness.check_quiet().await;
 }
 
+/// An outcome this node queued before `Close` arrived is the one it sends.
+#[tokio::test(start_paused = true)]
+async fn a_queued_outcome_wins_over_a_later_close() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let id = harness
+        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    // The task has not run between these, so both reach `end_due` together.
+    let ended = {
+        let mut shared = lock(&harness.publisher.shared);
+        shared.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
+        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
+        shared.end_due::<HB>()
+    };
+    let [(ended_id, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+    assert_eq!(ended_id, id);
+    assert!(matches!(
+        decode_frame::<RegtestMessage>(&frame),
+        Ok(Message::HeadersOutcome(HeadersOutcome {
+            outcome: HeadersOutcomeCode::SubscriptionSuperseded,
+            ..
+        }))
+    ));
+}
+
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,
 /// and an unadvertised schema fault.
 #[tokio::test(start_paused = true)]

@@ -720,8 +720,8 @@ impl Subscriber {
     /// The live subscription, if a `Grant` can continue it toward its
     /// target: it is not closing or failed, it has not reached its target, it
     /// has no unspent header credit, and every page it received was accepted.
-    /// Returns its ID, target, and accepted cursor.
-    pub(crate) fn resumable(&self) -> Option<(u64, block::Hash, Cursor)> {
+    /// Returns its ID, target, accepted cursor, and schema.
+    pub(crate) fn resumable(&self) -> Option<(u64, block::Hash, Cursor, AuxSchema)> {
         let live = self
             .live
             .as_ref()
@@ -732,6 +732,7 @@ impl Subscriber {
             live.id,
             live.target,
             live.accepted,
+            live.schema,
         ))
     }
 }

@@ -370,8 +370,12 @@ impl Shared {
             .is_some_and(|credit| credit.consumed().objects > 0)
     }
 
-    /// Queue `outcome` for `id`, adjusted into its window.
+    /// Queue `outcome` for `id`, adjusted into its window. After `Close`
+    /// arrived, the subscription ends with `SubscriptionClosed` instead.
     fn queue_end(&mut self, id: u64, outcome: HeadersOutcomeCode) {
+        if self.publications.is_closing(&id) {
+            return;
+        }
         let pages_sent = self.pages_sent(&id);
         if let Some(subscription) = self.subscriptions.get_mut(&id) {
             subscription.end = Some(in_window(

@@ -1425,6 +1425,39 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
     harness.check_quiet().await;
 }
 
+/// An outcome a job finds after `Close` arrived gives way to
+/// `SubscriptionClosed`.
+#[tokio::test(start_paused = true)]
+async fn close_wins_over_an_outcome_found_after_it() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let id = harness
+        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    // The task has not run between these, so both reach `end_due` together.
+    let ended = {
+        let mut shared = lock(&harness.publisher.shared);
+        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
+        let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
+        shared.finish(id, found, false);
+        shared.end_due::<HB>()
+    };
+    let [(_, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+    assert!(matches!(
+        decode_frame::<RegtestMessage>(&frame),
+        Ok(Message::HeadersOutcome(HeadersOutcome {
+            outcome: HeadersOutcomeCode::SubscriptionClosed,
+            ..
+        }))
+    ));
+}
+
 /// The margin admits a second `Open`. A third, a changed target, and an
 /// unadvertised schema fault.
 #[tokio::test(start_paused = true)]

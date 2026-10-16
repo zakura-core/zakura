@@ -8,7 +8,7 @@ use zakura_quic::{NodeAddr, QuicEndpoint};
 
 use super::{
     service::LayoutShared, LayoutService, LayoutSession, SiblingService, StreamConformance,
-    CONFORMANCE_DEADLINE, SIBLINGS,
+    UpdateOp, CONFORMANCE_DEADLINE, SIBLINGS,
 };
 use crate::{
     zakura::{
@@ -149,44 +149,29 @@ impl<A: StreamConformance> LayoutNode<A> {
 
     /// Download `exchanges` of the layout's first request row and `pages`
     /// pages of a subscription on its first subscription row from `peer`, at
-    /// once. Each part runs only if the layout has its row.
+    /// once.
     pub(crate) async fn exchange(
         &self,
         peer: &ZakuraPeerId,
         exchanges: impl IntoIterator<Item = u32>,
         pages: u32,
     ) -> Result<(), BoxError> {
-        let plan = &self.shared().plan;
-        let requests = async {
-            if plan.requests.is_empty() {
-                return Ok(());
-            }
-            self.download(peer, exchanges).await
-        };
-        let subscription = async {
-            if plan.subscriptions.is_empty() {
-                return Ok(());
-            }
-            self.subscribe(peer, pages).await
-        };
-        tokio::try_join!(requests, subscription).map(drop)
+        tokio::try_join!(self.download(peer, exchanges), self.subscribe(peer, pages)).map(drop)
     }
 
     /// Download `exchanges` of the layout's first request row from `peer`,
     /// keeping at most `max_in_flight` open and sending the next request as
-    /// soon as an ending arrives.
+    /// soon as an ending arrives. Does nothing if the layout has no request
+    /// row.
     pub(crate) async fn download(
         &self,
         peer: &ZakuraPeerId,
         exchanges: impl IntoIterator<Item = u32>,
     ) -> Result<(), BoxError> {
+        let Some(&plan) = self.shared().plan.requests.first() else {
+            return Ok(());
+        };
         let session = self.wait_session(peer).await?;
-        let plan = *self
-            .shared()
-            .plan
-            .requests
-            .first()
-            .ok_or("the layout has no request row")?;
         let limit = usize::try_from(plan.max_in_flight).expect("a small limit fits usize");
         let mut ended = session.ended.subscribe();
         let before = ended.borrow().len();
@@ -215,24 +200,23 @@ impl<A: StreamConformance> LayoutNode<A> {
 
     /// Subscribe to `peer` on the layout's first subscription row with the
     /// row's whole window, and accept `pages` pages, renewing credit as it
-    /// frees. Then close the subscription and wait for its ending.
+    /// frees. Then close the subscription and wait for its ending. Does
+    /// nothing if the layout has no subscription row.
     ///
     /// See [`LayoutSession::subscription_progress`] for when a grant is due.
     pub(crate) async fn subscribe(&self, peer: &ZakuraPeerId, pages: u32) -> Result<(), BoxError> {
-        let session = self.wait_session(peer).await?;
         let shared = self.shared();
-        let plan = *shared
-            .plan
-            .subscriptions
-            .first()
-            .ok_or("the layout has no subscription row")?;
+        let Some(&plan) = shared.plan.subscriptions.first() else {
+            return Ok(());
+        };
+        let session = self.wait_session(peer).await?;
         let row = plan.row.message_type;
         let key = session.next_key();
         let mut accepted = session.pages.subscribe();
         let mut ended = session.subscriptions_ended.subscribe();
         let before = ended.borrow().len();
         self.service
-            .subscribe(peer, row, key, plan.credit())
+            .subscribe(peer, row, key, plan.limits.credit)
             .await?;
         loop {
             // Mark the pages seen before reading the progress, so a page that
@@ -245,13 +229,21 @@ impl<A: StreamConformance> LayoutNode<A> {
                 break;
             }
             if let Some(added) = due {
-                self.service.grant(peer, row, key, added).await?;
+                self.service
+                    .update(peer, row, key, UpdateOp::Grant, |subscriptions| {
+                        subscriptions.grant(&key, added)
+                    })
+                    .await?;
             }
             tokio::time::timeout(CONFORMANCE_DEADLINE, accepted.changed())
                 .await
                 .map_err(|_| "timed out waiting for a page")??;
         }
-        self.service.close(peer, row, key).await?;
+        self.service
+            .update(peer, row, key, UpdateOp::Close, |subscriptions| {
+                subscriptions.close(&key)
+            })
+            .await?;
         tokio::time::timeout(
             CONFORMANCE_DEADLINE,
             ended.wait_for(|ended| ended[before..].contains(&(row, key))),

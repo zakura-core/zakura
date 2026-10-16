@@ -5,13 +5,13 @@
 //! linkage, the target marker, and each outcome's window.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     time::Duration,
 };
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::{block::genesis::regtest_genesis_block, fmt::HexDebug, work::difficulty::U256};
+use zakura_chain::work::difficulty::U256;
 use zakura_header_chain::{
     AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
     SuffixWork, VerifiedGeneration,
@@ -23,7 +23,7 @@ use zakura_node_services::header_chain::{
 
 use super::super::{
     smallest_page,
-    test_support::{p, record, OUTCOME_CODES},
+    test_support::{p, record, HeaderTree, OUTCOME_CODES},
     RegtestMessage,
 };
 use super::*;
@@ -85,7 +85,7 @@ fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot
 /// A header tree, the leases issued on it, and scripted replies.
 #[derive(Default)]
 struct Store {
-    nodes: HashMap<block::Hash, (Frontier, Arc<block::Header>)>,
+    tree: HeaderTree,
     next_lease: u64,
     leases: HashSet<u64>,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
@@ -94,50 +94,9 @@ struct Store {
     no_record: HashSet<block::Hash>,
     reads_running: usize,
     most_reads_running: usize,
-    /// Distinguishes sibling headers.
-    next_nonce: u32,
 }
 
 impl Store {
-    /// Add `count` headers above `parent`, and return them.
-    fn extend(&mut self, parent: Frontier, count: u32) -> Vec<Frontier> {
-        let mut added = Vec::new();
-        let mut parent = parent;
-        for _ in 0..count {
-            let mut header = *self.nodes[&parent.hash].1;
-            header.previous_block_hash = parent.hash;
-            self.next_nonce += 1;
-            let mut nonce = [0; 32];
-            nonce[..4].copy_from_slice(&self.next_nonce.to_le_bytes());
-            header.nonce = HexDebug(nonce);
-            let child = Frontier::new(
-                parent.height.next().expect("test heights are small"),
-                header.hash(),
-            );
-            self.nodes.insert(child.hash, (child, Arc::new(header)));
-            added.push(child);
-            parent = child;
-        }
-        added
-    }
-
-    /// The parent of `frontier`, if retained.
-    fn parent(&self, frontier: Frontier) -> Option<Frontier> {
-        let (_, header) = self.nodes.get(&frontier.hash)?;
-        self.nodes
-            .get(&header.previous_block_hash)
-            .map(|(parent, _)| *parent)
-    }
-
-    /// The retained ancestor of `of` at `height`.
-    fn ancestor(&self, of: Frontier, height: block::Height) -> Option<Frontier> {
-        let mut current = of;
-        while current.height > height {
-            current = self.parent(current)?;
-        }
-        Some(current)
-    }
-
     /// Lease the path from the nearest locator to the target, as state does.
     fn acquire(
         &mut self,
@@ -147,12 +106,12 @@ impl Store {
         if let Some(reply) = self.acquire_script.pop_front() {
             return reply;
         }
-        let Some(&(target, _)) = self.nodes.get(&request.target_tip_hash) else {
+        let Some(&(target, _)) = self.tree.nodes.get(&request.target_tip_hash) else {
             return Ok(AcquirePathReply::TargetNotRetained);
         };
         let mut current = target;
         while !request.locator_hashes.contains(&current.hash) {
-            current = match self.parent(current) {
+            current = match self.tree.parent(current) {
                 Some(parent) => parent,
                 None if current.height == block::Height(0) => {
                     return Ok(AcquirePathReply::NoLocatorIntersection)
@@ -194,9 +153,10 @@ impl Store {
         let mut headers = Vec::new();
         let mut current = path.target;
         while current != path.common_ancestor {
-            let (Some((_, header)), Some(parent)) =
-                (self.nodes.get(&current.hash), self.parent(current))
-            else {
+            let (Some((_, header)), Some(parent)) = (
+                self.tree.nodes.get(&current.hash),
+                self.tree.parent(current),
+            ) else {
                 return Ok(ReadPathReply::Unavailable);
             };
             headers.push(header.clone());
@@ -245,10 +205,8 @@ impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
     fn new(gate: usize) -> Arc<Self> {
-        let header = regtest_genesis_block().header.clone();
-        let genesis = Frontier::new(block::Height(0), header.hash());
-        let mut store = Store::default();
-        store.nodes.insert(genesis.hash, (genesis, header));
+        let store = Store::default();
+        let genesis = store.tree.genesis;
         Arc::new(Self {
             key: AdapterKey::new(),
             store: Mutex::new(store),
@@ -287,7 +245,7 @@ impl FakePort {
 
     /// Extend the selected chain by `count` headers and select the new tip.
     fn grow(&self, count: u32) -> Vec<Frontier> {
-        let added = self.store().extend(self.tip(), count);
+        let added = self.store().tree.extend(self.tip(), count);
         if let Some(&tip) = added.last() {
             self.select(tip);
         }
@@ -865,7 +823,7 @@ async fn outcomes_before_the_first_page_name_their_cause() {
     use HeadersOutcomeCode::*;
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(3);
-    let side = port.store().extend(chain[0], 3);
+    let side = port.store().tree.extend(chain[0], 3);
     let mut harness = Harness::new(port.clone(), serve_limits());
     let unknown = block::Hash([5; 32]);
     let elsewhere = Frontier::new(block::Height(1), block::Hash([6; 32]));
@@ -901,7 +859,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         .open(chain[7].hash, vec![port.genesis], one_page, AuxSchema::None)
         .await;
     assert_eq!(harness.deliver_all().await.len(), 1);
-    port.store().nodes.remove(&chain[7].hash);
+    port.store().tree.nodes.remove(&chain[7].hash);
     let grant = harness
         .subscriber
         .grant(10, 0)
@@ -922,7 +880,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         .open(chain[3].hash, vec![chain[3]], credit(), AuxSchema::None)
         .await;
     assert!(harness.deliver_all().await.is_empty());
-    let side = port.store().extend(chain[1], 4);
+    let side = port.store().tree.extend(chain[1], 4);
     port.select(side[3]);
     assert_eq!(
         harness.deliver_all().await,
@@ -937,7 +895,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         .await;
     assert!(harness.deliver_all().await.is_empty());
     let above = port.grow(2);
-    port.store().nodes.remove(&above[0].hash);
+    port.store().tree.nodes.remove(&above[0].hash);
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(SubscriptionSuperseded)]
@@ -1094,7 +1052,7 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     assert!(harness.deliver_all().await.is_empty());
     port.grow(2);
     harness.drain().await;
-    let side = port.store().extend(chain[2], 3);
+    let side = port.store().tree.extend(chain[2], 3);
     port.select(side[2]);
     // The read finishes, and the recheck's lease blocks in state.
     port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
@@ -1148,14 +1106,14 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
 
     // The chain grows, so the page is still selected, and the read ends.
     // The recheck then waits behind the other peer's read.
-    let grown = port.store().extend(main[1], 1);
+    let grown = port.store().tree.extend(main[1], 1);
     port.select(grown[0]);
     port.gate.add_permits(1);
     tokio::time::sleep(QUIET).await;
     assert_eq!(harness.capacity.node_execution_held(), 1);
 
     // While it waits, the chain reorgs away from the page.
-    let side = port.store().extend(chain[2], 4);
+    let side = port.store().tree.extend(chain[2], 4);
     port.select(side[3]);
     other_port.gate.add_permits(1);
     let h = block::Height;
@@ -1541,9 +1499,9 @@ async fn run(ops: Vec<Op>) {
             Op::Reorg { depth, len } => {
                 let tip = port.tip();
                 let height = block::Height(tip.height.0.saturating_sub(u32::from(depth)));
-                let base = port.store().ancestor(tip, height);
+                let base = port.store().tree.ancestor(tip, height);
                 if let Some(base) = base {
-                    let added = port.store().extend(base, u32::from(len));
+                    let added = port.store().tree.extend(base, u32::from(len));
                     port.select(added.last().copied().unwrap_or(base));
                     tips.push(port.tip());
                 }
@@ -1560,6 +1518,7 @@ async fn run(ops: Vec<Op>) {
                 let height = block::Height(target.height.0.saturating_sub(u32::from(depth)));
                 let base = port
                     .store()
+                    .tree
                     .ancestor(target, height)
                     .unwrap_or(port.genesis);
                 let mut locators = vec![base];
@@ -1630,9 +1589,9 @@ async fn run(ops: Vec<Op>) {
                 let tip = port.tip();
                 let height = block::Height(tip.height.0.saturating_sub(u32::from(depth)));
                 let mut store = port.store();
-                if let Some(pruned) = store.ancestor(tip, height) {
+                if let Some(pruned) = store.tree.ancestor(tip, height) {
                     if pruned != tip && pruned != port.genesis {
-                        store.nodes.remove(&pruned.hash);
+                        store.tree.nodes.remove(&pruned.hash);
                     }
                 }
             }

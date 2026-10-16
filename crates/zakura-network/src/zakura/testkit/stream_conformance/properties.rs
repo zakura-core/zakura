@@ -10,13 +10,13 @@ use std::{
 };
 
 use super::{
-    node::production_limits, LayoutNode, LayoutPlan, LayoutSession, RawLayoutPeer, RequestPlan,
-    StreamConformance, SubscriptionPlan, SubscriptionUpdate, UpdateOp, CONFORMANCE_DEADLINE,
-    SIBLINGS,
+    node::production_limits, service::encode_update, LayoutNode, LayoutPlan, LayoutSession,
+    RawLayoutPeer, RequestPlan, StreamConformance, SubscriptionPlan, UpdateOp,
+    CONFORMANCE_DEADLINE, SIBLINGS,
 };
 use crate::{
     zakura::{
-        regulation::{ServeCapacity, UNFINISHED_EXCHANGE},
+        regulation::{ServeCapacity, Update, UNFINISHED_EXCHANGE},
         testkit::await_until,
         wire_codec::{decode_frame, encode_frame},
         Credit, Frame, MessageRole, MessageRule, Stream, DEFAULT_ZAKURA_RECEIVE_WINDOW,
@@ -62,14 +62,13 @@ fn update_frame<A: StreamConformance>(
     sequence: u32,
     added: Credit,
 ) -> Result<Frame, BoxError> {
-    let update = SubscriptionUpdate {
-        op,
-        key,
+    let acknowledged = 0;
+    let update = Update {
         sequence,
-        acknowledged: 0,
+        acknowledged,
         added,
     };
-    encode_frame(&A::update(subscription.row, update)).map_err(|error| error.to_string().into())
+    encode_update::<A>(subscription.row, op, key, &update)
 }
 
 /// Page `cursor` of subscription 0 on `subscription`'s page row.

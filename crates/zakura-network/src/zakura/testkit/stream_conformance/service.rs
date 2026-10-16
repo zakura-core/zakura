@@ -559,7 +559,7 @@ impl<A: StreamConformance> LayoutService<A> {
 }
 
 /// Encode `update` of subscription `key` as an `op` update on `row`.
-fn encode_update<A: StreamConformance>(
+pub(crate) fn encode_update<A: StreamConformance>(
     row: &MessageRule,
     op: UpdateOp,
     key: u32,

@@ -893,7 +893,7 @@ fn acknowledgements_name_only_accepted_cursors() {
 #[test]
 fn a_failed_validation_is_never_acknowledged() {
     let (tree, chain) = chain(6);
-    let mut fixture = Fixture::open(tree, chain[6], &[chain[0]], 10);
+    let mut fixture = Fixture::open(tree, chain[6], &[chain[0]], 4);
     let passed = fixture
         .page(chain[0], &chain[1..3], false)
         .expect("first page");
@@ -901,13 +901,20 @@ fn a_failed_validation_is_never_acknowledged() {
         .page(chain[2], &chain[3..5], false)
         .expect("second page");
     let id = fixture.id;
-    assert_eq!(fixture.sub.accept_through(id, &passed.cursor, 10), Ok(None));
+    let grant = fixture
+        .sub
+        .accept_through(id, &passed.cursor, 4)
+        .expect("a received cursor")
+        .expect("the two pages starved the window");
+    assert_eq!(wire(&grant).acknowledged, passed.cursor);
     assert!(fixture.sub.validation_failed(id));
     assert_eq!(
-        fixture.sub.accept_through(id, &failed.cursor, 10),
+        fixture.sub.accept_through(id, &failed.cursor, 4),
         Err(SubscribeError::Failed)
     );
-    assert_eq!(fixture.sub.grant_due(10), None);
+    // Eight headers of staging leave room for a full prefix of four, so only
+    // the failure holds this grant back.
+    assert_eq!(fixture.sub.grant_due(8), None);
     let close = wire(&fixture.sub.close().expect("Close is recorded"));
     assert_eq!(close.acknowledged, passed.cursor);
     assert!(!fixture.sub.validation_failed(id + 1));

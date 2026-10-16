@@ -977,7 +977,7 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, (u64, Option<ServingCapacitySignal>)>,
+    reservations: HashMap<SourceId, (u64, RetainedPathCapacity, Option<ServingCapacitySignal>)>,
     general_capacity: Option<ServingCapacitySignal>,
     fallback_capacity: Option<ServingCapacitySignal>,
     // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
@@ -987,14 +987,23 @@ struct RetainedPathLeaseRegistry {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum RetainedPathCapacity {
     General,
-    FinalizedFallback,
+    Bounded,
 }
 
 impl RetainedPathCapacity {
+    fn for_range(ancestor: Frontier, target: Frontier) -> Self {
+        let count = target.height.0.saturating_sub(ancestor.height.0);
+        if count <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE {
+            Self::Bounded
+        } else {
+            Self::General
+        }
+    }
+
     fn limit(self) -> usize {
         match self {
             Self::General => MAX_RETAINED_PATH_LEASES.saturating_sub(1),
-            Self::FinalizedFallback => MAX_RETAINED_PATH_LEASES,
+            Self::Bounded => MAX_RETAINED_PATH_LEASES,
         }
     }
 }
@@ -1013,7 +1022,7 @@ enum CanonicalHeaderPathPosition {
 
 #[derive(Clone, Debug)]
 struct CanonicalHeaderPathCursor {
-    capacity: Option<ServingCapacitySignal>,
+    capacity_signal: Option<ServingCapacitySignal>,
     lease_id: u64,
     peer: SourceId,
     session_id: u64,
@@ -1022,9 +1031,9 @@ struct CanonicalHeaderPathCursor {
     scope: HeaderWorkAuthority,
     position: CanonicalHeaderPathPosition,
     last_frontier: Frontier,
-    retained_ancestor: Option<block::Hash>,
     retained_path: Arc<[block::Hash]>,
     idle_deadline: Instant,
+    capacity: RetainedPathCapacity,
 }
 
 impl CanonicalHeaderPathCursor {
@@ -1049,8 +1058,8 @@ struct RetainedPathLeaseSpec {
     common_ancestor: Frontier,
     scope: HeaderWorkAuthority,
     position: CanonicalHeaderPathPosition,
-    retained_ancestor: Option<block::Hash>,
     retained_path: Arc<[block::Hash]>,
+    capacity: RetainedPathCapacity,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1122,6 +1131,18 @@ impl RetainedPathReservation {
         self.active = false;
         Ok(outcome)
     }
+    /// Gives up reserve admission for a path that only ordinary capacity can serve.
+    ///
+    /// See [`RetainedPathLeaseRegistry::reject_beyond_reserve`] for the returned signal.
+    fn reject_beyond_reserve(mut self) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
+        let outcome = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reject_beyond_reserve(self.peer, self.reservation_id);
+        self.active = false;
+        Ok(outcome)
+    }
 }
 
 impl Drop for RetainedPathReservation {
@@ -1148,21 +1169,35 @@ impl RetainedPathLeaseRegistry {
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
         let mut cursor = self.by_peer.remove(&peer)?;
-        if let Some(signal) = cursor.capacity.take() {
+        if let Some(signal) = cursor.capacity_signal.take() {
             signal.release();
         }
         self.notify_capacity();
         Some(cursor)
     }
 
+    /// Counts reservations and leases admitted to ordinary capacity.
+    fn general_count(&self) -> usize {
+        self.by_peer
+            .values()
+            .filter(|cursor| cursor.capacity == RetainedPathCapacity::General)
+            .count()
+            + self
+                .reservations
+                .values()
+                .filter(|(_, class, _)| *class == RetainedPathCapacity::General)
+                .count()
+    }
+
     fn notify_capacity(&mut self) {
         let occupied = self.by_peer.len().saturating_add(self.reservations.len());
-        if occupied < RetainedPathCapacity::General.limit() {
+        let general_count = self.general_count();
+        if general_count < RetainedPathCapacity::General.limit() {
             if let Some(signal) = self.general_capacity.take() {
                 signal.release();
             }
         }
-        if occupied < RetainedPathCapacity::FinalizedFallback.limit() {
+        if occupied < RetainedPathCapacity::Bounded.limit() {
             if let Some(signal) = self.fallback_capacity.take() {
                 signal.release();
             }
@@ -1174,43 +1209,53 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         now: Instant,
         capacity: RetainedPathCapacity,
-    ) -> Result<u64, RetainedPathLeaseOutcome> {
+    ) -> Result<(u64, RetainedPathCapacity), RetainedPathLeaseOutcome> {
         self.expire(now);
         if let Some(cursor) = self.by_peer.get_mut(&peer) {
             return Err(RetainedPathLeaseOutcome::CapacityBusy(
-                cursor.capacity.get_or_insert_default().clone(),
+                cursor.capacity_signal.get_or_insert_default().clone(),
             ));
         }
-        if let Some((_, signal)) = self.reservations.get_mut(&peer) {
+        if let Some((_, _, signal)) = self.reservations.get_mut(&peer) {
             return Err(RetainedPathLeaseOutcome::CapacityBusy(
                 signal.get_or_insert_default().clone(),
             ));
         }
-        if self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit() {
+        // Ordinary transfers count only against ordinary slots, so a reserve lease never
+        // consumes one of them. A bounded request uses the reserve only when they are full.
+        let general_count = self.general_count();
+        let admitted_capacity = if general_count < RetainedPathCapacity::General.limit() {
+            RetainedPathCapacity::General
+        } else if capacity == RetainedPathCapacity::Bounded
+            && self.by_peer.len() + self.reservations.len() < RetainedPathCapacity::Bounded.limit()
+        {
+            RetainedPathCapacity::Bounded
+        } else {
             let signal = match capacity {
                 RetainedPathCapacity::General => &mut self.general_capacity,
-                RetainedPathCapacity::FinalizedFallback => &mut self.fallback_capacity,
+                RetainedPathCapacity::Bounded => &mut self.fallback_capacity,
             };
             return Err(RetainedPathLeaseOutcome::CapacityBusy(
                 signal.get_or_insert_default().clone(),
             ));
-        }
+        };
         let reservation_id = self
             .next_reservation_id
             .checked_add(1)
             .ok_or(RetainedPathLeaseOutcome::Busy)?;
         self.next_reservation_id = reservation_id;
-        self.reservations.insert(peer, (reservation_id, None));
-        Ok(reservation_id)
+        self.reservations
+            .insert(peer, (reservation_id, admitted_capacity, None));
+        Ok((reservation_id, admitted_capacity))
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
         if self
             .reservations
             .get(&peer)
-            .is_some_and(|(id, _)| *id == reservation_id)
+            .is_some_and(|(id, _, _)| *id == reservation_id)
         {
-            let (_, signal) = self
+            let (_, _, signal) = self
                 .reservations
                 .remove(&peer)
                 .expect("the reservation matches");
@@ -1219,6 +1264,19 @@ impl RetainedPathLeaseRegistry {
             }
             self.notify_capacity();
         }
+    }
+
+    /// Releases a reserve admission whose path needs ordinary capacity and returns the ordinary
+    /// capacity signal, already released when an ordinary slot freed after admission.
+    fn reject_beyond_reserve(
+        &mut self,
+        peer: SourceId,
+        reservation_id: u64,
+    ) -> RetainedPathLeaseOutcome {
+        self.release_reservation(peer, reservation_id);
+        let signal = self.general_capacity.get_or_insert_default().clone();
+        self.notify_capacity();
+        RetainedPathLeaseOutcome::CapacityBusy(signal)
     }
 
     fn commit_reservation(
@@ -1232,7 +1290,7 @@ impl RetainedPathLeaseRegistry {
             || !self
                 .reservations
                 .get(&peer)
-                .is_some_and(|(id, _)| *id == reservation_id)
+                .is_some_and(|(id, class, _)| *id == reservation_id && *class == spec.capacity)
         {
             return RetainedPathLeaseOutcome::Busy;
         }
@@ -1245,12 +1303,12 @@ impl RetainedPathLeaseRegistry {
             return RetainedPathLeaseOutcome::Busy;
         };
         self.next_lease_id = lease_id;
-        let (_, capacity) = self
+        let (_, _, capacity_signal) = self
             .reservations
             .remove(&peer)
             .expect("the reservation matches");
         let cursor = CanonicalHeaderPathCursor {
-            capacity,
+            capacity_signal,
             lease_id,
             peer: spec.peer,
             session_id: spec.session_id,
@@ -1259,9 +1317,9 @@ impl RetainedPathLeaseRegistry {
             scope: spec.scope,
             position: spec.position,
             last_frontier: spec.common_ancestor,
-            retained_ancestor: spec.retained_ancestor,
             retained_path: spec.retained_path,
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
+            capacity: spec.capacity,
         };
         let lease = cursor.lease();
         self.by_peer.insert(spec.peer, cursor);
@@ -2150,82 +2208,18 @@ impl HeaderChainReader {
         reservation.commit(spec, Instant::now())
     }
 
-    /// Lease one bounded canonical range that ends below the finalized frontier.
+    /// Lease one immutable path from the nearest locator ancestor to an exact target.
     ///
-    /// Refusing a finalized target would strand any node whose VCT repair height every peer has
-    /// already finalized: the requester has no other way to obtain those headers and their
-    /// authenticated roots. The fallback accepts a canonical locator within one protocol range
-    /// of the target.
-    fn acquire_finalized_target_path(
-        &self,
-        reservation: RetainedPathReservation,
-        session_id: u64,
-        scope: HeaderWorkAuthority,
-        locator_hashes: &[block::Hash],
-        snapshot: &EngineSnapshot,
-        read: &audit_snapshot::HeaderChainAuditSnapshot<'_>,
-    ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
-        let peer = reservation.peer;
-        let Some(target) = read.finalized_frontier(scope.branch.target_tip_hash)? else {
-            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-        };
-        if target.height >= snapshot.frontiers.finalized.height {
-            // A header at or above the finalized frontier belongs to the graph. Its absence there
-            // means the branch moved under the request, so the requester must re-derive it.
-            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
-        }
-        // The nearest canonical locator bounds the leased path. Honouring list order instead
-        // would let a requester place a distant ancestor behind a useless near entry and lease a
-        // complete protocol range it never needed.
-        let mut common_ancestor: Option<Frontier> = None;
-        for locator_hash in locator_hashes {
-            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
-                let distance = target.height.0.checked_sub(frontier.height.0);
-                if distance.is_some_and(|distance| {
-                    distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
-                }) && common_ancestor.is_none_or(|nearest| frontier.height > nearest.height)
-                {
-                    common_ancestor = Some(frontier);
-                }
-            }
-        }
-        let Some(common_ancestor) = common_ancestor else {
-            return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
-        };
-        let next = common_ancestor.height.next().map_err(|_| {
-            StoreError::Incoherent("canonical header cursor start height overflowed")
-        })?;
-        self.commit_path_lease(
-            reservation,
-            RetainedPathLeaseSpec {
-                peer,
-                session_id,
-                target,
-                common_ancestor,
-                scope,
-                position: CanonicalHeaderPathPosition::Finalized {
-                    next,
-                    end: target.height,
-                },
-                retained_ancestor: None,
-                retained_path: Arc::from(Vec::new()),
-            },
-        )
-    }
-
-    /// Lease a canonical header path from a locator intersection up to an exact target.
-    ///
-    /// The target resolves from the retained header graph, or, when it sits below the finalized
-    /// frontier, from the canonical finalized indexes. A VCT repair can ask for a bounded range
-    /// that every peer past it has already finalized. Refusing the second band would strand the
-    /// requester.
+    /// The target resolves from the retained header graph or, below the finalized frontier, from
+    /// the canonical finalized indexes. Storage does not affect locator rules or capacity
+    /// admission. Bounded paths can use the reserved slot; ordinary paths leave that slot
+    /// available for repair.
     ///
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
-    /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
-    /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
-    /// lease or capacity is unavailable. A successful page read consumes the lease.
-    /// Explicit release and expiry also free unused leases. The finalized fallback limits the
-    /// complete historical path to one protocol range.
+    /// when no locator hash is an ancestor of it, `HistoryPruned` when the retained path no
+    /// longer reaches a locator or the finalized frontier, and `Busy` when the peer already
+    /// holds a lease or capacity is unavailable. A successful page read consumes the lease.
+    /// Explicit release and expiry also free unused leases.
     pub(crate) fn acquire_retained_path(
         &self,
         peer: SourceId,
@@ -2241,6 +2235,23 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
+        // Reserve before taking any commit lock or resolving peer-selected hashes.
+        // The reserve permits only a protocol-sized ancestry walk.
+        let admission = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .reserve(peer, Instant::now(), RetainedPathCapacity::Bounded);
+        let (reservation_id, capacity) = match admission {
+            Ok(admission) => admission,
+            Err(outcome) => return Ok(outcome),
+        };
+        let reservation = RetainedPathReservation {
+            leases: self.leases.clone(),
+            peer,
+            reservation_id,
+            active: true,
+        };
         // Capture frontiers and durable rows under one short commit barrier. All
         // ancestry reads run outside both locks, and lease installation rechecks
         // the exact target's availability after the snapshot read.
@@ -2255,29 +2266,6 @@ impl HeaderChainReader {
                 .lock()
                 .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
             (engine.snapshot(), self.store.audit_snapshot()?)
-        };
-        let target_node = read.retained_path_node(target_tip_hash)?;
-        // General paths may occupy all but one registry slot. A target outside the retained graph
-        // may use the final slot only when it resolves to the bounded finalized fallback below.
-        let capacity = if target_node.is_some() {
-            RetainedPathCapacity::General
-        } else {
-            RetainedPathCapacity::FinalizedFallback
-        };
-        let reservation_id = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .reserve(peer, Instant::now(), capacity);
-        let reservation_id = match reservation_id {
-            Ok(id) => id,
-            Err(outcome) => return Ok(outcome),
-        };
-        let reservation = RetainedPathReservation {
-            leases: self.leases.clone(),
-            peer,
-            reservation_id,
-            active: true,
         };
         // Serving reads an exact hash, not the selected branch. The captured scope
         // correlates this lease with its requester and may predate normal head progress.
@@ -2295,13 +2283,11 @@ impl HeaderChainReader {
         if let Some(cursor) = continuation.filter(|cursor| {
             cursor.session_id == session_id
                 && cursor.target.hash == target_tip_hash
-                && locator_hashes.first() == Some(&cursor.last_frontier.hash)
+                && locator_hashes == [cursor.last_frontier.hash]
+                // A continuation cannot extend the range that its admitted class permits.
                 && (capacity == RetainedPathCapacity::General
-                    // Finalized fallback chooses the nearest locator and bounds the full
-                    // remaining range. Multiple locators must use that selection below.
-                    || (locator_hashes.len() == 1
-                        && cursor.target.height.0.saturating_sub(cursor.last_frontier.height.0)
-                            <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE))
+                    || RetainedPathCapacity::for_range(cursor.last_frontier, cursor.target)
+                        == RetainedPathCapacity::Bounded)
         }) {
             return self.commit_path_lease(
                 reservation,
@@ -2312,79 +2298,88 @@ impl HeaderChainReader {
                     common_ancestor: cursor.last_frontier,
                     scope,
                     position: cursor.position,
-                    retained_ancestor: cursor.retained_ancestor,
                     retained_path: cursor.retained_path,
+                    capacity,
                 },
             );
         }
-        let Some(target_node) = target_node else {
-            // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
-            // range that every peer past it has finalized. The target is absent here but present
-            // and immutable in the finalized indexes.
-            return self.acquire_finalized_target_path(
-                reservation,
-                session_id,
-                scope,
-                locator_hashes,
-                &snapshot,
-                &read,
-            );
+        let locators: HashSet<_> = locator_hashes.iter().copied().collect();
+        let mut path = match read.retained_path_node(target_tip_hash)? {
+            Some(target_node) => match read.retained_ancestry_to_nearest_locator(
+                target_node,
+                snapshot.frontiers.finalized,
+                &locators,
+                (capacity == RetainedPathCapacity::Bounded)
+                    .then_some(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE),
+            )? {
+                serving_snapshot::RetainedAncestry::Path(path) => path,
+                serving_snapshot::RetainedAncestry::Pruned => {
+                    return Ok(RetainedPathLeaseOutcome::HistoryPruned)
+                }
+                serving_snapshot::RetainedAncestry::BeyondReserve => {
+                    return reservation.reject_beyond_reserve()
+                }
+            },
+            None => Vec::new(),
         };
-        let target = Frontier::new(target_node.height, target_tip_hash);
-        let Some(mut reverse_path) = read.retained_ancestry_to_locator(
-            target_node,
-            snapshot.frontiers.finalized,
-            locator_hashes,
-        )?
-        else {
-            return Ok(RetainedPathLeaseOutcome::HistoryPruned);
+        let target = match path.first().copied() {
+            Some(target) => target,
+            None => match read.finalized_frontier(target_tip_hash)? {
+                Some(target) if target.height < snapshot.frontiers.finalized.height => target,
+                _ => return Ok(RetainedPathLeaseOutcome::TargetNotRetained),
+            },
         };
-        reverse_path.reverse();
-        let mut intersection = None;
-        for locator_hash in locator_hashes {
-            if let Some(common_index) = reverse_path
-                .iter()
-                .position(|frontier| frontier.hash == *locator_hash)
-            {
-                intersection = Some((
-                    reverse_path[common_index],
-                    CanonicalHeaderPathPosition::Retained { next: 0 },
-                    common_index.saturating_add(1),
-                    Some(reverse_path[common_index].hash),
-                ));
-                break;
-            }
-            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
-                if frontier.height < snapshot.frontiers.finalized.height {
-                    let next = frontier.height.next().map_err(|_| {
-                        StoreError::Incoherent("canonical header cursor start height overflowed")
-                    })?;
-                    intersection = Some((
-                        frontier,
-                        CanonicalHeaderPathPosition::Finalized {
-                            next,
-                            end: snapshot.frontiers.finalized.height,
-                        },
-                        1,
-                        None,
-                    ));
-                    break;
+        path.reverse();
+        let finalized_end = target.height.min(snapshot.frontiers.finalized.height);
+        // The downward walk stops at the nearest retained locator. Finalized locators
+        // cannot improve that intersection, so they need no database reads.
+        let mut common_ancestor = path
+            .first()
+            .copied()
+            .filter(|frontier| locators.contains(&frontier.hash));
+        if common_ancestor.is_none() {
+            for locator_hash in locator_hashes {
+                if let Some(ancestor) = read
+                    .finalized_frontier(*locator_hash)?
+                    .filter(|frontier| frontier.height <= finalized_end)
+                {
+                    if common_ancestor.is_none_or(|nearest| ancestor.height > nearest.height) {
+                        common_ancestor = Some(ancestor);
+                    }
+                    if ancestor.height == finalized_end {
+                        break;
+                    }
                 }
             }
         }
-        let Some((common_ancestor, mut position, retained_start, retained_ancestor)) = intersection
-        else {
+        let Some(common_ancestor) = common_ancestor else {
             return Ok(RetainedPathLeaseOutcome::NoLocatorIntersection);
         };
-        let retained_path: Arc<[block::Hash]> = reverse_path[retained_start..]
+        if capacity == RetainedPathCapacity::Bounded
+            && RetainedPathCapacity::for_range(common_ancestor, target)
+                != RetainedPathCapacity::Bounded
+        {
+            return reservation.reject_beyond_reserve();
+        }
+        let retained_path: Arc<[block::Hash]> = path
             .iter()
+            .filter(|frontier| {
+                frontier.height > common_ancestor.height && frontier.height > finalized_end
+            })
             .map(|frontier| frontier.hash)
             .collect();
-        if retained_path.is_empty()
-            && matches!(position, CanonicalHeaderPathPosition::Retained { .. })
-        {
-            position = CanonicalHeaderPathPosition::Complete;
-        }
+        let position = if common_ancestor == target {
+            CanonicalHeaderPathPosition::Complete
+        } else if common_ancestor.height < finalized_end {
+            CanonicalHeaderPathPosition::Finalized {
+                next: common_ancestor.height.next().map_err(|_| {
+                    StoreError::Incoherent("canonical header cursor start height overflowed")
+                })?,
+                end: finalized_end,
+            }
+        } else {
+            CanonicalHeaderPathPosition::Retained { next: 0 }
+        };
         self.commit_path_lease(
             reservation,
             RetainedPathLeaseSpec {
@@ -2394,8 +2389,8 @@ impl HeaderChainReader {
                 common_ancestor,
                 scope,
                 position,
-                retained_ancestor,
                 retained_path,
+                capacity,
             },
         )
     }

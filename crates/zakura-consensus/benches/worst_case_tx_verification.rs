@@ -18,7 +18,7 @@
 //! ```
 //!
 //! This matters here specifically: all Zakura proof verification runs on the global rayon
-//! pool, whose size comes from `sync.parallel_cpu_threads`, and `tower-batch-control`
+//! pool, whose size comes from `sync.parallel_cpu_threads`, and the batch middleware
 //! sizes its batch queue from `rayon::current_num_threads()`. A node configured with one
 //! rayon thread verifies serially *and* loses cross-batch pipelining.
 

@@ -10,8 +10,10 @@ use tokio::sync::oneshot::error::RecvError;
 
 use crate::BoxError;
 
+pub(crate) mod batch_control;
 mod cache;
 pub mod ed25519;
+pub(crate) mod fallback;
 pub mod groth16;
 pub mod halo2;
 pub mod redjubjub;

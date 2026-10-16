@@ -5,13 +5,16 @@
 # fixture, README tag, projected end-of-support height, an automatic import of
 # the latest verified release state, and changelog assembly), verifies the
 # result with `make pre-release`, and opens or updates a draft PR through the
-# release GitHub App. Nothing merges, tags, or publishes from this workflow:
+# release GitHub App. Only complete published sets are consumed here.
+# Publication is a separate daily workflow. Nothing merges or creates release tags here:
 # the PR is always a draft, judgment items (bump-level review, authoritative
 # end-of-support halt height, changelog curation) are listed in the PR body, and
 # create-release.yml re-validates everything after merge.
 #
 # Re-running with the same tag recreates the release/v* branch from the
-# current main HEAD, which is how the PR stays rebased.
+# current main HEAD, which is how the PR stays rebased. Dry runs can also
+# validate the selected branch without opening a PR or accessing the release
+# environment.
 #
 # Unlike semver-checks.yml (crates.io baselines gating every PR), bump levels
 # here are computed against BASE_TAG as a git baseline: the version at the
@@ -52,26 +55,26 @@ on:
 permissions: {}
 
 concurrency:
-  group: prepare-release-pr
+  group: prepare-release-pr-${{ inputs.dry_run && github.ref || 'main' }}
   cancel-in-progress: false
 
 jobs:
   prepare:
     name: Prepare release PR
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || inputs.dry_run
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    environment: release-automation
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
     steps:
       # fetch-depth: 0 — tag resolution, per-crate diffs against BASE_TAG, and
       # cargo-semver-checks --baseline-rev all need full history.
-      - name: Checkout main
+      - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Resolve parameters
@@ -112,27 +115,28 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Preparing ${RELEASE_TAG} from ${BASE_TAG} (rc: ${IS_RC}, flags: '${NO_CRATES_FLAG}')"
 
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        id: toolchain
+        with:
+          toolchain: stable
+          cache-key: prepare-release
+          cache-on-failure: true
+          cache-save-if: false
+
       - name: Resolve the latest verified Mainnet release state
         id: release-state
         env:
           EXPECTED_TAG_DELAY_DAYS: ${{ inputs.expected_tag_delay_days }}
-          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
+          READY_URL: ${{ vars.MAINNET_RELEASE_STATE_READY_URL }}
         run: |
           set -euo pipefail
-          if [ -z "$LATEST_URL" ]; then
-            echo "Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable." >&2
-            exit 1
-          fi
           python3 .github/scripts/fetch-release-state.py --self-test
           python3 .github/scripts/import-release-state.py --self-test
           python3 scripts/release-readiness.py self-test
-          python3 .github/scripts/fetch-release-state.py \
-            --latest-url "$LATEST_URL" \
-            --output-dir "$RUNNER_TEMP/release-state-bundle" \
-            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"
+          python3 .github/scripts/release_state.py ready --state "$RUNNER_TEMP/release-state"
           report="$(
             python3 scripts/release-readiness.py height \
-              --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+              --resolution "$RUNNER_TEMP/release-state/resolution.json" \
               --expected-tag-delay-days "$EXPECTED_TAG_DELAY_DAYS"
           )"
           {
@@ -142,14 +146,26 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           jq . <<<"$report" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Record whether the selected bundle advances committed state
+        id: selection
+        run: |
+          jq -r '"has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Verify the preserved ready set
+        run: python3 .github/scripts/release_state.py verify --state "$RUNNER_TEMP/release-state"
+      - name: Validate the preserved candidate before import
+        if: inputs.release_state_waiver == '' && steps.selection.outputs.has_changes == 'true'
+        run: python3 .github/scripts/release_state.py validate --state "$RUNNER_TEMP/release-state"
+
       - name: Import the latest Mainnet release state
         if: inputs.release_state_waiver == ''
         id: release-state-import
         run: |
           set -euo pipefail
           python3 .github/scripts/import-release-state.py \
-            --bundle "$RUNNER_TEMP/release-state-bundle" \
-            --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+            --bundle "$RUNNER_TEMP/release-state/bundle" \
+            --resolution "$RUNNER_TEMP/release-state/resolution.json" \
             --result-out "$RUNNER_TEMP/release-state-import.json" \
             --no-eos-floor
           jq -r '
@@ -162,23 +178,20 @@ jobs:
             "meta_sha256=\(.meta_sha256)"
           ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
 
-      - name: Validate the imported release state
+      - name: Pin the ready asset for the imported state
         if: steps.release-state-import.outputs.has_changes == 'true'
         run: |
+          python3 .github/scripts/release_state.py pin \
+            --import-result "$RUNNER_TEMP/release-state-import.json" \
+            --state "$RUNNER_TEMP/release-state"
+
+      - name: Validate the imported release state
+        run: |
+          python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
           set -euo pipefail
           .github/scripts/validate-checkpoints.sh \
             crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
-
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
-        id: toolchain
-        with:
-          toolchain: stable
-          cache-key: prepare-release
-          cache-on-failure: true
-          # Release preparation consumes existing build caches without
-          # replacing caches warmed by regular CI.
-          cache-save-if: false
 
       # Read the registry-baseline rustdoc JSON warmed by semver-checks.yml.
       # Release preparation never saves or replaces this cache. Entries are
@@ -198,8 +211,6 @@ jobs:
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
         with:
           tool: cargo-release,cargo-semver-checks
-
-      - uses: ./.github/actions/setup-zakura-build
 
       - name: Re-prove the imported checkpoint/frontier pairing in cargo
         if: steps.release-state-import.outputs.has_changes == 'true'
@@ -477,8 +488,11 @@ jobs:
             ${{ runner.temp }}/prep-summary.json
             ${{ runner.temp }}/pr-body.md
 
+      - name: Recheck ready-set and committed-state freshness
+        run: python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
+
       - name: Create release GitHub App token
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
         with:
@@ -490,7 +504,7 @@ jobs:
       # Never hotfix/*: that namespace is reserved for the embargoed hotfix
       # process (docs/security-hotfix-release.md).
       - name: Open or update the draft pull request
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}

@@ -23,6 +23,8 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::Batch;
+use crate::primitives::fallback::Fallback;
 use futures::future::join_all;
 use orchard::{
     builder::{Builder, BundleType},
@@ -33,8 +35,6 @@ use orchard::{
     Anchor,
 };
 use tower::{Service, ServiceExt};
-use tower_batch_control::Batch;
-use tower_fallback::Fallback;
 use zakura_chain::{
     block::Block,
     parameters::NetworkUpgrade,

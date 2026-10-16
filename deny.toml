@@ -100,12 +100,6 @@ skip-tree = [
     # wait for ordered-map to release a dependency fix
     { name = "ordered-map", version = "=0.4.2" },
 
-    # wait for abscissa_core to upgrade
-    {name = "tracing-log", version = "=0.1.4" },
-
-    # wait for abscissa_core to update toml
-    { name = "toml", version = "=0.5.11" },
-
     # wait for hdrhistogram (via tower's `load` feature and console-subscriber) to update base64;
     # hdrhistogram 7.6 does, but it pulls in nom 8 alongside nom 7
     { name = "hdrhistogram", version = "=7.5.4" },
@@ -127,9 +121,6 @@ skip-tree = [
     # toml 0.9.x pulled by zakurad direct; 1.1.x by config 0.15 (also via zakurad).
     # toml 1.x is the spec-1.1 line; remove once zakurad migrates its direct dep.
     { name = "toml", version = "=0.9.12+spec-1.1.0" },
-
-    # wait for abscissa_core to update synstructure
-    { name = "synstructure", version = "=0.12.6" },
 
     { name = "windows-sys", version = "=0.52.0" },
 

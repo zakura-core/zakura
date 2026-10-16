@@ -52,6 +52,9 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
+[policy.zakura-quic]
+audit-as-crates-io = false
+
 [policy.zakura-rpc]
 audit-as-crates-io = false
 
@@ -62,12 +65,6 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.zakura-test]
-audit-as-crates-io = false
-
-[policy.zakura-tower-batch-control]
-audit-as-crates-io = false
-
-[policy.zakura-tower-fallback]
 audit-as-crates-io = false
 
 [policy.zakura-utils]

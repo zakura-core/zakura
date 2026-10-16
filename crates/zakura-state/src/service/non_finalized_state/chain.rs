@@ -43,7 +43,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::{counted_set::CountedSet, height_map::HeightMap, index::TransparentTransfers};
-use super::{AddressTransfers, CreatedUtxos};
+use super::{AddressTransfers, CreatedUtxos, SharedMap};
 
 #[cfg(test)]
 mod chunked_height_map_tests;
@@ -91,10 +91,10 @@ pub struct ChainInner {
     pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
-    pub height_by_hash: HashMap<block::Hash, block::Height>,
+    pub(crate) height_by_hash: SharedMap<block::Hash, block::Height>,
 
     /// An index of [`TransactionLocation`]s for each transaction hash in `blocks`.
-    pub tx_loc_by_hash: HashMap<transaction::Hash, TransactionLocation>,
+    pub(crate) tx_loc_by_hash: SharedMap<transaction::Hash, TransactionLocation>,
 
     // Transparent outputs and spends
     //
@@ -112,7 +112,7 @@ pub struct ChainInner {
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///
     /// Note: Spending transaction ids are only tracked when the `indexer` feature is selected.
-    pub(crate) spent_utxos: HashMap<transparent::OutPoint, SpendingTransactionId>,
+    pub(crate) spent_utxos: SharedMap<transparent::OutPoint, SpendingTransactionId>,
 
     // Note commitment trees
     //
@@ -154,7 +154,7 @@ pub struct ChainInner {
     ///
     /// When a chain is forked from the finalized tip, also contains the finalized tip tree.
     /// This extra tree is removed when the first non-finalized block is committed.
-    pub(crate) history_trees_by_height: BTreeMap<block::Height, Arc<HistoryTree>>,
+    pub(crate) history_trees_by_height: HeightMap<Arc<HistoryTree>>,
 
     // Anchors
     //
@@ -217,16 +217,16 @@ pub struct ChainInner {
     //
     /// The Sprout nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) sprout_nullifiers: HashMap<sprout::Nullifier, SpendingTransactionId>,
+    pub(crate) sprout_nullifiers: SharedMap<sprout::Nullifier, SpendingTransactionId>,
     /// The Sapling nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) sapling_nullifiers: HashMap<sapling::Nullifier, SpendingTransactionId>,
+    pub(crate) sapling_nullifiers: SharedMap<sapling::Nullifier, SpendingTransactionId>,
     /// The Orchard nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) orchard_nullifiers: HashMap<orchard::Nullifier, SpendingTransactionId>,
+    pub(crate) orchard_nullifiers: SharedMap<orchard::Nullifier, SpendingTransactionId>,
     /// The Ironwood nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
     /// the id of the transaction that revealed them.
-    pub(crate) ironwood_nullifiers: HashMap<ironwood::Nullifier, SpendingTransactionId>,
+    pub(crate) ironwood_nullifiers: SharedMap<ironwood::Nullifier, SpendingTransactionId>,
 
     // Transparent Transfers
     // TODO: move to the transparent section
@@ -255,7 +255,7 @@ pub struct ChainInner {
     /// chain value pool balances.
     pub(crate) chain_value_pools: ValueBalance<NonNegative>,
     /// The block info after the given block height.
-    pub(crate) block_info_by_height: BTreeMap<block::Height, BlockInfo>,
+    pub(crate) block_info_by_height: HeightMap<BlockInfo>,
 }
 
 impl Chain {
@@ -1327,8 +1327,7 @@ impl Chain {
         if position == RevertPosition::Root {
             // Remove all trees at or below the reverted root block.
             // This makes sure the temporary trees from finalized tip forks are removed.
-            self.history_trees_by_height
-                .retain(|index_height, _tree| *index_height > height);
+            self.history_trees_by_height.remove_through(height);
         } else {
             // Just remove the reverted tip tree.
             self.history_trees_by_height

@@ -616,16 +616,18 @@ impl Subscriber {
                     .tools
                     .claim_end(&opened.id)
                     .expect("the subscription is live");
-                assert!(
-                    is_legal(
-                        outcome.outcome,
-                        ended.pages > 0,
-                        opened.reached,
-                        ended.close_sent
-                    ),
-                    "{:?} arrived outside its window",
-                    outcome.outcome
-                );
+                // The specification's window table, kept apart from the
+                // publisher's own `is_legal`.
+                use HeadersOutcomeCode::*;
+                let legal = match outcome.outcome {
+                    NoLocatorIntersection | TargetNotRetained | TargetNotSelected => {
+                        ended.pages == 0
+                    }
+                    HistoryPruned => !opened.reached,
+                    SubscriptionSuperseded => true,
+                    SubscriptionClosed => ended.close_sent,
+                };
+                assert!(legal, "{:?} arrived outside its window", outcome.outcome);
                 Received::Ended(outcome.outcome)
             }
             other => panic!("the publisher wrote {other:?}"),

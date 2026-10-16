@@ -1825,8 +1825,14 @@ async fn follow(
 /// last header ends with `SubscriptionSuperseded`.
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
-    use super::super::{subscriber::Subscriber, test_support::status};
+    use super::super::{subscriber::Subscriber, test_support, Status};
     use crate::zakura::{regulation::WriterFence, CloseCause};
+    // The publisher's own page caps, as its `Status` advertises them.
+    let status = |tip: Frontier| Status {
+        max_headers_per_response: limits().max_headers,
+        max_message_bytes: limits().max_bytes,
+        ..test_support::status::<HB>(tip)
+    };
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1839,7 +1845,7 @@ async fn the_subscriber_follows_the_publisher() {
     );
     let open = subscriber
         .open(
-            &status::<HB>(chain[9]),
+            &status(chain[9]),
             &[chain[2], port.genesis],
             AuxSchema::None,
             6,
@@ -1871,7 +1877,7 @@ async fn the_subscriber_follows_the_publisher() {
     let tip = port.tip();
     let open = subscriber
         .open(
-            &status::<HB>(tip),
+            &status(tip),
             &[tip, chain[3], port.genesis],
             AuxSchema::None,
             6,

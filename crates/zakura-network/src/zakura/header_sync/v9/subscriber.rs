@@ -132,6 +132,9 @@ pub(crate) enum SubscriberFault {
     /// An outcome outside its window.
     #[error("{0:?} arrived outside its window")]
     OutcomeWindow(HeadersOutcomeCode),
+    /// A page above the header count or byte cap the publisher advertised.
+    #[error("the page exceeds the publisher's advertised caps")]
+    AboveAdvertised,
 }
 
 impl SubscriberFault {
@@ -148,6 +151,7 @@ impl SubscriberFault {
             Self::Marker => "marker",
             Self::SecondMarker => "second_marker",
             Self::OutcomeWindow(_) => "outcome_window",
+            Self::AboveAdvertised => "above_advertised",
         }
     }
 
@@ -196,6 +200,10 @@ struct Live {
     target: block::Hash,
     /// The target's height in the `Status` that named it.
     target_height: block::Height,
+    /// The largest page caps the publisher advertised since the `Open`. A
+    /// page follows the `Status` that allowed it on the ordered stream.
+    max_headers: u32,
+    max_bytes: u32,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
     /// The sent locator that equals the target, if any. The subscription
@@ -257,14 +265,34 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     ///
     /// A transport reader already ran this check. In-process channels have
     /// none, so this runs the same check for them.
+    ///
+    /// It also holds a page to the publisher's advertised byte cap. Only a
+    /// page can exceed a cap that the `Status` decoder accepted.
     pub(crate) fn admit(&self, frame: &Frame) -> Result<(), SubscriberFault> {
-        if self.transport_admits {
-            return Ok(());
+        let len = frame.payload.len();
+        if !self.transport_admits {
+            self.tools
+                .lock()
+                .precheck(frame.message_type, len)
+                .map_err(|fault| SubscriberFault::from(fault).counted())?;
         }
-        self.tools
-            .lock()
-            .precheck(frame.message_type, frame.payload.len())
-            .map_err(|fault| SubscriberFault::from(fault).counted())
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| len > usize::try_from(live.max_bytes).unwrap_or(usize::MAX))
+        {
+            return Err(SubscriberFault::AboveAdvertised.counted());
+        }
+        Ok(())
+    }
+
+    /// Record a later `Status` from the peer. Pages may use the largest caps
+    /// it advertised since the `Open`.
+    pub(crate) fn observe(&mut self, status: &Status) {
+        if let Some(live) = self.live.as_mut() {
+            live.max_headers = live.max_headers.max(status.max_headers_per_response);
+            live.max_bytes = live.max_bytes.max(status.max_message_bytes);
+        }
     }
 
     /// The credit window for `staging` reserved headers under `schema`: at
@@ -349,6 +377,8 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             id,
             target,
             target_height: status.selected_tip_height,
+            max_headers: status.max_headers_per_response,
+            max_bytes: status.max_message_bytes,
             locators: locators.to_vec(),
             target_locator,
             schema,
@@ -437,6 +467,9 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             .0
             .checked_add(count)
             .expect("the decoder rejects a page whose last height overflows");
+        if count > live.max_headers {
+            return Err(SubscriberFault::AboveAdvertised);
+        }
         if live.reached {
             if page.reaches_initial_target {
                 return Err(SubscriberFault::SecondMarker);

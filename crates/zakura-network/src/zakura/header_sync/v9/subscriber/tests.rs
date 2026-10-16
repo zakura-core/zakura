@@ -46,9 +46,21 @@ fn subscriber() -> Sub {
     fenced(&CancellationToken::new())
 }
 
-/// A peer `Status` that advertises `tip`.
+/// A peer `Status` that advertises `tip` and the scripted publisher's page
+/// caps.
 fn status(tip: Frontier) -> Status {
-    super::super::test_support::status::<HB>(tip)
+    Status {
+        max_headers_per_response: PAGE_HEADERS,
+        max_message_bytes: page_bytes(PAGE_HEADERS, AuxSchema::V1),
+        ..super::super::test_support::status::<HB>(tip)
+    }
+}
+
+/// Bytes of a page of `count` headers under `schema`.
+fn page_bytes(count: u32, schema: AuxSchema) -> u32 {
+    // Widening u32 to usize is lossless on supported targets.
+    u32::try_from(HEADERS_RESPONSE_FIXED_BYTES + count as usize * entry_bytes(HB, schema))
+        .expect("a small page fits u32")
 }
 
 impl HeaderTree {
@@ -160,9 +172,16 @@ struct Fixture {
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
     fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
+        Self::open_with(tree, &status(target), locators, staging)
+    }
+
+    /// Open to the tip of `status` with `locators` and `staging` reserved
+    /// headers.
+    fn open_with(tree: HeaderTree, status: &Status, locators: &[Frontier], staging: u32) -> Self {
+        let target = Frontier::new(status.selected_tip_height, status.selected_tip_hash);
         let mut sub = subscriber();
         let (open, _) = sub
-            .open(&status(target), locators, AuxSchema::None, staging)
+            .open(status, locators, AuxSchema::None, staging)
             .expect("the first Open is recorded");
         let open = wire(&open);
         Self {
@@ -567,6 +586,33 @@ fn a_path_to_the_target_height_without_it_faults() {
         fixture.page(chain[5], &[chain[6], beside[0]], false),
         Err(SubscriberFault::PastTarget)
     );
+}
+
+/// A page above the header count or bytes the publisher advertised faults,
+/// and a later `Status` that raises them lets larger pages through.
+#[test]
+fn pages_fit_the_advertised_caps() {
+    let (tree, chain) = chain(4);
+    let caps = Status {
+        max_headers_per_response: 1,
+        max_message_bytes: page_bytes(2, AuxSchema::None),
+        ..status(chain[4])
+    };
+    let mut fixture = Fixture::open_with(tree, &caps, &[chain[0]], 100);
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..3], false),
+        Err(SubscriberFault::AboveAdvertised),
+        "two headers where one was advertised"
+    );
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..4], false),
+        Err(SubscriberFault::AboveAdvertised),
+        "three headers' bytes where two were advertised"
+    );
+    fixture.sub.observe(&status(chain[4]));
+    fixture
+        .page(chain[0], &chain[1..4], false)
+        .expect("the later Status raised both caps");
 }
 
 /// Each outcome is legal exactly in its window: before the first page, before

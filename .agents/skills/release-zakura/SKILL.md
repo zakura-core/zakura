@@ -103,11 +103,18 @@ For crates.io publishing:
    runs the same script as the `crates.io publish graph` job in
    `tests-unit.yml` (part of `test success`), so a missing cascade bump
    cannot merge. It is also step 5 of `make pre-release`.
-7. Reserve any crate name the release adds. The same check fails when a
-   selected crate has never been published, blocking merge;
-   CI cannot bootstrap it, because
-   its crates.io Trusted Publishing entry lives on a crate that must already
-   exist. Publish an initial version manually and configure it before merging.
+7. Before merging a new publishable crate, create or reuse its reservation in
+   [`zakura-core/reserved`](https://github.com/zakura-core/reserved), following
+   that repository's README, and link the reservation PR from the implementation
+   PR. Publish its blank `0.0.0` placeholder from a trusted maintainer machine.
+   Ensure Sean Bowe (`ebfull`) is a crates.io co-owner: an existing owner runs
+   `cargo owner --add ebfull <crate-name>` if needed, Sean accepts the invitation,
+   and `cargo owner --list <crate-name>` must include `ebfull`. Report pending
+   invitations and owner-permission blockers explicitly; neither completes setup.
+   Configure its trusted publisher before CI publishes the implementation.
+   The required CI check blocks unpublished crate names; the reservation PR and
+   accepted co-ownership are manual review requirements. See
+   [the setup instructions](../../../docs/release-tag-protection.md#one-time-setup).
    Pending version bumps of existing crates remain allowed, and crates with
    `publish = false` are exempt. The GitHub-only override cannot bypass this gate.
 

@@ -282,16 +282,22 @@ fn arbitrary_service() -> BoxedStrategy<ZakuraServiceId> {
         .boxed()
 }
 
+/// Keeps the first item for each key.
+fn dedup_by_key<T, K: PartialEq>(items: &mut Vec<T>, key: impl Fn(&T) -> K) {
+    let mut seen = Vec::new();
+    items.retain(|item| {
+        let key = key(item);
+        let fresh = !seen.contains(&key);
+        seen.push(key);
+        fresh
+    });
+}
+
 /// Unique service ids, at most `max` of them.
 fn arbitrary_unique_services(max: usize) -> BoxedStrategy<Vec<ZakuraServiceId>> {
     proptest::collection::vec(arbitrary_service(), 0..=max)
         .prop_map(|mut services| {
-            let mut seen = Vec::new();
-            services.retain(|service| {
-                let fresh = !seen.contains(service);
-                seen.push(service.clone());
-                fresh
-            });
+            dedup_by_key(&mut services, ZakuraServiceId::clone);
             services
         })
         .boxed()
@@ -340,8 +346,7 @@ fn arbitrary_record() -> BoxedStrategy<ZakuraNodeRecord> {
                     extensions: Vec::new(),
                 };
                 let mut fixed = Vec::new();
-                super::protocol::encode_record_body_to(&body, &mut fixed)
-                    .expect("a bounded body encodes");
+                super::wire::write_record_body(&body, &mut fixed);
                 let room = MAX_NODE_RECORD_BODY_BYTES - fixed.len();
                 body.extensions = extensions;
                 body.extensions.truncate(room);
@@ -431,12 +436,7 @@ impl MessageSample for DiscoveryMessage {
                     }
                 }),
             proptest::collection::vec(arbitrary_record(), 0..=4).prop_map(|mut records| {
-                let mut seen = Vec::new();
-                records.retain(|record| {
-                    let fresh = !seen.contains(&record.body.node_id);
-                    seen.push(record.body.node_id);
-                    fresh
-                });
+                dedup_by_key(&mut records, |record| record.body.node_id);
                 Self::Peers { records }
             }),
             arbitrary_unique_services(MAX_GET_SERVICES_WANTED)
@@ -450,12 +450,7 @@ impl MessageSample for DiscoveryMessage {
                 ),
             )
                 .prop_map(|(node_id, expires_at_unix_secs, mut summaries)| {
-                    let mut seen = Vec::new();
-                    summaries.retain(|summary| {
-                        let fresh = !seen.contains(&summary.service_id);
-                        seen.push(summary.service_id.clone());
-                        fresh
-                    });
+                    dedup_by_key(&mut summaries, |summary| summary.service_id.clone());
                     Self::Services(Services {
                         node_id,
                         expires_at_unix_secs,
@@ -737,6 +732,129 @@ impl MessageSample for DiscoveryMessage {
 }
 
 message_suite!(discovery_family, DiscoveryMessage);
+
+/// The encoder refuses each message the decoder would reject, so this node
+/// never sends a frame its peers must refuse.
+#[test]
+fn the_encoder_refuses_what_the_decoder_rejects() {
+    let get_peers = |limit: u16, wanted: Vec<ZakuraServiceId>, excluded: Vec<NodeId>| {
+        DiscoveryMessage::GetPeers {
+            limit,
+            wanted_services: wanted,
+            exclude_node_ids: excluded,
+        }
+    };
+    let services = |summaries: Vec<ServiceSummaryEnvelope>| {
+        DiscoveryMessage::Services(Services {
+            node_id: node_ids()[0],
+            expires_at_unix_secs: 1,
+            summaries,
+        })
+    };
+    let envelope = |index: usize| ServiceSummaryEnvelope {
+        service_id: service_id(index, 4),
+        summary_tag: UNKNOWN_TAG,
+        summary_bytes: Vec::new(),
+    };
+    let ids = node_ids();
+    let too_many = |len: usize| (0..len).map(|index| service_id(index, 4)).collect();
+    let crossed_protocols = record(ZakuraNodeRecordBody {
+        zakura_protocol_min: 2,
+        zakura_protocol_max: 1,
+        ..shortest_body(ids[0])
+    });
+
+    let refused = [
+        ("a zero limit", get_peers(0, Vec::new(), Vec::new())),
+        (
+            "a limit above one response",
+            get_peers(
+                MAX_DISCOVERY_RECORDS_PER_RESPONSE as u16 + 1,
+                Vec::new(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "a repeated wanted service",
+            get_peers(1, vec![service_id(0, 4), service_id(0, 4)], Vec::new()),
+        ),
+        (
+            "too many wanted services",
+            get_peers(1, too_many(MAX_GET_PEERS_WANTED_SERVICES + 1), Vec::new()),
+        ),
+        (
+            "unsorted exclusions",
+            get_peers(1, Vec::new(), vec![ids[1], ids[0]]),
+        ),
+        (
+            "a repeated exclusion",
+            get_peers(1, Vec::new(), vec![ids[0], ids[0]]),
+        ),
+        (
+            "too many exclusions",
+            get_peers(
+                1,
+                Vec::new(),
+                ids[..=MAX_DISCOVERY_EXCLUDED_NODE_IDS].to_vec(),
+            ),
+        ),
+        (
+            "a repeated record",
+            DiscoveryMessage::Peers {
+                records: vec![record(shortest_body(ids[0])); 2],
+            },
+        ),
+        (
+            "too many records",
+            DiscoveryMessage::Peers {
+                records: ids[..=MAX_DISCOVERY_RECORDS_PER_RESPONSE]
+                    .iter()
+                    .map(|node_id| record(shortest_body(*node_id)))
+                    .collect(),
+            },
+        ),
+        (
+            "a crossed protocol range",
+            DiscoveryMessage::Hello {
+                record: crossed_protocols,
+            },
+        ),
+        (
+            "a repeated GetServices wanted service",
+            DiscoveryMessage::GetServices(GetServices {
+                wanted_services: vec![service_id(0, 4), service_id(0, 4)],
+            }),
+        ),
+        (
+            "too many GetServices wanted services",
+            DiscoveryMessage::GetServices(GetServices {
+                wanted_services: too_many(MAX_GET_SERVICES_WANTED + 1),
+            }),
+        ),
+        (
+            "a repeated summary",
+            services(vec![envelope(0), envelope(0)]),
+        ),
+        (
+            "too many summaries",
+            services(
+                (0..=MAX_SERVICE_SUMMARIES_PER_RESPONSE)
+                    .map(envelope)
+                    .collect(),
+            ),
+        ),
+        (
+            "an oversized summary",
+            services(vec![ServiceSummaryEnvelope {
+                summary_bytes: vec![0; MAX_SERVICE_SUMMARY_BYTES + 1],
+                ..envelope(0)
+            }]),
+        ),
+    ];
+    for (case, message) in refused {
+        assert!(encode_frame(&message).is_err(), "the encoder sent {case}");
+    }
+}
 
 #[test]
 fn the_stream_carries_exactly_the_family_rows() {

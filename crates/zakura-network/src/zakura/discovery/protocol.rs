@@ -20,6 +20,7 @@ use zakura_chain::{
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 
+use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
     canonical_ip, regulation::SlotBudget, BlockSyncStatus, ServiceAdmissionDecision,
     ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId,
@@ -135,10 +136,6 @@ pub const SUMMARY_TAG_BLOCK_SYNC_V1: u16 = 3;
 /// instead of rejecting it as a service/tag mismatch.
 pub const SUMMARY_TAG_HEADER_SYNC: u16 = 4;
 
-const SIGNATURE_BYTES: usize = 64;
-const NODE_ID_BYTES: usize = 32;
-const SOCKET_ADDR_V4: u8 = 4;
-const SOCKET_ADDR_V6: u8 = 6;
 const ZAKURA_NODE_RECORD_SIG_DOMAIN: &[u8] = b"zakura-node-record-v1";
 /// Node record encoding version, bound into the signature pre-image.
 ///
@@ -275,7 +272,7 @@ impl ZakuraNodeRecordBody {
         bytes.write_all(ZAKURA_NODE_RECORD_SIG_DOMAIN)?;
         bytes.write_u16::<LittleEndian>(ZAKURA_NODE_RECORD_FORMAT_VERSION)?;
         let body_start = bytes.len();
-        encode_record_body_to(self, &mut bytes)?;
+        write_record_body(self, &mut bytes);
         // Bound the body, not the pre-image, so every body that decodes also verifies.
         let body_len = bytes.len() - body_start;
         if body_len > MAX_NODE_RECORD_BODY_BYTES {
@@ -648,30 +645,9 @@ pub enum DiscoveryWireError {
     #[error("Zakura discovery wire I/O error: {0}")]
     Io(#[from] io::Error),
 
-    /// A length-delimited field claimed more bytes than remain in the bounded buffer.
-    #[error("Zakura discovery field declared {declared} bytes with only {remaining} remaining")]
-    TruncatedPayload {
-        /// Declared field length.
-        declared: usize,
-        /// Remaining bytes in the bounded parent buffer.
-        remaining: usize,
-    },
-
-    /// The discovery message type is unknown.
-    #[error("invalid Zakura discovery message type {0}")]
-    InvalidMessageType(u8),
-
     /// The network id is unknown.
     #[error("invalid Zakura discovery network id {0}")]
     InvalidNetworkId(u32),
-
-    /// A record address family is unknown.
-    #[error("invalid Zakura discovery socket address family {0}")]
-    InvalidAddressFamily(u8),
-
-    /// A node id did not decode into a valid Ed25519 public key.
-    #[error("invalid Zakura discovery node id")]
-    InvalidNodeId,
 
     /// A first-party live field described a different node than the authenticated peer.
     #[error("Zakura discovery {field} does not match authenticated peer node id")]
@@ -699,15 +675,6 @@ pub enum DiscoveryWireError {
         field: &'static str,
         /// Encoded value.
         value: u8,
-    },
-
-    /// A known summary tag was attached to the wrong service id.
-    #[error("Zakura discovery summary tag {summary_tag} does not match service id {service_id}")]
-    MismatchedSummaryService {
-        /// Versioned summary payload tag.
-        summary_tag: u16,
-        /// Service id from the enclosing summary envelope.
-        service_id: ZakuraServiceId,
     },
 
     /// A block height exceeded Zebra's accepted height range.
@@ -2930,11 +2897,11 @@ impl ZakuraDiscoveryBook {
                     && advertises_all_services(&entry.record, wanted_services)
             })
             .filter(|entry| {
-                let record_len = encoded_record_len(&entry.record);
-                if record_len > remaining_bytes {
+                let len = record_len(&entry.record);
+                if len > remaining_bytes {
                     return false;
                 }
-                remaining_bytes -= record_len;
+                remaining_bytes -= len;
                 true
             })
             .take(limit)
@@ -3290,7 +3257,7 @@ impl ZakuraDiscoveryBook {
             });
         }
 
-        let encoded_len = encoded_record_len(record);
+        let encoded_len = record_len(record);
         if encoded_len > self.limits.max_encoded_record_bytes {
             return Err(DiscoveryBookError::Limit {
                 field: "encoded record byte",
@@ -4023,9 +3990,6 @@ pub(super) fn validate_record_body_bounds(
             max: MAX_SERVICES_PER_RECORD,
         });
     }
-    for service in &body.services {
-        validate_service_id(service.as_str().as_bytes())?;
-    }
     if body.zakura_protocol_min > body.zakura_protocol_max {
         return Err(DiscoveryWireError::InvalidProtocolRange);
     }
@@ -4080,120 +4044,6 @@ fn validate_service_id(bytes: &[u8]) -> Result<(), DiscoveryWireError> {
 
 /// Encoded bytes of a `Peers` payload before its records: the record count.
 const PEERS_COUNT_BYTES: usize = 2;
-
-/// Returns the length [`encode_record`] writes for `record`, without encoding it.
-fn encoded_record_len(record: &ZakuraNodeRecord) -> usize {
-    let body = &record.body;
-    let addrs_len: usize = body
-        .direct_addrs
-        .iter()
-        .map(|addr| match addr {
-            SocketAddr::V4(_) => 1 + 4 + 2,
-            SocketAddr::V6(_) => 1 + 16 + 2 + 4 + 4,
-        })
-        .sum();
-    let services_len: usize = body
-        .services
-        .iter()
-        .map(|service| 2 + service.as_str().len())
-        .sum();
-    let body_len = NODE_ID_BYTES
-        + 2
-        + addrs_len
-        + 2
-        + services_len
-        + 2
-        + 2
-        + 4
-        + 32
-        + 8
-        + 8
-        + body.extensions.len();
-    4 + body_len + SIGNATURE_BYTES
-}
-
-pub(super) fn encode_record_body_to(
-    body: &ZakuraNodeRecordBody,
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
-    writer.write_all(body.node_id.as_bytes())?;
-    encode_socket_addrs(&body.direct_addrs, writer)?;
-    encode_service_ids(&body.services, writer)?;
-    writer.write_u16::<LittleEndian>(body.zakura_protocol_min)?;
-    writer.write_u16::<LittleEndian>(body.zakura_protocol_max)?;
-    writer.write_u32::<LittleEndian>(body.network_id.code())?;
-    writer.write_all(&body.chain_id)?;
-    writer.write_u64::<LittleEndian>(body.sequence)?;
-    writer.write_u64::<LittleEndian>(body.expires_at_unix_secs)?;
-    writer.write_all(&body.extensions)?;
-    Ok(())
-}
-
-fn encode_socket_addrs(
-    addrs: &[SocketAddr],
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
-    if addrs.len() > MAX_DIRECT_ADDRS_PER_RECORD {
-        return Err(DiscoveryWireError::OversizedPayload {
-            actual: addrs.len(),
-            max: MAX_DIRECT_ADDRS_PER_RECORD,
-        });
-    }
-    writer.write_u16::<LittleEndian>(u16_from_usize(addrs.len(), "direct address count")?)?;
-    for addr in addrs {
-        match addr {
-            SocketAddr::V4(addr) => {
-                writer.write_u8(SOCKET_ADDR_V4)?;
-                writer.write_all(&addr.ip().octets())?;
-                writer.write_u16::<LittleEndian>(addr.port())?;
-            }
-            SocketAddr::V6(addr) => {
-                writer.write_u8(SOCKET_ADDR_V6)?;
-                writer.write_all(&addr.ip().octets())?;
-                writer.write_u16::<LittleEndian>(addr.port())?;
-                writer.write_u32::<LittleEndian>(addr.flowinfo())?;
-                writer.write_u32::<LittleEndian>(addr.scope_id())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn encode_service_ids(
-    services: &[ZakuraServiceId],
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
-    encode_service_ids_capped(services, MAX_SERVICES_PER_RECORD, writer)
-}
-
-fn encode_service_ids_capped(
-    services: &[ZakuraServiceId],
-    max_count: usize,
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
-    if services.len() > max_count {
-        return Err(DiscoveryWireError::OversizedPayload {
-            actual: services.len(),
-            max: max_count,
-        });
-    }
-    writer.write_u16::<LittleEndian>(u16_from_usize(services.len(), "service count")?)?;
-    for service in services {
-        encode_service_id(service, writer)?;
-    }
-    Ok(())
-}
-
-fn encode_service_id(
-    service: &ZakuraServiceId,
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
-    let bytes = service.as_str().as_bytes();
-    validate_service_id(bytes)?;
-    writer.write_u16::<LittleEndian>(u16_from_usize(bytes.len(), "service id length")?)?;
-    writer.write_all(bytes)?;
-    Ok(())
-}
 
 pub(super) fn network_id_from_code(value: u32) -> Result<ZakuraNetworkId, DiscoveryWireError> {
     match value {
@@ -4410,10 +4260,6 @@ fn reject_trailing(bytes: &[u8], reader: &Cursor<&[u8]>) -> Result<(), Discovery
     Ok(())
 }
 
-fn u16_from_usize(value: usize, field: &'static str) -> Result<u16, DiscoveryWireError> {
-    u16::try_from(value).map_err(|_| DiscoveryWireError::NumericOverflow(field))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{net::IpAddr, time::Duration};
@@ -4491,7 +4337,7 @@ mod tests {
         bytes
             .write_u16::<LittleEndian>(record_format_version)
             .expect("test record format version writes");
-        encode_record_body_to(&body, &mut bytes).expect("test record body encodes");
+        write_record_body(&body, &mut bytes);
 
         let signing_key = SigningKey::from(secret_key.to_bytes());
         let signature = signing_key.sign(&bytes);
@@ -4848,7 +4694,7 @@ mod tests {
         );
 
         let mut body_bytes = Vec::new();
-        encode_record_body_to(&record.body, &mut body_bytes).expect("record body encodes");
+        write_record_body(&record.body, &mut body_bytes);
         assert_eq!(
             &signed_bytes[ZAKURA_NODE_RECORD_SIG_DOMAIN.len() + 2..],
             body_bytes.as_slice()
@@ -4863,7 +4709,7 @@ mod tests {
             usize::try_from(Cursor::new(&bytes[1..]).read_u32::<LittleEndian>().unwrap())
                 .expect("encoded record body length fits in usize");
         assert_eq!(encoded_body_len, body_bytes.len());
-        assert_eq!(bytes.len() - 1, encoded_record_len(&record));
+        assert_eq!(bytes.len() - 1, record_len(&record));
 
         let DiscoveryMessage::Hello { record: decoded } =
             DiscoveryMessage::decode(&bytes).expect("hello decodes")
@@ -4971,7 +4817,7 @@ mod tests {
         lying.write_all(node_id.as_bytes()).unwrap();
         lying.write_u64::<LittleEndian>(NOW + 30).unwrap();
         lying.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&service(1), &mut lying).unwrap();
+        super::super::wire::write_service_id(&service(1), &mut lying);
         lying.write_u16::<LittleEndian>(999).unwrap();
         lying.write_u16::<LittleEndian>(4).unwrap();
         lying.write_u8(1).unwrap();
@@ -4985,7 +4831,7 @@ mod tests {
         truncated_known.write_all(node_id.as_bytes()).unwrap();
         truncated_known.write_u64::<LittleEndian>(NOW + 30).unwrap();
         truncated_known.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&ZakuraServiceId::header_sync(), &mut truncated_known).unwrap();
+        super::super::wire::write_service_id(&ZakuraServiceId::header_sync(), &mut truncated_known);
         truncated_known
             .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC)
             .unwrap();
@@ -4998,7 +4844,7 @@ mod tests {
         truncated_block.write_all(node_id.as_bytes()).unwrap();
         truncated_block.write_u64::<LittleEndian>(NOW + 30).unwrap();
         truncated_block.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&ZakuraServiceId::block_sync(), &mut truncated_block).unwrap();
+        super::super::wire::write_service_id(&ZakuraServiceId::block_sync(), &mut truncated_block);
         truncated_block
             .write_u16::<LittleEndian>(SUMMARY_TAG_BLOCK_SYNC_V1)
             .unwrap();
@@ -5012,7 +4858,7 @@ mod tests {
         oversized.write_all(node_id.as_bytes()).unwrap();
         oversized.write_u64::<LittleEndian>(NOW + 30).unwrap();
         oversized.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&ZakuraServiceId::block_sync(), &mut oversized).unwrap();
+        super::super::wire::write_service_id(&ZakuraServiceId::block_sync(), &mut oversized);
         oversized
             .write_u16::<LittleEndian>(SUMMARY_TAG_BLOCK_SYNC_V1)
             .unwrap();
@@ -5044,7 +4890,7 @@ mod tests {
         encoded.write_all(node_id.as_bytes()).unwrap();
         encoded.write_u64::<LittleEndian>(NOW + 30).unwrap();
         encoded.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&envelope.service_id, &mut encoded).unwrap();
+        super::super::wire::write_service_id(&envelope.service_id, &mut encoded);
         encoded
             .write_u16::<LittleEndian>(envelope.summary_tag)
             .unwrap();
@@ -5513,8 +5359,10 @@ mod tests {
         mismatched_header_wire
             .write_u16::<LittleEndian>(1)
             .expect("test summary count writes");
-        encode_service_id(&ZakuraServiceId::discovery(), &mut mismatched_header_wire)
-            .expect("test service id writes");
+        super::super::wire::write_service_id(
+            &ZakuraServiceId::discovery(),
+            &mut mismatched_header_wire,
+        );
         mismatched_header_wire
             .write_u16::<LittleEndian>(SUMMARY_TAG_HEADER_SYNC)
             .expect("test summary tag writes");
@@ -5641,7 +5489,7 @@ mod tests {
             .write_u64::<LittleEndian>(NOW + 30)
             .unwrap();
         oversized_summary.write_u16::<LittleEndian>(1).unwrap();
-        encode_service_id(&service(1), &mut oversized_summary).unwrap();
+        super::super::wire::write_service_id(&service(1), &mut oversized_summary);
         oversized_summary.write_u16::<LittleEndian>(999).unwrap();
         oversized_summary
             .write_u16::<LittleEndian>(
@@ -5824,7 +5672,7 @@ mod tests {
             "a relayed record is byte-identical"
         );
 
-        assert_eq!(encoded_record_len(&record), encoded.len() - 1);
+        assert_eq!(record_len(&record), encoded.len() - 1);
 
         let mut mutated = decoded;
         mutated.body.extensions[4] ^= 1;
@@ -5835,12 +5683,13 @@ mod tests {
     }
 
     /// A record body this release cannot decode fails the whole `Peers`
-    /// message: the frame's maximum assumes every record parses.
+    /// message. New record contents go only in the extension area, so a
+    /// conformant relay never sends such a body.
     #[test]
     fn peers_message_rejects_undecodable_record_bodies() {
         fn push_record(record: &ZakuraNodeRecord, out: &mut Vec<u8>) {
             let mut body = Vec::new();
-            encode_record_body_to(&record.body, &mut body).expect("body encodes");
+            write_record_body(&record.body, &mut body);
             out.write_u32::<LittleEndian>(u32::try_from(body.len()).unwrap())
                 .unwrap();
             out.write_all(&body).unwrap();
@@ -5861,7 +5710,7 @@ mod tests {
         // A record with an address family this release does not know.
         let unknown_family = signed_record_with(3, service(3), test_addr(3));
         let mut unknown_body = Vec::new();
-        encode_record_body_to(&unknown_family.body, &mut unknown_body).expect("body encodes");
+        write_record_body(&unknown_family.body, &mut unknown_body);
         let family_offset = NODE_ID_BYTES + 2;
         assert_eq!(unknown_body[family_offset], 4);
         unknown_body[family_offset] = 9;
@@ -5911,10 +5760,10 @@ mod tests {
             let mut body = body(&secret_key);
             body.direct_addrs = vec![test_addr(index)];
             let mut body_bytes = Vec::new();
-            encode_record_body_to(&body, &mut body_bytes).expect("body encodes");
+            write_record_body(&body, &mut body_bytes);
             body.extensions = vec![index; MAX_NODE_RECORD_BODY_BYTES - body_bytes.len()];
             let record = ZakuraNodeRecord::sign(body, &secret_key).expect("record signs");
-            assert_eq!(encoded_record_len(&record), MAX_NODE_RECORD_BYTES);
+            assert_eq!(record_len(&record), MAX_NODE_RECORD_BYTES);
             book.import_record(record, Some(secret_key.public()), NOW, &context())
                 .expect("first-party record imports");
         }

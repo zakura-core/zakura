@@ -922,16 +922,16 @@ impl DiscoverySource {
         let record = (*record).clone();
         self.handle_send_result(self.send_hello(record))?;
 
-        let limit = self
-            .handle
-            .peer_sample_limit()
-            .await
-            .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        // The wire limit is 1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE, and that
-        // maximum fits in u16, so the cast cannot truncate.
+        let limit = u16::try_from(
+            self.handle
+                .peer_sample_limit()
+                .await
+                .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
+        )
+        .expect("the largest wire limit fits u16");
         let exclude_node_ids = self.handle.peer_sample_exclusions().await;
         self.handle_send_result(self.session.try_send_get_peers(
-            limit as u16,
+            limit,
             Vec::new(),
             exclude_node_ids,
         ))?;

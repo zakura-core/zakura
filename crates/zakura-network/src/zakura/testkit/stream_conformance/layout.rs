@@ -1,7 +1,8 @@
 //! What a layout's tables say about its exchanges.
 
 use crate::zakura::{
-    regulation::ResponseCap, Credit, MessageRole, MessageRule, PayloadLen, Stream,
+    regulation::{ResponseCap, SubscriptionLimits},
+    MessageRole, MessageRule, PayloadLen, Stream,
 };
 
 /// One request row's exchange, as the layout's tables declare it.
@@ -40,30 +41,13 @@ fn max_payload(payload: PayloadLen) -> u64 {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SubscriptionPlan {
     pub(crate) row: &'static MessageRule,
+    pub(crate) limits: SubscriptionLimits,
     /// The member that carries the updates.
     pub(crate) stream: usize,
     /// The member that carries the pages and the ending.
     pub(crate) response_stream: usize,
     pub(crate) page: &'static MessageRule,
     pub(crate) end: &'static MessageRule,
-}
-
-impl SubscriptionPlan {
-    /// The row's credit window.
-    pub(crate) fn credit(&self) -> Credit {
-        let MessageRole::Subscription { credit, .. } = self.row.role else {
-            unreachable!("the plan lists subscription rows");
-        };
-        credit
-    }
-
-    /// Most live or closing subscriptions the row allows one session.
-    pub(crate) fn max_live(&self) -> u32 {
-        let MessageRole::Subscription { max_live, .. } = self.row.role else {
-            unreachable!("the plan lists subscription rows");
-        };
-        max_live
-    }
 }
 
 /// The exchanges and members of one layout.
@@ -102,8 +86,8 @@ impl LayoutPlan {
             })
         };
         let subscriptions: Vec<_> = rows()
-            .filter(|(row, _)| matches!(row.role, MessageRole::Subscription { .. }))
-            .map(|(row, stream)| {
+            .filter_map(|(row, stream)| {
+                let limits = SubscriptionLimits::from_rule(row)?;
                 let &(page, response_stream) = answers(row, false)
                     .expect("the layout validator requires a page row for every subscription");
                 let &(end, end_stream) = answers(row, true)
@@ -112,13 +96,14 @@ impl LayoutPlan {
                     end_stream, response_stream,
                     "the harness publishes each subscription on one member"
                 );
-                SubscriptionPlan {
+                Some(SubscriptionPlan {
                     row,
+                    limits,
                     stream,
                     response_stream,
                     page,
                     end,
-                }
+                })
             })
             .collect();
         let requests: Vec<_> = rows()

@@ -32,7 +32,7 @@ use crate::{
             ReservationPool, Reservations, Responded, ResponseCap, ResponsePrecheck, ResponseSink,
             Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey, SessionTable,
             SharedReservations, SharedSubscriptions, SinkError, SinkProgress, SubscribeRefused,
-            SubscriptionLimits, Subscriptions, Update, WorkLease, WriterFence,
+            Subscriptions, Update, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
         CloseCause, Credit, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, Peer, Service,
@@ -197,7 +197,7 @@ impl<A: StreamConformance> LayoutSession<A> {
     ) -> Option<(u32, Option<Credit>)> {
         let index = shared.subscription_index(subscription_type);
         let plan = shared.plan.subscriptions[index];
-        let window = plan.credit();
+        let window = plan.limits.credit;
         let subscriptions = self.subscriptions[index].lock();
         let received = *subscriptions.received(&key)?;
         let room = subscriptions.grantable(&key)?;
@@ -535,47 +535,11 @@ impl<A: StreamConformance> LayoutService<A> {
         sent
     }
 
-    /// Record a `Grant` of `added` on subscription `key` of
-    /// `subscription_type` with `peer`, then write it.
-    pub(crate) async fn grant(
-        &self,
-        peer: &ZakuraPeerId,
-        subscription_type: u16,
-        key: u32,
-        added: Credit,
-    ) -> Result<(), BoxError> {
-        self.update(
-            peer,
-            subscription_type,
-            key,
-            UpdateOp::Grant,
-            |subscriptions| subscriptions.grant(&key, added),
-        )
-        .await
-    }
-
-    /// Record a `Close` of subscription `key` of `subscription_type` with
-    /// `peer`, then write it. Pages within its credit may still arrive before
-    /// its ending.
-    pub(crate) async fn close(
-        &self,
-        peer: &ZakuraPeerId,
-        subscription_type: u16,
-        key: u32,
-    ) -> Result<(), BoxError> {
-        self.update(
-            peer,
-            subscription_type,
-            key,
-            UpdateOp::Close,
-            |subscriptions| subscriptions.close(&key),
-        )
-        .await
-    }
-
-    /// Record an `op` update of subscription `key` with `record`, then write
-    /// it on the subscription row's member.
-    async fn update(
+    /// Record an `op` update of subscription `key` with `record`, such as
+    /// `Subscriptions::grant` or `Subscriptions::close`, then write it on the
+    /// subscription row's member. After a `Close`, pages within the credit may
+    /// still arrive before the ending.
+    pub(crate) async fn update(
         &self,
         peer: &ZakuraPeerId,
         subscription_type: u16,
@@ -595,7 +559,7 @@ impl<A: StreamConformance> LayoutService<A> {
 }
 
 /// Encode `update` of subscription `key` as an `op` update on `row`.
-fn encode_update<A: StreamConformance>(
+pub(crate) fn encode_update<A: StreamConformance>(
     row: &MessageRule,
     op: UpdateOp,
     key: u32,
@@ -681,9 +645,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .subscriptions
             .iter()
             .map(|plan| {
-                let limits = SubscriptionLimits::from_rule(plan.row)
-                    .expect("the plan lists subscription rows");
-                SharedSubscriptions::new(Subscriptions::new(limits, A::Message::RULES))
+                SharedSubscriptions::new(Subscriptions::new(plan.limits, A::Message::RULES))
             })
             .collect();
         let prechecks = shared
@@ -738,10 +700,8 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .iter()
             .zip(&shared.pushing)
             .map(|(plan, capacity)| {
-                let limits = SubscriptionLimits::from_rule(plan.row)
-                    .expect("the plan lists subscription rows");
                 let publisher = Publisher {
-                    publications: Arc::new(Mutex::new(Publications::new(limits))),
+                    publications: Arc::new(Mutex::new(Publications::new(plan.limits))),
                     wake: Arc::new(Notify::new()),
                 };
                 tokio::spawn(publish(

@@ -5,55 +5,22 @@
 //! cursor ring, and tombstones. This module adds what only header sync knows:
 //! which headers each page carries, and when a subscription ends.
 //!
-//! # One task per session
-//!
-//! One task writes every page and terminal outcome of a session, so an outcome
+//! One task per session writes every page and terminal outcome, so an outcome
 //! always follows its subscription's pages. [`Publisher::apply`] applies each
-//! update under a short lock and wakes the task. The task holds at most one
-//! page in progress, so a `Grant` never queues page jobs. A `Close` ends its
+//! update under a short lock and wakes the task, which holds at most one page
+//! in progress, so a `Grant` never queues page jobs. A `Close` ends its
 //! subscription on the next wake and abandons that subscription's page in
-//! progress. The terminal outcome needs no credit, output grant, or execution
-//! slot, so `Close` never waits for a serving worker or for output.
+//! progress. Its terminal outcome waits for no credit or output, as
+//! [`TerminalPermit::send`] describes.
 //!
-//! # Pages
-//!
-//! A page waits for the budgets of a served response through [`Push`], then a
-//! spawned job reads it from state while holding the permit. The job keeps the
-//! permit until the state read finishes, even if the session ends first. A
-//! page carries at most the advertised header and byte limits and the unspent
-//! credit, and at least one header.
-//!
-//! The path to the initial target comes from the retained-path leases in
-//! [`Port`]: one lease per page, acquired and read back to back. The first
-//! page acquires with the `Open` locators. Each later page acquires with the
+//! Pages come from the retained-path leases in [`Port`], one lease per page,
+//! acquired and read back to back. Each page after the first acquires with the
 //! last header sent as its only locator, which state's continuation index
-//! answers without a new ancestry walk. A lease's idle deadline therefore
-//! covers only one read, and a lost lease is acquired again from the last
-//! header sent. No subscription ends because a lease expired.
-//!
-//! After the target, the publisher follows [`Port::selected_chain`]. It leases
-//! the path from the last header sent to the selected tip, which also checks
-//! that the selected chain still extends that header. If it does not, the
-//! subscription ends with `SubscriptionSuperseded`. A page whose selected tip
-//! moved while it was in progress is checked again before it is sent, and
-//! read again if it left the selected chain.
-//!
-//! # Waits and outcomes
-//!
-//! Version 9 has no `Busy`. When state refuses a lease for capacity, the
-//! subscription waits for that capacity's release signal. Other local
-//! failures wait for the next update or selected-chain change. Neither sends
-//! anything, and neither uses a timer.
-//!
-//! A schema-1 subscription needs a record for every header. A page stops
-//! before the first header that has none, and a subscription whose next
-//! header has none waits, because a page's schema must match its
-//! subscription.
-//!
-//! Every outcome is adjusted into its legal window before it is queued: a
-//! lease result that is legal only before the first page becomes
-//! `HistoryPruned` after it, and every failure after the initial target
-//! becomes `SubscriptionSuperseded`.
+//! answers without a new ancestry walk. So a lease's idle deadline covers one
+//! read, and no subscription ends because a lease expired. After the initial
+//! target, the leases run from the last header sent to the tip of
+//! [`Port::selected_chain`]. Local failures wait for an update, a
+//! selected-chain change, or a capacity release, never for a timer.
 
 use std::{
     collections::BTreeMap,
@@ -835,8 +802,9 @@ async fn any_released(signals: Vec<ServingCapacitySignal>) {
 /// Start one page: wait for its budgets, run its job holding them, then
 /// reserve its transport slot.
 ///
-/// A following page whose selected tip moved meanwhile is checked against
-/// `selected` before it is sent; see [`still_selected`].
+/// The job keeps its permit until the state read finishes, even if the
+/// session ends first. A following page whose selected tip moved meanwhile is
+/// checked by [`still_selected`] before it is sent.
 fn start_page<'a, const HEADER_BYTES: usize>(
     task: &Task,
     job: Job,
@@ -858,8 +826,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         });
         let (output, permit): (Output, PushPermit) = match running.await {
             Ok(done) => done,
-            // Only a local bug panics a job. Stalling would leave the
-            // subscription half live, so the publisher task panics too.
+            // See `Publisher::spawn`.
             Err(error) if error.is_panic() => {
                 tracing::error!(
                     subscription_id = id,
@@ -1111,8 +1078,11 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
     }
 }
 
-/// Build and encode `job`'s page from a state page. A schema-1 page stops
-/// before the first header without a record.
+/// Build and encode `job`'s page from a state page.
+///
+/// A schema-1 page stops before the first header without a record. With none
+/// for its first header, the subscription waits, because a page's schema must
+/// match its subscription.
 fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPage) -> Output {
     let count = page.headers.len();
     // Widening u32 to usize is lossless on supported targets.

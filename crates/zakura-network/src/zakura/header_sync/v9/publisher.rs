@@ -271,25 +271,6 @@ impl Publisher {
     }
 }
 
-#[cfg(test)]
-impl Publisher {
-    /// Live or closing subscriptions, tombstones, and `Open`s admitted above
-    /// the limit, as the subscription tools count them.
-    fn tally(&self) -> (usize, usize, u64) {
-        let shared = lock(&self.shared);
-        (
-            shared.publications.keys().count(),
-            shared.publications.tombstones(),
-            shared.publications.over_limit_count(),
-        )
-    }
-
-    /// Unacknowledged pages of `id`, if it is live.
-    fn unacknowledged(&self, id: u64) -> Option<usize> {
-        lock(&self.shared).publications.unacknowledged(&id)
-    }
-}
-
 impl Shared {
     /// Check `update` and apply it to the subscription tools. A refused
     /// update changes nothing.

@@ -645,30 +645,21 @@ fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("a 32-byte peer ID is valid")
 }
 
-/// Start a publisher for `peer` on `capacity`.
+/// Start a publisher for `peer` on `capacity`, writing to a transport queue
+/// of `queue` frames.
 fn session(
     port: &Arc<FakePort>,
     capacity: &ServeCapacity,
     peer: &ZakuraPeerId,
     session_id: u64,
-) -> (Publisher, FramedRecv, CancellationToken) {
-    let (publisher, recv, cancel, _task) = session_with_task(port, capacity, peer, session_id);
-    (publisher, recv, cancel)
-}
-
-/// Start a publisher for `peer` on `capacity`, and keep its task handle.
-fn session_with_task(
-    port: &Arc<FakePort>,
-    capacity: &ServeCapacity,
-    peer: &ZakuraPeerId,
-    session_id: u64,
+    queue: usize,
 ) -> (
     Publisher,
     FramedRecv,
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let (send, recv) = framed_channel(64);
+    let (send, recv) = framed_channel(queue);
     let cancel = CancellationToken::new();
     let (publisher, task) = Publisher::spawn::<HB>(
         port.clone(),
@@ -684,12 +675,29 @@ fn session_with_task(
     (publisher, recv, cancel, task)
 }
 
+impl Publisher {
+    /// Live or closing subscriptions and tombstones, as the subscription
+    /// tools count them.
+    fn tally(&self) -> (usize, usize) {
+        let shared = lock(&self.shared);
+        (
+            shared.publications.keys().count(),
+            shared.publications.tombstones(),
+        )
+    }
+
+    /// Unacknowledged pages of `id`, if it is live.
+    fn unacknowledged(&self, id: u64) -> Option<usize> {
+        lock(&self.shared).publications.unacknowledged(&id)
+    }
+}
+
 impl Harness {
     /// A publisher over `port` with `serve` budgets.
     fn new(port: Arc<FakePort>, serve: ServeLimits) -> Self {
         let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
             .expect("the test budgets are valid");
-        let (publisher, recv, cancel) = session(&port, &capacity, &peer(7), 1);
+        let (publisher, recv, cancel, _task) = session(&port, &capacity, &peer(7), 1, 64);
         Self {
             port,
             capacity,
@@ -755,7 +763,7 @@ impl Harness {
         );
         assert_eq!(self.capacity.node_execution_held(), 0);
         assert_eq!(self.capacity.node_output_held(), 0);
-        let (live, tombstones, _) = self.publisher.tally();
+        let (live, tombstones) = self.publisher.tally();
         assert!(live <= 2 && tombstones <= 2);
     }
 }
@@ -1050,7 +1058,7 @@ async fn a_page_job_panic_reaches_the_session_owner() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
-    let (publisher, _recv, _cancel, task) = session_with_task(&port, &capacity, &peer(7), 1);
+    let (publisher, _recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1069,19 +1077,7 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
     // One slot, which the first page fills because nobody reads it.
-    let (send, _recv) = framed_channel(1);
-    let cancel = CancellationToken::new();
-    let (publisher, task) = Publisher::spawn::<HB>(
-        port.clone(),
-        capacity.push(&peer(7)),
-        send,
-        LeaseOwner {
-            peer: SourceId::from_digest(peer(7).digest()),
-            session_id: 1,
-        },
-        limits(),
-        cancel.clone(),
-    );
+    let (publisher, _recv, cancel, task) = session(&port, &capacity, &peer(7), 1, 1);
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1158,8 +1154,8 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
     // Another peer's page queues for that slot, then blocks in its own read.
     let other_port = FakePort::new(0);
     let other_chain = other_port.grow(1);
-    let (other, mut other_recv, _other_cancel) =
-        session(&other_port, &harness.capacity, &peer(9), 1);
+    let (other, mut other_recv, _other_cancel, _other_task) =
+        session(&other_port, &harness.capacity, &peer(9), 1, 64);
     let mut other_subscriber = Subscriber::new();
     let open = other_subscriber.open(
         other_chain[0].hash,
@@ -1393,8 +1389,8 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
     let mut sessions = Vec::new();
     for round in 0..4_u8 {
         let peer = peer(10 + round % 2);
-        let (publisher, recv, cancel) =
-            session(&port, &harness.capacity, &peer, u64::from(round) + 2);
+        let (publisher, recv, cancel, _task) =
+            session(&port, &harness.capacity, &peer, u64::from(round) + 2, 64);
         let mut subscriber = Subscriber::new();
         let open = subscriber.open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None);
         publisher.apply(&open).await.expect("the Open applies");

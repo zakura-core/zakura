@@ -118,11 +118,18 @@ impl<V: Clone> HeightMap<V> {
     pub(super) fn entry(&mut self, height: Height) -> Entry<'_, V> {
         Entry { map: self, height }
     }
-    #[cfg(test)]
-    fn remove_through(&mut self, height: Height) {
-        let keys: Vec<_> = self.range(..=height).map(|(key, _)| *key).collect();
-        for key in keys {
-            self.remove(&key);
+    /// Removes every entry at or below `height`, copying at most the boundary chunk.
+    pub(super) fn remove_through(&mut self, height: Height) {
+        let boundary_chunk_id = height.0 / HEIGHTS_PER_CHUNK;
+        // Keep the boundary chunk and every chunk above it, and drop the chunks below it.
+        self.chunks = self.chunks.split_off(&boundary_chunk_id);
+        if let Some(chunk) = self.chunks.get_mut(&boundary_chunk_id) {
+            if chunk.range(..=height).next().is_some() {
+                Arc::make_mut(chunk).retain(|key, _| *key > height);
+            }
+            if chunk.is_empty() {
+                self.chunks.remove(&boundary_chunk_id);
+            }
         }
     }
     #[cfg(test)]

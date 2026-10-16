@@ -4,7 +4,7 @@
 //! stale address queries. A durable marker preserves this across restarts and rollback.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -36,7 +36,7 @@ use crate::{
             CheckpointVerifiedBlock, FinalizedState, ZakuraDb, PRUNING_METADATA,
             STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        non_finalized_state::CreatedUtxos,
+        non_finalized_state::{CreatedUtxos, SharedMap},
     },
     ContextuallyVerifiedBlock, ReadRequest, ReadResponse, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateInitError,
@@ -190,7 +190,7 @@ fn commit_contextual(state: &mut FinalizedState, block: Arc<Block>) {
     let spent_utxos = check::utxo::transparent_spend(
         &semantically_verified,
         &CreatedUtxos::default(),
-        &HashMap::new(),
+        &SharedMap::default(),
         &state.db,
     )
     .expect("the test block only spends valid finalized outputs");
@@ -240,7 +240,7 @@ fn check_spends(
     all_transactions.extend(transactions);
     let block = SemanticallyVerifiedBlock::from(child_block(parent, all_transactions));
 
-    check::utxo::transparent_spend(&block, &CreatedUtxos::default(), &HashMap::new(), db)
+    check::utxo::transparent_spend(&block, &CreatedUtxos::default(), &SharedMap::default(), db)
         .map(|spent| spent.into_keys().collect())
 }
 

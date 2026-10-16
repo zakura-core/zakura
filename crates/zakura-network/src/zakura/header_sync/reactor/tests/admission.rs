@@ -860,16 +860,19 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
 
 #[test]
 fn retiring_repair_reopens_refill_at_the_batch_boundary() {
-    assert_retiring_repair_reopens_refill(400);
+    assert_retiring_repair_reopens_refill(400, false);
 }
 
 #[test]
 fn retiring_repair_preserves_refill_above_the_batch_boundary() {
-    assert_retiring_repair_reopens_refill(401);
+    assert_retiring_repair_reopens_refill(401, true);
 }
 
 /// Exercise a real repair reservation without another peer status or header authority change.
-fn assert_retiring_repair_reopens_refill(initial_window: u32) {
+///
+/// `window_open` says whether the initial body window admits an ordinary request. A closed
+/// window leaves the status unspent instead of spending a locator read on it.
+fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool) {
     let frontier = |height: u32| {
         let mut hash = [0; 32];
         hash[..4].copy_from_slice(&height.to_le_bytes());
@@ -915,11 +918,15 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
         }),
     );
-    assert!(matches!(
-        actions.try_recv().unwrap(),
-        HeaderPortOperation::QueryHeaderLocator { .. }
-    ));
-    // The repair takes the peer slot while the ordinary locator query is outstanding.
+    if window_open {
+        assert!(matches!(
+            actions.try_recv().unwrap(),
+            HeaderPortOperation::QueryHeaderLocator { .. }
+        ));
+    } else {
+        assert!(actions.try_recv().is_err());
+    }
+    // The repair takes the peer slot, including any outstanding ordinary locator query.
     let selected: Vec<_> = (500..901).map(frontier).collect();
     let context = zakura_header_chain::VctRepairContext::from_durable_rows(
         selected[0],

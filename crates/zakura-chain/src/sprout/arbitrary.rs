@@ -5,7 +5,7 @@ use crate::{
     primitives::ZkSnarkProof,
 };
 
-use super::{commitment, joinsplit, note, tree, JoinSplit};
+use super::{commitment, joinsplit, keys, note, tree, JoinSplit};
 
 impl<P: ZkSnarkProof + Arbitrary + 'static> Arbitrary for JoinSplit<P> {
     type Parameters = ();
@@ -42,7 +42,7 @@ impl<P: ZkSnarkProof + Arbitrary + 'static> Arbitrary for JoinSplit<P> {
                         anchor,
                         nullifiers,
                         commitments,
-                        ephemeral_key: x25519_dalek::PublicKey::from(ephemeral_key_bytes),
+                        ephemeral_key: keys::EphemeralPublicKey::from(ephemeral_key_bytes),
                         random_seed,
                         vmacs,
                         zkproof,

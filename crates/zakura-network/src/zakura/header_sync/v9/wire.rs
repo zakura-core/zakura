@@ -209,6 +209,14 @@ pub(crate) const fn smallest_page(header_bytes: usize, schema: AuxSchema) -> usi
     HEADERS_RESPONSE_FIXED_BYTES + entry_bytes(header_bytes, schema)
 }
 
+/// The most headers a page under `schema` holds within `max_bytes`, on a
+/// network whose headers take `header_bytes`.
+pub(crate) fn page_capacity(header_bytes: usize, schema: AuxSchema, max_bytes: usize) -> u32 {
+    let count =
+        max_bytes.saturating_sub(HEADERS_RESPONSE_FIXED_BYTES) / entry_bytes(header_bytes, schema);
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// The `Headers` row's maximum: the largest page under either schema that
 /// fits [`MAX_HS_MESSAGE_BYTES`] and [`MAX_HS_RANGE`] headers.
 pub(crate) const fn largest_page(header_bytes: usize) -> usize {
@@ -244,6 +252,15 @@ pub(crate) type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
 const _: () = Stream::validate_layout(&CommonMessage::LAYOUT);
 const _: () = Stream::validate_layout(&RegtestMessage::LAYOUT);
 
+/// The version 9 rows of a network whose headers take `header_bytes`.
+pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
+    if header_bytes == REGTEST_HEADER_BYTES {
+        &RegtestMessage::ROWS
+    } else {
+        &CommonMessage::ROWS
+    }
+}
+
 /// The version 9 layout for `network`, chosen by its header size.
 pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
     if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
@@ -255,7 +272,7 @@ pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [S
 
 /// A `Status` advertisement: the sender's frontier and serving caps.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Status {
+pub struct Status {
     /// Height of the sender's finality anchor, excluded from the suffix work.
     pub(crate) work_anchor_height: block::Height,
     /// Hash of the work anchor.
@@ -282,7 +299,7 @@ pub(crate) struct Status {
 
 /// A `SubscribeHeaders` operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Operation {
+pub enum Operation {
     /// Opens a subscription with its locators and first credit.
     Open = 0,
     /// Acknowledges a cursor and adds credit.
@@ -294,7 +311,7 @@ pub(crate) enum Operation {
 
 /// A subscription cursor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Cursor {
+pub struct Cursor {
     /// Height of the last accepted header, or of the first locator.
     pub(crate) height: block::Height,
     /// Hash of that header.
@@ -307,7 +324,7 @@ pub(crate) struct Cursor {
 
 /// One subscription update.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SubscribeHeaders {
+pub struct SubscribeHeaders {
     /// What the update does.
     pub(crate) operation: Operation,
     /// Nonzero subscription identifier.
@@ -329,7 +346,7 @@ pub(crate) struct SubscribeHeaders {
 
 /// One pushed page of headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Headers {
+pub struct Headers {
     /// Nonzero subscription identifier.
     pub(crate) subscription_id: u64,
     /// The subscription's initial target.
@@ -349,7 +366,7 @@ pub(crate) struct Headers {
 
 /// Why a subscription ended.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HeadersOutcomeCode {
+pub enum HeadersOutcomeCode {
     /// The publisher no longer retains the initial target.
     TargetNotRetained = 1,
     /// No locator hash lies on the target path.
@@ -381,7 +398,7 @@ impl HeadersOutcomeCode {
 
 /// A subscription's terminal outcome.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HeadersOutcome {
+pub struct HeadersOutcome {
     /// Nonzero subscription identifier.
     pub(crate) subscription_id: u64,
     /// The subscription's initial target.

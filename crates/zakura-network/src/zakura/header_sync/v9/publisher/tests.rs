@@ -188,7 +188,7 @@ impl Store {
 }
 
 /// A port over a [`Store`], with a selected chain the test moves.
-struct FakePort {
+pub(crate) struct FakePort {
     key: AdapterKey,
     store: Mutex<Store>,
     genesis: Frontier,
@@ -204,7 +204,7 @@ struct FakePort {
 impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
-    fn new(gate: usize) -> Arc<Self> {
+    pub(crate) fn new(gate: usize) -> Arc<Self> {
         let store = Store::default();
         let genesis = store.tree.genesis;
         Arc::new(Self {
@@ -244,7 +244,7 @@ impl FakePort {
     }
 
     /// Extend the selected chain by `count` headers and select the new tip.
-    fn grow(&self, count: u32) -> Vec<Frontier> {
+    pub(crate) fn grow(&self, count: u32) -> Vec<Frontier> {
         let added = self.store().tree.extend(self.tip(), count);
         if let Some(&tip) = added.last() {
             self.select(tip);
@@ -1779,7 +1779,7 @@ proptest! {
 /// validated and applying each due `Grant`.
 async fn follow(
     harness: &mut Harness,
-    subscriber: &mut super::super::subscriber::Subscriber<HB>,
+    subscriber: &mut super::super::subscriber::Subscriber,
     staging: u32,
 ) -> Vec<Received> {
     let mut received = Vec::new();
@@ -1836,7 +1836,7 @@ async fn the_subscriber_follows_the_publisher() {
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
-    let mut subscriber = Subscriber::<HB>::new();
+    let mut subscriber = Subscriber::new(HB);
     let open = subscriber
         .open(
             &status::<HB>(chain[9]),

@@ -1,26 +1,41 @@
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError},
 };
 
+#[cfg(any(test, feature = "zakura-testkit"))]
+use tokio::sync::mpsc;
 use tokio::{
-    sync::{mpsc, watch},
-    task,
+    sync::watch,
+    task::{self, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
-use zakura_chain::block;
+use zakura_header_chain::Frontier;
 
-use super::{events::*, pipe::run_peer, wire::*};
+use super::{
+    config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
+    events::*,
+    pipe::run_peer,
+    v9::{
+        CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeHeaders, Subscriber,
+    },
+    wire::*,
+    Status,
+};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, CloseCause, Frame, FramedRecv,
-    FramedSend, OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerDirection,
-    SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream, ZakuraConnId,
-    ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
+    handle_pipe_exit,
+    regulation::{
+        CadenceSendError, CadenceSender, Current, Replacement, SessionKey, SessionTable,
+        WriterFence,
+    },
+    spawn_supervised_pipe,
+    transport::{FrameGuard, GuardedFrameSlot, GuardedReserveError},
+    wire_codec::encode_frame,
+    BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
+    ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
+    ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// Conservative re-offer delay when header sync publishes no peer backoff deadline.
@@ -32,6 +47,8 @@ mod stream_tests {
     use crate::zakura::{header_sync::v9, StreamQueueDepths};
     use zakura_chain::parameters::Network;
 
+    /// Both header sizes declare stream 5 at version 9 under bit 10 alone,
+    /// with at least two queue slots each way.
     #[test]
     fn declares_only_capability_bit_ten_at_stream_version_nine() {
         assert_eq!(ZAKURA_CAP_HEADER_SYNC, 1 << 10);
@@ -67,34 +84,51 @@ struct PeerSessionInner {
     cancel_token: CancellationToken,
     connection_cancel_token: CancellationToken,
     close_cause: CloseCause,
-    commands: Option<mpsc::UnboundedSender<PeerCommand>>,
-    next_request_id: AtomicU64,
+    /// The subscription this session holds on the peer.
+    subscriber: StdMutex<Subscriber>,
+    /// Fences this session's `Open`, so retiring the session cannot orphan a
+    /// subscription that the peer still serves.
+    fence: WriterFence,
+    /// The connection's `Status` cadence.
+    status: StatusCadence,
 }
 
+/// One connection's `Status` cadence, which every session of the connection
+/// shares, so a reopened stream cannot reset it. `Status` rows match on every
+/// network.
+type StatusCadence = Arc<StdMutex<CadenceSender<CommonMessage>>>;
+
 impl PeerSession {
-    fn new_with_commands(
-        session: &PeerStreamSession,
-        direction: ServicePeerDirection,
-        commands: mpsc::UnboundedSender<PeerCommand>,
+    /// A session for `peer_id` that sends through `send`, subscribes with
+    /// `subscriber` under `fence`, and shares its connection's `status`
+    /// cadence.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        peer_id: ZakuraPeerId,
         session_id: u64,
+        direction: ServicePeerDirection,
+        send: FramedSend,
+        cancel_token: CancellationToken,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
+        subscriber: Subscriber,
+        fence: WriterFence,
+        status: StatusCadence,
     ) -> Self {
-        debug_assert_eq!(
-            session.stream_version(),
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            "transport admits only the canonical header-sync stream version"
-        );
-        Self::from_parts_with_direction_and_commands(
-            session.peer_id().clone(),
+        Self {
+            peer_id,
             session_id,
             direction,
-            session.sender(),
-            session.cancel_token(),
-            connection_cancel_token,
-            close_cause,
-            Some(commands),
-        )
+            inner: Arc::new(PeerSessionInner {
+                send,
+                cancel_token,
+                connection_cancel_token,
+                close_cause,
+                subscriber: StdMutex::new(subscriber),
+                fence,
+                status,
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -113,7 +147,7 @@ impl PeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::for_test(
             peer_id,
             session_id,
             ServicePeerDirection::Inbound,
@@ -121,7 +155,6 @@ impl PeerSession {
             cancel_token.clone(),
             cancel_token,
             CloseCause::new(),
-            None,
         )
     }
 
@@ -134,7 +167,7 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::for_test(
             peer_id,
             session_id,
             ServicePeerDirection::Inbound,
@@ -142,7 +175,6 @@ impl PeerSession {
             service_cancel_token,
             connection_cancel_token,
             close_cause,
-            None,
         )
     }
 
@@ -153,7 +185,7 @@ impl PeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::for_test(
             peer_id,
             0,
             direction,
@@ -161,12 +193,12 @@ impl PeerSession {
             cancel_token.clone(),
             cancel_token,
             CloseCause::new(),
-            None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_parts_with_direction_and_commands(
+    /// A Regtest session with its own fence and `Status` cadence.
+    #[cfg(test)]
+    fn for_test(
         peer_id: ZakuraPeerId,
         session_id: u64,
         direction: ServicePeerDirection,
@@ -174,21 +206,20 @@ impl PeerSession {
         cancel_token: CancellationToken,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
-        commands: Option<mpsc::UnboundedSender<PeerCommand>>,
     ) -> Self {
-        Self {
+        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        Self::new(
             peer_id,
             session_id,
             direction,
-            inner: Arc::new(PeerSessionInner {
-                send,
-                cancel_token,
-                connection_cancel_token,
-                close_cause,
-                commands,
-                next_request_id: AtomicU64::new(1),
-            }),
-        }
+            send,
+            cancel_token,
+            connection_cancel_token,
+            close_cause,
+            Subscriber::new(REGTEST_HEADER_BYTES),
+            fence,
+            Arc::new(StdMutex::new(CadenceSender::new())),
+        )
     }
 
     /// Authenticated peer identity.
@@ -226,130 +257,126 @@ impl PeerSession {
         self.inner.send.max_capacity()
     }
 
-    fn next_request_id(&self) -> Result<HeaderSyncRequestId, OrderedSendError> {
-        let mut id = self.inner.next_request_id.load(Ordering::Relaxed);
-        loop {
-            let next_id = id.checked_add(1).ok_or_else(|| {
-                OrderedSendError::Encode("header-sync request ID counter exhausted".into())
-            })?;
-            match self.inner.next_request_id.compare_exchange_weak(
-                id,
-                next_id,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => id = current,
-            }
+    /// Lock this session's subscriber. No holder panics, so the lock is never
+    /// poisoned.
+    pub(super) fn subscriber(&self) -> MutexGuard<'_, Subscriber> {
+        self.inner
+            .subscriber
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queue `status` under the connection's cadence. `Full` means the cadence
+    /// or the queue holds it back, and it waits as the latest value.
+    pub(super) fn try_send_status(&self, status: Status) -> Result<(), OrderedSendError> {
+        let mut cadence = self
+            .inner
+            .status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cadence
+            .update(CommonMessage::Status(status))
+            .map_err(|error| OrderedSendError::Encode(error.into()))?;
+        match cadence.send_due(&self.inner.send) {
+            Ok(0) => Err(OrderedSendError::Full),
+            Ok(_) => Ok(()),
+            Err(CadenceSendError::Closed) => Err(OrderedSendError::Closed),
+            Err(error) => Err(OrderedSendError::Encode(error.into())),
         }
-        HeaderSyncRequestId::new(id).ok_or_else(|| {
-            OrderedSendError::Encode("header-sync request ID counter exhausted".into())
-        })
     }
 
-    pub(super) fn try_send_status(
+    /// Record an `Open` toward the selected tip of `status`, granting the
+    /// window for `staging` reserved headers, and queue it under the session's
+    /// fence. Returns the subscription ID.
+    ///
+    /// Nothing is recorded unless the queue has a slot.
+    pub(super) fn try_open(
         &self,
-        codec: &HeaderSyncCodec,
-        status: Status,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send(codec, HeaderSyncMessage::Status(status))
-    }
-
-    pub(super) fn try_send_get_headers(
-        &self,
-        codec: &HeaderSyncCodec,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        target_tip_hash: block::Hash,
-        locator: &zakura_header_chain::HeaderLocator,
-        max_header_count: u32,
-        tree_aux_schema: AuxSchema,
+        status: &Status,
+        locators: &[Frontier],
+        schema: AuxSchema,
+        staging: u32,
     ) -> Result<HeaderSyncRequestId, OrderedSendError> {
-        let request_id = self.next_request_id()?;
-        let message = HeaderSyncMessage::GetHeaders(GetHeaders {
-            request_id: request_id.get(),
-            target_tip_hash,
-            locator_hashes: locator.hashes(),
-            max_header_count,
-            tree_aux_schema,
-        });
-        let frame = codec
-            .encode_frame(&message)
-            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        let expected = ExpectedHeadersResponse {
-            request_id,
-            scope,
-            context: HeaderSyncDecodeContext {
-                max_header_count,
-                requested_tree_aux_schema: tree_aux_schema,
-            },
+        let slot = self.reserve()?;
+        let exchange = self.inner.fence.open().ok_or(OrderedSendError::Closed)?;
+        let writer = exchange.writer();
+        let mut subscriber = self.subscriber();
+        let update = subscriber
+            .open_fenced(status, locators, schema, staging, exchange)
+            .map_err(|error| OrderedSendError::Encode(error.into()))?;
+        let id = update.subscription_id;
+        if slot
+            .send_fenced(update_frame(subscriber.header_bytes(), update), &writer)
+            .is_err()
+        {
+            // The fence skipped the frame before its first byte.
+            subscriber.retract(id);
+            return Err(OrderedSendError::Closed);
+        }
+        Ok(HeaderSyncRequestId::new(id).expect("subscription IDs are nonzero"))
+    }
+
+    /// Record a `Grant` that refills the window for `staging` reserved
+    /// headers, and queue it, if one is due. Returns whether it queued one.
+    pub(super) fn try_grant(&self, staging: u32) -> Result<bool, OrderedSendError> {
+        let slot = self.reserve()?;
+        let mut subscriber = self.subscriber();
+        let Some(update) = subscriber.grant_due(staging) else {
+            return Ok(false);
         };
-        if let Some(commands) = &self.inner.commands {
-            commands
-                .send(PeerCommand::Reserve(expected))
-                .map_err(|_| OrderedSendError::Closed)?;
-        }
-        let result = match self.inner.send.try_send(frame) {
-            Ok(()) => Ok(request_id),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(OrderedSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(OrderedSendError::Closed),
+        slot.send(
+            update_frame(subscriber.header_bytes(), update),
+            FrameGuard::new(Arc::new(())),
+        );
+        Ok(true)
+    }
+
+    /// Record a `Close` of the live subscription and queue it, unless it is
+    /// already closing. Returns whether it queued one. Pages within the
+    /// granted credit still arrive until the terminal outcome.
+    pub(super) fn try_close(&self) -> Result<bool, OrderedSendError> {
+        let slot = self.reserve()?;
+        let mut subscriber = self.subscriber();
+        let Ok(update) = subscriber.close() else {
+            return Ok(false);
         };
-        if result.is_err() {
-            if let Some(commands) = &self.inner.commands {
-                let _ = commands.send(PeerCommand::Cancel(request_id));
-            }
-        }
-        result
+        slot.send(
+            update_frame(subscriber.header_bytes(), update),
+            FrameGuard::new(Arc::new(())),
+        );
+        Ok(true)
     }
 
-    pub(super) fn cancel_request(&self, request_id: HeaderSyncRequestId) {
-        if let Some(commands) = &self.inner.commands {
-            let _ = commands.send(PeerCommand::Cancel(request_id));
-        }
+    /// Record that every page of subscription `id` through `cursor` passed
+    /// validation. The next update acknowledges it.
+    pub(super) fn accept(&self, id: u64, cursor: &Cursor) {
+        // A zero staging budget grants nothing.
+        let _ = self.subscriber().accept_through(id, cursor, 0);
     }
 
-    pub(super) fn try_send_headers(
-        &self,
-        codec: &HeaderSyncCodec,
-        headers: Headers,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send(codec, HeaderSyncMessage::Headers(headers))
-    }
-
-    pub(super) fn try_send_headers_outcome(
-        &self,
-        codec: &HeaderSyncCodec,
-        outcome: HeadersOutcome,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send(codec, HeaderSyncMessage::HeadersOutcome(outcome))
-    }
-
-    fn try_send(
-        &self,
-        codec: &HeaderSyncCodec,
-        message: HeaderSyncMessage,
-    ) -> Result<(), OrderedSendError> {
-        let frame = codec
-            .encode_frame(&message)
-            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        match self.inner.send.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(OrderedSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(OrderedSendError::Closed),
-        }
+    /// Reserve a queue slot before recording an update.
+    fn reserve(&self) -> Result<GuardedFrameSlot<'_>, OrderedSendError> {
+        self.inner
+            .send
+            .try_reserve_guarded()
+            .map_err(|error| match error {
+                GuardedReserveError::Full => OrderedSendError::Full,
+                GuardedReserveError::Closed | GuardedReserveError::Unsupported => {
+                    OrderedSendError::Closed
+                }
+            })
     }
 }
 
-#[derive(Debug)]
-pub(super) enum PeerCommand {
-    Reserve(ExpectedHeadersResponse),
-    Cancel(HeaderSyncRequestId),
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) struct ExpectedHeadersResponse {
-    pub(super) request_id: HeaderSyncRequestId,
-    pub(super) scope: zakura_header_chain::HeaderWorkAuthority,
-    pub(super) context: HeaderSyncDecodeContext,
+/// Encode an update the subscriber recorded, checking its credit against the
+/// smallest page of a network whose headers take `header_bytes`.
+fn update_frame(header_bytes: usize, update: SubscribeHeaders) -> Frame {
+    if header_bytes == REGTEST_HEADER_BYTES {
+        encode_frame(&RegtestMessage::SubscribeHeaders(update))
+    } else {
+        encode_frame(&CommonMessage::SubscribeHeaders(update))
+    }
+    .expect("the subscriber records only updates that encode")
 }
 
 /// Process actions that do not require the production state driver.
@@ -408,27 +435,7 @@ pub(crate) async fn drive_header_sync_actions(
                     })
                     .await;
             }
-            HeaderSyncAction::AcquirePath {
-                peer,
-                session_id,
-                scope,
-                request,
-            } => {
-                let _ = handle
-                    .send(Event::PathLeaseReady {
-                        peer,
-                        session_id,
-                        scope,
-                        request,
-                        result: HeaderPathLeaseResult::Outcome(
-                            HeadersOutcomeCode::TargetNotRetained,
-                        ),
-                    })
-                    .await;
-            }
-            HeaderSyncAction::ReadPath { .. }
-            | HeaderSyncAction::ReleaseHeaderPath { .. }
-            | HeaderSyncAction::PrepareHeaderTarget { .. }
+            HeaderSyncAction::PrepareHeaderTarget { .. }
             | HeaderSyncAction::ApplyHeaderTarget { .. } => {}
         }
     }
@@ -438,7 +445,13 @@ pub(crate) async fn drive_header_sync_actions(
 #[derive(Debug)]
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
-    peers: Arc<StdMutex<HashMap<ZakuraPeerId, HeaderSyncPeerRecord>>>,
+    /// Each peer's current session, with its connection direction.
+    sessions: Arc<SessionTable<ServicePeerDirection>>,
+    /// Orders admission checks with the table, so an older connection never
+    /// replaces a newer one's session.
+    admission: StdMutex<()>,
+    /// Each live connection's `Status` cadence.
+    status_cadences: StdMutex<HashMap<(ZakuraPeerId, ZakuraConnId), StatusCadence>>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
 }
@@ -455,7 +468,9 @@ impl HeaderSyncService {
     pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {
             header_sync,
-            peers: Arc::new(StdMutex::new(HashMap::new())),
+            sessions: Arc::default(),
+            admission: StdMutex::new(()),
+            status_cadences: StdMutex::new(HashMap::new()),
             service_demand: None,
         }
     }
@@ -561,11 +576,9 @@ impl Service for HeaderSyncService {
             return false;
         }
         let replaces_same_direction = self
-            .peers
-            .lock()
-            .expect("header-sync peer map mutex is never poisoned")
+            .sessions
             .get(peer)
-            .is_some_and(|record| record.direction == direction);
+            .is_some_and(|(_, current)| current == direction);
         if replaces_same_direction {
             return true;
         }
@@ -593,101 +606,118 @@ impl Service for HeaderSyncService {
         }
 
         let peer_id = peer.id.clone();
-        let session = PeerStreamSession::new(
-            peer_id.clone(),
-            ZAKURA_STREAM_HEADER_SYNC,
-            ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            recv,
-            send,
-            peer.service_cancel_token(),
-        );
-        let service_cancel_token = session.cancel_token();
+        let conn_id = peer.conn_id;
+        let key = SessionKey {
+            conn_id,
+            session_id,
+        };
+        let service_cancel_token = peer.service_cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let conn_id = peer.conn_id;
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let header_sync_session = PeerSession::new_with_commands(
-            &session,
-            peer.direction,
-            commands_tx,
-            session_id,
-            connection_cancel_token.clone(),
-            close_cause.clone(),
-        );
-
+        let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
         {
-            let mut peers = self
-                .peers
+            let _admission = self
+                .admission
                 .lock()
-                .expect("header-sync peer map mutex is never poisoned");
-            if peers
+                .unwrap_or_else(PoisonError::into_inner);
+            if self
+                .sessions
                 .get(&peer_id)
-                .is_some_and(|record| record.conn_id > conn_id)
+                .is_some_and(|(current, _)| current.conn_id > conn_id)
             {
                 service_cancel_token.cancel();
                 return;
             }
-            if let Some(old) = peers.insert(
-                peer_id.clone(),
-                HeaderSyncPeerRecord {
-                    conn_id,
-                    session_id,
-                    direction: peer.direction,
-                    cancel_token: header_sync_session.cancel_token(),
-                },
+            let current = Current {
+                key,
+                cancel: service_cancel_token.clone(),
+                fence: fence.clone(),
+                session: peer.direction,
+            };
+            if matches!(
+                self.sessions.replace(peer_id.clone(), current),
+                Replacement::Refused
             ) {
-                old.cancel_token.cancel();
+                return;
             }
         }
 
+        let status = self
+            .status_cadences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((peer_id.clone(), conn_id))
+            .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
+            .clone();
+        let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
+        let subscriber = Subscriber::new(header_bytes);
+        // The reader checks each page and outcome header against the
+        // subscription before it reads the payload.
+        recv.attach_precheck(Arc::new(subscriber.precheck()));
+        let session = PeerSession::new(
+            peer_id.clone(),
+            session_id,
+            peer.direction,
+            send.clone(),
+            service_cancel_token.clone(),
+            connection_cancel_token.clone(),
+            close_cause.clone(),
+            subscriber,
+            fence,
+            status,
+        );
+        let (publisher, publishing) = spawn_publisher(
+            &self.header_sync,
+            header_bytes,
+            &peer_id,
+            session_id,
+            send,
+            service_cancel_token.clone(),
+        );
+
         let _ = self
             .header_sync
-            .send_lifecycle(Event::PeerConnected(header_sync_session));
-        let codec = self.header_sync.codec();
-        let (_, _, _, recv, _, _) = session.into_parts();
-        let pipe_peer = peer_id.clone();
+            .send_lifecycle(Event::PeerConnected(session.clone()));
+        let handle = self.header_sync.clone();
         let pipe_cancel = service_cancel_token.clone();
         let protocol_connection_cancel = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
-        let handle = self.header_sync.clone();
         let pipe: BoxRunFuture<'static, ()> = Box::pin(async move {
+            let result = if header_bytes == REGTEST_HEADER_BYTES {
+                run_peer::<REGTEST_HEADER_BYTES>(
+                    handle,
+                    session,
+                    publisher,
+                    publishing,
+                    recv,
+                    pipe_cancel,
+                )
+                .await
+            } else {
+                run_peer::<COMMON_HEADER_BYTES>(
+                    handle,
+                    session,
+                    publisher,
+                    publishing,
+                    recv,
+                    pipe_cancel,
+                )
+                .await
+            };
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel,
                 &protocol_close_cause,
-                run_peer(
-                    handle,
-                    codec,
-                    pipe_peer,
-                    session_id,
-                    peer.direction,
-                    commands_rx,
-                    recv,
-                    pipe_cancel,
-                )
-                .await,
+                result,
             );
         });
 
         let teardown_handle = self.header_sync.clone();
-        let teardown_peers = self.peers.clone();
+        let teardown_sessions = self.sessions.clone();
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
         let on_teardown = move || {
-            let should_notify = {
-                let mut peers = teardown_peers
-                    .lock()
-                    .expect("header-sync peer map mutex is never poisoned");
-                if peers.get(&teardown_peer).is_some_and(|record| {
-                    record.conn_id == conn_id && record.session_id == session_id
-                }) {
-                    peers.remove(&teardown_peer);
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_notify {
+            if teardown_sessions.remove(&teardown_peer, key).is_some() {
                 let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
                     peer: teardown_peer,
                     session_id,
@@ -706,11 +736,9 @@ impl Service for HeaderSyncService {
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
         let owns_stream = self
-            .peers
-            .lock()
-            .expect("header-sync peer map mutex is never poisoned")
+            .sessions
             .get(peer)
-            .is_some_and(|record| record.conn_id == conn_id);
+            .is_some_and(|(key, _)| key.conn_id == conn_id);
         if !owns_stream {
             return false;
         }
@@ -727,53 +755,67 @@ impl Service for HeaderSyncService {
     }
 
     fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
-        let removed = {
-            let mut peers = self
-                .peers
-                .lock()
-                .expect("header-sync peer map mutex is never poisoned");
-            if peers
-                .get(peer)
-                .is_some_and(|record| record.conn_id == conn_id)
-            {
-                peers.remove(peer)
-            } else {
-                None
-            }
+        self.status_cadences
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(peer.clone(), conn_id));
+        let Some((key, _)) = self.sessions.get(peer) else {
+            return;
         };
-        if let Some(record) = removed {
-            record.cancel_token.cancel();
-            let _ = self.header_sync.send_lifecycle(Event::PeerDisconnected {
-                peer: peer.clone(),
-                session_id: record.session_id,
-                reason: "service_removed",
-            });
+        if key.conn_id != conn_id || self.sessions.remove(peer, key).is_none() {
+            return;
         }
+        let _ = self.header_sync.send_lifecycle(Event::PeerDisconnected {
+            peer: peer.clone(),
+            session_id: key.session_id,
+            reason: "service_removed",
+        });
     }
 
     fn deliver_frame(
         &self,
-        peer: ZakuraPeerId,
-        stream_kind: u16,
-        frame: Frame,
+        _peer: ZakuraPeerId,
+        _stream_kind: u16,
+        _frame: Frame,
     ) -> Result<(), SinkReject> {
-        if stream_kind != ZAKURA_STREAM_HEADER_SYNC {
-            return Ok(());
-        }
-        let message = self
-            .header_sync
-            .codec()
-            .decode_frame(frame, None)
-            .map_err(|error| SinkReject::protocol(std::io::Error::other(error.to_string())))?;
-        self.header_sync
-            .try_send(Event::WireMessage {
-                peer,
-                session_id: 0,
-                msg: message,
-            })
-            .map_err(|error| SinkReject::local(error.to_string()))
+        // Only the testkit recorder delivers frames here. Every header-sync
+        // frame needs the session reader that owns its stream, so a frame
+        // without one is ignored.
+        Ok(())
     }
 }
+
+/// Spawn the publisher for one session of `peer`, on a network whose headers
+/// take `header_bytes`. Returns its handle and its task.
+fn spawn_publisher(
+    header_sync: &HeaderSyncHandle,
+    header_bytes: usize,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    send: FramedSend,
+    cancel: CancellationToken,
+) -> (Publisher, JoinHandle<()>) {
+    let port = header_sync.port.clone();
+    let push = header_sync.serving.push(peer);
+    let owner = LeaseOwner {
+        peer: zakura_header_chain::SourceId::from_digest(peer.digest()),
+        session_id,
+    };
+    let limits = header_sync.page_limits;
+    if header_bytes == REGTEST_HEADER_BYTES {
+        Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+    } else {
+        Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+    }
+}
+
+/// Stream 5 as a recorder declares it: the version 9 stream without a message
+/// table, so a recorder sees every frame a test sends.
+const PASSTHROUGH_STREAMS: [Stream; 1] = [Stream {
+    messages: None,
+    queue_depths: None,
+    ..CommonMessage::LAYOUT[0]
+}];
 
 /// Testkit/no-reactor mode records inbound frames without decoding them.
 #[derive(Debug)]
@@ -793,8 +835,7 @@ impl Service for HeaderSyncPassthroughService {
     }
 
     fn streams(&self) -> &[Stream] {
-        // Recorder nodes run on Mainnet.
-        &super::v9::CommonMessage::LAYOUT
+        &PASSTHROUGH_STREAMS
     }
 
     fn session_policy(&self) -> SessionPolicy {

@@ -65,13 +65,15 @@ use crate::zakura::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::FakePort;
 
 /// Lease attempts one page makes before it waits for a wake.
 const LEASE_ATTEMPTS: usize = 2;
 
 /// The serving limits this node advertises in its `Status`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PageLimits {
+pub struct PageLimits {
     /// `max_headers_per_response`.
     pub(crate) max_headers: u32,
     /// `max_message_bytes`.

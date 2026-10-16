@@ -9,7 +9,7 @@
 //!
 //! # Updates
 //!
-//! [`Subscriber::open`], the grants, and [`Subscriber::close`] record each
+//! [`Subscriber::open_fenced`], the grants, and [`Subscriber::close`] record each
 //! update in the subscription tools before returning it, so the caller writes
 //! only updates the tools already counted. The session reader checks each
 //! frame header against the same tools through [`Subscriber::precheck`].
@@ -51,17 +51,16 @@ use zakura_chain::block;
 use zakura_header_chain::Frontier;
 
 use super::{
-    publisher::is_legal, smallest_page, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode,
-    Message, Operation, Status, SubscribeHeaders, MAX_HS_PUSH_CREDIT_BYTES,
-    MAX_HS_PUSH_CREDIT_HEADERS, MAX_LOCATOR_HASHES, SUBSCRIBE_HEADERS,
+    publisher::is_legal, rows, smallest_page, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode,
+    Operation, Status, SubscribeHeaders, MAX_HS_PUSH_CREDIT_BYTES, MAX_HS_PUSH_CREDIT_HEADERS,
+    MAX_LOCATOR_HASHES, SUBSCRIBE_HEADERS,
 };
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
     regulation::{
-        SharedSubscriptions, SubscribeRefused, SubscriptionFault, SubscriptionLimits,
+        Exchange, SharedSubscriptions, SubscribeRefused, SubscriptionFault, SubscriptionLimits,
         Subscriptions, Update,
     },
-    wire_codec::WireMessage,
     Credit,
 };
 
@@ -154,7 +153,7 @@ impl SubscriberFault {
 
 /// An admitted page, for the reactor to validate.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Admitted {
+pub struct Admitted {
     /// The page's subscription.
     pub(crate) id: u64,
     /// The header the page's first header extends.
@@ -170,7 +169,7 @@ pub(crate) struct Admitted {
 
 /// An ended subscription, for the reactor to reschedule.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Ended {
+pub struct Ended {
     /// The subscription.
     pub(crate) id: u64,
     /// Why it ended.
@@ -205,35 +204,34 @@ struct Live {
 }
 
 /// One session's subscriber: the subscription this node holds on one peer.
-///
-/// `HEADER_BYTES` is the network's encoded header size, which fixes the
-/// smallest page.
 #[derive(Debug)]
-pub(crate) struct Subscriber<const HEADER_BYTES: usize> {
+pub(crate) struct Subscriber {
     tools: SharedSubscriptions<u64, Cursor>,
     /// At most one: `SUBSCRIBE_HEADERS` allows one live or closing
     /// subscription, and the tools refuse a second.
     live: Option<Live>,
     next_id: u64,
+    /// The network's encoded header size, which fixes the smallest page.
+    header_bytes: usize,
 }
 
-impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
-    /// `P`: the smallest legal page, and the least byte credit a `Grant` adds
-    /// when it adds no header.
-    const SMALLEST_PAGE: usize = smallest_page(HEADER_BYTES, AuxSchema::None);
-
-    /// A subscriber with no subscription.
-    pub(crate) fn new() -> Self {
+impl Subscriber {
+    /// A subscriber with no subscription, on a network whose headers take
+    /// `header_bytes`.
+    pub(crate) fn new(header_bytes: usize) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         Self {
-            tools: SharedSubscriptions::new(Subscriptions::new(
-                limits,
-                Message::<HEADER_BYTES>::RULES,
-            )),
+            tools: SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes))),
             live: None,
             next_id: 1,
+            header_bytes,
         }
+    }
+
+    /// The encoded header size of the subscriber's network.
+    pub(crate) fn header_bytes(&self) -> usize {
+        self.header_bytes
     }
 
     /// The table the session reader checks frame headers against.
@@ -241,16 +239,22 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         self.tools.clone()
     }
 
-    /// The credit window for `staging` reserved headers under `schema`: at
-    /// most the row's window and the staging budget in headers, and one
-    /// smallest page per header in bytes.
-    fn window(staging: u32, schema: AuxSchema) -> Credit {
+    /// The headers of the credit window for `staging` reserved headers: at
+    /// most the row's window and the staging budget.
+    fn window_headers(staging: u32) -> u32 {
         // The budget capacity is 4,000 headers, so it fits u32.
-        let headers = staging
+        staging
             .min(MAX_HS_PUSH_CREDIT_HEADERS)
-            .min(HEADER_CHUNK_BUDGET_CAPACITY_V1 as u32);
+            .min(HEADER_CHUNK_BUDGET_CAPACITY_V1 as u32)
+    }
+
+    /// The credit window for `staging` reserved headers under `schema`:
+    /// [`Self::window_headers`] in headers, and one smallest page per header
+    /// in bytes.
+    fn window(&self, staging: u32, schema: AuxSchema) -> Credit {
+        let headers = Self::window_headers(staging);
         // Widening usize to u64 is lossless on supported targets.
-        let bytes = (u64::from(headers) * smallest_page(HEADER_BYTES, schema) as u64)
+        let bytes = (u64::from(headers) * smallest_page(self.header_bytes, schema) as u64)
             .min(u64::from(MAX_HS_PUSH_CREDIT_BYTES));
         Credit {
             objects: headers,
@@ -262,22 +266,49 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// half the window for `staging` reserved headers, and at least one. The
     /// module docs explain why grants overlap delivery at this size.
     pub(crate) fn prefix(staging: u32) -> u32 {
-        (Self::window(staging, AuxSchema::None).objects / 2).max(1)
+        (Self::window_headers(staging) / 2).max(1)
     }
 
-    /// Record an `Open` to the selected tip of `status`, and return it to
-    /// write.
-    ///
-    /// `locators` are this node's locators, highest first; the first is the
-    /// start cursor. `staging` is the header staging budget reserved for the
-    /// subscription. The `Open` grants the whole window, which fits one page
-    /// under `schema`. A locator equal to the target reaches it at `Open`.
+    /// Record an unfenced `Open`, as [`Self::open_with`] describes.
+    #[cfg(test)]
     pub(crate) fn open(
         &mut self,
         status: &Status,
         locators: &[Frontier],
         schema: AuxSchema,
         staging: u32,
+    ) -> Result<SubscribeHeaders, SubscribeError> {
+        self.open_with(status, locators, schema, staging, None)
+    }
+
+    /// Record an `Open` as [`Self::open_with`] describes, and keep `exchange`
+    /// until the terminal outcome ends it. Retiring the session's fence while the
+    /// `Open` was written and no outcome arrived closes the connection.
+    pub(crate) fn open_fenced(
+        &mut self,
+        status: &Status,
+        locators: &[Frontier],
+        schema: AuxSchema,
+        staging: u32,
+        exchange: Exchange,
+    ) -> Result<SubscribeHeaders, SubscribeError> {
+        self.open_with(status, locators, schema, staging, Some(exchange))
+    }
+
+    /// Record an `Open` to the selected tip of `status`, fenced by `exchange`
+    /// if there is one, and return it to write.
+    ///
+    /// `locators` are this node's locators, highest first; the first is the
+    /// start cursor. `staging` is the header staging budget reserved for the
+    /// subscription. The `Open` grants the whole window, which fits one page
+    /// under `schema`. A locator equal to the target reaches it at `Open`.
+    fn open_with(
+        &mut self,
+        status: &Status,
+        locators: &[Frontier],
+        schema: AuxSchema,
+        staging: u32,
+        exchange: Option<Exchange>,
     ) -> Result<SubscribeHeaders, SubscribeError> {
         let Some(&start) = locators.first() else {
             return Err(SubscribeError::Locators);
@@ -295,7 +326,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         if status.tree_aux_schema_mask & schema.mask_bit() != schema.mask_bit() {
             return Err(SubscribeError::Schema);
         }
-        let window = Self::window(staging, schema);
+        let window = self.window(staging, schema);
         if window.objects == 0 {
             return Err(SubscribeError::NoStaging);
         }
@@ -306,7 +337,10 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             headers: 0,
             bytes: 0,
         };
-        let update = self.tools.lock().open(id, window, start)?;
+        let update = match exchange {
+            Some(exchange) => self.tools.lock().open_fenced(id, window, start, exchange)?,
+            None => self.tools.lock().open(id, window, start)?,
+        };
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let target = status.selected_tip_hash;
         let target_locator = locators
@@ -522,6 +556,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// Record that a page of `id` failed contextual validation. The
     /// subscription accepts no more cursors and sends no more grants. The
     /// reactor disconnects the peer.
+    #[cfg(test)]
     pub(crate) fn validation_failed(&mut self, id: u64) -> bool {
         let Some(live) = self.live.as_mut().filter(|live| live.id == id) else {
             return false;
@@ -543,7 +578,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         if live.close_sent || live.failed {
             return None;
         }
-        let window = Self::window(staging, live.schema);
+        let window = self.window(staging, live.schema);
         let mut tools = self.tools.lock();
         let credit = tools.credit(&live.id)?;
         let (granted, unspent) = (credit.granted(), credit.unspent());
@@ -553,8 +588,8 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         let headers = room(window.objects, granted.objects, live.accepted.headers);
         let bytes = room(window.bytes, granted.bytes, live.accepted.bytes);
         // Widening usize to u64 is lossless on supported targets.
-        let page = smallest_page(HEADER_BYTES, live.schema) as u64;
-        if headers == 0 && bytes < Self::SMALLEST_PAGE as u64 {
+        let page = smallest_page(self.header_bytes, live.schema) as u64;
+        if headers == 0 && bytes < smallest_page(self.header_bytes, AuxSchema::None) as u64 {
             return None;
         }
         let starved = unspent.objects == 0 || unspent.bytes < page;
@@ -585,6 +620,24 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// The live subscription's ID, if there is one.
     pub(crate) fn live(&self) -> Option<u64> {
         self.live.as_ref().map(|live| live.id)
+    }
+
+    /// The live subscription, if a `Grant` can continue it toward its
+    /// target: it is not closing or failed, it has not reached its target, it
+    /// has no unspent header credit, and every page it received was accepted.
+    /// Returns its ID, target, and accepted cursor.
+    pub(crate) fn resumable(&self) -> Option<(u64, block::Hash, Cursor)> {
+        let live = self
+            .live
+            .as_ref()
+            .filter(|live| !live.close_sent && !live.failed && !live.reached)?;
+        let tools = self.tools.lock();
+        let idle = tools.credit(&live.id)?.unspent().objects == 0;
+        (idle && tools.received(&live.id) == Some(&live.accepted)).then_some((
+            live.id,
+            live.target,
+            live.accepted,
+        ))
     }
 }
 

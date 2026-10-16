@@ -45,7 +45,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::zakura::{transport::FrameWriteClaim, CloseCause, Frame, FramedSend};
+use crate::zakura::{
+    transport::{FrameWriteClaim, GuardedFrameSlot},
+    CloseCause, Frame, FramedSend,
+};
 
 #[cfg(test)]
 mod tests;
@@ -268,6 +271,19 @@ impl FramedSend {
             .reserve_guarded()
             .await
             .map_err(|_| FencedSendError::Closed)?;
+        slot.send_fenced(frame, writer)
+    }
+}
+
+impl GuardedFrameSlot<'_> {
+    /// Publish `frame` into this reserved slot under `writer`'s fence, as
+    /// [`FramedSend::send_fenced`] does without waiting.
+    pub(crate) fn send_fenced(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        let slot = self;
         let mut queued = false;
         if !writer.publish(|| {
             queued = slot.send_request(frame, Arc::new(FencedWrite(writer.clone())));

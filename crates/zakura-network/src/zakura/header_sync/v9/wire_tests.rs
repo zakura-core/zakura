@@ -33,7 +33,7 @@ use crate::zakura::{
         item_suite::item_suite,
         message_suite::{decode_checked, message_suite, MessageSample, Violation},
         sample::WireSample,
-        BlockHash, HeightLe, WireError, WireMessage,
+        BlockHash, HeightLe, WireError,
     },
     Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen,
 };

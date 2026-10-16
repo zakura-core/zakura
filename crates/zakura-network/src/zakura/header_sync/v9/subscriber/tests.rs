@@ -15,7 +15,7 @@ use crate::zakura::{
         v9::{
             entry_bytes,
             test_support::{record, HeaderTree, OUTCOME_CODES},
-            RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
+            Message, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
         },
         wire::HeaderEntry,
     },
@@ -28,7 +28,7 @@ use crate::zakura::{
 const HB: usize = REGTEST_HEADER_BYTES;
 
 /// The subscriber under test.
-type Sub = Subscriber<HB>;
+type Sub = Subscriber;
 
 /// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
@@ -147,7 +147,7 @@ struct Fixture {
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
     fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
-        let mut sub = Sub::new();
+        let mut sub = Sub::new(HB);
         let open = sub
             .open(&status(target), locators, AuxSchema::None, staging)
             .expect("the first Open is recorded");
@@ -207,7 +207,7 @@ fn chain(length: u32) -> (HeaderTree, Vec<Frontier>) {
 #[test]
 fn open_records_its_reservation_first() {
     let (_tree, chain) = chain(6);
-    let mut sub = Sub::new();
+    let mut sub = Sub::new(HB);
     let locators = [chain[3], chain[1], chain[0]];
     let open = wire(
         &sub.open(&status(chain[6]), &locators, AuxSchema::None, 10)
@@ -273,7 +273,7 @@ fn open_records_its_reservation_first() {
 #[test]
 fn open_refuses_what_the_publisher_would_fault() {
     let (_tree, chain) = chain(20);
-    let mut sub = Sub::new();
+    let mut sub = Sub::new(HB);
     let target = status(chain[20]);
     assert_eq!(
         sub.open(&target, &[], AuxSchema::None, 10),
@@ -569,7 +569,7 @@ fn outcomes_fault_outside_their_window() {
         Err(SubscriberFault::Target)
     );
     assert_eq!(
-        Sub::new().receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
+        Sub::new(HB).receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
         Err(SubscriptionFault::Unknown.into())
     );
 }
@@ -731,7 +731,7 @@ fn close_keeps_credit_and_admits_pages() {
         .expect("legal after Close");
     assert_eq!(ended.accepted, page.cursor);
 
-    let mut sub = Sub::new();
+    let mut sub = Sub::new(HB);
     let open = sub
         .open(&status(chain[6]), &[chain[0]], AuxSchema::None, 4)
         .expect("recorded");
@@ -1028,7 +1028,7 @@ impl Session {
             let tools = self.sub.precheck();
             let tools = tools.lock();
             let credit = tools.credit(&update.subscription_id).expect("live");
-            let window = Sub::window(self.staging, update.tree_aux_schema);
+            let window = self.sub.window(self.staging, update.tree_aux_schema);
             assert!(
                 credit.granted().objects - update.acknowledged.headers <= u64::from(window.objects),
                 "a Grant keeps the window within the staging budget"
@@ -1211,7 +1211,7 @@ fn run(ops: Vec<Op>) {
     let tip = *tree.extend(genesis, 4).last().expect("four headers");
     let mut session = Session {
         tree,
-        sub: Sub::new(),
+        sub: Sub::new(HB),
         script: Script::new(tip),
         to_subscriber: VecDeque::new(),
         to_publisher: VecDeque::new(),

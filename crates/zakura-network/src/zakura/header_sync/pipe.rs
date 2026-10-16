@@ -1,123 +1,90 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
-
-use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zakura_chain::{block, parameters::Network};
 
 use super::{
-    events::{Event, HeaderSyncHandle, HeaderSyncRequestId},
-    service::{ExpectedHeadersResponse, PeerCommand},
-    HeaderSyncCodec, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME,
+    events::{Event, HeaderSyncHandle},
+    service::PeerSession,
+    v9::{Headers, Message, Publisher},
+    wire::{HeaderSyncWireError, TreeAuxWire},
 };
-use crate::zakura::{Frame, FramedRecv, SinkReject, ZakuraPeerId};
+use crate::zakura::{wire_codec::decode_frame, FramedRecv, SinkReject};
 
-/// Grace period for a response to a request the local reactor has retired.
-const CANCELLED_RESPONSE_GRACE: Duration = Duration::from_secs(30);
-/// Maximum cancelled response IDs remembered by one peer pipe.
-const MAX_CANCELLED_RESPONSE_IDS: usize = 64;
-
-/// Run the sole peer-owned header-sync decode pipe.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_peer(
+/// Run the sole peer-owned header-sync session reader.
+///
+/// It decodes each frame, applies each `SubscribeHeaders` update to this
+/// session's publisher in stream order, and admits each page and outcome
+/// through the session's subscriber before the reactor sees it. A frame that
+/// breaks a rule ends the session as a protocol violation. The reader also
+/// ends with the publisher task, and re-raises the task's panic.
+pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     handle: HeaderSyncHandle,
-    codec: HeaderSyncCodec,
-    peer: ZakuraPeerId,
-    session_id: u64,
-    direction: crate::zakura::ServicePeerDirection,
-    mut commands: mpsc::UnboundedReceiver<PeerCommand>,
+    session: PeerSession,
+    publisher: Publisher,
+    mut publishing: JoinHandle<()>,
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
-    let mut expected = HashMap::<HeaderSyncRequestId, ExpectedHeadersResponse>::new();
-    let mut cancelled = CancelledResponseIds::default();
+    let peer = session.peer_id().clone();
+    let session_id = session.session_id();
     loop {
-        enum Input {
-            Frame(Frame),
-            Command(PeerCommand),
-            Done,
-        }
-
-        let input = tokio::select! {
+        let frame = tokio::select! {
             biased;
-            () = cancel.cancelled() => Input::Done,
-            command = commands.recv() => match command {
-                Some(command) => Input::Command(command),
-                None => Input::Done,
-            },
-            frame = recv.recv() => match frame {
-                Some(frame) => Input::Frame(frame),
-                None => Input::Done,
-            },
-        };
-        let frame = match input {
-            Input::Done => return Ok(()),
-            Input::Command(command) => {
-                apply_command(&mut expected, &mut cancelled, command);
-                continue;
-            }
-            Input::Frame(frame) => frame,
-        };
-
-        while let Ok(command) = commands.try_recv() {
-            apply_command(&mut expected, &mut cancelled, command);
-        }
-
-        let message_type = u8::try_from(frame.message_type).ok();
-        let expected_response = if matches!(
-            message_type,
-            Some(MSG_HS_HEADERS) | Some(MSG_HS_HEADERS_OUTCOME)
-        ) {
-            let request_id =
-                HeaderSyncCodec::peek_response_request_id(&frame).map_err(protocol_reject)?;
-            let response = expected.remove(&request_id);
-            if response.is_none() && cancelled.take(request_id) {
-                continue;
-            }
-            let Some(response) = response else {
-                emit_pipe_violation(
-                    &handle,
-                    &peer,
-                    session_id,
-                    direction,
-                    "unsolicited_response",
-                );
-                return Err(protocol_reject("unsolicited header-sync response"));
-            };
-            Some(response)
-        } else {
-            None
-        };
-        let response_context = expected_response.as_ref().and_then(|response| {
-            (message_type == Some(MSG_HS_HEADERS)).then_some(response.context)
-        });
-        let msg = codec
-            .decode_frame(frame, response_context)
-            .map_err(|error| {
-                let reason = match error {
-                    super::HeaderSyncWireError::UnknownMessageType(_)
-                    | super::HeaderSyncWireError::UnknownFrameMessageType(_)
-                    | super::HeaderSyncWireError::MismatchedFrameMessageType { .. } => {
-                        "unknown_message_type"
+            () = cancel.cancelled() => return Ok(()),
+            ended = &mut publishing => {
+                if let Err(error) = ended {
+                    if error.is_panic() {
+                        std::panic::resume_unwind(error.into_panic());
                     }
-                    _ => "malformed_message",
-                };
-                emit_pipe_violation(&handle, &peer, session_id, direction, reason);
-                protocol_reject(error)
-            })?;
-        let event = match expected_response {
-            Some(response) => Event::SessionResponse {
+                }
+                return Ok(());
+            }
+            frame = recv.recv() => match frame {
+                Some(frame) => frame,
+                None => return Ok(()),
+            },
+        };
+        let payload_len = frame.payload.len();
+        let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
+            .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
+        let event = match message {
+            Message::Status(status) => Event::Status {
                 peer: peer.clone(),
                 session_id,
-                scope: response.scope,
-                msg,
+                status,
             },
-            None => Event::WireMessage {
-                peer: peer.clone(),
-                session_id,
-                msg,
-            },
+            Message::SubscribeHeaders(update) => {
+                publisher
+                    .apply(&update)
+                    .await
+                    .map_err(|fault| violation(&handle, &session, "subscription_update", fault))?;
+                continue;
+            }
+            Message::Headers(page) => {
+                check_records(&page, &handle.network)
+                    .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
+                let admitted = session
+                    .subscriber()
+                    .receive_page(&page, payload_len)
+                    .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
+                Event::Page {
+                    peer: peer.clone(),
+                    session_id,
+                    page,
+                    admitted,
+                }
+            }
+            Message::HeadersOutcome(outcome) => {
+                let ended = session
+                    .subscriber()
+                    .receive_outcome(&outcome)
+                    .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
+                Event::Outcome {
+                    peer: peer.clone(),
+                    session_id,
+                    ended,
+                }
+            }
         };
         tokio::select! {
             biased;
@@ -129,15 +96,29 @@ pub(super) async fn run_peer(
     }
 }
 
-fn emit_pipe_violation(
+/// Check each schema-1 record against its header's height and the network's
+/// activation defaults, which the codec cannot see.
+fn check_records(page: &Headers, network: &Network) -> Result<(), HeaderSyncWireError> {
+    // The decoder rejects a page whose last height overflows.
+    let heights = (page.common_ancestor_height.0 + 1..).map(block::Height);
+    for (height, entry) in heights.zip(&page.entries) {
+        if let Some(record) = &entry.tree_aux {
+            record.validate_for(height, network)?;
+        }
+    }
+    Ok(())
+}
+
+/// Trace a protocol violation by `session`'s peer, and return the rejection
+/// that ends the session.
+fn violation(
     handle: &HeaderSyncHandle,
-    peer: &ZakuraPeerId,
-    session_id: u64,
-    direction: crate::zakura::ServicePeerDirection,
+    session: &PeerSession,
     reason: &'static str,
-) {
+    error: impl std::fmt::Display,
+) -> SinkReject {
     use crate::zakura::trace::{header_sync_trace as hs_trace, peer_label, HEADER_SYNC_TABLE};
-    let direction = match direction {
+    let direction = match session.direction() {
         crate::zakura::ServicePeerDirection::Inbound => "inbound",
         crate::zakura::ServicePeerDirection::Outbound => "outbound",
     };
@@ -146,8 +127,8 @@ fn emit_pipe_violation(
             hs_trace::EVENT.into(),
             hs_trace::HEADER_PEER_VIOLATION.into(),
         );
-        row.insert(hs_trace::PEER.into(), peer_label(peer).into());
-        row.insert(hs_trace::SESSION_ID.into(), session_id.into());
+        row.insert(hs_trace::PEER.into(), peer_label(session.peer_id()).into());
+        row.insert(hs_trace::SESSION_ID.into(), session.session_id().into());
         row.insert(hs_trace::DIRECTION.into(), direction.into());
         row.insert(hs_trace::REASON.into(), reason.into());
         row.insert(hs_trace::BOUNDARY.into(), "pipe".into());

@@ -8,7 +8,7 @@
 //! the publisher and from the mirror.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -258,6 +258,8 @@ struct FakePort {
     selected: watch::Sender<Option<EngineSnapshot>>,
     /// Every read waits for a permit here.
     gate: Semaphore,
+    /// Reads panic, standing in for a local bug.
+    panic_reads: std::sync::atomic::AtomicBool,
 }
 
 impl FakePort {
@@ -274,6 +276,7 @@ impl FakePort {
             genesis,
             selected: watch::channel(Some(snapshot(genesis, 1, genesis))).0,
             gate: Semaphore::new(gate),
+            panic_reads: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -346,6 +349,10 @@ impl Port for FakePort {
                 store.most_reads_running = store.most_reads_running.max(store.reads_running);
             }
             let _permit = self.gate.acquire().await.expect("the gate never closes");
+            assert!(
+                !self.panic_reads.load(std::sync::atomic::Ordering::Relaxed),
+                "the test asked this read to panic"
+            );
             let mut store = self.store();
             store.reads_running -= 1;
             store.read(&path, &request)
@@ -664,9 +671,25 @@ fn session(
     peer: &ZakuraPeerId,
     session_id: u64,
 ) -> (Publisher, FramedRecv, CancellationToken) {
+    let (publisher, recv, cancel, _task) = session_with_task(port, capacity, peer, session_id);
+    (publisher, recv, cancel)
+}
+
+/// Start a publisher for `peer` on `capacity`, and keep its task handle.
+fn session_with_task(
+    port: &Arc<FakePort>,
+    capacity: &ServeCapacity,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+) -> (
+    Publisher,
+    FramedRecv,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
     let (send, recv) = framed_channel(64);
     let cancel = CancellationToken::new();
-    let (publisher, _task) = Publisher::spawn::<HB>(
+    let (publisher, task) = Publisher::spawn::<HB>(
         port.clone(),
         capacity.push(peer),
         send,
@@ -677,7 +700,7 @@ fn session(
         limits(),
         cancel.clone(),
     );
-    (publisher, recv, cancel)
+    (publisher, recv, cancel, task)
 }
 
 impl Harness {
@@ -986,11 +1009,25 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         harness.deliver_all().await,
         [Received::Ended(SubscriptionSuperseded)]
     );
+
+    // History between the selected tip and the last header is gone: the
+    // lease reports `HistoryPruned`, past its window.
+    port.select(chain[4]);
+    harness
+        .open(chain[4].hash, vec![chain[4]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let above = port.grow(2);
+    port.store().nodes.remove(&above[0].hash);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(SubscriptionSuperseded)]
+    );
     harness.check_quiet().await;
 }
 
 /// `Close` with pages queued ends after them, and every update after `Close`
-/// faults before the end.
+/// faults, before and after the end.
 #[tokio::test(start_paused = true)]
 async fn close_with_pages_queued_ends_after_them() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -1033,15 +1070,16 @@ async fn close_with_pages_queued_ends_after_them() {
         received.last(),
         Some(&Received::Ended(HeadersOutcomeCode::SubscriptionClosed))
     );
-    // After the end, the tombstone answers as the subscription tools do.
-    assert_ne!(harness.apply(grant).await, Ok(Applied::Live));
+    // After the end, the tombstone remembers the Close, so the update still
+    // faults.
+    assert_eq!(harness.apply(grant).await, after_close);
     assert!(harness.deliver_all().await.is_empty());
     harness.check_quiet().await;
 }
 
 /// Updates that cross `SubscriptionSuperseded` or `HistoryPruned` are dropped
-/// up to the window, a crossing `Close` consumes the tombstone, and the next
-/// `Open` clears it.
+/// up to the window past the consumed credit and fault beyond it, a crossing
+/// `Close` consumes the tombstone, and the next `Open` clears it.
 #[tokio::test(start_paused = true)]
 async fn crossing_updates_drop_on_each_outcome_tombstone() {
     use HeadersOutcomeCode::*;
@@ -1063,20 +1101,22 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
         assert_eq!(harness.apply(grant.clone()).await, Ok(Applied::Crossed));
         last = Some(grant);
     }
-    // One header beyond the window answers as the subscription tools do.
+    // The crossing grants used the whole window past the consumed credit, so
+    // one more header faults and changes nothing.
     let mut beyond = last.expect("the window had room");
     beyond.update_sequence += 1;
-    let applied = harness.apply(beyond.clone()).await;
-    assert_ne!(applied, Ok(Applied::Live));
+    assert_eq!(
+        harness.apply(beyond.clone()).await,
+        Err(PublisherFault::Subscription(
+            SubscriptionFault::CrossedAboveWindow
+        ))
+    );
     let mut close = beyond;
     close.operation = Operation::Close;
     close.added_credit = Credit {
         objects: 0,
         bytes: 0,
     };
-    if applied.is_ok() {
-        close.update_sequence += 1;
-    }
     assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Crossed));
     let mut late = close;
     late.update_sequence += 1;
@@ -1108,6 +1148,11 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
         .expect("a conformant grant applies");
     let crossing = harness.subscriber.grant(3, 0).expect("the window has room");
     assert_eq!(harness.apply(crossing.clone()).await, Ok(Applied::Crossed));
+    // A tombstone matches by ID and sequence, not by the fixed fields.
+    let mut moved = harness.subscriber.grant(3, 0).expect("the window has room");
+    moved.initial_target_tip_hash = block::Hash([4; 32]);
+    assert_eq!(harness.apply(moved.clone()).await, Ok(Applied::Crossed));
+    let crossing = moved;
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(HistoryPruned)]
@@ -1126,6 +1171,84 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
         harness.apply(late).await,
         Err(PublisherFault::Subscription(SubscriptionFault::Unknown))
     );
+    harness.check_quiet().await;
+}
+
+/// An outcome this node queued before `Close` arrived is the one it sends.
+#[tokio::test(start_paused = true)]
+async fn a_queued_outcome_wins_over_a_later_close() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let id = harness
+        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    // The task has not run between these, so both reach `end_due` together.
+    let ended = {
+        let mut shared = lock(&harness.publisher.shared);
+        shared.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
+        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
+        shared.end_due::<HB>()
+    };
+    let [(ended_id, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+    assert_eq!(ended_id, id);
+    assert!(matches!(
+        decode_frame::<RegtestMessage>(&frame),
+        Ok(Message::HeadersOutcome(HeadersOutcome {
+            outcome: HeadersOutcomeCode::SubscriptionSuperseded,
+            ..
+        }))
+    ));
+}
+
+/// A page job's panic reaches the publisher task's handle instead of
+/// stalling the subscription.
+#[tokio::test(start_paused = true)]
+async fn a_page_job_panic_reaches_the_session_owner() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    port.panic_reads
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let (publisher, _recv, _cancel, task) = session_with_task(&port, &capacity, &peer(7), 1);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    let ended = tokio::time::timeout(QUIET, task)
+        .await
+        .expect("the publisher task ends");
+    assert!(ended.is_err_and(|error| error.is_panic()));
+}
+
+/// A following page whose headers leave the selected chain while it is in
+/// progress is dropped and read again toward the new tip.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read while the chain reorgs
+    // onto a branch that forks at the last header sent.
+    port.grow(2);
+    harness.drain().await;
+    assert_eq!(port.store().reads_running, 1);
+    let side = port.store().extend(chain[2], 3);
+    port.select(side[2]);
+    port.gate.add_permits(1);
+    let received = harness.deliver_all().await;
+    let h = block::Height;
+    assert_eq!(pages(&received), [(h(3), h(6), false)], "{received:?}");
+    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
     harness.check_quiet().await;
 }
 

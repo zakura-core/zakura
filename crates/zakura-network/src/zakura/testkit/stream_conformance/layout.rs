@@ -1,6 +1,8 @@
 //! What a layout's tables say about its exchanges.
 
-use crate::zakura::{regulation::ResponseCap, MessageRole, MessageRule, PayloadLen, Stream};
+use crate::zakura::{
+    regulation::ResponseCap, Credit, MessageRole, MessageRule, PayloadLen, Stream,
+};
 
 /// One request row's exchange, as the layout's tables declare it.
 #[derive(Copy, Clone, Debug)]
@@ -46,6 +48,24 @@ pub(crate) struct SubscriptionPlan {
     pub(crate) end: &'static MessageRule,
 }
 
+impl SubscriptionPlan {
+    /// The row's credit window.
+    pub(crate) fn credit(&self) -> Credit {
+        let MessageRole::Subscription { credit, .. } = self.row.role else {
+            unreachable!("the plan lists subscription rows");
+        };
+        credit
+    }
+
+    /// Most live or closing subscriptions the row allows one session.
+    pub(crate) fn max_live(&self) -> u32 {
+        let MessageRole::Subscription { max_live, .. } = self.row.role else {
+            unreachable!("the plan lists subscription rows");
+        };
+        max_live
+    }
+}
+
 /// The exchanges and members of one layout.
 #[derive(Debug)]
 pub(crate) struct LayoutPlan {
@@ -57,7 +77,8 @@ pub(crate) struct LayoutPlan {
 }
 
 impl LayoutPlan {
-    /// Read `layout`'s tables. Every member must declare one.
+    /// Read `layout`'s tables. Every member must declare one, and the layout
+    /// needs a request or subscription row.
     pub(crate) fn new(layout: &'static [Stream]) -> Self {
         let rows = || {
             layout.iter().enumerate().flat_map(|(stream, member)| {
@@ -80,7 +101,7 @@ impl LayoutPlan {
                 )
             })
         };
-        let subscriptions = rows()
+        let subscriptions: Vec<_> = rows()
             .filter(|(row, _)| matches!(row.role, MessageRole::Subscription { .. }))
             .map(|(row, stream)| {
                 let &(page, response_stream) = answers(row, false)
@@ -100,7 +121,7 @@ impl LayoutPlan {
                 }
             })
             .collect();
-        let requests = rows()
+        let requests: Vec<_> = rows()
             .filter_map(|(row, stream)| {
                 let MessageRole::Request { max_in_flight, .. } = row.role else {
                     return None;
@@ -125,6 +146,10 @@ impl LayoutPlan {
                 })
             })
             .collect();
+        assert!(
+            !requests.is_empty() || !subscriptions.is_empty(),
+            "a conformance layout needs a request or subscription row"
+        );
         Self {
             layout,
             requests,

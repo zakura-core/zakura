@@ -34,7 +34,9 @@
 //! After the target, the publisher follows [`Port::selected_chain`]. It leases
 //! the path from the last header sent to the selected tip, which also checks
 //! that the selected chain still extends that header. If it does not, the
-//! subscription ends with `SubscriptionSuperseded`.
+//! subscription ends with `SubscriptionSuperseded`. A page whose selected tip
+//! moved while it was in progress is checked again before it is sent, and
+//! read again if it left the selected chain.
 //!
 //! # Waits and outcomes
 //!
@@ -54,7 +56,7 @@
 //! becomes `SubscriptionSuperseded`.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     future::Future,
     num::NonZeroU32,
     ops::Bound,
@@ -76,7 +78,7 @@ use zakura_node_services::header_chain::{
 
 use super::{
     entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
-    SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, MAX_HS_SUBSCRIPTIONS, SUBSCRIBE_HEADERS,
+    SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
 };
 use crate::zakura::{
     header_sync::{
@@ -124,7 +126,8 @@ pub(crate) enum PublisherFault {
     /// A rule the subscription tools enforce.
     #[error(transparent)]
     Subscription(#[from] SubscriptionFault),
-    /// A `Grant` or `Close` whose target or schema differs from its `Open`.
+    /// A `Grant` or `Close` on a live subscription whose target or schema
+    /// differs from its `Open`.
     #[error("the update changes its subscription's target or schema")]
     ChangedFields,
     /// An `Open` that asks for a schema this node does not advertise.
@@ -192,9 +195,6 @@ struct Shared {
     publications: Publications<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
-    /// The fixed fields of tombstoned subscriptions, oldest first. It mirrors
-    /// the tombstones in `publications`.
-    ended: VecDeque<(u64, Fixed)>,
     /// The subscription served last, so two subscriptions take turns.
     last_served: Option<u64>,
 }
@@ -212,6 +212,9 @@ impl Publisher {
     /// Start publishing on one session, and return the handle with the task
     /// that writes pages and outcomes to `send` until `cancel` fires.
     ///
+    /// The task re-raises a page job's panic, so the session's owner sees it
+    /// through the returned handle and can close the session.
+    ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
     /// version 9 codec.
     pub(crate) fn spawn<const HEADER_BYTES: usize>(
@@ -227,7 +230,6 @@ impl Publisher {
         let shared = Arc::new(Mutex::new(Shared {
             publications: Publications::new(limits_row),
             subscriptions: BTreeMap::new(),
-            ended: VecDeque::new(),
             last_served: None,
         }));
         let wake = Arc::new(Notify::new());
@@ -312,14 +314,6 @@ impl Shared {
                     update.added_credit,
                     update.acknowledged,
                 )?;
-                // `Publications::open` clears the oldest tombstones by this
-                // rule. Its module docs explain why.
-                let keep = usize::from(MAX_HS_SUBSCRIPTIONS)
-                    .saturating_sub(1)
-                    .saturating_sub(self.subscriptions.len());
-                while self.ended.len() > keep {
-                    self.ended.pop_front();
-                }
                 self.subscriptions.insert(
                     id,
                     Subscription {
@@ -333,21 +327,13 @@ impl Shared {
                 Ok(Applied::Live)
             }
             Operation::Grant | Operation::Close => {
-                let known = self
-                    .subscriptions
-                    .get(&id)
-                    .map(|subscription| subscription.fixed)
-                    .or_else(|| {
-                        self.ended
-                            .iter()
-                            .find(|(key, _)| *key == id)
-                            .map(|(_, fixed)| *fixed)
-                    });
-                if known.is_some_and(|known| known != fixed) {
+                // A tombstone matches by ID and sequence only, so only a
+                // live subscription checks the fixed fields.
+                let live = self.subscriptions.get(&id);
+                if live.is_some_and(|subscription| subscription.fixed != fixed) {
                     return Err(PublisherFault::ChangedFields);
                 }
-                let close = update.operation == Operation::Close;
-                let applied = if close {
+                let applied = if update.operation == Operation::Close {
                     self.publications
                         .close(&id, update.update_sequence, &update.acknowledged)?
                 } else {
@@ -358,19 +344,11 @@ impl Shared {
                         update.added_credit,
                     )?
                 };
-                match applied {
-                    Applied::Live => {
-                        // New credit may let a locally stalled subscription
-                        // retry.
-                        if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                            if matches!(subscription.stall, Some(Stall::Local)) {
-                                subscription.stall = None;
-                            }
-                        }
+                // New credit may let a locally stalled subscription retry.
+                if let Some(subscription) = self.subscriptions.get_mut(&id) {
+                    if matches!(subscription.stall, Some(Stall::Local)) {
+                        subscription.stall = None;
                     }
-                    // A crossed `Close` consumes its tombstone.
-                    Applied::Crossed if close => self.ended.retain(|(key, _)| *key != id),
-                    Applied::Crossed => {}
                 }
                 Ok(applied)
             }
@@ -379,16 +357,19 @@ impl Shared {
 
     /// End every subscription that is closing or has an outcome queued, in
     /// order, and return each terminal frame with its permit.
+    ///
+    /// An outcome this node already queued wins over `SubscriptionClosed`,
+    /// as the specification requires.
     fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<(u64, Frame, TerminalPermit)> {
         let due: Vec<(u64, HeadersOutcomeCode)> = self
             .subscriptions
             .iter()
-            .filter_map(|(&id, subscription)| {
-                if self.publications.is_closing(&id) {
+            .filter_map(|(&id, subscription)| match subscription.end {
+                Some(outcome) => Some((id, outcome)),
+                None if self.publications.is_closing(&id) => {
                     Some((id, HeadersOutcomeCode::SubscriptionClosed))
-                } else {
-                    subscription.end.map(|outcome| (id, outcome))
                 }
+                None => None,
             })
             .collect();
         due.into_iter()
@@ -404,11 +385,6 @@ impl Shared {
                     "the publisher queued {outcome:?} outside its window"
                 );
                 let terminal = self.publications.end(&id)?;
-                self.ended.push_back((id, subscription.fixed));
-                // `Publications::end` keeps this many tombstones.
-                while self.ended.len() > usize::from(MAX_HS_SUBSCRIPTIONS) * 2 {
-                    self.ended.pop_front();
-                }
                 metrics::counter!(
                     "sync.header.v9.publisher.outcome",
                     "outcome" => outcome_label(outcome),
@@ -546,6 +522,10 @@ impl Shared {
                 }
             }
             Output::End(outcome) => self.queue_end(id, outcome),
+            Output::Retry(reason) => {
+                metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => reason)
+                    .increment(1);
+            }
             Output::Stall(stall, reason) => {
                 metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
@@ -748,6 +728,8 @@ enum Output {
     ReachedAtOpen(Frontier),
     End(HeadersOutcomeCode),
     Stall(Stall, &'static str),
+    /// The page left the selected chain while in progress. Read again.
+    Retry(&'static str),
 }
 
 /// Everything the publisher task owns besides its stream.
@@ -802,7 +784,9 @@ async fn publish<const HEADER_BYTES: usize>(
                 .any(|subscription| subscription.end.is_some());
             drop(shared);
             if let Some(job) = job {
-                work = Some((job.id, start_page::<HEADER_BYTES>(&task, job, &send)));
+                let id = job.id;
+                let page = start_page::<HEADER_BYTES>(&task, job, &send, selected.clone());
+                work = Some((id, page));
             }
             if ending {
                 continue;
@@ -854,14 +838,21 @@ async fn any_released(signals: Vec<ServingCapacitySignal>) {
 
 /// Start one page: wait for its budgets, run its job holding them, then
 /// reserve its transport slot.
+///
+/// A following page whose selected tip moved meanwhile is checked against
+/// `selected` before it is sent; see [`still_selected`].
 fn start_page<'a, const HEADER_BYTES: usize>(
     task: &Task,
     job: Job,
     send: &'a FramedSend,
+    selected: watch::Receiver<Option<EngineSnapshot>>,
 ) -> Work<'a> {
     let push = task.push.clone();
     let port = task.port.clone();
+    let check_port = task.port.clone();
     let owner = task.owner;
+    let id = job.id;
+    let leased_tip = job.following.then_some(job.lease_target);
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
     Box::pin(async move {
         let permit = push.acquire(bytes).await;
@@ -871,16 +862,66 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         });
         let (output, permit): (Output, PushPermit) = match running.await {
             Ok(done) => done,
-            Err(_) => return Progress::Other(Output::Stall(Stall::Local, "job_failed")),
+            // Only a local bug panics a job. Stalling would leave the
+            // subscription half live, so the publisher task panics too.
+            Err(error) if error.is_panic() => {
+                tracing::error!(
+                    subscription_id = id,
+                    ?error,
+                    "a header sync v9 page job panicked"
+                );
+                std::panic::resume_unwind(error.into_panic())
+            }
+            // The runtime is shutting down.
+            Err(_) => return Progress::Closed,
         };
         let Output::Page(page) = output else {
             return Progress::Other(output);
         };
-        match permit.reserve_send(send).await {
-            Ok(slot) => Progress::Page(page, slot),
-            Err(_) => Progress::Closed,
+        let Ok(slot) = permit.reserve_send(send).await else {
+            return Progress::Closed;
+        };
+        if let Some(leased_tip) = leased_tip {
+            if !still_selected(&*check_port, owner, &selected, leased_tip, page.last).await {
+                return Progress::Other(Output::Retry("left_selected_chain"));
+            }
         }
+        Progress::Page(page, slot)
     })
+}
+
+/// Whether the latest selected chain still contains `last`, the last header
+/// of a following page leased toward `leased_tip`.
+///
+/// It checks only when the selected tip moved, and only a lease that finds no
+/// intersection says no, so growth and local failures keep the page. The
+/// check closes the window between leasing a page and sending it, not the
+/// write after it.
+async fn still_selected(
+    port: &dyn Port,
+    owner: LeaseOwner,
+    selected: &watch::Receiver<Option<EngineSnapshot>>,
+    leased_tip: block::Hash,
+    last: Frontier,
+) -> bool {
+    let Some(latest) = selected.borrow().clone() else {
+        return true;
+    };
+    let tip = latest.frontiers.header_best;
+    if tip.hash == leased_tip || tip == last {
+        return true;
+    }
+    if tip.height <= last.height {
+        return false;
+    }
+    match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
+        Ok(AcquirePathReply::Acquired(path)) => {
+            release(port, *path).await;
+            true
+        }
+        Ok(AcquirePathReply::NoLocatorIntersection) => false,
+        Ok(_) | Err(_) => true,
+    }
 }
 
 /// Read one page, or decide the subscription's outcome, through `port`.
@@ -890,7 +931,8 @@ async fn run_job<const HEADER_BYTES: usize>(
     job: &Job,
 ) -> Output {
     if let Some(tip) = job.probe {
-        match acquire(port, owner, job, tip.hash, vec![job.initial_target]).await {
+        let selected = job.selected.as_ref();
+        match acquire(port, owner, selected, tip.hash, vec![job.initial_target]).await {
             Ok(AcquirePathReply::Acquired(path)) => {
                 let selected = path.common_ancestor.hash == job.initial_target;
                 release(port, *path).await;
@@ -901,7 +943,8 @@ async fn run_job<const HEADER_BYTES: usize>(
             Ok(AcquirePathReply::NoLocatorIntersection) => {
                 // Tell a target this node never retained from one that left
                 // the selected chain.
-                let path = acquire(port, owner, job, job.lease_target, job.locators.clone()).await;
+                let locators = job.locators.clone();
+                let path = acquire(port, owner, selected, job.lease_target, locators).await;
                 return match path {
                     Ok(AcquirePathReply::Acquired(path)) => {
                         release(port, *path).await;
@@ -923,7 +966,15 @@ async fn run_job<const HEADER_BYTES: usize>(
         }
     }
     for _ in 0..LEASE_ATTEMPTS {
-        let reply = acquire(port, owner, job, job.lease_target, job.locators.clone()).await;
+        let locators = job.locators.clone();
+        let reply = acquire(
+            port,
+            owner,
+            job.selected.as_ref(),
+            job.lease_target,
+            locators,
+        )
+        .await;
         let path = match reply {
             Ok(AcquirePathReply::Acquired(path)) => *path,
             Ok(AcquirePathReply::CapacityBusy(signal)) => {
@@ -937,10 +988,13 @@ async fn run_job<const HEADER_BYTES: usize>(
                 return Output::End(HeadersOutcomeCode::NoLocatorIntersection)
             }
             // A stale selected tip: the next selected-chain change retries.
-            Ok(AcquirePathReply::TargetNotRetained | AcquirePathReply::HistoryPruned)
-                if job.following =>
-            {
+            Ok(AcquirePathReply::TargetNotRetained) if job.following => {
                 return Output::Stall(Stall::Local, "selected_tip")
+            }
+            // History from the last header sent is gone and will not return,
+            // and `HistoryPruned` is past its window.
+            Ok(AcquirePathReply::HistoryPruned) if job.following => {
+                return Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
                 return Output::End(HeadersOutcomeCode::TargetNotRetained)
@@ -985,14 +1039,14 @@ async fn run_job<const HEADER_BYTES: usize>(
 async fn acquire(
     port: &dyn Port,
     owner: LeaseOwner,
-    job: &Job,
+    selected: Option<&EngineSnapshot>,
     target: block::Hash,
     locators: Vec<block::Hash>,
 ) -> Result<AcquirePathReply, zakura_node_services::header_chain::PortError> {
     port.acquire_header_path(AcquirePath {
         source: owner.peer,
         session_id: owner.session_id,
-        scope: scope(job.selected.as_ref(), target),
+        scope: scope(selected, target),
         target_tip_hash: target,
         locator_hashes: locators,
     })

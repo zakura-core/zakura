@@ -928,7 +928,7 @@ fn readers_follow_both_layouts() {
 }
 
 /// Each network selects the layout for its header size, on stream 5 at
-/// version 9 under capability bit 9.
+/// version 9 under capability bit 10.
 #[test]
 fn every_network_selects_the_layout_for_its_header_size() {
     /// Check `network`'s layout against the `HEADER_BYTES` family.
@@ -937,7 +937,7 @@ fn every_network_selects_the_layout_for_its_header_size() {
         assert_eq!(layout, &Message::<HEADER_BYTES>::LAYOUT[..]);
         assert_eq!(
             (layout[0].kind, layout[0].version, layout[0].capability),
-            (5, 9, 1 << 9)
+            (5, 9, 1 << 10)
         );
     }
     on_every_network!(check);

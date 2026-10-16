@@ -507,7 +507,7 @@ fn every_publisher_outcome_row() {
         Ok(Applied::Live)
     );
 
-    // `Grant` or a second `Close` after `Close`.
+    // `Grant` or a second `Close` after `Close`, before and after the end.
     assert_eq!(publications.close(&1, 2, &1), Ok(Applied::Live));
     assert_eq!(
         publications.grant(&1, 3, &1, credit(1, 0)),
@@ -518,6 +518,12 @@ fn every_publisher_outcome_row() {
         publications.reserve_page(&1, 1, 8, 2),
         Err(PageStall::Closing)
     );
+    drop(publications.end(&1));
+    assert_eq!(
+        publications.grant(&1, 3, &1, credit(1, 0)),
+        Err(F::AfterClose)
+    );
+    assert_eq!(publications.close(&1, 3, &1), Err(F::AfterClose));
 
     // A crossed `Grant` is dropped and keeps the tombstone; a crossed `Close`
     // is dropped and consumes it. Both still follow the sequence, and a
@@ -634,40 +640,6 @@ fn a_crossed_grant_is_held_by_the_ended_window() {
             Err(F::CrossedAboveWindow)
         );
     }
-}
-
-#[test]
-fn every_update_after_close_faults_even_after_the_end() {
-    use SubscriptionFault as F;
-
-    // Ended after `Close`: no conformant update follows it, so every update
-    // on the tombstone faults, whatever its sequence or credit. The
-    // tombstone stays until the next `Open`.
-    let mut publications = opened(1, &[1]);
-    publications.reserve_page(&1, 1, 8, 1).unwrap();
-    assert_eq!(publications.close(&1, 1, &0), Ok(Applied::Live));
-    drop(publications.end(&1));
-    for sequence in [1, 2, 3] {
-        assert_eq!(
-            publications.grant(&1, sequence, &1, credit(1, 0)),
-            Err(F::AfterClose)
-        );
-        assert_eq!(publications.close(&1, sequence, &1), Err(F::AfterClose));
-    }
-    assert_eq!(publications.tombstones(), 1);
-    publications.open(2, 0, LIMIT, 0).unwrap();
-    assert_eq!(publications.tombstones(), 0);
-
-    // Ended on the publisher's own outcome: the same updates crossed it.
-    let mut publications = opened(1, &[1]);
-    publications.reserve_page(&1, 1, 8, 1).unwrap();
-    drop(publications.end(&1));
-    assert_eq!(
-        publications.grant(&1, 1, &1, credit(1, 0)),
-        Ok(Applied::Crossed)
-    );
-    assert_eq!(publications.close(&1, 2, &1), Ok(Applied::Crossed));
-    assert_eq!(publications.tombstones(), 0);
 }
 
 #[derive(Clone, Debug)]

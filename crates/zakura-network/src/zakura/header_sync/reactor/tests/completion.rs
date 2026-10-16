@@ -1133,6 +1133,122 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
     task.await.expect("the reactor exits cleanly");
 }
 
+/// A peer that reorganizes ends its subscription with
+/// `SubscriptionSuperseded` and advertises the new tip. The new target starts
+/// once both arrive, in either order, without waiting for another `Status`.
+/// The peer sends that `Status` at most one second after the commit, the
+/// floor that `StatusPublisher` enforces, so recovery takes at most the floor
+/// plus the round trips.
+#[tokio::test(start_paused = true)]
+async fn superseded_recovery_starts_at_once_in_either_order() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, mut actions, task) =
+        spawn_header_sync_reactor(startup).expect("the requester fixture starts");
+    let (send, mut outbound) = framed_channel(16);
+    let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
+    handle
+        .send(Event::PeerConnected(session.clone()))
+        .await
+        .expect("the peer connects");
+    let _initial_status = outbound.recv().await.expect("initial status is sent");
+    let status = |height: u32, tip: block::Hash| Event::Status {
+        peer: peer.clone(),
+        session_id: 0,
+        status: Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: block::Height(height),
+            selected_tip_hash: tip,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(height),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 1,
+            max_subscriptions: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: 0,
+        },
+    };
+    /// Answer the locator query for `target`, and return the sent `Open`.
+    async fn open(
+        handle: &HeaderSyncHandle,
+        actions: &mut mpsc::Receiver<HeaderPortOperation>,
+        outbound: &mut crate::zakura::FramedRecv,
+        anchor: zakura_header_chain::Frontier,
+        target: block::Hash,
+    ) -> v9::SubscribeHeaders {
+        let (peer, session_id, scope) = match next_action(actions).await {
+            HeaderPortOperation::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+            } if target_tip_hash == target => (peer, session_id, scope),
+            other => panic!("expected a locator query for the new tip, got {other:?}"),
+        };
+        handle
+            .send(Event::HeaderLocatorReady {
+                peer,
+                session_id,
+                target_tip_hash: target,
+                scope,
+                locator: Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+            })
+            .await
+            .expect("the locator reaches the reactor");
+        update(outbound.recv().await.expect("Open is sent"))
+    }
+    let superseded = |open: &v9::SubscribeHeaders| {
+        outcome_event(
+            &session,
+            HeadersOutcome {
+                subscription_id: open.subscription_id,
+                initial_target_tip_hash: open.initial_target_tip_hash,
+                outcome: HeadersOutcomeCode::SubscriptionSuperseded,
+            },
+        )
+    };
+
+    handle
+        .send(status(2, block::Hash([0x42; 32])))
+        .await
+        .unwrap();
+    let mut live = open(
+        &handle,
+        &mut actions,
+        &mut outbound,
+        anchor,
+        block::Hash([0x42; 32]),
+    )
+    .await;
+    for (status_first, tip) in [(true, [0x43; 32]), (false, [0x44; 32])] {
+        let (reorganized, ended) = (status(3, block::Hash(tip)), superseded(&live));
+        let started = Instant::now();
+        let (first, second) = if status_first {
+            (reorganized, ended)
+        } else {
+            (ended, reorganized)
+        };
+        handle.send(first).await.expect("the reactor is running");
+        handle.send(second).await.expect("the reactor is running");
+        live = open(
+            &handle,
+            &mut actions,
+            &mut outbound,
+            anchor,
+            block::Hash(tip),
+        )
+        .await;
+        assert_eq!(Instant::now(), started, "status_first={status_first}");
+    }
+    handle.send(superseded(&live)).await.unwrap();
+    shutdown.cancel();
+    task.await.expect("the reactor exits cleanly");
+}
+
 #[test]
 fn header_continuation_uses_credits_released_after_a_small_first_request() {
     for advertised_limit in [1, 1_000] {

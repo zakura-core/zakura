@@ -1011,8 +1011,11 @@ impl HeaderSyncReactor {
             return;
         }
         if let Some(active) = self.peer_work_queue.active(&peer) {
-            // Exact selected-range repair does not use the advertised ordinary offer.
-            if matches!(active.purpose, HeaderTargetPurpose::Normal) {
+            // Exact selected-range repair does not use the advertised ordinary offer. A status
+            // for another target stays unspent, so it starts once this work ends.
+            if matches!(active.purpose, HeaderTargetPurpose::Normal)
+                && active.target.status.selected_tip_hash == target_tip_hash
+            {
                 self.spend_status(&peer);
             }
             metrics::counter!("sync.header.target.already_active").increment(1);

@@ -10,8 +10,8 @@ Exercise SubscribeHeaders through its Headers pages and one HeadersOutcome termi
 through its cadence. Use production framing, decode, subscription tools, serving, and cleanup. Add
 only the seams needed to control chain growth, header validation, capacity, and page delivery.
 
-Version 9 replaces version 8 without a compatibility path, so version 8 tests retire when
-version 9 activates.
+Version 9 replaced version 8 without a compatibility path, so the version 8 tests retired with
+it.
 
 ## Existing infrastructure
 
@@ -22,8 +22,8 @@ version 9 activates.
 | Header checks | [Frame suite](../../crates/zakura-network/src/zakura/transport/message_rule/frame_suite.rs) | Every row against every reader of a layout |
 | Real QUIC properties | [Stream conformance suite](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) | Unsolicited responses, retirement, paused siblings, partial frames, and Close progress |
 | Cadence buckets | [CadenceBuckets](../../crates/zakura-network/src/zakura/regulation/cadence.rs) | Status observation, outage bursts, and read-pause credit |
-| Reactor tests | [Header sync reactor tests](../../crates/zakura-network/src/zakura/header_sync/reactor/tests/mod.rs) | Version 8 serving, admission, peer faults, and timeouts to port |
-| Codec fuzzing | [header_codec](../../qa/fuzz/header-chain/fuzz_targets/header_codec.rs) | Arbitrary payload decode and re-encode |
+| Reactor tests | [Header sync reactor tests](../../crates/zakura-network/src/zakura/header_sync/reactor/tests/mod.rs) | Admission, completion, peer faults, repair, and timeouts over version 9 |
+| Codec fuzzing | [header_codec_v9](../../qa/fuzz/header-chain/fuzz_targets/header_codec_v9.rs) | Arbitrary payload decode and re-encode |
 | Multi-node harness | [Cluster](../../crates/zakura-network/src/zakura/testkit/cluster.rs) | Honest multi-node sync |
 | Monotonic test time | [TestClock](../../crates/zakura-network/src/zakura/testkit/clock.rs) | Existing clock-dependent checks |
 

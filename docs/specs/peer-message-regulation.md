@@ -399,11 +399,9 @@ Header sync version 9 uses capability bit 10. It replaces version 8 without a co
 Capability bit 5, which identified version 8, is retired and MUST NOT be reused. A peer that offers
 only version 8 negotiates no header sync stream.
 
-Version 9 takes effect at activation. Until then, version 8 remains as section 5 of the [fork-aware
-header chain engine specification](fork-aware-header-chain-engine.md) defines it. At activation,
-this section supersedes that specification's stream version, message encodings, and `GetHeaders`
-request rules, and the tests that pin them, including PW-08. Its other header sync rules keep
-applying except where this section changes them. The activation change updates that specification.
+This section defines version 9's encodings and subscription rules. Section 5 of the [fork-aware
+header chain engine specification](fork-aware-header-chain-engine.md) states the header chain rules
+that apply to them.
 
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet

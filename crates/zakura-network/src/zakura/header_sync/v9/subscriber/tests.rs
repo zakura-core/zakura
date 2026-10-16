@@ -10,6 +10,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::zakura::{
+    framed_channel,
     header_sync::{
         config::REGTEST_HEADER_BYTES,
         v9::{
@@ -19,9 +20,9 @@ use crate::zakura::{
         },
         wire::HeaderEntry,
     },
-    regulation::Publications,
+    regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    CloseCause, Frame,
+    CloseCause, Frame, FrameRejection,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -34,9 +35,10 @@ type Sub = Subscriber<HB>;
 /// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
 
-/// A subscriber on a session whose fence closes `connection`.
+/// A subscriber on an in-process session whose fence closes `connection`.
 fn fenced(connection: &CancellationToken) -> Sub {
-    Sub::new(WriterFence::new(connection.clone(), CloseCause::default()))
+    let fence = WriterFence::new(connection.clone(), CloseCause::default());
+    Sub::new(fence, &framed_channel(1).1)
 }
 
 /// A subscriber on a session whose connection the test ignores.
@@ -188,11 +190,8 @@ impl Fixture {
             marker,
             self.schema,
         );
+        self.sub.admit(&frame)?;
         let (page, len) = decode_page(&frame);
-        self.sub
-            .precheck()
-            .lock()
-            .precheck(frame.message_type, len)?;
         self.sub.receive_page(&page, len)
     }
 
@@ -253,7 +252,7 @@ fn open_records_its_reservation_first() {
         }
     );
     assert_eq!(
-        sub.precheck()
+        sub.tools
             .lock()
             .credit(&open.subscription_id)
             .map(|credit| credit.granted().objects),
@@ -317,7 +316,7 @@ fn open_refuses_what_the_publisher_would_fault() {
         Some(SubscribeError::NoStaging)
     );
     assert_eq!(sub.live(), None);
-    assert_eq!(sub.precheck().lock().len(), 0);
+    assert_eq!(sub.tools.lock().len(), 0);
 
     // A schema-1 Open's byte credit fits a schema-1 page.
     let open = wire(
@@ -329,6 +328,38 @@ fn open_refuses_what_the_publisher_would_fault() {
     assert_eq!(
         open.added_credit.bytes as usize,
         smallest_page(HB, AuxSchema::V1)
+    );
+}
+
+/// The constructor attaches the frame header check to a transport reader,
+/// which refuses an unsolicited page before its payload is read. Without a
+/// reader, `admit` runs the same check before decode.
+#[test]
+fn the_frame_header_check_runs_before_decode() {
+    let (tree, chain) = chain(2);
+    let frame = page_frame(
+        &tree,
+        1,
+        chain[2].hash,
+        chain[0],
+        &chain[1..2],
+        false,
+        AuxSchema::None,
+    );
+    let slot = PrecheckSlot::default();
+    let (_, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let sub = Sub::new(fence, &recv);
+    let reader = slot.get().expect("the subscriber attaches its check");
+    assert_eq!(
+        reader.check(frame.message_type, frame.payload.len()),
+        Err(FrameRejection::Unsolicited)
+    );
+    assert_eq!(sub.admit(&frame), Ok(()), "the reader already checked it");
+    assert_eq!(
+        subscriber().admit(&frame),
+        Err(SubscriptionFault::Unknown.into())
     );
 }
 
@@ -637,7 +668,7 @@ fn grants_refill_half_window_prefixes() {
     let granted = |fixture: &Fixture| {
         fixture
             .sub
-            .precheck()
+            .tools
             .lock()
             .credit(&id)
             .expect("live")
@@ -798,7 +829,7 @@ fn an_open_holds_its_exchange_until_the_outcome() {
     );
 
     let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
-    let mut sub = Sub::new(fence.clone());
+    let mut sub = Sub::new(fence.clone(), &framed_channel(1).1);
     assert!(fence.retire());
     assert_eq!(
         sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
@@ -1092,8 +1123,7 @@ impl Session {
             "an update acknowledges only a start or a validated cursor"
         );
         if update.operation == Operation::Grant {
-            let tools = self.sub.precheck();
-            let tools = tools.lock();
+            let tools = self.sub.tools.lock();
             let credit = tools.credit(&update.subscription_id).expect("live");
             let window = Sub::window(self.staging, update.tree_aux_schema);
             assert!(
@@ -1120,9 +1150,7 @@ impl Session {
                 return;
             };
             self.sub
-                .precheck()
-                .lock()
-                .precheck(frame.message_type, frame.payload.len())
+                .admit(&frame)
                 .expect("a conformant frame header passes");
             match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames")
             {

@@ -1785,11 +1785,7 @@ async fn follow(
     let mut received = Vec::new();
     harness.drain().await;
     while let Some(frame) = harness.inbox.pop_front() {
-        subscriber
-            .precheck()
-            .lock()
-            .precheck(frame.message_type, frame.payload.len())
-            .expect("the frame header passes");
+        subscriber.admit(&frame).expect("the frame header passes");
         match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames") {
             Message::Headers(page) => {
                 let admitted = subscriber
@@ -1837,10 +1833,10 @@ async fn the_subscriber_follows_the_publisher() {
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
-    let mut subscriber = Subscriber::<HB>::new(WriterFence::new(
-        CancellationToken::new(),
-        CloseCause::default(),
-    ));
+    let mut subscriber = Subscriber::<HB>::new(
+        WriterFence::new(CancellationToken::new(), CloseCause::default()),
+        &framed_channel(1).1,
+    );
     let open = subscriber
         .open(
             &status::<HB>(chain[9]),

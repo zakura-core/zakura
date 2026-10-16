@@ -46,6 +46,8 @@
 //! Nothing here uses a timer or takes credit back, as the specification's
 //! "Header sync — stream 5, version 9" section requires.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
@@ -62,7 +64,7 @@ use crate::zakura::{
         SubscriptionLimits, Subscriptions, Update, WriterFence,
     },
     wire_codec::WireMessage,
-    Credit,
+    Credit, Frame, FramedRecv,
 };
 
 #[cfg(test)]
@@ -214,6 +216,8 @@ struct Live {
 #[derive(Debug)]
 pub(crate) struct Subscriber<const HEADER_BYTES: usize> {
     tools: SharedSubscriptions<u64, Cursor>,
+    /// Whether a transport reader checks frame headers against `tools`.
+    transport_admits: bool,
     /// The session's fence. Each `Open` holds an exchange of it until the
     /// terminal outcome.
     fence: WriterFence,
@@ -228,24 +232,36 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// when it adds no header.
     const SMALLEST_PAGE: usize = smallest_page(HEADER_BYTES, AuxSchema::None);
 
-    /// A subscriber with no subscription, on the session that `fence` guards.
-    pub(crate) fn new(fence: WriterFence) -> Self {
+    /// A subscriber with no subscription, on the session that `fence` guards
+    /// and `recv` reads. It attaches its frame header check to `recv`'s
+    /// transport reader, if `recv` has one.
+    pub(crate) fn new(fence: WriterFence, recv: &FramedRecv) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
+        let tools =
+            SharedSubscriptions::new(Subscriptions::new(limits, Message::<HEADER_BYTES>::RULES));
+        let transport_admits = recv.attach_precheck(Arc::new(tools.clone()));
         Self {
-            tools: SharedSubscriptions::new(Subscriptions::new(
-                limits,
-                Message::<HEADER_BYTES>::RULES,
-            )),
+            tools,
+            transport_admits,
             fence,
             live: None,
             next_id: 1,
         }
     }
 
-    /// The table the session reader checks frame headers against.
-    pub(crate) fn precheck(&self) -> SharedSubscriptions<u64, Cursor> {
-        self.tools.clone()
+    /// Check a page or outcome frame header before its payload is decoded.
+    ///
+    /// A transport reader already ran this check. In-process channels have
+    /// none, so this runs the same check for them.
+    pub(crate) fn admit(&self, frame: &Frame) -> Result<(), SubscriberFault> {
+        if self.transport_admits {
+            return Ok(());
+        }
+        self.tools
+            .lock()
+            .precheck(frame.message_type, frame.payload.len())
+            .map_err(|fault| SubscriberFault::from(fault).counted())
     }
 
     /// The credit window for `staging` reserved headers under `schema`: at

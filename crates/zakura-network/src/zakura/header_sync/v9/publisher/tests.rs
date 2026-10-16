@@ -11,22 +11,21 @@ use std::{
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::{
-    block::{genesis::regtest_genesis_block, merkle::AuthDataRoot},
-    fmt::HexDebug,
-    ironwood, orchard, sapling,
-    work::difficulty::U256,
-};
+use zakura_chain::{block::genesis::regtest_genesis_block, fmt::HexDebug, work::difficulty::U256};
 use zakura_header_chain::{
     AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
-    SuffixWork, TreeAuxRecordV1, VerifiedGeneration,
+    SuffixWork, VerifiedGeneration,
 };
 use zakura_node_services::header_chain::{
     AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, VctRepairContextReply,
 };
 
-use super::super::{smallest_page, RegtestMessage};
+use super::super::{
+    smallest_page,
+    test_support::{p, record, OUTCOME_CODES},
+    RegtestMessage,
+};
 use super::*;
 use crate::zakura::{
     framed_channel,
@@ -41,11 +40,6 @@ const HB: usize = REGTEST_HEADER_BYTES;
 
 /// How long the paused clock runs before a receive counts as quiet.
 const QUIET: Duration = Duration::from_secs(1);
-
-/// `P`, the smallest legal page.
-fn p() -> u32 {
-    u32::try_from(smallest_page(HB, AuxSchema::None)).expect("a page fits u32")
-}
 
 /// Three headers per page, and bytes for two schema-1 entries, so pages
 /// split by count without records and by bytes with them.
@@ -67,20 +61,6 @@ fn serve_limits() -> ServeLimits {
         node_output_responses: 16,
         peer_output_bytes: 1 << 20,
         node_output_bytes: 1 << 22,
-    }
-}
-
-/// A schema-1 record with every root at its empty default.
-fn record(height: block::Height) -> TreeAuxRecordV1 {
-    TreeAuxRecordV1 {
-        height,
-        sapling_root: sapling::tree::Root::default(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx_count: 0,
-        orchard_tx_count: 0,
-        ironwood_tx_count: 0,
-        auth_data_root: AuthDataRoot::from([0; 32]),
     }
 }
 
@@ -488,7 +468,7 @@ impl Subscriber {
             objects: headers.min(room.objects),
             bytes: bytes.min(room.bytes),
         };
-        if added.objects == 0 && added.bytes < p() {
+        if added.objects == 0 && added.bytes < p::<HB>() {
             return None;
         }
         let update = self.tools.grant(&opened.id, added).ok()?;
@@ -1432,7 +1412,7 @@ async fn update_bursts_yield_to_other_peers() {
     let mut subscriber = Subscriber::new();
     let first = Credit {
         objects: 1,
-        bytes: p(),
+        bytes: p::<HB>(),
     };
     let open = subscriber.open(chain[0].hash, vec![chain[0]], first, AuxSchema::None);
     harness
@@ -1461,14 +1441,11 @@ async fn update_bursts_yield_to_other_peers() {
 /// legal one is kept.
 #[test]
 fn every_own_outcome_lands_in_its_window() {
-    use HeadersOutcomeCode::*;
-    for outcome in [
-        TargetNotRetained,
-        NoLocatorIntersection,
-        HistoryPruned,
-        TargetNotSelected,
-        SubscriptionSuperseded,
-    ] {
+    // `SubscriptionClosed` answers the peer's `Close`, never this node.
+    let own = OUTCOME_CODES
+        .into_iter()
+        .filter(|outcome| *outcome != HeadersOutcomeCode::SubscriptionClosed);
+    for outcome in own {
         for pages_sent in [false, true] {
             for reached in [false, true] {
                 let sent = in_window(outcome, pages_sent, reached);
@@ -1613,7 +1590,7 @@ async fn run(ops: Vec<Op>) {
             Op::Grant { headers, pages } => {
                 if let Some(grant) = harness
                     .subscriber
-                    .grant(u32::from(headers), u32::from(pages) * p())
+                    .grant(u32::from(headers), u32::from(pages) * p::<HB>())
                 {
                     harness
                         .apply(grant)

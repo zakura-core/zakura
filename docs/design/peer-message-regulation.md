@@ -325,7 +325,7 @@ updates, but it would delay acknowledgements during tip following. A cadence on 
 row would not bound the flood at all, because buckets record and forward.
 
 **Compatibility.** Version 9 replaces version 8 in one step, as block sync version 3 replaced
-version 2. It takes capability bit 9 and retires bit 5. One release of both versions would have
+version 2. It takes capability bit 10 and retires bit 5. One release of both versions would have
 kept native header sync working between upgraded and older nodes, but it would have left the
 version 8 path unregulated for that release and doubled the codec, reactor, and tests. Until most
 peers upgrade, upgraded and older nodes cannot exchange headers over native header sync.

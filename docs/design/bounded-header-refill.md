@@ -179,3 +179,16 @@ visits after the initial pass. This measures eliminated scheduler work, not
 production throughput or a saturation threshold. Header-sync v9 cadence changes
 can reduce event frequency, but activation must retain these opportunity inputs
 and release notifications when replacing the ordinary request state machine.
+
+The test also clears only the scheduling cache before each pass as a control,
+replaying the previous unconditional scan with identical offers and scheduling
+logic. Expected additional peer visits over 3,000 passes are:
+
+| Admitted peers | Unconditional control | Opportunity tracking |
+| --- | ---: | ---: |
+| 16 | 48,000 | 0 |
+| 64 | 192,000 | 0 |
+| 256 | 768,000 | 0 |
+| 512 | 1,536,000 | 0 |
+
+Both the duplicate-target and zero-headroom workloads assert these counts.

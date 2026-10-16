@@ -414,102 +414,102 @@ version = "0.52.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.zakura-address]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-bellman]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-bls12-381]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-equihash]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-jubjub]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-note-encryption]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
-notes = "Newly adopted Common note-encryption package in the coordinated v3.0.0 release. Exact-version audit backlog entry pending direct package review; this is not an audit certification."
+notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-orchard]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-pairing]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-pasta-curves]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-primitives]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-protocol]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-reddsa]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-redjubjub]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-sinsemilla]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 
 [[exemptions.zakura-transparent]]
-version = "3.0.0@git:d4b395ad2d5d3534ad897de3f3264a9d8723d4fa"
+version = "3.0.0@git:cef9b810f0b45585d9688c1aaa41146d8cb90e59"
 criteria = "safe-to-deploy"
 notes = "Draft Common integration at this exact upstream revision. Carry the existing v3.0.0 audit backlog; the changes since publication also require review before deployment. This is an exemption, not an audit certification."
 

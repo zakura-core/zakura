@@ -770,8 +770,13 @@ async fn publish<const HEADER_BYTES: usize>(
             if work.as_ref().is_some_and(|(working, _)| *working == id) {
                 work = None;
             }
-            if !terminal.send(&send, frame).await {
-                return;
+            // A full queue must not keep a cancelled session's task alive.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                sent = terminal.send(&send, frame) => if !sent {
+                    return;
+                },
             }
         }
         if work.is_none() {

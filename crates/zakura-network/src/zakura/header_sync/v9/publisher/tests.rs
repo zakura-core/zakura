@@ -1252,6 +1252,46 @@ async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
     harness.check_quiet().await;
 }
 
+/// Cancelling the session stops the publisher even while a terminal outcome
+/// waits for a full transport queue.
+#[tokio::test(start_paused = true)]
+async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    // One slot, which the first page fills because nobody reads it.
+    let (send, _recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let (publisher, task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel.clone(),
+    );
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !task.is_finished(),
+        "the terminal outcome waits for the queue"
+    );
+    cancel.cancel();
+    tokio::time::timeout(QUIET, task)
+        .await
+        .expect("cancel stops the publisher")
+        .expect("the publisher task does not panic");
+}
+
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,
 /// and an unadvertised schema fault.
 #[tokio::test(start_paused = true)]

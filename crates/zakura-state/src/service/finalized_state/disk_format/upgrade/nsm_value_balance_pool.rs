@@ -117,6 +117,43 @@ impl DiskFormatUpgrade for Upgrade {
     }
 }
 
+/// Reruns the backfill on databases that format 29.0.0 left without a valid NSM balance.
+///
+/// A database marked 29.0.0 before its network scheduled NU7 skipped the backfill, and the
+/// format version stops it from running again once NU7 is scheduled. Healthy databases are
+/// left unchanged; histories the backfill refuses stay refused.
+pub struct Repair;
+
+impl DiskFormatUpgrade for Repair {
+    fn version(&self) -> Version {
+        Version::new(30, 0, 1)
+    }
+
+    fn description(&self) -> &'static str {
+        "repair NSM value balances skipped by the format 29.0.0 backfill"
+    }
+
+    fn run(
+        &self,
+        initial_finalized_tip_height: Option<Height>,
+        db: &ZakuraDb,
+        cancel_receiver: &Receiver<CancelFormatChange>,
+    ) -> Result<(), FormatChangeError> {
+        if Upgrade.validate(db, cancel_receiver)?.is_ok() {
+            return Ok(());
+        }
+        Upgrade.run(initial_finalized_tip_height, db, cancel_receiver)
+    }
+
+    fn validate(
+        &self,
+        db: &ZakuraDb,
+        cancel_receiver: &Receiver<CancelFormatChange>,
+    ) -> Result<Result<(), String>, FormatChangeError> {
+        Upgrade.validate(db, cancel_receiver)
+    }
+}
+
 fn backfill(
     initial_finalized_tip_height: Option<Height>,
     db: &ZakuraDb,
@@ -1528,6 +1565,68 @@ mod database_tests {
             DbFormatChange::CheckOpenCurrent { .. }
         ));
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+    }
+
+    /// A database marked 29.0.0 without its NSM backfill, as when NU7 was unscheduled at the
+    /// time, is repaired on upgrade. A healthy database is left unchanged.
+    #[test]
+    fn repair_backfills_a_database_marked_without_nsm_balances() {
+        use super::super::DbFormatChange;
+
+        const SEED: i64 = 1_234_567;
+        const ROWS: u32 = 6;
+        let tip = Height(ROWS - 1);
+        let running_version = state_database_format_version_in_code();
+        let records = |db: &ZakuraDb| {
+            let rows: Vec<_> = (0..ROWS)
+                .map(|h| db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0)
+                .collect();
+            (rows, db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0)
+        };
+
+        let healthy = legacy_db_with_seed(ROWS, 48, SEED);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(tip), &healthy, &rx).unwrap();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: tempdir.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let db = legacy_db_with_config(accounting_network(SEED), ROWS, 48, &config);
+        db.update_format_version_on_disk(&Version::new(29, 0, 0))
+            .unwrap();
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_err());
+
+        DbFormatChange::open_database(&running_version, Some(Version::new(29, 0, 0)))
+            .apply_format_upgrade(&db, Some(tip), &rx)
+            .unwrap();
+        assert_eq!(records(&db), records(&healthy));
+
+        let network = db.network();
+        drop(db);
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &running_version,
+            &network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            DbFormatChange::open_database(&running_version, db.format_version_on_disk().unwrap()),
+            DbFormatChange::CheckOpenCurrent { .. }
+        ));
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+
+        let before = records(&healthy);
+        Repair.run(Some(tip), &healthy, &rx).unwrap();
+        assert_eq!(records(&healthy), before);
     }
 
     #[test]

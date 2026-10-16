@@ -863,9 +863,10 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// Whether the latest selected chain still contains `last`, the last header
 /// of a following page leased toward `leased_tip`.
 ///
-/// It checks only when the selected tip moved, and only a lease that finds no
-/// intersection says no, so growth and local failures keep the page. The
-/// lease is state work, so it waits for execution slots through `push` as the
+/// It checks only when the selected tip moved, and only a lease that confirms
+/// the page keeps it. Anything else drops the page, and the next pass leases
+/// again from the last header sent, where the usual stall and outcome rules
+/// apply. The lease is state work, so it waits for execution slots through `push` as the
 /// page's read did. The chain can move during that wait or the lease, so the
 /// check repeats until the tip it judged against is still the selected one.
 /// That closes the window up to the page's commit, not the write after it.
@@ -899,11 +900,10 @@ async fn still_selected(
                 release(port, *path).await;
                 true
             }
-            Ok(AcquirePathReply::NoLocatorIntersection) => false,
-            Ok(_) => true,
+            Ok(_) => false,
             Err(error) => {
                 log_port_failure(id, "recheck", &error);
-                true
+                false
             }
         };
         let current = selected

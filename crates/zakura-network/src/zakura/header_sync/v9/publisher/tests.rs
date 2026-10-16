@@ -1198,6 +1198,32 @@ async fn a_following_page_recheck_repeats_when_the_tip_moves_during_its_lease() 
     harness.check_quiet().await;
 }
 
+/// A recheck that cannot confirm the page drops it, and the next pass reads
+/// again toward the new tip.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read while the chain grows.
+    let main = port.grow(2);
+    harness.drain().await;
+    let grown = port.store().tree.extend(main[1], 1);
+    port.select(grown[0]);
+    // State refuses the recheck's lease.
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::Busy));
+    port.gate.add_permits(1);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
+    harness.check_quiet().await;
+}
+
 /// A follower stalled on a capacity refusal still ends as superseded when
 /// the selected tip drops below its last header.
 #[tokio::test(start_paused = true)]

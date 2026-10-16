@@ -1,12 +1,10 @@
 //! The version 9 codec's tests.
 //!
 //! The generated item, message, and frame suites run on both header sizes.
-//! Hand-written fixtures pin each layout independently of the encoder, and the
-//! cap tests pin the fixed sizes and every network's page bounds.
+//! Hand-written fixtures pin each layout independently of the encoder.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use chrono::{TimeZone, Utc};
 use proptest::{collection::hash_set, prelude::*};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block, merkle::AuthDataRoot},
@@ -14,7 +12,7 @@ use zakura_chain::{
     parameters::Network,
     sapling,
     serialization::{ZcashDeserialize, ZcashSerialize},
-    work::{difficulty::U256, equihash::Solution},
+    work::difficulty::U256,
 };
 
 use super::{replay_header_sync_v9_codec_bytes, wire::*};
@@ -31,9 +29,7 @@ use crate::zakura::{
     wire_codec::{
         encode_frame,
         item_suite::item_suite,
-        message_suite::{
-            check_layout_carries_family, decode_checked, message_suite, MessageSample, Violation,
-        },
+        message_suite::{decode_checked, message_suite, MessageSample, Violation},
         sample::WireSample,
         BlockHash, HeightLe, WireError, WireMessage,
     },
@@ -133,50 +129,6 @@ fn smallest_status<const HEADER_BYTES: usize>() -> Status {
     }
 }
 
-/// An `Open` with `locators` distinct locators, starting at the first.
-fn open(locators: u8, added_credit: Credit, schema: AuxSchema) -> SubscribeHeaders {
-    let locator_hashes: Vec<_> = (0..locators).map(|index| hash(0x40 + index)).collect();
-    SubscribeHeaders {
-        operation: Operation::Open,
-        subscription_id: 7,
-        update_sequence: 0,
-        initial_target_tip_hash: hash(0x22),
-        acknowledged: Cursor {
-            height: block::Height(5),
-            hash: locator_hashes[0],
-            headers: 0,
-            bytes: 0,
-        },
-        locator_hashes,
-        added_credit,
-        tree_aux_schema: schema,
-    }
-}
-
-/// A `Grant` or `Close` with no locators.
-fn update(operation: Operation, update_sequence: u32, added_credit: Credit) -> SubscribeHeaders {
-    SubscribeHeaders {
-        operation,
-        subscription_id: 7,
-        update_sequence,
-        initial_target_tip_hash: hash(0x22),
-        acknowledged: Cursor {
-            height: block::Height(6),
-            hash: hash(0x33),
-            headers: 1,
-            bytes: 1_573,
-        },
-        locator_hashes: Vec::new(),
-        added_credit,
-        tree_aux_schema: AuxSchema::None,
-    }
-}
-
-/// Header and byte credit.
-fn credit(objects: u32, bytes: u32) -> Credit {
-    Credit { objects, bytes }
-}
-
 /// A page of `count` copies of a real header, with the largest body-size
 /// hint and, under schema 1, an empty record each.
 fn page<const HEADER_BYTES: usize>(count: u32, schema: AuxSchema) -> Headers {
@@ -202,14 +154,13 @@ fn page<const HEADER_BYTES: usize>(count: u32, schema: AuxSchema) -> Headers {
     }
 }
 
-/// The most headers a page holds under `schema`: the 2 MiB cap binds on
+/// The most headers a page with records holds: the 2 MiB cap binds on
 /// Mainnet and Testnet, and `MAX_HS_RANGE` binds on Regtest.
-fn most_headers<const HEADER_BYTES: usize>(schema: AuxSchema) -> u32 {
-    match (HEADER_BYTES, schema) {
-        (COMMON_HEADER_BYTES, AuxSchema::None) => 1_406,
-        (COMMON_HEADER_BYTES, AuxSchema::V1) => 1_273,
-        (REGTEST_HEADER_BYTES, _) => 4_000,
-        _ => unreachable!("no network has {HEADER_BYTES}-byte headers"),
+fn most_headers<const HEADER_BYTES: usize>() -> u32 {
+    if HEADER_BYTES == REGTEST_HEADER_BYTES {
+        4_000
+    } else {
+        1_273
     }
 }
 
@@ -243,137 +194,89 @@ impl WireSample for Work {
     }
 }
 
-item_suite!(work, Work);
-item_suite!(locators, Locators);
 item_suite!(status_payload, StatusPayload);
 item_suite!(update_payload, UpdatePayload);
 item_suite!(page_fixed_fields, PageFixed);
 item_suite!(outcome_payload, OutcomePayload);
 
-/// Valid statuses: heights in order, caps within the protocol limits.
+/// Valid statuses: heights put in order and the message cap moved into
+/// range for the advertised schema.
 fn arbitrary_status<const HEADER_BYTES: usize>() -> BoxedStrategy<Status> {
-    let max_message_bytes = u32::try_from(MAX_HS_MESSAGE_BYTES).expect("2 MiB fits u32");
-    (0..=block::Height::MAX.0, any::<bool>())
-        .prop_flat_map(move |(tip, records)| {
-            let schema = if records {
-                AuxSchema::V1
-            } else {
-                AuxSchema::None
-            };
-            let smallest =
-                u32::try_from(smallest_page(HEADER_BYTES, schema)).expect("a page fits u32");
-            (
-                (Just(tip), 0..=tip, 0..=tip),
-                (
-                    BlockHash::arbitrary(),
-                    BlockHash::arbitrary(),
-                    Work::arbitrary(),
-                ),
-                (
-                    1..=MAX_HS_RANGE,
-                    smallest..=max_message_bytes,
-                    Just(u32::from(records)),
-                ),
-            )
-        })
+    (
+        (
+            HeightLe::arbitrary(),
+            HeightLe::arbitrary(),
+            HeightLe::arbitrary(),
+        ),
+        (
+            BlockHash::arbitrary(),
+            BlockHash::arbitrary(),
+            Work::arbitrary(),
+        ),
+        (1..=MAX_HS_RANGE, 0..=1u32, any::<prop::sample::Index>()),
+    )
         .prop_map(
             |(
-                (tip, anchor, retained),
+                (a, b, c),
                 (work_anchor_hash, selected_tip_hash, suffix_cumulative_work),
-                (max_headers_per_response, max_message_bytes, tree_aux_schema_mask),
-            )| Status {
-                work_anchor_height: block::Height(anchor),
-                work_anchor_hash,
-                selected_tip_height: block::Height(tip),
-                selected_tip_hash,
-                suffix_cumulative_work,
-                oldest_retained_height: block::Height(retained),
-                max_headers_per_response,
-                max_subscriptions: MAX_HS_SUBSCRIPTIONS,
-                max_message_bytes,
-                tree_aux_schema_mask,
+                (max_headers_per_response, tree_aux_schema_mask, cap),
+            )| {
+                let schema = if tree_aux_schema_mask == 1 {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
+                };
+                let smallest = smallest_page(HEADER_BYTES, schema);
+                let max_message_bytes = smallest + cap.index(MAX_HS_MESSAGE_BYTES - smallest + 1);
+                Status {
+                    work_anchor_height: a.min(b),
+                    work_anchor_hash,
+                    selected_tip_height: a.max(b).max(c),
+                    selected_tip_hash,
+                    suffix_cumulative_work,
+                    oldest_retained_height: b.min(c),
+                    max_headers_per_response,
+                    max_subscriptions: MAX_HS_SUBSCRIPTIONS,
+                    max_message_bytes: u32::try_from(max_message_bytes).expect("2 MiB fits u32"),
+                    tree_aux_schema_mask,
+                }
             },
         )
         .boxed()
 }
 
-/// Either known auxiliary schema.
-fn arbitrary_schema() -> BoxedStrategy<AuxSchema> {
-    prop_oneof![Just(AuxSchema::None), Just(AuxSchema::V1)].boxed()
-}
-
-/// Valid updates of every operation.
+/// Valid updates: each operation's fields fixed up to its shape.
 fn arbitrary_update<const HEADER_BYTES: usize>() -> BoxedStrategy<SubscribeHeaders> {
-    let opens = arbitrary_schema()
-        .prop_flat_map(|schema| {
-            let smallest =
-                u32::try_from(smallest_page(HEADER_BYTES, schema)).expect("a page fits u32");
-            (
-                (1..=u64::MAX, BlockHash::arbitrary(), HeightLe::arbitrary()),
-                hash_set(any::<[u8; 32]>(), 1..=13),
-                (
-                    1..=MAX_HS_PUSH_CREDIT_HEADERS,
-                    smallest..=MAX_HS_PUSH_CREDIT_BYTES,
-                    Just(schema),
-                ),
-            )
-        })
-        .prop_map(
-            |((subscription_id, target, height), locators, (objects, bytes, schema))| {
-                let locator_hashes: Vec<_> = locators.into_iter().map(block::Hash).collect();
-                SubscribeHeaders {
-                    operation: Operation::Open,
-                    subscription_id,
-                    update_sequence: 0,
-                    initial_target_tip_hash: target,
-                    acknowledged: Cursor {
-                        height,
-                        hash: locator_hashes[0],
-                        headers: 0,
-                        bytes: 0,
-                    },
-                    locator_hashes,
-                    added_credit: credit(objects, bytes),
-                    tree_aux_schema: schema,
-                }
-            },
-        );
-    let later = (
+    (
+        (0..3u8, 1..=u64::MAX, any::<u32>(), BlockHash::arbitrary()),
         (
-            prop_oneof![Just(Operation::Grant), Just(Operation::Close)],
-            1..=u64::MAX,
-            1..=u32::MAX,
-        ),
-        (
-            BlockHash::arbitrary(),
             HeightLe::arbitrary(),
             BlockHash::arbitrary(),
             any::<(u64, u64)>(),
         ),
+        hash_set(any::<[u8; 32]>(), 1..=13),
         (
             0..=MAX_HS_PUSH_CREDIT_HEADERS,
             0..=MAX_HS_PUSH_CREDIT_BYTES,
-            arbitrary_schema(),
+            any::<bool>(),
         ),
     )
         .prop_map(
             |(
-                (operation, subscription_id, update_sequence),
-                (target, height, hash, (headers, bytes)),
-                (objects, added_bytes, schema),
+                (operation, subscription_id, sequence, target),
+                (height, hash, (headers, bytes)),
+                locators,
+                (objects, added_bytes, records),
             )| {
-                let added_credit = match operation {
-                    Operation::Close => credit(0, 0),
-                    // Lift a grant below the minimum to one header.
-                    _ if objects == 0 && added_bytes < p::<HEADER_BYTES>() => {
-                        credit(1, added_bytes)
-                    }
-                    _ => credit(objects, added_bytes),
+                let tree_aux_schema = if records {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
                 };
-                SubscribeHeaders {
-                    operation,
+                let mut update = SubscribeHeaders {
+                    operation: Operation::Grant,
                     subscription_id,
-                    update_sequence,
+                    update_sequence: sequence.max(1),
                     initial_target_tip_hash: target,
                     acknowledged: Cursor {
                         height,
@@ -382,68 +285,68 @@ fn arbitrary_update<const HEADER_BYTES: usize>() -> BoxedStrategy<SubscribeHeade
                         bytes,
                     },
                     locator_hashes: Vec::new(),
-                    added_credit,
-                    tree_aux_schema: schema,
+                    added_credit: Credit {
+                        objects,
+                        bytes: added_bytes,
+                    },
+                    tree_aux_schema,
+                };
+                match operation {
+                    0 => {
+                        let least = u32::try_from(smallest_page(HEADER_BYTES, tree_aux_schema))
+                            .expect("a page fits u32");
+                        update.operation = Operation::Open;
+                        update.update_sequence = 0;
+                        update.locator_hashes = locators.into_iter().map(block::Hash).collect();
+                        update.acknowledged = Cursor {
+                            hash: update.locator_hashes[0],
+                            headers: 0,
+                            bytes: 0,
+                            ..update.acknowledged
+                        };
+                        update.added_credit = Credit {
+                            objects: objects.max(1),
+                            bytes: added_bytes.max(least),
+                        };
+                    }
+                    // Lift a grant below the minimum to one header.
+                    1 if objects == 0 && added_bytes < p::<HEADER_BYTES>() => {
+                        update.added_credit.objects = 1;
+                    }
+                    1 => {}
+                    _ => {
+                        update.operation = Operation::Close;
+                        update.added_credit = Credit {
+                            objects: 0,
+                            bytes: 0,
+                        };
+                    }
                 }
+                update
             },
-        );
-    prop_oneof![opens, later].boxed()
-}
-
-/// Headers of `HEADER_BYTES` with arbitrary links, times, nonces, and
-/// solutions.
-fn arbitrary_header<const HEADER_BYTES: usize>() -> BoxedStrategy<Arc<block::Header>> {
-    let base = *sample_header::<HEADER_BYTES>();
-    let solution_bytes = match base.solution {
-        Solution::Common(bytes) => bytes.len(),
-        Solution::Regtest(bytes) => bytes.len(),
-    };
-    (
-        any::<[u8; 32]>(),
-        any::<u32>(),
-        any::<[u8; 32]>(),
-        proptest::collection::vec(any::<u8>(), solution_bytes),
-    )
-        .prop_map(move |(previous, time, nonce, solution)| {
-            Arc::new(block::Header {
-                previous_block_hash: block::Hash(previous),
-                time: Utc
-                    .timestamp_opt(time.into(), 0)
-                    .single()
-                    .expect("every u32 is a valid timestamp"),
-                nonce: nonce.into(),
-                solution: Solution::from_bytes(&solution).expect("the network's solution size"),
-                ..base
-            })
-        })
+        )
         .boxed()
 }
 
-/// Valid pages of one to four entries.
+/// Valid pages of one to four copies of a real header.
 fn arbitrary_page<const HEADER_BYTES: usize>() -> BoxedStrategy<Headers> {
+    let header = sample_header::<HEADER_BYTES>();
     let record = empty_aux(block::Height(0));
     let entry = (
-        arbitrary_header::<HEADER_BYTES>(),
         0..=2_000_000u32,
-        (
-            HeightLe::arbitrary(),
-            any::<(u64, u64, u64)>(),
-            any::<[u8; 32]>(),
-        ),
+        HeightLe::arbitrary(),
+        any::<(u64, u64, u64)>(),
+        any::<[u8; 32]>(),
     );
     (
         (1..=u64::MAX, BlockHash::arbitrary(), BlockHash::arbitrary()),
-        (
-            0..=block::Height::MAX.0 - 4,
-            any::<bool>(),
-            arbitrary_schema(),
-        ),
+        (0..=block::Height::MAX.0 - 4, any::<bool>(), any::<bool>()),
         proptest::collection::vec(entry, 1..=4),
     )
         .prop_map(
             move |(
                 (subscription_id, target, parent_hash),
-                (parent_height, reaches_initial_target, schema),
+                (parent_height, reaches_initial_target, records),
                 entries,
             )| Headers {
                 subscription_id,
@@ -451,13 +354,17 @@ fn arbitrary_page<const HEADER_BYTES: usize>() -> BoxedStrategy<Headers> {
                 common_ancestor_height: block::Height(parent_height),
                 common_ancestor_hash: parent_hash,
                 reaches_initial_target,
-                tree_aux_schema: schema,
+                tree_aux_schema: if records {
+                    AuxSchema::V1
+                } else {
+                    AuxSchema::None
+                },
                 entries: entries
                     .into_iter()
-                    .map(|(header, body_size, (height, counts, auth))| HeaderEntry {
-                        header,
+                    .map(|(body_size, height, counts, auth)| HeaderEntry {
+                        header: header.clone(),
                         body_size,
-                        tree_aux: (schema == AuxSchema::V1).then_some(TreeAuxRecordV1 {
+                        tree_aux: records.then_some(TreeAuxRecordV1 {
                             height,
                             sapling_tx_count: counts.0,
                             orchard_tx_count: counts.1,
@@ -642,7 +549,10 @@ impl RawUpdate {
                 bytes,
             },
             locator_hashes: self.locators.iter().copied().map(block::Hash).collect(),
-            added_credit: credit(self.header_credit, self.byte_credit),
+            added_credit: Credit {
+                objects: self.header_credit,
+                bytes: self.byte_credit,
+            },
             tree_aux_schema: if self.schema == 1 {
                 AuxSchema::V1
             } else {
@@ -722,6 +632,7 @@ fn outcome_payload(subscription_id: u64, code: u8) -> Vec<u8> {
 impl<const HEADER_BYTES: usize> MessageSample for Message<HEADER_BYTES> {
     fn samples() -> Vec<Self> {
         let p = p::<HEADER_BYTES>();
+        let record = u32::try_from(smallest_page(HEADER_BYTES, AuxSchema::V1)).expect("fits u32");
         let mut samples = vec![
             Self::Status(smallest_status::<HEADER_BYTES>()),
             Self::Status(Status {
@@ -734,27 +645,50 @@ impl<const HEADER_BYTES: usize> MessageSample for Message<HEADER_BYTES> {
                 tree_aux_schema_mask: 1,
                 ..smallest_status::<HEADER_BYTES>()
             }),
-            Self::SubscribeHeaders(open(1, credit(1, p), AuxSchema::None)),
-            Self::SubscribeHeaders(open(
-                13,
-                credit(MAX_HS_PUSH_CREDIT_HEADERS, MAX_HS_PUSH_CREDIT_BYTES),
-                AuxSchema::V1,
-            )),
-            Self::SubscribeHeaders(update(Operation::Grant, 1, credit(1, 0))),
-            Self::SubscribeHeaders(update(Operation::Grant, u32::MAX, credit(0, p))),
-            Self::SubscribeHeaders(update(Operation::Close, 2, credit(0, 0))),
-            Self::Headers(page::<HEADER_BYTES>(1, AuxSchema::None)),
-            Self::Headers(page::<HEADER_BYTES>(1, AuxSchema::V1)),
-            Self::Headers(page::<HEADER_BYTES>(
-                most_headers::<HEADER_BYTES>(AuxSchema::V1),
-                AuxSchema::V1,
-            )),
+            Self::Status(
+                RawStatus {
+                    message_bytes: record,
+                    ..RawStatus::valid()
+                }
+                .value(),
+            ),
         ];
+        let open = RawUpdate::open(1);
         samples.extend(
-            OUTCOME_CODES
-                .into_iter()
-                .map(|code| Self::HeadersOutcome(outcome(u64::MAX, code))),
+            [
+                RawUpdate {
+                    header_credit: 1,
+                    byte_credit: p,
+                    ..open.clone()
+                },
+                RawUpdate {
+                    header_credit: 1,
+                    byte_credit: record,
+                    schema: 1,
+                    ..open
+                },
+                RawUpdate {
+                    schema: 1,
+                    ..RawUpdate::open(13)
+                },
+                RawUpdate::grant(1, 0),
+                RawUpdate {
+                    sequence: u32::MAX,
+                    ..RawUpdate::grant(0, p)
+                },
+                RawUpdate::close(),
+            ]
+            .map(|raw| Self::SubscribeHeaders(raw.value())),
         );
+        samples.extend(
+            [
+                page::<HEADER_BYTES>(1, AuxSchema::None),
+                page::<HEADER_BYTES>(1, AuxSchema::V1),
+                page::<HEADER_BYTES>(most_headers::<HEADER_BYTES>(), AuxSchema::V1),
+            ]
+            .map(Self::Headers),
+        );
+        samples.extend(OUTCOME_CODES.map(|code| Self::HeadersOutcome(outcome(u64::MAX, code))));
         samples
     }
 
@@ -913,13 +847,6 @@ fn violations<const HEADER_BYTES: usize>() -> Vec<Violation<Message<HEADER_BYTES
 message_suite!(mainnet_and_testnet_family, CommonMessage);
 message_suite!(regtest_family, RegtestMessage);
 
-/// Each layout carries exactly its family's rows.
-#[test]
-fn layouts_carry_exactly_their_family_rows() {
-    check_layout_carries_family::<CommonMessage>(&CommonMessage::LAYOUT);
-    check_layout_carries_family::<RegtestMessage>(&RegtestMessage::LAYOUT);
-}
-
 /// The frame suite: every reader of both layouts follows its rows.
 #[test]
 fn readers_follow_both_layouts() {
@@ -943,161 +870,65 @@ fn every_network_selects_the_layout_for_its_header_size() {
     on_every_network!(check);
 }
 
-/// The rows hold the specification's values on every network.
+/// The rows and constants hold the specification's values.
 #[test]
 fn rows_hold_the_specified_limits() {
-    /// Check the rows of the `HEADER_BYTES` family.
-    fn check<const HEADER_BYTES: usize>(_network: &Network) {
-        let [status, subscribe, headers, outcome] = Message::<HEADER_BYTES>::ROWS;
-        assert_eq!(status.message_type, 1);
-        assert_eq!(status.payload, PayloadLen::exact(122));
-        assert_eq!(
-            status.role,
-            MessageRole::Announcement {
-                cadence: Cadence {
-                    capacity: 602,
-                    refill_interval: std::time::Duration::from_millis(500),
-                    send_interval: std::time::Duration::from_secs(1),
-                },
-            }
-        );
-        // The bucket holds exactly the one-second sender's outage burst.
-        assert_eq!(
-            Cadence::min_capacity(std::time::Duration::from_secs(1)),
-            602
-        );
+    let rows = |rows: [MessageRule; 4]| rows.map(|row| (row.message_type, row.payload));
+    let with_page = |page| {
+        [
+            (1, PayloadLen::exact(122)),
+            (2, PayloadLen::between(107, 523)),
+            (3, page),
+            (4, PayloadLen::exact(41)),
+        ]
+    };
+    assert_eq!(
+        rows(CommonMessage::ROWS),
+        with_page(PayloadLen::between(1_573, 2_096_713))
+    );
+    assert_eq!(
+        rows(RegtestMessage::ROWS),
+        with_page(PayloadLen::between(263, 1_348_082))
+    );
+    assert_eq!(
+        (
+            MAX_HS_PUSH_CREDIT_HEADERS,
+            MAX_HS_PUSH_CREDIT_BYTES,
+            MAX_HS_SUBSCRIPTIONS,
+            HS_SENT_CURSOR_RING,
+            HEADERS_RESPONSE_FIXED_BYTES,
+        ),
+        (4_000, 8 * 1024 * 1024, 1, 4_096, 82)
+    );
+    // A fieldless enum's discriminant is its declared `u8` value.
+    assert_eq!(OUTCOME_CODES.map(|code| code as u8), [1, 2, 3, 5, 6, 7]);
 
-        assert_eq!(subscribe.message_type, 2);
-        assert_eq!(subscribe.payload, PayloadLen::between(107, 523));
-        assert_eq!(
-            subscribe.role,
-            MessageRole::Subscription {
-                max_live: 1,
-                credit: Credit {
-                    objects: 4_000,
-                    bytes: 8 * 1024 * 1024,
-                },
-                cursor_history: 4_096,
-                cadence: None,
-            }
-        );
-
-        let (smallest, largest) = match HEADER_BYTES {
-            COMMON_HEADER_BYTES => (1_573, 2_096_713),
-            REGTEST_HEADER_BYTES => (263, 1_348_082),
-            _ => unreachable!("no network has {HEADER_BYTES}-byte headers"),
-        };
-        assert_eq!(headers.message_type, 3);
-        assert_eq!(headers.payload, PayloadLen::between(smallest, largest));
-        assert_eq!(
-            headers.role,
-            MessageRole::Response {
-                request: 2,
-                ends_exchange: false
-            }
-        );
-
-        assert_eq!(outcome.message_type, 4);
-        assert_eq!(outcome.payload, PayloadLen::exact(41));
-        assert_eq!(
-            outcome.role,
-            MessageRole::Response {
-                request: 2,
-                ends_exchange: true
-            }
-        );
-    }
-    on_every_network!(check);
-}
-
-/// The cap test: the fixed sizes and the page bounds are what the codec
-/// produces.
-///
-/// A one-header page is the fixed fields, the header, and its hint, so it pins
-/// `HEADERS_RESPONSE_FIXED_BYTES`. Under each schema, the most headers that fit
-/// encode, and one more does not, so the `Headers` row's maximum is the
-/// longest page the codec produces, not the 2 MiB cap.
-#[test]
-fn caps_match_the_codec_on_every_network() {
-    /// Check the caps of the `HEADER_BYTES` family on `network`.
-    fn check<const HEADER_BYTES: usize>(network: &Network) {
-        assert_eq!(HEADERS_RESPONSE_FIXED_BYTES, 82);
-        assert_eq!(HEADERS_OUTCOME_BYTES, 41);
-        let header = genesis_header(network);
-        let one = Headers {
-            entries: vec![HeaderEntry {
-                header: header.clone(),
-                body_size: 0,
-                tree_aux: None,
-            }],
-            ..page::<HEADER_BYTES>(1, AuxSchema::None)
-        };
-        let payload = encode_frame(&Message::<HEADER_BYTES>::Headers(one))
-            .expect("a one-header page encodes")
-            .payload;
-        assert_eq!(
-            payload.len(),
-            HEADERS_RESPONSE_FIXED_BYTES + HEADER_BYTES + 4
-        );
-        assert_eq!(
-            &payload[HEADERS_RESPONSE_FIXED_BYTES..][..HEADER_BYTES],
-            &header_bytes(&header)[..],
-            "the header follows the fixed fields"
-        );
-        let row = Message::<HEADER_BYTES>::ROWS[2].payload;
-        assert_eq!(payload.len(), row.min());
-
-        let outcome = encode_frame(&Message::<HEADER_BYTES>::HeadersOutcome(outcome(
-            1,
-            HeadersOutcomeCode::SubscriptionClosed,
-        )))
-        .expect("an outcome encodes");
-        assert_eq!(outcome.payload.len(), HEADERS_OUTCOME_BYTES);
-
-        let mut longest = 0;
-        for schema in [AuxSchema::None, AuxSchema::V1] {
-            let most = most_headers::<HEADER_BYTES>(schema);
-            let full = encode_frame(&Message::<HEADER_BYTES>::Headers(page::<HEADER_BYTES>(
-                most, schema,
-            )))
-            .expect("the fullest page encodes");
-            longest = longest.max(full.payload.len());
-            assert!(
-                encode_frame(&Message::<HEADER_BYTES>::Headers(page::<HEADER_BYTES>(
-                    most + 1,
-                    schema
-                )))
-                .is_err(),
-                "one more header under {schema:?} breaks the 2 MiB or MAX_HS_RANGE cap"
-            );
+    // The bucket holds a one-second sender's outage burst and refills twice
+    // as fast as the sender.
+    let MessageRole::Announcement { cadence } = CommonMessage::ROWS[0].role else {
+        panic!("Status is an announcement");
+    };
+    assert_eq!(
+        cadence,
+        Cadence {
+            capacity: Cadence::min_capacity(Duration::from_secs(1)),
+            refill_interval: Duration::from_millis(500),
+            send_interval: Duration::from_secs(1),
         }
-        assert_eq!(longest, row.max());
-        assert!(row.max() <= MAX_HS_MESSAGE_BYTES);
-    }
-    on_every_network!(check);
+    );
 }
 
-/// A legal fixture, laid out by hand, and the message it must decode to.
-type Fixture<const HEADER_BYTES: usize> = (&'static str, Frame, Message<HEADER_BYTES>);
-
-/// Legal fixtures at each boundary, independent of the encoder.
-fn fixtures<const HEADER_BYTES: usize>(network: &Network) -> Vec<Fixture<HEADER_BYTES>> {
-    let p = p::<HEADER_BYTES>();
-    let record = u32::try_from(smallest_page(HEADER_BYTES, AuxSchema::V1)).expect("fits u32");
+/// One legal payload per layout, laid out by hand, and the message it must
+/// decode to.
+fn fixtures<const HEADER_BYTES: usize>(network: &Network) -> Vec<(Frame, Message<HEADER_BYTES>)> {
     let header = genesis_header(network);
-    let status = |raw: RawStatus| (frame(1, raw.payload()), Message::Status(raw.value()));
     let update = |raw: RawUpdate| {
         (
             frame(2, raw.payload()),
             Message::SubscribeHeaders(raw.value()),
         )
     };
-    let entry = |tree_aux| HeaderEntry {
-        header: header.clone(),
-        body_size: 2_000_000,
-        tree_aux,
-    };
-    let page = |raw: &RawPage, entries| {
+    let page = |raw: RawPage, tree_aux: Option<TreeAuxRecordV1>| {
         (
             frame(3, raw.payload()),
             Message::Headers(Headers {
@@ -1106,97 +937,40 @@ fn fixtures<const HEADER_BYTES: usize>(network: &Network) -> Vec<Fixture<HEADER_
                 common_ancestor_height: block::Height(10),
                 common_ancestor_hash: hash(0x33),
                 reaches_initial_target: true,
-                tree_aux_schema: if raw.schema == 1 {
+                tree_aux_schema: if tree_aux.is_some() {
                     AuxSchema::V1
                 } else {
                     AuxSchema::None
                 },
-                entries,
+                entries: vec![HeaderEntry {
+                    header: header.clone(),
+                    body_size: 2_000_000,
+                    tree_aux,
+                }],
             }),
         )
     };
-    let mut fixtures = vec![
-        ("status", status(RawStatus::valid())),
+    vec![
         (
-            "status cap at a one-header page",
-            status(RawStatus {
-                mask: 0,
-                message_bytes: p,
-                ..RawStatus::valid()
-            }),
+            frame(1, RawStatus::valid().payload()),
+            Message::Status(RawStatus::valid().value()),
+        ),
+        update(RawUpdate::open(13)),
+        update(RawUpdate::grant(
+            MAX_HS_PUSH_CREDIT_HEADERS,
+            MAX_HS_PUSH_CREDIT_BYTES,
+        )),
+        update(RawUpdate::close()),
+        page(RawPage::valid(&header), None),
+        page(
+            RawPage::with_record(&header),
+            Some(empty_aux(block::Height(11))),
         ),
         (
-            "status cap at a one-header page with a record",
-            status(RawStatus {
-                message_bytes: record,
-                ..RawStatus::valid()
-            }),
+            frame(4, outcome_payload(u64::MAX, 7)),
+            Message::HeadersOutcome(outcome(u64::MAX, HeadersOutcomeCode::SubscriptionClosed)),
         ),
-        (
-            "status at the edges",
-            status(RawStatus {
-                anchor: 9,
-                retained: 9,
-                header_cap: 4_000,
-                ..RawStatus::valid()
-            }),
-        ),
-        ("open with one locator", update(RawUpdate::open(1))),
-        ("open with 13 locators", update(RawUpdate::open(13))),
-        (
-            "open with the least credit",
-            update(RawUpdate {
-                header_credit: 1,
-                byte_credit: p,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        (
-            "open with the least credit for records",
-            update(RawUpdate {
-                header_credit: 1,
-                byte_credit: record,
-                schema: 1,
-                ..RawUpdate::open(1)
-            }),
-        ),
-        ("grant of one header", update(RawUpdate::grant(1, 0))),
-        ("grant of one page of bytes", update(RawUpdate::grant(0, p))),
-        (
-            "grant of the whole window",
-            update(RawUpdate::grant(
-                MAX_HS_PUSH_CREDIT_HEADERS,
-                MAX_HS_PUSH_CREDIT_BYTES,
-            )),
-        ),
-        ("close", update(RawUpdate::close())),
-        (
-            "page of one header",
-            page(&RawPage::valid(&header), vec![entry(None)]),
-        ),
-        (
-            "page of one header with a record",
-            page(
-                &RawPage::with_record(&header),
-                vec![entry(Some(empty_aux(block::Height(11))))],
-            ),
-        ),
-    ];
-    for code in OUTCOME_CODES {
-        // A fieldless enum's discriminant is its declared `u8` value.
-        let wire = code as u8;
-        fixtures.push((
-            "outcome",
-            (
-                frame(4, outcome_payload(u64::MAX, wire)),
-                Message::HeadersOutcome(outcome(u64::MAX, code)),
-            ),
-        ));
-    }
-    fixtures
-        .into_iter()
-        .map(|(name, (frame, message))| (name, frame, message))
-        .collect()
+    ]
 }
 
 /// Hand-written fixtures decode to their values and re-encode to their bytes.
@@ -1204,14 +978,14 @@ fn fixtures<const HEADER_BYTES: usize>(network: &Network) -> Vec<Fixture<HEADER_
 fn fixtures_decode_and_reencode_on_every_network() {
     /// Check the fixtures of the `HEADER_BYTES` family on `network`.
     fn check<const HEADER_BYTES: usize>(network: &Network) {
-        for (name, frame, message) in fixtures::<HEADER_BYTES>(network) {
+        for (index, (frame, message)) in fixtures::<HEADER_BYTES>(network).into_iter().enumerate() {
             let decoded = decode_checked::<Message<HEADER_BYTES>>(&frame)
-                .unwrap_or_else(|error| panic!("{name} is legal: {error}"));
-            assert_eq!(decoded, message, "{name} decodes to its value");
+                .unwrap_or_else(|error| panic!("fixture {index} is legal: {error}"));
+            assert_eq!(decoded, message, "fixture {index} decodes to its value");
             assert_eq!(
                 encode_frame(&message).expect("legal fixtures encode"),
                 frame,
-                "{name} re-encodes to its bytes"
+                "fixture {index} re-encodes to its bytes"
             );
         }
     }

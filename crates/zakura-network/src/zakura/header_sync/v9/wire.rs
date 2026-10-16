@@ -63,9 +63,6 @@ pub(crate) const HS_SENT_CURSOR_RING: u32 = 4_096;
 /// Bytes of a `Headers` page before its entries.
 pub(crate) const HEADERS_RESPONSE_FIXED_BYTES: usize = <PageFixed as Wire>::MAX_LEN;
 
-/// Bytes of a `HeadersOutcome`.
-pub(crate) const HEADERS_OUTCOME_BYTES: usize = <OutcomePayload as Wire>::MAX_LEN;
-
 /// Most locator hashes an `Open` carries.
 const MAX_LOCATOR_HASHES: usize = 13;
 

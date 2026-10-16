@@ -668,7 +668,14 @@ async fn run_discovery_pipe(
         let Some(message) = pipe.local_mut().take_decoded() else {
             continue;
         };
-        sink.handle_message(message).await?;
+        // A cancelled session drops its pending work, including a wait for a
+        // verification slot, so it neither holds the slot queue nor imports
+        // after its session ends.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            handled = sink.handle_message(message) => handled?,
+        }
     }
 }
 
@@ -1760,6 +1767,62 @@ mod tests {
             .await
             .expect("an authentic expired hello is dropped, not rejected");
         assert!(sink.progress.hello.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// A cancelled session's reader drops a `Hello` that waits for a
+    /// verification slot. It leaves the slot queue and never imports the
+    /// record.
+    #[tokio::test]
+    async fn cancelled_session_drops_a_hello_waiting_for_a_verification_slot(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[50u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_secret = NodeSecretKey::from_bytes(&[51u8; 32]);
+        let peer_node_id = peer_secret.public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit,
+        );
+        let (sink, _sink_recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let cancel = sink.session.cancel_token();
+        let (peer_send, recv) = framed_channel(8);
+        peer_send
+            .send(discovery_frame(DiscoveryMessage::Hello {
+                record: signed_discovery_record(&peer_secret, &handshake)?,
+            })?)
+            .await?;
+
+        let held = handle.hold_verify_slots();
+        let mut pipe = discovery_pipe(peer_id.clone());
+        let reader = tokio::spawn(async move { run_discovery_pipe(&mut pipe, recv, sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reader.is_finished(), "the hello waits for a slot");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the cancelled reader stops while the slots stay held")?
+            .expect("a cancelled session ends without a rejection");
+        drop(held);
+        assert_eq!(handle.record_for(peer_node_id).await, None);
         Ok(())
     }
 

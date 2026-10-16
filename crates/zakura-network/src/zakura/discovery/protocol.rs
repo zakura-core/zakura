@@ -952,7 +952,7 @@ pub enum ImportOutcome {
 /// Summary of importing a bounded batch of discovery records.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImportBatchOutcome {
-    /// Number of records considered before the per-response cap stopped import.
+    /// Number of records offered to the book before the per-response cap stopped import.
     pub attempted: usize,
     /// Number of newly added records.
     pub added: usize,
@@ -1871,9 +1871,14 @@ impl ZakuraDiscoveryHandle {
     ///    to the one stored for its node was verified when it was stored, so it skips
     ///    verification.
     /// 2. The rest verify off the lock, under one node-wide verification slot.
-    /// 3. One lock hold applies expiry, staleness, address, storage, and per-relay
-    ///    policy. Each of those only drops its record: a record can expire in transit,
-    ///    and policy is local.
+    /// 3. One lock hold offers the authentic records to the book, up to
+    ///    `max_imported_records_per_response`, and applies expiry, staleness,
+    ///    address, storage, and per-relay policy. Each of those only drops its
+    ///    record: a record can expire in transit, and policy is local.
+    ///
+    /// The import limit applies after verification, so a forged record past it
+    /// still rejects the batch. The caller bounds the batch: a `Peers` holds at
+    /// most 32 records.
     ///
     /// Returns the first verification error that disconnects the relay; see
     /// [`relay_verdict`]. Nothing from the batch is imported then.
@@ -1884,15 +1889,7 @@ impl ZakuraDiscoveryHandle {
     ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
         let max_records = self.import_validation.max_imported_records_per_response;
         let mut outcome = ImportBatchOutcome::default();
-        let mut batch = Vec::new();
-        for record in records {
-            if outcome.attempted >= max_records {
-                outcome.dropped_for_limit += 1;
-                continue;
-            }
-            outcome.attempted += 1;
-            batch.push(record);
-        }
+        let batch: Vec<_> = records.into_iter().collect();
         if batch.is_empty() {
             return Ok(outcome);
         }
@@ -1922,6 +1919,11 @@ impl ZakuraDiscoveryHandle {
         let mut inner = self.inner.lock().await;
         let context = inner.validation_context(now);
         for record in authentic {
+            if outcome.attempted >= max_records {
+                outcome.dropped_for_limit += 1;
+                continue;
+            }
+            outcome.attempted += 1;
             match inner
                 .book
                 .import_verified_record(record, source, now, &context)
@@ -8656,8 +8658,8 @@ mod tests {
     }
 
     /// Relayed records follow the relay verdict table: a forged record anywhere in the
-    /// batch disconnects the relay before any record is imported, and records that only
-    /// fail local or compatibility checks drop alone.
+    /// batch, even past the import limit, disconnects the relay before any record is
+    /// imported, and records that only fail local or compatibility checks drop alone.
     #[tokio::test]
     async fn relayed_batch_verdicts() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8680,6 +8682,33 @@ mod tests {
                 "position {position}"
             );
         }
+
+        // A forged record past a smaller import limit still rejects the batch.
+        let handle = discovery_handle_at(
+            local_config_with(
+                secret_key(),
+                vec![test_addr(200)],
+                vec![ZakuraServiceId::discovery()],
+            ),
+            ZakuraDiscoveryConfig {
+                book_limits: ZakuraDiscoveryBookLimits {
+                    max_imported_records_per_response: 1,
+                    ..ZakuraDiscoveryBookLimits::default()
+                },
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx.clone(),
+            current_unix_secs(),
+        );
+        let mut forged = runtime_record_with(1, service(2), test_addr(2));
+        forged.body.sequence += 1;
+        assert!(matches!(
+            handle
+                .import_peer_records([valid(), forged], Some(relay))
+                .await,
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+        assert_eq!(handle.inner.lock().await.book.len(), 0);
 
         let handle = discovery_handle_with_connected(connected_rx.clone());
         let now = current_unix_secs();

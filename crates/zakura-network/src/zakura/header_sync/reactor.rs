@@ -1121,7 +1121,7 @@ impl HeaderSyncReactor {
         if subscriber.live().is_none()
             || subscriber
                 .resumable()
-                .is_some_and(|(_, resumable, _)| resumable == target)
+                .is_some_and(|(_, resumable, _, _)| resumable == target)
         {
             return true;
         }
@@ -1182,6 +1182,26 @@ impl HeaderSyncReactor {
             .reservable_header_count(self.negotiated_response_limits(status).1.min(
                 Self::request_header_prefix_remaining(local, claimed, status.selected_tip_height),
             ))
+    }
+
+    /// The schema for an ordinary round of up to `count` headers after `start`
+    /// from `status`'s sender: `schema` while the round ends at or below the
+    /// sender's work anchor, and no records past it.
+    ///
+    /// A publisher is sure to hold records only through its finalized height,
+    /// and a schema 1 page waits for a missing record rather than dropping it,
+    /// so a round past the anchor could stall.
+    fn ordinary_schema(
+        schema: AuxSchema,
+        status: &Status,
+        start: block::Height,
+        count: u32,
+    ) -> AuxSchema {
+        if start.0.saturating_add(count) <= status.work_anchor_height.0 {
+            schema
+        } else {
+            AuxSchema::None
+        }
     }
 
     /// Return the response schema and the most headers that one response from `status`'s
@@ -2390,27 +2410,7 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;
         }
-        // A subscription that stopped at a committed prefix continues from it.
-        let resumed = session
-            .subscriber()
-            .resumable()
-            .filter(|(_, resumable, accepted)| {
-                *resumable == target_tip_hash
-                    && locator
-                        .entries()
-                        .contains(&zakura_header_chain::Frontier::new(
-                            accepted.height,
-                            accepted.hash,
-                        ))
-            });
-        if session.subscriber().live().is_some() && resumed.is_none() {
-            // The next `Open` follows the live subscription's outcome.
-            let _ = session.try_close();
-            self.defer_ordinary_target(&peer);
-            return;
-        }
-
-        let (tree_aux_schema, negotiated_header_count) =
+        let (negotiated_schema, negotiated_header_count) =
             self.negotiated_response_limits(&target.status);
         let max_header_count = negotiated_header_count.min(Self::request_header_prefix_remaining(
             &local,
@@ -2420,6 +2420,34 @@ impl HeaderSyncReactor {
         let max_header_count = self
             .peer_work_queue
             .reservable_header_count(max_header_count);
+        // A subscription that stopped at a committed prefix continues from it,
+        // while its schema still fits the round.
+        let resumable = session.subscriber().resumable();
+        let resumed = resumable.filter(|&(_, tip, accepted, schema)| {
+            let accepted_frontier =
+                zakura_header_chain::Frontier::new(accepted.height, accepted.hash);
+            tip == target_tip_hash
+                && locator.entries().contains(&accepted_frontier)
+                && Self::ordinary_schema(schema, &target.status, accepted.height, max_header_count)
+                    == schema
+        });
+        if session.subscriber().live().is_some() && resumed.is_none() {
+            // The next `Open` follows the live subscription's outcome.
+            let _ = session.try_close();
+            self.defer_ordinary_target(&peer);
+            return;
+        }
+        let tree_aux_schema = match resumed {
+            Some((_, _, _, schema)) => schema,
+            None => locator.entries().first().map_or(AuxSchema::None, |start| {
+                Self::ordinary_schema(
+                    negotiated_schema,
+                    &target.status,
+                    start.height,
+                    max_header_count,
+                )
+            }),
+        };
         if max_header_count == 0
             || !self
                 .peer_work_queue
@@ -2430,7 +2458,7 @@ impl HeaderSyncReactor {
         }
         let source = source_id_from_peer(&peer);
         let (sent, locator) = match resumed {
-            Some((id, _, accepted)) => {
+            Some((id, _, accepted, _)) => {
                 let accepted = zakura_header_chain::Frontier::new(accepted.height, accepted.hash);
                 let sent = match session.try_grant(max_header_count) {
                     Ok(true) => {

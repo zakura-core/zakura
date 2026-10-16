@@ -1236,3 +1236,61 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
         );
     }
 }
+
+/// An ordinary round asks for schema 1 records only when it ends at or below
+/// the publisher's work anchor, where its finalized state holds them. A
+/// publisher waits for a missing record, so a round past the anchor asks for
+/// none.
+#[test]
+fn ordinary_rounds_ask_for_records_only_below_the_publisher_anchor() {
+    for (work_anchor_height, expected) in [(0, AuxSchema::None), (5_000, AuxSchema::V1)] {
+        let mut startup = startup(CancellationToken::new());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(committed_snapshot(anchor)));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+        let supplier = peer();
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts(
+            supplier.clone(),
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().expect("the initial status was sent");
+
+        let target = block::Hash([0x53; 32]);
+        reactor.handle_status(
+            supplier.clone(),
+            0,
+            Status {
+                work_anchor_height: block::Height(work_anchor_height),
+                work_anchor_hash: anchor.hash,
+                selected_tip_height: block::Height(10_000),
+                selected_tip_hash: target,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: 1_000,
+                max_subscriptions: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+            },
+        );
+        let HeaderPortOperation::QueryHeaderLocator { scope, .. } = actions.try_recv().unwrap()
+        else {
+            panic!("the advertised target requires a locator");
+        };
+        reactor.handle_header_locator_ready(
+            supplier,
+            0,
+            target,
+            scope,
+            Some(zakura_header_chain::HeaderLocator::for_continuation(anchor)),
+        );
+        let open = update(outbound.try_recv().expect("Open is sent"));
+        assert_eq!(open.operation, v9::Operation::Open);
+        assert_eq!(
+            open.tree_aux_schema, expected,
+            "a publisher anchored at {work_anchor_height} holds records for this round only below it"
+        );
+    }
+}

@@ -5,7 +5,7 @@
 //! linkage, the target marker, and each outcome's window.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -83,11 +83,25 @@ fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot
 }
 
 /// A header tree, the leases issued on it, and scripted replies.
+///
+/// Like state, it holds one lease per peer, refuses a second for capacity
+/// until the first ends, and keeps a peer's continuation after each partial
+/// read, which a later lease toward the same target from the last header
+/// read reuses without walking the ancestry.
 #[derive(Default)]
 struct Store {
     tree: HeaderTree,
     next_lease: u64,
-    leases: HashSet<u64>,
+    /// Each live lease's peer and the signal its end releases.
+    leases: HashMap<u64, (SourceId, ServingCapacitySignal)>,
+    /// Each peer's target and last header read, after a partial read.
+    continuations: HashMap<SourceId, (block::Hash, Frontier)>,
+    /// Leases that walked the ancestry instead of reusing a continuation.
+    walks: usize,
+    /// The next release fails and leaves its lease held.
+    leak_release: bool,
+    /// The selected tip grows by one header after each of this many leases.
+    move_tip_on_acquire: usize,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
     read_script: VecDeque<Result<ReadPathReply, PortError>>,
     /// Headers without a schema-1 record.
@@ -106,21 +120,42 @@ impl Store {
         if let Some(reply) = self.acquire_script.pop_front() {
             return reply;
         }
+        if let Some((_, signal)) = self
+            .leases
+            .values()
+            .find(|(peer, _)| *peer == request.source)
+        {
+            return Ok(AcquirePathReply::CapacityBusy(signal.clone()));
+        }
         let Some(&(target, _)) = self.tree.nodes.get(&request.target_tip_hash) else {
             return Ok(AcquirePathReply::TargetNotRetained);
         };
-        let mut current = target;
-        while !request.locator_hashes.contains(&current.hash) {
-            current = match self.tree.parent(current) {
-                Some(parent) => parent,
-                None if current.height == block::Height(0) => {
-                    return Ok(AcquirePathReply::NoLocatorIntersection)
+        let current = match self.continuations.remove(&request.source) {
+            Some((continued, last))
+                if continued == target.hash && request.locator_hashes == [last.hash] =>
+            {
+                last
+            }
+            _ => {
+                self.walks += 1;
+                let mut current = target;
+                while !request.locator_hashes.contains(&current.hash) {
+                    current = match self.tree.parent(current) {
+                        Some(parent) => parent,
+                        None if current.height == block::Height(0) => {
+                            return Ok(AcquirePathReply::NoLocatorIntersection)
+                        }
+                        None => return Ok(AcquirePathReply::HistoryPruned),
+                    };
                 }
-                None => return Ok(AcquirePathReply::HistoryPruned),
-            };
-        }
+                current
+            }
+        };
         self.next_lease += 1;
-        self.leases.insert(self.next_lease);
+        self.leases.insert(
+            self.next_lease,
+            (request.source, ServingCapacitySignal::default()),
+        );
         Ok(AcquirePathReply::Acquired(Box::new(
             RetainedHeaderPath::from_adapter(
                 key,
@@ -134,6 +169,14 @@ impl Store {
         )))
     }
 
+    /// End lease `id`, release its signal, and return its peer, if it was
+    /// live.
+    fn end_lease(&mut self, id: u64) -> Option<SourceId> {
+        let (peer, signal) = self.leases.remove(&id)?;
+        signal.release();
+        Some(peer)
+    }
+
     /// Read one page and consume the lease, as state does.
     fn read(
         &mut self,
@@ -142,12 +185,14 @@ impl Store {
     ) -> Result<ReadPathReply, PortError> {
         if let Some(reply) = self.read_script.pop_front() {
             if matches!(reply, Ok(ReadPathReply::Unavailable)) {
-                self.leases.remove(&path.handle_id());
+                self.end_lease(path.handle_id());
             }
             return reply;
         }
-        if !self.leases.remove(&path.handle_id()) || request.after_hash != path.common_ancestor.hash
-        {
+        let Some(peer) = self.end_lease(path.handle_id()) else {
+            return Ok(ReadPathReply::Unavailable);
+        };
+        if request.after_hash != path.common_ancestor.hash {
             return Ok(ReadPathReply::Unavailable);
         }
         let mut headers = Vec::new();
@@ -166,6 +211,14 @@ impl Store {
         let count = usize::try_from(request.max_header_count).unwrap_or(usize::MAX);
         let complete = headers.len() <= count;
         headers.truncate(count);
+        if !complete {
+            let height = path.common_ancestor.height.0 + u32::try_from(count).unwrap_or(0);
+            let last = headers.last().expect("a partial read has a header").hash();
+            self.continuations.insert(
+                peer,
+                (path.target.hash, Frontier::new(block::Height(height), last)),
+            );
+        }
         let finalized_tree_aux = headers
             .iter()
             .zip(1..)
@@ -278,7 +331,19 @@ impl Port for FakePort {
                 .acquire()
                 .await
                 .expect("the gate never closes");
-            self.store().acquire(&self.key, request)
+            let (reply, moves) = {
+                let mut store = self.store();
+                let reply = store.acquire(&self.key, request);
+                let moves = store.move_tip_on_acquire.checked_sub(1);
+                if let Some(left) = moves {
+                    store.move_tip_on_acquire = left;
+                }
+                (reply, moves.is_some())
+            };
+            if moves {
+                self.grow(1);
+            }
+            reply
         })
     }
 
@@ -309,7 +374,11 @@ impl Port for FakePort {
         path: RetainedHeaderPath,
     ) -> HeaderChainFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
-            self.store().leases.remove(&path.handle_id());
+            let mut store = self.store();
+            if std::mem::take(&mut store.leak_release) {
+                return Err(PortError::Unavailable { source: None });
+            }
+            store.end_lease(path.handle_id());
             Ok(())
         })
     }
@@ -549,16 +618,18 @@ impl Subscriber {
                     .tools
                     .claim_end(&opened.id)
                     .expect("the subscription is live");
-                assert!(
-                    is_legal(
-                        outcome.outcome,
-                        ended.pages > 0,
-                        opened.reached,
-                        ended.close_sent
-                    ),
-                    "{:?} arrived outside its window",
-                    outcome.outcome
-                );
+                // The specification's window table, kept apart from the
+                // publisher's own `is_legal`.
+                use HeadersOutcomeCode::*;
+                let legal = match outcome.outcome {
+                    NoLocatorIntersection | TargetNotRetained | TargetNotSelected => {
+                        ended.pages == 0
+                    }
+                    HistoryPruned => !opened.reached,
+                    SubscriptionSuperseded => true,
+                    SubscriptionClosed => ended.close_sent,
+                };
+                assert!(legal, "{:?} arrived outside its window", outcome.outcome);
                 Received::Ended(outcome.outcome)
             }
             other => panic!("the publisher wrote {other:?}"),
@@ -768,6 +839,9 @@ async fn path_pages_carry_one_marker_then_follow_the_tip() {
         pages(&received),
         [(h(6), h(9), false), (h(9), h(10), false)]
     );
+    // Each run toward one target walks the ancestry once, and later pages
+    // reuse state's continuation.
+    assert_eq!(port.store().walks, 2);
     harness.check_quiet().await;
 }
 
@@ -1150,6 +1224,35 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     harness.check_quiet().await;
 }
 
+/// A recheck whose tip keeps moving stops after a bounded number of leases
+/// and sends the page it last confirmed.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    port.grow(2);
+    harness.drain().await;
+    // The tip moves past the page, then again during every recheck lease.
+    port.grow(1);
+    port.store().move_tip_on_acquire = 100;
+    let walks = port.store().walks;
+    port.gate.add_permits(1);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    assert_eq!(port.store().walks - walks, RECHECK_LEASES);
+    harness.check_quiet().await;
+}
+
 /// A recheck that waits for execution slots judges the page against the
 /// selected tip after that wait, not the one before it.
 #[tokio::test(start_paused = true)]
@@ -1270,6 +1373,58 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.check_quiet().await;
 }
 
+/// A local stall from a job that read an older selected chain is not
+/// recorded, because the change that would clear it already passed.
+#[tokio::test(start_paused = true)]
+async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // A following page's lease waits in state toward height 4.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.grow(1);
+    harness.drain().await;
+    // The chain moves on, and the wake for it passes while the lease waits.
+    // Then state calls the old tip stale.
+    port.grow(1);
+    harness.drain().await;
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::TargetNotRetained));
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    harness.check_quiet().await;
+}
+
+/// A capacity stall from a lease state never releases retries on the next
+/// selected-chain change.
+#[tokio::test(start_paused = true)]
+async fn a_leaked_lease_capacity_stall_retries_on_a_chain_change() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // The Open's lease reaches the target, and its release fails, so state
+    // keeps this peer's one lease.
+    port.store().leak_release = true;
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    // State expires the lease without a signal, as it does lazily.
+    port.store().leases.clear();
+    port.grow(1);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    harness.check_quiet().await;
+}
+
 /// A follower stalled on a capacity refusal still ends as superseded when
 /// the selected tip drops below its last header.
 #[tokio::test(start_paused = true)]
@@ -1295,6 +1450,39 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
     );
     assert!(!signal.is_released());
     harness.check_quiet().await;
+}
+
+/// An outcome a job finds after `Close` arrived gives way to
+/// `SubscriptionClosed`.
+#[tokio::test(start_paused = true)]
+async fn close_wins_over_an_outcome_found_after_it() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let id = harness
+        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    // The task has not run between these, so both reach `end_due` together.
+    let ended = {
+        let mut shared = lock(&harness.publisher.shared);
+        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
+        let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
+        shared.finish(id, found, false);
+        shared.end_due::<HB>()
+    };
+    let [(_, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+    assert!(matches!(
+        decode_frame::<RegtestMessage>(&frame),
+        Ok(Message::HeadersOutcome(HeadersOutcome {
+            outcome: HeadersOutcomeCode::SubscriptionClosed,
+            ..
+        }))
+    ));
 }
 
 /// The margin admits a second `Open`. A third, a changed target, and an

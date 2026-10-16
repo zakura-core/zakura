@@ -43,6 +43,16 @@
 //! before validation time. A `Grant` costs 107 bytes per prefix of up to 2,000
 //! headers, so smaller prefixes would add updates without adding throughput.
 //!
+//! The overlap needs pages of at most `W / 2` headers. A cursor names one
+//! page, so acceptance moves a whole page at a time, and a larger page spends
+//! the window before its own acceptance. The publisher caps each page at its
+//! advertised `max_headers_per_response`, 1,000 by default, so a full window
+//! keeps the overlap. A window of at most twice that cap, such as the
+//! 250-header fair share of the staging budget, moves about one window per
+//! round trip plus validation. Capping unspent credit at half the window would
+//! split pages, but only half the window would then be in flight, which is no
+//! faster unless validation takes longer than the round trip.
+//!
 //! Nothing here uses a timer or takes credit back, as the specification's
 //! "Header sync — stream 5, version 9" section requires.
 
@@ -313,8 +323,9 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     }
 
     /// The most headers the reactor validates before it accepts a cursor:
-    /// half the window for `staging` reserved headers, and at least one. The
-    /// module docs explain why grants overlap delivery at this size.
+    /// half the window for `staging` reserved headers, and at least one. A
+    /// larger page is accepted whole. The module docs explain why grants
+    /// overlap delivery at this size, and when pages are too large for it.
     pub(crate) fn prefix(staging: u32) -> u32 {
         (Self::window(staging, AuxSchema::None).objects / 2).max(1)
     }

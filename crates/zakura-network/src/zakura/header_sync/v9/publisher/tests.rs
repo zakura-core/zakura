@@ -1638,3 +1638,137 @@ proptest! {
             .block_on(run(ops));
     }
 }
+
+/// Feed every written frame to the real subscriber, accepting each page as
+/// validated and applying each due `Grant`. Returns each page's parent and
+/// last heights with its marker, and the outcome, if one ended the
+/// subscription.
+async fn follow(
+    harness: &mut Harness,
+    subscriber: &mut super::super::subscriber::Subscriber<HB>,
+    staging: u32,
+) -> (
+    Vec<(block::Height, block::Height, bool)>,
+    Option<HeadersOutcomeCode>,
+) {
+    let mut pages = Vec::new();
+    let mut ended = None;
+    harness.drain().await;
+    while let Some(frame) = harness.inbox.pop_front() {
+        subscriber
+            .precheck()
+            .lock()
+            .precheck(frame.message_type, frame.payload.len())
+            .expect("the frame header passes");
+        match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames") {
+            Message::Headers(page) => {
+                let admitted = subscriber
+                    .receive_page(&page, frame.payload.len())
+                    .expect("the publisher's pages pass the subscriber");
+                pages.push((
+                    admitted.parent.height,
+                    admitted.cursor.height,
+                    admitted.reaches_target,
+                ));
+                let grant = subscriber
+                    .accept_through(admitted.id, &admitted.cursor, staging)
+                    .expect("a received page is accepted");
+                if let Some(grant) = grant {
+                    harness
+                        .apply(grant)
+                        .await
+                        .expect("the subscriber's grants apply");
+                }
+            }
+            Message::HeadersOutcome(outcome) => {
+                let end = subscriber
+                    .receive_outcome(&outcome)
+                    .expect("the publisher's outcomes land in their windows");
+                ended = Some(end.outcome);
+            }
+            other => panic!("the publisher wrote {other:?}"),
+        }
+    }
+    (pages, ended)
+}
+
+/// The real subscriber follows the real publisher. A small staging budget
+/// splits the path into half-window grants, the marker lands on the page that
+/// ends at the target, pushes follow, and `Close` ends the subscription. A
+/// locator at the target sends no path page, and a reorganization below the
+/// last header ends with `SubscriptionSuperseded`.
+#[tokio::test(start_paused = true)]
+async fn the_subscriber_follows_the_publisher() {
+    use super::super::{subscriber::Subscriber, Status};
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(10);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let status = |tip: Frontier| Status {
+        work_anchor_height: block::Height(0),
+        work_anchor_hash: port.genesis.hash,
+        selected_tip_height: tip.height,
+        selected_tip_hash: tip.hash,
+        suffix_cumulative_work: U256::from(tip.height.0),
+        oldest_retained_height: block::Height(0),
+        max_headers_per_response: limits().max_headers,
+        max_subscriptions: MAX_HS_SUBSCRIPTIONS,
+        max_message_bytes: limits().max_bytes,
+        tree_aux_schema_mask: limits().aux_schema_mask,
+    };
+    let h = block::Height;
+
+    // Six headers of staging: three-header pages, granted three at a time.
+    let mut subscriber = Subscriber::<HB>::new();
+    let open = subscriber
+        .open(
+            &status(chain[9]),
+            &[chain[2], port.genesis],
+            AuxSchema::None,
+            6,
+        )
+        .expect("the first Open is recorded");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
+    assert_eq!(
+        pages,
+        [
+            (h(3), h(6), false),
+            (h(6), h(9), false),
+            (h(9), h(10), true)
+        ]
+    );
+    assert_eq!(ended, None);
+    port.grow(4);
+    let (pages, _) = follow(&mut harness, &mut subscriber, 6).await;
+    assert_eq!(pages, [(h(10), h(13), false), (h(13), h(14), false)]);
+    let close = subscriber.close().expect("Close is recorded");
+    assert_eq!(harness.apply(close).await, Ok(Applied::Live));
+    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
+    assert!(pages.is_empty());
+    assert_eq!(ended, Some(HeadersOutcomeCode::SubscriptionClosed));
+
+    // A locator at the target: no path page, then a push that extends it.
+    let tip = port.tip();
+    let open = subscriber
+        .open(
+            &status(tip),
+            &[tip, chain[3], port.genesis],
+            AuxSchema::None,
+            6,
+        )
+        .expect("the terminal outcome freed the slot");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+    assert_eq!(
+        follow(&mut harness, &mut subscriber, 6).await,
+        (vec![], None)
+    );
+    port.grow(1);
+    let (pages, _) = follow(&mut harness, &mut subscriber, 6).await;
+    assert_eq!(pages, [(h(14), h(15), false)]);
+    let side = port.store().extend(chain[8], 7);
+    port.select(side[6]);
+    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
+    assert!(pages.is_empty());
+    assert_eq!(ended, Some(HeadersOutcomeCode::SubscriptionSuperseded));
+    harness.check_quiet().await;
+}

@@ -42,9 +42,9 @@ use crate::zakura::{
 /// The header sync stream version this module encodes.
 pub(crate) const STREAM_VERSION: u16 = 9;
 
-/// Capability bit 9, which identifies version 9. Activation moves it into the
-/// handshake and retires bit 5.
-pub(crate) const CAPABILITY: u64 = 1 << 9;
+/// Capability bit 10, which identifies version 9. Activation moves it into
+/// the handshake and retires bit 5.
+pub(crate) const CAPABILITY: u64 = 1 << 10;
 
 /// Most header credit a subscription holds beyond its acknowledged cursor.
 pub(crate) const MAX_HS_PUSH_CREDIT_HEADERS: u32 = 4_000;

@@ -21,7 +21,7 @@ pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
 ///
 /// The stream version provides a transport compatibility barrier.
 /// The stream version does not select the codec.
-pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 8;
+pub const ZAKURA_HEADER_SYNC_STREAM_VERSION: u16 = 9;
 /// Maximum encoded header-sync message bytes.
 pub const MAX_HS_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Default number of headers advertised per response.

@@ -160,6 +160,7 @@ fn build_header_sync_reactor(
         candidates: candidates_rx,
         codec: codec.clone(),
         trace: startup.trace.clone(),
+        layout: v9::layout(&startup.network),
     };
     let mut reactor = HeaderSyncReactor {
         startup,

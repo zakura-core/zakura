@@ -13,7 +13,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
-use super::{events::*, pipe::run_peer, wire::*, FRAME_HEADER_BYTES};
+use super::{events::*, pipe::run_peer, wire::*};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -26,41 +26,29 @@ use crate::zakura::{
 /// Conservative re-offer delay when header sync publishes no peer backoff deadline.
 const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
-// The cast is safe because both terms are small protocol constants checked
-// against the local message cap in header_sync::wire.
-const HEADER_SYNC_FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
-
-const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
-    kind: ZAKURA_STREAM_HEADER_SYNC,
-    version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
-    frame_cap: HEADER_SYNC_FRAME_CAP,
-    capability: ZAKURA_CAP_HEADER_SYNC,
-    ..Stream::PERSISTENT
-}];
-
-/// The sole stream declaration for native header sync.
-pub(crate) fn header_sync_streams() -> &'static [Stream] {
-    &HEADER_SYNC_SERVICE_STREAMS
-}
-
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    use crate::zakura::{header_sync::v9, StreamQueueDepths};
+    use zakura_chain::parameters::Network;
 
     #[test]
-    fn declares_only_capability_bit_five_at_stream_version_eight() {
-        assert_eq!(ZAKURA_CAP_HEADER_SYNC, 1 << 5);
-        assert_eq!(header_sync_streams().len(), 1);
-        assert_eq!(
-            header_sync_streams()[0],
-            Stream {
-                kind: ZAKURA_STREAM_HEADER_SYNC,
-                version: 8,
-                frame_cap: HEADER_SYNC_FRAME_CAP,
-                capability: 1 << 5,
-                ..Stream::PERSISTENT
-            }
-        );
+    fn declares_only_capability_bit_ten_at_stream_version_nine() {
+        assert_eq!(ZAKURA_CAP_HEADER_SYNC, 1 << 10);
+        for network in [Network::Mainnet, Network::new_regtest(Default::default())] {
+            let layout = v9::layout(&network);
+            assert_eq!(layout.len(), 1);
+            let stream = layout[0];
+            assert_eq!(
+                (stream.kind, stream.version, stream.capability),
+                (ZAKURA_STREAM_HEADER_SYNC, 9, 1 << 10)
+            );
+            assert!(stream.messages.is_some());
+            assert!(matches!(
+                stream.queue_depths,
+                Some(StreamQueueDepths { inbound, outbound }) if inbound >= 2 && outbound >= 2
+            ));
+        }
     }
 }
 
@@ -506,7 +494,7 @@ impl Service for HeaderSyncService {
     }
 
     fn streams(&self) -> &[Stream] {
-        header_sync_streams()
+        self.header_sync.layout
     }
 
     fn session_policy(&self) -> SessionPolicy {
@@ -594,7 +582,13 @@ impl Service for HeaderSyncService {
         else {
             return;
         };
-        if stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION {
+        // The publisher needs room for a page and for control.
+        if stream_version != ZAKURA_HEADER_SYNC_STREAM_VERSION
+            || peer.negotiated & ZAKURA_CAP_HEADER_SYNC == 0
+            || send.max_capacity() < 2
+        {
+            peer.close_cause().record("header_sync_regulation_contract");
+            peer.cancel_token().cancel();
             return;
         }
 
@@ -799,7 +793,8 @@ impl Service for HeaderSyncPassthroughService {
     }
 
     fn streams(&self) -> &[Stream] {
-        header_sync_streams()
+        // Recorder nodes run on Mainnet.
+        &super::v9::CommonMessage::LAYOUT
     }
 
     fn session_policy(&self) -> SessionPolicy {

@@ -155,6 +155,8 @@ pub struct HeaderSyncHandle {
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
     pub(super) codec: HeaderSyncCodec,
     pub(super) trace: ZakuraTrace,
+    /// The stream layout for the network's header size.
+    pub(super) layout: &'static [crate::zakura::Stream],
 }
 
 impl HeaderSyncHandle {

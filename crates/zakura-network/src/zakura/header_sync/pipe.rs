@@ -252,6 +252,7 @@ mod tests {
                 candidates,
                 codec,
                 trace: crate::zakura::ZakuraTrace::noop(),
+                layout: &crate::zakura::header_sync::v9::CommonMessage::LAYOUT,
             },
             receiver,
         )

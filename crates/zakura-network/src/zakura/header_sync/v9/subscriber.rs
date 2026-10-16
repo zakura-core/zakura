@@ -14,16 +14,7 @@
 //! only updates the tools already counted. The session reader checks each
 //! frame header against the same tools through [`Subscriber::precheck`].
 //!
-//! # Pages and acknowledgements
-//!
-//! [`Subscriber::receive_page`] checks a decoded page against its
-//! subscription and spends the page's exact credit. It does not validate
-//! headers. The reactor runs context-free and contextual validation, then
-//! calls [`Subscriber::accept_through`] with a page's cursor once every header
-//! through that page passed. An update only ever acknowledges an accepted
-//! cursor, so a cursor that failed validation is never acknowledged.
-//! [`Subscriber::validation_failed`] also stops the subscription's grants
-//! until the reactor disconnects the peer.
+//! # Page linkage
 //!
 //! A page's linkage is checked without hashing its headers, except the last
 //! one, whose hash decides the target marker. Before the target, a header's
@@ -38,35 +29,22 @@
 //!
 //! Every header a subscription authorizes lands in the reactor's header
 //! staging budget, [`HEADER_CHUNK_BUDGET_CAPACITY_V1`] headers across all
-//! targets, until validation releases it. So the header window, granted minus
-//! accepted, never exceeds the `staging` headers the caller reserved for this
-//! subscription. The byte window is what those headers occupy at one smallest
-//! page each, so bytes never bind before headers. Every grant meets the
-//! `Grant` minimum of one header or `P` bytes, and before the target it leaves
-//! credit for one page.
+//! targets, until validation releases it, so the header window stays within
+//! the `staging` headers the caller reserved.
 //!
-//! Grants refill the window in prefixes of at most half of it. Take a window
-//! of `W` headers, a link that carries `r` headers per second, and a round
-//! trip `t` plus validation time `v` between a prefix's last header leaving
-//! the publisher and its `Grant` arriving. Granting only after accepting the
-//! whole window idles the publisher for `t + v` every window, so throughput is
-//! `W / (W / r + t + v)`, always below `r`. Granting each prefix of `W / 2`
-//! lets the publisher spend the other half while the grant travels, so the
-//! link stays full whenever `W / 2 >= r (t + v)`. On Mainnet a full window is
-//! 4,000 headers, about 6 MB of pages, so header credit binds before byte
-//! credit, and at a 200 ms round trip the link stays full up to about 10,000
-//! headers per second before validation time. A `Grant` costs 107 bytes per
-//! prefix of up to 2,000 headers, so smaller prefixes would add updates
-//! without adding throughput. The reactor should validate in prefixes of at
-//! most [`Subscriber::prefix`] headers, so acceptance keeps the same pace.
+//! Grants refill the window in prefixes of at most half of it, so the
+//! publisher spends one half while the grant for the other travels. Take a
+//! window of `W` headers, a link that carries `r` headers per second, and a
+//! round trip `t` plus validation time `v` between a prefix's last header
+//! leaving the publisher and its `Grant` arriving. The link then stays full
+//! whenever `W / 2 >= r (t + v)`. On Mainnet a full window is 4,000 headers,
+//! about 6 MB of pages, so header credit binds before byte credit, and at a
+//! 200 ms round trip the link stays full up to about 10,000 headers per second
+//! before validation time. A `Grant` costs 107 bytes per prefix of up to 2,000
+//! headers, so smaller prefixes would add updates without adding throughput.
 //!
-//! # No deadline and no revocation
-//!
-//! Nothing here uses a timer. Slow progress is not a violation: the reactor
-//! may fetch the target from another peer, or change its target, while this
-//! subscription stays live. Neither revokes credit, because no call here takes
-//! credit back. Only the publisher's pages spend credit, only `Close` stops new
-//! pages, and only the publisher's terminal outcome ends the subscription.
+//! Nothing here uses a timer or takes credit back, as the specification's
+//! "Header sync — stream 5, version 9" section requires.
 
 use thiserror::Error;
 use zakura_chain::block;

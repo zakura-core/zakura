@@ -248,9 +248,6 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
 
     /// Match an update for no live subscription against the tombstones; see
     /// the module docs. `added` is a `Grant`'s credit, or `None` for `Close`.
-    ///
-    /// A `Close` consumes its tombstone. A `Grant` keeps it and adds to its
-    /// granted credit. A refused update changes nothing.
     fn crossed(
         &mut self,
         key: &K,

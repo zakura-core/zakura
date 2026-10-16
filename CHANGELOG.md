@@ -15,9 +15,6 @@ independently.
 
 ### Added
 
-- Added a persistent NU7 dashboard selector that verifies public-Testnet chain
-  agreement using existing node RPCs
-  ([#1278](https://github.com/zakura-core/zakura/pull/1278)).
 - Preserve automatic staging-to-Testnet selection and support explicitly
   configured Mainnet selection after verified NU7 activation
 - Added the `[network.zakura.quic]` config section for the native P2P

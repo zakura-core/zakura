@@ -960,7 +960,7 @@ pub enum ImportOutcome {
 /// Summary of importing a bounded batch of discovery records.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImportBatchOutcome {
-    /// Number of records considered before the per-response cap stopped import.
+    /// Number of records offered to the book before the per-response cap stopped import.
     pub attempted: usize,
     /// Number of newly added records.
     pub added: usize,
@@ -1121,7 +1121,7 @@ pub struct ZakuraDiscoveryBook {
     sample_snapshot: Option<SampleSnapshot>,
     /// Changes that can add sample candidates: a new or newly confirmed
     /// entry, or a new record for an entry. A small snapshot compares it to
-    /// tell when a rebuild would add candidates.
+    /// tell when the book may have new candidates for it.
     generation: u64,
     /// Third-party entries attributed to each relay. A relay with no entries
     /// has no key.
@@ -1130,14 +1130,14 @@ pub struct ZakuraDiscoveryBook {
 
 /// One disclosure epoch's peer-sample candidates, in random order.
 ///
-/// A requester's sample is a window over this list. Rebuilding it reshuffles
-/// every window, so it is rebuilt only for a new epoch or while it is small
-/// enough that every window already covers it.
+/// A requester's sample is a window over this list. Each epoch starts a new
+/// list. Within an epoch the list only grows, and only while one window
+/// covers it, so no requester learns more than one window of ids per epoch.
 #[derive(Clone, Debug)]
 struct SampleSnapshot {
     epoch: u64,
     node_ids: Vec<NodeId>,
-    /// The book's `generation` when this snapshot was built.
+    /// The book's `generation` when this snapshot last took candidates.
     generation: u64,
 }
 
@@ -1879,9 +1879,14 @@ impl ZakuraDiscoveryHandle {
     ///    to the one stored for its node was verified when it was stored, so it skips
     ///    verification.
     /// 2. The rest verify off the lock, under one node-wide verification slot.
-    /// 3. One lock hold applies expiry, staleness, address, storage, and per-relay
-    ///    policy. Each of those only drops its record: a record can expire in transit,
-    ///    and policy is local.
+    /// 3. One lock hold offers the authentic records to the book, up to
+    ///    `max_imported_records_per_response`, and applies expiry, staleness,
+    ///    address, storage, and per-relay policy. Each of those only drops its
+    ///    record: a record can expire in transit, and policy is local.
+    ///
+    /// The import limit applies after verification, so a forged record past it
+    /// still rejects the batch. The caller bounds the batch: a `Peers` holds at
+    /// most 32 records.
     ///
     /// Returns the first verification error that disconnects the relay; see
     /// [`relay_verdict`]. Nothing from the batch is imported then.
@@ -1892,15 +1897,7 @@ impl ZakuraDiscoveryHandle {
     ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
         let max_records = self.import_validation.max_imported_records_per_response;
         let mut outcome = ImportBatchOutcome::default();
-        let mut batch = Vec::new();
-        for record in records {
-            if outcome.attempted >= max_records {
-                outcome.dropped_for_limit += 1;
-                continue;
-            }
-            outcome.attempted += 1;
-            batch.push(record);
-        }
+        let batch: Vec<_> = records.into_iter().collect();
         if batch.is_empty() {
             return Ok(outcome);
         }
@@ -1930,6 +1927,11 @@ impl ZakuraDiscoveryHandle {
         let mut inner = self.inner.lock().await;
         let context = inner.validation_context(now);
         for record in authentic {
+            if outcome.attempted >= max_records {
+                outcome.dropped_for_limit += 1;
+                continue;
+            }
+            outcome.attempted += 1;
             match inner
                 .book
                 .import_verified_record(record, source, now, &context)
@@ -2735,10 +2737,11 @@ impl ZakuraDiscoveryInner {
                 .get(&node_id)
                 .is_some_and(|entry| entry.record() == &record),
             Ok(ImportOutcome::IgnoredOlder) => false,
-            Err(error) if is_direct_address_import_error(error) => self
-                .book
-                .get(&node_id)
-                .is_none_or(|entry| connected_record_is_fresh_for_stored_record(&record, entry)),
+            Err(error) if is_direct_address_import_error(error) => {
+                self.book.get(&node_id).is_none_or(|entry| {
+                    connected_record_is_fresh_for_stored_record(&record, entry, now)
+                })
+            }
             Err(_) => false,
         };
 
@@ -2988,10 +2991,11 @@ impl ZakuraDiscoveryBook {
     ///
     /// A request costs one keyed hash, at most one map lookup per window slot, and at most
     /// `limit` record clones, whatever the book size. Collecting the snapshot scans the book
-    /// once per epoch. While the snapshot is no longer than a window, every window covers
-    /// all of it, so it is rebuilt whenever the book gained a candidate since: a new or
+    /// once per epoch. While the snapshot is shorter than a window, every window covers
+    /// all of it, so the book's new candidates join it until it fills one window: a new or
     /// newly confirmed entry, or a new record for an entry. A new node therefore discloses
-    /// its first peers without waiting for the next epoch.
+    /// its first peers without waiting for the next epoch. The snapshot never drops an id
+    /// within an epoch, so book churn cannot widen what a requester learns.
     ///
     /// `exclude_node_ids` must be in ascending byte order.
     pub fn sample_peers(
@@ -3057,30 +3061,44 @@ impl ZakuraDiscoveryBook {
             && has_discovery_dialable_direct_addrs(&entry.record)
     }
 
-    /// Rebuilds the sample snapshot when it is stale.
+    /// Starts a new snapshot for a new epoch, and adds the book's new
+    /// candidates to a snapshot shorter than one window.
     ///
-    /// See [`Self::sample_peers`] for when a rebuild happens.
+    /// See [`Self::sample_peers`] for why.
     fn refresh_sample_snapshot(&mut self, now: u64) {
         let epoch = now / DISCOVERY_DISCLOSURE_EPOCH.as_secs();
         let window = self.sample_window();
-        let stale = self.sample_snapshot.as_ref().is_none_or(|snapshot| {
-            snapshot.epoch != epoch
-                || (snapshot.node_ids.len() <= window && snapshot.generation != self.generation)
-        });
-        if stale {
-            let mut node_ids: Vec<NodeId> = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| self.is_sample_eligible(entry, now))
-                .map(|(node_id, _)| *node_id)
-                .collect();
-            node_ids.shuffle(&mut rand::thread_rng());
-            self.sample_snapshot = Some(SampleSnapshot {
+        let snapshot = match self.sample_snapshot.take() {
+            Some(mut snapshot) if snapshot.epoch == epoch => {
+                let room = window.saturating_sub(snapshot.node_ids.len());
+                if room > 0 && snapshot.generation != self.generation {
+                    let added = self.sample_candidates(now, &snapshot.node_ids);
+                    snapshot.node_ids.extend(added.into_iter().take(room));
+                    snapshot.generation = self.generation;
+                }
+                snapshot
+            }
+            _ => SampleSnapshot {
                 epoch,
-                node_ids,
+                node_ids: self.sample_candidates(now, &[]),
                 generation: self.generation,
-            });
-        }
+            },
+        };
+        self.sample_snapshot = Some(snapshot);
+    }
+
+    /// The sample-eligible ids not in `known`, in random order.
+    fn sample_candidates(&self, now: u64, known: &[NodeId]) -> Vec<NodeId> {
+        let mut node_ids: Vec<NodeId> = self
+            .entries
+            .iter()
+            .filter(|(node_id, entry)| {
+                self.is_sample_eligible(entry, now) && !known.contains(node_id)
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        node_ids.shuffle(&mut rand::thread_rng());
+        node_ids
     }
 
     /// Keys a requester's sample window for one epoch.
@@ -3774,7 +3792,12 @@ fn update_existing_entry(
 fn connected_record_is_fresh_for_stored_record(
     record: &ZakuraNodeRecord,
     entry: &ZakuraDiscoveryEntry,
+    now: u64,
 ) -> bool {
+    // An expired record no longer orders the peer's records.
+    if entry_is_expired(entry, now) {
+        return true;
+    }
     match record.body.sequence.cmp(&entry.record.body.sequence) {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => entry.record() == record,
@@ -7839,6 +7862,35 @@ mod tests {
             .is_empty());
     }
 
+    /// A peer that reset its sequence and dropped its addresses regains its
+    /// services once its old dialable record expires.
+    #[tokio::test]
+    async fn addressless_reset_hello_replaces_an_expired_dialable_record() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let node_id = secret.public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+        // Expired, but within the clock-skew tolerance, so it imports.
+        let mut old = runtime_record_with_secret(&secret, 10, service(2), test_addr(2)).body;
+        old.expires_at_unix_secs = current_unix_secs() - 1;
+        let old = ZakuraNodeRecord::sign(old, &secret).expect("record signs");
+        handle
+            .import_connected_peer_record(old, node_id)
+            .await
+            .expect("a dialable record imports");
+
+        let reset = runtime_record_with_secret_and_addrs(&secret, 1, service(3), Vec::new());
+        assert!(matches!(
+            handle.import_connected_peer_record(reset, node_id).await,
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(3)])
+        );
+    }
+
     #[tokio::test]
     async fn expired_connected_hello_does_not_create_active_services() {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8664,8 +8716,8 @@ mod tests {
     }
 
     /// Relayed records follow the relay verdict table: a forged record anywhere in the
-    /// batch disconnects the relay before any record is imported, and records that only
-    /// fail local or compatibility checks drop alone.
+    /// batch, even past the import limit, disconnects the relay before any record is
+    /// imported, and records that only fail local or compatibility checks drop alone.
     #[tokio::test]
     async fn relayed_batch_verdicts() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8688,6 +8740,33 @@ mod tests {
                 "position {position}"
             );
         }
+
+        // A forged record past a smaller import limit still rejects the batch.
+        let handle = discovery_handle_at(
+            local_config_with(
+                secret_key(),
+                vec![test_addr(200)],
+                vec![ZakuraServiceId::discovery()],
+            ),
+            ZakuraDiscoveryConfig {
+                book_limits: ZakuraDiscoveryBookLimits {
+                    max_imported_records_per_response: 1,
+                    ..ZakuraDiscoveryBookLimits::default()
+                },
+                ..ZakuraDiscoveryConfig::default()
+            },
+            connected_rx.clone(),
+            current_unix_secs(),
+        );
+        let mut forged = runtime_record_with(1, service(2), test_addr(2));
+        forged.body.sequence += 1;
+        assert!(matches!(
+            handle
+                .import_peer_records([valid(), forged], Some(relay))
+                .await,
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+        assert_eq!(handle.inner.lock().await.book.len(), 0);
 
         let handle = discovery_handle_with_connected(connected_rx.clone());
         let now = current_unix_secs();
@@ -9006,10 +9085,10 @@ mod tests {
     }
 
     /// While one window covers the whole snapshot, a newly confirmed entry
-    /// enters the next sample in the same epoch. A longer snapshot keeps every
+    /// enters the next sample in the same epoch. A full snapshot keeps every
     /// window stable until the next epoch, so new entries wait for it.
     #[test]
-    fn sample_snapshot_rebuilds_within_an_epoch_only_while_one_window_covers_it() {
+    fn sample_snapshot_grows_within_an_epoch_only_while_one_window_covers_it() {
         const WINDOW: usize = 4;
         let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
             max_imported_records_per_response: WINDOW,
@@ -9037,7 +9116,11 @@ mod tests {
             .expect("test record imports");
         }
         let window = sampled_node_ids(&mut book, NOW);
-        assert_eq!(window.len(), WINDOW, "the snapshot now outgrows one window");
+        assert_eq!(window.len(), WINDOW, "the snapshot now fills one window");
+        assert!(
+            window.contains(&gossiped_id),
+            "an id disclosed earlier in the epoch stays in the window"
+        );
 
         let late = long_lived_record_with(1, service(9), test_addr(50));
         let late_id = late.body.node_id;
@@ -9051,6 +9134,45 @@ mod tests {
             seen_late |= sampled_node_ids(&mut book, now).contains(&late_id);
         }
         assert!(seen_late, "a later epoch's snapshot includes the new entry");
+    }
+
+    /// A requester learns at most one window of ids per epoch, even when every
+    /// id it learned expires and new candidates replace them.
+    #[test]
+    fn book_churn_does_not_widen_an_epochs_disclosure() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let window = MAX_DISCOVERY_RECORDS_PER_RESPONSE;
+        let short_lived = (1..=window).map(|index| {
+            let octet = u8::try_from(index).expect("small test index fits in u8");
+            signed_record_with(octet.into(), service(1), test_addr(octet))
+        });
+        for record in short_lived {
+            import_confirmed_record(&mut book, record).expect("test record imports");
+        }
+        let mut seen = sampled_node_ids(&mut book, NOW);
+        assert_eq!(seen.len(), window);
+
+        // Every record expires at `NOW + 60`, inside the epoch.
+        let later = NOW + 61;
+        assert_eq!(
+            later / DISCOVERY_DISCLOSURE_EPOCH.as_secs(),
+            NOW / DISCOVERY_DISCLOSURE_EPOCH.as_secs()
+        );
+        for index in window + 1..=2 * window {
+            let octet = u8::try_from(index).expect("small test index fits in u8");
+            import_confirmed_record(
+                &mut book,
+                long_lived_record_with(octet.into(), service(1), test_addr(octet)),
+            )
+            .expect("test record imports");
+        }
+        seen.extend(sampled_node_ids(&mut book, later));
+        assert_eq!(seen.len(), window);
+
+        // The next epoch discloses the new candidates.
+        let next = sampled_node_ids(&mut book, next_epoch(later));
+        assert_eq!(next.len(), window);
+        assert!(next.is_disjoint(&seen));
     }
 
     /// Each sampled entry is rechecked, so one that expires leaves samples

@@ -4944,7 +4944,14 @@ impl HeaderSyncReactor {
         self.handle_typed_failure(peer.clone(), source, &failure);
 
         if context.operation == "query_header_locator" {
-            self.peer_work_queue.remove_unstarted(peer);
+            match self
+                .peer_work_queue
+                .awaiting_target(peer)
+                .map(|target| target.scope)
+            {
+                Some(scope) => self.abandon_unstarted_attempt(peer, scope),
+                None => self.peer_work_queue.remove_unstarted(peer),
+            }
         }
 
         if let Some(owner) = context.owner {

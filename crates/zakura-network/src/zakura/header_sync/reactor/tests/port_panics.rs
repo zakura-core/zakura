@@ -735,3 +735,48 @@ async fn locator_timeout_after_tip_churn_rediscovers_the_latest_target() {
     );
     assert_eq!(reactor.pending_locator_queries.len(), 1);
 }
+
+#[tokio::test]
+async fn locator_panics_do_not_alternate_between_cached_statuses() {
+    let mut reactor = direct_reactor(Arc::new(PanickingPort {
+        release: None,
+        vct_release: None,
+    }));
+    let snapshot = reactor
+        .committed_snapshot
+        .clone()
+        .expect("the fixture has a committed snapshot");
+    let anchor = snapshot.frontiers.finalized;
+    let status = Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: block::Height(2),
+        selected_tip_hash: block::Hash([0x81; 32]),
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response: 1,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: 0,
+    };
+    let first = peer();
+    let second =
+        ZakuraPeerId::new(vec![0x82; 32]).expect("the second peer ID has the required length");
+    connected_session(&mut reactor, first.clone(), 7);
+    connected_session(&mut reactor, second.clone(), 8);
+    reactor.handle_wire_message(first, 7, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_wire_message(second, 8, HeaderSyncMessage::Status(status));
+
+    for _ in 0..2 {
+        let completion = reactor
+            .pending_port_operations
+            .next()
+            .await
+            .expect("each staged status starts one panicking locator read");
+        reactor.handle_port_completion(completion);
+    }
+    assert!(
+        reactor.pending_port_operations.is_empty(),
+        "each cached status gets one panicked locator read until its peer sends a fresh status"
+    );
+}

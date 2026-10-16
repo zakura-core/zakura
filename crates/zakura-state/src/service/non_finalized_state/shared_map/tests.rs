@@ -12,7 +12,7 @@ fn mutation_copies_only_the_touched_partition() {
         .all(|(a, b)| Arc::ptr_eq(a, b)));
 
     index.insert(0, 1);
-    let touched = index.partition(&0);
+    let touched = index.partition_index(&0);
     for (partition, (current, retained)) in index
         .partitions
         .iter()

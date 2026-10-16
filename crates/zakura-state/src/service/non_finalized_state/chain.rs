@@ -42,16 +42,14 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
-pub(crate) use self::shared_map::SharedMap;
 use self::{counted_set::CountedSet, height_map::HeightMap, index::TransparentTransfers};
-use super::{AddressTransfers, CreatedUtxos};
+use super::{AddressTransfers, CreatedUtxos, SharedMap};
 
 #[cfg(test)]
 mod chunked_height_map_tests;
 mod counted_set;
 mod height_map;
 pub mod index;
-mod shared_map;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,
 /// to a non-finalized chain tip.

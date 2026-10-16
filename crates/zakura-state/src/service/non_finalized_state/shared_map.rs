@@ -1,7 +1,6 @@
 //! Hash indexes shared between independent chain snapshots.
 
 use std::{
-    borrow::Borrow,
     collections::{hash_map::RandomState, HashMap},
     hash::{BuildHasher, Hash},
     sync::Arc,
@@ -13,11 +12,17 @@ mod tests;
 // Bound snapshot cloning to 256 Arc increments. Writes copy only touched partitions.
 const PARTITIONS: usize = 256;
 
-/// A private copy-on-write hash index. Clones share partitions but keep independent membership.
+/// A partitioned hash map with independent snapshots.
+///
+/// Cloning shares partitions. The first write to a shared partition clones its
+/// entries, leaving other snapshots unchanged.
+///
+/// Insertions replace existing values and return the previous value.
+/// Equality compares contents; iteration order is unspecified.
 #[derive(Clone, Debug)]
 pub(crate) struct SharedMap<K, V> {
     // Clones must keep this seed so each key stays in the same partition.
-    hash: RandomState,
+    partition_hasher: RandomState,
     partitions: Vec<Arc<HashMap<K, V>>>,
     len: usize,
 }
@@ -25,7 +30,7 @@ pub(crate) struct SharedMap<K, V> {
 impl<K, V> Default for SharedMap<K, V> {
     fn default() -> Self {
         Self {
-            hash: RandomState::new(),
+            partition_hasher: RandomState::new(),
             partitions: (0..PARTITIONS).map(|_| Arc::new(HashMap::new())).collect(),
             len: 0,
         }
@@ -33,29 +38,18 @@ impl<K, V> Default for SharedMap<K, V> {
 }
 
 impl<K: Eq + Hash, V> SharedMap<K, V> {
-    fn partition<Q>(&self, key: &Q) -> usize
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
+    fn partition_index(&self, key: &K) -> usize {
         // Use a randomized hash rather than attacker-controlled key bytes.
         let mask = u64::try_from(PARTITIONS - 1).expect("the partition count fits in u64");
-        usize::try_from(self.hash.hash_one(key) & mask).expect("a partition index fits in usize")
+        usize::try_from(self.partition_hasher.hash_one(key) & mask)
+            .expect("a partition index fits in usize")
     }
 
-    pub(crate) fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.partitions[self.partition(key)].get(key)
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        self.partitions[self.partition_index(key)].get(key)
     }
 
-    pub(crate) fn contains_key<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.get(key).is_some()
     }
 
@@ -78,7 +72,7 @@ impl<K: Eq + Hash, V> SharedMap<K, V> {
 
 impl<K: Eq + Hash + Clone, V: Clone> SharedMap<K, V> {
     pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let partition = self.partition(&key);
+        let partition = self.partition_index(&key);
         let previous = Arc::make_mut(&mut self.partitions[partition]).insert(key, value);
         if previous.is_none() {
             self.len += 1;
@@ -86,12 +80,8 @@ impl<K: Eq + Hash + Clone, V: Clone> SharedMap<K, V> {
         previous
     }
 
-    pub(crate) fn remove<Q>(&mut self, key: &Q) -> Option<V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let partition = self.partition(key);
+    pub(crate) fn remove(&mut self, key: &K) -> Option<V> {
+        let partition = self.partition_index(key);
         // Avoid copying a shared partition when the key is absent.
         if !self.partitions[partition].contains_key(key) {
             return None;

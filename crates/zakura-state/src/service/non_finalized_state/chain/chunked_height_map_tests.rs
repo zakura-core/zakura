@@ -124,3 +124,36 @@ fn chunked_pool_indices_preserve_root_tip_counts_and_shared_fork_snapshots() {
         ironwood_anchors
     );
 }
+
+#[test]
+fn history_tree_root_removal_matches_the_previous_filter_and_keeps_snapshots() {
+    let _guard = zakura_test::init();
+    let tree = Arc::new(HistoryTree::default());
+    let mut chain = Chain::default();
+    for height in 0..=193 {
+        chain.add_history_tree(Height(height), tree.clone());
+    }
+    let sibling = chain.clone();
+    let sibling_before = sibling.inner.clone();
+    for threshold in [0, 1, 63, 64, 65, 127, 128, 191, 192] {
+        let expected: Vec<_> = chain
+            .history_trees_by_height
+            .iter()
+            .map(|(height, _)| *height)
+            .filter(|height| *height > Height(threshold))
+            .collect();
+        chain.remove_history_tree(RevertPosition::Root, Height(threshold));
+        assert_eq!(
+            chain
+                .history_trees_by_height
+                .iter()
+                .map(|(height, _)| *height)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(sibling.inner, sibling_before);
+    }
+    chain.remove_history_tree(RevertPosition::Tip, Height(193));
+    assert!(chain.history_trees_by_height.is_empty());
+    assert_eq!(sibling.inner, sibling_before);
+}

@@ -153,7 +153,9 @@ tokio-util = "0.7.14"
 toml = "1.0"
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
-tonic-prost-build = "0.14"
+# `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,
+# pulldown-cmark-to-cmark and unicase; xtask does not need it.
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 tonic-reflection = "0.14"
 tower = "0.5.3"
 tracing = "0.1.41"

@@ -604,3 +604,224 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
     );
     assert!(!reactor.peer_state[&third].status_spent);
 }
+
+#[test]
+fn locator_losing_headroom_keeps_offer_for_body_progress() {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 - 401),
+        block::Hash([0x40; 32]),
+    );
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let (waiting, mut outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let mut status = status_for(&snapshot, target);
+    status.selected_tip_height = block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1);
+    reactor.handle_wire_message(waiting.clone(), 0, HeaderSyncMessage::Status(status));
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+
+    // A continuation can enlarge its claim while the locator read is in flight.
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 151, 250);
+    complete_locator(&mut reactor, &snapshot, &waiting, scope, target, true);
+    assert!(outbound.try_recv().is_err());
+    assert_quiescent(&mut reactor, &mut actions);
+    assert!(!reactor.peer_state[&waiting].status_spent);
+
+    // Only verified bodies advance: neither header authority nor the peer status changes.
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    snapshot.frontiers.verified_best =
+        zakura_header_chain::Frontier::new(block::Height(250), block::Hash([0x43; 32]));
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+    start_request(
+        &mut reactor,
+        &waiting,
+        &mut outbound,
+        scope,
+        target,
+        snapshot.frontiers.header_best,
+    );
+}
+
+#[test]
+fn in_flight_locator_waits_for_committed_resource_stall_to_clear() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    let (source, owner_scope, branch) =
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let (waiting, mut outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    reactor.handle_wire_message(
+        waiting.clone(),
+        0,
+        HeaderSyncMessage::Status(status_for(&snapshot, target)),
+    );
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
+        peer: owner,
+        source,
+        owner: owner_scope,
+        result: HeaderTargetAdmissionResult::ResourceStalled(
+            zakura_header_chain::CommittedStallReceipt {
+                state_version: snapshot.state_version,
+                alarm_changed: true,
+                attempted_branch: Some(branch),
+            },
+        ),
+    });
+    complete_locator(&mut reactor, &snapshot, &waiting, scope, target, true);
+    assert!(
+        outbound.try_recv().is_err(),
+        "a ready locator cannot bypass the committed stall"
+    );
+    assert_eq!(reactor.peer_work_queue.reserved_header_count(&waiting), 0);
+    assert_quiescent(&mut reactor, &mut actions);
+    assert!(!reactor.peer_state[&waiting].status_spent);
+    let mut newer = snapshot;
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    reactor.observe_latest_committed_snapshot(newer.clone());
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+    start_request(
+        &mut reactor,
+        &waiting,
+        &mut outbound,
+        scope,
+        target,
+        newer.frontiers.header_best,
+    );
+}
+
+fn ready_repair(
+    reactor: &mut HeaderSyncReactor,
+    actions: &mut mpsc::Receiver<HeaderPortOperation>,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+) {
+    reactor.observe_vct_root_repair(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: block::Height(1),
+        },
+        generation: 7,
+    });
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = actions.try_recv().unwrap()
+    else {
+        panic!("repair must request context");
+    };
+    let context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        snapshot.frontiers.header_best,
+        zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.finalized),
+        snapshot.state_version,
+        None,
+        true,
+        &[],
+    )
+    .unwrap();
+    reactor.handle_vct_repair_context_ready(owner, VctRepairContextResult::Resolved(context));
+}
+
+#[test]
+fn repair_send_failure_preserves_ordinary_offer() {
+    assert_failed_repair_preserves_offer(false);
+}
+
+#[test]
+fn repair_budget_failure_preserves_ordinary_offer() {
+    assert_failed_repair_preserves_offer(true);
+}
+
+fn assert_failed_repair_preserves_offer(full_budget: bool) {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let (supplier, mut outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x42; 32]);
+    let mut status = status_for(&snapshot, target);
+    status.tree_aux_schema_mask = AuxSchema::V1.mask_bit();
+    reactor.handle_wire_message(supplier.clone(), 0, HeaderSyncMessage::Status(status));
+    expect_locator_query(&mut actions, &supplier, target);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x72);
+    if full_budget {
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&owner, 4000, 0);
+    } else {
+        // Fill the ordered stream so the repair send fails without disconnecting it.
+        let session = &reactor.peer_state[&supplier].session;
+        while session
+            .try_send_status(&reactor.codec, status_for(&snapshot, target))
+            .is_ok()
+        {}
+    }
+    ready_repair(&mut reactor, &mut actions, &snapshot);
+    assert!(reactor.peer_work_queue.active(&supplier).is_none());
+    assert!(
+        !reactor.peer_state[&supplier].status_spent,
+        "failed repair must preserve the ordinary offer (full_budget={full_budget})"
+    );
+    if full_budget {
+        reactor.peer_work_queue.remove(&owner);
+    } else {
+        while outbound.try_recv().is_ok() {}
+    }
+    reactor.schedule_cached_statuses();
+    let scope = expect_locator_query(&mut actions, &supplier, target);
+    start_request(
+        &mut reactor,
+        &supplier,
+        &mut outbound,
+        scope,
+        target,
+        snapshot.frontiers.header_best,
+    );
+}
+
+#[test]
+fn status_during_repair_keeps_its_ordinary_attempt() {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let (supplier, mut outbound) = connect(&mut reactor, 0x71);
+    ready_repair(&mut reactor, &mut actions, &snapshot);
+    let target = block::Hash([0x42; 32]);
+    let mut status = status_for(&snapshot, target);
+    status.tree_aux_schema_mask = AuxSchema::V1.mask_bit();
+    reactor.handle_wire_message(
+        supplier.clone(),
+        0,
+        HeaderSyncMessage::Status(status.clone()),
+    );
+    assert!(matches!(
+        reactor.peer_work_queue.active(&supplier).unwrap().purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+    outbound.try_recv().expect("repair request sent");
+    assert!(
+        !reactor.peer_state[&supplier].status_spent,
+        "the status that assigns repair still offers ordinary work"
+    );
+    reactor.handle_wire_message(supplier.clone(), 0, HeaderSyncMessage::Status(status));
+    assert!(
+        !reactor.peer_state[&supplier].status_spent,
+        "a fresh status during repair is not an ordinary attempt"
+    );
+    reactor.retire_vct_repair();
+    reactor.schedule_cached_statuses();
+    let scope = expect_locator_query(&mut actions, &supplier, target);
+    start_request(
+        &mut reactor,
+        &supplier,
+        &mut outbound,
+        scope,
+        target,
+        snapshot.frontiers.header_best,
+    );
+}

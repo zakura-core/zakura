@@ -207,11 +207,11 @@ struct PeerState {
     last_status: Option<Status>,
     /// Whether `last_status` already had its one chance to start ordinary work.
     ///
-    /// Staging spends a status, and so does a status that arrives during the peer's own
-    /// attempt or that cannot yield work under the current header authority. A fresh status
-    /// or a header authority change makes it available again. Each locator read and
-    /// `GetHeaders` therefore follows a peer message or local progress, so no failure path
-    /// can restart the same attempt in a loop.
+    /// Staging spends a status, as does a status received during an ordinary attempt or
+    /// one that cannot yield work under the current header authority. Fresh status or
+    /// header authority restores it. Unstarted work deferred by local capacity, a committed
+    /// stall, or repair preemption also keeps its offer until the blocker clears.
+    /// Failed locator reads, sends, and ordinary attempts remain spent.
     status_spent: bool,
     waiting_for_serving_slot: bool,
     capacity_signal: Option<zakura_node_services::header_chain::ServingCapacitySignal>,
@@ -1193,9 +1193,11 @@ impl HeaderSyncReactor {
             }
             return;
         }
-        if self.peer_work_queue.active(&peer).is_some() {
-            // The attempt in progress already used this peer's chance at the target.
-            self.spend_status(&peer);
+        if let Some(active) = self.peer_work_queue.active(&peer) {
+            // Exact selected-range repair does not use the advertised ordinary offer.
+            if matches!(active.purpose, HeaderTargetPurpose::Normal) {
+                self.spend_status(&peer);
+            }
             metrics::counter!("sync.header.target.already_active").increment(1);
             return;
         }
@@ -1289,6 +1291,14 @@ impl HeaderSyncReactor {
     fn spend_status(&mut self, peer: &ZakuraPeerId) {
         if let Some(state) = self.peer_state.get_mut(peer) {
             state.status_spent = true;
+        }
+    }
+
+    /// Return an unstarted ordinary offer to the scheduler when a local blocker defers it.
+    fn defer_ordinary_target(&mut self, peer: &ZakuraPeerId) {
+        self.peer_work_queue.remove_unstarted(peer);
+        if let Some(state) = self.peer_state.get_mut(peer) {
+            state.status_spent = false;
         }
     }
 
@@ -2890,6 +2900,10 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.stale_locator").increment(1);
             return;
         }
+        if self.ordinary_discovery_paused() {
+            self.defer_ordinary_target(&peer);
+            return;
+        }
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -2914,7 +2928,7 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .reserve_request(&peer, max_header_count)
         {
-            self.peer_work_queue.remove_unstarted(&peer);
+            self.defer_ordinary_target(&peer);
             return;
         }
         let source = source_id_from_peer(&peer);
@@ -3437,8 +3451,10 @@ impl HeaderSyncReactor {
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
         for (peer, source, session, mut status, request_count) in candidates {
-            let preempts_ordinary_work = self.peer_work_queue.awaiting_target(&peer).is_some();
-            self.peer_work_queue.remove_unstarted(&peer);
+            if self.peer_work_queue.awaiting_target(&peer).is_some() {
+                // Preemption returns the ordinary offer even if reserving or sending repair fails.
+                self.defer_ordinary_target(&peer);
+            }
             if self
                 .peer_work_queue
                 .reservable_repair_header_count(request_count)
@@ -3560,13 +3576,6 @@ impl HeaderSyncReactor {
             }
             self.request_deadlines
                 .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-            if preempts_ordinary_work {
-                // The repair took the slot before the ordinary request started, so the peer's
-                // status keeps its attempt for when the repair retires.
-                if let Some(state) = self.peer_state.get_mut(&peer) {
-                    state.status_spent = false;
-                }
-            }
             metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
             metrics::counter!("sync.header.vct.repair.requested.headers")
                 .increment(u64::from(request_count));

@@ -849,10 +849,10 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 ///
 /// It checks only when the selected tip moved, and only a lease that finds no
 /// intersection says no, so growth and local failures keep the page. The
-/// check closes the window between leasing a page and sending it, not the
-/// write after it. The lease is state work, so it waits for execution slots
-/// through `push` as the page's read did, then reads the selected tip again,
-/// because the chain can move during that wait.
+/// lease is state work, so it waits for execution slots through `push` as the
+/// page's read did. The chain can move during that wait or the lease, so the
+/// check repeats until the tip it judged against is still the selected one.
+/// That closes the window up to the page's commit, not the write after it.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
@@ -863,7 +863,7 @@ async fn still_selected(
     last: Frontier,
 ) -> bool {
     let mut execution = None;
-    let latest = loop {
+    loop {
         let Some(latest) = selected.borrow().clone() else {
             return true;
         };
@@ -874,22 +874,28 @@ async fn still_selected(
         if tip.height <= last.height {
             return false;
         }
-        if execution.is_some() {
-            break latest;
+        if execution.is_none() {
+            execution = Some(push.execution().await);
+            continue;
         }
-        execution = Some(push.execution().await);
-    };
-    let tip = latest.frontiers.header_best;
-    match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
-        Ok(AcquirePathReply::Acquired(path)) => {
-            release(port, *path).await;
-            true
-        }
-        Ok(AcquirePathReply::NoLocatorIntersection) => false,
-        Ok(_) => true,
-        Err(error) => {
-            log_port_failure(id, "recheck", &error);
-            true
+        let contains = match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
+            Ok(AcquirePathReply::Acquired(path)) => {
+                release(port, *path).await;
+                true
+            }
+            Ok(AcquirePathReply::NoLocatorIntersection) => false,
+            Ok(_) => true,
+            Err(error) => {
+                log_port_failure(id, "recheck", &error);
+                true
+            }
+        };
+        let current = selected
+            .borrow()
+            .as_ref()
+            .map(|selected| selected.frontiers.header_best);
+        if current == Some(tip) {
+            return contains;
         }
     }
 }

@@ -403,9 +403,9 @@ This section defines version 9's encodings and subscription rules. Section 5 of 
 header chain engine specification](fork-aware-header-chain-engine.md) states the header chain rules
 that apply to them.
 
-The header credit, sent-cursor ring, and grant minimum below have the evidence that Parameters to
-validate requires. The `Status` interval does not yet. The
-[header sync plan](../design/property-testing-header-sync.md#measured-evidence) records both.
+The header credit, sent-cursor ring, grant minimum, and `Status` interval below have the evidence
+that Parameters to validate requires. The
+[header sync plan](../design/property-testing-header-sync.md#measured-evidence) records it.
 
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet

@@ -111,7 +111,7 @@ where
         },
         best_header_tip: Some(best_header_tip),
         verified_block_tip_hash: verified_block_tip.1,
-        committed_snapshots,
+        committed_snapshots: committed_snapshots.clone(),
         committed_views,
         retained_block_height: read_state.subscribe_retained_block_height(),
         service_demand: coordinator.subscribe_service_demand(),
@@ -121,6 +121,7 @@ where
             read_state,
             header_chain_authority,
             network.clone(),
+            committed_snapshots,
         )),
     })
 }
@@ -314,14 +315,18 @@ pub(crate) struct HeaderChainServicePort<State, ReadState> {
     authority: zakura_state::HeaderChainBodyEvidenceAuthority,
     network: zakura_chain::parameters::Network,
     adapter_key: port::AdapterKey,
+    selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
 }
 
 impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
+    /// Build the port over the state services. `selected_chain` is state's
+    /// committed snapshot watch, which [`Port::selected_chain`] hands out.
     pub(crate) fn new(
         state: State,
         read_state: ReadState,
         authority: zakura_state::HeaderChainBodyEvidenceAuthority,
         network: zakura_chain::parameters::Network,
+        selected_chain: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     ) -> Self {
         Self {
             state,
@@ -329,6 +334,7 @@ impl<State, ReadState> HeaderChainServicePort<State, ReadState> {
             authority,
             network,
             adapter_key: port::AdapterKey::new(),
+            selected_chain,
         }
     }
 }
@@ -451,6 +457,12 @@ where
         let authority = self.authority.clone();
         let adapter_key = self.adapter_key.clone();
         Box::pin(async move { apply_header_target(state, authority, adapter_key, target).await })
+    }
+
+    fn selected_chain(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
+        self.selected_chain.clone()
     }
 }
 

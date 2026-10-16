@@ -171,7 +171,7 @@ const STATUS: MessageRule = MessageRule {
 
 /// Opens, renews, and closes a subscription. A subscriber holds one live or
 /// closing subscription, with a window of 4,000 headers and 8 MiB.
-const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
+pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
     message_type: message_type::SUBSCRIBE_HEADERS,
     payload: PayloadLen::of::<UpdatePayload>(),
     role: MessageRole::Subscription {

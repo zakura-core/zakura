@@ -110,7 +110,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
 pub(crate) use lease::WorkLease;
-pub(crate) use push::{Push, PushPermit};
+pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
 use capacity::{PeerBudgets, ServeMetrics};

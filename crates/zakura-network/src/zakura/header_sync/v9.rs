@@ -7,10 +7,12 @@
 //! pages. The rules are in the peer message regulation specification, section
 //! "Header sync — stream 5, version 9".
 //!
-//! This module holds the wire codec and the message table. Nothing negotiates
-//! or uses them yet: the reactor, its stream declaration, and the capability
-//! bits stay on version 8 until activation switches them all at once.
+//! This module holds the wire codec, the message table, and the publisher.
+//! Nothing negotiates or uses them yet: the reactor, its stream declaration,
+//! and the capability bits stay on version 8 until activation switches them
+//! all at once.
 
+mod publisher;
 mod wire;
 
 #[cfg(any(test, feature = "header-fuzz"))]

@@ -1034,6 +1034,40 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
         .expect("the publisher task does not panic");
 }
 
+/// A page job that panics after `Close` abandoned its page still panics the
+/// publisher task.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_page_job_panic_reaches_the_session_owner() {
+    let port = FakePort::new(0);
+    let chain = port.grow(2);
+    port.panic_reads
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let (publisher, mut recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    // The page's read waits at the gate when Close abandons the page.
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    let closed = tokio::time::timeout(QUIET, recv.recv())
+        .await
+        .expect("the outcome arrives")
+        .expect("the session is open");
+    assert_eq!(
+        subscriber.receive(&closed),
+        Received::Ended(HeadersOutcomeCode::SubscriptionClosed)
+    );
+    assert!(!task.is_finished());
+    port.gate.add_permits(1);
+    let ended = tokio::time::timeout(QUIET, task)
+        .await
+        .expect("the publisher task ends");
+    assert!(ended.is_err_and(|error| error.is_panic()));
+}
+
 /// A following page that leaves the selected chain while in progress is read
 /// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.

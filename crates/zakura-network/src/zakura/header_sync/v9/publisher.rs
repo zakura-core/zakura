@@ -23,16 +23,19 @@
 //! selected-chain change, or a capacity release, never for a timer.
 
 use std::{
+    any::Any,
     collections::BTreeMap,
     future::Future,
     num::NonZeroU32,
     ops::Bound,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
 };
 
+use futures::FutureExt;
 use thiserror::Error;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -179,8 +182,9 @@ impl Publisher {
     /// Start publishing on one session, and return the handle with the task
     /// that writes pages and outcomes to `send` until `cancel` fires.
     ///
-    /// The task re-raises a page job's panic, so the session's owner sees it
-    /// through the returned handle and can close the session.
+    /// The task re-raises a page job's panic, even one whose page it had
+    /// abandoned, so the session's owner sees it through the returned handle
+    /// and can close the session.
     ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
     /// version 9 codec.
@@ -200,6 +204,8 @@ impl Publisher {
             last_served: None,
         }));
         let wake = Arc::new(Notify::new());
+        // One panic ends the task, so the channel never needs more room.
+        let (panics, panicked) = mpsc::channel(1);
         let task = tokio::spawn(publish::<HEADER_BYTES>(
             Task {
                 shared: shared.clone(),
@@ -208,8 +214,10 @@ impl Publisher {
                 push,
                 owner,
                 limits,
+                panics,
             },
             send,
+            panicked,
             cancel,
         ));
         (
@@ -688,6 +696,8 @@ struct Task {
     push: Push,
     owner: LeaseOwner,
     limits: PageLimits,
+    /// Page jobs report a panic here, even after their page was abandoned.
+    panics: mpsc::Sender<Box<dyn Any + Send>>,
 }
 
 /// A page in progress: its permit wait, its job, and its transport slot.
@@ -705,6 +715,7 @@ enum Progress<'a> {
 async fn publish<const HEADER_BYTES: usize>(
     task: Task,
     send: FramedSend,
+    mut panicked: mpsc::Receiver<Box<dyn Any + Send>>,
     cancel: CancellationToken,
 ) {
     let mut selected = task.port.selected_chain();
@@ -751,6 +762,8 @@ async fn publish<const HEADER_BYTES: usize>(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
+            // See `Publisher::spawn`.
+            Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
             progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
                 if work.is_some() =>
             {
@@ -804,6 +817,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let push = task.push.clone();
     let port = task.port.clone();
     let check_port = task.port.clone();
+    let panics = task.panics.clone();
     let owner = task.owner;
     let id = job.id;
     let leased_tip = job.following.then_some(job.lease_target);
@@ -811,20 +825,22 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     Box::pin(async move {
         let permit = push.acquire(bytes).await;
         let running = tokio::spawn(async move {
-            let output = run_job::<HEADER_BYTES>(&*port, owner, &job).await;
-            (output, permit)
+            let job = AssertUnwindSafe(run_job::<HEADER_BYTES>(&*port, owner, &job));
+            match job.catch_unwind().await {
+                Ok(output) => Some((output, permit)),
+                // The permit drops once the job has ended, panic or not.
+                Err(panic) => {
+                    tracing::error!(subscription_id = id, "a header sync v9 page job panicked");
+                    // A full channel already holds a panic that ends the task.
+                    let _ = panics.try_send(panic);
+                    None
+                }
+            }
         });
         let (output, permit): (Output, PushPermit) = match running.await {
-            Ok(done) => done,
-            // See `Publisher::spawn`.
-            Err(error) if error.is_panic() => {
-                tracing::error!(
-                    subscription_id = id,
-                    ?error,
-                    "a header sync v9 page job panicked"
-                );
-                std::panic::resume_unwind(error.into_panic())
-            }
+            Ok(Some(done)) => done,
+            // The publisher task re-raises the job's panic.
+            Ok(None) => return Progress::Other(Output::Stall(Stall::Local, "job_panicked")),
             // The runtime is shutting down.
             Err(_) => return Progress::Closed,
         };

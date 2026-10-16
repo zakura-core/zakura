@@ -1057,12 +1057,25 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
         0,
         HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([1; 32]))),
     );
-    for _ in 0..32 {
-        reactor.handle_peer_disconnected(&peer, 0, "test reconnect");
-        let (_, _outbound) = connect(&mut reactor, 1);
+    let mut outbounds = Vec::new();
+    for session_id in 1..=32 {
+        if session_id % 2 == 0 {
+            reactor.handle_peer_disconnected(&peer, session_id - 1, "test reconnect");
+        }
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+            peer.clone(),
+            session_id,
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().unwrap();
+        outbounds.push(outbound);
+        // A late disconnect for the previous session must not retire the replacement.
+        reactor.handle_peer_disconnected(&peer, session_id - 1, "stale disconnect");
         reactor.handle_wire_message(
             peer.clone(),
-            0,
+            session_id,
             HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([2; 32]))),
         );
         assert_eq!(reactor.pending_locator_queries.len(), 1);
@@ -1071,7 +1084,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
             MAX_STAGED_TARGETS_V1 - 1
         );
     }
-    reactor.handle_peer_disconnected(&peer, 0, "test final disconnect");
+    reactor.handle_peer_disconnected(&peer, 32, "test final disconnect");
     let completion = reactor.pending_port_operations.next().await.unwrap();
     reactor.handle_port_completion(completion);
     assert!(reactor.pending_locator_queries.is_empty());

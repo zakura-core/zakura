@@ -2543,6 +2543,12 @@ impl ZakuraDiscoveryHandle {
             .map(|entry| entry.live_summaries.clone())
     }
 
+    /// Holds every free verification slot until the returned permits drop.
+    #[cfg(test)]
+    pub(super) fn hold_verify_slots(&self) -> Vec<crate::zakura::regulation::SlotPermit> {
+        self.verify_slots.hold_free()
+    }
+
     /// Returns a stored discovery record for `node_id`, if present.
     pub async fn record_for(&self, node_id: NodeId) -> Option<ZakuraNodeRecord> {
         let inner = self.inner.lock().await;

@@ -5,12 +5,12 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
 
 use super::{
-    AuxSchema, GetHeaders, HeaderEntry, HeaderSyncCodec, HeaderSyncMessage, HeadersOutcomeCode,
-    PeerSession, ZakuraHeaderSyncConfig,
+    v9::{Admitted, Ended, PageLimits},
+    HeaderEntry, Headers, PeerSession, Status, ZakuraHeaderSyncConfig,
 };
 use crate::zakura::{
-    HeaderSyncServiceSummary, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState, ZakuraPeerId,
-    ZakuraTrace,
+    regulation::ServeCapacity, HeaderSyncServiceSummary, ServicePeerSnapshot, Stream,
+    ZakuraHeaderSyncCandidateState, ZakuraPeerId, ZakuraTrace,
 };
 
 /// Cached full-state frontiers used by header sync and block sync.
@@ -153,10 +153,17 @@ pub struct HeaderSyncHandle {
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
-    pub(super) codec: HeaderSyncCodec,
     pub(super) trace: ZakuraTrace,
+    /// The active network, which fixes the header size and stream layout.
+    pub(super) network: Network,
     /// The stream layout for the network's header size.
-    pub(super) layout: &'static [crate::zakura::Stream],
+    pub(super) layout: &'static [Stream],
+    /// The header-chain port that publishers read pages from.
+    pub(super) port: Arc<dyn zakura_node_services::header_chain::Port>,
+    /// Node-wide capacity that every session's published pages share.
+    pub(super) serving: ServeCapacity,
+    /// The serving limits this node advertises in its `Status`.
+    pub(super) page_limits: PageLimits,
 }
 
 impl HeaderSyncHandle {
@@ -234,25 +241,34 @@ pub enum Event {
         /// Advisory summary.
         summary: HeaderSyncServiceSummary,
     },
-    /// A message decoded on a canonical stream.
-    WireMessage {
+    /// A `Status` decoded on a canonical stream.
+    Status {
         /// Sending peer.
         peer: ZakuraPeerId,
         /// Ordered-stream generation.
         session_id: u64,
-        /// Decoded message.
-        msg: HeaderSyncMessage,
+        /// The peer's advertisement.
+        status: Status,
     },
-    /// A correlated response that the reactor decoded under the request's reserved scope.
-    SessionResponse {
+    /// A page that the session's subscriber admitted.
+    Page {
         /// Sending peer.
         peer: ZakuraPeerId,
         /// Ordered-stream generation.
         session_id: u64,
-        /// Durable generation and exact branch that owns the response reservation.
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        /// Decoded `Headers` or `HeadersOutcome` response.
-        msg: HeaderSyncMessage,
+        /// The decoded page.
+        page: Headers,
+        /// Where the page leaves its subscription.
+        admitted: Admitted,
+    },
+    /// A terminal outcome that the session's subscriber admitted.
+    Outcome {
+        /// Sending peer.
+        peer: ZakuraPeerId,
+        /// Ordered-stream generation.
+        session_id: u64,
+        /// The subscription the outcome ended.
+        ended: Ended,
     },
     /// State returned the selected-path locator for an advertised target.
     #[cfg(any(test, feature = "zakura-testkit"))]
@@ -350,8 +366,9 @@ impl Event {
             Self::PeerConnected(_) => "peer_connected",
             Self::PeerDisconnected { .. } => "peer_disconnected",
             Self::AdvisorySummary { .. } => "advisory_header_summary",
-            Self::WireMessage { .. } => "session_wire_message",
-            Self::SessionResponse { .. } => "session_response",
+            Self::Status { .. } => "status",
+            Self::Page { .. } => "page",
+            Self::Outcome { .. } => "outcome",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderLocatorReady { .. } => "header_locator_ready",
             #[cfg(any(test, feature = "zakura-testkit"))]

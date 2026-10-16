@@ -8,7 +8,6 @@ use crate::zakura::ServicePeerLimits;
 
 pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
 pub(super) const REGTEST_HEADER_BYTES: usize = 177;
-const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 1;
 const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 3;
 const DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN: Duration = Duration::from_secs(60);
@@ -17,7 +16,7 @@ const DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuraHeaderSyncConfig {
-    /// Maximum headers this node advertises per `GetHeaders` response.
+    /// Maximum headers this node advertises per `Headers` page.
     pub max_headers_per_response: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]

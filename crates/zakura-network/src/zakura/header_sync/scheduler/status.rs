@@ -107,7 +107,7 @@ mod tests {
             suffix_cumulative_work: U256::from(u64::from(marker)),
             oldest_retained_height: block::Height(1),
             max_headers_per_response: 1,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 1,
             tree_aux_schema_mask: 1,
         }

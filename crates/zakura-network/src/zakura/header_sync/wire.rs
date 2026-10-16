@@ -1,4 +1,5 @@
-//! Native Zakura header-sync wire types and bounded codec.
+//! Header-sync wire types shared by every message: stream constants, header
+//! entries, and auxiliary schema-1 records. The version 9 codec is in `v9`.
 
 use std::{io, sync::Arc};
 
@@ -10,10 +11,7 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade},
     sapling,
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
-    work::difficulty::U256,
 };
-
-use super::{header_sync_header_bytes_for_network, Frame, HeaderSyncRequestId};
 
 /// Zakura stream kind reserved for native header sync.
 pub const ZAKURA_STREAM_HEADER_SYNC: u16 = 5;
@@ -37,14 +35,11 @@ pub const MSG_HS_HEADERS: u8 = 3;
 /// Header-sync `HeadersOutcome` discriminator.
 pub const MSG_HS_HEADERS_OUTCOME: u8 = 4;
 
-const MAX_LOCATOR_HASHES: usize = 13;
-const MAX_BODY_SIZE_HINT: u32 = 2_000_000;
 pub(super) const KNOWN_TREE_AUX_SCHEMA_MASK: u32 = 1;
-const HEADERS_RESPONSE_FIXED_BYTES: usize = 1 + 8 + 32 + 4 + 32 + 4 + 1 + 1;
 /// Exact encoded length of one immutable tree-aux schema-1 record.
 pub const TREE_AUX_SCHEMA_V1_BYTES: usize = 4 + 32 + 32 + 32 + 8 + 8 + 8 + 32;
 
-/// Errors produced while constructing, encoding, or bounded-decoding messages.
+/// Errors produced while encoding, decoding, or checking schema-1 records.
 #[derive(Debug, Error)]
 pub enum HeaderSyncWireError {
     /// A payload exceeded the negotiated or hard cap.

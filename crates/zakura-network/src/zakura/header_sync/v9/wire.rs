@@ -1,20 +1,11 @@
 //! The version 9 message table and codec.
 //!
-//! Version 9 drops version 8's payload discriminator: the frame header alone
-//! names the message. Every other field keeps version 8's little-endian
-//! layout.
-//!
 //! Header bytes differ by network, so the codec is generic over
 //! `HEADER_BYTES`: [`CommonMessage`] serves Mainnet and Testnet, and
-//! [`RegtestMessage`] serves Regtest. Each has its own `Headers` row, whose
-//! bounds are the smallest and largest page the codec produces on that network.
+//! [`RegtestMessage`] serves Regtest. Each has its own `Headers` row.
 //!
-//! Decoding checks every rule that needs only the payload and the network.
-//! Rules that need the subscription, such as remaining credit, page linkage,
-//! and the auxiliary schema the subscriber asked for, belong to the
-//! reservation match that follows. So do header hashes and auxiliary record
-//! contents, because the specification puts expensive verification after that
-//! match.
+//! Decoding checks the rules that need only the payload and the network. The
+//! subscriber checks the rest after the reservation match.
 
 use std::{mem::size_of, sync::Arc, time::Duration};
 
@@ -42,8 +33,7 @@ use crate::zakura::{
 /// The header sync stream version this module encodes.
 pub(crate) const STREAM_VERSION: u16 = 9;
 
-/// Capability bit 10, which identifies version 9. Activation moves it into
-/// the handshake and retires bit 5.
+/// Capability bit 10, which identifies version 9.
 pub(crate) const CAPABILITY: u64 = 1 << 10;
 
 /// Most header credit a subscription holds beyond its acknowledged cursor.
@@ -63,14 +53,8 @@ pub(crate) const HS_SENT_CURSOR_RING: u32 = 4_096;
 /// Bytes of a `Headers` page before its entries.
 pub(crate) const HEADERS_RESPONSE_FIXED_BYTES: usize = <PageFixed as Wire>::MAX_LEN;
 
-/// Bytes of a `HeadersOutcome`.
-pub(crate) const HEADERS_OUTCOME_BYTES: usize = <OutcomePayload as Wire>::MAX_LEN;
-
 /// Most locator hashes an `Open` carries.
 const MAX_LOCATOR_HASHES: usize = 13;
-
-/// Largest body-size hint, the consensus block-size ceiling.
-const MAX_BODY_SIZE_HINT: u32 = 2_000_000;
 
 /// Bytes of one body-size hint.
 const BODY_SIZE_BYTES: usize = 4;
@@ -80,7 +64,7 @@ const BODY_SIZE_BYTES: usize = 4;
 // The sum is a small protocol constant, far below u32::MAX.
 const FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
 
-/// Frame message types. Version 9 has no payload discriminator.
+/// Frame message types.
 mod message_type {
     pub(crate) const STATUS: u16 = 1;
     pub(crate) const SUBSCRIBE_HEADERS: u16 = 2;
@@ -149,14 +133,7 @@ pub(crate) type PageFixed = (LeU64, BlockHash, HeightLe, BlockHash, LeU32, (Bool
 /// `HeadersOutcome`: the subscription ID, initial target, and outcome code.
 pub(crate) type OutcomePayload = (LeU64, BlockHash, U8);
 
-/// Each side's frontier and serving caps, sent on open, after each change,
-/// and at least every refresh interval. Senders leave a second between two.
-///
-/// The bucket holds the 600 messages a one-second sender queues during the
-/// ten-minute outage, plus the initial message and one of jitter, and refills
-/// twice as fast as the sender. Exhaustion cannot prove a violation, because
-/// one stream can stall longer while sibling traffic keeps the connection
-/// alive, so the reader records it and forwards the message.
+/// Each side's frontier and serving caps, sent at most once a second.
 const STATUS: MessageRule = MessageRule {
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
@@ -169,8 +146,7 @@ const STATUS: MessageRule = MessageRule {
     },
 };
 
-/// Opens, renews, and closes a subscription. A subscriber holds one live or
-/// closing subscription, with a window of 4,000 headers and 8 MiB.
+/// Opens, renews, and closes a subscription.
 pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
     message_type: message_type::SUBSCRIBE_HEADERS,
     payload: PayloadLen::of::<UpdatePayload>(),
@@ -229,11 +205,8 @@ pub(crate) const fn smallest_page(header_bytes: usize, schema: AuxSchema) -> usi
     HEADERS_RESPONSE_FIXED_BYTES + entry_bytes(header_bytes, schema)
 }
 
-/// The largest page under either schema that fits [`MAX_HS_MESSAGE_BYTES`]
-/// and [`MAX_HS_RANGE`] headers.
-///
-/// Entries have a fixed size, so no page is longer than this but within the
-/// 2 MiB cap. This is the `Headers` row's maximum.
+/// The `Headers` row's maximum: the largest page under either schema that
+/// fits [`MAX_HS_MESSAGE_BYTES`] and [`MAX_HS_RANGE`] headers.
 pub(crate) const fn largest_page(header_bytes: usize) -> usize {
     let plain = largest_page_under(header_bytes, AuxSchema::None);
     let with_records = largest_page_under(header_bytes, AuxSchema::V1);
@@ -277,9 +250,6 @@ pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [S
 }
 
 /// A `Status` advertisement: the sender's frontier and serving caps.
-///
-/// It keeps version 8's fields in order, with `max_subscriptions` in place of
-/// the in-flight request cap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Status {
     /// Height of the sender's finality anchor, excluded from the suffix work.
@@ -318,8 +288,7 @@ pub(crate) enum Operation {
     Close = 2,
 }
 
-/// A subscription cursor. The publisher compares cursors by equality of all
-/// four fields.
+/// A subscription cursor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Cursor {
     /// Height of the last accepted header, or of the first locator.
@@ -355,10 +324,6 @@ pub(crate) struct SubscribeHeaders {
 }
 
 /// One pushed page of headers.
-///
-/// It keeps version 8's `Headers` fields in order, with `subscription_id` and
-/// `reaches_initial_target` in place of the request ID and the completion
-/// flag.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Headers {
     /// Nonzero subscription identifier.
@@ -379,25 +344,19 @@ pub(crate) struct Headers {
 }
 
 /// Why a subscription ended.
-///
-/// Codes 1 through 3 keep their version 8 values. Version 8's `Busy` (4) is
-/// retired, because local capacity pauses work instead of ending it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HeadersOutcomeCode {
-    /// The publisher no longer retains the initial target. Before the first
-    /// page.
+    /// The publisher no longer retains the initial target.
     TargetNotRetained = 1,
-    /// No locator hash lies on the target path. Before the first page.
+    /// No locator hash lies on the target path.
     NoLocatorIntersection = 2,
-    /// The publisher pruned history on the target path. Before the
-    /// subscription reaches its initial target.
+    /// The publisher pruned history on the target path.
     HistoryPruned = 3,
     /// The publisher's selected chain changed between `Status` and `Open`.
-    /// Before the first page.
     TargetNotSelected = 5,
-    /// The publisher's selected chain stopped extending the cursor. Any time.
+    /// The publisher's selected chain stopped extending the cursor.
     SubscriptionSuperseded = 6,
-    /// The publisher received `Close`. Only after `Close`.
+    /// The publisher received `Close`.
     SubscriptionClosed = 7,
 }
 
@@ -456,10 +415,6 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
         ..Stream::PERSISTENT
     }];
 
-    /// `P`: the smallest legal page, and the least byte credit a `Grant` adds
-    /// when it adds no header.
-    const SMALLEST_PAGE: usize = smallest_page(HEADER_BYTES, AuxSchema::None);
-
     /// Check the rules that the payload items cannot express.
     fn check(&self) -> Result<(), WireError> {
         match self {
@@ -502,10 +457,8 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     }
 
     /// Check an update's shape: the rules for its operation, and the credit
-    /// limits that every update shares.
-    ///
-    /// An `Open` must start at its first locator with zero counts. Only the
-    /// publisher can check the start height.
+    /// limits that every update shares. The publisher checks an `Open`'s start
+    /// height, which needs its chain.
     fn check_update(update: &SubscribeHeaders) -> Result<(), WireError> {
         check_subscription_id(update.subscription_id)?;
         let added = update.added_credit;
@@ -550,7 +503,7 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
                 }
                 if update.operation == Operation::Grant
                     && added.objects == 0
-                    && added_bytes < Self::SMALLEST_PAGE
+                    && added_bytes < smallest_page(HEADER_BYTES, AuxSchema::None)
                 {
                     return Err(WireError::OutOfRange("grant minimum"));
                 }
@@ -876,7 +829,7 @@ fn check_subscription_id(subscription_id: u64) -> Result<(), WireError> {
 
 /// Reject a body-size hint above the consensus block-size ceiling.
 fn check_body_size(body_size: u32) -> Result<(), WireError> {
-    if body_size > MAX_BODY_SIZE_HINT {
+    if u64::from(body_size) > block::MAX_BLOCK_BYTES {
         return Err(WireError::OutOfRange("body size hint"));
     }
     Ok(())

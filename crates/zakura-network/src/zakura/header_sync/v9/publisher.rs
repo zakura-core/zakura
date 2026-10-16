@@ -887,7 +887,8 @@ fn start_page<'a, const HEADER_BYTES: usize>(
             return Progress::Closed;
         };
         if let Some(leased_tip) = leased_tip {
-            if !still_selected(&*check_port, owner, id, &selected, leased_tip, page.last).await {
+            let last = page.last;
+            if !still_selected(&*check_port, &push, owner, id, &selected, leased_tip, last).await {
                 return Progress::Other(Output::Retry("left_selected_chain"));
             }
         }
@@ -901,9 +902,11 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// It checks only when the selected tip moved, and only a lease that finds no
 /// intersection says no, so growth and local failures keep the page. The
 /// check closes the window between leasing a page and sending it, not the
-/// write after it.
+/// write after it. The lease is state work, so it waits for execution slots
+/// through `push` as the page's read did.
 async fn still_selected(
     port: &dyn Port,
+    push: &Push,
     owner: LeaseOwner,
     id: u64,
     selected: &watch::Receiver<Option<EngineSnapshot>>,
@@ -920,6 +923,7 @@ async fn still_selected(
     if tip.height <= last.height {
         return false;
     }
+    let _execution = push.execution().await;
     match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
         Ok(AcquirePathReply::Acquired(path)) => {
             release(port, *path).await;

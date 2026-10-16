@@ -1305,9 +1305,14 @@ impl HeaderSyncReactor {
             return;
         };
         if self.ordinary_discovery_paused()
-            || self.locator_capacity.available_permits() == 0
             || self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1
         {
+            return;
+        }
+        if self.locator_capacity.available_permits() == 0 {
+            // Cached offers can become idle without a fresh dispatch refusal.
+            // Arm the wakeup even when we skip their scan at exhausted capacity.
+            self.locator_capacity_waiting = true;
             return;
         }
         #[cfg(test)]

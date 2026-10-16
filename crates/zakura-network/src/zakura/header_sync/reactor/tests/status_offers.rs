@@ -947,7 +947,10 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     }
     assert!(reactor.pending_locator_queries.is_empty());
     assert_eq!(reactor.locator_capacity.available_permits(), 0);
+    // A cached offer can become idle without a fresh refusal arming the waiter.
+    reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
+    assert!(reactor.locator_capacity_waiting);
     assert!(reactor.pending_locator_queries.is_empty());
     assert!(!reactor.peer_state[&peer].status_spent);
     // The real service finishes one orphaned read. Its last permit drop wakes
@@ -1061,35 +1064,53 @@ fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
                 offers.push((peer, status));
             }
             reactor.schedule_cached_statuses();
-            let visits = reactor.cached_offer_visits;
-            for iteration in 0..1000 {
-                // The end-of-event pass also runs on events with no scheduling effect.
-                reactor.schedule_cached_statuses();
-                let (peer, status) = &offers[iteration % offers.len()];
-                reactor.handle_wire_message(
-                    peer.clone(),
-                    0,
-                    HeaderSyncMessage::Status(status.clone()),
+            // Clearing only the cache reproduces the prior unconditional pass and
+            // provides a deterministic control using the same scheduling code.
+            for unconditional in [false, true] {
+                let visits = reactor.cached_offer_visits;
+                for iteration in 0..1000 {
+                    // The end-of-event pass also runs on events with no scheduling effect.
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                    let (peer, status) = &offers[iteration % offers.len()];
+                    reactor.handle_wire_message(
+                        peer.clone(),
+                        0,
+                        HeaderSyncMessage::Status(status.clone()),
+                    );
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                    reactor.handle_wire_message(
+                        owner.clone(),
+                        0,
+                        HeaderSyncMessage::Status(owner_status.clone()),
+                    );
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                }
+                assert_eq!(
+                    reactor.cached_offer_visits - visits,
+                    if unconditional {
+                        usize::from(peers) * 3000
+                    } else {
+                        0
+                    },
+                    "peers={peers}, no_headroom={no_headroom}, unconditional={unconditional}"
                 );
-                reactor.schedule_cached_statuses();
-                reactor.handle_wire_message(
-                    owner.clone(),
-                    0,
-                    HeaderSyncMessage::Status(owner_status.clone()),
-                );
-                reactor.schedule_cached_statuses();
-            }
-            assert_eq!(
-                reactor.cached_offer_visits, visits,
-                "peers={peers}, no_headroom={no_headroom}"
-            );
-            assert!(actions.try_recv().is_err());
-            eprintln!(
-                "cached offers: peers={}, zero_headroom={}, events=3000, additional_peer_visits={}",
+                assert!(actions.try_recv().is_err());
+                eprintln!(
+                "cached offers: peers={}, zero_headroom={}, unconditional={unconditional}, events=3000, additional_peer_visits={}",
                 usize::from(peers),
                 no_headroom,
                 reactor.cached_offer_visits - visits
             );
+            }
         }
     }
 }

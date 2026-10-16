@@ -72,7 +72,7 @@ use zakura_header_chain::{
     BranchId, EngineSnapshot, Frontier, HeaderGeneration, HeaderWorkAuthority, SourceId,
 };
 use zakura_node_services::header_chain::{
-    AcquirePath, AcquirePathReply, Port, ReadPath, ReadPathReply, RetainedHeaderPath,
+    AcquirePath, AcquirePathReply, Port, PortError, ReadPath, ReadPathReply, RetainedHeaderPath,
     RetainedHeaderPathPage, ServingCapacitySignal,
 };
 
@@ -770,8 +770,13 @@ async fn publish<const HEADER_BYTES: usize>(
             if work.as_ref().is_some_and(|(working, _)| *working == id) {
                 work = None;
             }
-            if !terminal.send(&send, frame).await {
-                return;
+            // A full queue must not keep a cancelled session's task alive.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                sent = terminal.send(&send, frame) => if !sent {
+                    return;
+                },
             }
         }
         if work.is_none() {
@@ -882,7 +887,8 @@ fn start_page<'a, const HEADER_BYTES: usize>(
             return Progress::Closed;
         };
         if let Some(leased_tip) = leased_tip {
-            if !still_selected(&*check_port, owner, &selected, leased_tip, page.last).await {
+            let last = page.last;
+            if !still_selected(&*check_port, &push, owner, id, &selected, leased_tip, last).await {
                 return Progress::Other(Output::Retry("left_selected_chain"));
             }
         }
@@ -896,10 +902,13 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// It checks only when the selected tip moved, and only a lease that finds no
 /// intersection says no, so growth and local failures keep the page. The
 /// check closes the window between leasing a page and sending it, not the
-/// write after it.
+/// write after it. The lease is state work, so it waits for execution slots
+/// through `push` as the page's read did.
 async fn still_selected(
     port: &dyn Port,
+    push: &Push,
     owner: LeaseOwner,
+    id: u64,
     selected: &watch::Receiver<Option<EngineSnapshot>>,
     leased_tip: block::Hash,
     last: Frontier,
@@ -914,13 +923,18 @@ async fn still_selected(
     if tip.height <= last.height {
         return false;
     }
+    let _execution = push.execution().await;
     match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
         Ok(AcquirePathReply::Acquired(path)) => {
             release(port, *path).await;
             true
         }
         Ok(AcquirePathReply::NoLocatorIntersection) => false,
-        Ok(_) | Err(_) => true,
+        Ok(_) => true,
+        Err(error) => {
+            log_port_failure(id, "recheck", &error);
+            true
+        }
     }
 }
 
@@ -956,13 +970,20 @@ async fn run_job<const HEADER_BYTES: usize>(
                     Ok(AcquirePathReply::CapacityBusy(signal)) => {
                         Output::Stall(Stall::Capacity(signal), "capacity")
                     }
-                    Ok(_) | Err(_) => Output::End(HeadersOutcomeCode::TargetNotSelected),
+                    // The probe already showed the target is off the
+                    // selected chain.
+                    Ok(_) => Output::End(HeadersOutcomeCode::TargetNotSelected),
+                    Err(error) => {
+                        log_port_failure(job.id, "target_retained", &error);
+                        Output::End(HeadersOutcomeCode::TargetNotSelected)
+                    }
                 };
             }
             Ok(AcquirePathReply::CapacityBusy(signal)) => {
                 return Output::Stall(Stall::Capacity(signal), "capacity")
             }
-            Ok(_) | Err(_) => return Output::Stall(Stall::Local, "probe"),
+            Ok(_) => return Output::Stall(Stall::Local, "probe"),
+            Err(error) => return port_failure(job.id, "probe", &error),
         }
     }
     for _ in 0..LEASE_ATTEMPTS {
@@ -1002,7 +1023,8 @@ async fn run_job<const HEADER_BYTES: usize>(
             Ok(AcquirePathReply::HistoryPruned) => {
                 return Output::End(HeadersOutcomeCode::HistoryPruned)
             }
-            Ok(AcquirePathReply::Busy) | Err(_) => return Output::Stall(Stall::Local, "acquire"),
+            Ok(AcquirePathReply::Busy) => return Output::Stall(Stall::Local, "acquire"),
+            Err(error) => return port_failure(job.id, "acquire", &error),
         };
         if job.parent.is_none() && path.common_ancestor == path.target {
             let target = path.target;
@@ -1026,13 +1048,31 @@ async fn run_job<const HEADER_BYTES: usize>(
             // The lease expired or state evicted it. Acquire it again from
             // the last header sent.
             Ok(ReadPathReply::Unavailable) => release(port, path).await,
-            Err(_) => {
+            Err(error) => {
                 release(port, path).await;
-                return Output::Stall(Stall::Local, "read");
+                return port_failure(job.id, "read", &error);
             }
         }
     }
     Output::Stall(Stall::Local, "lease_lost")
+}
+
+/// Log a failed port `operation` for subscription `id`, and wait for the
+/// next update or selected-chain change.
+fn port_failure(id: u64, operation: &'static str, error: &PortError) -> Output {
+    log_port_failure(id, operation, error);
+    Output::Stall(Stall::Local, operation)
+}
+
+/// Log a failed port `operation` for subscription `id`. Port failures are
+/// local, so they never count against the peer.
+fn log_port_failure(id: u64, operation: &'static str, error: &PortError) {
+    tracing::debug!(
+        subscription_id = id,
+        operation,
+        ?error,
+        "a header sync v9 port operation failed"
+    );
 }
 
 /// Ask `port` for a lease on the path from `locators` to `target`.
@@ -1042,7 +1082,7 @@ async fn acquire(
     selected: Option<&EngineSnapshot>,
     target: block::Hash,
     locators: Vec<block::Hash>,
-) -> Result<AcquirePathReply, zakura_node_services::header_chain::PortError> {
+) -> Result<AcquirePathReply, PortError> {
     port.acquire_header_path(AcquirePath {
         source: owner.peer,
         session_id: owner.session_id,

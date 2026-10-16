@@ -258,6 +258,8 @@ struct FakePort {
     selected: watch::Sender<Option<EngineSnapshot>>,
     /// Every read waits for a permit here.
     gate: Semaphore,
+    /// Every lease acquisition waits for a permit here.
+    acquire_gate: Semaphore,
     /// Reads panic, standing in for a local bug.
     panic_reads: std::sync::atomic::AtomicBool,
 }
@@ -276,6 +278,7 @@ impl FakePort {
             genesis,
             selected: watch::channel(Some(snapshot(genesis, 1, genesis))).0,
             gate: Semaphore::new(gate),
+            acquire_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             panic_reads: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -334,7 +337,14 @@ impl Port for FakePort {
         &self,
         request: AcquirePath,
     ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-        Box::pin(async move { self.store().acquire(&self.key, request) })
+        Box::pin(async move {
+            let _permit = self
+                .acquire_gate
+                .acquire()
+                .await
+                .expect("the gate never closes");
+            self.store().acquire(&self.key, request)
+        })
     }
 
     fn read_header_path(
@@ -1249,6 +1259,77 @@ async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
     let h = block::Height;
     assert_eq!(pages(&received), [(h(3), h(6), false)], "{received:?}");
     assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
+    harness.check_quiet().await;
+}
+
+/// Cancelling the session stops the publisher even while a terminal outcome
+/// waits for a full transport queue.
+#[tokio::test(start_paused = true)]
+async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    // One slot, which the first page fills because nobody reads it.
+    let (send, _recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let (publisher, task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        cancel.clone(),
+    );
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !task.is_finished(),
+        "the terminal outcome waits for the queue"
+    );
+    cancel.cancel();
+    tokio::time::timeout(QUIET, task)
+        .await
+        .expect("cancel stops the publisher")
+        .expect("the publisher task does not panic");
+}
+
+/// The lease that rechecks a following page after a reorg waits for and
+/// holds an execution slot, as the page's read did.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_holds_an_execution_slot() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let serve = ServeLimits {
+        node_execution: 1,
+        ..serve_limits()
+    };
+    let mut harness = Harness::new(port.clone(), serve);
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    port.grow(2);
+    harness.drain().await;
+    let side = port.store().extend(chain[2], 3);
+    port.select(side[2]);
+    // The read finishes, and the recheck's lease blocks in state.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(port.store().reads_running, 0);
+    assert_eq!(harness.capacity.node_execution_held(), 1);
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
     harness.check_quiet().await;
 }
 

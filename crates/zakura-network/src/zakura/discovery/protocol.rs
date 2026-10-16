@@ -677,6 +677,15 @@ pub enum DiscoveryWireError {
     /// The record has an invalid protocol range.
     #[error("invalid Zakura discovery protocol range")]
     InvalidProtocolRange,
+
+    /// This node advertises more services than its record carries.
+    #[error("this node advertises {actual} distinct services, but a Zakura discovery record carries at most {max}")]
+    TooManyAdvertisedServices {
+        /// Distinct services this node advertises.
+        actual: usize,
+        /// Maximum services in a record.
+        max: usize,
+    },
 }
 
 /// A signed record failed validation for import.
@@ -1419,7 +1428,7 @@ impl ZakuraDiscoveryHandle {
         now_unix_secs: u64,
         wall_clock_sequence: u64,
     ) -> Result<Self, DiscoveryWireError> {
-        let mut local = ZakuraLocalDiscoveryState::new(local_config, wall_clock_sequence);
+        let mut local = ZakuraLocalDiscoveryState::new(local_config, wall_clock_sequence)?;
         let self_record = Arc::new(local.build_self_record(
             now_unix_secs,
             wall_clock_sequence,
@@ -1697,7 +1706,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         services: Vec<ZakuraServiceId>,
     ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
-        let services = normalize_services(services);
+        let services = advertised_services(services)?;
         if self.self_record.borrow().body.services == services {
             return Ok(self.current_self_record());
         }
@@ -2514,23 +2523,26 @@ impl ZakuraDiscoveryInner {
 }
 
 impl ZakuraLocalDiscoveryState {
-    fn new(config: ZakuraDiscoveryLocalConfig, wall_clock_sequence: u64) -> Self {
+    fn new(
+        config: ZakuraDiscoveryLocalConfig,
+        wall_clock_sequence: u64,
+    ) -> Result<Self, DiscoveryWireError> {
         let node_id = config.secret_key.public();
         let persisted_next_sequence = config
             .last_authored_sequence
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(0);
-        Self {
+        Ok(Self {
             secret_key: config.secret_key,
             node_id,
             direct_addrs: normalize_direct_addrs(config.direct_addrs),
-            services: normalize_services(config.services),
+            services: advertised_services(config.services)?,
             zakura_protocol_min: config.zakura_protocol_min,
             zakura_protocol_max: config.zakura_protocol_max,
             network_id: config.network_id,
             chain_id: config.chain_id,
             next_sequence: persisted_next_sequence.max(wall_clock_sequence),
-        }
+        })
     }
 
     fn build_self_record(
@@ -3445,12 +3457,27 @@ fn normalize_direct_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     addrs
 }
 
-fn normalize_services(services: Vec<ZakuraServiceId>) -> Vec<ZakuraServiceId> {
-    let mut services = services;
+fn normalize_services(mut services: Vec<ZakuraServiceId>) -> Vec<ZakuraServiceId> {
     services.sort_unstable();
     services.dedup();
-    services.truncate(MAX_SERVICES_PER_RECORD);
     services
+}
+
+/// Normalizes this node's advertised services.
+///
+/// It rejects a list the self-record cannot carry. Truncating the sorted list
+/// would silently drop built-in `zakura.*` services behind custom ids.
+fn advertised_services(
+    services: Vec<ZakuraServiceId>,
+) -> Result<Vec<ZakuraServiceId>, DiscoveryWireError> {
+    let services = normalize_services(services);
+    if services.len() > MAX_SERVICES_PER_RECORD {
+        return Err(DiscoveryWireError::TooManyAdvertisedServices {
+            actual: services.len(),
+            max: MAX_SERVICES_PER_RECORD,
+        });
+    }
+    Ok(services)
 }
 
 fn push_unique_service(services: &mut Vec<ZakuraServiceId>, service: ZakuraServiceId) {
@@ -6665,6 +6692,69 @@ mod tests {
                 ..context()
             })
             .expect("updated record verifies");
+    }
+
+    #[test]
+    fn startup_rejects_more_advertised_services_than_a_record_carries() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        // Custom ids sort ahead of the built-ins, so truncation would drop built-ins.
+        let mut services = crate::zakura::discovery::default_advertised_services();
+        let custom = MAX_SERVICES_PER_RECORD + 1 - services.len();
+        services.extend((0..custom).map(|index| {
+            ZakuraServiceId::new(format!("valar.custom.{index}.v1")).expect("valid service id")
+        }));
+
+        let Err(error) = ZakuraDiscoveryHandle::new_at(
+            local_config_with(secret_key(), vec![test_addr(43)], services.clone()),
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+            NOW,
+        ) else {
+            panic!("an oversized service list fails startup");
+        };
+        assert!(matches!(
+            error,
+            DiscoveryWireError::TooManyAdvertisedServices { actual, max: MAX_SERVICES_PER_RECORD }
+                if actual == MAX_SERVICES_PER_RECORD + 1
+        ));
+
+        // Duplicates do not count against the limit.
+        services.pop();
+        services.push(services[0].clone());
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), vec![test_addr(43)], services),
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        assert_eq!(
+            handle.current_self_record().body.services.len(),
+            MAX_SERVICES_PER_RECORD
+        );
+    }
+
+    #[tokio::test]
+    async fn update_rejects_more_advertised_services_than_a_record_carries() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_at(
+            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+            NOW,
+        );
+        let initial = handle.current_self_record();
+
+        let result = handle
+            .update_advertised_services((0..=MAX_SERVICES_PER_RECORD).map(service).collect())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DiscoveryWireError::TooManyAdvertisedServices { .. })
+        ));
+        assert_eq!(handle.current_self_record(), initial);
     }
 
     #[tokio::test]

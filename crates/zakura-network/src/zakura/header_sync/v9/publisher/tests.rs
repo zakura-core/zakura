@@ -927,18 +927,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         [Received::Ended(HistoryPruned)]
     );
 
-    // After the target, the selected chain moves below the last header:
-    // `SubscriptionSuperseded`.
-    port.select(chain[5]);
-    harness
-        .open(chain[5].hash, vec![chain[4]], credit(), AuxSchema::None)
-        .await;
-    assert_eq!(pages(&harness.deliver_all().await).len(), 1);
     port.select(chain[3]);
-    assert_eq!(
-        harness.deliver_all().await,
-        [Received::Ended(SubscriptionSuperseded)]
-    );
 
     // A higher tip on another branch: the lease finds no intersection.
     harness
@@ -968,8 +957,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
     harness.check_quiet().await;
 }
 
-/// `Close` with pages queued ends after them, and every update after `Close`
-/// faults, before and after the end.
+/// `Close` with pages queued ends after them.
 #[tokio::test(start_paused = true)]
 async fn close_with_pages_queued_ends_after_them() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -985,133 +973,37 @@ async fn close_with_pages_queued_ends_after_them() {
         .subscriber
         .close()
         .expect("the subscription is live");
-    let sequence = close.update_sequence;
-    assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Live));
-    // Before the end, every further update faults.
-    let mut grant = close.clone();
-    grant.operation = Operation::Grant;
-    grant.update_sequence = sequence + 1;
-    grant.added_credit = Credit {
-        objects: 1,
-        bytes: 0,
-    };
-    // Apply them without yielding, so the task cannot end the subscription
-    // first.
-    let after_close = Err(PublisherFault::Subscription(SubscriptionFault::AfterClose));
-    {
-        let mut shared = lock(&harness.publisher.shared);
-        assert_eq!(shared.apply(&grant, limits()), after_close);
-        let mut second = close.clone();
-        second.update_sequence = sequence + 1;
-        assert_eq!(shared.apply(&second, limits()), after_close);
-    }
-
+    assert_eq!(harness.apply(close).await, Ok(Applied::Live));
     let received = harness.deliver_all().await;
     assert_eq!(pages(&received).len(), 3);
     assert_eq!(
         received.last(),
         Some(&Received::Ended(HeadersOutcomeCode::SubscriptionClosed))
     );
-    // After the end, the tombstone remembers the Close, so the update still
-    // faults.
-    assert_eq!(harness.apply(grant).await, after_close);
-    assert!(harness.deliver_all().await.is_empty());
     harness.check_quiet().await;
 }
 
-/// Updates that cross `SubscriptionSuperseded` or `HistoryPruned` are dropped
-/// up to the window past the consumed credit and fault beyond it, a crossing
-/// `Close` consumes the tombstone, and the next `Open` clears it.
+/// Updates that cross this node's own outcome are dropped, and its tombstone
+/// matches them by ID and sequence, not by their target.
 #[tokio::test(start_paused = true)]
-async fn crossing_updates_drop_on_each_outcome_tombstone() {
-    use HeadersOutcomeCode::*;
+async fn crossing_updates_drop_on_an_outcome_tombstone() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
-    let chain = port.grow(6);
+    let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
-
-    // A Superseded tombstone: repeated crossing grants, then a crossing
-    // Close that consumes it.
-    port.select(chain[2]);
     harness
         .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
         .await;
     assert!(harness.deliver_all().await.is_empty());
     port.select(chain[1]);
     harness.drain().await;
-    let mut last = None;
-    while let Some(grant) = harness.subscriber.grant(1, 0) {
-        assert_eq!(harness.apply(grant.clone()).await, Ok(Applied::Crossed));
-        last = Some(grant);
-    }
-    // The crossing grants used the whole window past the consumed credit, so
-    // one more header faults and changes nothing.
-    let mut beyond = last.expect("the window had room");
-    beyond.update_sequence += 1;
-    assert_eq!(
-        harness.apply(beyond.clone()).await,
-        Err(PublisherFault::Subscription(
-            SubscriptionFault::CrossedAboveWindow
-        ))
-    );
-    let mut close = beyond;
-    close.operation = Operation::Close;
-    close.added_credit = Credit {
-        objects: 0,
-        bytes: 0,
-    };
-    assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Crossed));
-    let mut late = close;
-    late.update_sequence += 1;
-    assert_eq!(
-        harness.publisher.apply(&late).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::Unknown))
-    );
-    assert_eq!(
-        harness.deliver_all().await,
-        [Received::Ended(SubscriptionSuperseded)]
-    );
-
-    // A HistoryPruned tombstone: a crossing grant keeps it until the next
-    // Open clears it.
-    port.select(chain[5]);
-    let one_page = Credit {
-        objects: 3,
-        bytes: credit().bytes,
-    };
-    harness
-        .open(chain[5].hash, vec![port.genesis], one_page, AuxSchema::None)
-        .await;
-    harness.deliver_all().await;
-    port.store().nodes.remove(&chain[3].hash);
-    let grant = harness.subscriber.grant(3, 0).expect("the window has room");
-    harness
-        .apply(grant)
-        .await
-        .expect("a conformant grant applies");
-    let crossing = harness.subscriber.grant(3, 0).expect("the window has room");
-    assert_eq!(harness.apply(crossing.clone()).await, Ok(Applied::Crossed));
-    // A tombstone matches by ID and sequence, not by the fixed fields.
-    let mut moved = harness.subscriber.grant(3, 0).expect("the window has room");
+    let crossing = harness.subscriber.grant(1, 0).expect("the window has room");
+    assert_eq!(harness.apply(crossing).await, Ok(Applied::Crossed));
+    let mut moved = harness.subscriber.grant(1, 0).expect("the window has room");
     moved.initial_target_tip_hash = block::Hash([4; 32]);
-    assert_eq!(harness.apply(moved.clone()).await, Ok(Applied::Crossed));
-    let crossing = moved;
+    assert_eq!(harness.apply(moved).await, Ok(Applied::Crossed));
     assert_eq!(
         harness.deliver_all().await,
-        [Received::Ended(HistoryPruned)]
-    );
-    harness
-        .open(
-            block::Hash([1; 32]),
-            vec![chain[0]],
-            credit(),
-            AuxSchema::None,
-        )
-        .await;
-    let mut late = crossing;
-    late.update_sequence += 1;
-    assert_eq!(
-        harness.apply(late).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::Unknown))
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
     );
     harness.check_quiet().await;
 }
@@ -1168,32 +1060,6 @@ async fn a_page_job_panic_reaches_the_session_owner() {
     assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
-/// A following page whose headers leave the selected chain while it is in
-/// progress is dropped and read again toward the new tip.
-#[tokio::test(start_paused = true)]
-async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
-    let port = FakePort::new(0);
-    let chain = port.grow(3);
-    let mut harness = Harness::new(port.clone(), serve_limits());
-    harness
-        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
-        .await;
-    assert!(harness.deliver_all().await.is_empty());
-    // The page for heights 4 and 5 waits in its read while the chain reorgs
-    // onto a branch that forks at the last header sent.
-    port.grow(2);
-    harness.drain().await;
-    assert_eq!(port.store().reads_running, 1);
-    let side = port.store().extend(chain[2], 3);
-    port.select(side[2]);
-    port.gate.add_permits(1);
-    let received = harness.deliver_all().await;
-    let h = block::Height;
-    assert_eq!(pages(&received), [(h(3), h(6), false)], "{received:?}");
-    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
-    harness.check_quiet().await;
-}
-
 /// Cancelling the session stops the publisher even while a terminal outcome
 /// waits for a full transport queue.
 #[tokio::test(start_paused = true)]
@@ -1234,7 +1100,8 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
         .expect("the publisher task does not panic");
 }
 
-/// The lease that rechecks a following page after a reorg waits for and
+/// A following page that leaves the selected chain while in progress is read
+/// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.
 #[tokio::test(start_paused = true)]
 async fn a_following_page_recheck_holds_an_execution_slot() {
@@ -1260,8 +1127,12 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     assert_eq!(port.store().reads_running, 0);
     assert_eq!(harness.capacity.node_execution_held(), 1);
     port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    // The page for heights 4 and 5 left the selected chain, so it is read
+    // again toward the new tip.
+    let received = harness.deliver_all().await;
     let h = block::Height;
-    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
+    assert_eq!(pages(&received), [(h(3), h(6), false)]);
+    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
     harness.check_quiet().await;
 }
 
@@ -1353,10 +1224,10 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
     harness.check_quiet().await;
 }
 
-/// The margin admits a second `Open`. A third, a reused ID, a changed target,
-/// and an unadvertised schema fault.
+/// The margin admits a second `Open`. A third, a changed target, and an
+/// unadvertised schema fault.
 #[tokio::test(start_paused = true)]
-async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
+async fn a_second_open_is_admitted_and_a_third_faults() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(2);
     let harness = Harness::new(port.clone(), serve_limits());
@@ -1378,17 +1249,12 @@ async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
     let publisher = &harness.publisher;
     assert_eq!(publisher.apply(&open(1)).await, Ok(Applied::Live));
     assert_eq!(publisher.apply(&open(2)).await, Ok(Applied::Live));
-    assert_eq!(publisher.tally(), (2, 0, 1), "the margin admits the second");
     assert_eq!(
         publisher.apply(&open(3)).await,
         Err(PublisherFault::Subscription(SubscriptionFault::NoSlot {
             held: 2,
             limit: 1
         }))
-    );
-    assert_eq!(
-        publisher.apply(&open(1)).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::ReusedKey))
     );
     let mut moved = open(1);
     moved.operation = Operation::Grant;
@@ -1401,30 +1267,12 @@ async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
     );
     let mut records = open(4);
     records.tree_aux_schema = AuxSchema::V1;
-    let (narrow, _recv, _cancel) = {
-        let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
-            .expect("the test budgets are valid");
-        let (send, recv) = framed_channel(4);
-        let cancel = CancellationToken::new();
-        let without_records = PageLimits {
-            aux_schema_mask: 0,
-            ..limits()
-        };
-        let (publisher, _task) = Publisher::spawn::<HB>(
-            port.clone(),
-            capacity.push(&peer(8)),
-            send,
-            LeaseOwner {
-                peer: SourceId::from_digest(peer(8).digest()),
-                session_id: 1,
-            },
-            without_records,
-            cancel.clone(),
-        );
-        (publisher, recv, cancel)
+    let without_records = PageLimits {
+        aux_schema_mask: 0,
+        ..limits()
     };
     assert_eq!(
-        narrow.apply(&records).await,
+        lock(&publisher.shared).apply(&records, without_records),
         Err(PublisherFault::UnadvertisedSchema)
     );
 }

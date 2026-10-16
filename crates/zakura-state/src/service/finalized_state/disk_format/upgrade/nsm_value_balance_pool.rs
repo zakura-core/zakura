@@ -1624,6 +1624,15 @@ mod database_tests {
         ));
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
 
+        // A trailing byte that a rewrite would drop shows the healthy database is not rewritten.
+        let mut row = healthy.raw_block_info_cf().zs_get(&Height(3)).unwrap();
+        row.0.push(0);
+        let mut batch = DiskWriteBatch::new();
+        let _ = healthy
+            .raw_block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&Height(3), &row);
+        healthy.write_batch(batch).unwrap();
         let before = records(&healthy);
         Repair.run(Some(tip), &healthy, &rx).unwrap();
         assert_eq!(records(&healthy), before);

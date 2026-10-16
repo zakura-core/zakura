@@ -180,6 +180,15 @@ pub(crate) enum ClaimRefused {
 }
 
 impl ClaimRefused {
+    /// The transport reader's rejection for a refused header.
+    pub(crate) fn frame_rejection(self) -> FrameRejection {
+        match self {
+            Self::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
+            Self::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
+            _ => FrameRejection::Unsolicited,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -637,10 +646,7 @@ impl<K: Eq + Hash + std::fmt::Debug + Send + 'static> ResponsePrecheck for Share
     fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         self.lock()
             .precheck(message_type, payload_len)
-            .map_err(|refused| match refused {
-                ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-                _ => FrameRejection::Unsolicited,
-            })
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 

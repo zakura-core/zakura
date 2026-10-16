@@ -792,7 +792,9 @@ pub const DEFAULT_MAX_DISCOVERY_BOOK_RECORDS: usize = 10_000;
 ///
 /// An honest relay discloses at most one window of 32 records per requester per
 /// 10-minute epoch, so this holds eight epochs of distinct windows. It stops one
-/// relay from filling the book and from forcing evictions on every insert.
+/// relay from filling the book. It does not bound eviction work: a relay's
+/// expired entries leave the book and return their room, so the `Peers`
+/// reservation, 32 records per `GetPeers`, bounds the inserts.
 pub const DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE: usize = 256;
 
 const HIGH_DIAL_FAILURE_COUNT: u32 = 3;
@@ -3345,12 +3347,26 @@ impl ZakuraDiscoveryBook {
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
         let node_id = record.body.node_id;
+        // A relay may hold only so many entries. The author of a record is
+        // not a relay.
+        let relay_attributed = metadata
+            .source
+            .filter(|source| *source != node_id)
+            .map(|source| self.source_counts.get(&source).copied().unwrap_or(0));
+        let relay_full = relay_attributed
+            .is_some_and(|attributed| attributed >= self.limits.max_records_per_source);
         if let Some(entry) = self.entries.get_mut(&node_id) {
             let was_confirmed = entry.last_confirmed.is_some();
             let old_source = entry.source;
             let outcome = update_existing_entry(entry, record, metadata);
             if !was_confirmed && entry.last_confirmed.is_some() {
                 self.confirmations += 1;
+            }
+            // An update keeps the book's size, so it is never refused. A full
+            // relay keeps the entry's old source, so two relays cannot pass
+            // entries back and forth to add without bound.
+            if relay_full {
+                entry.source = old_source;
             }
             let new_source = entry.source;
             if new_source != old_source {
@@ -3359,17 +3375,12 @@ impl ZakuraDiscoveryBook {
             }
             return Ok(outcome);
         }
-        // A relay may add only so many new entries. An update keeps the
-        // book's size, so it is never refused for its source.
-        if let Some(source) = metadata.source.filter(|source| *source != node_id) {
-            let attributed = self.source_counts.get(&source).copied().unwrap_or(0);
-            if attributed >= self.limits.max_records_per_source {
-                return Err(DiscoveryBookError::Limit {
-                    field: "records per source",
-                    actual: attributed + 1,
-                    max: self.limits.max_records_per_source,
-                });
-            }
+        if let Some(attributed) = relay_attributed.filter(|_| relay_full) {
+            return Err(DiscoveryBookError::Limit {
+                field: "records per source",
+                actual: attributed + 1,
+                max: self.limits.max_records_per_source,
+            });
         }
         if metadata.last_confirmed.is_some() {
             self.confirmations += 1;
@@ -8652,6 +8663,25 @@ mod tests {
             &context(),
         )
         .expect("the relay is back under its quota");
+
+        // A relay at its quota cannot take over another relay's entry.
+        book.import_record(
+            long_lived_record_with(1, service(11), test_addr(52)),
+            Some(other_relay),
+            NOW,
+            &context(),
+        )
+        .expect("the other relay is under its quota");
+        book.import_record(records[0].clone(), Some(other_relay), NOW, &context())
+            .expect("an update adds no entry");
+        assert_eq!(
+            book.get(&records[0].body.node_id)
+                .expect("the entry is stored")
+                .source,
+            Some(relay)
+        );
+        assert_eq!(book.source_counts.get(&relay), Some(&QUOTA));
+        assert_eq!(book.source_counts.get(&other_relay), Some(&QUOTA));
     }
 
     /// A third-party gossiped record is a local dial hint only. Until its owner confirms

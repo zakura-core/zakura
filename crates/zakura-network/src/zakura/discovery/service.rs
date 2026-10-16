@@ -565,7 +565,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
-    let queries = Queries::new(queries, connection_cancel.clone(), close_cause.clone());
+    let mut queries = Queries::new(queries, connection_cancel.clone(), close_cause.clone());
     queries.attach_precheck(&recv);
     let sink = DiscoverySink {
         handle: handle.clone(),

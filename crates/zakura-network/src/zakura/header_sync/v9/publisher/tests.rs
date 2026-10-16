@@ -250,6 +250,8 @@ struct FakePort {
     acquire_gate: Semaphore,
     /// Reads panic, standing in for a local bug.
     panic_reads: std::sync::atomic::AtomicBool,
+    /// The selected tip grows by one header after each of this many leases.
+    move_tip_on_acquire: std::sync::atomic::AtomicUsize,
 }
 
 impl FakePort {
@@ -266,6 +268,7 @@ impl FakePort {
             gate: Semaphore::new(gate),
             acquire_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             panic_reads: std::sync::atomic::AtomicBool::new(false),
+            move_tip_on_acquire: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -329,7 +332,16 @@ impl Port for FakePort {
                 .acquire()
                 .await
                 .expect("the gate never closes");
-            self.store().acquire(&self.key, request)
+            let reply = self.store().acquire(&self.key, request);
+            let moves = self.move_tip_on_acquire.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |moves| moves.checked_sub(1),
+            );
+            if moves.is_ok() {
+                self.grow(1);
+            }
+            reply
         })
     }
 
@@ -1205,6 +1217,36 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     let h = block::Height;
     assert_eq!(pages(&received), [(h(3), h(6), false)]);
     assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
+    harness.check_quiet().await;
+}
+
+/// A recheck whose tip keeps moving stops after a bounded number of leases
+/// and sends the page it last confirmed.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    port.grow(2);
+    harness.drain().await;
+    // The tip moves past the page, then again during every recheck lease.
+    port.grow(1);
+    port.move_tip_on_acquire
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+    let walks = port.store().walks;
+    port.gate.add_permits(1);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    assert_eq!(port.store().walks - walks, RECHECK_LEASES);
     harness.check_quiet().await;
 }
 

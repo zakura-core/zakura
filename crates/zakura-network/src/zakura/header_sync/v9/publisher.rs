@@ -69,6 +69,10 @@ mod tests;
 /// Lease attempts one page makes before it waits for a wake.
 const LEASE_ATTEMPTS: usize = 2;
 
+/// Leases one following page's recheck takes while the selected tip keeps
+/// moving; see [`still_selected`].
+const RECHECK_LEASES: usize = 2;
+
 /// The serving limits this node advertises in its `Status`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PageLimits {
@@ -868,10 +872,15 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// It checks only when the selected tip moved, and only a lease that confirms
 /// the page keeps it. Anything else drops the page, and the next pass leases
 /// again from the last header sent, where the usual stall and outcome rules
-/// apply. The lease is state work, so it waits for execution slots through `push` as the
-/// page's read did. The chain can move during that wait or the lease, so the
-/// check repeats until the tip it judged against is still the selected one.
-/// That closes the window up to the page's commit, not the write after it.
+/// apply. The lease is state work, so it waits for execution slots through
+/// `push` as the page's read did.
+///
+/// The chain can move during that wait or the lease, so a lease whose tip is
+/// no longer selected is taken again toward the newer tip, at most
+/// [`RECHECK_LEASES`] times. After that the last verdict stands, judged
+/// against a tip at most one lease old, and the slots go back to other work.
+/// A reorganization can overtake any page after it is written anyway, and the
+/// next lease ends that subscription as superseded.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
@@ -882,6 +891,7 @@ async fn still_selected(
     last: Frontier,
 ) -> bool {
     let mut execution = None;
+    let mut leases = 0;
     loop {
         let Some(latest) = selected.borrow().clone() else {
             return true;
@@ -908,11 +918,12 @@ async fn still_selected(
                 false
             }
         };
+        leases += 1;
         let current = selected
             .borrow()
             .as_ref()
             .map(|selected| selected.frontiers.header_best);
-        if current == Some(tip) {
+        if current == Some(tip) || leases >= RECHECK_LEASES {
             return contains;
         }
     }

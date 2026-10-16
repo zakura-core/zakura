@@ -100,6 +100,8 @@ struct Store {
     walks: usize,
     /// The next release fails and leaves its lease held.
     leak_release: bool,
+    /// The selected tip grows by one header after each of this many leases.
+    move_tip_on_acquire: usize,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
     read_script: VecDeque<Result<ReadPathReply, PortError>>,
     /// Headers without a schema-1 record.
@@ -250,8 +252,6 @@ struct FakePort {
     acquire_gate: Semaphore,
     /// Reads panic, standing in for a local bug.
     panic_reads: std::sync::atomic::AtomicBool,
-    /// The selected tip grows by one header after each of this many leases.
-    move_tip_on_acquire: std::sync::atomic::AtomicUsize,
 }
 
 impl FakePort {
@@ -268,7 +268,6 @@ impl FakePort {
             gate: Semaphore::new(gate),
             acquire_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             panic_reads: std::sync::atomic::AtomicBool::new(false),
-            move_tip_on_acquire: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -332,13 +331,16 @@ impl Port for FakePort {
                 .acquire()
                 .await
                 .expect("the gate never closes");
-            let reply = self.store().acquire(&self.key, request);
-            let moves = self.move_tip_on_acquire.fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |moves| moves.checked_sub(1),
-            );
-            if moves.is_ok() {
+            let (reply, moves) = {
+                let mut store = self.store();
+                let reply = store.acquire(&self.key, request);
+                let moves = store.move_tip_on_acquire.checked_sub(1);
+                if let Some(left) = moves {
+                    store.move_tip_on_acquire = left;
+                }
+                (reply, moves.is_some())
+            };
+            if moves {
                 self.grow(1);
             }
             reply
@@ -1242,8 +1244,7 @@ async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
     harness.drain().await;
     // The tip moves past the page, then again during every recheck lease.
     port.grow(1);
-    port.move_tip_on_acquire
-        .store(100, std::sync::atomic::Ordering::Relaxed);
+    port.store().move_tip_on_acquire = 100;
     let walks = port.store().walks;
     port.gate.add_permits(1);
     let h = block::Height;

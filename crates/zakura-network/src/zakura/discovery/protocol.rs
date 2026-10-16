@@ -1003,6 +1003,42 @@ pub enum DiscoveryBookError {
     },
 }
 
+/// What a failed record import means for the peer that sent it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum RecordVerdict {
+    /// Local policy or the local clock rejected an authentic record.
+    Drop,
+    /// The peer sent a record no conformant peer sends.
+    Disconnect,
+}
+
+/// The verdict for a failed `Hello` import.
+///
+/// The match names every variant, so a new error fails the build until it is
+/// classified. Expiry depends on the local clock and TTL, and address and
+/// storage policy are local, so those only drop the record.
+pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
+    match error {
+        DiscoveryBookError::Record(error) => match error {
+            DiscoveryRecordError::Wire(_)
+            | DiscoveryRecordError::MalformedNodeId
+            | DiscoveryRecordError::InvalidSignature
+            | DiscoveryRecordError::WrongNetwork
+            | DiscoveryRecordError::WrongChain
+            | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
+            DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry => {
+                RecordVerdict::Drop
+            }
+        },
+        DiscoveryBookError::MismatchedConnectedPeerRecord => RecordVerdict::Disconnect,
+        DiscoveryBookError::SelfRecord
+        | DiscoveryBookError::NoUsableDirectAddress
+        | DiscoveryBookError::NonDialableDirectAddress { .. }
+        | DiscoveryBookError::Limit { .. }
+        | DiscoveryBookError::VerificationCancelled => RecordVerdict::Drop,
+    }
+}
+
 /// In-memory storage for signed Zakura discovery records.
 #[derive(Clone, Debug)]
 pub struct ZakuraDiscoveryBook {
@@ -1120,8 +1156,8 @@ pub struct ZakuraDiscoveryHandle {
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     peer_snapshot_tx: watch::Sender<ServicePeerSnapshot>,
     import_validation: DiscoveryImportValidation,
-    /// Node-wide slots for record signature verification. A peer waits for a
-    /// slot before it verifies, so one peer holds at most one slot at a time.
+    /// Node-wide slots for record signature verification. Each session's
+    /// reader verifies one message at a time, so a peer holds at most one slot.
     verify_slots: SlotBudget,
 }
 
@@ -1930,7 +1966,8 @@ impl ZakuraDiscoveryHandle {
         import_result
     }
 
-    /// Verifies `record`'s author checks in a blocking task under a verification slot.
+    /// Verifies `record`'s author checks off the lock, unless the record is
+    /// already stored.
     ///
     /// A record identical to the one stored for its node, in the book or in the live
     /// service hints, was verified when it was stored, so it skips verification.
@@ -1941,16 +1978,28 @@ impl ZakuraDiscoveryHandle {
         if self.inner.lock().await.holds_record(&record) {
             return Ok(record);
         }
+        self.verify_off_lock(move |context| record.verify_authentic(context).map(|()| record))
+            .await
+            .ok_or(DiscoveryBookError::VerificationCancelled)?
+            .map_err(DiscoveryBookError::Record)
+    }
+
+    /// Runs `verify` in a blocking task under a node-wide verification slot,
+    /// with the validation context for now. Returns `None` if shutdown
+    /// cancelled the task.
+    async fn verify_off_lock<T: Send + 'static>(
+        &self,
+        verify: impl FnOnce(&DiscoveryRecordValidationContext) -> T + Send + 'static,
+    ) -> Option<T> {
         let slot = self.verify_slots.reserve().await;
         let context = self.import_validation.context(current_unix_secs());
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            record.verify_authentic(&context).map(|()| record)
+            verify(&context)
         })
         .await
         .check_for_panics_with(false)
-        .map_err(|_| DiscoveryBookError::VerificationCancelled)?
-        .map_err(DiscoveryBookError::Record)
+        .ok()
     }
 
     /// Imports records loaded from persistent storage through the validation path.
@@ -2800,7 +2849,7 @@ impl ZakuraDiscoveryBook {
         outcome: &mut ImportBatchOutcome,
     ) {
         for record in records {
-            match self.import_record_inner(record, source, false, true, now, context) {
+            match self.import_verified_record(record, source, now, context) {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
@@ -3216,7 +3265,7 @@ impl ZakuraDiscoveryBook {
 
         let node_id = record.body.node_id;
         if let Some(entry) = self.entries.get_mut(&node_id) {
-            return Ok(update_existing_entry(entry, record, metadata));
+            return Ok(update_existing_entry(entry, record, metadata, now));
         }
 
         self.entries.insert(
@@ -3461,12 +3510,13 @@ fn update_existing_entry(
     entry: &mut ZakuraDiscoveryEntry,
     record: ZakuraNodeRecord,
     metadata: DiscoveryEntryMetadata,
+    now: u64,
 ) -> ImportOutcome {
     let incoming_sequence = record.body.sequence;
     let stored_sequence = entry.record.body.sequence;
     // An expired record no longer orders its node's records, so a node that
     // reset its sequence recovers once its old record expires.
-    let stored_orders = !entry_is_expired(entry, metadata.last_seen);
+    let stored_orders = !entry_is_expired(entry, now);
 
     if stored_orders && incoming_sequence < stored_sequence {
         return ImportOutcome::IgnoredOlder;
@@ -7266,7 +7316,7 @@ mod tests {
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
 
-        let held = handle.verify_slots.hold_free();
+        let held = handle.hold_verify_slots();
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -7286,21 +7336,27 @@ mod tests {
             .expect("an identical addressless hello needs no verification slot"),
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.import_connected_peer_record(newer, node_id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(50),
-                handle.import_connected_peer_record(newer.clone(), node_id),
-            )
-            .await
-            .is_err(),
+            !waiting.is_finished(),
             "a changed hello waits for a verification slot"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), handle.record_for(node_id))
+                .await
+                .is_ok(),
+            "a hello waiting for a slot does not hold the discovery lock"
         );
 
         drop(held);
         assert_eq!(
-            handle
-                .import_connected_peer_record(newer, node_id)
+            waiting
                 .await
+                .expect("the import task does not panic")
                 .expect("a changed hello imports once a slot is free"),
             ImportOutcome::Updated
         );
@@ -8727,5 +8783,44 @@ mod tests {
         handle.import_peer_records([new], Some(author)).await;
 
         assert_eq!(sample, vec![old]);
+    }
+
+    #[test]
+    fn hello_verdicts_disconnect_only_for_records_no_conformant_peer_sends() {
+        use crate::zakura::discovery::protocol::DiscoveryWireError;
+
+        let disconnect = [
+            DiscoveryBookError::Record(DiscoveryRecordError::Wire(
+                DiscoveryWireError::InvalidProtocolRange,
+            )),
+            DiscoveryBookError::Record(DiscoveryRecordError::MalformedNodeId),
+            DiscoveryBookError::Record(DiscoveryRecordError::InvalidSignature),
+            DiscoveryBookError::Record(DiscoveryRecordError::WrongNetwork),
+            DiscoveryBookError::Record(DiscoveryRecordError::WrongChain),
+            DiscoveryBookError::Record(DiscoveryRecordError::IncompatibleProtocol),
+            DiscoveryBookError::MismatchedConnectedPeerRecord,
+        ];
+        for error in disconnect {
+            assert_eq!(hello_verdict(&error), RecordVerdict::Disconnect, "{error}");
+        }
+
+        let drop = [
+            DiscoveryBookError::Record(DiscoveryRecordError::Expired),
+            DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry),
+            DiscoveryBookError::SelfRecord,
+            DiscoveryBookError::NoUsableDirectAddress,
+            DiscoveryBookError::NonDialableDirectAddress {
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
+            },
+            DiscoveryBookError::Limit {
+                field: "service",
+                actual: 9,
+                max: 8,
+            },
+            DiscoveryBookError::VerificationCancelled,
+        ];
+        for error in drop {
+            assert_eq!(hello_verdict(&error), RecordVerdict::Drop, "{error}");
+        }
     }
 }

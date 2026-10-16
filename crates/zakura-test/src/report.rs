@@ -53,7 +53,8 @@ impl EyreHandler for SectionHandler {
     }
 }
 
-/// A section body under a header, with the body indented.
+/// A section body under a header, with the body indented by three spaces, as
+/// color-eyre formatted it.
 pub struct IndentedSection<H, B> {
     header: H,
     body: B,
@@ -64,7 +65,7 @@ impl<H: fmt::Display, B: fmt::Display> fmt::Display for IndentedSection<H, B> {
         write!(f, "{}", self.header)?;
 
         for line in self.body.to_string().lines() {
-            write!(f, "\n    {line}")?;
+            write!(f, "\n   {line}")?;
         }
 
         Ok(())
@@ -158,7 +159,7 @@ mod tests {
 
         assert!(
             output.starts_with(
-                "command failed\n\nStdout:\n    first line\n    second line\n\n\
+                "command failed\n\nStdout:\n   first line\n   second line\n\n\
                  Warning: possible port conflict"
             ),
             "{output}"

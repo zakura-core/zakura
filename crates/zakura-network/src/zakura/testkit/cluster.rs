@@ -139,7 +139,7 @@ mod tests {
             },
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
+            DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, GetPeers, HeaderEntry,
             HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
             Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
             MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
@@ -2145,11 +2145,11 @@ mod tests {
 
     /// Builds a discovery `GetPeers` request frame on the native wire.
     fn discovery_get_peers_frame() -> Frame {
-        crate::zakura::wire_codec::encode_frame(&DiscoveryMessage::GetPeers {
+        crate::zakura::wire_codec::encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
             limit: 8,
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),
-        })
+        }))
         .expect("empty GetPeers encodes")
     }
 
@@ -2299,7 +2299,7 @@ mod tests {
                     saw_peers = true;
                 }
                 // The victim's own discovery source also asks us for peers.
-                DiscoveryMessage::GetPeers { .. } => {}
+                DiscoveryMessage::GetPeers(_) => {}
                 DiscoveryMessage::GetServices(_) => {}
                 other => panic!("unexpected discovery message: {other:?}"),
             }

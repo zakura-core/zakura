@@ -17,14 +17,26 @@
 //! stores the decoded message in peer-local state for the async runner to take
 //! and handle immediately after `Pipe::run_one`.
 
-use super::{protocol::DiscoveryMessage, wire::PEERS_MAX_BYTES};
+use super::{
+    protocol::{
+        DiscoveryMessage, MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO,
+        MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
+    },
+    wire::PEERS_MAX_BYTES,
+};
 use crate::zakura::{
     wire_codec::decode_frame, Edge, Flow, Frame, Node, NodeKind, Pipe, PipeCx, PipeShape,
     SessionGuard, SinkReject, ZakuraPeerId,
 };
 
 /// The discovery discriminators, carried in the frame header.
-const DISCOVERY_ALLOWED_FRAME_TYPES: &[u8] = &[1, 2, 3, 4, 5];
+const DISCOVERY_ALLOWED_FRAME_TYPES: &[u8] = &[
+    MSG_DISCOVERY_HELLO,
+    MSG_DISCOVERY_GET_PEERS,
+    MSG_DISCOVERY_PEERS,
+    MSG_DISCOVERY_GET_SERVICES,
+    MSG_DISCOVERY_SERVICES,
+];
 
 /// Per-peer discovery local state.
 pub(super) struct DsLocal {
@@ -117,11 +129,12 @@ pub(super) fn discovery_pipe(peer_id: ZakuraPeerId) -> Pipe<DsLocal, DsEnv> {
         DsLocal::new(),
         DsEnv,
         // The transport reader already checked each header against the
-        // stream's rows. The guard repeats the type and cap checks for frames
-        // that arrive without a transport reader.
+        // stream's rows. For frames that arrive without a transport reader,
+        // the guard checks the type and the stream-wide cap, and
+        // `decode_frame` checks each row's bounds.
         SessionGuard::new(
             DISCOVERY_ALLOWED_FRAME_TYPES,
-            // The largest payload is 20,738 bytes, so it fits in `u32`.
+            // The largest row payload, `PEERS_MAX_BYTES`, fits in `u32`.
             PEERS_MAX_BYTES as u32,
             None,
         ),
@@ -140,7 +153,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, DsLocal, DsEnv>, frame: Frame) -> 
 
     match &msg {
         DiscoveryMessage::Hello { .. }
-        | DiscoveryMessage::GetPeers { .. }
+        | DiscoveryMessage::GetPeers(_)
         | DiscoveryMessage::Peers { .. }
         | DiscoveryMessage::GetServices(_)
         | DiscoveryMessage::Services(_) => {
@@ -160,7 +173,7 @@ fn decode(frame: Frame) -> Flow<DiscoveryMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::wire_codec::encode_frame;
+    use crate::zakura::{discovery::protocol::GetPeers, wire_codec::encode_frame};
 
     const MESSAGE_BRANCHES: [&str; 5] = ["Hello", "GetPeers", "Peers", "GetServices", "Services"];
 
@@ -173,11 +186,11 @@ mod tests {
     #[test]
     fn run_one_hands_off_decoded_message() {
         let mut pipe = discovery_pipe(peer());
-        let frame = encode_frame(&DiscoveryMessage::GetPeers {
+        let frame = encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
             limit: 8,
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),
-        })
+        }))
         .expect("message encodes");
 
         let flow = pipe.run_one(frame);
@@ -186,7 +199,7 @@ mod tests {
         assert!(
             matches!(
                 pipe.local_mut().take_decoded(),
-                Some(DiscoveryMessage::GetPeers { .. })
+                Some(DiscoveryMessage::GetPeers(_))
             ),
             "the decoded message is handed off to the async runner"
         );

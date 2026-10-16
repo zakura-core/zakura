@@ -119,7 +119,8 @@ pub(crate) enum SubscriberFault {
     /// first page extended.
     #[error("the path passes a higher sent locator")]
     LowerLocator,
-    /// A page continues past the target before the subscription reached it.
+    /// A page continues past the target, or reaches its height without it,
+    /// before the subscription reached it.
     #[error("a page continues past the initial target")]
     PastTarget,
     /// The target marker disagrees with whether the page ends at the target.
@@ -193,6 +194,8 @@ pub(crate) struct Ended {
 struct Live {
     id: u64,
     target: block::Hash,
+    /// The target's height in the `Status` that named it.
+    target_height: block::Height,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
     /// The sent locator that equals the target, if any. The subscription
@@ -345,6 +348,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         let live = Live {
             id,
             target,
+            target_height: status.selected_tip_height,
             locators: locators.to_vec(),
             target_locator,
             schema,
@@ -426,6 +430,13 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             return Err(SubscriptionFault::OverCredit.into());
         };
         let last_hash = last.header.hash();
+        // A page beyond u32::MAX headers exceeds any credit.
+        let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
+        let height = parent
+            .height
+            .0
+            .checked_add(count)
+            .expect("the decoder rejects a page whose last height overflows");
         if live.reached {
             if page.reaches_initial_target {
                 return Err(SubscriberFault::SecondMarker);
@@ -451,17 +462,15 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             {
                 return Err(SubscriberFault::LowerLocator);
             }
+            // Only the target is at its height on the path to it, so a page
+            // that reaches that height elsewhere never reaches the target.
+            if !reaches && height >= live.target_height.0 {
+                return Err(SubscriberFault::PastTarget);
+            }
             if page.reaches_initial_target != reaches {
                 return Err(SubscriberFault::Marker);
             }
         }
-        // A page beyond u32::MAX headers exceeds any credit.
-        let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
-        let height = parent
-            .height
-            .0
-            .checked_add(count)
-            .expect("the decoder rejects a page whose last height overflows");
         let consumed = tools
             .credit(&live.id)
             .expect("the live subscription is in the tools")

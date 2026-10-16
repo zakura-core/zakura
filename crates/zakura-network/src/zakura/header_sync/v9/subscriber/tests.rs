@@ -548,6 +548,27 @@ fn misplaced_pages_fault() {
     );
 }
 
+/// A path that reaches the target's height without the target never reaches
+/// it: a first page from a sent locator above the target, or a page whose
+/// last header sits at the target's height under another hash.
+#[test]
+fn a_path_to_the_target_height_without_it_faults() {
+    let (mut tree, chain) = chain(8);
+    let beside = tree.extend(chain[6], 1);
+    let above = tree.extend(chain[8], 1);
+    // chain[8] descends from the target, chain[7]. chain[5] is its ancestor.
+    let locators = [chain[8], chain[5], chain[0]];
+    let mut fixture = Fixture::open(tree, chain[7], &locators, 100);
+    assert_eq!(
+        fixture.page(chain[8], &above, false),
+        Err(SubscriberFault::PastTarget)
+    );
+    assert_eq!(
+        fixture.page(chain[5], &[chain[6], beside[0]], false),
+        Err(SubscriberFault::PastTarget)
+    );
+}
+
 /// Each outcome is legal exactly in its window: before the first page, before
 /// the target, at any time, or after `Close`. Outside it, or for another
 /// subscription or target, it faults.

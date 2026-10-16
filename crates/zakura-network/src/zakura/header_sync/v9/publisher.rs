@@ -903,7 +903,8 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// intersection says no, so growth and local failures keep the page. The
 /// check closes the window between leasing a page and sending it, not the
 /// write after it. The lease is state work, so it waits for execution slots
-/// through `push` as the page's read did.
+/// through `push` as the page's read did, then reads the selected tip again,
+/// because the chain can move during that wait.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
@@ -913,17 +914,24 @@ async fn still_selected(
     leased_tip: block::Hash,
     last: Frontier,
 ) -> bool {
-    let Some(latest) = selected.borrow().clone() else {
-        return true;
+    let mut execution = None;
+    let latest = loop {
+        let Some(latest) = selected.borrow().clone() else {
+            return true;
+        };
+        let tip = latest.frontiers.header_best;
+        if tip.hash == leased_tip || tip == last {
+            return true;
+        }
+        if tip.height <= last.height {
+            return false;
+        }
+        if execution.is_some() {
+            break latest;
+        }
+        execution = Some(push.execution().await);
     };
     let tip = latest.frontiers.header_best;
-    if tip.hash == leased_tip || tip == last {
-        return true;
-    }
-    if tip.height <= last.height {
-        return false;
-    }
-    let _execution = push.execution().await;
     match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
         Ok(AcquirePathReply::Acquired(path)) => {
             release(port, *path).await;

@@ -258,6 +258,8 @@ struct FakePort {
     selected: watch::Sender<Option<EngineSnapshot>>,
     /// Every read waits for a permit here.
     gate: Semaphore,
+    /// Reads panic, standing in for a local bug.
+    panic_reads: std::sync::atomic::AtomicBool,
 }
 
 impl FakePort {
@@ -274,6 +276,7 @@ impl FakePort {
             genesis,
             selected: watch::channel(Some(snapshot(genesis, 1, genesis))).0,
             gate: Semaphore::new(gate),
+            panic_reads: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -346,6 +349,10 @@ impl Port for FakePort {
                 store.most_reads_running = store.most_reads_running.max(store.reads_running);
             }
             let _permit = self.gate.acquire().await.expect("the gate never closes");
+            assert!(
+                !self.panic_reads.load(std::sync::atomic::Ordering::Relaxed),
+                "the test asked this read to panic"
+            );
             let mut store = self.store();
             store.reads_running -= 1;
             store.read(&path, &request)
@@ -664,9 +671,25 @@ fn session(
     peer: &ZakuraPeerId,
     session_id: u64,
 ) -> (Publisher, FramedRecv, CancellationToken) {
+    let (publisher, recv, cancel, _task) = session_with_task(port, capacity, peer, session_id);
+    (publisher, recv, cancel)
+}
+
+/// Start a publisher for `peer` on `capacity`, and keep its task handle.
+fn session_with_task(
+    port: &Arc<FakePort>,
+    capacity: &ServeCapacity,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+) -> (
+    Publisher,
+    FramedRecv,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
     let (send, recv) = framed_channel(64);
     let cancel = CancellationToken::new();
-    let (publisher, _task) = Publisher::spawn::<HB>(
+    let (publisher, task) = Publisher::spawn::<HB>(
         port.clone(),
         capacity.push(peer),
         send,
@@ -677,7 +700,7 @@ fn session(
         limits(),
         cancel.clone(),
     );
-    (publisher, recv, cancel)
+    (publisher, recv, cancel, task)
 }
 
 impl Harness {
@@ -1178,6 +1201,26 @@ async fn a_queued_outcome_wins_over_a_later_close() {
             ..
         }))
     ));
+}
+
+/// A page job's panic reaches the publisher task's handle instead of
+/// stalling the subscription.
+#[tokio::test(start_paused = true)]
+async fn a_page_job_panic_reaches_the_session_owner() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(2);
+    port.panic_reads
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let (publisher, _recv, _cancel, task) = session_with_task(&port, &capacity, &peer(7), 1);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    let ended = tokio::time::timeout(QUIET, task)
+        .await
+        .expect("the publisher task ends");
+    assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,

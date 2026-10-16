@@ -210,6 +210,9 @@ impl Publisher {
     /// Start publishing on one session, and return the handle with the task
     /// that writes pages and outcomes to `send` until `cancel` fires.
     ///
+    /// The task re-raises a page job's panic, so the session's owner sees it
+    /// through the returned handle and can close the session.
+    ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
     /// version 9 codec.
     pub(crate) fn spawn<const HEADER_BYTES: usize>(
@@ -833,6 +836,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let push = task.push.clone();
     let port = task.port.clone();
     let owner = task.owner;
+    let id = job.id;
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
     Box::pin(async move {
         let permit = push.acquire(bytes).await;
@@ -842,7 +846,18 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         });
         let (output, permit): (Output, PushPermit) = match running.await {
             Ok(done) => done,
-            Err(_) => return Progress::Other(Output::Stall(Stall::Local, "job_failed")),
+            // Only a local bug panics a job. Stalling would leave the
+            // subscription half live, so the publisher task panics too.
+            Err(error) if error.is_panic() => {
+                tracing::error!(
+                    subscription_id = id,
+                    ?error,
+                    "a header sync v9 page job panicked"
+                );
+                std::panic::resume_unwind(error.into_panic())
+            }
+            // The runtime is shutting down.
+            Err(_) => return Progress::Closed,
         };
         let Output::Page(page) = output else {
             return Progress::Other(output);

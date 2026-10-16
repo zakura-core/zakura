@@ -60,21 +60,25 @@ peers on a new connection both open subscriptions.
 
 Record the local subscription and its credit before sending Open or Grant. Exercise:
 
-1. An Open whose pages reach the initial target, with the target marker on exactly the last of
-   them, followed by pushed descendants.
-2. Grants at the window limit and one beyond, each cursor field changed, a cursor the publisher
+1. An Open whose pages start at the highest sent locator that is the target or its ancestor and
+   reach the initial target, with the target marker on exactly the last of them, followed by
+   pushed descendants.
+2. An Open whose first or a later locator is the target, with no path page and no target marker,
+   followed by pushes that extend the target, and a HistoryPruned that faults.
+3. Grants at the window limit and one beyond, each cursor field changed, a cursor the publisher
    already passed, and sequence gaps.
-3. Credit exhaustion and the next Grant, with each page spending its exact header and byte credit,
+4. Credit exhaustion and the next Grant, with each page spending its exact header and byte credit,
    and 4,000 unacknowledged one-header pages within the cursor history.
-4. Close with pages queued, followed by SubscriptionClosed, and a Grant or second Close after it,
+5. Close with pages queued, followed by SubscriptionClosed, and a Grant or second Close after it,
    both before and after the subscription ends.
-5. Grant and Close crossing SubscriptionSuperseded or HistoryPruned, repeated crossing Grants up to
+6. Grant and Close crossing SubscriptionSuperseded or HistoryPruned, repeated crossing Grants up to
    and beyond the tombstone window, and the next Open.
-6. A second Open while one slot is held, a third, and a reused subscription ID.
-7. Unsolicited pages and outcomes, a first page that extends no sent locator, broken linkage, a
-   second target marker, a schema mismatch, and each outcome outside its window.
-8. Local failover, target change, finality change, or reassignment before pages arrive.
-9. Connection closure with a live subscription.
+7. A second Open while one slot is held, a third, and a reused subscription ID.
+8. Unsolicited pages and outcomes, a first page that extends no sent locator or, when a locator is
+   the target, does not extend the target, broken linkage, a second target marker, a schema
+   mismatch, and each outcome outside its window.
+9. Local failover, target change, finality change, or reassignment before pages arrive.
+10. Connection closure with a live subscription.
 
 Local scheduling must not revoke credit. Conformant crossings never fault, and both ledgers agree.
 A terminal outcome ends a subscription once. An idle subscription at the tip needs no page or

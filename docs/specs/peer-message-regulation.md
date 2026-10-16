@@ -404,9 +404,11 @@ header chain engine specification](fork-aware-header-chain-engine.md) defines it
 this section supersedes that specification's stream version, message encodings, and `GetHeaders`
 request rules, and the tests that pin them, including PW-08. Its other header sync rules keep
 applying except where this section changes them, including the atomic status snapshot, locator
-construction, target scheduling, auxiliary schemas, peer attribution, and unknown-fork discovery.
-The activation change updates that specification. A node still runs exactly one header sync protocol
-at one stream version, as its LC-SCOPE-09 requires.
+construction, LC-WIRE-05's path selection and serving reserve, target scheduling, auxiliary schemas,
+peer attribution, and unknown-fork discovery. Under version 9, a locator at the target ends with no
+page instead of LC-WIRE-05's empty, complete response. The activation change updates that
+specification. A node still runs exactly one header sync protocol at one stream version, as its
+LC-SCOPE-09 requires.
 
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
@@ -438,13 +440,15 @@ maximum subscriptions, maximum message bytes, and the auxiliary-schema mask. Rem
 discriminator makes its encoded size 122 bytes.
 
 A subscription has **reached its initial target** when the hash of its receive cursor equals
-`initial_target_tip_hash`. Until then the publisher serves the path to that target. After that the
-publisher pushes direct descendants as its selected chain grows.
+`initial_target_tip_hash`, or at `Open` when a sent locator equals it. Until then the publisher
+serves the path to that target. A subscription that reaches its target at `Open` has no path to
+serve, so the publisher sends no path page for it. After the subscription reaches its target, the
+publisher pushes descendants of the target as its selected chain grows.
 
 `SubscribeHeaders` replaces `GetHeaders`. A subscription binds its initial pages to one advertised
-target. After those pages reach the target, the subscription authorizes direct descendants of its
-accepted cursor. It allows at most the declared outstanding header and byte credit. Credit is
-renewable, so the publisher can keep the link full without accepting an unbounded push.
+target. After the subscription reaches the target, it authorizes pages that extend the target, each
+extending the one before. It allows at most the declared outstanding header and byte credit. Credit
+is renewable, so the publisher can keep the link full without accepting an unbounded push.
 
 `SubscribeHeaders` encodes an operation byte, a `u64` subscription ID, a `u32` update sequence, a
 32-byte target hash, a `u32` acknowledged height, a 32-byte acknowledged hash, two `u64`
@@ -464,8 +468,9 @@ start has zero counts and each page consumes at least one header.
 `Headers` retains the version 8 response fields and order. It renames `request_id` to
 `subscription_id` and `complete` to `reaches_initial_target`. The fixed fields occupy 82 bytes.
 `reaches_initial_target` is true exactly on the page whose last header is the initial target and is
-false on every other page. `HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial
-target hash, and a one-byte outcome.
+false on every other page. A subscription that reaches its target at `Open` sends no such page.
+`HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial target hash, and a one-byte
+outcome.
 
 #### `Status` — Announcement, discriminator 1
 
@@ -651,12 +656,13 @@ already passed.
 - **Reservation**
   - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
     requested schema)
-  - the first parent is a sent locator; each later parent equals the hash of the reservation
-    receive cursor
+  - the first parent is a sent locator, and it is the initial target when a sent locator equals
+    the target; each later parent equals the hash of the reservation receive cursor
   - consume `header_count` and the encoded payload bytes
   - advance the receive cursor
   - require `reaches_initial_target` exactly when the final header hash equals the initial target
-  - record when the initial target is reached and reject a second such marker
+  - record when the initial target is reached, at `Open` or by a marked page, and reject any later
+    marker
   - remain live
 - **Verify** — [`prepare_headers`][prepare-headers], the context-free header validator, over the
   decoded page. It establishes the supported encoding version, the locally computed hash, the
@@ -669,11 +675,14 @@ already passed.
 Page linkage is a reservation rule, not a context-free one. It holds against the sent locator and
 receive cursor in the local reservation, so [`prepare_headers`][prepare-headers] cannot decide it.
 
-The first page MUST extend the locator intersection selected by the publisher. The publisher MUST
-reach the initial target before it pushes a descendant beyond that target. Each later page MUST
-extend the preceding page on the ordered stream. After reaching the initial target, the publisher
-MAY push a new header immediately when its selected chain extends the subscription cursor and credit
-remains. If its selected chain no longer extends that cursor, it MUST stop pushing and MUST queue
+The first page MUST extend the highest sent locator that is the initial target or one of its
+ancestors. When a sent locator equals the target, that locator is the highest such locator, so the
+first page extends the target. The publisher MUST reach the initial target before it pushes a
+descendant beyond that target. Each later page MUST extend the preceding page on the ordered stream.
+After reaching the initial target, the publisher MAY push a new header immediately when its selected
+chain extends the subscription's last header and credit remains. That header is the last one the
+publisher sent on the subscription, or the initial target before any page. If its selected chain no
+longer extends that header, it MUST stop pushing and MUST queue
 `HeadersOutcome(SubscriptionSuperseded)`. The subscriber MUST acknowledge only a cursor that passes
 contextual difficulty, time, chain-connection, and auxiliary-root validation.
 
@@ -713,7 +722,8 @@ Each outcome is legal only in its window:
 | `SubscriptionSuperseded` | 6 | Any time |
 | `SubscriptionClosed` | 7 | After the publisher receives `Close` |
 
-An outcome outside its window MUST return `Disconnect`.
+An outcome outside its window MUST return `Disconnect`. A subscription that reaches its target at
+`Open` has no window for `HistoryPruned`.
 
 `Busy` is not a protocol outcome, and its version 8 byte, 4, MUST NOT be reused. Bytes 1 through 3
 keep their version 8 meanings. Local capacity exhaustion MUST pause response-work admission under

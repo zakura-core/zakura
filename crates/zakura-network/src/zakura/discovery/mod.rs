@@ -9,6 +9,7 @@ mod protocol;
 mod redial;
 mod runtime;
 mod service;
+mod serving;
 mod trace;
 pub(crate) mod wire;
 #[cfg(test)]

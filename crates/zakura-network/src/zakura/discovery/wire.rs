@@ -25,6 +25,7 @@ use super::protocol::{
     MSG_DISCOVERY_SERVICES,
 };
 use crate::zakura::{
+    regulation::ResponseCap,
     wire_codec::{BoundedReader, WireError, WireMessage},
     Cadence, MessageRole, MessageRule, PayloadLen,
 };
@@ -67,6 +68,17 @@ const GET_PEERS_MAX_BYTES: usize = 2
 /// The largest `Peers` payload.
 pub(crate) const PEERS_MAX_BYTES: usize =
     2 + MAX_DISCOVERY_RECORDS_PER_RESPONSE * MAX_NODE_RECORD_BYTES;
+
+/// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
+/// with the record count and at most `limit` records. The responder's `Serve`
+/// reserves output for it.
+pub(crate) fn peers_cap(limit: u16) -> ResponseCap {
+    // Widening usize to u64 is lossless on supported targets.
+    ResponseCap {
+        frames: 0,
+        bytes: 2 + u64::from(limit) * MAX_NODE_RECORD_BYTES as u64,
+    }
+}
 const GET_SERVICES_MAX_BYTES: usize = 2 + MAX_GET_SERVICES_WANTED * SERVICE_ID_MAX_BYTES;
 /// A `Services` payload's fixed prefix: node id, expiry, and summary count.
 pub(crate) const SERVICES_FIXED_BYTES: usize = NODE_ID_BYTES + 8 + 2;
@@ -180,7 +192,7 @@ impl WireMessage for DiscoveryMessage {
                 check_sorted_unique(exclude_node_ids)?;
                 write_count(exclude_node_ids.len(), MAX_DISCOVERY_EXCLUDED_NODE_IDS, out)?;
                 for node_id in exclude_node_ids {
-                    out.extend_from_slice(node_id.as_bytes());
+                    out.extend_from_slice(node_id);
                 }
                 Ok(())
             }
@@ -246,7 +258,9 @@ impl WireMessage for DiscoveryMessage {
                 )?;
                 let mut exclude_node_ids = Vec::with_capacity(count);
                 for _ in 0..count {
-                    exclude_node_ids.push(read_node_id(reader, "excluded node id")?);
+                    // Raw bytes: the responder only compares them, so it never
+                    // pays a curve point decompression per excluded id.
+                    exclude_node_ids.push(reader.array("excluded node id")?);
                 }
                 check_sorted_unique(&exclude_node_ids)?;
                 Self::GetPeers {
@@ -344,11 +358,8 @@ fn check_limit(limit: u16) -> Result<(), WireError> {
     Ok(())
 }
 
-fn check_sorted_unique(node_ids: &[NodeId]) -> Result<(), WireError> {
-    if node_ids
-        .windows(2)
-        .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
-    {
+fn check_sorted_unique(node_ids: &[[u8; NODE_ID_BYTES]]) -> Result<(), WireError> {
+    if node_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(WireError::OutOfRange("sorted unique excluded node ids"));
     }
     Ok(())

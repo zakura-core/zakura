@@ -125,7 +125,10 @@ fn longest_get_peers() -> DiscoveryMessage {
         wanted_services: (0..MAX_GET_PEERS_WANTED_SERVICES)
             .map(longest_service)
             .collect(),
-        exclude_node_ids: node_ids()[..MAX_DISCOVERY_EXCLUDED_NODE_IDS].to_vec(),
+        exclude_node_ids: node_ids()[..MAX_DISCOVERY_EXCLUDED_NODE_IDS]
+            .iter()
+            .map(|node_id| *node_id.as_bytes())
+            .collect(),
     }
 }
 
@@ -419,7 +422,10 @@ impl MessageSample for DiscoveryMessage {
                 1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE as u16,
                 arbitrary_unique_services(MAX_GET_PEERS_WANTED_SERVICES),
                 proptest::sample::subsequence(
-                    node_ids().to_vec(),
+                    node_ids()
+                        .iter()
+                        .map(|node_id| *node_id.as_bytes())
+                        .collect::<Vec<_>>(),
                     0..=MAX_DISCOVERY_EXCLUDED_NODE_IDS
                 ),
             )
@@ -518,14 +524,6 @@ impl MessageSample for DiscoveryMessage {
                 rejected_by: |error| {
                     *error == WireError::OutOfRange("sorted unique excluded node ids")
                 },
-            },
-            Violation {
-                name: "excluded node id is not a curve point",
-                frame: frame(
-                    MSG_DISCOVERY_GET_PEERS,
-                    get_peers_payload(1, &[], &[invalid_node_id()]),
-                ),
-                rejected_by: |error| *error == WireError::OutOfRange("excluded node id"),
             },
             Violation {
                 name: "excluded count beyond the payload",

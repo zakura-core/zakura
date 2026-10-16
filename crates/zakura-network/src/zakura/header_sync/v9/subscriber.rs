@@ -75,7 +75,7 @@ use zakura_header_chain::Frontier;
 use super::{
     publisher::is_legal, smallest_page, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode,
     Message, Operation, Status, SubscribeHeaders, MAX_HS_PUSH_CREDIT_BYTES,
-    MAX_HS_PUSH_CREDIT_HEADERS, SUBSCRIBE_HEADERS,
+    MAX_HS_PUSH_CREDIT_HEADERS, MAX_LOCATOR_HASHES, SUBSCRIBE_HEADERS,
 };
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
@@ -89,9 +89,6 @@ use crate::zakura::{
 
 #[cfg(test)]
 mod tests;
-
-/// Most locator hashes an `Open` carries.
-const MAX_LOCATORS: usize = 13;
 
 /// Why this node did not send an update or accept a cursor. The peer is not
 /// at fault.
@@ -308,7 +305,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             return Err(SubscribeError::Locators);
         };
         // At most 13 locators, so the pairwise check stays small.
-        if locators.len() > MAX_LOCATORS
+        if locators.len() > MAX_LOCATOR_HASHES
             || locators.iter().enumerate().any(|(index, locator)| {
                 locators[..index]
                     .iter()

@@ -67,7 +67,7 @@ pub(crate) const HEADERS_RESPONSE_FIXED_BYTES: usize = <PageFixed as Wire>::MAX_
 pub(crate) const HEADERS_OUTCOME_BYTES: usize = <OutcomePayload as Wire>::MAX_LEN;
 
 /// Most locator hashes an `Open` carries.
-const MAX_LOCATOR_HASHES: usize = 13;
+pub(crate) const MAX_LOCATOR_HASHES: usize = 13;
 
 /// Largest body-size hint, the consensus block-size ceiling.
 const MAX_BODY_SIZE_HINT: u32 = 2_000_000;

@@ -1419,7 +1419,7 @@ impl DiskDb {
     /// Collect the rows under each raw key prefix, in prefix order.
     ///
     /// Returns the same rows as [`Self::raw_range_cf`] over each prefix's half-open range.
-    /// It usually reads them with one iterator instead of one per prefix.
+    /// It usually reads them with one iterator, so from one snapshot, instead of one per prefix.
     pub(crate) fn raw_prefixes_cf<C, P>(
         &self,
         cf: &C,

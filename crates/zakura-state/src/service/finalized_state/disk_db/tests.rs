@@ -281,8 +281,26 @@ fn raw_prefixes_match_one_range_scan_per_prefix() {
         expected()
     );
 
-    // Many deleted keys between `\x01c` and the next live key make an unbounded seek skip
-    // too far, so the scan falls back to bounded per-prefix iterators.
+    // A run of deleted keys shorter than the limit keeps the one-iterator path, in memory and on disk.
+    for index in 0..MAX_SKIPPED_KEYS_PER_PREFIX_SEEK / 2 {
+        let key = [b"\x01b".as_slice(), &index.to_be_bytes()].concat();
+        db.put_cf(cf, &key, [0])
+            .expect("writing a test row should succeed");
+        db.delete_cf(cf, &key)
+            .expect("deleting a test row should succeed");
+    }
+    db.flush_cf(cf)
+        .expect("flushing the test column family should succeed");
+    db.put_cf(cf, b"\x01b", [0xb])
+        .expect("writing a test row should succeed");
+    assert_eq!(
+        db.raw_prefixes_cf_with_one_iterator(&cf, &prefixes)
+            .expect("a short run of deleted keys keeps the one-iterator path"),
+        expected()
+    );
+
+    // A longer run of deleted keys under `\x01d` makes one seek or step skip more than the limit,
+    // so the scan falls back to bounded per-prefix iterators.
     for index in 0..=MAX_SKIPPED_KEYS_PER_PREFIX_SEEK {
         let key = [b"\x01d".as_slice(), &index.to_be_bytes()].concat();
         db.put_cf(cf, &key, [0])

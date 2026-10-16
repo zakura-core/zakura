@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use color_eyre::eyre::{self, Context};
+use eyre::{self, Context};
 
 use zakura_chain::{
     amount::Amount,

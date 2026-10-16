@@ -75,7 +75,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 ed25519-zebra = { workspace = true }
 
 hex = { workspace = true }

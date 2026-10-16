@@ -13,7 +13,7 @@ use std::{
 use crate::primitives::batch_control::{Batch, BatchControl};
 use crate::primitives::fallback::Fallback;
 use chrono::{DateTime, TimeZone, Utc};
-use color_eyre::eyre::Report;
+use eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;

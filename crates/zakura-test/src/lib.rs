@@ -7,9 +7,7 @@
 
 use std::sync::Once;
 
-use color_eyre::section::PanicMessage;
 use once_cell::sync::Lazy;
-use owo_colors::OwoColorize;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -24,6 +22,7 @@ pub mod net;
 pub mod network_addr;
 pub mod prelude;
 pub mod process_stats;
+pub mod report;
 pub mod service_extensions;
 pub mod transcript;
 pub mod vectors;
@@ -116,46 +115,8 @@ pub fn init() -> impl Drop {
             .try_init()
             .ok();
 
-        let _ = color_eyre::config::HookBuilder::default()
-            .add_frame_filter(Box::new(|frames| {
-                let mut displayed = std::collections::HashSet::new();
-                let filters = &[
-                    "tokio::",
-                    "<futures_util::",
-                    "std::panic",
-                    "test::run_test_in_process",
-                    "core::ops::function::FnOnce::call_once",
-                    "std::thread::local",
-                    "<core::future::",
-                    "<alloc::boxed::Box",
-                    "<std::panic::AssertUnwindSafe",
-                    "core::result::Result",
-                    "<T as futures_util",
-                    "<tracing::instrument::Instrumented",
-                    "test::assert_test_result",
-                ];
-
-                frames.retain(|frame| {
-                    let loc = (frame.lineno, &frame.filename);
-                    let inserted = displayed.insert(loc);
-
-                    if !inserted {
-                        return false;
-                    }
-
-                    !filters.iter().any(|f| {
-                        let name = if let Some(name) = frame.name.as_ref() {
-                            name.as_str()
-                        } else {
-                            return true;
-                        };
-
-                        name.starts_with(f)
-                    })
-                });
-            }))
-            .panic_message(SkipTestReturnedErrPanicMessages)
-            .install();
+        report::SectionHandler::install();
+        install_test_panic_hook();
     });
 
     drop_guard
@@ -181,43 +142,26 @@ pub fn init_async() -> (tokio::runtime::Runtime, impl Drop) {
     )
 }
 
-struct SkipTestReturnedErrPanicMessages;
+/// Installs a panic hook that skips the panic output of tests that returned an `Err`.
+///
+/// The test harness has already printed the `Err` value, so the panic message
+/// adds nothing. Other panics use the default hook.
+fn install_test_panic_hook() {
+    let default_hook = std::panic::take_hook();
 
-impl PanicMessage for SkipTestReturnedErrPanicMessages {
-    fn display(
-        &self,
-        pi: &std::panic::PanicHookInfo<'_>,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        let payload = pi
+    #[allow(clippy::print_stderr)]
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
             .payload()
             .downcast_ref::<String>()
             .map(String::as_str)
-            .or_else(|| pi.payload().downcast_ref::<&str>().cloned())
-            .unwrap_or("<non string panic payload>");
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
 
-        // skip panic output that is clearly from tests that returned an `Err`
-        // and assume that the test handler has already printed the value inside
-        // of the `Err`.
         if payload.contains("the test returned a termination value with a non-zero status code") {
-            return write!(f, "---- end of test output ----");
-        }
-
-        writeln!(f, "{}", "\nThe application panicked (crashed).".red())?;
-
-        write!(f, "Message:  ")?;
-        writeln!(f, "{}", payload.cyan())?;
-
-        // If known, print panic location.
-        write!(f, "Location: ")?;
-        if let Some(loc) = pi.location() {
-            write!(f, "{}", loc.file().purple())?;
-            write!(f, ":")?;
-            write!(f, "{}", loc.line().purple())?;
+            eprintln!("---- end of test output ----");
         } else {
-            write!(f, "<unknown>")?;
+            default_hook(info);
         }
-
-        Ok(())
-    }
+    }));
 }

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use reqwest::{blocking::Client, redirect::Policy, Url};
 use sha2::{Digest, Sha256};
 use zakura_chain::common::TempFile;

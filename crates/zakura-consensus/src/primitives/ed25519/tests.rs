@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Report, Result};
+use eyre::{eyre, Report, Result};
 use futures::stream::{FuturesOrdered, StreamExt};
 use tower::ServiceExt;
 

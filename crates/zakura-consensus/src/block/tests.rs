@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use chrono::DateTime;
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{amount::NegativeAllowed, ironwood};

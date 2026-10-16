@@ -4,7 +4,7 @@
 
 use std::iter;
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 
 use transparent::OutPoint;
 use zakura_chain::{

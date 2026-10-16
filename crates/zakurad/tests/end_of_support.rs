@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use color_eyre::eyre::Result;
+use eyre::Result;
 use tracing::instrument::WithSubscriber;
 
 #[path = "end_of_support/log_capture.rs"]

@@ -1,6 +1,6 @@
 use std::{future::Future, num::NonZeroU32, sync::Arc};
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
 use tower::{Service, ServiceExt};
 

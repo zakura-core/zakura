@@ -9,7 +9,7 @@
 
 use std::{future::Future, time::Duration};
 
-use color_eyre::Report;
+use eyre::Report;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 

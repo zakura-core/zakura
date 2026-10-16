@@ -1920,7 +1920,7 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
 /// The handoff request must release children queued before the final checkpoint became durable.
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
-    use color_eyre::eyre::eyre;
+    use eyre::eyre;
     use tower::Service;
 
     let _init_guard = zakura_test::init();

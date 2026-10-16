@@ -31,6 +31,11 @@ independently.
 
 ### Changed
 
+- Set this release's Mainnet end of support to height 3,541,074, with the
+  first unsupported block estimated at November 5, 2026 UTC. Warnings begin
+  three days before the halt
+  ([#1460](https://github.com/zakura-core/zakura/pull/1460)).
+
 - Replaced the Iroh library under the native Zakura P2P stack with the
   Zakura-owned `zakura-quic` transport, built on upstream `quinn-proto`. Node
   IDs, key files and bootstrap entries stay the same. The native protocol

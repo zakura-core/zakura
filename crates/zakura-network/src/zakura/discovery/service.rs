@@ -634,7 +634,8 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             panic_source_connection_cancel.cancel();
         },
         async move {
-            let exchanged = match source.run_initial_exchange().await {
+            let initial = source.run_initial_exchange().await;
+            let exchanged = match initial {
                 InitialExchange::Complete => {
                     record_discovery_session_success(
                         &session_states,
@@ -646,7 +647,8 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 }
                 // The answers can wait behind the peer's serving queue and this
                 // node's verification slots, so a slow exchange is not the
-                // peer's fault. It ends like a completed one, without a charge.
+                // peer's fault. It continues like a completed one, and is
+                // settled when its session ends.
                 InitialExchange::TimedOut => true,
                 InitialExchange::Ended => {
                     // The stream broke before the exchange completed; charge the
@@ -675,6 +677,26 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             if closes_discovery_only_connection {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
                 retire_discovery_session(&session_states, &peer_id, conn_id, session_id);
+            }
+            // A timed-out session that completed late resets the count, and
+            // one that never completed is charged, so a silent peer cannot
+            // reopen without bound.
+            if initial == InitialExchange::TimedOut {
+                if source.progress.complete() {
+                    record_discovery_session_success(
+                        &session_states,
+                        &peer_id,
+                        conn_id,
+                        session_id,
+                    );
+                } else {
+                    record_discovery_session_failure(
+                        &session_states,
+                        &peer_id,
+                        conn_id,
+                        session_id,
+                    );
+                }
             }
             service_cancel.cancel();
             source.queries.retire();
@@ -733,7 +755,14 @@ async fn run_discovery_pipe(
         let Some(message) = pipe.local_mut().take_decoded() else {
             continue;
         };
-        sink.handle_message(message, peers_limit).await?;
+        // A cancelled session drops its pending work, including a wait for a
+        // verification slot, so it neither holds the slot queue nor imports
+        // after its session ends.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Ok(()),
+            handled = sink.handle_message(message, peers_limit) => handled?,
+        }
     }
 }
 
@@ -1993,6 +2022,62 @@ mod tests {
         Ok(())
     }
 
+    /// A cancelled session's reader drops a `Hello` that waits for a
+    /// verification slot. It leaves the slot queue and never imports the
+    /// record.
+    #[tokio::test]
+    async fn cancelled_session_drops_a_hello_waiting_for_a_verification_slot(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[50u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_secret = NodeSecretKey::from_bytes(&[51u8; 32]);
+        let peer_node_id = peer_secret.public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit,
+        );
+        let (sink, _sink_recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let cancel = sink.session.cancel_token();
+        let (peer_send, recv) = framed_channel(8);
+        peer_send
+            .send(discovery_frame(DiscoveryMessage::Hello {
+                record: signed_discovery_record(&peer_secret, &handshake)?,
+            })?)
+            .await?;
+
+        let held = handle.hold_verify_slots();
+        let mut pipe = discovery_pipe(peer_id.clone());
+        let reader = tokio::spawn(async move { run_discovery_pipe(&mut pipe, recv, sink).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reader.is_finished(), "the hello waits for a slot");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the cancelled reader stops while the slots stay held")?
+            .expect("a cancelled session ends without a rejection");
+        drop(held);
+        assert_eq!(handle.record_for(peer_node_id).await, None);
+        Ok(())
+    }
+
     /// The `DiscoverySink` session guard must drop messages from a superseded stream generation.
     ///
     /// A replacement discovery stream re-admits the peer under a higher `session_id`.
@@ -2759,6 +2844,95 @@ mod tests {
             .expect("the session record outlives the exchange");
         assert_eq!(record.failed_attempts, 0);
         assert_eq!(record.state, DiscoverySessionState::Retired);
+        Ok(())
+    }
+
+    /// A timed-out session on a shared connection is settled when it ends: it
+    /// is charged if the exchange never completed, and resets the count if
+    /// the exchange completed late.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_shared_session_is_settled_when_it_ends() -> Result<(), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[56u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let peer_secret = NodeSecretKey::from_bytes(&[57u8; 32]);
+        let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+        service.set_connection_owners(vec![Arc::new(TestConnectionOwner {
+            peer: peer_id.clone(),
+            conn_id: 0,
+        })]);
+        connected_tx.send_replace(vec![peer_id.clone()]);
+        let connection_cancel = CancellationToken::new();
+        // The source sees the ended stream at its next send, a send interval
+        // later.
+        async fn wait_for_session_end(handle: &ZakuraDiscoveryHandle) {
+            tokio::time::timeout(2 * SEND_INTERVAL, async {
+                while handle.peer_snapshot().inbound_peers != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the session ends once its stream ends");
+        }
+        let failed_attempts = || {
+            service
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned")
+                .get(&(peer_id.clone(), 0))
+                .map(|record| record.failed_attempts)
+        };
+
+        // The peer stays silent past the timeout, then ends the stream.
+        let (peer_send, service_recv) = framed_channel(16);
+        let (service_send, peer_recv) = framed_channel(16);
+        service.add_peer(Peer::new(
+            peer_id.clone(),
+            None,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_LEGACY_GOSSIP,
+            HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]),
+            connection_cancel.clone(),
+        ));
+        wait_for_discovery_inbound_peers(&handle, 1).await;
+        tokio::time::sleep(2 * DISCOVERY_INITIAL_EXCHANGE_TIMEOUT).await;
+        assert_eq!(failed_attempts(), Some(0), "a slow exchange is not charged");
+        drop((peer_send, peer_recv));
+        wait_for_session_end(&handle).await;
+        assert_eq!(failed_attempts(), Some(1));
+
+        // The peer answers after the timeout, then ends the stream.
+        let (peer_send, service_recv) = framed_channel(16);
+        let (service_send, mut peer_recv) = framed_channel(16);
+        service.add_peer(Peer::new(
+            peer_id.clone(),
+            None,
+            ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_LEGACY_GOSSIP,
+            HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]),
+            connection_cancel.clone(),
+        ));
+        wait_for_discovery_inbound_peers(&handle, 1).await;
+        tokio::time::sleep(2 * DISCOVERY_INITIAL_EXCHANGE_TIMEOUT).await;
+        complete_peer_side_discovery_exchange(&peer_send, &mut peer_recv, &peer_secret, &handshake)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop((peer_send, peer_recv));
+        wait_for_session_end(&handle).await;
+        assert_eq!(failed_attempts(), Some(0));
+        assert!(!connection_cancel.is_cancelled());
         Ok(())
     }
 

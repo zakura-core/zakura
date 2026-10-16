@@ -232,7 +232,7 @@ impl<A: StreamConformance> LayoutNode<A> {
         let mut ended = session.subscriptions_ended.subscribe();
         let before = ended.borrow().len();
         self.service
-            .subscribe(peer, row, key, plan.credit())
+            .subscribe(peer, row, key, plan.limits.credit)
             .await?;
         loop {
             // Mark the pages seen before reading the progress, so a page that

@@ -97,7 +97,7 @@ async fn raw_subscription<A: StreamConformance>(
     subscription: &SubscriptionPlan,
     key: u32,
 ) -> Result<(), BoxError> {
-    let credit = subscription.credit();
+    let credit = subscription.limits.credit;
     raw.send(
         subscription.stream,
         &update_frame::<A>(subscription, UpdateOp::Open, key, 0, credit)?,
@@ -178,7 +178,7 @@ fn four_windows(plan: &LayoutPlan) -> (u32, u32) {
         .first()
         .map_or(0, |request| request.max_in_flight.saturating_mul(4));
     let pages = plan.subscriptions.first().map_or(0, |subscription| {
-        subscription.credit().objects.saturating_mul(4)
+        subscription.limits.credit.objects.saturating_mul(4)
     });
     (exchanges, pages)
 }
@@ -243,7 +243,7 @@ pub(crate) async fn unsolicited_response_disconnects<A: StreamConformance>(
     for (offset, subscription) in (50..).zip(&plan.subscriptions) {
         let (mut raw, _) = raw_peer(&victim, layout, seed + offset).await?;
         let session = victim.wait_session(&raw.id()).await?;
-        let credit = subscription.credit();
+        let credit = subscription.limits.credit;
         victim
             .service
             .subscribe(&raw.id(), subscription.row.message_type, 0, credit)
@@ -418,8 +418,9 @@ async fn subscription_margin<A: StreamConformance>(
     let shared = victim.shared();
     let row = subscription.row.message_type;
     let stream = subscription.stream;
-    let limit = subscription.max_live();
-    let open = |key| update_frame::<A>(subscription, UpdateOp::Open, key, 0, subscription.credit());
+    let limit = subscription.limits.max_live;
+    let credit = subscription.limits.credit;
+    let open = |key| update_frame::<A>(subscription, UpdateOp::Open, key, 0, credit);
     let close = |key| update_frame::<A>(subscription, UpdateOp::Close, key, 1, NO_CREDIT);
 
     // Open again at every ending, for at least sixteen subscriptions.
@@ -652,7 +653,7 @@ pub(crate) async fn member_retirement<A: StreamConformance>(
                     &raw.id(),
                     subscription.row.message_type,
                     5,
-                    subscription.credit(),
+                    subscription.limits.credit,
                 )
                 .await?;
             // The `Open`'s bytes arrived, so its write started.
@@ -792,7 +793,13 @@ pub(crate) async fn unnegotiated_version<A: StreamConformance>(
         (Some(request), _) => (request.stream, encode::<A>(request.row, 3)?),
         (None, Some(subscription)) => (
             subscription.stream,
-            update_frame::<A>(subscription, UpdateOp::Open, 3, 0, subscription.credit())?,
+            update_frame::<A>(
+                subscription,
+                UpdateOp::Open,
+                3,
+                0,
+                subscription.limits.credit,
+            )?,
         ),
         (None, None) => unreachable!("the plan requires a request or subscription row"),
     };
@@ -994,9 +1001,7 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     let Some(subscription) = plan.subscriptions.first().copied() else {
         return Ok(None);
     };
-    let MessageRole::Subscription { credit, .. } = subscription.row.role else {
-        unreachable!("the plan lists subscription rows");
-    };
+    let credit = subscription.limits.credit;
     let update = |op, sequence, added| update_frame::<A>(&subscription, op, 0, sequence, added);
     // Open with all but one page of the window; a grant adds that page later.
     let largest = u32::try_from(subscription.page.payload.max())?;

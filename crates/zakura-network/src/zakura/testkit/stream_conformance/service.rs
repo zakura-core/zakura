@@ -32,7 +32,7 @@ use crate::{
             ReservationPool, Reservations, Responded, ResponseCap, ResponsePrecheck, ResponseSink,
             Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey, SessionTable,
             SharedReservations, SharedSubscriptions, SinkError, SinkProgress, SubscribeRefused,
-            SubscriptionLimits, Subscriptions, Update, WorkLease, WriterFence,
+            Subscriptions, Update, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
         CloseCause, Credit, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, Peer, Service,
@@ -197,7 +197,7 @@ impl<A: StreamConformance> LayoutSession<A> {
     ) -> Option<(u32, Option<Credit>)> {
         let index = shared.subscription_index(subscription_type);
         let plan = shared.plan.subscriptions[index];
-        let window = plan.credit();
+        let window = plan.limits.credit;
         let subscriptions = self.subscriptions[index].lock();
         let received = *subscriptions.received(&key)?;
         let room = subscriptions.grantable(&key)?;
@@ -645,9 +645,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .subscriptions
             .iter()
             .map(|plan| {
-                let limits = SubscriptionLimits::from_rule(plan.row)
-                    .expect("the plan lists subscription rows");
-                SharedSubscriptions::new(Subscriptions::new(limits, A::Message::RULES))
+                SharedSubscriptions::new(Subscriptions::new(plan.limits, A::Message::RULES))
             })
             .collect();
         let prechecks = shared
@@ -702,10 +700,8 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .iter()
             .zip(&shared.pushing)
             .map(|(plan, capacity)| {
-                let limits = SubscriptionLimits::from_rule(plan.row)
-                    .expect("the plan lists subscription rows");
                 let publisher = Publisher {
-                    publications: Arc::new(Mutex::new(Publications::new(limits))),
+                    publications: Arc::new(Mutex::new(Publications::new(plan.limits))),
                     wake: Arc::new(Notify::new()),
                 };
                 tokio::spawn(publish(

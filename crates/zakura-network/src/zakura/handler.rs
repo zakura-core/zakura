@@ -551,6 +551,11 @@ pub struct CustomService {
     pub service: Arc<dyn Service>,
 
     /// Service ids to advertise to the network.
+    ///
+    /// The node's record carries at most
+    /// [`MAX_SERVICES_PER_RECORD`](discovery::MAX_SERVICES_PER_RECORD)
+    /// services, the six built-in services included. Startup fails if the
+    /// distinct services exceed that limit.
     pub provides: Vec<ZakuraServiceId>,
 
     /// Remote service ids to prefer when selecting outbound discovery peers.

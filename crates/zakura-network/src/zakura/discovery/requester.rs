@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    protocol::{DiscoveryMessage, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS},
+    protocol::{
+        DiscoveryMessage, GetPeers, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS,
+    },
     wire::{peers_cap, GET_PEERS},
 };
 use crate::zakura::{
@@ -104,12 +106,10 @@ impl Queries {
         &self,
         send: &FramedSend,
         cancel: &CancellationToken,
-        message: DiscoveryMessage,
+        query: GetPeers,
     ) -> Result<(), QueryUnsent> {
-        let DiscoveryMessage::GetPeers { limit, .. } = message else {
-            unreachable!("send_get_peers sends only GetPeers");
-        };
-        let frame = encode_frame(&message).map_err(|error| {
+        let limit = query.limit;
+        let frame = encode_frame(&DiscoveryMessage::GetPeers(query)).map_err(|error| {
             tracing::debug!(?error, "failed to encode Zakura discovery GetPeers");
             QueryUnsent::NotDue
         })?;
@@ -209,8 +209,8 @@ mod tests {
     use super::*;
     use crate::zakura::{framed_channel, regulation::UNFINISHED_EXCHANGE};
 
-    fn get_peers(limit: u16) -> DiscoveryMessage {
-        DiscoveryMessage::GetPeers {
+    fn get_peers(limit: u16) -> GetPeers {
+        GetPeers {
             limit,
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),

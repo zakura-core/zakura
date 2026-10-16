@@ -8,7 +8,7 @@ use zakura_quic::NodeSecretKey;
 
 use super::{
     protocol::{
-        DiscoveryMessage, GetServices, Services, ZakuraNodeRecord, ZakuraNodeRecordBody,
+        DiscoveryMessage, GetPeers, GetServices, Services, ZakuraNodeRecord, ZakuraNodeRecordBody,
         ZakuraServiceId, MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO,
         MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
     },
@@ -70,11 +70,11 @@ impl StreamConformance for DiscoveryConformance {
             MSG_DISCOVERY_HELLO => DiscoveryMessage::Hello {
                 record: record(exchange),
             },
-            MSG_DISCOVERY_GET_PEERS => DiscoveryMessage::GetPeers {
+            MSG_DISCOVERY_GET_PEERS => DiscoveryMessage::GetPeers(GetPeers {
                 limit: 1,
                 wanted_services: wanted(exchange),
                 exclude_node_ids: Vec::new(),
-            },
+            }),
             MSG_DISCOVERY_PEERS => DiscoveryMessage::Peers {
                 records: vec![record(exchange)],
             },
@@ -93,9 +93,9 @@ impl StreamConformance for DiscoveryConformance {
     fn exchange(message: &DiscoveryMessage) -> u32 {
         match message {
             DiscoveryMessage::Hello { record } => record_exchange(record),
-            DiscoveryMessage::GetPeers {
+            DiscoveryMessage::GetPeers(GetPeers {
                 wanted_services, ..
-            } => wanted_exchange(wanted_services),
+            }) => wanted_exchange(wanted_services),
             DiscoveryMessage::Peers { records } => records
                 .first()
                 .map(record_exchange)

@@ -4,24 +4,27 @@
 //! takes response slots, output bytes, and execution before `produce` runs,
 //! and sends exactly one response per admitted request.
 
+use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
 use zakura_quic::NodeId;
 
 use super::{
-    protocol::{
-        DiscoveryMessage, ZakuraDiscoveryHandle, ZakuraServiceId,
-        MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-    },
-    wire::{peers_cap, GET_PEERS},
+    protocol::{DiscoveryMessage, GetPeers, ZakuraDiscoveryHandle},
+    wire::{peers_cap, GET_PEERS, LARGEST_PEERS},
 };
-use crate::zakura::regulation::{
-    sizing, Produce, Responded, ResponseCap, ResponseSink, ServeCapacity, ServeEnd, ServeLimits,
-    SinkProgress, WorkLease,
+use crate::zakura::{
+    regulation::{
+        sizing, Produce, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
+        ServeLimits, SinkProgress, WorkLease,
+    },
+    CloseCause, FramedSend, MessageRole, MessageRule, ZakuraPeerId,
 };
 
 /// Node-wide `produce` steps for one discovery request row. Each step takes
 /// the book lock for microseconds, so more steps would only queue on it.
 const NODE_EXECUTION: usize = 4;
-/// One peer has at most one request open, so one step serves it.
+/// Each row allows one request in flight per peer, so one step serves it.
 const PEER_EXECUTION: usize = 1;
 
 /// The serving limits of a discovery request row whose largest response is
@@ -34,22 +37,58 @@ fn serving_limits(largest: ResponseCap) -> ServeLimits {
     }
 }
 
-/// The node-wide `GetPeers` serving capacity, shared by every session.
-pub(super) fn get_peers_capacity() -> ServeCapacity {
-    let largest = peers_cap(
-        u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE).expect("the largest limit fits u16"),
-    );
-    ServeCapacity::new("discovery", &GET_PEERS, serving_limits(largest))
-        .expect("the discovery serving limits are nonzero and fit their budgets")
+/// The in-flight limit this node advertises for `row`: the limit the row
+/// declares.
+fn advertised(row: &MessageRule) -> u32 {
+    let MessageRole::Request { max_in_flight, .. } = row.role else {
+        unreachable!("discovery serves only request rows");
+    };
+    max_in_flight
 }
 
-/// A decoded `GetPeers`.
+/// The node-wide capacity of discovery's request rows, shared by every session.
+#[derive(Clone, Debug)]
+pub(super) struct ServingCapacity {
+    get_peers: ServeCapacity,
+}
+
+/// One session's serving of discovery's request rows.
 #[derive(Debug)]
-pub(super) struct PeersQuery {
-    pub(super) limit: u16,
-    pub(super) wanted_services: Vec<ZakuraServiceId>,
-    /// Raw node ids in ascending order, as the decoder checked.
-    pub(super) exclude_node_ids: Vec<[u8; 32]>,
+pub(super) struct Serving {
+    pub(super) get_peers: Serve<PeerSampler>,
+}
+
+impl ServingCapacity {
+    pub(super) fn new() -> Self {
+        Self {
+            get_peers: ServeCapacity::new("discovery", &GET_PEERS, serving_limits(LARGEST_PEERS))
+                .expect("the discovery serving limits are nonzero and fit their budgets"),
+        }
+    }
+
+    /// Serves one session's requests on `send`. Cancelling `cancel` ends the
+    /// session's serving, and a serving panic closes `connection`.
+    pub(super) fn session(
+        &self,
+        sampler: PeerSampler,
+        peer: &ZakuraPeerId,
+        send: FramedSend,
+        cancel: CancellationToken,
+        connection: CancellationToken,
+        close_cause: CloseCause,
+    ) -> Serving {
+        Serving {
+            get_peers: self.get_peers.session(
+                Arc::new(sampler),
+                peer,
+                advertised(&GET_PEERS),
+                send,
+                cancel,
+                connection,
+                close_cause,
+            ),
+        }
+    }
 }
 
 /// Answers one session's `GetPeers` with a sample from the book.
@@ -61,16 +100,16 @@ pub(super) struct PeerSampler {
 }
 
 impl Produce for PeerSampler {
-    type Request = PeersQuery;
+    type Request = GetPeers;
     type Message = DiscoveryMessage;
 
-    fn response_cap(&self, query: &PeersQuery) -> ResponseCap {
+    fn response_cap(&self, query: &GetPeers) -> ResponseCap {
         peers_cap(query.limit)
     }
 
     async fn produce(
         &self,
-        query: &PeersQuery,
+        query: &GetPeers,
         lease: WorkLease,
         sink: ResponseSink<DiscoveryMessage>,
     ) -> Result<Responded, ServeEnd> {
@@ -91,7 +130,7 @@ impl Produce for PeerSampler {
     }
 
     /// An empty `Peers` is a legal answer to any `GetPeers`.
-    fn local_failure(&self, _query: &PeersQuery, _sent: SinkProgress) -> DiscoveryMessage {
+    fn local_failure(&self, _query: &GetPeers, _sent: SinkProgress) -> DiscoveryMessage {
         DiscoveryMessage::Peers {
             records: Vec::new(),
         }

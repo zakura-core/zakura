@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex, PoisonError,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -30,9 +30,9 @@ use crate::zakura::{
 
 use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
-    BlockSyncServiceSummary, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError,
-    GetServices, HeaderSyncServiceSummary, ServiceSummaryEnvelope, Services, ZakuraDiscoveryHandle,
-    ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+    hello_verdict, BlockSyncServiceSummary, DiscoveryMessage, GetServices,
+    HeaderSyncServiceSummary, RecordVerdict, ServiceSummaryEnvelope, Services,
+    ZakuraDiscoveryHandle, ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use super::serving::{get_peers_capacity, PeerSampler, PeersQuery};
@@ -94,11 +94,6 @@ impl DiscoveryPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
-    }
-
-    /// Send this node's signed self-record.
-    pub fn try_send_hello(&self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
-        self.try_send_message(DiscoveryMessage::Hello { record })
     }
 
     /// Ask this peer for more peer records.
@@ -593,13 +588,13 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     // `PipeTeardown` still runs on every exit path.
     spawn_supervised_pipe(peer_id.clone(), sink_service_cancel, || {}, on_panic, pipe);
 
-    let source = DiscoverySource {
+    let mut source = DiscoverySource {
         handle: handle.clone(),
         session: discovery_session,
         conn_id,
         session_id,
         progress,
-        hello: StdMutex::new(CadenceSender::new()),
+        hello: CadenceSender::new(),
     };
     // SR-1: a panic in the source task skips its `service_cancel.cancel()`,
     // `handle.remove_session()`, and discovery-only connection cancellation,
@@ -711,37 +706,37 @@ struct DiscoverySink {
 
 async fn run_discovery_pipe(
     pipe: &mut Pipe<DsLocal, DsEnv>,
-    mut recv: FramedRecv,
+    recv: FramedRecv,
     sink: DiscoverySink,
 ) -> Result<(), SinkReject> {
     let cancel = sink.session.cancel_token();
-    loop {
-        let frame = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            frame = recv.recv() => frame,
-        };
-        let Some(frame) = frame else {
-            return Ok(());
-        };
+    // A cancelled session drops its pending work, including a wait for a
+    // verification slot, so it neither holds the slot queue nor imports after
+    // its session ends.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(()),
+        read = read_discovery_messages(pipe, recv, &sink) => read,
+    }
+}
 
+/// Runs each frame through the pipe and handles each decoded message, until
+/// the stream ends.
+async fn read_discovery_messages(
+    pipe: &mut Pipe<DsLocal, DsEnv>,
+    mut recv: FramedRecv,
+    sink: &DiscoverySink,
+) -> Result<(), SinkReject> {
+    while let Some(frame) = recv.recv().await {
         match pipe.run_one(frame) {
             Flow::Continue(()) | Flow::Done => {}
             Flow::Reject(reject) => return Err(reject),
         }
-
-        let Some(message) = pipe.local_mut().take_decoded() else {
-            continue;
-        };
-        // A cancelled session drops its pending work, including a wait for a
-        // verification slot, so it neither holds the slot queue nor imports
-        // after its session ends.
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            handled = sink.handle_message(message) => handled?,
+        if let Some(message) = pipe.local_mut().take_decoded() {
+            sink.handle_message(message).await?;
         }
     }
+    Ok(())
 }
 
 impl DiscoverySink {
@@ -911,8 +906,8 @@ struct DiscoverySource {
     conn_id: ZakuraConnId,
     session_id: u64,
     progress: Arc<DiscoveryExchangeProgress>,
-    /// Paces `Hello` to its row's send interval and keeps only the latest record.
-    hello: StdMutex<CadenceSender<DiscoveryMessage>>,
+    /// Paces `Hello` to its row's send interval.
+    hello: CadenceSender<DiscoveryMessage>,
 }
 
 /// How a session's initial exchange ended.
@@ -927,7 +922,7 @@ enum InitialExchange {
 }
 
 impl DiscoverySource {
-    async fn run_initial_exchange(&self) -> InitialExchange {
+    async fn run_initial_exchange(&mut self) -> InitialExchange {
         if self.exchange().await.is_err() {
             return InitialExchange::Ended;
         }
@@ -950,7 +945,7 @@ impl DiscoverySource {
     }
 
     /// Exchanges again once the rows' send interval has passed.
-    async fn refresh_after_interval(&self) -> Result<(), ()> {
+    async fn refresh_after_interval(&mut self) -> Result<(), ()> {
         let cancel = self.session.cancel_token();
         tokio::select! {
             biased;
@@ -963,7 +958,7 @@ impl DiscoverySource {
     ///
     /// Returns `Err(())` once the stream's send side is gone, so the caller
     /// stops the periodic loop.
-    async fn exchange(&self) -> Result<(), ()> {
+    async fn exchange(&mut self) -> Result<(), ()> {
         if !self
             .handle
             .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
@@ -984,18 +979,19 @@ impl DiscoverySource {
                 );
             })?;
         let record = (*record).clone();
-        self.handle_send_result(self.send_hello(record))?;
+        let sent = self.send_hello(record);
+        self.handle_send_result(sent)?;
 
-        let limit = self
-            .handle
-            .peer_sample_limit()
-            .await
-            .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        // The wire limit is 1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE, and that
-        // maximum fits in u16, so the cast cannot truncate.
+        let limit = u16::try_from(
+            self.handle
+                .peer_sample_limit()
+                .await
+                .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE),
+        )
+        .expect("the largest wire limit fits u16");
         let exclude_node_ids = self.handle.peer_sample_exclusions().await;
         self.handle_send_result(self.session.try_send_get_peers(
-            limit as u16,
+            limit,
             Vec::new(),
             exclude_node_ids,
         ))?;
@@ -1003,14 +999,14 @@ impl DiscoverySource {
         self.handle_send_result(self.session.try_send_get_services(Vec::new()))
     }
 
-    /// Offers `record` to the `Hello` cadence and sends it once its interval
-    /// allows. A record that must wait replaces any record already waiting.
-    fn send_hello(&self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
-        let mut hello = self.hello.lock().unwrap_or_else(PoisonError::into_inner);
-        hello
+    /// Sends `record` as `Hello` if the row's interval has passed and the
+    /// previous `Hello` was written. Otherwise the next exchange offers a
+    /// fresh record.
+    fn send_hello(&mut self, record: ZakuraNodeRecord) -> Result<(), OrderedSendError> {
+        self.hello
             .update(DiscoveryMessage::Hello { record })
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
-        match hello.send_due(&self.session.send) {
+        match self.hello.send_due(&self.session.send) {
             Ok(_) => Ok(()),
             Err(CadenceSendError::Closed) => Err(OrderedSendError::Closed),
             Err(error) => Err(OrderedSendError::Encode(error.into())),
@@ -1087,43 +1083,6 @@ fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     NodeId::from_bytes(&bytes).ok()
 }
 
-/// What a failed record import means for the peer that sent it.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum RecordVerdict {
-    /// Local policy or the local clock rejected an authentic record.
-    Drop,
-    /// The peer sent a record no conformant peer sends.
-    Disconnect,
-}
-
-/// The verdict for a failed `Hello` import.
-///
-/// The match names every variant, so a new error fails the build until it is
-/// classified. Expiry depends on the local clock and TTL, and address and
-/// storage policy are local, so those only drop the record.
-fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
-    match error {
-        DiscoveryBookError::Record(error) => match error {
-            DiscoveryRecordError::Wire(_)
-            | DiscoveryRecordError::MalformedNodeId
-            | DiscoveryRecordError::InvalidSignature
-            | DiscoveryRecordError::WrongNetwork
-            | DiscoveryRecordError::WrongChain
-            | DiscoveryRecordError::IncompatibleProtocol => RecordVerdict::Disconnect,
-            DiscoveryRecordError::Expired | DiscoveryRecordError::FarFutureExpiry => {
-                RecordVerdict::Drop
-            }
-        },
-        DiscoveryBookError::MismatchedConnectedPeerRecord => RecordVerdict::Disconnect,
-        DiscoveryBookError::SelfRecord
-        | DiscoveryBookError::NoUsableDirectAddress
-        | DiscoveryBookError::NonDialableDirectAddress { .. }
-        | DiscoveryBookError::Limit { .. }
-        | DiscoveryBookError::VerificationCancelled => RecordVerdict::Drop,
-    }
-}
-
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1152,45 +1111,6 @@ mod tests {
     };
     use crate::zakura::{wire_codec::decode_frame, Frame};
     use zakura_chain::{block, parameters::Network};
-
-    #[test]
-    fn hello_verdicts_disconnect_only_for_records_no_conformant_peer_sends() {
-        use crate::zakura::discovery::protocol::DiscoveryWireError;
-
-        let disconnect = [
-            DiscoveryBookError::Record(DiscoveryRecordError::Wire(
-                DiscoveryWireError::InvalidProtocolRange,
-            )),
-            DiscoveryBookError::Record(DiscoveryRecordError::MalformedNodeId),
-            DiscoveryBookError::Record(DiscoveryRecordError::InvalidSignature),
-            DiscoveryBookError::Record(DiscoveryRecordError::WrongNetwork),
-            DiscoveryBookError::Record(DiscoveryRecordError::WrongChain),
-            DiscoveryBookError::Record(DiscoveryRecordError::IncompatibleProtocol),
-            DiscoveryBookError::MismatchedConnectedPeerRecord,
-        ];
-        for error in disconnect {
-            assert_eq!(hello_verdict(&error), RecordVerdict::Disconnect, "{error}");
-        }
-
-        let drop = [
-            DiscoveryBookError::Record(DiscoveryRecordError::Expired),
-            DiscoveryBookError::Record(DiscoveryRecordError::FarFutureExpiry),
-            DiscoveryBookError::SelfRecord,
-            DiscoveryBookError::NoUsableDirectAddress,
-            DiscoveryBookError::NonDialableDirectAddress {
-                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233),
-            },
-            DiscoveryBookError::Limit {
-                field: "service",
-                actual: 9,
-                max: 8,
-            },
-            DiscoveryBookError::VerificationCancelled,
-        ];
-        for error in drop {
-            assert_eq!(hello_verdict(&error), RecordVerdict::Drop, "{error}");
-        }
-    }
 
     #[test]
     fn periodic_exchange_refreshes_before_live_service_summaries_expire() {
@@ -1960,7 +1880,13 @@ mod tests {
             .await
             .expect("the cancelled reader stops while the slots stay held")?
             .expect("a cancelled session ends without a rejection");
+        let slots = held.len();
         drop(held);
+        assert_eq!(
+            handle.hold_verify_slots().len(),
+            slots,
+            "the cancelled hello took no verification slot"
+        );
         assert_eq!(handle.record_for(peer_node_id).await, None);
         Ok(())
     }
@@ -2352,6 +2278,84 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the authors of the `Hello` frames queued on `recv`, draining
+    /// every queued frame.
+    fn drain_hello_authors(recv: &mut FramedRecv) -> Vec<NodeId> {
+        use futures::FutureExt;
+
+        let mut authors = Vec::new();
+        while let Some(Some(frame)) = recv.recv().now_or_never() {
+            if let DiscoveryMessage::Hello { record } =
+                decode_frame::<DiscoveryMessage>(&frame).expect("the source encodes valid frames")
+            {
+                authors.push(record.body.node_id);
+            }
+        }
+        authors
+    }
+
+    /// The source sends `Hello` once per send interval: an exchange inside the
+    /// interval sends none, and the first exchange after it sends the current
+    /// self-record.
+    #[tokio::test(start_paused = true)]
+    async fn exchange_resends_hello_once_its_interval_passes() -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let local_secret = NodeSecretKey::from_bytes(&[52u8; 32]);
+        let local_node_id = local_secret.public();
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: local_secret,
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[53u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        let (send, mut recv) = framed_channel(8);
+        let mut source = DiscoverySource {
+            handle: handle.clone(),
+            session: DiscoveryPeerSession {
+                peer_id,
+                direction: ServicePeerDirection::Inbound,
+                send,
+                cancel: CancellationToken::new(),
+            },
+            conn_id: 2,
+            session_id: 1,
+            progress: Arc::new(DiscoveryExchangeProgress::default()),
+            hello: CadenceSender::new(),
+        };
+
+        source.exchange().await.expect("the session is current");
+        assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
+
+        source.exchange().await.expect("the session is current");
+        assert_eq!(
+            drain_hello_authors(&mut recv),
+            Vec::new(),
+            "an exchange inside the interval sends no Hello"
+        );
+
+        tokio::time::advance(super::super::wire::SEND_INTERVAL).await;
+        source.exchange().await.expect("the session is current");
+        assert_eq!(drain_hello_authors(&mut recv), vec![local_node_id]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stale_discovery_source_cannot_send_after_stream_replacement(
     ) -> Result<(), crate::BoxError> {
@@ -2381,7 +2385,7 @@ mod tests {
         );
 
         let (send, mut recv) = framed_channel(4);
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle: handle.clone(),
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
@@ -2392,7 +2396,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
-            hello: StdMutex::new(CadenceSender::new()),
+            hello: CadenceSender::new(),
         };
         assert_eq!(
             handle
@@ -2441,7 +2445,7 @@ mod tests {
 
         let (send, mut recv) = framed_channel(4);
         let progress = Arc::new(DiscoveryExchangeProgress::default());
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle: handle.clone(),
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
@@ -2452,7 +2456,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: progress.clone(),
-            hello: StdMutex::new(CadenceSender::new()),
+            hello: CadenceSender::new(),
         };
         let source_task = tokio::spawn(async move { source.run_initial_exchange().await });
         for _ in 0..3 {
@@ -2503,7 +2507,7 @@ mod tests {
         );
 
         let (send, _recv) = framed_channel(4);
-        let source = DiscoverySource {
+        let mut source = DiscoverySource {
             handle,
             session: DiscoveryPeerSession {
                 peer_id,
@@ -2514,7 +2518,7 @@ mod tests {
             conn_id: 2,
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
-            hello: StdMutex::new(CadenceSender::new()),
+            hello: CadenceSender::new(),
         };
 
         assert_eq!(

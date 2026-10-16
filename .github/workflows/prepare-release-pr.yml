@@ -133,7 +133,7 @@ jobs:
           python3 .github/scripts/fetch-release-state.py --self-test
           python3 .github/scripts/import-release-state.py --self-test
           python3 scripts/release-readiness.py self-test
-          python3 .github/scripts/ready-release-state.py fetch --state "$RUNNER_TEMP/release-state"
+          python3 .github/scripts/release_state.py ready --state "$RUNNER_TEMP/release-state"
           report="$(
             python3 scripts/release-readiness.py height \
               --resolution "$RUNNER_TEMP/release-state/resolution.json" \
@@ -153,10 +153,10 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
       - name: Verify the preserved ready set
-        run: python3 .github/scripts/ready-release-state.py verify --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py verify --state "$RUNNER_TEMP/release-state"
       - name: Validate the preserved candidate before import
         if: inputs.release_state_waiver == '' && steps.selection.outputs.has_changes == 'true'
-        run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py validate --state "$RUNNER_TEMP/release-state"
 
       - name: Import the latest Mainnet release state
         if: inputs.release_state_waiver == ''
@@ -181,13 +181,13 @@ jobs:
       - name: Pin the ready asset for the imported state
         if: steps.release-state-import.outputs.has_changes == 'true'
         run: |
-          python3 .github/scripts/pin-release-state-assets.py \
+          python3 .github/scripts/release_state.py pin \
             --import-result "$RUNNER_TEMP/release-state-import.json" \
             --state "$RUNNER_TEMP/release-state"
 
       - name: Validate the imported release state
         run: |
-          python3 .github/scripts/ready-release-state.py verify --committed --state "$RUNNER_TEMP/release-state"
+          python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
           set -euo pipefail
           .github/scripts/validate-checkpoints.sh \
             crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
@@ -489,7 +489,7 @@ jobs:
             ${{ runner.temp }}/pr-body.md
 
       - name: Recheck ready-set and committed-state freshness
-        run: python3 .github/scripts/ready-release-state.py verify --committed --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
 
       - name: Create release GitHub App token
         if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' }}

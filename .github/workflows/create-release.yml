@@ -163,7 +163,7 @@ jobs:
           )"; then
             echo "::warning title=Release level advisory::The requested tag is below the changelog-derived release level; continuing temporarily."
           fi
-          if ! READY_URL="$LATEST_URL" python3 .github/scripts/ready-release-state.py fetch \
+          if ! READY_URL="$LATEST_URL" python3 .github/scripts/release_state.py ready \
             --state "$RUNNER_TEMP/readiness-state"; then
             echo "::warning title=Release-state advisory unavailable::The latest Mainnet release-state bundle could not be verified; continuing temporarily."
             exit 0

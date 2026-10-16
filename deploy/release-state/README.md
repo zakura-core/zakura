@@ -113,8 +113,10 @@ Local validation uses Python 3.12, the pinned client requirements in
 `.github/scripts/requirements-release-state.txt`, and
 `python -m unittest discover -s .github/scripts -p 'test_*release_state*.py'`.
 The integration tests run actual Cargo publication, resolution, and lockfile
-updates against a loopback registry and SDK conditional writes against a
-loopback object store. They require no production credentials or uploads.
+updates against a loopback registry. Promotion runs against an in-memory store
+with S3 conditional-write semantics, and stubbed SDK calls check how storage
+responses map onto those semantics. The tests require no production
+credentials or uploads.
 Real R2/CDN behavior, crates.io authentication, and the node's cryptographic
 subtree verifier still require their separate live/CI qualification.
 

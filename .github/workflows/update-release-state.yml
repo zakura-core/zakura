@@ -45,9 +45,7 @@ jobs:
       - name: Fetch one immutable bundle
         env:
           LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
-        run: |
-          python3 .github/scripts/release-state-assets.py fetch --state "$RUNNER_TEMP/release-state"
-          python3 .github/scripts/release-state-assets.py select --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py candidate --state "$RUNNER_TEMP/release-state"
 
       - name: Preserve the verified candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
@@ -79,20 +77,14 @@ jobs:
           name: release-state-candidate
           path: ${{ runner.temp }}/release-state/
       - name: Verify append-only history and prove subtree roots
-        run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py validate --state "$RUNNER_TEMP/release-state"
       - name: Package and verify an already published asset for the dry run
         if: inputs.dry_run
         run: |
           set -euo pipefail
-          python3 scripts/pack-assets-crate.py \
-            --grid "$RUNNER_TEMP/release-state/bundle/mainnet-frontier-grid.bin" \
-            --result-out "$RUNNER_TEMP/release-state/pack.json"
-          python3 .github/scripts/release-state-assets.py check --state "$RUNNER_TEMP/release-state"
-          if [ "$(jq -r '.needed' "$RUNNER_TEMP/release-state/publication.json")" = "true" ]; then
-            echo "Publication prerequisite: the matching crate must be published from main before this dry run can pass." >&2
-            exit 1
-          fi
-          python3 .github/scripts/release-state-assets.py verify --state "$RUNNER_TEMP/release-state"
+          python3 .github/scripts/release_state.py pack --state "$RUNNER_TEMP/release-state"
+          python3 .github/scripts/release_state.py check --expect-published --state "$RUNNER_TEMP/release-state"
+          python3 .github/scripts/release_state.py visible --state "$RUNNER_TEMP/release-state"
 
   publish-assets:
     name: Publish the frontier grid to crates.io
@@ -126,27 +118,11 @@ jobs:
           path: ${{ runner.temp }}/release-state/
 
       - name: Pack the asset crate
-        env:
-          BUNDLE: ${{ runner.temp }}/release-state/bundle
-        run: |
-          set -euo pipefail
-          python3 scripts/pack-assets-crate.py \
-            --grid "$BUNDLE/mainnet-frontier-grid.bin" \
-            --result-out "$RUNNER_TEMP/release-state/pack.json"
-          python3 - <<'PYTHON'
-          import json, os
-          from pathlib import Path
-          state = Path(os.environ["RUNNER_TEMP"]) / "release-state"
-          packed = json.loads((state / "pack.json").read_text())
-          selected = json.loads((state / "selection.json").read_text())
-          for key, selected_key in (("name", "name"), ("version", "version"), ("sha256", "grid_sha256")):
-              if packed[key] != selected[selected_key]:
-                  raise SystemExit("packed asset differs from validated selection")
-          PYTHON
+        run: python3 .github/scripts/release_state.py pack --state "$RUNNER_TEMP/release-state"
 
       - name: Check or refuse the existing asset version
         id: existing
-        run: python3 .github/scripts/release-state-assets.py check --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py check --state "$RUNNER_TEMP/release-state"
 
       - name: Authenticate with crates.io
         id: auth
@@ -160,10 +136,10 @@ jobs:
         if: steps.existing.outputs.needed == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: python3 .github/scripts/release-state-assets.py publish --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py publish --state "$RUNNER_TEMP/release-state"
 
       - name: Verify Cargo availability
-        run: python3 .github/scripts/release-state-assets.py verify --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py visible --state "$RUNNER_TEMP/release-state"
 
   promote:
     name: Promote the verified set to immutable ready storage
@@ -193,7 +169,7 @@ jobs:
         env:
           RELEASE_STATE_R2_ACCESS_KEY_ID: ${{ secrets.RELEASE_STATE_R2_ACCESS_KEY_ID }}
           RELEASE_STATE_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_STATE_R2_SECRET_ACCESS_KEY }}
-        run: python3 .github/scripts/ready-release-state.py promote --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py promote --state "$RUNNER_TEMP/release-state"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: published-release-state

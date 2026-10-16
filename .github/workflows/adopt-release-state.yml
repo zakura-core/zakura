@@ -38,27 +38,20 @@ jobs:
       - name: Fetch one complete published set
         env:
           READY_URL: ${{ vars.MAINNET_RELEASE_STATE_READY_URL }}
-        run: python3 .github/scripts/ready-release-state.py fetch --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py ready --state "$RUNNER_TEMP/release-state"
       - name: Export the selected asset identity
         id: selection
         run: |
           jq -r '"name=\(.name)", "version=\(.version)", "has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
       - name: Validate the ready candidate
         if: steps.selection.outputs.has_changes == 'true'
-        run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py validate --state "$RUNNER_TEMP/release-state"
       - name: Resolve the currently pinned frontier grid
         if: steps.selection.outputs.has_changes == 'true'
         id: pinned
-        env:
-          NAME: ${{ steps.selection.outputs.name }}
-          PYTHONPATH: .github/scripts
         run: |
-          python3 - <<'PYTHON'
-          import os
-          from ready_release_state import ROOT, previous_grid
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              print(f"path={previous_grid(ROOT, os.environ['NAME'])}", file=output)
-          PYTHON
+          path=$(python3 .github/scripts/release_state.py pinned-grid)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
 
       # Release preparation owns end-of-support changes.
       - name: Import checkpoints, frontier, subtrees, and provenance
@@ -93,7 +86,7 @@ jobs:
       - name: Pin the ready asset
         if: steps.import.outputs.has_changes == 'true'
         run: |
-          python3 .github/scripts/pin-release-state-assets.py \
+          python3 .github/scripts/release_state.py pin \
             --state "$RUNNER_TEMP/release-state" \
             --import-result "$RUNNER_TEMP/release-state-import.json"
 
@@ -143,7 +136,7 @@ jobs:
           git diff --stat HEAD
 
       - name: Recheck freshness and integrity before opening a PR
-        run: python3 .github/scripts/ready-release-state.py verify --committed --state "$RUNNER_TEMP/release-state"
+        run: python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
 
       - name: Create release GitHub App token
         if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && steps.import.outputs.has_changes == 'true' }}
@@ -192,19 +185,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
         run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import subprocess
-          number = os.environ["PR_NUMBER"]
-          result = subprocess.run(["gh", "pr", "view", number, "--json", "labels"],
-              check=True, capture_output=True, text=True, timeout=30)
-          existing = {label["name"] for label in json.loads(result.stdout)["labels"]}
-          missing = [label for label in ("A-release", "A-release-state") if label not in existing]
-          if missing:
-              subprocess.run(["gh", "pr", "edit", number, "--add-label", ",".join(missing)],
-                  check=True, timeout=30)
-          PYTHON
+          set -euo pipefail
+          missing=$(gh pr view "$PR_NUMBER" --json labels \
+            --jq '["A-release", "A-release-state"] - [.labels[].name] | join(",")')
+          if [ -n "$missing" ]; then
+            gh pr edit "$PR_NUMBER" --add-label "$missing"
+          fi
 
       - name: Upload non-publishing adoption evidence
         if: inputs.dry_run

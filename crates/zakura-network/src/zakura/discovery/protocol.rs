@@ -736,37 +736,16 @@ pub enum DiscoveryRecordError {
     IncompatibleProtocol,
 }
 
-/// Whether a relayed record that failed `verify_authentic` with `error` is only dropped.
-///
-/// A relay cannot change a third party's signed bytes, and it can legitimately know
-/// nodes whose protocol range does not overlap this node's, so that record is dropped.
-/// Every other failure is one no conformant relay sends, so it disconnects the relay.
-/// Expiry and far-future expiry are local policy checked after verification, and they
-/// also only drop. The match names every variant, so a new error fails the build until
-/// it is classified.
-pub(crate) fn relay_drops(error: &DiscoveryRecordError) -> bool {
-    match error {
-        DiscoveryRecordError::IncompatibleProtocol
-        | DiscoveryRecordError::Expired
-        | DiscoveryRecordError::FarFutureExpiry => true,
-        DiscoveryRecordError::Wire(_)
-        | DiscoveryRecordError::MalformedNodeId
-        | DiscoveryRecordError::InvalidSignature
-        | DiscoveryRecordError::WrongNetwork
-        | DiscoveryRecordError::WrongChain => false,
-    }
-}
-
 /// Default maximum discovery book entries learned from peers.
 pub const DEFAULT_MAX_DISCOVERY_BOOK_RECORDS: usize = 10_000;
 
-/// Default maximum discovery book entries attributed to one source peer.
+/// Default maximum third-party discovery book entries attributed to one relay.
 ///
 /// An honest relay discloses at most one window of 32 records per requester per
 /// 10-minute epoch, so this holds eight epochs of distinct windows. It stops one
-/// relay from filling the book. It does not bound eviction work: a relay's
-/// expired entries leave the book and return their room, so the `Peers`
-/// reservation, 32 records per `GetPeers`, bounds the inserts.
+/// relay from filling the book. A relay at its quota adds an entry only in
+/// place of its own expired entries. The quota does not bound insert work; the
+/// `Peers` reservation, 32 records per `GetPeers`, does.
 pub const DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE: usize = 256;
 
 const HIGH_DIAL_FAILURE_COUNT: u32 = 3;
@@ -784,19 +763,19 @@ pub struct ZakuraDiscoveryBookLimits {
     pub max_services_per_record: usize,
     /// Maximum encoded record size accepted by the book.
     pub max_encoded_record_bytes: usize,
-    /// Maximum records attributed to one source peer.
+    /// Maximum third-party records attributed to one relay.
     pub max_records_per_source: usize,
 }
 
 impl Default for ZakuraDiscoveryBookLimits {
     fn default() -> Self {
         Self {
-            max_records_per_source: DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE,
             max_records: DEFAULT_MAX_DISCOVERY_BOOK_RECORDS,
             max_imported_records_per_response: MAX_DISCOVERY_RECORDS_PER_RESPONSE,
             max_direct_addrs_per_record: MAX_DIRECT_ADDRS_PER_RECORD,
             max_services_per_record: MAX_SERVICES_PER_RECORD,
             max_encoded_record_bytes: MAX_NODE_RECORD_BYTES,
+            max_records_per_source: DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE,
         }
     }
 }
@@ -1078,6 +1057,45 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
     }
 }
 
+/// The verdict for a relayed record that failed its author checks.
+///
+/// The match names every variant, so a new error fails the build until it is
+/// classified. A relay cannot change a third party's signed bytes, and it can
+/// know nodes whose protocol range does not overlap this node's, so that
+/// record only drops. A record can expire in transit, so expiry only drops.
+fn relay_verdict(error: &DiscoveryRecordError) -> RecordVerdict {
+    match error {
+        DiscoveryRecordError::IncompatibleProtocol
+        | DiscoveryRecordError::Expired
+        | DiscoveryRecordError::FarFutureExpiry => RecordVerdict::Drop,
+        DiscoveryRecordError::Wire(_)
+        | DiscoveryRecordError::MalformedNodeId
+        | DiscoveryRecordError::InvalidSignature
+        | DiscoveryRecordError::WrongNetwork
+        | DiscoveryRecordError::WrongChain => RecordVerdict::Disconnect,
+    }
+}
+
+/// Runs the author checks of relayed records. Returns the authentic records
+/// and the number dropped, or the first error that disconnects the relay.
+fn verify_relayed(
+    records: Vec<ZakuraNodeRecord>,
+    context: &DiscoveryRecordValidationContext,
+) -> Result<(Vec<ZakuraNodeRecord>, usize), DiscoveryRecordError> {
+    let mut authentic = Vec::with_capacity(records.len());
+    let mut dropped = 0;
+    for record in records {
+        match record.verify_authentic(context) {
+            Ok(()) => authentic.push(record),
+            Err(error) => match relay_verdict(&error) {
+                RecordVerdict::Drop => dropped += 1,
+                RecordVerdict::Disconnect => return Err(error),
+            },
+        }
+    }
+    Ok((authentic, dropped))
+}
+
 /// In-memory storage for signed Zakura discovery records.
 #[derive(Clone, Debug)]
 pub struct ZakuraDiscoveryBook {
@@ -1097,9 +1115,9 @@ pub struct ZakuraDiscoveryBook {
     /// entry, or a new record for an entry. A small snapshot compares it to
     /// tell when a rebuild would add candidates.
     generation: u64,
-    /// Entries attributed to each source peer. A source with no entries has
-    /// no key.
-    source_counts: HashMap<NodeId, usize>,
+    /// Third-party entries attributed to each relay. A relay with no entries
+    /// has no key.
+    relayed: HashMap<NodeId, usize>,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -1852,15 +1870,13 @@ impl ZakuraDiscoveryHandle {
     /// 1. One lock hold compares the batch with the stored records. A record identical
     ///    to the one stored for its node was verified when it was stored, so it skips
     ///    verification.
-    /// 2. The rest verify in one blocking task under a node-wide verification slot, so
-    ///    Ed25519 work never runs under the discovery mutex and one relay holds at most
-    ///    one slot.
-    /// 3. One lock hold applies expiry, staleness, address, storage, and per-source
+    /// 2. The rest verify off the lock, under one node-wide verification slot.
+    /// 3. One lock hold applies expiry, staleness, address, storage, and per-relay
     ///    policy. Each of those only drops its record: a record can expire in transit,
     ///    and policy is local.
     ///
-    /// Returns the first verification error that no conformant relay causes; see
-    /// [`relay_drops`]. Nothing from the batch is imported then.
+    /// Returns the first verification error that disconnects the relay; see
+    /// [`relay_verdict`]. Nothing from the batch is imported then.
     pub async fn import_peer_records(
         &self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
@@ -1881,7 +1897,7 @@ impl ZakuraDiscoveryHandle {
             return Ok(outcome);
         }
 
-        let (mut verified, unverified): (Vec<_>, Vec<_>) = {
+        let (mut authentic, unverified): (Vec<_>, Vec<_>) = {
             let inner = self.inner.lock().await;
             batch
                 .into_iter()
@@ -1889,44 +1905,26 @@ impl ZakuraDiscoveryHandle {
         };
         if !unverified.is_empty() {
             let unverified_len = unverified.len();
-            let slot = self.verify_slots.reserve().await;
-            let context = self.import_validation.context(current_unix_secs());
-            let checked = tokio::task::spawn_blocking(move || {
-                let _slot = slot;
-                let mut verified = Vec::with_capacity(unverified.len());
-                let mut dropped = 0;
-                for record in unverified {
-                    match record.verify_authentic(&context) {
-                        Ok(()) => verified.push(record),
-                        Err(error) if relay_drops(&error) => dropped += 1,
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok((verified, dropped))
-            })
-            .await
-            .check_for_panics_with(false);
-            let Ok(checked) = checked else {
+            let Some(verified) = self
+                .verify_off_lock(move |context| verify_relayed(unverified, context))
+                .await
+            else {
                 // Shutdown cancelled the task. The relay is not at fault.
                 outcome.rejected += unverified_len;
                 return Ok(outcome);
             };
-            let (fresh, dropped) = checked?;
+            let (fresh, dropped) = verified?;
             outcome.rejected += dropped;
-            verified.extend(fresh);
+            authentic.extend(fresh);
         }
 
         let now = current_unix_secs();
         let mut inner = self.inner.lock().await;
         let context = inner.validation_context(now);
-        for record in verified {
-            if validate_record_expiry(&record.body, &context).is_err() {
-                outcome.rejected += 1;
-                continue;
-            }
+        for record in authentic {
             match inner
                 .book
-                .import_record_inner(record, source, false, true, now, &context)
+                .import_verified_record(record, source, now, &context)
             {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
@@ -2046,7 +2044,6 @@ impl ZakuraDiscoveryHandle {
         let services = normalize_services(record.body.services.clone());
         let mut inner = self.inner.lock().await;
         let context = inner.validation_context(now);
-        validate_record_expiry(&record.body, &context)?;
         if record.body.services.len() > inner.config.book_limits.max_services_per_record {
             return Err(DiscoveryBookError::Limit {
                 field: "service",
@@ -2809,7 +2806,7 @@ impl ZakuraDiscoveryBook {
             disclosure_key: RandomState::new(),
             sample_snapshot: None,
             generation: 0,
-            source_counts: HashMap::new(),
+            relayed: HashMap::new(),
         }
     }
 
@@ -2912,8 +2909,8 @@ impl ZakuraDiscoveryBook {
 
     /// Imports one peer record whose author checks already passed.
     ///
-    /// The caller checked expiry too. Storage limits, address policy, and
-    /// sequence order still run here.
+    /// Expiry, storage limits, address policy, and sequence order still run
+    /// here.
     fn import_verified_record(
         &mut self,
         record: ZakuraNodeRecord,
@@ -3356,9 +3353,9 @@ impl ZakuraDiscoveryBook {
 
     /// Validates and stores one record.
     ///
-    /// When `pre_verified` is set the caller has already run the author checks outside the
-    /// global discovery mutex and checked expiry, so they are not repeated here; the cheap storage-limit, address-policy, insertion, and
-    /// eviction steps still run under the caller's lock.
+    /// When `pre_verified` is set, the caller already ran the author checks outside the
+    /// global discovery mutex, so only expiry runs here. The storage-limit,
+    /// address-policy, insertion, and eviction steps always run under the caller's lock.
     fn import_validated_record(
         &mut self,
         record: ZakuraNodeRecord,
@@ -3371,7 +3368,9 @@ impl ZakuraDiscoveryBook {
             return Err(DiscoveryBookError::SelfRecord);
         }
 
-        if !pre_verified {
+        if pre_verified {
+            validate_record_expiry(&record.body, context)?;
+        } else {
             record.verify(context)?;
         }
         self.validate_record_storage_limits(&record)?;
@@ -3383,47 +3382,46 @@ impl ZakuraDiscoveryBook {
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
         let node_id = record.body.node_id;
-        // A relay may hold only so many entries. The author of a record is
-        // not a relay.
-        let relay_attributed = metadata
-            .source
-            .filter(|source| *source != node_id)
-            .map(|source| self.source_counts.get(&source).copied().unwrap_or(0));
-        let relay_full = relay_attributed
-            .is_some_and(|attributed| attributed >= self.limits.max_records_per_source);
+        // A relay may hold only so many third-party entries.
+        let full_relay = relay_of(metadata.source, node_id).filter(|relay| {
+            self.relayed.get(relay).copied().unwrap_or(0) >= self.limits.max_records_per_source
+        });
         if let Some(entry) = self.entries.get_mut(&node_id) {
+            // An update keeps the book's size, so it is never refused. A full
+            // relay leaves the entry's source alone, so two relays cannot pass
+            // entries back and forth to add without bound.
+            let mut metadata = metadata;
+            if full_relay.is_some() {
+                metadata.source = entry.source;
+            }
+            let old_relay = relay_of(entry.source, node_id);
             let was_confirmed = entry.last_confirmed.is_some();
-            let old_source = entry.source;
             let outcome = update_existing_entry(entry, record, metadata, now);
             if outcome == ImportOutcome::Updated
                 || (!was_confirmed && entry.last_confirmed.is_some())
             {
                 self.generation += 1;
             }
-            // An update keeps the book's size, so it is never refused. A full
-            // relay keeps the entry's old source, so two relays cannot pass
-            // entries back and forth to add without bound.
-            if relay_full {
-                entry.source = old_source;
-            }
-            let new_source = entry.source;
-            if new_source != old_source {
-                self.unattribute(old_source);
-                self.attribute(new_source);
+            let new_relay = relay_of(entry.source, node_id);
+            if new_relay != old_relay {
+                self.unattribute(old_relay);
+                self.attribute(new_relay);
             }
             return Ok(outcome);
         }
-        if let Some(attributed) = relay_attributed.filter(|_| relay_full) {
-            return Err(DiscoveryBookError::Limit {
-                field: "records per source",
-                actual: attributed + 1,
-                max: self.limits.max_records_per_source,
-            });
+        if let Some(relay) = full_relay {
+            if !self.remove_expired_relayed(relay, now) {
+                return Err(DiscoveryBookError::Limit {
+                    field: "records per relay",
+                    actual: self.limits.max_records_per_source + 1,
+                    max: self.limits.max_records_per_source,
+                });
+            }
         }
         if metadata.last_confirmed.is_some() {
             self.generation += 1;
         }
-        self.attribute(metadata.source);
+        self.attribute(relay_of(metadata.source, node_id));
 
         self.entries.insert(
             node_id,
@@ -3488,27 +3486,49 @@ impl ZakuraDiscoveryBook {
             let Some(node_id) = self.next_eviction_candidate(now) else {
                 break;
             };
-            if let Some(entry) = self.entries.remove(&node_id) {
-                self.unattribute(entry.source);
-            }
+            self.remove_entry(&node_id);
         }
     }
 
-    /// Counts one more entry for `source`.
-    fn attribute(&mut self, source: Option<NodeId>) {
-        if let Some(source) = source {
-            *self.source_counts.entry(source).or_default() += 1;
+    /// Removes `node_id`'s entry and its attribution.
+    fn remove_entry(&mut self, node_id: &NodeId) {
+        if let Some(entry) = self.entries.remove(node_id) {
+            self.unattribute(relay_of(entry.source, *node_id));
         }
     }
 
-    /// Counts one fewer entry for `source`.
-    fn unattribute(&mut self, source: Option<NodeId>) {
-        let Some(source) = source else {
+    /// Removes `relay`'s expired third-party entries. Returns whether any
+    /// were removed.
+    ///
+    /// It scans the book, but only for a relay at its quota.
+    fn remove_expired_relayed(&mut self, relay: NodeId, now: u64) -> bool {
+        let expired: Vec<NodeId> = self
+            .entries
+            .iter()
+            .filter(|(node_id, entry)| {
+                relay_of(entry.source, **node_id) == Some(relay) && entry_is_expired(entry, now)
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect();
+        for node_id in &expired {
+            self.remove_entry(node_id);
+        }
+        !expired.is_empty()
+    }
+
+    /// Counts one more entry for `relay`.
+    fn attribute(&mut self, relay: Option<NodeId>) {
+        if let Some(relay) = relay {
+            *self.relayed.entry(relay).or_default() += 1;
+        }
+    }
+
+    /// Counts one fewer entry for `relay`.
+    fn unattribute(&mut self, relay: Option<NodeId>) {
+        let Some(relay) = relay else {
             return;
         };
-        if let std::collections::hash_map::Entry::Occupied(mut count) =
-            self.source_counts.entry(source)
-        {
+        if let std::collections::hash_map::Entry::Occupied(mut count) = self.relayed.entry(relay) {
             *count.get_mut() -= 1;
             if *count.get() == 0 {
                 count.remove();
@@ -3696,6 +3716,12 @@ fn dial_candidate_sort_key<R: rand::Rng + ?Sized>(
         non_static_random_tie,
         static_deterministic_tie,
     )
+}
+
+/// The relay an entry with `source` is attributed to: its source, unless the
+/// source authored the record for `node_id`.
+fn relay_of(source: Option<NodeId>, node_id: NodeId) -> Option<NodeId> {
+    source.filter(|source| *source != node_id)
 }
 
 fn update_existing_entry(
@@ -8708,10 +8734,21 @@ mod tests {
         assert_eq!(outcome.metadata_updated, 1);
     }
 
-    /// One source adds at most its quota of new entries. Updates and other sources
-    /// still import, and eviction returns the source's attribution.
+    /// Recounts each relay's third-party entries from the book.
+    fn recount_relayed(book: &ZakuraDiscoveryBook) -> HashMap<NodeId, usize> {
+        let mut relayed = HashMap::new();
+        for (node_id, entry) in &book.entries {
+            if let Some(relay) = relay_of(entry.source, *node_id) {
+                *relayed.entry(relay).or_default() += 1;
+            }
+        }
+        relayed
+    }
+
+    /// One relay adds at most its quota of new third-party entries. Updates and
+    /// other relays still import.
     #[test]
-    fn per_source_quota_bounds_new_entries() {
+    fn per_relay_quota_bounds_new_entries() {
         const QUOTA: usize = 3;
         let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
             max_records_per_source: QUOTA,
@@ -8731,7 +8768,7 @@ mod tests {
         assert!(matches!(
             book.import_record(extra.clone(), Some(relay), NOW, &context()),
             Err(DiscoveryBookError::Limit {
-                field: "records per source",
+                field: "records per relay",
                 ..
             })
         ));
@@ -8767,8 +8804,70 @@ mod tests {
                 .source,
             Some(relay)
         );
-        assert_eq!(book.source_counts.get(&relay), Some(&QUOTA));
-        assert_eq!(book.source_counts.get(&other_relay), Some(&QUOTA));
+        assert_eq!(book.relayed.get(&relay), Some(&QUOTA));
+        assert_eq!(book.relayed.get(&other_relay), Some(&QUOTA));
+        assert_eq!(book.relayed, recount_relayed(&book));
+    }
+
+    /// A relay at its quota adds a new entry in place of its own expired entries,
+    /// and an entry its author sent never counts against a quota.
+    #[test]
+    fn a_full_relay_reuses_its_expired_entries() {
+        const QUOTA: usize = 2;
+        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
+            max_records_per_source: QUOTA,
+            ..ZakuraDiscoveryBookLimits::default()
+        });
+        let relay_secret = secret_key();
+        let relay = relay_secret.public();
+        book.import_record(
+            record_with_secret(&relay_secret, 1, service(0)),
+            Some(relay),
+            NOW,
+            &context(),
+        )
+        .expect("a relay's own record imports");
+        let short_lived = signed_record_with(1, service(1), test_addr(1));
+        book.import_record(short_lived.clone(), Some(relay), NOW, &context())
+            .expect("the relay is under its quota");
+        book.import_record(
+            long_lived_record_with(1, service(2), test_addr(2)),
+            Some(relay),
+            NOW,
+            &context(),
+        )
+        .expect("the relay's own record does not count against its quota");
+        assert_eq!(book.relayed.get(&relay), Some(&QUOTA));
+
+        let fresh = || long_lived_record_with(1, service(3), test_addr(3));
+        assert!(matches!(
+            book.import_record(fresh(), Some(relay), NOW, &context()),
+            Err(DiscoveryBookError::Limit { .. })
+        ));
+        let later = short_lived.body.expires_at_unix_secs + 1;
+        book.import_record(fresh(), Some(relay), later, &context())
+            .expect("the expired entry makes room");
+        assert!(book.get(&short_lived.body.node_id).is_none());
+        assert_eq!(book.relayed.get(&relay), Some(&QUOTA));
+        assert_eq!(book.relayed, recount_relayed(&book));
+    }
+
+    /// Book eviction returns the evicted entry's attribution.
+    #[test]
+    fn eviction_returns_the_relays_attribution() {
+        let mut book = small_book(2);
+        let relay = secret_key().public();
+        for index in 0..3u8 {
+            let _ = book.import_record(
+                long_lived_record_with(1, service(usize::from(index)), test_addr(index + 1)),
+                Some(relay),
+                NOW,
+                &context(),
+            );
+        }
+        assert_eq!(book.len(), 2);
+        assert_eq!(book.relayed.get(&relay), Some(&2));
+        assert_eq!(book.relayed, recount_relayed(&book));
     }
 
     /// A third-party gossiped record is a local dial hint only. Until its owner confirms

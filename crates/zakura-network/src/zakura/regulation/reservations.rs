@@ -185,7 +185,10 @@ impl ClaimRefused {
         match self {
             Self::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
             Self::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
-            _ => FrameRejection::Unsolicited,
+            Self::Unsolicited { .. }
+            | Self::WrongRequest { .. }
+            | Self::WrongRole { .. }
+            | Self::OverFrames { .. } => FrameRejection::Unsolicited,
         }
     }
 

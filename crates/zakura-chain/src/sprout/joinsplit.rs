@@ -9,14 +9,14 @@ use crate::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::MAX_BLOCK_BYTES,
     fmt::HexDebug,
-    primitives::{x25519, Bctv14Proof, Groth16Proof, ZkSnarkProof},
+    primitives::{Bctv14Proof, Groth16Proof, ZkSnarkProof},
     serialization::{
         ReadZcashExt, SerializationError, TrustedPreallocate, WriteZcashExt, ZcashDeserialize,
         ZcashSerialize,
     },
 };
 
-use super::{commitment, note, tree};
+use super::{commitment, keys::EphemeralPublicKey, note, tree};
 
 /// A 256-bit seed that must be chosen independently at
 /// random for each [JoinSplit description].
@@ -76,8 +76,8 @@ pub struct JoinSplit<P: ZkSnarkProof> {
     pub nullifiers: [note::Nullifier; 2],
     /// A note commitment for this output note.
     pub commitments: [commitment::NoteCommitment; 2],
-    /// An X25519 public key.
-    pub ephemeral_key: x25519::PublicKey,
+    /// An ephemeral X25519 public key, kept as its encoded bytes.
+    pub ephemeral_key: EphemeralPublicKey,
     /// A 256-bit seed that must be chosen independently at random for each
     /// JoinSplit description.
     pub random_seed: RandomSeed,
@@ -109,8 +109,8 @@ pub struct GenericJoinSplit {
     pub nullifiers: [note::Nullifier; 2],
     /// A note commitment for this output note.
     pub commitments: [commitment::NoteCommitment; 2],
-    /// An X25519 public key.
-    pub ephemeral_key: x25519::PublicKey,
+    /// An ephemeral X25519 public key, kept as its encoded bytes.
+    pub ephemeral_key: EphemeralPublicKey,
     /// A 256-bit seed that must be chosen independently at random for each
     /// JoinSplit description.
     pub random_seed: RandomSeed,
@@ -220,7 +220,7 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
             ],
             // Type is `KA^{Sprout}.Public`, i.e. `B^Y^{[32]}`, i.e. 32 bytes.
             // https://zips.z.cash/protocol/protocol.pdf#concretesproutkeyagreement
-            ephemeral_key: x25519_dalek::PublicKey::from(reader.read_32_bytes()?),
+            ephemeral_key: EphemeralPublicKey::from(reader.read_32_bytes()?),
             // Type is `B^{[ℓ_{Seed}]}`, i.e. 32 bytes
             random_seed: RandomSeed::from(reader.read_32_bytes()?),
             // Types are `B^{ℓ^{Sprout}_{PRF}}` i.e. 32 bytes.

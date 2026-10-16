@@ -35,6 +35,11 @@
 # time) or, for a GitHub-only release candidate, by using the override
 # below.
 #
+# Every publishable workspace crate must also have an initial publication
+# on crates.io before merging: Trusted Publishing cannot create new crate
+# entries. Pending version bumps are allowed. The GitHub-only override
+# does not bypass the initial-publication requirement.
+#
 # It also sizes each workspace version against the index: a version more
 # than one release step (patch/minor/major) above the crate's newest stable
 # release means two bumps stacked in one publish cycle — the semver-checks
@@ -214,14 +219,14 @@ while IFS=$'\t' read -r crate version; do
       printf '  %s@%s: to publish\n' "$crate" "$version"
       publish_set+=("${crate}@${version}")
 
-      # Advisory: Trusted Publishing cannot create a crate, because the
+      # Trusted Publishing cannot create a crate, because the
       # configuration authorizing the release workflow lives on an existing
       # crate. Surfacing an unreserved name here puts it in the release PR,
       # rather than in a half-finished publish at T-0. The index response is
       # already cached by the query above, so this costs no extra request.
       if [ -z "$(crates_index_versions "$crate")" ]; then
-        printf '      WARNING: %s has never been published; reserve the name manually and add its crates.io Trusted Publishing entry (docs/release-tag-protection.md) before this release\n' \
-          "$crate"
+        printf '      ERROR: %s has never been published; publish an initial version and add its crates.io Trusted Publishing entry (docs/release-tag-protection.md) before merging\n' \
+          "$crate" >&2
         unreserved=1
       fi
       ;;
@@ -231,6 +236,20 @@ while IFS=$'\t' read -r crate version; do
       ;;
   esac
 done <<<"$publishable"
+
+if [ "$unreserved" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+ERROR: every publishable workspace crate must already exist on crates.io.
+
+Publish an initial version of each crate named above from a trusted
+maintainer machine, then configure its trusted publisher. CI cannot create
+new crates through Trusted Publishing. New versions of existing crates may
+remain unpublished until release; crates with publish = false are exempt.
+The GitHub-only release override does not bypass this requirement.
+EOF
+  exit 1
+fi
 
 echo
 if [ "$oversized" -ne 0 ]; then
@@ -350,8 +369,5 @@ fi
 echo "Publish graph resolves at workspace versions: ${publish_set[*]}"
 if [ "$divergent" = 1 ]; then
   echo "WARNING: published crates with locally diverged requirements were skipped above; review the warnings." >&2
-fi
-if [ "$unreserved" = 1 ]; then
-  echo "WARNING: crate names that do not exist on crates.io were selected above; automated publishing refuses to run until they are reserved and configured." >&2
 fi
 exit 0

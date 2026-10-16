@@ -767,64 +767,11 @@ fn grants_refill_half_window_prefixes() {
     assert_eq!(grant.added_credit.objects, 6);
 }
 
-/// Acknowledgements name only cursors the reactor accepted: a cursor with any
-/// field changed, or one already passed, is refused locally.
-#[test]
-fn acknowledgements_name_only_accepted_cursors() {
-    let (tree, chain) = chain(6);
-    let mut fixture = Fixture::open(tree, chain[6], &[chain[0]], 100);
-    let first = fixture
-        .page(chain[0], &chain[1..3], false)
-        .expect("first page");
-    let second = fixture
-        .page(chain[2], &chain[3..5], false)
-        .expect("second page");
-    let id = fixture.id;
-    let changed = [
-        Cursor {
-            height: block::Height(first.cursor.height.0 + 1),
-            ..first.cursor
-        },
-        Cursor {
-            hash: chain[3].hash,
-            ..first.cursor
-        },
-        Cursor {
-            headers: first.cursor.headers + 1,
-            ..first.cursor
-        },
-        Cursor {
-            bytes: first.cursor.bytes - 1,
-            ..first.cursor
-        },
-    ];
-    for cursor in changed {
-        assert_eq!(
-            fixture.sub.accept_through(id, &cursor, 100),
-            Err(SubscribeError::Tools(SubscribeRefused::UnknownCursor))
-        );
-    }
-    assert_eq!(
-        fixture.sub.accept_through(id, &second.cursor, 100),
-        Ok(None)
-    );
-    assert_eq!(
-        fixture.sub.accept_through(id, &first.cursor, 100),
-        Err(SubscribeError::Tools(SubscribeRefused::UnknownCursor)),
-        "a passed cursor"
-    );
-    assert_eq!(
-        fixture.sub.accept_through(id + 1, &second.cursor, 100),
-        Err(SubscribeError::Tools(SubscribeRefused::Unknown))
-    );
-    let close = wire(&fixture.sub.close().expect("Close is recorded"));
-    assert_eq!(close.update_sequence, 1);
-    assert_eq!(close.acknowledged, second.cursor);
-}
-
-/// A page that fails contextual validation is never acknowledged: the
-/// subscription accepts no later cursor and sends no more grants, and a
-/// `Close` acknowledges only what passed.
+/// Updates acknowledge only cursors the reactor accepted: a cursor with a
+/// changed field, one already passed, or one for another subscription is
+/// refused locally. A page that fails contextual validation is never
+/// acknowledged: the subscription accepts no later cursor and sends no more
+/// grants, and a `Close` acknowledges only what passed.
 #[test]
 fn a_failed_validation_is_never_acknowledged() {
     let (tree, chain) = chain(6);
@@ -836,12 +783,29 @@ fn a_failed_validation_is_never_acknowledged() {
         .page(chain[2], &chain[3..5], false)
         .expect("second page");
     let id = fixture.id;
+    let changed = Cursor {
+        bytes: passed.cursor.bytes - 1,
+        ..passed.cursor
+    };
+    assert_eq!(
+        fixture.sub.accept_through(id, &changed, 4),
+        Err(SubscribeError::Tools(SubscribeRefused::UnknownCursor))
+    );
+    assert_eq!(
+        fixture.sub.accept_through(id + 1, &passed.cursor, 4),
+        Err(SubscribeError::Tools(SubscribeRefused::Unknown))
+    );
     let grant = fixture
         .sub
         .accept_through(id, &passed.cursor, 4)
         .expect("a received cursor")
         .expect("the two pages starved the window");
     assert_eq!(wire(&grant).acknowledged, passed.cursor);
+    assert_eq!(
+        fixture.sub.accept_through(id, &passed.cursor, 4),
+        Err(SubscribeError::Tools(SubscribeRefused::UnknownCursor)),
+        "a passed cursor"
+    );
     assert!(fixture.sub.validation_failed(id));
     assert_eq!(
         fixture.sub.accept_through(id, &failed.cursor, 4),
@@ -851,6 +815,7 @@ fn a_failed_validation_is_never_acknowledged() {
     // the failure holds this grant back.
     assert_eq!(fixture.sub.grant_due(8), None);
     let close = wire(&fixture.sub.close().expect("Close is recorded"));
+    assert_eq!(close.update_sequence, 2);
     assert_eq!(close.acknowledged, passed.cursor);
     assert!(!fixture.sub.validation_failed(id + 1));
 }

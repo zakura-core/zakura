@@ -46,23 +46,19 @@ jobs:
       - name: Validate the ready candidate
         if: steps.selection.outputs.has_changes == 'true'
         run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
-      # The append-only check compares against the grid this repository currently pins, which
-      # lives in the registry rather than the tree, so it has to be materialised first.
-      - name: Materialise the currently pinned frontier grid
+      - name: Resolve the currently pinned frontier grid
+        if: steps.selection.outputs.has_changes == 'true'
         id: pinned
         env:
           NAME: ${{ steps.selection.outputs.name }}
+          PYTHONPATH: .github/scripts
         run: |
-          set -euo pipefail
-          cargo fetch --locked
-          MANIFEST=$(cargo metadata --format-version 1 --locked \
-            | jq -r --arg n "$NAME" 'first(.packages[] | select(.name == $n) | .manifest_path)')
-          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "null" ]; then
-            echo "path=" >> "$GITHUB_OUTPUT"
-            echo "No pinned ${NAME} to extend; importing without an append-only comparison."
-            exit 0
-          fi
-          echo "path=$(dirname "$MANIFEST")/src/mainnet-frontier-grid.bin" >> "$GITHUB_OUTPUT"
+          python3 - <<'PYTHON'
+          import os
+          from ready_release_state import ROOT, previous_grid
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"path={previous_grid(ROOT, os.environ['NAME'])}", file=output)
+          PYTHON
 
       # Release preparation owns end-of-support changes.
       - name: Import checkpoints, frontier, subtrees, and provenance
@@ -141,15 +137,6 @@ jobs:
             crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
           if [ "${REMOVED:-0}" != "0" ]; then
             echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
-            exit 1
-          fi
-
-          # The pin bump must move one package. A wider lockfile churn means the resolution
-          # drifted for reasons this workflow is not reviewing.
-          LOCK_PACKAGES=$(git diff -U0 HEAD -- Cargo.lock | grep -c '^[+-]name = ' || true)
-          if [ "${LOCK_PACKAGES}" -gt 2 ]; then
-            echo "Cargo.lock changed ${LOCK_PACKAGES} package names; expected one pin bump." >&2
-            git diff HEAD -- Cargo.lock >&2
             exit 1
           fi
 

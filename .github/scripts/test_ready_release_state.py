@@ -35,6 +35,22 @@ CLI = load("ready_test_cli", "ready-release-state.py")
 PIN = load("ready_test_pin", "pin-release-state-assets.py")
 
 
+class ReadyUrlTests(unittest.TestCase):
+    def test_invalid_ready_urls_are_rejected_without_a_request(self):
+        urls = (
+            "http://127.0.0.1:1/private",
+            "https://example.com/release-state/published/latest.json",
+            ready.PUBLIC_BASE.removesuffix("/published") + "/latest.json",
+            ready.PUBLIC_BASE + "/latest.json?redirect=elsewhere",
+        )
+        for url in urls:
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as scratch:
+                with patch.object(ready.FETCH, "_download", return_value=b"{}") as fetch:
+                    with self.assertRaises((assets.AssetError, ready.FETCH.BundleError)):
+                        ready.resolve_ready(url, Path(scratch) / "state", fetch=fetch)
+                    fetch.assert_not_called()
+
+
 class CompleteSetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

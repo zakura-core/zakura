@@ -59,20 +59,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  resolve:
-    name: Resolve release preparation inputs
+  prepare:
+    name: Prepare release PR
     if: github.ref == 'refs/heads/main' || inputs.dry_run
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 300
     environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
     permissions:
       contents: read
-    outputs:
-      base_tag: ${{ steps.params.outputs.base_tag }}
-      no_crates_flag: ${{ steps.params.outputs.no_crates_flag }}
-      bundle_height: ${{ steps.release-state.outputs.bundle_height }}
-      estimated_release_height: ${{ steps.release-state.outputs.estimated_release_height }}
-      has_changes: ${{ steps.selection.outputs.has_changes }}
     steps:
       # fetch-depth: 0 — tag resolution, per-crate diffs against BASE_TAG, and
       # cargo-semver-checks --baseline-rev all need full history.
@@ -122,9 +116,12 @@ jobs:
           echo "Preparing ${RELEASE_TAG} from ${BASE_TAG} (rc: ${IS_RC}, flags: '${NO_CRATES_FLAG}')"
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        id: toolchain
         with:
           toolchain: stable
-          cache: false
+          cache-key: prepare-release
+          cache-on-failure: true
+          cache-save-if: false
 
       - name: Resolve the latest verified Mainnet release state
         id: release-state
@@ -154,46 +151,11 @@ jobs:
         run: |
           jq -r '"has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
 
-      - name: Preserve the selected release-state bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
-        with:
-          name: preparation-release-state
-          path: ${{ runner.temp }}/release-state/
-          if-no-files-found: error
-          retention-days: 7
-
-  prepare:
-    name: Prepare release PR
-    needs: [resolve]
-    if: needs.resolve.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout the resolved source revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c #v8.0.1
-        with:
-          name: preparation-release-state
-          path: ${{ runner.temp }}/release-state/
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
-        id: toolchain
-        with:
-          toolchain: stable
-          cache-key: prepare-release
-          cache-on-failure: true
-          cache-save-if: false
       - uses: ./.github/actions/setup-zakura-build
       - name: Verify the preserved ready set
         run: python3 .github/scripts/ready-release-state.py verify --state "$RUNNER_TEMP/release-state"
       - name: Validate the preserved candidate before import
-        if: inputs.release_state_waiver == '' && needs.resolve.outputs.has_changes == 'true'
+        if: inputs.release_state_waiver == '' && steps.selection.outputs.has_changes == 'true'
         run: python3 .github/scripts/release-state-assets.py validate --state "$RUNNER_TEMP/release-state"
 
       - name: Import the latest Mainnet release state
@@ -239,7 +201,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: target/semver-checks/cache
-          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.resolve.outputs.base_tag }}
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ steps.params.outputs.base_tag }}
           restore-keys: |
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
@@ -258,10 +220,10 @@ jobs:
         id: prep
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-          BASE_TAG: ${{ needs.resolve.outputs.base_tag }}
-          NO_CRATES_FLAG: ${{ needs.resolve.outputs.no_crates_flag }}
-          ESTIMATED_RELEASE_HEIGHT: ${{ needs.resolve.outputs.estimated_release_height }}
-          LATEST_RELEASE_STATE_HEIGHT: ${{ needs.resolve.outputs.bundle_height }}
+          BASE_TAG: ${{ steps.params.outputs.base_tag }}
+          NO_CRATES_FLAG: ${{ steps.params.outputs.no_crates_flag }}
+          ESTIMATED_RELEASE_HEIGHT: ${{ steps.release-state.outputs.estimated_release_height }}
+          LATEST_RELEASE_STATE_HEIGHT: ${{ steps.release-state.outputs.bundle_height }}
           RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
           RELEASE_STATE_IMPORTED: ${{ steps.release-state-import.outputs.has_changes }}
         run: |
@@ -305,7 +267,7 @@ jobs:
         continue-on-error: true
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-          BASE_TAG: ${{ needs.resolve.outputs.base_tag }}
+          BASE_TAG: ${{ steps.params.outputs.base_tag }}
         run: |
           make pre-release \
             RELEASE_TAG="$RELEASE_TAG" \

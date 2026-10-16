@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import importlib.util
 import json
 import os
 import shutil
@@ -14,43 +12,9 @@ import tempfile
 from pathlib import Path
 
 from release_state_assets import AssetError, check_identity, publication_needed, verify_visible
-from ready_release_state import fresh, validate_checkpoint_identity
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def load_tool(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-FETCH = load_tool("fetch_release_state", ROOT / ".github/scripts/fetch-release-state.py")
-IMPORT = load_tool("import_release_state", ROOT / ".github/scripts/import-release-state.py")
-PACK = load_tool("pack_assets", ROOT / "scripts/pack-assets-crate.py")
-
-
-def select(root: Path, bundle: Path, resolution: dict) -> dict:
-    grid = (bundle / PACK.GRID_NAME).read_bytes()
-    height, _entries, _payload = PACK.parse_grid(grid, str(bundle))
-    if height != resolution["height"]:
-        raise AssetError("grid and selected bundle have different checkpoint heights")
-    committed = IMPORT._checkpoint_height((root / IMPORT.CHECKPOINTS).read_bytes(), "committed list")
-    result = {**resolution, "has_changes": height > committed,
-              "name": PACK.crate_name(root / "crates/zakura-assets"),
-              "version": f"0.{height}.0", "grid_sha256": hashlib.sha256(grid).hexdigest()}
-    check_identity(result)
-    return result
-
-
-def previous_grid(root: Path, name: str) -> Path:
-    result = subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked"],
-                            cwd=root, check=True, capture_output=True, text=True, timeout=300)
-    packages = [p for p in json.loads(result.stdout)["packages"] if p["name"] == name]
-    if len(packages) != 1:
-        raise AssetError("expected exactly one currently pinned frontier grid")
-    return Path(packages[0]["manifest_path"]).parent / "src/mainnet-frontier-grid.bin"
+from ready_release_state import (
+    ROOT, FETCH, IMPORT, PACK, fresh, previous_grid, select, validate_checkpoint_identity,
+)
 
 
 def validate_candidate(root: Path, bundle: Path, selected: dict) -> None:

@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -14,9 +15,19 @@ from pathlib import Path
 from release_state_assets import AssetError, check_identity, registry_grid, verify_visible
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location("ready_bundle_fetch", ROOT / ".github/scripts/fetch-release-state.py")
-FETCH = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(FETCH)
+
+
+def _load_tool(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+FETCH = _load_tool("fetch_release_state", ROOT / ".github/scripts/fetch-release-state.py")
+IMPORT = _load_tool("import_release_state", ROOT / ".github/scripts/import-release-state.py")
+PACK = _load_tool("pack_assets", ROOT / "scripts/pack-assets-crate.py")
+
 RESOLUTION_KEYS = ("height", "block_hash", "generated_at", "meta_url", "meta_sha256")
 MAX_AGE = timedelta(hours=48)
 PUBLIC_BASE = "https://zakura-release.valargroup.dev/release-state/published"
@@ -25,6 +36,30 @@ R2_ENDPOINT = "https://152e2a8834283136c2f0575782b1b7aa.r2.cloudflarestorage.com
 R2_BUCKET = "zakura-release-state"
 POINTER_KEYS = FETCH.LATEST_REQUIRED_KEYS | {"asset"}
 ASSET_KEYS = {"name", "version", "checksum", "grid_sha256"}
+
+
+def select(root: Path, bundle: Path, resolution: dict) -> dict:
+    """Bind a bundle to its grid crate and compare its height with committed state."""
+    grid = (bundle / PACK.GRID_NAME).read_bytes()
+    height, _entries, _payload = PACK.parse_grid(grid, str(bundle))
+    if height != resolution["height"]:
+        raise AssetError("grid and selected bundle have different checkpoint heights")
+    committed = IMPORT._checkpoint_height((root / IMPORT.CHECKPOINTS).read_bytes(), "committed list")
+    result = {**resolution, "has_changes": height > committed,
+              "name": PACK.crate_name(root / "crates/zakura-assets"),
+              "version": f"0.{height}.0", "grid_sha256": hashlib.sha256(grid).hexdigest()}
+    check_identity(result)
+    return result
+
+
+def previous_grid(root: Path, name: str) -> Path:
+    """Resolve exactly one currently pinned grid, refusing missing or ambiguous packages."""
+    result = subprocess.run(["cargo", "metadata", "--format-version", "1", "--locked"],
+                            cwd=root, check=True, capture_output=True, text=True, timeout=300)
+    packages = [p for p in json.loads(result.stdout)["packages"] if p["name"] == name]
+    if len(packages) != 1:
+        raise AssetError("expected exactly one currently pinned frontier grid")
+    return Path(packages[0]["manifest_path"]).parent / "src/mainnet-frontier-grid.bin"
 
 
 def fresh(generated_at: str, now: datetime | None = None) -> None:
@@ -36,10 +71,15 @@ def fresh(generated_at: str, now: datetime | None = None) -> None:
         raise AssetError("release-state set is older than 48 hours; publish a fresh export")
 
 
-def parse_ready(data: bytes, url: str, *, now=None, check_age=True) -> dict:
+def validate_ready_url(url: str) -> None:
+    """Reject URLs outside the allowed HTTPS published namespace before any request."""
     FETCH._validate_url(url, "ready pointer")
     if not url.endswith("/published/latest.json"):
         raise AssetError("ready pointer must use the separate published prefix")
+
+
+def parse_ready(data: bytes, url: str, *, now=None, check_age=True) -> dict:
+    validate_ready_url(url)
     value = FETCH._parse_json(data, "ready manifest")
     FETCH._check_keys(value, POINTER_KEYS, set(), "ready manifest")
     if type(value["schema_version"]) is not int or value["schema_version"] != 2 or value["network"] != "Mainnet":
@@ -75,6 +115,7 @@ def validate_checkpoint_identity(bundle: Path, resolution: dict) -> None:
 def resolve_ready(url: str, output: Path, *, fetch=FETCH._download, registry_fetch=None,
                   cargo_resolve=None, now=None) -> dict:
     """Resolve once, verify all bytes and Cargo, then expose a complete local snapshot."""
+    validate_ready_url(url)
     manifest_bytes = fetch(url, FETCH.LATEST_MAX_BYTES)
     manifest = parse_ready(manifest_bytes, url, now=now)
     if output.exists():

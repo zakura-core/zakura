@@ -463,7 +463,8 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
-    /// Changes to target ownership or awaiting-locator claims invalidate cached offers.
+    /// Changes to target ownership or awaiting/active state invalidate cached offers.
+    /// The reactor separately tracks effective virtual claims using negotiated limits.
     pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
         self.scheduling_revision
     }
@@ -604,7 +605,9 @@ impl PeerWorkQueue {
                 } => {
                     self.request_reservations.remove(&peer);
                     self.staged_capacity.remove(&peer);
-                    if **current != target || *current_priority != priority {
+                    // Replacing metadata or priority does not release a target.
+                    // The reactor tracks changes to the negotiated locator claim.
+                    if current.status.selected_tip_hash != target.status.selected_tip_hash {
                         self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
                     }
                     **current = target;

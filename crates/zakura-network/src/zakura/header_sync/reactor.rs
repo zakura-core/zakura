@@ -1182,10 +1182,6 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
-        let offer_changed = self
-            .peer_state
-            .get(&peer)
-            .is_some_and(|state| state.last_status.as_ref() != Some(&status) || state.status_spent);
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
             state.status_spent = false;
@@ -1195,16 +1191,10 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
-        self.consider_advertised_header_target(peer.clone(), session_id, status);
-        if offer_changed
-            && !self.peer_work_queue.has_work(&peer)
-            && self
-                .peer_state
-                .get(&peer)
-                .is_some_and(|state| !state.status_spent)
-        {
-            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
-        }
+        // This offer is considered synchronously. If it remains blocked, changing
+        // its payload cannot make another peer eligible. Shared ownership and
+        // effective locator claims below invalidate the global pass when needed.
+        self.consider_advertised_header_target(peer, session_id, status);
     }
 
     /// Stage ordinary work for `peer`'s latest status.
@@ -1256,12 +1246,20 @@ impl HeaderSyncReactor {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
+        let previous_claim = self
+            .peer_work_queue
+            .awaiting_target(&peer)
+            .map(|target| self.pending_locator_header_count(&target.status));
+        let next_claim = self.pending_locator_header_count(&target.status);
         match self.peer_work_queue.stage_distinct_target(
             peer.clone(),
             target,
             PeerWorkPriority::from_work_order(work_order),
         ) {
             QueueWorkResult::NeedsLocator => {
+                if previous_claim.is_some_and(|claimed| claimed != next_claim) {
+                    self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+                }
                 self.spend_status(&peer);
                 if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                     peer: peer.clone(),
@@ -1404,11 +1402,7 @@ impl HeaderSyncReactor {
             .peer_work_queue
             .awaiting_targets()
             .filter(|(owner, _)| *owner != peer)
-            .map(|(_, target)| {
-                usize::try_from(self.negotiated_response_limits(&target.status).1)
-                    .unwrap_or(usize::MAX)
-                    .min(MAX_HEADER_CHUNK_RESERVATION_V1)
-            })
+            .map(|(_, target)| self.pending_locator_header_count(&target.status))
             .fold(0, usize::saturating_add);
         let claimed = self
             .peer_work_queue
@@ -1418,6 +1412,13 @@ impl HeaderSyncReactor {
             .reservable_header_count(self.negotiated_response_limits(status).1.min(
                 Self::request_header_prefix_remaining(local, claimed, status.selected_tip_height),
             ))
+    }
+
+    /// The effective virtual claim used by ordinary headroom and cache invalidation.
+    fn pending_locator_header_count(&self, status: &Status) -> usize {
+        usize::try_from(self.negotiated_response_limits(status).1)
+            .unwrap_or(usize::MAX)
+            .min(MAX_HEADER_CHUNK_RESERVATION_V1)
     }
 
     /// Return the response schema and the most headers that one response from `status`'s

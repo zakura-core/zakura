@@ -1166,3 +1166,172 @@ async fn final_header_lease_drop_wakes_blocked_offers_without_queue_mutation() {
         expect_locator_query(&mut actions, &alternate, status.selected_tip_hash);
     }
 }
+
+fn assert_status_metadata_churn_is_local(no_headroom: bool, awaiting_owner: bool) {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (owner, outbound) = connect(&mut reactor, 0);
+    let owner_status = if awaiting_owner {
+        let mut status = status_for(&snapshot, block::Hash([0x80; 32]));
+        status.max_headers_per_response = 4000;
+        reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+        status
+    } else {
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+        applying_target_status(&reactor, &owner)
+    };
+    if no_headroom {
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&owner, 4000, 0);
+    }
+    let mut outbounds = vec![outbound];
+    let mut blocked = None;
+    for byte in 1..=64 {
+        let (peer, outbound) = connect(&mut reactor, byte);
+        outbounds.push(outbound);
+        let status = if no_headroom {
+            status_for(&snapshot, block::Hash([byte; 32]))
+        } else {
+            owner_status.clone()
+        };
+        reactor.handle_wire_message(peer.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+        blocked = Some((peer, status));
+    }
+    reactor.schedule_cached_statuses();
+    let visits = reactor.cached_offer_visits;
+    let (peer, mut status) = if awaiting_owner {
+        (owner, owner_status)
+    } else {
+        blocked.unwrap()
+    };
+    for height in 1..=64 {
+        status.oldest_retained_height = block::Height(height);
+        reactor.handle_wire_message(peer.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+        reactor.schedule_cached_statuses();
+    }
+    assert_eq!(reactor.cached_offer_visits - visits, 0);
+    // Neither nonzero slot-count changes nor limits above the effective virtual
+    // claim change other peers' headroom. Priority is retained for later eviction,
+    // but changing it does not itself release ownership or capacity.
+    for value in 1..=64 {
+        status.max_inflight_requests = value + 1;
+        status.max_message_bytes = 2_000_000 + u32::from(value);
+        status.suffix_cumulative_work = zakura_chain::work::difficulty::U256::from(value % 2);
+        if awaiting_owner {
+            status.max_headers_per_response = 4000 - u32::from(value);
+        }
+        reactor.handle_wire_message(peer.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+        reactor.schedule_cached_statuses();
+    }
+    assert_eq!(reactor.cached_offer_visits - visits, 0);
+    assert_eq!(
+        reactor.peer_state[&peer].last_status.as_ref(),
+        Some(&status)
+    );
+    if awaiting_owner {
+        assert_eq!(
+            &reactor
+                .peer_work_queue
+                .awaiting_target(&peer)
+                .unwrap()
+                .status,
+            &status
+        );
+    }
+}
+
+#[test]
+fn blocked_duplicate_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(false, false);
+}
+
+#[test]
+fn blocked_headroom_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(true, false);
+}
+
+#[test]
+fn awaiting_locator_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(false, true);
+}
+
+#[test]
+fn pending_locator_claim_shrink_wakes_cached_offer_without_changing_target() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (budget_owner, _budget_outbound) = connect(&mut reactor, 1);
+    seed_applying_request(&mut reactor, &snapshot, budget_owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&budget_owner, 3998, 0);
+    let (owner, _outbound) = connect(&mut reactor, 2);
+    let mut status = status_for(&snapshot, block::Hash([2; 32]));
+    status.max_headers_per_response = 2;
+    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 3);
+    reactor.handle_wire_message(
+        alternate.clone(),
+        0,
+        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([3; 32]))),
+    );
+    reactor.schedule_cached_statuses();
+    let visits = reactor.cached_offer_visits;
+    assert!(!reactor.peer_work_queue.has_work(&alternate));
+    status.max_headers_per_response = 1;
+    reactor.handle_wire_message(owner, 0, HeaderSyncMessage::Status(status));
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_offer_visits > visits);
+    assert!(reactor
+        .peer_work_queue
+        .awaiting_target(&alternate)
+        .is_some());
+    assert_eq!(reactor.pending_locator_queries.len(), 2);
+}
+
+#[test]
+fn awaiting_owner_retarget_wakes_old_target_alternate() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (owner, _outbound) = connect(&mut reactor, 1);
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 2);
+    let status = status_for(&snapshot, block::Hash([1; 32]));
+    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_wire_message(alternate.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.schedule_cached_statuses();
+    assert!(!reactor.peer_work_queue.has_work(&alternate));
+    reactor.handle_wire_message(
+        owner,
+        0,
+        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([3; 32]))),
+    );
+    reactor.schedule_cached_statuses();
+    assert!(reactor
+        .peer_work_queue
+        .awaiting_target(&alternate)
+        .is_some());
+    assert_eq!(reactor.pending_locator_queries.len(), 2);
+}
+
+#[test]
+fn changed_offer_is_considered_immediately_without_global_invalidation() {
+    for field in 0..4 {
+        let (mut reactor, _actions, snapshot) = offers_reactor();
+        reactor.startup.port_dispatch = PortDispatch::Direct;
+        let (peer, _outbound) = connect(&mut reactor, 1);
+        let eligible = status_for(&snapshot, block::Hash([1; 32]));
+        let mut ineligible = eligible.clone();
+        match field {
+            0 => ineligible.max_inflight_requests = 0,
+            1 => ineligible.max_headers_per_response = 0,
+            2 => ineligible.max_message_bytes = 0,
+            _ => ineligible.selected_tip_height = snapshot.frontiers.finalized.height,
+        }
+        reactor.handle_wire_message(peer.clone(), 0, HeaderSyncMessage::Status(ineligible));
+        reactor.schedule_cached_statuses();
+        assert!(!reactor.peer_work_queue.has_work(&peer));
+        // Admission of this peer does not depend on running the cached-offer pass.
+        reactor.handle_wire_message(peer.clone(), 0, HeaderSyncMessage::Status(eligible));
+        assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
+    }
+}

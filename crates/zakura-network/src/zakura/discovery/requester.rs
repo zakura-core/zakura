@@ -254,7 +254,7 @@ impl Queries {
         };
         let mut live = self.lock();
         if self.transport_admits {
-            live.reservations.take_admitted(payload_len);
+            live.reservations.take_admitted(message_type, payload_len);
         }
         live.reservations
             .claim_end(&kind, message_type, payload_len)?;
@@ -521,7 +521,8 @@ mod tests {
     }
 
     /// The transport reader queues a `Services` only while a `GetServices`
-    /// is owed, and refuses one above its reservation.
+    /// is owed, and refuses one above its reservation. A live `GetPeers`
+    /// lends it no credit.
     #[tokio::test]
     async fn the_transport_reader_queues_only_owed_services() {
         let slot = PrecheckSlot::default();
@@ -539,9 +540,14 @@ mod tests {
             Err(FrameRejection::Unsolicited)
         );
         queries
+            .send_get_peers(get_peers(32))
+            .await
+            .expect("GetPeers is sent");
+        queries
             .send_get_services(get_services(Vec::new()))
             .await
             .expect("the query is sent");
+        written.recv().await.expect("GetPeers was queued");
         written.recv().await.expect("the query was queued");
         assert!(matches!(
             precheck.check(SERVICES, services_len(0) + 1),
@@ -556,8 +562,9 @@ mod tests {
         ));
     }
 
-    /// The transport reader queues at most the one `Peers` this node is owed.
-    /// Its claim releases the queued answer.
+    /// The transport reader queues at most the one `Peers` this node is owed,
+    /// even while a `GetServices` is owed too. Its claim releases the queued
+    /// answer.
     #[tokio::test]
     async fn the_transport_reader_queues_at_most_the_owed_peers() {
         let slot = PrecheckSlot::default();
@@ -575,9 +582,14 @@ mod tests {
             Err(FrameRejection::Unsolicited)
         );
         queries
+            .send_get_services(get_services(Vec::new()))
+            .await
+            .expect("GetServices is sent");
+        queries
             .send_get_peers(get_peers(1))
             .await
             .expect("the query is sent");
+        written.recv().await.expect("GetServices was queued");
         written.recv().await.expect("the query was queued");
 
         precheck

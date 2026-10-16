@@ -177,7 +177,9 @@ impl LiveRequester {
     /// Endings are small and must validate before their reservation is removed.
     pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
         if self.transport_admits && (3..=5).contains(&frame.message_type) {
-            self.shared.lock().take_admitted(frame.payload.len());
+            self.shared
+                .lock()
+                .take_admitted(frame.message_type, frame.payload.len());
         }
         let rule = MessageRule::find(RULES, frame.message_type)
             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
@@ -296,7 +298,7 @@ mod tests {
         assert_eq!(reader.check(1, 53), Ok(()));
 
         // The routine takes and claims the body, then the ending.
-        requester.shared.lock().take_admitted(50);
+        requester.shared.lock().take_admitted(3, 50);
         requester.shared.lock().claim_block(hash, 50).unwrap();
         let mut ending = vec![4];
         ending.extend_from_slice(&1u32.to_le_bytes());

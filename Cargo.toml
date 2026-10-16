@@ -45,7 +45,7 @@ edition = "2021"
 # Published from `crates/zakura-assets/` in this repository. The dependency name and the
 # published name now match, so no `package` rename is needed: every consumer, script, and
 # gate refers to `zakura-assets` and nothing else.
-zakura-assets = { version = "=0.3513777.0" }
+zakura-assets = { version = "=0.3517272.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "=3.0.0", package = "zakura-orchard", default-features = false, features = ["circuit", "multicore", "std"] }
 sapling-crypto = { version = "=3.0.0", package = "zakura-sapling-crypto", default-features = false, features = ["circuit", "multicore"] }
@@ -153,7 +153,9 @@ tokio-util = "0.7.14"
 toml = "1.0"
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
-tonic-prost-build = "0.14"
+# `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,
+# pulldown-cmark-to-cmark and unicase; xtask does not need it.
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 tonic-reflection = "0.14"
 tower = "0.5.3"
 tracing = "0.1.41"
@@ -165,7 +167,6 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
-x25519-dalek = "2.0.1"
 zcash_note_encryption = { version = "=3.0.0", package = "zakura-note-encryption" }
 zcash_script = "0.6"
 zeroize = "1.8"

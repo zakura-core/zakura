@@ -118,7 +118,7 @@ jobs:
       - name: Check release readiness advisories
         env:
           EXPECTED_TAG_DELAY_DAYS: ${{ inputs.expected_tag_delay_days }}
-          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
+          LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_READY_URL }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_STATE_WAIVER: ${{ inputs.release_state_waiver }}
         run: |
@@ -135,7 +135,7 @@ jobs:
           trap advisory_exit EXIT
           set -euo pipefail
           if [ -z "$LATEST_URL" ]; then
-            echo "::warning title=Release-state advisory unavailable::Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable."
+            echo "::warning title=Release-state advisory unavailable::Set the MAINNET_RELEASE_STATE_READY_URL repository variable."
             exit 0
           fi
           if [ -n "$RELEASE_STATE_WAIVER" ] && [[ "$RELEASE_TAG" != *-rc* ]]; then
@@ -163,17 +163,15 @@ jobs:
           )"; then
             echo "::warning title=Release level advisory::The requested tag is below the changelog-derived release level; continuing temporarily."
           fi
-          if ! python3 .github/scripts/fetch-release-state.py \
-            --latest-url "$LATEST_URL" \
-            --output-dir "$RUNNER_TEMP/release-state-bundle" \
-            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"; then
+          if ! READY_URL="$LATEST_URL" python3 .github/scripts/release_state.py ready \
+            --state "$RUNNER_TEMP/readiness-state"; then
             echo "::warning title=Release-state advisory unavailable::The latest Mainnet release-state bundle could not be verified; continuing temporarily."
             exit 0
           fi
           report=""
           if ! report="$(
             python3 scripts/release-readiness.py height \
-              --resolution "$RUNNER_TEMP/release-state-resolution.json" \
+              --resolution "$RUNNER_TEMP/readiness-state/resolution.json" \
               --expected-tag-delay-days "$EXPECTED_TAG_DELAY_DAYS"
           )"; then
             echo "::warning title=Support-height advisory unavailable::The projected release height could not be calculated; continuing temporarily."

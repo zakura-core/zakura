@@ -12,9 +12,9 @@ rollback pattern generalized to a dynamic multi-node config.
 - Python 3.11+ (uses the stdlib `tomllib`; no third-party packages).
 - A working SSH key for every node's `ssh_string` (key-based auth; the tool runs
   ssh in `BatchMode`, so password prompts are not supported).
-- A local Rust toolchain + `protoc` to build `zakurad` (same as a normal workspace
-  build). Builds run on this host; the resulting binary is copied to every node,
-  so nodes must share the build host's architecture and a compatible glibc
+- A local Rust toolchain and the normal workspace build dependencies to build
+  `zakurad`. Builds run on this host; the resulting binary is copied to every
+  node, so nodes must share the build host's architecture and a compatible glibc
   (DigitalOcean Ubuntu x86_64 droplets do).
 
 ## Config

@@ -8,7 +8,7 @@ use zakura_quic::{NodeAddr, QuicEndpoint};
 
 use super::{
     service::LayoutShared, LayoutService, LayoutSession, SiblingService, StreamConformance,
-    CONFORMANCE_DEADLINE, SIBLINGS,
+    UpdateOp, CONFORMANCE_DEADLINE, SIBLINGS,
 };
 use crate::{
     zakura::{
@@ -245,13 +245,21 @@ impl<A: StreamConformance> LayoutNode<A> {
                 break;
             }
             if let Some(added) = due {
-                self.service.grant(peer, row, key, added).await?;
+                self.service
+                    .update(peer, row, key, UpdateOp::Grant, |subscriptions| {
+                        subscriptions.grant(&key, added)
+                    })
+                    .await?;
             }
             tokio::time::timeout(CONFORMANCE_DEADLINE, accepted.changed())
                 .await
                 .map_err(|_| "timed out waiting for a page")??;
         }
-        self.service.close(peer, row, key).await?;
+        self.service
+            .update(peer, row, key, UpdateOp::Close, |subscriptions| {
+                subscriptions.close(&key)
+            })
+            .await?;
         tokio::time::timeout(
             CONFORMANCE_DEADLINE,
             ended.wait_for(|ended| ended[before..].contains(&(row, key))),

@@ -535,47 +535,11 @@ impl<A: StreamConformance> LayoutService<A> {
         sent
     }
 
-    /// Record a `Grant` of `added` on subscription `key` of
-    /// `subscription_type` with `peer`, then write it.
-    pub(crate) async fn grant(
-        &self,
-        peer: &ZakuraPeerId,
-        subscription_type: u16,
-        key: u32,
-        added: Credit,
-    ) -> Result<(), BoxError> {
-        self.update(
-            peer,
-            subscription_type,
-            key,
-            UpdateOp::Grant,
-            |subscriptions| subscriptions.grant(&key, added),
-        )
-        .await
-    }
-
-    /// Record a `Close` of subscription `key` of `subscription_type` with
-    /// `peer`, then write it. Pages within its credit may still arrive before
-    /// its ending.
-    pub(crate) async fn close(
-        &self,
-        peer: &ZakuraPeerId,
-        subscription_type: u16,
-        key: u32,
-    ) -> Result<(), BoxError> {
-        self.update(
-            peer,
-            subscription_type,
-            key,
-            UpdateOp::Close,
-            |subscriptions| subscriptions.close(&key),
-        )
-        .await
-    }
-
-    /// Record an `op` update of subscription `key` with `record`, then write
-    /// it on the subscription row's member.
-    async fn update(
+    /// Record an `op` update of subscription `key` with `record`, such as
+    /// `Subscriptions::grant` or `Subscriptions::close`, then write it on the
+    /// subscription row's member. After a `Close`, pages within the credit may
+    /// still arrive before the ending.
+    pub(crate) async fn update(
         &self,
         peer: &ZakuraPeerId,
         subscription_type: u16,

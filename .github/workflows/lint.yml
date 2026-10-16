@@ -204,6 +204,12 @@ jobs:
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: Install the pinned release-state test client
+        if: ${{ !cancelled() }}
+        run: python3 -m pip install --disable-pip-version-check -r .github/scripts/requirements-release-state.txt
+      - name: Release-state asset pin tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*release_state*.py'
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}

@@ -97,6 +97,9 @@ audit-as-crates-io = true
 [policy.zakura-protocol]
 audit-as-crates-io = true
 
+[policy.zakura-quic]
+audit-as-crates-io = false
+
 [policy.zakura-reddsa]
 audit-as-crates-io = true
 

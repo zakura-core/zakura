@@ -27,6 +27,7 @@ on:
       - .github/workflows/tests-unit.yml
       - .github/workflows/zakura-e2e.yml
       - scripts/check-crate-publish-graph.sh
+      - scripts/tests/test_crate_publish_graph.sh
       - scripts/lib/crates-index.sh
       - docs/specs/fork-aware-header-chain-engine.md
       - crates/zakura-header-chain/conformance.toml
@@ -195,7 +196,7 @@ jobs:
           # Semver-checks cannot see a dependency major underneath unchanged
           # type names. This path set is what can introduce a skipped crate
           # whose index manifest still pins the old major.
-          if grep -qE '(^|/)Cargo\.(toml|lock)$|^scripts/check-crate-publish-graph\.sh$|^scripts/lib/crates-index\.sh$|^\.github/workflows/tests-unit\.yml$' <<< "$changed"; then
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^scripts/check-crate-publish-graph\.sh$|^scripts/tests/test_crate_publish_graph\.sh$|^scripts/lib/crates-index\.sh$|^\.github/workflows/tests-unit\.yml$' <<< "$changed"; then
             publish_graph=true
           else
             publish_graph=false
@@ -487,6 +488,8 @@ jobs:
           toolchain: stable
           # Packages crates with --no-verify; does not compile them.
           cache: false
+      - name: Test crate publication gate
+        run: bash scripts/tests/test_crate_publish_graph.sh
       - name: Check crates.io publish graph
         run: ./scripts/check-crate-publish-graph.sh
 

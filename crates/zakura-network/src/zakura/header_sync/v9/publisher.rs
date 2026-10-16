@@ -5,67 +5,37 @@
 //! cursor ring, and tombstones. This module adds what only header sync knows:
 //! which headers each page carries, and when a subscription ends.
 //!
-//! # One task per session
-//!
-//! One task writes every page and terminal outcome of a session, so an outcome
+//! One task per session writes every page and terminal outcome, so an outcome
 //! always follows its subscription's pages. [`Publisher::apply`] applies each
-//! update under a short lock and wakes the task. The task holds at most one
-//! page in progress, so a `Grant` never queues page jobs. A `Close` ends its
+//! update under a short lock and wakes the task, which holds at most one page
+//! in progress, so a `Grant` never queues page jobs. A `Close` ends its
 //! subscription on the next wake and abandons that subscription's page in
-//! progress. The terminal outcome needs no credit, output grant, or execution
-//! slot, so `Close` never waits for a serving worker or for output.
+//! progress. Its terminal outcome waits for no credit or output, as
+//! [`TerminalPermit::send`] describes.
 //!
-//! # Pages
-//!
-//! A page waits for the budgets of a served response through [`Push`], then a
-//! spawned job reads it from state while holding the permit. The job keeps the
-//! permit until the state read finishes, even if the session ends first. A
-//! page carries at most the advertised header and byte limits and the unspent
-//! credit, and at least one header.
-//!
-//! The path to the initial target comes from the retained-path leases in
-//! [`Port`]: one lease per page, acquired and read back to back. The first
-//! page acquires with the `Open` locators. Each later page acquires with the
+//! Pages come from the retained-path leases in [`Port`], one lease per page,
+//! acquired and read back to back. Each page after the first acquires with the
 //! last header sent as its only locator, which state's continuation index
-//! answers without a new ancestry walk. A lease's idle deadline therefore
-//! covers only one read, and a lost lease is acquired again from the last
-//! header sent. No subscription ends because a lease expired.
-//!
-//! After the target, the publisher follows [`Port::selected_chain`]. It leases
-//! the path from the last header sent to the selected tip, which also checks
-//! that the selected chain still extends that header. If it does not, the
-//! subscription ends with `SubscriptionSuperseded`. A page whose selected tip
-//! moved while it was in progress is checked again before it is sent, and
-//! read again if it left the selected chain.
-//!
-//! # Waits and outcomes
-//!
-//! Version 9 has no `Busy`. When state refuses a lease for capacity, the
-//! subscription waits for that capacity's release signal. Other local
-//! failures wait for the next update or selected-chain change. Neither sends
-//! anything, and neither uses a timer.
-//!
-//! A schema-1 subscription needs a record for every header. A page stops
-//! before the first header that has none, and a subscription whose next
-//! header has none waits, because a page's schema must match its
-//! subscription.
-//!
-//! Every outcome is adjusted into its legal window before it is queued: a
-//! lease result that is legal only before the first page becomes
-//! `HistoryPruned` after it, and every failure after the initial target
-//! becomes `SubscriptionSuperseded`.
+//! answers without a new ancestry walk. So a lease's idle deadline covers one
+//! read, and no subscription ends because a lease expired. After the initial
+//! target, the leases run from the last header sent to the tip of
+//! [`Port::selected_chain`]. Local failures wait for an update, a
+//! selected-chain change, or a capacity release, never for a timer.
 
 use std::{
+    any::Any,
     collections::BTreeMap,
     future::Future,
     num::NonZeroU32,
     ops::Bound,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
 };
 
+use futures::FutureExt;
 use thiserror::Error;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 use zakura_header_chain::{
@@ -212,8 +182,9 @@ impl Publisher {
     /// Start publishing on one session, and return the handle with the task
     /// that writes pages and outcomes to `send` until `cancel` fires.
     ///
-    /// The task re-raises a page job's panic, so the session's owner sees it
-    /// through the returned handle and can close the session.
+    /// The task re-raises a page job's panic, even one whose page it had
+    /// abandoned, so the session's owner sees it through the returned handle
+    /// and can close the session.
     ///
     /// `HEADER_BYTES` is the network's encoded header size, which selects the
     /// version 9 codec.
@@ -233,6 +204,8 @@ impl Publisher {
             last_served: None,
         }));
         let wake = Arc::new(Notify::new());
+        // One panic ends the task, so the channel never needs more room.
+        let (panics, panicked) = mpsc::channel(1);
         let task = tokio::spawn(publish::<HEADER_BYTES>(
             Task {
                 shared: shared.clone(),
@@ -241,8 +214,10 @@ impl Publisher {
                 push,
                 owner,
                 limits,
+                panics,
             },
             send,
+            panicked,
             cancel,
         ));
         (
@@ -268,25 +243,6 @@ impl Publisher {
         }
         tokio::task::coop::consume_budget().await;
         applied
-    }
-}
-
-#[cfg(test)]
-impl Publisher {
-    /// Live or closing subscriptions, tombstones, and `Open`s admitted above
-    /// the limit, as the subscription tools count them.
-    fn tally(&self) -> (usize, usize, u64) {
-        let shared = lock(&self.shared);
-        (
-            shared.publications.keys().count(),
-            shared.publications.tombstones(),
-            shared.publications.over_limit_count(),
-        )
-    }
-
-    /// Unacknowledged pages of `id`, if it is live.
-    fn unacknowledged(&self, id: u64) -> Option<usize> {
-        lock(&self.shared).publications.unacknowledged(&id)
     }
 }
 
@@ -461,11 +417,11 @@ impl Shared {
                     continue;
                 }
             }
-            if subscription.stall.is_some() {
-                continue;
-            }
             let schema = subscription.fixed.schema;
             let count = page_room(unspent, schema, limits, HEADER_BYTES);
+            if subscription.stall.is_some() || count == 0 {
+                continue;
+            }
             let job = if let Position::Following(last) = subscription.position {
                 let Some(selected) = selected else {
                     continue;
@@ -473,9 +429,6 @@ impl Shared {
                 let tip = selected.frontiers.header_best;
                 // The check above ended a tip at or below the last header.
                 if tip.height <= last.height {
-                    continue;
-                }
-                if count == 0 {
                     continue;
                 }
                 Job {
@@ -491,9 +444,6 @@ impl Shared {
                     selected: Some(selected.clone()),
                 }
             } else {
-                if count == 0 {
-                    continue;
-                }
                 let target = subscription.fixed.target;
                 let last = subscription.position.last();
                 Job {
@@ -596,20 +546,16 @@ impl Shared {
         true
     }
 
-    /// Clear capacity stalls whose signal was released.
-    fn clear_released(&mut self) {
+    /// Clear the local stalls after the selected chain changed, or else the
+    /// capacity stalls whose signal was released.
+    fn clear_stalls(&mut self, local: bool) {
         for subscription in self.subscriptions.values_mut() {
-            if matches!(&subscription.stall, Some(Stall::Capacity(signal)) if signal.is_released())
-            {
-                subscription.stall = None;
-            }
-        }
-    }
-
-    /// Clear local stalls after the selected chain changed.
-    fn clear_local(&mut self) {
-        for subscription in self.subscriptions.values_mut() {
-            if matches!(subscription.stall, Some(Stall::Local)) {
+            let clear = match &subscription.stall {
+                Some(Stall::Local) => local,
+                Some(Stall::Capacity(signal)) => !local && signal.is_released(),
+                None => false,
+            };
+            if clear {
                 subscription.stall = None;
             }
         }
@@ -750,6 +696,8 @@ struct Task {
     push: Push,
     owner: LeaseOwner,
     limits: PageLimits,
+    /// Page jobs report a panic here, even after their page was abandoned.
+    panics: mpsc::Sender<Box<dyn Any + Send>>,
 }
 
 /// A page in progress: its permit wait, its job, and its transport slot.
@@ -767,6 +715,7 @@ enum Progress<'a> {
 async fn publish<const HEADER_BYTES: usize>(
     task: Task,
     send: FramedSend,
+    mut panicked: mpsc::Receiver<Box<dyn Any + Send>>,
     cancel: CancellationToken,
 ) {
     let mut selected = task.port.selected_chain();
@@ -813,6 +762,8 @@ async fn publish<const HEADER_BYTES: usize>(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
+            // See `Publisher::spawn`.
+            Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
             progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
                 if work.is_some() =>
             {
@@ -832,12 +783,12 @@ async fn publish<const HEADER_BYTES: usize>(
             () = task.wake.notified() => {}
             changed = selected.changed(), if selected_open => {
                 if changed.is_ok() {
-                    lock(&task.shared).clear_local();
+                    lock(&task.shared).clear_stalls(true);
                 } else {
                     selected_open = false;
                 }
             }
-            () = any_released(capacity) => lock(&task.shared).clear_released(),
+            () = any_released(capacity) => lock(&task.shared).clear_stalls(false),
         }
     }
 }
@@ -854,8 +805,9 @@ async fn any_released(signals: Vec<ServingCapacitySignal>) {
 /// Start one page: wait for its budgets, run its job holding them, then
 /// reserve its transport slot.
 ///
-/// A following page whose selected tip moved meanwhile is checked against
-/// `selected` before it is sent; see [`still_selected`].
+/// The job keeps its permit until the state read finishes, even if the
+/// session ends first. A following page whose selected tip moved meanwhile is
+/// checked by [`still_selected`] before it is sent.
 fn start_page<'a, const HEADER_BYTES: usize>(
     task: &Task,
     job: Job,
@@ -865,6 +817,7 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let push = task.push.clone();
     let port = task.port.clone();
     let check_port = task.port.clone();
+    let panics = task.panics.clone();
     let owner = task.owner;
     let id = job.id;
     let leased_tip = job.following.then_some(job.lease_target);
@@ -872,21 +825,22 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     Box::pin(async move {
         let permit = push.acquire(bytes).await;
         let running = tokio::spawn(async move {
-            let output = run_job::<HEADER_BYTES>(&*port, owner, &job).await;
-            (output, permit)
+            let job = AssertUnwindSafe(run_job::<HEADER_BYTES>(&*port, owner, &job));
+            match job.catch_unwind().await {
+                Ok(output) => Some((output, permit)),
+                // The permit drops once the job has ended, panic or not.
+                Err(panic) => {
+                    tracing::error!(subscription_id = id, "a header sync v9 page job panicked");
+                    // A full channel already holds a panic that ends the task.
+                    let _ = panics.try_send(panic);
+                    None
+                }
+            }
         });
         let (output, permit): (Output, PushPermit) = match running.await {
-            Ok(done) => done,
-            // Only a local bug panics a job. Stalling would leave the
-            // subscription half live, so the publisher task panics too.
-            Err(error) if error.is_panic() => {
-                tracing::error!(
-                    subscription_id = id,
-                    ?error,
-                    "a header sync v9 page job panicked"
-                );
-                std::panic::resume_unwind(error.into_panic())
-            }
+            Ok(Some(done)) => done,
+            // The publisher task re-raises the job's panic.
+            Ok(None) => return Progress::Other(Output::Stall(Stall::Local, "job_panicked")),
             // The runtime is shutting down.
             Err(_) => return Progress::Closed,
         };
@@ -911,10 +865,10 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 ///
 /// It checks only when the selected tip moved, and only a lease that finds no
 /// intersection says no, so growth and local failures keep the page. The
-/// check closes the window between leasing a page and sending it, not the
-/// write after it. The lease is state work, so it waits for execution slots
-/// through `push` as the page's read did, then reads the selected tip again,
-/// because the chain can move during that wait.
+/// lease is state work, so it waits for execution slots through `push` as the
+/// page's read did. The chain can move during that wait or the lease, so the
+/// check repeats until the tip it judged against is still the selected one.
+/// That closes the window up to the page's commit, not the write after it.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
@@ -925,7 +879,7 @@ async fn still_selected(
     last: Frontier,
 ) -> bool {
     let mut execution = None;
-    let latest = loop {
+    loop {
         let Some(latest) = selected.borrow().clone() else {
             return true;
         };
@@ -936,22 +890,28 @@ async fn still_selected(
         if tip.height <= last.height {
             return false;
         }
-        if execution.is_some() {
-            break latest;
+        if execution.is_none() {
+            execution = Some(push.execution().await);
+            continue;
         }
-        execution = Some(push.execution().await);
-    };
-    let tip = latest.frontiers.header_best;
-    match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
-        Ok(AcquirePathReply::Acquired(path)) => {
-            release(port, *path).await;
-            true
-        }
-        Ok(AcquirePathReply::NoLocatorIntersection) => false,
-        Ok(_) => true,
-        Err(error) => {
-            log_port_failure(id, "recheck", &error);
-            true
+        let contains = match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
+            Ok(AcquirePathReply::Acquired(path)) => {
+                release(port, *path).await;
+                true
+            }
+            Ok(AcquirePathReply::NoLocatorIntersection) => false,
+            Ok(_) => true,
+            Err(error) => {
+                log_port_failure(id, "recheck", &error);
+                true
+            }
+        };
+        let current = selected
+            .borrow()
+            .as_ref()
+            .map(|selected| selected.frontiers.header_best);
+        if current == Some(tip) {
+            return contains;
         }
     }
 }
@@ -1029,11 +989,6 @@ async fn run_job<const HEADER_BYTES: usize>(
             // A stale selected tip: the next selected-chain change retries.
             Ok(AcquirePathReply::TargetNotRetained) if job.following => {
                 return Output::Stall(Stall::Local, "selected_tip")
-            }
-            // History from the last header sent is gone and will not return,
-            // and `HistoryPruned` is past its window.
-            Ok(AcquirePathReply::HistoryPruned) if job.following => {
-                return Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
                 return Output::End(HeadersOutcomeCode::TargetNotRetained)
@@ -1130,8 +1085,11 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
     }
 }
 
-/// Build and encode `job`'s page from a state page. A schema-1 page stops
-/// before the first header without a record.
+/// Build and encode `job`'s page from a state page.
+///
+/// A schema-1 page stops before the first header without a record. With none
+/// for its first header, the subscription waits, because a page's schema must
+/// match its subscription.
 fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPage) -> Output {
     let count = page.headers.len();
     // Widening u32 to usize is lossless on supported targets.

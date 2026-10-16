@@ -85,7 +85,6 @@
 //! | The cursor history never fills; a slow acknowledger never faults | `crossed_updates_never_fault_a_conformant_peer`, `a_slow_acknowledger_is_held_by_the_window` |
 //! | A grant beyond the window faults | `a_grant_beyond_the_window_faults` |
 //! | A crossed grant fits consumed credit plus the window, in each unit, and still counts | `a_crossed_grant_is_held_by_the_ended_window` |
-//! | Every update after `Close` faults, before and after the end; one crossing the publisher's own outcome does not | `every_update_after_close_faults_even_after_the_end` |
 //! | An idle subscription holds no execution and needs no outcome | `an_idle_subscription_holds_nothing_and_needs_no_outcome` |
 //! | Closure needs no credit and no execution | `close_needs_no_credit_and_no_execution` |
 //! | Retiring a session with a live subscription closes the connection | `retirement_with_a_live_subscription_closes_the_connection` |

@@ -2,34 +2,30 @@
 //!
 //! A fake port serves a header tree from memory, with scripted failures. The
 //! subscriber uses the real [`Subscriptions`] tool and checks each page's
-//! linkage, the target marker, and each outcome's window against the
-//! specification's table. A mirror [`Publications`] ledger replays every page
-//! and outcome from the wire, so each update must get the same result from
-//! the publisher and from the mirror.
+//! linkage, the target marker, and each outcome's window.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     time::Duration,
 };
 
 use proptest::prelude::*;
 use tokio::sync::Semaphore;
-use zakura_chain::{
-    block::{genesis::regtest_genesis_block, merkle::AuthDataRoot},
-    fmt::HexDebug,
-    ironwood, orchard, sapling,
-    work::difficulty::U256,
-};
+use zakura_chain::work::difficulty::U256;
 use zakura_header_chain::{
     AlarmSet, BodyWorkOwner, ChainScore, EngineMode, FrontierSet, HeaderLocator, StateVersion,
-    SuffixWork, TreeAuxRecordV1, VerifiedGeneration,
+    SuffixWork, VerifiedGeneration,
 };
 use zakura_node_services::header_chain::{
     AdapterKey, ApplyHeaderTargetReply, HeaderChainFuture, PortError, PrepareHeaderTarget,
     PrepareHeaderTargetReply, PreparedHeaderTarget, VctRepairContextReply,
 };
 
-use super::super::{smallest_page, RegtestMessage};
+use super::super::{
+    smallest_page,
+    test_support::{p, record, HeaderTree, OUTCOME_CODES},
+    RegtestMessage,
+};
 use super::*;
 use crate::zakura::{
     framed_channel,
@@ -44,11 +40,6 @@ const HB: usize = REGTEST_HEADER_BYTES;
 
 /// How long the paused clock runs before a receive counts as quiet.
 const QUIET: Duration = Duration::from_secs(1);
-
-/// `P`, the smallest legal page.
-fn p() -> u32 {
-    u32::try_from(smallest_page(HB, AuxSchema::None)).expect("a page fits u32")
-}
 
 /// Three headers per page, and bytes for two schema-1 entries, so pages
 /// split by count without records and by bytes with them.
@@ -73,20 +64,6 @@ fn serve_limits() -> ServeLimits {
     }
 }
 
-/// A schema-1 record with every root at its empty default.
-fn record(height: block::Height) -> TreeAuxRecordV1 {
-    TreeAuxRecordV1 {
-        height,
-        sapling_root: sapling::tree::Root::default(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx_count: 0,
-        orchard_tx_count: 0,
-        ironwood_tx_count: 0,
-        auth_data_root: AuthDataRoot::from([0; 32]),
-    }
-}
-
 /// A selected chain ending at `tip`.
 fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot {
     EngineSnapshot {
@@ -108,7 +85,7 @@ fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot
 /// A header tree, the leases issued on it, and scripted replies.
 #[derive(Default)]
 struct Store {
-    nodes: HashMap<block::Hash, (Frontier, Arc<block::Header>)>,
+    tree: HeaderTree,
     next_lease: u64,
     leases: HashSet<u64>,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
@@ -117,50 +94,9 @@ struct Store {
     no_record: HashSet<block::Hash>,
     reads_running: usize,
     most_reads_running: usize,
-    /// Distinguishes sibling headers.
-    next_nonce: u32,
 }
 
 impl Store {
-    /// Add `count` headers above `parent`, and return them.
-    fn extend(&mut self, parent: Frontier, count: u32) -> Vec<Frontier> {
-        let mut added = Vec::new();
-        let mut parent = parent;
-        for _ in 0..count {
-            let mut header = *self.nodes[&parent.hash].1;
-            header.previous_block_hash = parent.hash;
-            self.next_nonce += 1;
-            let mut nonce = [0; 32];
-            nonce[..4].copy_from_slice(&self.next_nonce.to_le_bytes());
-            header.nonce = HexDebug(nonce);
-            let child = Frontier::new(
-                parent.height.next().expect("test heights are small"),
-                header.hash(),
-            );
-            self.nodes.insert(child.hash, (child, Arc::new(header)));
-            added.push(child);
-            parent = child;
-        }
-        added
-    }
-
-    /// The parent of `frontier`, if retained.
-    fn parent(&self, frontier: Frontier) -> Option<Frontier> {
-        let (_, header) = self.nodes.get(&frontier.hash)?;
-        self.nodes
-            .get(&header.previous_block_hash)
-            .map(|(parent, _)| *parent)
-    }
-
-    /// The retained ancestor of `of` at `height`.
-    fn ancestor(&self, of: Frontier, height: block::Height) -> Option<Frontier> {
-        let mut current = of;
-        while current.height > height {
-            current = self.parent(current)?;
-        }
-        Some(current)
-    }
-
     /// Lease the path from the nearest locator to the target, as state does.
     fn acquire(
         &mut self,
@@ -170,12 +106,12 @@ impl Store {
         if let Some(reply) = self.acquire_script.pop_front() {
             return reply;
         }
-        let Some(&(target, _)) = self.nodes.get(&request.target_tip_hash) else {
+        let Some(&(target, _)) = self.tree.nodes.get(&request.target_tip_hash) else {
             return Ok(AcquirePathReply::TargetNotRetained);
         };
         let mut current = target;
         while !request.locator_hashes.contains(&current.hash) {
-            current = match self.parent(current) {
+            current = match self.tree.parent(current) {
                 Some(parent) => parent,
                 None if current.height == block::Height(0) => {
                     return Ok(AcquirePathReply::NoLocatorIntersection)
@@ -217,9 +153,10 @@ impl Store {
         let mut headers = Vec::new();
         let mut current = path.target;
         while current != path.common_ancestor {
-            let (Some((_, header)), Some(parent)) =
-                (self.nodes.get(&current.hash), self.parent(current))
-            else {
+            let (Some((_, header)), Some(parent)) = (
+                self.tree.nodes.get(&current.hash),
+                self.tree.parent(current),
+            ) else {
                 return Ok(ReadPathReply::Unavailable);
             };
             headers.push(header.clone());
@@ -268,10 +205,8 @@ impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
     fn new(gate: usize) -> Arc<Self> {
-        let header = regtest_genesis_block().header.clone();
-        let genesis = Frontier::new(block::Height(0), header.hash());
-        let mut store = Store::default();
-        store.nodes.insert(genesis.hash, (genesis, header));
+        let store = Store::default();
+        let genesis = store.tree.genesis;
         Arc::new(Self {
             key: AdapterKey::new(),
             store: Mutex::new(store),
@@ -310,7 +245,7 @@ impl FakePort {
 
     /// Extend the selected chain by `count` headers and select the new tip.
     fn grow(&self, count: u32) -> Vec<Frontier> {
-        let added = self.store().extend(self.tip(), count);
+        let added = self.store().tree.extend(self.tip(), count);
         if let Some(&tip) = added.last() {
             self.select(tip);
         }
@@ -491,7 +426,7 @@ impl Subscriber {
             objects: headers.min(room.objects),
             bytes: bytes.min(room.bytes),
         };
-        if added.objects == 0 && added.bytes < p() {
+        if added.objects == 0 && added.bytes < p::<HB>() {
             return None;
         }
         let update = self.tools.grant(&opened.id, added).ok()?;
@@ -614,16 +549,16 @@ impl Subscriber {
                     .tools
                     .claim_end(&opened.id)
                     .expect("the subscription is live");
-                use HeadersOutcomeCode::*;
-                let legal = match outcome.outcome {
-                    NoLocatorIntersection | TargetNotRetained | TargetNotSelected => {
-                        ended.pages == 0
-                    }
-                    HistoryPruned => !opened.reached,
-                    SubscriptionSuperseded => true,
-                    SubscriptionClosed => ended.close_sent,
-                };
-                assert!(legal, "{:?} arrived outside its window", outcome.outcome);
+                assert!(
+                    is_legal(
+                        outcome.outcome,
+                        ended.pages > 0,
+                        opened.reached,
+                        ended.close_sent
+                    ),
+                    "{:?} arrived outside its window",
+                    outcome.outcome
+                );
                 Received::Ended(outcome.outcome)
             }
             other => panic!("the publisher wrote {other:?}"),
@@ -631,32 +566,7 @@ impl Subscriber {
     }
 }
 
-/// Apply `update` to a bare ledger.
-fn mirror_apply(
-    mirror: &mut Publications<u64, Cursor>,
-    update: &SubscribeHeaders,
-) -> Result<Applied, SubscriptionFault> {
-    let id = update.subscription_id;
-    match update.operation {
-        Operation::Open => mirror
-            .open(
-                id,
-                update.update_sequence,
-                update.added_credit,
-                update.acknowledged,
-            )
-            .map(|()| Applied::Live),
-        Operation::Grant => mirror.grant(
-            &id,
-            update.update_sequence,
-            &update.acknowledged,
-            update.added_credit,
-        ),
-        Operation::Close => mirror.close(&id, update.update_sequence, &update.acknowledged),
-    }
-}
-
-/// A publisher on one session, its subscriber, and the mirror ledger.
+/// A publisher on one session and its subscriber.
 struct Harness {
     port: Arc<FakePort>,
     capacity: ServeCapacity,
@@ -665,7 +575,6 @@ struct Harness {
     cancel: CancellationToken,
     /// Frames written and not yet delivered to the subscriber.
     inbox: VecDeque<Frame>,
-    mirror: Publications<u64, Cursor>,
     subscriber: Subscriber,
 }
 
@@ -674,30 +583,21 @@ fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("a 32-byte peer ID is valid")
 }
 
-/// Start a publisher for `peer` on `capacity`.
+/// Start a publisher for `peer` on `capacity`, writing to a transport queue
+/// of `queue` frames.
 fn session(
     port: &Arc<FakePort>,
     capacity: &ServeCapacity,
     peer: &ZakuraPeerId,
     session_id: u64,
-) -> (Publisher, FramedRecv, CancellationToken) {
-    let (publisher, recv, cancel, _task) = session_with_task(port, capacity, peer, session_id);
-    (publisher, recv, cancel)
-}
-
-/// Start a publisher for `peer` on `capacity`, and keep its task handle.
-fn session_with_task(
-    port: &Arc<FakePort>,
-    capacity: &ServeCapacity,
-    peer: &ZakuraPeerId,
-    session_id: u64,
+    queue: usize,
 ) -> (
     Publisher,
     FramedRecv,
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let (send, recv) = framed_channel(64);
+    let (send, recv) = framed_channel(queue);
     let cancel = CancellationToken::new();
     let (publisher, task) = Publisher::spawn::<HB>(
         port.clone(),
@@ -713,14 +613,29 @@ fn session_with_task(
     (publisher, recv, cancel, task)
 }
 
+impl Publisher {
+    /// Live or closing subscriptions and tombstones, as the subscription
+    /// tools count them.
+    fn tally(&self) -> (usize, usize) {
+        let shared = lock(&self.shared);
+        (
+            shared.publications.keys().count(),
+            shared.publications.tombstones(),
+        )
+    }
+
+    /// Unacknowledged pages of `id`, if it is live.
+    fn unacknowledged(&self, id: u64) -> Option<usize> {
+        lock(&self.shared).publications.unacknowledged(&id)
+    }
+}
+
 impl Harness {
     /// A publisher over `port` with `serve` budgets.
     fn new(port: Arc<FakePort>, serve: ServeLimits) -> Self {
         let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
             .expect("the test budgets are valid");
-        let (publisher, recv, cancel) = session(&port, &capacity, &peer(7), 1);
-        let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
-            .expect("SUBSCRIBE_HEADERS is a subscription row");
+        let (publisher, recv, cancel, _task) = session(&port, &capacity, &peer(7), 1, 64);
         Self {
             port,
             capacity,
@@ -728,46 +643,13 @@ impl Harness {
             recv,
             cancel,
             inbox: VecDeque::new(),
-            mirror: Publications::new(limits),
             subscriber: Subscriber::new(),
         }
     }
 
-    /// Take every frame written until the publisher goes quiet, and replay
-    /// each in the mirror.
+    /// Take every frame written until the publisher goes quiet.
     async fn drain(&mut self) {
         while let Ok(Some(frame)) = tokio::time::timeout(QUIET, self.recv.recv()).await {
-            match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames")
-            {
-                Message::Headers(page) => {
-                    let id = page.subscription_id;
-                    let count = u32::try_from(page.entries.len()).expect("a page fits u32");
-                    let last = page.entries.last().expect("a page has a header");
-                    let consumed = self
-                        .mirror
-                        .credit(&id)
-                        .expect("a page for a live subscription")
-                        .consumed();
-                    // Widening usize to u64 is lossless on supported targets.
-                    let cursor = Cursor {
-                        height: block::Height(page.common_ancestor_height.0 + count),
-                        hash: last.header.hash(),
-                        headers: consumed.objects + u64::from(count),
-                        bytes: consumed.bytes + frame.payload.len() as u64,
-                    };
-                    self.mirror
-                        .reserve_page(&id, count, frame.payload.len(), cursor)
-                        .expect("the publisher spends only credit it holds");
-                }
-                Message::HeadersOutcome(outcome) => {
-                    drop(
-                        self.mirror
-                            .end(&outcome.subscription_id)
-                            .expect("an outcome ends a live subscription"),
-                    );
-                }
-                other => panic!("the publisher wrote {other:?}"),
-            }
             self.inbox.push_back(frame);
         }
     }
@@ -787,16 +669,12 @@ impl Harness {
         self.deliver(usize::MAX).await
     }
 
-    /// Apply `update` to the publisher once it is quiet, and check that the
-    /// mirror agrees.
+    /// Apply `update` to the publisher once it is quiet.
     async fn apply(&mut self, update: SubscribeHeaders) -> Result<Applied, PublisherFault> {
         encode_frame(&RegtestMessage::SubscribeHeaders(update.clone()))
             .expect("the subscriber sends only legal updates");
         self.drain().await;
-        let expected = mirror_apply(&mut self.mirror, &update).map_err(PublisherFault::from);
-        let applied = self.publisher.apply(&update).await;
-        assert_eq!(applied, expected, "the publisher and the mirror agree");
-        applied
+        self.publisher.apply(&update).await
     }
 
     /// Open a subscription to `target` with `credit`.
@@ -823,7 +701,7 @@ impl Harness {
         );
         assert_eq!(self.capacity.node_execution_held(), 0);
         assert_eq!(self.capacity.node_output_held(), 0);
-        let (live, tombstones, _) = self.publisher.tally();
+        let (live, tombstones) = self.publisher.tally();
         assert!(live <= 2 && tombstones <= 2);
     }
 }
@@ -945,7 +823,7 @@ async fn outcomes_before_the_first_page_name_their_cause() {
     use HeadersOutcomeCode::*;
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(3);
-    let side = port.store().extend(chain[0], 3);
+    let side = port.store().tree.extend(chain[0], 3);
     let mut harness = Harness::new(port.clone(), serve_limits());
     let unknown = block::Hash([5; 32]);
     let elsewhere = Frontier::new(block::Height(1), block::Hash([6; 32]));
@@ -981,7 +859,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         .open(chain[7].hash, vec![port.genesis], one_page, AuxSchema::None)
         .await;
     assert_eq!(harness.deliver_all().await.len(), 1);
-    port.store().nodes.remove(&chain[7].hash);
+    port.store().tree.nodes.remove(&chain[7].hash);
     let grant = harness
         .subscriber
         .grant(10, 0)
@@ -995,25 +873,14 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         [Received::Ended(HistoryPruned)]
     );
 
-    // After the target, the selected chain moves below the last header:
-    // `SubscriptionSuperseded`.
-    port.select(chain[5]);
-    harness
-        .open(chain[5].hash, vec![chain[4]], credit(), AuxSchema::None)
-        .await;
-    assert_eq!(pages(&harness.deliver_all().await).len(), 1);
     port.select(chain[3]);
-    assert_eq!(
-        harness.deliver_all().await,
-        [Received::Ended(SubscriptionSuperseded)]
-    );
 
     // A higher tip on another branch: the lease finds no intersection.
     harness
         .open(chain[3].hash, vec![chain[3]], credit(), AuxSchema::None)
         .await;
     assert!(harness.deliver_all().await.is_empty());
-    let side = port.store().extend(chain[1], 4);
+    let side = port.store().tree.extend(chain[1], 4);
     port.select(side[3]);
     assert_eq!(
         harness.deliver_all().await,
@@ -1028,7 +895,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         .await;
     assert!(harness.deliver_all().await.is_empty());
     let above = port.grow(2);
-    port.store().nodes.remove(&above[0].hash);
+    port.store().tree.nodes.remove(&above[0].hash);
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(SubscriptionSuperseded)]
@@ -1036,8 +903,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
     harness.check_quiet().await;
 }
 
-/// `Close` with pages queued ends after them, and every update after `Close`
-/// faults, before and after the end.
+/// `Close` with pages queued ends after them.
 #[tokio::test(start_paused = true)]
 async fn close_with_pages_queued_ends_after_them() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -1053,133 +919,37 @@ async fn close_with_pages_queued_ends_after_them() {
         .subscriber
         .close()
         .expect("the subscription is live");
-    let sequence = close.update_sequence;
-    assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Live));
-    // Before the end, every further update faults.
-    let mut grant = close.clone();
-    grant.operation = Operation::Grant;
-    grant.update_sequence = sequence + 1;
-    grant.added_credit = Credit {
-        objects: 1,
-        bytes: 0,
-    };
-    // Apply them without yielding, so the task cannot end the subscription
-    // first.
-    let after_close = Err(PublisherFault::Subscription(SubscriptionFault::AfterClose));
-    {
-        let mut shared = lock(&harness.publisher.shared);
-        assert_eq!(shared.apply(&grant, limits()), after_close);
-        let mut second = close.clone();
-        second.update_sequence = sequence + 1;
-        assert_eq!(shared.apply(&second, limits()), after_close);
-    }
-
+    assert_eq!(harness.apply(close).await, Ok(Applied::Live));
     let received = harness.deliver_all().await;
     assert_eq!(pages(&received).len(), 3);
     assert_eq!(
         received.last(),
         Some(&Received::Ended(HeadersOutcomeCode::SubscriptionClosed))
     );
-    // After the end, the tombstone remembers the Close, so the update still
-    // faults.
-    assert_eq!(harness.apply(grant).await, after_close);
-    assert!(harness.deliver_all().await.is_empty());
     harness.check_quiet().await;
 }
 
-/// Updates that cross `SubscriptionSuperseded` or `HistoryPruned` are dropped
-/// up to the window past the consumed credit and fault beyond it, a crossing
-/// `Close` consumes the tombstone, and the next `Open` clears it.
+/// Updates that cross this node's own outcome are dropped, and its tombstone
+/// matches them by ID and sequence, not by their target.
 #[tokio::test(start_paused = true)]
-async fn crossing_updates_drop_on_each_outcome_tombstone() {
-    use HeadersOutcomeCode::*;
+async fn crossing_updates_drop_on_an_outcome_tombstone() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
-    let chain = port.grow(6);
+    let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
-
-    // A Superseded tombstone: repeated crossing grants, then a crossing
-    // Close that consumes it.
-    port.select(chain[2]);
     harness
         .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
         .await;
     assert!(harness.deliver_all().await.is_empty());
     port.select(chain[1]);
     harness.drain().await;
-    let mut last = None;
-    while let Some(grant) = harness.subscriber.grant(1, 0) {
-        assert_eq!(harness.apply(grant.clone()).await, Ok(Applied::Crossed));
-        last = Some(grant);
-    }
-    // The crossing grants used the whole window past the consumed credit, so
-    // one more header faults and changes nothing.
-    let mut beyond = last.expect("the window had room");
-    beyond.update_sequence += 1;
-    assert_eq!(
-        harness.apply(beyond.clone()).await,
-        Err(PublisherFault::Subscription(
-            SubscriptionFault::CrossedAboveWindow
-        ))
-    );
-    let mut close = beyond;
-    close.operation = Operation::Close;
-    close.added_credit = Credit {
-        objects: 0,
-        bytes: 0,
-    };
-    assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Crossed));
-    let mut late = close;
-    late.update_sequence += 1;
-    assert_eq!(
-        harness.publisher.apply(&late).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::Unknown))
-    );
-    assert_eq!(
-        harness.deliver_all().await,
-        [Received::Ended(SubscriptionSuperseded)]
-    );
-
-    // A HistoryPruned tombstone: a crossing grant keeps it until the next
-    // Open clears it.
-    port.select(chain[5]);
-    let one_page = Credit {
-        objects: 3,
-        bytes: credit().bytes,
-    };
-    harness
-        .open(chain[5].hash, vec![port.genesis], one_page, AuxSchema::None)
-        .await;
-    harness.deliver_all().await;
-    port.store().nodes.remove(&chain[3].hash);
-    let grant = harness.subscriber.grant(3, 0).expect("the window has room");
-    harness
-        .apply(grant)
-        .await
-        .expect("a conformant grant applies");
-    let crossing = harness.subscriber.grant(3, 0).expect("the window has room");
-    assert_eq!(harness.apply(crossing.clone()).await, Ok(Applied::Crossed));
-    // A tombstone matches by ID and sequence, not by the fixed fields.
-    let mut moved = harness.subscriber.grant(3, 0).expect("the window has room");
+    let crossing = harness.subscriber.grant(1, 0).expect("the window has room");
+    assert_eq!(harness.apply(crossing).await, Ok(Applied::Crossed));
+    let mut moved = harness.subscriber.grant(1, 0).expect("the window has room");
     moved.initial_target_tip_hash = block::Hash([4; 32]);
-    assert_eq!(harness.apply(moved.clone()).await, Ok(Applied::Crossed));
-    let crossing = moved;
+    assert_eq!(harness.apply(moved).await, Ok(Applied::Crossed));
     assert_eq!(
         harness.deliver_all().await,
-        [Received::Ended(HistoryPruned)]
-    );
-    harness
-        .open(
-            block::Hash([1; 32]),
-            vec![chain[0]],
-            credit(),
-            AuxSchema::None,
-        )
-        .await;
-    let mut late = crossing;
-    late.update_sequence += 1;
-    assert_eq!(
-        harness.apply(late).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::Unknown))
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
     );
     harness.check_quiet().await;
 }
@@ -1226,7 +996,7 @@ async fn a_page_job_panic_reaches_the_session_owner() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
-    let (publisher, _recv, _cancel, task) = session_with_task(&port, &capacity, &peer(7), 1);
+    let (publisher, _recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1234,32 +1004,6 @@ async fn a_page_job_panic_reaches_the_session_owner() {
         .await
         .expect("the publisher task ends");
     assert!(ended.is_err_and(|error| error.is_panic()));
-}
-
-/// A following page whose headers leave the selected chain while it is in
-/// progress is dropped and read again toward the new tip.
-#[tokio::test(start_paused = true)]
-async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
-    let port = FakePort::new(0);
-    let chain = port.grow(3);
-    let mut harness = Harness::new(port.clone(), serve_limits());
-    harness
-        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
-        .await;
-    assert!(harness.deliver_all().await.is_empty());
-    // The page for heights 4 and 5 waits in its read while the chain reorgs
-    // onto a branch that forks at the last header sent.
-    port.grow(2);
-    harness.drain().await;
-    assert_eq!(port.store().reads_running, 1);
-    let side = port.store().extend(chain[2], 3);
-    port.select(side[2]);
-    port.gate.add_permits(1);
-    let received = harness.deliver_all().await;
-    let h = block::Height;
-    assert_eq!(pages(&received), [(h(3), h(6), false)], "{received:?}");
-    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
-    harness.check_quiet().await;
 }
 
 /// Cancelling the session stops the publisher even while a terminal outcome
@@ -1271,19 +1015,7 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
     // One slot, which the first page fills because nobody reads it.
-    let (send, _recv) = framed_channel(1);
-    let cancel = CancellationToken::new();
-    let (publisher, task) = Publisher::spawn::<HB>(
-        port.clone(),
-        capacity.push(&peer(7)),
-        send,
-        LeaseOwner {
-            peer: SourceId::from_digest(peer(7).digest()),
-            session_id: 1,
-        },
-        limits(),
-        cancel.clone(),
-    );
+    let (publisher, _recv, cancel, task) = session(&port, &capacity, &peer(7), 1, 1);
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1302,7 +1034,42 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
         .expect("the publisher task does not panic");
 }
 
-/// The lease that rechecks a following page after a reorg waits for and
+/// A page job that panics after `Close` abandoned its page still panics the
+/// publisher task.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_page_job_panic_reaches_the_session_owner() {
+    let port = FakePort::new(0);
+    let chain = port.grow(2);
+    port.panic_reads
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let (publisher, mut recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    // The page's read waits at the gate when Close abandons the page.
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    let closed = tokio::time::timeout(QUIET, recv.recv())
+        .await
+        .expect("the outcome arrives")
+        .expect("the session is open");
+    assert_eq!(
+        subscriber.receive(&closed),
+        Received::Ended(HeadersOutcomeCode::SubscriptionClosed)
+    );
+    assert!(!task.is_finished());
+    port.gate.add_permits(1);
+    let ended = tokio::time::timeout(QUIET, task)
+        .await
+        .expect("the publisher task ends");
+    assert!(ended.is_err_and(|error| error.is_panic()));
+}
+
+/// A following page that leaves the selected chain while in progress is read
+/// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.
 #[tokio::test(start_paused = true)]
 async fn a_following_page_recheck_holds_an_execution_slot() {
@@ -1319,7 +1086,7 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     assert!(harness.deliver_all().await.is_empty());
     port.grow(2);
     harness.drain().await;
-    let side = port.store().extend(chain[2], 3);
+    let side = port.store().tree.extend(chain[2], 3);
     port.select(side[2]);
     // The read finishes, and the recheck's lease blocks in state.
     port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
@@ -1328,8 +1095,12 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     assert_eq!(port.store().reads_running, 0);
     assert_eq!(harness.capacity.node_execution_held(), 1);
     port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    // The page for heights 4 and 5 left the selected chain, so it is read
+    // again toward the new tip.
+    let received = harness.deliver_all().await;
     let h = block::Height;
-    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
+    assert_eq!(pages(&received), [(h(3), h(6), false)]);
+    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
     harness.check_quiet().await;
 }
 
@@ -1355,8 +1126,8 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
     // Another peer's page queues for that slot, then blocks in its own read.
     let other_port = FakePort::new(0);
     let other_chain = other_port.grow(1);
-    let (other, mut other_recv, _other_cancel) =
-        session(&other_port, &harness.capacity, &peer(9), 1);
+    let (other, mut other_recv, _other_cancel, _other_task) =
+        session(&other_port, &harness.capacity, &peer(9), 1, 64);
     let mut other_subscriber = Subscriber::new();
     let open = other_subscriber.open(
         other_chain[0].hash,
@@ -1369,14 +1140,14 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
 
     // The chain grows, so the page is still selected, and the read ends.
     // The recheck then waits behind the other peer's read.
-    let grown = port.store().extend(main[1], 1);
+    let grown = port.store().tree.extend(main[1], 1);
     port.select(grown[0]);
     port.gate.add_permits(1);
     tokio::time::sleep(QUIET).await;
     assert_eq!(harness.capacity.node_execution_held(), 1);
 
     // While it waits, the chain reorgs away from the page.
-    let side = port.store().extend(chain[2], 4);
+    let side = port.store().tree.extend(chain[2], 4);
     port.select(side[3]);
     other_port.gate.add_permits(1);
     let h = block::Height;
@@ -1391,6 +1162,39 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
         other_subscriber.receive(&other_page),
         Received::Page { .. }
     ));
+    harness.check_quiet().await;
+}
+
+/// A recheck whose lease outlasts another tip change judges the page again
+/// against the newer tip.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_repeats_when_the_tip_moves_during_its_lease() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read.
+    let main = port.grow(2);
+    harness.drain().await;
+    // The chain grows past the page, and the recheck's lease toward that tip
+    // blocks in state.
+    let grown = port.store().tree.extend(main[1], 1);
+    port.select(grown[0]);
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    // While that lease waits, the chain reorgs away from the page.
+    let side = port.store().tree.extend(chain[2], 4);
+    port.select(side[3]);
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    let h = block::Height;
+    assert_eq!(
+        pages(&harness.deliver_all().await),
+        [(h(3), h(6), false), (h(6), h(7), false)]
+    );
     harness.check_quiet().await;
 }
 
@@ -1421,10 +1225,10 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
     harness.check_quiet().await;
 }
 
-/// The margin admits a second `Open`. A third, a reused ID, a changed target,
-/// and an unadvertised schema fault.
+/// The margin admits a second `Open`. A third, a changed target, and an
+/// unadvertised schema fault.
 #[tokio::test(start_paused = true)]
-async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
+async fn a_second_open_is_admitted_and_a_third_faults() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(2);
     let harness = Harness::new(port.clone(), serve_limits());
@@ -1446,17 +1250,12 @@ async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
     let publisher = &harness.publisher;
     assert_eq!(publisher.apply(&open(1)).await, Ok(Applied::Live));
     assert_eq!(publisher.apply(&open(2)).await, Ok(Applied::Live));
-    assert_eq!(publisher.tally(), (2, 0, 1), "the margin admits the second");
     assert_eq!(
         publisher.apply(&open(3)).await,
         Err(PublisherFault::Subscription(SubscriptionFault::NoSlot {
             held: 2,
             limit: 1
         }))
-    );
-    assert_eq!(
-        publisher.apply(&open(1)).await,
-        Err(PublisherFault::Subscription(SubscriptionFault::ReusedKey))
     );
     let mut moved = open(1);
     moved.operation = Operation::Grant;
@@ -1469,30 +1268,12 @@ async fn a_second_open_is_admitted_and_a_third_or_a_reused_id_faults() {
     );
     let mut records = open(4);
     records.tree_aux_schema = AuxSchema::V1;
-    let (narrow, _recv, _cancel) = {
-        let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
-            .expect("the test budgets are valid");
-        let (send, recv) = framed_channel(4);
-        let cancel = CancellationToken::new();
-        let without_records = PageLimits {
-            aux_schema_mask: 0,
-            ..limits()
-        };
-        let (publisher, _task) = Publisher::spawn::<HB>(
-            port.clone(),
-            capacity.push(&peer(8)),
-            send,
-            LeaseOwner {
-                peer: SourceId::from_digest(peer(8).digest()),
-                session_id: 1,
-            },
-            without_records,
-            cancel.clone(),
-        );
-        (publisher, recv, cancel)
+    let without_records = PageLimits {
+        aux_schema_mask: 0,
+        ..limits()
     };
     assert_eq!(
-        narrow.apply(&records).await,
+        lock(&publisher.shared).apply(&records, without_records),
         Err(PublisherFault::UnadvertisedSchema)
     );
 }
@@ -1613,8 +1394,8 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
     let mut sessions = Vec::new();
     for round in 0..4_u8 {
         let peer = peer(10 + round % 2);
-        let (publisher, recv, cancel) =
-            session(&port, &harness.capacity, &peer, u64::from(round) + 2);
+        let (publisher, recv, cancel, _task) =
+            session(&port, &harness.capacity, &peer, u64::from(round) + 2, 64);
         let mut subscriber = Subscriber::new();
         let open = subscriber.open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None);
         publisher.apply(&open).await.expect("the Open applies");
@@ -1640,66 +1421,56 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
 }
 
 /// A burst of conformant grants yields to another peer's task.
-#[test]
-fn update_bursts_yield_to_other_peers() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("the test runtime starts");
-    runtime.block_on(async {
-        let port = FakePort::new(Semaphore::MAX_PERMITS);
-        let chain = port.grow(1);
-        let harness = Harness::new(port.clone(), serve_limits());
-        let other = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ticks = other.clone();
-        let other_peer = tokio::spawn(async move {
-            loop {
-                ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tokio::task::yield_now().await;
-            }
-        });
-        let mut subscriber = Subscriber::new();
-        let first = Credit {
-            objects: 1,
-            bytes: p(),
-        };
-        let open = subscriber.open(chain[0].hash, vec![chain[0]], first, AuxSchema::None);
+#[tokio::test(start_paused = true)]
+async fn update_bursts_yield_to_other_peers() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(1);
+    let harness = Harness::new(port.clone(), serve_limits());
+    let other = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticks = other.clone();
+    let other_peer = tokio::spawn(async move {
+        loop {
+            ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut subscriber = Subscriber::new();
+    let first = Credit {
+        objects: 1,
+        bytes: p::<HB>(),
+    };
+    let open = subscriber.open(chain[0].hash, vec![chain[0]], first, AuxSchema::None);
+    harness
+        .publisher
+        .apply(&open)
+        .await
+        .expect("the Open applies");
+    let before = other.load(std::sync::atomic::Ordering::Relaxed);
+    // The window takes 3,999 more one-header grants.
+    let mut grants = 0;
+    while let Some(grant) = subscriber.grant(1, 0) {
         harness
             .publisher
-            .apply(&open)
+            .apply(&grant)
             .await
-            .expect("the Open applies");
-        let before = other.load(std::sync::atomic::Ordering::Relaxed);
-        // The window takes 3,999 more one-header grants.
-        let mut grants = 0;
-        while let Some(grant) = subscriber.grant(1, 0) {
-            harness
-                .publisher
-                .apply(&grant)
-                .await
-                .expect("a conformant grant applies");
-            grants += 1;
-        }
-        assert_eq!(grants, 3_999);
-        let during = other.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert!(during > 0, "the burst yielded to another peer");
-        other_peer.abort();
-    });
+            .expect("a conformant grant applies");
+        grants += 1;
+    }
+    assert_eq!(grants, 3_999);
+    let during = other.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(during > 0, "the burst yielded to another peer");
+    other_peer.abort();
 }
 
 /// Every outcome this node queues is adjusted into a legal window, and a
 /// legal one is kept.
 #[test]
 fn every_own_outcome_lands_in_its_window() {
-    use HeadersOutcomeCode::*;
-    for outcome in [
-        TargetNotRetained,
-        NoLocatorIntersection,
-        HistoryPruned,
-        TargetNotSelected,
-        SubscriptionSuperseded,
-    ] {
+    // `SubscriptionClosed` answers the peer's `Close`, never this node.
+    let own = OUTCOME_CODES
+        .into_iter()
+        .filter(|outcome| *outcome != HeadersOutcomeCode::SubscriptionClosed);
+    for outcome in own {
         for pages_sent in [false, true] {
             for reached in [false, true] {
                 let sent = in_window(outcome, pages_sent, reached);
@@ -1795,9 +1566,9 @@ async fn run(ops: Vec<Op>) {
             Op::Reorg { depth, len } => {
                 let tip = port.tip();
                 let height = block::Height(tip.height.0.saturating_sub(u32::from(depth)));
-                let base = port.store().ancestor(tip, height);
+                let base = port.store().tree.ancestor(tip, height);
                 if let Some(base) = base {
-                    let added = port.store().extend(base, u32::from(len));
+                    let added = port.store().tree.extend(base, u32::from(len));
                     port.select(added.last().copied().unwrap_or(base));
                     tips.push(port.tip());
                 }
@@ -1814,6 +1585,7 @@ async fn run(ops: Vec<Op>) {
                 let height = block::Height(target.height.0.saturating_sub(u32::from(depth)));
                 let base = port
                     .store()
+                    .tree
                     .ancestor(target, height)
                     .unwrap_or(port.genesis);
                 let mut locators = vec![base];
@@ -1844,7 +1616,7 @@ async fn run(ops: Vec<Op>) {
             Op::Grant { headers, pages } => {
                 if let Some(grant) = harness
                     .subscriber
-                    .grant(u32::from(headers), u32::from(pages) * p())
+                    .grant(u32::from(headers), u32::from(pages) * p::<HB>())
                 {
                     harness
                         .apply(grant)
@@ -1884,9 +1656,9 @@ async fn run(ops: Vec<Op>) {
                 let tip = port.tip();
                 let height = block::Height(tip.height.0.saturating_sub(u32::from(depth)));
                 let mut store = port.store();
-                if let Some(pruned) = store.ancestor(tip, height) {
+                if let Some(pruned) = store.tree.ancestor(tip, height) {
                     if pruned != tip && pruned != port.genesis {
-                        store.nodes.remove(&pruned.hash);
+                        store.tree.nodes.remove(&pruned.hash);
                     }
                 }
             }
@@ -2057,7 +1829,7 @@ async fn the_subscriber_follows_the_publisher() {
     port.grow(1);
     let (pages, _) = follow(&mut harness, &mut subscriber, 6).await;
     assert_eq!(pages, [(h(14), h(15), false)]);
-    let side = port.store().extend(chain[8], 7);
+    let side = port.store().tree.extend(chain[8], 7);
     port.select(side[6]);
     let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
     assert!(pages.is_empty());

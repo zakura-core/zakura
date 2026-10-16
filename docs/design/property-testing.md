@@ -53,9 +53,9 @@ Four suites read the declarations, so each property is written once:
 The stream conformance adapter only encodes a valid message for a row and names the exchange a
 message belongs to. For a subscription row it also encodes and reads updates and encodes and reads
 pages. The suite's harness serves, downloads, publishes, and subscribes through the tools, so it
-tests the tools and the transport together. Each property checks every kind of row the layout has,
-so a layout whose only exchange is a subscription runs the whole suite. A reactor that bypasses the
-tools gets no coverage from it.
+tests the tools and the transport together. The
+[suite's module docs](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) say
+which rows each property checks. A reactor that bypasses the tools gets no coverage from it.
 
 Tuples and lists of items are items, so the item suite checks composition once. A message whose
 payload composes checked items needs no bound test of its own. The test allocator measures heap

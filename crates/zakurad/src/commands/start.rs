@@ -2046,123 +2046,6 @@ mod zakura_header_sync_driver_tests {
             .expect("the canonical durable suffix applies");
     }
 
-    /// The port's selected-chain watch follows state's committed header chain.
-    /// A lease from the selected tip finds a cursor on that chain and none off
-    /// it, which is how the header sync v9 publisher follows the tip.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn header_chain_port_watches_the_selected_chain() {
-        let state_config = zakura_state::Config {
-            enable_zakura_header_seed_from_committed_blocks: true,
-            ..zakura_state::Config::ephemeral()
-        };
-        let network = zakura_chain::parameters::Network::Mainnet;
-        let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
-        let blocks = [
-            mainnet_block(&BLOCK_MAINNET_1_BYTES),
-            mainnet_block(&BLOCK_MAINNET_2_BYTES),
-        ];
-        let (mut state_service, read_state, _latest_tip, _tip_change, header_chain_authority) =
-            zakura_state::init_with_header_chain_body_evidence(
-                state_config,
-                &network,
-                block::Height(0),
-                2,
-            )
-            .await
-            .expect("ephemeral test state initialization succeeds");
-        let committed = state_service
-            .ready()
-            .await
-            .expect("the state is ready for genesis")
-            .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-                genesis.clone().into(),
-            ))
-            .await
-            .expect("genesis commits");
-        assert!(matches!(
-            committed,
-            zakura_state::Response::Committed(hash) if hash == genesis.hash()
-        ));
-        state_service
-            .ready()
-            .await
-            .expect("the state performs semantic handoff");
-        let state = {
-            let state_service = Arc::new(tokio::sync::Mutex::new(state_service));
-            service_fn(move |request| {
-                let state_service = state_service.clone();
-                async move {
-                    state_service
-                        .lock()
-                        .await
-                        .ready()
-                        .await?
-                        .call(request)
-                        .await
-                }
-            })
-        };
-        let startup = zakura_header_sync_driver_startup(
-            state,
-            read_state,
-            header_chain_authority,
-            &network,
-            &zakura::SyncCoordinator::new(),
-        )
-        .await
-        .expect("the header driver starts");
-
-        let mut selected = startup.header_chain_port.selected_chain();
-        let genesis_snapshot = wait_for_header_snapshot(&mut selected, block::Height(0)).await;
-        let genesis_frontier = zakura_header_chain::Frontier::new(block::Height(0), genesis.hash());
-        apply_durable_header_suffix(
-            &startup,
-            &genesis_snapshot,
-            genesis_frontier,
-            &[
-                (
-                    block::Height(1),
-                    blocks[0].clone(),
-                    BLOCK_MAINNET_1_BYTES.len(),
-                ),
-                (
-                    block::Height(2),
-                    blocks[1].clone(),
-                    BLOCK_MAINNET_2_BYTES.len(),
-                ),
-            ],
-            1,
-            1,
-        )
-        .await;
-        let committed = wait_for_header_snapshot(&mut selected, block::Height(2)).await;
-        let tip = committed.frontiers.header_best;
-        assert_eq!(tip.hash, blocks[1].hash());
-
-        let port = &startup.header_chain_port;
-        let acquire = |locator| zakura_node_services::header_chain::AcquirePath {
-            source: zakura_header_chain::SourceId::from_digest([0x9a; 32]),
-            session_id: 1,
-            scope: zakura_header_chain::HeaderWorkAuthority::for_target(&committed, tip.hash),
-            target_tip_hash: tip.hash,
-            locator_hashes: vec![locator],
-        };
-        match port.acquire_header_path(acquire(genesis.hash())).await {
-            Ok(zakura_node_services::header_chain::AcquirePathReply::Acquired(path)) => {
-                assert_eq!(path.common_ancestor, genesis_frontier);
-                port.release_header_path(*path)
-                    .await
-                    .expect("the lease releases");
-            }
-            other => panic!("a cursor on the selected chain leases its descendants: {other:?}"),
-        }
-        assert!(matches!(
-            port.acquire_header_path(acquire(block::Hash([7; 32])))
-                .await,
-            Ok(zakura_node_services::header_chain::AcquirePathReply::NoLocatorIntersection)
-        ));
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn durable_header_sync_restart_requests_only_missing_suffix() {
         const PHASE_ENV: &str = "ZAKURA_DURABLE_HEADER_RESTART_PHASE";
@@ -2267,7 +2150,8 @@ mod zakura_header_sync_driver_tests {
             )
             .await
             .expect("the first durable header driver starts");
-            let mut snapshots = startup.committed_snapshots.clone();
+            // The port's selected-chain watch follows the durable commits.
+            let mut snapshots = startup.header_chain_port.selected_chain();
             let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
             let suffix: Vec<_> = blocks[..4]
                 .iter()

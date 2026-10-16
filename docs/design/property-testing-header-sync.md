@@ -10,9 +10,7 @@ Exercise SubscribeHeaders through its Headers pages and one HeadersOutcome termi
 through its cadence. Use production framing, decode, subscription tools, serving, and cleanup. Add
 only the seams needed to control chain growth, header validation, capacity, and page delivery.
 
-This work introduces no Work bucket, refund, mandatory push deadline, or serving query-result
-timer. It does not require a generic framework or exhaustive explorer. Block requests have separate
-tests. Version 9 replaces version 8 without a compatibility path, so version 8 tests retire when
+Version 9 replaces version 8 without a compatibility path, so version 8 tests retire when
 version 9 activates.
 
 ## Existing infrastructure
@@ -29,9 +27,7 @@ version 9 activates.
 | Multi-node harness | [Cluster](../../crates/zakura-network/src/zakura/testkit/cluster.rs) | Honest multi-node sync |
 | Monotonic test time | [TestClock](../../crates/zakura-network/src/zakura/testkit/clock.rs) | Existing clock-dependent checks |
 
-The subscription tools test their own counters with integer cursors. These helpers do not
-establish real QUIC backpressure or control every runtime interleaving. Use real transport for
-flow-control claims.
+The subscription tools test their own counters with integer cursors.
 
 ## Frame and decode
 
@@ -46,7 +42,6 @@ Include minimum/maximum locator counts, a Grant of exactly one header or one sma
 bytes and one below, maximum credit and one above, an Open with a nonzero sequence, a Grant or
 Close with locators or sequence zero, a Close with credit, a zero header count, an unknown outcome,
 truncation, and trailing bytes. Run each case on every network, because header sizes differ.
-Generated cases supplement deterministic boundaries.
 
 Status is the only row with a cadence. Check its capacity against the one-second sender's outage
 derivation. On a paused clock, a sender at the floor never exhausts the bucket, and the initial
@@ -85,15 +80,10 @@ A terminal outcome ends a subscription once. An idle subscription at the tip nee
 outcome. Contextual difficulty, time, chain-connection, and auxiliary-root failures disconnect the
 sender, and the subscriber never acknowledges that cursor. Local state failures do not.
 
-Use production transitions and the tools' operation-sequence proptests. A small expected-state
-model is optional when it clarifies a race. Do not build a generic model merely to mirror every
-handler.
-
 ## Capacity and ownership
 
 Hold every serving slot and the output allowance. Close must still produce SubscriptionClosed and
-free its slot, and Grants must still apply. The terminal outcome needs no credit, output grant, or
-execution slot.
+free its slot, and Grants must still apply.
 
 Bound control work. A burst of updates must yield shared execution to another peer. Credit
 authorizes future pages and must not allocate a queue of page jobs.
@@ -113,11 +103,8 @@ side's header validation so its accepted cursor stops. Its peer must stop at the
 the stalled side must still apply the peer's Grants and Close. A paused handler must not trap
 control behind pages. State finite bounds and scheduling assumptions.
 
-Repeat the stream conformance properties over real QUIC for stream 5, once the suite supports
-layouts without request rows. Cover unsolicited pages, the Open margin, sustained and mutual
-subscriptions, retirement, paused siblings, partial frames, and Close progress while pages sit
-unread. A peer that offers only version 8 negotiates no header sync stream, and the connection
-stays usable. In-memory queues alone cannot establish these properties.
+Repeat the stream conformance properties over real QUIC for stream 5. A peer that offers only
+version 8 negotiates no header sync stream, and the connection stays usable.
 
 ## Load and reporting
 
@@ -125,11 +112,4 @@ Run many peers following the tip, full pages from an empty start, Grant floods a
 size, Status floods, non-reading subscribers, and connection churn. Assert bounded execution,
 cursor history, and buffered pages, and opportunities for other runnable peers to progress.
 
-Report the credit, cursor history, Grant minimum, and Status interval evidence that the
-specification requires. Measure throughput at the target round trip, where header credit binds
-before byte credit on Mainnet. Measure recovery after SubscriptionSuperseded at the one-second
-Status interval. Keep diagnostics bounded and save minimal regressions in existing tests or small
-fixtures.
-
-Run focused regressions on pull requests and broader generated/load cases on a schedule. Do not
-claim exhaustive coverage.
+Gather the evidence that the specification's parameter table lists.

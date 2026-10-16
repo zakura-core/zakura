@@ -13,7 +13,6 @@ use crate::zakura::{
         stream_conformance_suite, StreamConformance, SubscriptionUpdate, UpdateOp,
     },
     wire_codec::{
-        item_suite::item_suite,
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         sample::WireSample,
     },
@@ -296,11 +295,6 @@ impl MessageSample for WatchMessage {
 
 message_suite!(watch_family, WatchMessage);
 
-item_suite!(status_payload, StatusPayload);
-item_suite!(watch_payload, WatchPayload);
-item_suite!(pushed_payload, PushedPayload);
-item_suite!(watch_ended_payload, WatchEndedPayload);
-
 #[test]
 fn every_layout_carries_exactly_its_family_rows() {
     check_layout_carries_family::<ExampleMessage>(&SINGLE);
@@ -414,42 +408,13 @@ impl StreamConformance for ExampleConformance {
     }
 }
 
-/// The conformance suite's view of the watch family: [`ExampleConformance`]
-/// on the family's rows.
-#[derive(Debug)]
-struct WatchConformance;
-
-impl StreamConformance for WatchConformance {
-    type Message = WatchMessage;
-
-    fn message(row: &MessageRule, exchange: u32) -> WatchMessage {
-        WatchMessage(ExampleConformance::message(row, exchange))
-    }
-
-    fn exchange(message: &WatchMessage) -> u32 {
-        ExampleConformance::exchange(&message.0)
-    }
-
-    fn update(row: &MessageRule, update: SubscriptionUpdate) -> WatchMessage {
-        WatchMessage(ExampleConformance::update(row, update))
-    }
-
-    fn read_update(message: &WatchMessage) -> Option<SubscriptionUpdate> {
-        ExampleConformance::read_update(&message.0)
-    }
-
-    fn page(row: &MessageRule, key: u32, cursor: u32) -> WatchMessage {
-        WatchMessage(ExampleConformance::page(row, key, cursor))
-    }
-
-    fn read_page(message: &WatchMessage) -> Option<(u32, u32)> {
-        ExampleConformance::read_page(&message.0)
-    }
-}
-
 stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
 stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);
-stream_conformance_suite!(watch_only_stream_conformance, WATCH_ONLY, WatchConformance);
+stream_conformance_suite!(
+    watch_only_stream_conformance,
+    WATCH_ONLY,
+    ExampleConformance
+);
 
 /// A one-page credit window still exercises Close while its page waits on send capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

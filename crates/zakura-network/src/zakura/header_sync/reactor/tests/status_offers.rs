@@ -1117,12 +1117,6 @@ fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
                     "peers={peers}, no_headroom={no_headroom}, unconditional={unconditional}"
                 );
                 assert!(actions.try_recv().is_err());
-                eprintln!(
-                "cached offers: peers={}, zero_headroom={}, unconditional={unconditional}, events=3000, additional_peer_visits={}",
-                usize::from(peers),
-                no_headroom,
-                reactor.cached_offer_visits - visits
-            );
             }
         }
     }

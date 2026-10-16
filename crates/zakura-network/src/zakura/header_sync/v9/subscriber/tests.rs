@@ -588,8 +588,10 @@ fn a_path_to_the_target_height_without_it_faults() {
     );
 }
 
-/// A page above the header count or bytes the publisher advertised faults,
-/// and a later `Status` that raises them lets larger pages through.
+/// A page must fit the header count and bytes of one `Status` the publisher
+/// advertised. Two `Status` messages that trade one cap for the other do not
+/// combine into a pair neither advertised, and a later `Status` that raises
+/// both lets larger pages through.
 #[test]
 fn pages_fit_the_advertised_caps() {
     let (tree, chain) = chain(4);
@@ -609,10 +611,46 @@ fn pages_fit_the_advertised_caps() {
         Err(SubscriberFault::AboveAdvertised),
         "three headers' bytes where two were advertised"
     );
+    fixture.sub.observe(&Status {
+        max_headers_per_response: 3,
+        max_message_bytes: page_bytes(1, AuxSchema::None),
+        ..status(chain[4])
+    });
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..3], false),
+        Err(SubscriberFault::AboveAdvertised),
+        "each Status allows only one of the page's count and bytes"
+    );
     fixture.sub.observe(&status(chain[4]));
     fixture
         .page(chain[0], &chain[1..4], false)
         .expect("the later Status raised both caps");
+}
+
+/// Past four cap pairs that trade one cap for the other, the subscription
+/// keeps one pair of the largest of each, which faults no page any of them
+/// allowed.
+#[test]
+fn trading_caps_merge_past_the_bound() {
+    let (tree, chain) = chain(4);
+    let bytes = page_bytes(2, AuxSchema::None);
+    let mut fixture = Fixture::open(tree, chain[4], &[chain[0]], 100);
+    for headers in 1..=MAX_PAGE_CAPS {
+        let headers = u32::try_from(headers).expect("small");
+        fixture.sub.observe(&Status {
+            max_headers_per_response: PAGE_HEADERS + headers,
+            max_message_bytes: bytes - headers,
+            ..status(chain[4])
+        });
+    }
+    let caps = &fixture.sub.live.as_ref().expect("live").caps;
+    assert_eq!(
+        caps[..],
+        [PageCaps {
+            headers: PAGE_HEADERS + 4,
+            bytes: page_bytes(PAGE_HEADERS, AuxSchema::V1),
+        }]
+    );
 }
 
 /// Each outcome is legal exactly in its window: before the first page, before

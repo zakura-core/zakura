@@ -204,6 +204,36 @@ pub struct Ended {
     pub(crate) accepted: Cursor,
 }
 
+/// Most page cap pairs a subscription keeps apart before it merges them.
+const MAX_PAGE_CAPS: usize = 4;
+
+/// The page caps one `Status` advertises.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PageCaps {
+    headers: u32,
+    bytes: u32,
+}
+
+impl PageCaps {
+    /// The caps `status` advertises.
+    fn of(status: &Status) -> Self {
+        Self {
+            headers: status.max_headers_per_response,
+            bytes: status.max_message_bytes,
+        }
+    }
+
+    /// Whether these caps allow every page that `other` allows.
+    fn covers(self, other: Self) -> bool {
+        self.headers >= other.headers && self.bytes >= other.bytes
+    }
+
+    /// Whether these caps allow a page of `headers` and `bytes`.
+    fn allow(self, headers: u32, bytes: usize) -> bool {
+        headers <= self.headers && bytes <= usize::try_from(self.bytes).unwrap_or(usize::MAX)
+    }
+}
+
 /// The live subscription's header sync state.
 #[derive(Clone, Debug)]
 struct Live {
@@ -211,10 +241,11 @@ struct Live {
     target: block::Hash,
     /// The target's height in the `Status` that named it.
     target_height: block::Height,
-    /// The largest page caps the publisher advertised since the `Open`. A
-    /// page follows the `Status` that allowed it on the ordered stream.
-    max_headers: u32,
-    max_bytes: u32,
+    /// The page caps each `Status` advertised since the `Open`, keeping only
+    /// pairs that no other covers. A page must fit one of them: it follows
+    /// the `Status` that allowed it on the ordered stream, even if a later
+    /// `Status` changed the caps before the page arrived.
+    caps: Vec<PageCaps>,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
     /// The sent locator that equals the target, if any. The subscription
@@ -291,19 +322,18 @@ impl Subscriber {
         if self
             .live
             .as_ref()
-            .is_some_and(|live| len > usize::try_from(live.max_bytes).unwrap_or(usize::MAX))
+            .is_some_and(|live| !live.caps.iter().any(|caps| caps.allow(0, len)))
         {
             return Err(SubscriberFault::AboveAdvertised.counted());
         }
         Ok(())
     }
 
-    /// Record a later `Status` from the peer. Pages may use the largest caps
-    /// it advertised since the `Open`.
+    /// Record a later `Status` from the peer. A page may use the caps of any
+    /// `Status` advertised since the `Open`.
     pub(crate) fn observe(&mut self, status: &Status) {
         if let Some(live) = self.live.as_mut() {
-            live.max_headers = live.max_headers.max(status.max_headers_per_response);
-            live.max_bytes = live.max_bytes.max(status.max_message_bytes);
+            live.advertise(PageCaps::of(status));
         }
     }
 
@@ -396,8 +426,7 @@ impl Subscriber {
             id,
             target,
             target_height: status.selected_tip_height,
-            max_headers: status.max_headers_per_response,
-            max_bytes: status.max_message_bytes,
+            caps: vec![PageCaps::of(status)],
             locators: locators.to_vec(),
             target_locator,
             schema,
@@ -486,7 +515,7 @@ impl Subscriber {
             .0
             .checked_add(count)
             .expect("the decoder rejects a page whose last height overflows");
-        if count > live.max_headers {
+        if !live.caps.iter().any(|caps| caps.allow(count, payload_len)) {
             return Err(SubscriberFault::AboveAdvertised);
         }
         if live.reached {
@@ -709,6 +738,24 @@ impl Subscriber {
 }
 
 impl Live {
+    /// Add one `Status`'s page caps, dropping pairs they cover. Past
+    /// [`MAX_PAGE_CAPS`] pairs, keep the largest count and bytes as one pair,
+    /// which still allows every page that an advertised pair allowed.
+    fn advertise(&mut self, caps: PageCaps) {
+        if self.caps.iter().any(|kept| kept.covers(caps)) {
+            return;
+        }
+        self.caps.retain(|kept| !caps.covers(*kept));
+        self.caps.push(caps);
+        if self.caps.len() > MAX_PAGE_CAPS {
+            let merged = self.caps.iter().fold(caps, |merged, kept| PageCaps {
+                headers: merged.headers.max(kept.headers),
+                bytes: merged.bytes.max(kept.bytes),
+            });
+            self.caps = vec![merged];
+        }
+    }
+
     /// The wire message for `update`. Only an `Open` carries the locators.
     fn message(&self, operation: Operation, update: Update<Cursor>) -> SubscribeHeaders {
         SubscribeHeaders {

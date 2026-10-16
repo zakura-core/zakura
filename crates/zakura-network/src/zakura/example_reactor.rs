@@ -24,8 +24,7 @@
 //!    function bounds a range's response for both sides. It pushes watched
 //!    items through `Publications` and receives them through `Subscriptions`.
 //! 5. **Tests.** The generated suites run once for each message family and once
-//!    for each layout, and the item suite runs on `WATCH_ONLY`'s payloads. The
-//!    reactor writes no bound or header test of its own.
+//!    for each layout. The reactor writes no bound or header test of its own.
 
 use std::time::Duration;
 

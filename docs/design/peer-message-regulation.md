@@ -282,14 +282,9 @@ arrive in the order the publisher ended the subscriptions. So an `Open` clears t
 tombstones until live subscriptions plus tombstones number at most `max_live - 1`. With one live
 subscription, this is header sync version 9's rule that the next `Open` clears the tombstone.
 
-A tombstone checks only the key and the update sequence, so crossing grants have no credit window
-yet, and a tombstone does not record why its subscription ended. Header sync version 9 closes both
-gaps. Its tombstone keeps the ended subscription's granted and consumed totals, adds each crossing
-grant to the granted total, and faults one that raises granted above consumed plus the window. A
-conformant subscriber stays within that bound, because it acknowledges only pages the publisher
-sent. The tombstone also records whether the publisher received `Close` before the end. No
-conformant update follows a `Close`, so every update on such a tombstone faults. The tools need
-both checks before header sync adopts them.
+A tombstone also keeps a credit window for crossing grants and records whether `Close` came
+first, so every update after `Close` faults. The [specification](../specs/peer-message-regulation.md)
+states both rules for header sync version 9.
 
 **Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
 terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's
@@ -297,11 +292,10 @@ pages and outcomes from one task, so each outcome follows its pages. Each update
 so `Close` never waits behind a page that waits for capacity.
 
 **Cursors.** The tools compare cursors by equality only, and each tool records the consumed totals
-through every page itself. Header sync version 9 makes its cursor the four acknowledged wire
-fields: height, hash, and the cumulative header and byte counts. Equality on all four checks the
-counts against the totals both sides recorded, and the counts keep the start cursor distinct from
-every page. An implementation can store only height and hash in the sent-cursor ring and compare
-the counts against the totals already stored with each entry.
+through every page itself. The specification defines header sync version 9's cursor, which adds
+cumulative header and byte counts to height and hash. An implementation can store only height and
+hash in the sent-cursor ring and compare the counts against the totals already stored with each
+entry.
 
 ### Header sync version 9
 
@@ -312,9 +306,10 @@ records why some of them changed from the first draft.
 empty. The layout validator rejects that row, because a one-second sender needs a capacity of
 `10 min / 1 s + 2 = 602`. `CadenceBuckets` also never disconnects. The row now records and
 forwards like block sync's `Status`. Pushed pages now deliver new tips to a subscription that has
-reached its target, so a longer sender interval could shrink the bucket. It would also delay
-recovery after `SubscriptionSuperseded`, which needs a fresh `Status`, so the interval stays at one
-second until measurements show that recovery stays acceptable.
+reached its target, so a longer sender interval could shrink the bucket. It would also loosen the
+two-second freshness bound and delay recovery after `SubscriptionSuperseded`, which needs a fresh
+`Status`, so the interval stays at one second until measurements show that recovery stays
+acceptable.
 
 **Grant minimum.** A `Grant` that adds one byte was legal, so a subscriber could send millions of
 grants inside one 8 MiB window. Each grant now adds at least one header or one smallest legal page

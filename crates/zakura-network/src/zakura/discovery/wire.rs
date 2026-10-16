@@ -89,6 +89,23 @@ pub(crate) const SUMMARY_ENVELOPE_MAX_BYTES: usize =
 const SERVICES_MAX_BYTES: usize =
     SERVICES_FIXED_BYTES + MAX_SERVICE_SUMMARIES_PER_RESPONSE * SUMMARY_ENVELOPE_MAX_BYTES;
 
+/// The most a `Services` answer to a `GetServices` naming `wanted` services may
+/// carry: the fixed prefix and one largest envelope per allowed summary. A
+/// nonempty wanted list allows one summary per wanted service, and an empty
+/// list asks for every service. Both allow at most 8 summaries. The
+/// responder's `Serve` reserves output for it.
+pub(crate) fn services_cap(wanted: usize) -> ResponseCap {
+    let summaries = match wanted {
+        0 => MAX_SERVICE_SUMMARIES_PER_RESPONSE,
+        wanted => wanted.min(MAX_SERVICE_SUMMARIES_PER_RESPONSE),
+    };
+    // Widening usize to u64 is lossless on supported targets.
+    ResponseCap {
+        frames: 0,
+        bytes: (SERVICES_FIXED_BYTES + summaries * SUMMARY_ENVELOPE_MAX_BYTES) as u64,
+    }
+}
+
 // The body cap leaves no extension room in a record with the most and largest
 // addresses and services.
 const _: () = assert!(

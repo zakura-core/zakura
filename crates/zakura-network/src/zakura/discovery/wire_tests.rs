@@ -26,7 +26,7 @@ use super::{
         MSG_DISCOVERY_SERVICES, SUMMARY_TAG_BLOCK_SYNC_V1, SUMMARY_TAG_DISCOVERY_V1,
     },
     service::discovery_streams,
-    wire::{GET_PEERS, GET_SERVICES, HELLO, PEERS, SEND_INTERVAL, SERVICES},
+    wire::{services_cap, GET_PEERS, GET_SERVICES, HELLO, PEERS, SEND_INTERVAL, SERVICES},
 };
 use crate::zakura::{
     check_frame_filter,
@@ -744,6 +744,33 @@ fn the_stream_carries_exactly_the_family_rows() {
 #[test]
 fn readers_follow_the_stream() {
     check_frame_filter(discovery_streams());
+}
+
+/// A `GetServices` naming `n` services allows `min(n, 8)` summaries, and an
+/// empty one allows 8. Its cap is exactly the payload of that many largest
+/// envelopes: `42 + summaries × 294` bytes.
+#[test]
+fn services_cap_fits_the_largest_answer_exactly() {
+    for wanted in 0..=MAX_GET_SERVICES_WANTED {
+        let summaries = match wanted {
+            0 => MAX_SERVICE_SUMMARIES_PER_RESPONSE,
+            wanted => wanted.min(MAX_SERVICE_SUMMARIES_PER_RESPONSE),
+        };
+        let DiscoveryMessage::Services(mut services) = longest_services() else {
+            unreachable!("longest_services builds a Services");
+        };
+        services.summaries.truncate(summaries);
+        let frame = encode_frame(&DiscoveryMessage::Services(services)).expect("services encode");
+        let payload = frame.payload.len();
+        assert_eq!(services_cap(wanted).frames, 0);
+        // Widening usize to u64 is lossless on supported targets.
+        assert_eq!(
+            services_cap(wanted).bytes,
+            payload as u64,
+            "wanted {wanted}"
+        );
+        assert_eq!(payload, 42 + summaries * 294);
+    }
 }
 
 /// Hello, GetPeers, and GetServices share one cadence: a 15 s sender floor,

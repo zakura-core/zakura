@@ -1068,6 +1068,52 @@ async fn an_abandoned_page_job_panic_reaches_the_session_owner() {
     assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
+/// A page job's panic reaches the session owner even while a terminal
+/// outcome waits for a full transport queue.
+#[tokio::test(start_paused = true)]
+async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
+    let port = FakePort::new(0);
+    let chain = port.grow(2);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    // A frame nobody reads fills the one-slot queue.
+    let (send, _recv) = framed_channel(1);
+    send.try_send(Frame {
+        message_type: 1,
+        flags: 0,
+        payload: Vec::new(),
+    })
+    .expect("the queue has room");
+    let (publisher, task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        CancellationToken::new(),
+    );
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    // The page's read waits at the gate, then Close abandons it and the
+    // terminal outcome waits for the queue.
+    tokio::time::sleep(QUIET).await;
+    let close = subscriber.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    assert!(!task.is_finished());
+    port.panic_reads
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    port.gate.add_permits(1);
+    let ended = tokio::time::timeout(QUIET, task)
+        .await
+        .expect("the publisher task ends");
+    assert!(ended.is_err_and(|error| error.is_panic()));
+}
+
 /// A following page that leaves the selected chain while in progress is read
 /// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.
@@ -1195,6 +1241,32 @@ async fn a_following_page_recheck_repeats_when_the_tip_moves_during_its_lease() 
         pages(&harness.deliver_all().await),
         [(h(3), h(6), false), (h(6), h(7), false)]
     );
+    harness.check_quiet().await;
+}
+
+/// A recheck that cannot confirm the page drops it, and the next pass reads
+/// again toward the new tip.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read while the chain grows.
+    let main = port.grow(2);
+    harness.drain().await;
+    let grown = port.store().tree.extend(main[1], 1);
+    port.select(grown[0]);
+    // State refuses the recheck's lease.
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::Busy));
+    port.gate.add_permits(1);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
     harness.check_quiet().await;
 }
 

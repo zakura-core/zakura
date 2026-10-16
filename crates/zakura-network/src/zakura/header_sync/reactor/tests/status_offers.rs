@@ -1122,7 +1122,7 @@ async fn final_header_lease_drop_wakes_blocked_offers_without_queue_mutation() {
         reactor.schedule_cached_statuses();
         assert_eq!(reactor.cached_offer_visits, visits);
         if during_scan {
-            reactor.after_cached_offer_scan = Some(Box::new(move || drop(final_leases)));
+            reactor.release_after_cached_offer_scan = Some(final_leases);
             reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
             reactor.schedule_cached_statuses();
             assert!(actions.try_recv().is_err());

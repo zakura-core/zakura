@@ -188,7 +188,7 @@ fn build_header_sync_reactor(
         #[cfg(test)]
         cached_offer_visits: 0,
         #[cfg(test)]
-        after_cached_offer_scan: None,
+        release_after_cached_offer_scan: None,
         retained_paths: HashMap::new(),
         tip: tip_tx,
         peers: peers_tx,
@@ -303,7 +303,7 @@ struct HeaderSyncReactor {
     #[cfg(test)]
     cached_offer_visits: usize,
     #[cfg(test)]
-    after_cached_offer_scan: Option<Box<dyn FnOnce() + Send>>,
+    release_after_cached_offer_scan: Option<Vec<super::scheduler::peer_work::HeaderCapacityLease>>,
     #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
     retained_paths: HashMap<u64, zakura_node_services::header_chain::RetainedHeaderPath>,
     tip: watch::Sender<(block::Height, block::Hash)>,
@@ -1354,9 +1354,7 @@ impl HeaderSyncReactor {
             self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
         #[cfg(test)]
-        if let Some(after_scan) = self.after_cached_offer_scan.take() {
-            after_scan();
-        }
+        drop(self.release_after_cached_offer_scan.take());
         // Retain the pre-pass key: an external lease can drop while we scan.
         // Recording a fresh key here would swallow that release's wakeup.
         self.last_scheduling_opportunity = Some(opportunity);

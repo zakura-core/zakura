@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Discovery record verification slots (`record_verify_slots`) | `crates/zakura-network/src/zakura/discovery/protocol.rs` | none (verified under the book lock) → a quarter of the cores, at least `1` | [#1449](https://github.com/zakura-core/zakura/pull/1449) | Bound the CPU that peer-announced records can take without serializing the address book. |
+| Discovery `Hello` send interval | `crates/zakura-network/src/zakura/discovery/service.rs` | every refresh → at most one per `15 s` | [#1449](https://github.com/zakura-core/zakura/pull/1449) | Meet the row's sender floor for any configured refresh interval. |
 | `MAX_DISCOVERY_MESSAGE_BYTES` | `crates/zakura-network/src/zakura/discovery/protocol.rs` | `16 KiB` for every message → removed; per-message caps in `crates/zakura-network/src/zakura/discovery/wire.rs`: `Hello` 648, `GetPeers` 8,470, `Peers` 20,738, `GetServices` 1,090, `Services` 2,394 bytes | [#1448](https://github.com/zakura-core/zakura/pull/1448) | Bound each discovery message by its own largest valid encoding. |
 | `MAX_NODE_RECORD_BODY_BYTES` | `crates/zakura-network/src/zakura/discovery/protocol.rs` | `16 KiB` → `580` bytes | [#1448](https://github.com/zakura-core/zakura/pull/1448) | The largest valid record body (8 IPv6 addresses, 8 maximal service IDs) fills it exactly. |
 | `MAX_SERVICES_PER_RECORD` | `crates/zakura-network/src/zakura/discovery/protocol.rs` | `32` → `8` | [#1448](https://github.com/zakura-core/zakura/pull/1448) | Match the regulation spec; a node advertises six services today. |

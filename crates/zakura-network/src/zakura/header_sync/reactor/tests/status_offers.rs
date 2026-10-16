@@ -808,3 +808,55 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
         snapshot.frontiers.header_best,
     );
 }
+
+/// A full cadence burst of repeated statuses from each of `peers` peers
+/// starts one locator read, and another peer's new target still starts at
+/// once. The port never answers, so each read stays pending, as under a slow
+/// state.
+#[allow(clippy::print_stderr)]
+fn status_flood(peers: u8) {
+    // The `Status` cadence capacity.
+    const BURST: usize = 602;
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = v9::FakePort::new(0);
+    startup.use_direct_port();
+    let (_, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let flooders: Vec<_> = (0..peers).map(|byte| connect(&mut reactor, byte)).collect();
+    let (honest, _outbound) = connect(&mut reactor, 0xff);
+    let flooded = block::Hash([0x42; 32]);
+    let started = std::time::Instant::now();
+    for _ in 0..BURST {
+        for (peer, _) in &flooders {
+            reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
+            reactor.schedule_cached_statuses();
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(reactor.pending_port_operations.len(), 1);
+    reactor.handle_status(honest, 0, status_for(&snapshot, block::Hash([0x43; 32])));
+    assert_eq!(reactor.pending_port_operations.len(), 2);
+    let statuses = BURST * flooders.len();
+    eprintln!(
+        "status_flood peers={peers} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
+        elapsed.as_nanos() / u128::try_from(statuses).expect("fits u128"),
+    );
+}
+
+/// Sixteen flooding peers, on every pull request.
+#[test]
+fn status_floods_start_no_repeated_work() {
+    status_flood(16);
+}
+
+/// Every peer a one-byte test identity allows but the honest one, on the
+/// scheduled run.
+#[test]
+#[ignore = "scheduled load run; nightly CI passes --run-ignored"]
+fn maximum_status_floods_start_no_repeated_work() {
+    status_flood(255);
+}

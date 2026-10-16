@@ -54,6 +54,23 @@ mod tests;
 /// Decimal byte units used by database size logs.
 const DECIMAL_BYTE_UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
 
+/// The most deleted or overwritten keys one seek of an unbounded multi-prefix scan may skip
+/// before the scan falls back to bounded per-prefix iterators.
+const MAX_SKIPPED_KEYS_PER_PREFIX_SEEK: u64 = 64;
+
+/// Returns the smallest key after every key that starts with `prefix`, or `None` if there is none.
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] = end[index].saturating_add(1);
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
 /// Formats an integer byte count with one optional decimal digit.
 fn format_bytes(bytes: u64) -> String {
     const UNIT_SCALE: u64 = 1_000;
@@ -1399,20 +1416,46 @@ impl DiskDb {
             .collect()
     }
 
-    /// Collect the rows under each raw key prefix, in prefix order, with one iterator.
+    /// Collect the rows under each raw key prefix, in prefix order.
     ///
-    /// Returns the same rows as [`Self::raw_range_cf`] over each prefix's half-open range,
-    /// without creating an iterator per prefix.
+    /// Returns the same rows as [`Self::raw_range_cf`] over each prefix's half-open range.
+    /// It usually reads them with one iterator instead of one per prefix.
     pub(crate) fn raw_prefixes_cf<C, P>(
         &self,
         cf: &C,
-        prefixes: impl IntoIterator<Item = P>,
+        prefixes: &[P],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
     where
         C: rocksdb::AsColumnFamilyRef,
         P: AsRef<[u8]>,
     {
-        let mut iterator = self.db.raw_iterator_cf(cf);
+        match self.raw_prefixes_cf_with_one_iterator(cf, prefixes) {
+            // Without per-prefix bounds, a seek can walk deleted keys past its prefix.
+            // Too many of them: scan each prefix with its own bounded iterator instead.
+            Err(error) if error.kind() == ErrorKind::Incomplete => {
+                let mut rows = Vec::new();
+                for prefix in prefixes {
+                    let prefix = prefix.as_ref();
+                    rows.extend(self.raw_range_cf(cf, prefix, prefix_end(prefix).as_deref())?);
+                }
+                Ok(rows)
+            }
+            result => result,
+        }
+    }
+
+    fn raw_prefixes_cf_with_one_iterator<C, P>(
+        &self,
+        cf: &C,
+        prefixes: &[P],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        P: AsRef<[u8]>,
+    {
+        let mut options = ReadOptions::default();
+        options.set_max_skippable_internal_keys(MAX_SKIPPED_KEYS_PER_PREFIX_SEEK);
+        let mut iterator = self.db.raw_iterator_cf_opt(cf, options);
         let mut rows = Vec::new();
         for prefix in prefixes {
             let prefix = prefix.as_ref();

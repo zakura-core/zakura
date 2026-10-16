@@ -146,6 +146,28 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(AssetError, "expanded asset archive"):
                 self.crates.registry().archive_checksum(self.asset)
 
+    def test_sparse_grid_cannot_expand_past_the_size_bound(self):
+        for size in (registry.GRID_LIMIT + 1, registry.ARCHIVE_LIMIT + 1):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+                entry = tarfile.TarInfo(GRID_MEMBER)
+                entry.size = 1
+                entry.pax_headers = {"GNU.sparse.map": "0,1", "GNU.sparse.size": str(size)}
+                archive.addfile(entry, io.BytesIO(b"x"))
+            self.crates.set_raw_archive(output.getvalue())
+            self.assertLess(len(gzip.decompress(self.crates.archive)), registry.ARCHIVE_LIMIT)
+            with self.subTest(size=size), \
+                    patch.object(tarfile.TarFile, "extractfile", side_effect=AssertionError("oversized grid read")), \
+                    self.assertRaisesRegex(AssetError, "bounded, regular frontier grid"):
+                self.crates.registry().archive_checksum(self.asset)
+
+    def test_grid_accepts_the_exact_size_bound(self):
+        with patch.object(registry, "GRID_LIMIT", len(self.crates.grid)):
+            self.assertEqual(self.crates.registry().archive_checksum(self.asset), self.crates.checksum)
+        with patch.object(registry, "GRID_LIMIT", len(self.crates.grid) - 1):
+            with self.assertRaisesRegex(AssetError, "bounded, regular frontier grid"):
+                self.crates.registry().archive_checksum(self.asset)
+
     def test_index_propagation_is_retried_and_resolves_the_exact_package(self):
         now, index_calls, resolutions = [0], [0], []
         def fetch(url, limit):

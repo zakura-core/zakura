@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 GRID_PATH = "src/mainnet-frontier-grid.bin"
+GRID_LIMIT = 32 * 1024 * 1024
 ARCHIVE_LIMIT = 40 * 1024 * 1024
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -68,7 +69,7 @@ def check_identity(identity: dict) -> None:
 
 
 def grid_digest(archive: bytes, member: str) -> str:
-    """Hash the single regular grid file in a `.crate` archive."""
+    """Hash the single bounded, regular grid file in a `.crate` archive."""
     # Bound decompression before tarfile sees the data, since tarfile allocates extended headers.
     with gzip.GzipFile(fileobj=io.BytesIO(archive)) as compressed:
         expanded = compressed.read(ARCHIVE_LIMIT + 1)
@@ -76,10 +77,11 @@ def grid_digest(archive: bytes, member: str) -> str:
         raise AssetError("expanded asset archive exceeds its size limit")
     with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as package:
         grids = [entry for entry in package if entry.name == member]
-        if len(grids) != 1 or not grids[0].isfile():
-            raise AssetError("published archive must contain exactly one regular frontier grid")
+        # Sparse tar members can expand beyond the decompressed archive's size.
+        if len(grids) != 1 or not grids[0].isfile() or grids[0].size > GRID_LIMIT:
+            raise AssetError("published archive must contain exactly one bounded, regular frontier grid")
         with package.extractfile(grids[0]) as grid:
-            return hashlib.sha256(grid.read()).hexdigest()
+            return hashlib.sha256(grid.read(GRID_LIMIT + 1)).hexdigest()
 
 
 def index_path(name: str) -> str:

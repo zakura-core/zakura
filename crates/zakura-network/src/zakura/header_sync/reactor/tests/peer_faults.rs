@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::{CloseCause, FramedRecv};
 
 #[test]
 fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
@@ -109,7 +110,7 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
             zakura_header_chain::Attribution::HeaderPeer(source),
             None,
         );
-        reactor.handle_typed_failure(peer.clone(), source, &error);
+        reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
         assert_peer_violation(&mut actions, expected);
     }
 
@@ -131,7 +132,7 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
             zakura_header_chain::Attribution::HeaderPeer(source),
             None,
         );
-        reactor.handle_typed_failure(peer.clone(), source, &error);
+        reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
         assert!(
             actions.try_recv().is_err(),
             "{category:?} cannot cross the header-peer scoring boundary"
@@ -157,13 +158,127 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
                 attribution,
                 None,
             );
-            reactor.handle_typed_failure(peer.clone(), source, &error);
+            reactor.handle_typed_failure(peer.clone(), source, Some(owner), &error);
             assert!(
                 actions.try_recv().is_err(),
                 "{category:?} with {attribution:?} cannot score this header peer"
             );
         }
     }
+}
+
+/// Connect `peer` with a session `session_id` whose connection the test
+/// watches, and keep its outbound queue open.
+fn connect(
+    reactor: &mut HeaderSyncReactor,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+) -> (PeerSession, FramedRecv, CancellationToken, CloseCause) {
+    let (send, outbound) = framed_channel(8);
+    let (connection, close_cause) = (CancellationToken::new(), CloseCause::new());
+    let session = PeerSession::from_parts_with_connection(
+        peer.clone(),
+        session_id,
+        send,
+        CancellationToken::new(),
+        connection.clone(),
+        close_cause.clone(),
+    );
+    reactor.handle_peer_connected(session.clone());
+    (session, outbound, connection, close_cause)
+}
+
+type FailureFixture = fn(
+    zakura_header_chain::SourceId,
+    zakura_header_chain::HeaderSyncWorkOwner,
+) -> Arc<zakura_header_chain::HeaderChainError>;
+
+/// An invalid header from preparation or admission disconnects the session
+/// that sent it, and its subscription never acknowledges its cursor. A local
+/// or stale failure keeps the connection, and so does a fault in the work of
+/// a session that a replacement superseded.
+#[test]
+fn header_peer_faults_disconnect_only_the_sending_session() {
+    let cases: [(FailureFixture, bool); 3] = [
+        (invalid_header_failure, true),
+        (|_, owner| local_failure(owner), false),
+        (|_, owner| stale_failure(owner), false),
+    ];
+    for (failure, faulted) in cases {
+        for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+            let (mut reactor, mut actions, snapshot, peer, source, owner) =
+                peer_violation_fixture();
+            let (session, _outbound, connection, close_cause) =
+                connect(&mut reactor, &peer, owner.session_id());
+            // Bind the seeded work to a live subscription of the session.
+            let anchor = snapshot.frontiers.finalized;
+            let target = zakura_header_chain::Frontier::new(
+                block::Height(1),
+                owner.header_authority().branch.target_tip_hash,
+            );
+            let status = v9::test_support::status::<
+                { crate::zakura::header_sync::config::REGTEST_HEADER_BYTES },
+            >(target);
+            let id = session
+                .try_open(&status, &[anchor], AuxSchema::None, 1)
+                .expect("the session opens a subscription");
+            let owner: zakura_header_chain::HeaderSyncWorkOwner =
+                zakura_header_chain::HeaderWorkOwner {
+                    request_id: NonZeroU64::new(id.get()).expect("subscription IDs are nonzero"),
+                    ..owner
+                        .header_owner()
+                        .expect("the fixture is ordinary header work")
+                }
+                .into();
+            let active = reactor
+                .peer_work_queue
+                .active_mut(&peer)
+                .expect("the fixture has active work");
+            (active.request_id, active.owner, active.phase) = (id, owner, phase);
+
+            let failure = failure(source, owner);
+            if phase == HeaderTargetPhase::Preparing {
+                let failed = HeaderTargetPreparationResult::Failed(failure);
+                reactor.handle_header_target_prepared(peer, source, owner, failed);
+            } else {
+                let failed = HeaderTargetAdmissionResult::Failed(failure);
+                reactor.handle_header_target_admission_ready(peer, source, owner, failed);
+            }
+
+            assert_eq!(connection.is_cancelled(), faulted);
+            if !faulted {
+                assert!(
+                    actions.try_recv().is_err(),
+                    "a local failure is no violation"
+                );
+                continue;
+            }
+            assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+            assert_eq!(close_cause.get_or("missing"), "header_peer_fault");
+            let start = v9::Cursor {
+                height: anchor.height,
+                hash: anchor.hash,
+                headers: 0,
+                bytes: 0,
+            };
+            assert_eq!(
+                session.subscriber().accept_through(id.get(), &start, 0),
+                Err(v9::SubscribeError::Failed),
+                "the failed subscription acknowledges no cursor",
+            );
+        }
+    }
+
+    let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+    let (_replacement, _outbound, connection, _) =
+        connect(&mut reactor, &peer, owner.session_id() + 1);
+    let failure = invalid_header_failure(source, owner);
+    reactor.handle_typed_failure(peer, source, Some(owner), &failure);
+    assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    assert!(
+        !connection.is_cancelled(),
+        "the replacement stays connected"
+    );
 }
 
 /// A page or outcome for another subscription leaves the active request,

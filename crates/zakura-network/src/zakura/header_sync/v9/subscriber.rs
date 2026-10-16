@@ -646,7 +646,6 @@ impl Subscriber {
     /// Record that a page of `id` failed contextual validation. The
     /// subscription accepts no more cursors and sends no more grants. The
     /// reactor disconnects the peer.
-    #[cfg(test)]
     pub(crate) fn validation_failed(&mut self, id: u64) -> bool {
         let Some(live) = self.live.as_mut().filter(|live| live.id == id) else {
             return false;

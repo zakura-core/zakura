@@ -247,6 +247,14 @@ impl PeerSession {
         self.inner.connection_cancel_token.cancel();
     }
 
+    /// Close the connection because a page of subscription `id` failed
+    /// validation. The subscription acknowledges no further cursor.
+    pub(super) fn disconnect_for_header_fault(&self, id: u64) {
+        self.subscriber().validation_failed(id);
+        self.inner.close_cause.record("header_peer_fault");
+        self.inner.connection_cancel_token.cancel();
+    }
+
     /// Current free slots in the bounded outbound queue.
     pub fn outbound_capacity(&self) -> usize {
         self.inner.send.capacity()

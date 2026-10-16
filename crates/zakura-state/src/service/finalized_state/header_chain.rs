@@ -541,7 +541,10 @@ pub enum HeaderChainStoreError {
     #[error(transparent)]
     Codec(#[from] HeaderChainValueError),
     /// Pure transition planning rejected the request before commit.
-    #[error(transparent)]
+    ///
+    /// Not transparent, so header sync can find the planner failure through
+    /// `source()` to classify the refusal.
+    #[error("{0}")]
     Transition(#[from] TransitionFailure),
     /// The writer could not install a committed transition in memory.
     /// The writer must fail closed.

@@ -403,12 +403,7 @@ Version 9 takes effect at activation. Until then, version 8 remains as section 5
 header chain engine specification](fork-aware-header-chain-engine.md) defines it. At activation,
 this section supersedes that specification's stream version, message encodings, and `GetHeaders`
 request rules, and the tests that pin them, including PW-08. Its other header sync rules keep
-applying except where this section changes them, including the atomic status snapshot, locator
-construction, LC-WIRE-05's path selection and serving reserve, target scheduling, auxiliary schemas,
-peer attribution, and unknown-fork discovery. Under version 9, a locator at the target ends with no
-page instead of LC-WIRE-05's empty, complete response. The activation change updates that
-specification. A node still runs exactly one header sync protocol at one stream version, as its
-LC-SCOPE-09 requires.
+applying except where this section changes them. The activation change updates that specification.
 
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
@@ -427,9 +422,6 @@ HEADERS_RESPONSE_FIXED_BYTES = 82 bytes
 HEADERS_OUTCOME_BYTES        = 41 bytes
 HS_SENT_CURSOR_RING          = 4,096 sent cursors per subscription
 ```
-
-`MAX_HS_SUBSCRIPTIONS` bounds the subscriber. `HS_PUBLISHER_SLOTS` bounds the publisher, which
-admits a margin above that limit as explained under `SubscribeHeaders`.
 
 The cap test pins `HEADERS_RESPONSE_FIXED_BYTES` to the codec. The frame cap already has an
 implementation in [`HeaderSyncMessage::check_payload_size`][hs-payload-size].
@@ -468,9 +460,8 @@ start has zero counts and each page consumes at least one header.
 `Headers` retains the version 8 response fields and order. It renames `request_id` to
 `subscription_id` and `complete` to `reaches_initial_target`. The fixed fields occupy 82 bytes.
 `reaches_initial_target` is true exactly on the page whose last header is the initial target and is
-false on every other page. A subscription that reaches its target at `Open` sends no such page.
-`HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial target hash, and a one-byte
-outcome.
+false on every other page. `HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial
+target hash, and a one-byte outcome.
 
 #### `Status` — Announcement, discriminator 1
 
@@ -504,18 +495,6 @@ snapshot. `work_anchor_height` is the height of the sender's finality anchor.
 
 The receiver capacity allows 600 messages buffered over the maximum ten-minute transport outage,
 plus the initial message and one message of jitter. The refill runs at twice the sender rate.
-As for block sync `Status`, a single stream can stall longer than that outage while sibling
-traffic keeps the connection alive, so exhaustion cannot prove a violation. The reader records it
-and forwards the message. Bounded handler work, not the bucket, bounds a `Status` flood.
-
-Version 8 needed the one-second interval because `Status` was the only way a new tip reached a
-peer. In version 9, a subscription that has reached its initial target receives new tips as pushed
-pages. `Status` still selects peers and targets, and it names the next target after
-`SubscriptionSuperseded`. A longer sender interval is therefore an option, not a decision. A
-five-second sender would need capacity 122 and a refill under five seconds, and a 30-second sender
-would match block sync's row. Any longer interval would also loosen the two-second freshness
-bound and delay reorganization recovery by up to that interval, so parameter evidence must
-measure that recovery first.
 
 #### `SubscribeHeaders` — Request, discriminator 2
 
@@ -569,12 +548,9 @@ nothing to send. The subscriber does not need to hold credit for a full page in 
 subscriber SHOULD keep header and byte credit for at least one page outstanding on a live
 subscription.
 
-The `Grant` minimum bounds control floods. Without it, a `Grant` that adds one byte stays legal
-until the 8 MiB byte window fills. A subscriber could then send up to 8,388,608 grants before any
-acknowledgement, and one more for each byte it later acknowledges. With the minimum, every `Open`
-and `Grant` adds at least one header or `P` bytes. The window and the tombstone bound below keep a
-subscription's total granted credit within the credit its pages consumed plus one window. So the
-`Open` and `Grant` updates of one subscription number at most:
+Every `Open` and `Grant` adds at least one header or `P` bytes, and the window and the tombstone
+bound below keep a subscription's total granted credit within the credit its pages consumed plus
+one window. So the `Open` and `Grant` updates of one subscription number at most:
 
 ```text
 4,000 + sent_headers + floor((8 MiB + sent_bytes) / P)
@@ -607,10 +583,8 @@ terminal outcome from causing a violation. A tombstone match validates the subsc
 update sequence, which continues from the last update the publisher applied. It does not check the
 acknowledged cursor.
 
-A tombstone records whether the publisher received `Close` before the subscription ended. A
-conformant subscriber sends nothing on a subscription after its `Close`, so an update that matches
-such a tombstone MUST return `Disconnect`. The remaining rules apply to a tombstone that the
-publisher's own terminal outcome left, where updates can honestly cross that outcome.
+The rules below apply to a tombstone that the publisher's own terminal outcome left, where updates
+can honestly cross that outcome.
 
 The tombstone keeps the subscription's granted and consumed credit. A crossing `Grant` that would
 raise granted credit above consumed credit plus the window, in headers or in bytes, MUST return
@@ -621,9 +595,8 @@ later crossing grants cannot reuse the same room. A crossing `Close` MUST return
 the tombstone.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
-clears every tombstone and MUST use a different subscription ID. This rule bounds a conformant
-subscriber to one live or closing subscription, and the publisher's slots bound it to two. Terminal
-reservations cannot accumulate. The terminal outcome consumes no header or byte credit.
+clears every tombstone and MUST use a different subscription ID. The terminal outcome consumes no
+header or byte credit.
 
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
@@ -676,15 +649,14 @@ Page linkage is a reservation rule, not a context-free one. It holds against the
 receive cursor in the local reservation, so [`prepare_headers`][prepare-headers] cannot decide it.
 
 The first page MUST extend the highest sent locator that is the initial target or one of its
-ancestors. When a sent locator equals the target, that locator is the highest such locator, so the
-first page extends the target. The publisher MUST reach the initial target before it pushes a
-descendant beyond that target. Each later page MUST extend the preceding page on the ordered stream.
-After reaching the initial target, the publisher MAY push a new header immediately when its selected
-chain extends the subscription's last header and credit remains. That header is the last one the
-publisher sent on the subscription, or the initial target before any page. If its selected chain no
-longer extends that header, it MUST stop pushing and MUST queue
-`HeadersOutcome(SubscriptionSuperseded)`. The subscriber MUST acknowledge only a cursor that passes
-contextual difficulty, time, chain-connection, and auxiliary-root validation.
+ancestors. The publisher MUST reach the initial target before it pushes a descendant beyond that
+target. Each later page MUST extend the preceding page on the ordered stream. After reaching the
+initial target, the publisher MAY push a new header immediately when its selected chain extends the
+subscription's last header and credit remains. That header is the last one the publisher sent on the
+subscription, or the initial target before any page. If its selected chain no longer extends that
+header, it MUST stop pushing and MUST queue `HeadersOutcome(SubscriptionSuperseded)`. The subscriber
+MUST acknowledge only a cursor that passes contextual difficulty, time, chain-connection, and
+auxiliary-root validation.
 
 The publisher SHOULD produce an eligible page when credit, chain data, and execution/output
 capacity are available. This specification imposes no mandatory push deadline. The subscriber MAY

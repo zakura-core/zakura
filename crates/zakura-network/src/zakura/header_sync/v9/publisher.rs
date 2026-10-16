@@ -425,8 +425,8 @@ impl Shared {
     /// The next page or check to run, if any subscription has one.
     ///
     /// A subscription that follows the selected chain ends here, without a
-    /// state read, when the selected tip is no higher than its last header
-    /// and differs from it.
+    /// state read and even while it is stalled, when the selected tip is no
+    /// higher than its last header and differs from it.
     fn next_job<const HEADER_BYTES: usize>(
         &mut self,
         selected: Option<&EngineSnapshot>,
@@ -448,7 +448,20 @@ impl Shared {
             let Some(subscription) = self.subscriptions.get(&id) else {
                 continue;
             };
-            if subscription.end.is_some() || subscription.stall.is_some() {
+            if subscription.end.is_some() {
+                continue;
+            }
+            // Superseding a follower needs no state work, so a stalled one
+            // ends as soon as the selected tip drops to or below its last
+            // header.
+            if let (Position::Following(last), Some(selected)) = (subscription.position, selected) {
+                let tip = selected.frontiers.header_best;
+                if tip != last && tip.height <= last.height {
+                    self.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
+                    continue;
+                }
+            }
+            if subscription.stall.is_some() {
                 continue;
             }
             let schema = subscription.fixed.schema;
@@ -458,11 +471,8 @@ impl Shared {
                     continue;
                 };
                 let tip = selected.frontiers.header_best;
-                if tip == last {
-                    continue;
-                }
+                // The check above ended a tip at or below the last header.
                 if tip.height <= last.height {
-                    self.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
                     continue;
                 }
                 if count == 0 {

@@ -1394,6 +1394,33 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
     harness.check_quiet().await;
 }
 
+/// A follower stalled on a capacity refusal still ends as superseded when
+/// the selected tip drops below its last header.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(4);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[3].hash, vec![chain[3]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let signal = ServingCapacitySignal::default();
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(signal.clone())));
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    // The refusal is never released.
+    port.select(chain[1]);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    assert!(!signal.is_released());
+    harness.check_quiet().await;
+}
+
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,
 /// and an unadvertised schema fault.
 #[tokio::test(start_paused = true)]

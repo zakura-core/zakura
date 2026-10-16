@@ -29,9 +29,11 @@ pub(crate) struct SharedMap<K, V> {
 
 impl<K, V> Default for SharedMap<K, V> {
     fn default() -> Self {
+        // Empty slots share one allocation until their first write.
+        let empty_partition = Arc::new(HashMap::new());
         Self {
             partition_hasher: RandomState::new(),
-            partitions: (0..PARTITIONS).map(|_| Arc::new(HashMap::new())).collect(),
+            partitions: vec![empty_partition; PARTITIONS],
             len: 0,
         }
     }

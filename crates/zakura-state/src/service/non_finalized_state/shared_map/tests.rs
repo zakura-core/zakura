@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn empty_maps_share_one_partition_until_the_first_write() {
+    let mut index = SharedMap::<u32, u32>::default();
+    let empty_partition = index.partitions[0].clone();
+    assert!(
+        index
+            .partitions
+            .iter()
+            .all(|partition| Arc::ptr_eq(partition, &empty_partition)),
+        "empty maps share one allocation across all partition slots"
+    );
+    let snapshot = index.clone();
+
+    assert_eq!(index.remove(&0), None);
+    assert!(index
+        .partitions
+        .iter()
+        .all(|partition| Arc::ptr_eq(partition, &empty_partition)));
+
+    assert_eq!(index.insert(0, 7), None);
+    let touched = index.partition_index(&0);
+    for (partition_index, partition) in index.partitions.iter().enumerate() {
+        assert_eq!(
+            Arc::ptr_eq(partition, &empty_partition),
+            partition_index != touched
+        );
+    }
+    assert_eq!(index.get(&0), Some(&7));
+    assert_eq!(index.len(), 1);
+    assert_eq!(index.iter().count(), 1);
+    assert!(snapshot.is_empty());
+    assert_eq!(snapshot.get(&0), None);
+    assert!(snapshot
+        .partitions
+        .iter()
+        .all(|partition| Arc::ptr_eq(partition, &empty_partition)));
+}
+
+#[test]
 fn mutation_copies_only_the_touched_partition() {
     let mut index = SharedMap::default();
     index.insert(0_u32, 0_u32);

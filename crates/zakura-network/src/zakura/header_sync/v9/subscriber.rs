@@ -644,9 +644,15 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         if !starved && headers < u64::from(Self::prefix(staging)) {
             return None;
         }
-        if !live.reached && (unspent.objects + headers == 0 || unspent.bytes + bytes < page) {
-            return None;
-        }
+        // Pages spend at most one smallest page of bytes per header, and
+        // grants refill both windows together, so unspent bytes always cover
+        // unspent headers at one smallest page each, and only a grant that
+        // adds a header gets here. The credit therefore fits a page, as the
+        // specification requires before the target.
+        debug_assert!(
+            headers >= 1 && unspent.bytes + bytes >= (unspent.objects + headers) * page,
+            "a grant leaves credit for a page"
+        );
         let added = Credit {
             objects: u32::try_from(headers).expect("the room is within the header window"),
             bytes: u32::try_from(bytes).expect("the room is within the byte window"),

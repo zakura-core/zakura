@@ -32,13 +32,14 @@ use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
     BlockSyncServiceSummary, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError,
     GetServices, HeaderSyncServiceSummary, ServiceSummaryEnvelope, Services, ZakuraDiscoveryHandle,
-    ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+    ZakuraNodeRecord, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS,
     ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
+use super::requester::{reservation_pool, Queries, QueryUnsent};
 use super::serving::{get_peers_capacity, PeerSampler, PeersQuery};
 use super::wire::{PEERS_MAX_BYTES, RULES, SEND_INTERVAL};
 use crate::zakura::{
-    regulation::{CadenceSendError, CadenceSender, Serve, ServeCapacity},
+    regulation::{CadenceSendError, CadenceSender, ReservationPool, Serve, ServeCapacity},
     wire_codec::encode_frame,
 };
 
@@ -160,6 +161,8 @@ pub struct DiscoveryService {
     connection_owners: Arc<StdMutex<Vec<Arc<dyn Service>>>>,
     /// Node-wide `GetPeers` serving capacity.
     get_peers: ServeCapacity,
+    /// Node-wide reservations for this node's queries.
+    queries: ReservationPool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +273,7 @@ impl DiscoveryService {
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             get_peers: get_peers_capacity(),
+            queries: reservation_pool(),
         }
     }
 
@@ -286,6 +290,7 @@ impl DiscoveryService {
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             get_peers: get_peers_capacity(),
+            queries: reservation_pool(),
         }
     }
 
@@ -422,6 +427,7 @@ impl Service for DiscoveryService {
         let header_sync = self.header_sync.clone();
         let block_sync = self.block_sync.clone();
         let get_peers = self.get_peers.clone();
+        let queries = self.queries.clone();
         let session_states = self.session_states.clone();
         let connection_owners = self
             .connection_owners
@@ -479,6 +485,7 @@ impl Service for DiscoveryService {
                     header_sync,
                     block_sync,
                     get_peers,
+                    queries,
                     connection_owners,
                     peer_node_id,
                     discovery_session,
@@ -512,6 +519,7 @@ struct DiscoveryExchangeStart {
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     get_peers: ServeCapacity,
+    queries: ReservationPool,
     connection_owners: Vec<Arc<dyn Service>>,
     peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
@@ -530,6 +538,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         header_sync,
         block_sync,
         get_peers,
+        queries,
         connection_owners,
         peer_node_id,
         discovery_session,
@@ -556,11 +565,14 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    let queries = Queries::new(queries, connection_cancel.clone(), close_cause.clone());
+    queries.attach_precheck(&recv);
     let sink = DiscoverySink {
         handle: handle.clone(),
         header_sync,
         block_sync,
         get_peers,
+        queries: queries.clone(),
         peer_node_id,
         session: discovery_session.clone(),
         conn_id,
@@ -600,6 +612,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         session_id,
         progress,
         hello: StdMutex::new(CadenceSender::new()),
+        queries,
     };
     // SR-1: a panic in the source task skips its `service_cancel.cancel()`,
     // `handle.remove_session()`, and discovery-only connection cancellation,
@@ -664,6 +677,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 retire_discovery_session(&session_states, &peer_id, conn_id, session_id);
             }
             service_cancel.cancel();
+            source.queries.retire();
             handle.remove_session(&peer_id, conn_id, session_id).await;
             if closes_discovery_only_connection {
                 source_close_cause.record("discovery_exchange_complete");
@@ -680,6 +694,8 @@ struct DiscoverySink {
     block_sync: Option<BlockSyncHandle>,
     /// Serves this session's `GetPeers`.
     get_peers: Serve<PeerSampler>,
+    /// This session's queries, whose answers the reader claims.
+    queries: Queries,
     peer_node_id: NodeId,
     session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
@@ -703,6 +719,12 @@ async fn run_discovery_pipe(
             return Ok(());
         };
 
+        // A response claims its reservation before its payload is decoded.
+        let peers_limit = (frame.message_type == u16::from(MSG_DISCOVERY_PEERS))
+            .then(|| sink.queries.claim_peers(frame.payload.len()))
+            .transpose()
+            .map_err(SinkReject::protocol)?;
+
         match pipe.run_one(frame) {
             Flow::Continue(()) | Flow::Done => {}
             Flow::Reject(reject) => return Err(reject),
@@ -711,12 +733,18 @@ async fn run_discovery_pipe(
         let Some(message) = pipe.local_mut().take_decoded() else {
             continue;
         };
-        sink.handle_message(message).await?;
+        sink.handle_message(message, peers_limit).await?;
     }
 }
 
 impl DiscoverySink {
-    async fn handle_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
+    /// Handles one decoded message. A `Peers` carries the limit of the
+    /// `GetPeers` whose reservation it claimed.
+    async fn handle_message(
+        &self,
+        message: DiscoveryMessage,
+        peers_limit: Option<u16>,
+    ) -> Result<(), SinkReject> {
         if !self
             .handle
             .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
@@ -740,9 +768,16 @@ impl DiscoverySink {
                 })
                 .map_err(SinkReject::protocol),
             DiscoveryMessage::Peers { records } => {
+                let limit = peers_limit.expect("the reader claims every Peers frame before decode");
+                if records.len() > usize::from(limit) {
+                    return Err(SinkReject::protocol(
+                        "Zakura discovery PEERS carries more records than its GetPeers limit",
+                    ));
+                }
                 self.handle
                     .import_peer_records(records, Some(self.peer_node_id))
-                    .await;
+                    .await
+                    .map_err(SinkReject::protocol)?;
                 self.progress.mark_peers();
                 Ok(())
             }
@@ -884,6 +919,9 @@ struct DiscoverySource {
     progress: Arc<DiscoveryExchangeProgress>,
     /// Paces `Hello` to its row's send interval and keeps only the latest record.
     hello: StdMutex<CadenceSender<DiscoveryMessage>>,
+    /// This session's queries. A `GetPeers` waits until the previous one is
+    /// answered.
+    queries: Queries,
 }
 
 /// How a session's initial exchange ended.
@@ -965,11 +1003,19 @@ impl DiscoverySource {
         // The wire limit is 1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE, and that
         // maximum fits in u16, so the cast cannot truncate.
         let exclude_node_ids = self.handle.peer_sample_exclusions().await;
-        self.handle_send_result(self.session.try_send_get_peers(
-            limit as u16,
-            Vec::new(),
+        let get_peers = DiscoveryMessage::GetPeers {
+            limit: limit as u16,
+            wanted_services: Vec::new(),
             exclude_node_ids,
-        ))?;
+        };
+        match self
+            .queries
+            .send_get_peers(&self.session.send, &self.session.cancel, get_peers)
+            .await
+        {
+            Ok(()) | Err(QueryUnsent::NotDue) => {}
+            Err(QueryUnsent::Closed) => return Err(()),
+        }
 
         self.handle_send_result(self.session.try_send_get_services(Vec::new()))
     }
@@ -1749,6 +1795,11 @@ mod tests {
             header_sync: None,
             block_sync: None,
             get_peers,
+            queries: Queries::new(
+                reservation_pool(),
+                CancellationToken::new(),
+                CloseCause::new(),
+            ),
             peer_node_id,
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
@@ -1855,11 +1906,14 @@ mod tests {
             Ok(())
         }
 
-        sink.handle_message(DiscoveryMessage::GetPeers {
-            limit: 1,
-            wanted_services: Vec::new(),
-            exclude_node_ids: Vec::new(),
-        })
+        sink.handle_message(
+            DiscoveryMessage::GetPeers {
+                limit: 1,
+                wanted_services: Vec::new(),
+                exclude_node_ids: Vec::new(),
+            },
+            None,
+        )
         .await?;
         next_peers(&mut recv).await?;
         assert!(
@@ -1877,6 +1931,65 @@ mod tests {
         drop(state);
         next_peers(&mut recv).await?;
         next_peers(&mut recv).await?;
+        Ok(())
+    }
+
+    /// The reader claims each `Peers` before decoding it: a `Peers` with no
+    /// unanswered `GetPeers` disconnects, and so does one with more records
+    /// than its `GetPeers` asked for.
+    #[tokio::test]
+    async fn peers_needs_its_get_peers_and_stays_within_its_limit() -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[56u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[57u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        let empty_peers = || {
+            discovery_frame(DiscoveryMessage::Peers {
+                records: Vec::new(),
+            })
+        };
+
+        let (sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let (to_sink, recv) = framed_channel(4);
+        let reader = tokio::spawn(async move {
+            let mut pipe = discovery_pipe(peer_id);
+            run_discovery_pipe(&mut pipe, recv, sink).await
+        });
+        to_sink.send(empty_peers()?).await?;
+        let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
+        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        let (sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let records = vec![
+            signed_discovery_record(&NodeSecretKey::from_bytes(&[58u8; 32]), &handshake)?,
+            signed_discovery_record(&NodeSecretKey::from_bytes(&[59u8; 32]), &handshake)?,
+        ];
+        assert!(matches!(
+            sink.handle_message(DiscoveryMessage::Peers { records }, Some(1))
+                .await,
+            Err(SinkReject::Protocol(_))
+        ));
         Ok(())
     }
 
@@ -1941,9 +2054,12 @@ mod tests {
         // rejecting at all.
         assert!(
             live_sink
-                .handle_message(DiscoveryMessage::Hello {
-                    record: imposter_record.clone(),
-                })
+                .handle_message(
+                    DiscoveryMessage::Hello {
+                        record: imposter_record.clone(),
+                    },
+                    None
+                )
                 .await
                 .is_err(),
             "the current session must still reject a hello authored by another node",
@@ -1951,9 +2067,12 @@ mod tests {
 
         assert!(
             stale_sink
-                .handle_message(DiscoveryMessage::Hello {
-                    record: imposter_record,
-                })
+                .handle_message(
+                    DiscoveryMessage::Hello {
+                        record: imposter_record,
+                    },
+                    None
+                )
                 .await
                 .is_ok(),
             "a superseded session must not reject on the connection's behalf: the guard is what \
@@ -2308,6 +2427,11 @@ mod tests {
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
             hello: StdMutex::new(CadenceSender::new()),
+            queries: Queries::new(
+                reservation_pool(),
+                CancellationToken::new(),
+                CloseCause::new(),
+            ),
         };
         assert_eq!(
             handle
@@ -2368,6 +2492,11 @@ mod tests {
             session_id: 1,
             progress: progress.clone(),
             hello: StdMutex::new(CadenceSender::new()),
+            queries: Queries::new(
+                reservation_pool(),
+                CancellationToken::new(),
+                CloseCause::new(),
+            ),
         };
         let source_task = tokio::spawn(async move { source.run_initial_exchange().await });
         for _ in 0..3 {
@@ -2430,6 +2559,11 @@ mod tests {
             session_id: 1,
             progress: Arc::new(DiscoveryExchangeProgress::default()),
             hello: StdMutex::new(CadenceSender::new()),
+            queries: Queries::new(
+                reservation_pool(),
+                CancellationToken::new(),
+                CloseCause::new(),
+            ),
         };
 
         assert_eq!(

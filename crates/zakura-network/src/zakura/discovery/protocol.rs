@@ -764,8 +764,36 @@ pub enum DiscoveryRecordError {
     IncompatibleProtocol,
 }
 
+/// Whether a relayed record that failed `verify_authentic` with `error` is only dropped.
+///
+/// A relay cannot change a third party's signed bytes, and it can legitimately know
+/// nodes whose protocol range does not overlap this node's, so that record is dropped.
+/// Every other failure is one no conformant relay sends, so it disconnects the relay.
+/// Expiry and far-future expiry are local policy checked after verification, and they
+/// also only drop. The match names every variant, so a new error fails the build until
+/// it is classified.
+pub(crate) fn relay_drops(error: &DiscoveryRecordError) -> bool {
+    match error {
+        DiscoveryRecordError::IncompatibleProtocol
+        | DiscoveryRecordError::Expired
+        | DiscoveryRecordError::FarFutureExpiry => true,
+        DiscoveryRecordError::Wire(_)
+        | DiscoveryRecordError::MalformedNodeId
+        | DiscoveryRecordError::InvalidSignature
+        | DiscoveryRecordError::WrongNetwork
+        | DiscoveryRecordError::WrongChain => false,
+    }
+}
+
 /// Default maximum discovery book entries learned from peers.
 pub const DEFAULT_MAX_DISCOVERY_BOOK_RECORDS: usize = 10_000;
+
+/// Default maximum discovery book entries attributed to one source peer.
+///
+/// An honest relay discloses at most one window of 32 records per requester per
+/// 10-minute epoch, so this holds eight epochs of distinct windows. It stops one
+/// relay from filling the book and from forcing evictions on every insert.
+pub const DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE: usize = 256;
 
 const HIGH_DIAL_FAILURE_COUNT: u32 = 3;
 
@@ -782,11 +810,14 @@ pub struct ZakuraDiscoveryBookLimits {
     pub max_services_per_record: usize,
     /// Maximum encoded record size accepted by the book.
     pub max_encoded_record_bytes: usize,
+    /// Maximum records attributed to one source peer.
+    pub max_records_per_source: usize,
 }
 
 impl Default for ZakuraDiscoveryBookLimits {
     fn default() -> Self {
         Self {
+            max_records_per_source: DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE,
             max_records: DEFAULT_MAX_DISCOVERY_BOOK_RECORDS,
             max_imported_records_per_response: MAX_DISCOVERY_RECORDS_PER_RESPONSE,
             max_direct_addrs_per_record: MAX_DIRECT_ADDRS_PER_RECORD,
@@ -1055,6 +1086,9 @@ pub struct ZakuraDiscoveryBook {
     /// Entries that became confirmed, counted so a small snapshot can tell
     /// when a rebuild would add candidates.
     confirmations: u64,
+    /// Entries attributed to each source peer. A source with no entries has
+    /// no key.
+    source_counts: HashMap<NodeId, usize>,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -1191,8 +1225,8 @@ fn record_verify_slots() -> SlotBudget {
 ///
 /// These mirror the fields [`ZakuraDiscoveryInner::validation_context`] reads, all of which
 /// are fixed at construction (local identity/network parameters and import limits never
-/// change at runtime). Snapshotting them on the handle lets [`ZakuraDiscoveryHandle::import_peer_records`]
-/// run CPU-heavy Ed25519 verification outside the lock.
+/// change at runtime). Snapshotting them on the handle lets record imports run CPU-heavy
+/// Ed25519 verification outside the lock.
 #[derive(Clone, Debug)]
 struct DiscoveryImportValidation {
     expected_network_id: ZakuraNetworkId,
@@ -1807,48 +1841,94 @@ impl ZakuraDiscoveryHandle {
         Ok(record)
     }
 
-    /// Imports peer-supplied signed records through the discovery book validation path.
+    /// Imports a relayed batch of peer-supplied signed records from `source`.
     ///
-    /// Record signatures are verified OUTSIDE the global discovery mutex. Ed25519
-    /// verification and signature-domain re-encoding are CPU-heavy and fully
-    /// attacker-driven (an authenticated discovery peer can send a full `Peers` batch of
-    /// records with valid or invalid signatures, repeatedly); running them while holding
-    /// the shared async lock lets that peer stall unrelated discovery admission,
-    /// sampling, and dial selection. Only the cheap book mutation (storage-limit recheck,
-    /// address policy, map insert, eviction) runs under the lock, and the lock is skipped
-    /// entirely when nothing survives verification. See finding
-    /// `claude-discovery-expensive-work-under-global-mutex` (SR-2).
+    /// Verification of every record finishes before any record is imported:
+    ///
+    /// 1. One lock hold compares the batch with the stored records. A record identical
+    ///    to the one stored for its node was verified when it was stored, so it skips
+    ///    verification.
+    /// 2. The rest verify in one blocking task under a node-wide verification slot, so
+    ///    Ed25519 work never runs under the discovery mutex and one relay holds at most
+    ///    one slot.
+    /// 3. One lock hold applies expiry, staleness, address, storage, and per-source
+    ///    policy. Each of those only drops its record: a record can expire in transit,
+    ///    and policy is local.
+    ///
+    /// Returns the first verification error that no conformant relay causes; see
+    /// [`relay_drops`]. Nothing from the batch is imported then.
     pub async fn import_peer_records(
         &self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
         source: Option<NodeId>,
-    ) -> ImportBatchOutcome {
-        let now = current_unix_secs();
-        let context = self.import_validation.context(now);
+    ) -> Result<ImportBatchOutcome, DiscoveryRecordError> {
         let max_records = self.import_validation.max_imported_records_per_response;
-
         let mut outcome = ImportBatchOutcome::default();
-        let mut verified = Vec::new();
+        let mut batch = Vec::new();
         for record in records {
             if outcome.attempted >= max_records {
                 outcome.dropped_for_limit += 1;
                 continue;
             }
             outcome.attempted += 1;
-            match record.verify(&context) {
-                Ok(()) => verified.push(record),
+            batch.push(record);
+        }
+        if batch.is_empty() {
+            return Ok(outcome);
+        }
+
+        let (mut verified, unverified): (Vec<_>, Vec<_>) = {
+            let inner = self.inner.lock().await;
+            batch
+                .into_iter()
+                .partition(|record| inner.holds_record(record))
+        };
+        if !unverified.is_empty() {
+            let unverified_len = unverified.len();
+            let slot = self.verify_slots.reserve().await;
+            let context = self.import_validation.context(current_unix_secs());
+            let checked = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                let mut verified = Vec::with_capacity(unverified.len());
+                let mut dropped = 0;
+                for record in unverified {
+                    match record.verify_authentic(&context) {
+                        Ok(()) => verified.push(record),
+                        Err(error) if relay_drops(&error) => dropped += 1,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok((verified, dropped))
+            })
+            .await
+            .check_for_panics_with(false);
+            let Ok(checked) = checked else {
+                // Shutdown cancelled the task. The relay is not at fault.
+                outcome.rejected += unverified_len;
+                return Ok(outcome);
+            };
+            let (fresh, dropped) = checked?;
+            outcome.rejected += dropped;
+            verified.extend(fresh);
+        }
+
+        let now = current_unix_secs();
+        let mut inner = self.inner.lock().await;
+        let context = inner.validation_context(now);
+        for record in verified {
+            if validate_record_expiry(&record.body, &context).is_err() {
+                outcome.rejected += 1;
+                continue;
+            }
+            match inner
+                .book
+                .import_record_inner(record, source, false, true, now, &context)
+            {
+                Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
             }
         }
-
-        if !verified.is_empty() {
-            let mut inner = self.inner.lock().await;
-            inner
-                .book
-                .import_pre_verified_records(verified, source, now, &context, &mut outcome);
-        }
-
-        outcome
+        Ok(outcome)
     }
 
     /// Imports one peer-supplied signed record through the discovery book validation path.
@@ -2706,6 +2786,7 @@ impl ZakuraDiscoveryBook {
             disclosure_key: RandomState::new(),
             sample_snapshot: None,
             confirmations: 0,
+            source_counts: HashMap::new(),
         }
     }
 
@@ -2833,29 +2914,6 @@ impl ZakuraDiscoveryBook {
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         self.import_record_inner(record, None, true, false, now, context)
-    }
-
-    /// Imports a batch of records whose signatures were already verified outside the lock.
-    ///
-    /// [`ZakuraDiscoveryHandle::import_peer_records`] performs signature verification and
-    /// applies the per-response cap before taking the global discovery mutex, so this only
-    /// runs the cheap storage-limit recheck, address-policy check, map mutation, and
-    /// eviction under the lock. `attempted`/`dropped_for_limit` are owned by the caller;
-    /// this updates the per-record success and rejection tallies on `outcome`.
-    fn import_pre_verified_records(
-        &mut self,
-        records: impl IntoIterator<Item = ZakuraNodeRecord>,
-        source: Option<NodeId>,
-        now: u64,
-        context: &DiscoveryRecordValidationContext,
-        outcome: &mut ImportBatchOutcome,
-    ) {
-        for record in records {
-            match self.import_record_inner(record, source, false, true, now, context) {
-                Ok(import_outcome) => outcome.record_success(import_outcome),
-                Err(_) => outcome.rejected += 1,
-            }
-        }
     }
 
     /// Imports a bounded batch of signed peer records from a single response.
@@ -3260,9 +3318,8 @@ impl ZakuraDiscoveryBook {
 
     /// Validates and stores one record.
     ///
-    /// When `pre_verified` is set the signature/import-context check has already been run
-    /// outside the global discovery mutex by [`ZakuraDiscoveryHandle::import_peer_records`],
-    /// so it is not repeated here; the cheap storage-limit, address-policy, insertion, and
+    /// When `pre_verified` is set the caller has already run the author checks outside the
+    /// global discovery mutex and checked expiry, so they are not repeated here; the cheap storage-limit, address-policy, insertion, and
     /// eviction steps still run under the caller's lock.
     fn import_validated_record(
         &mut self,
@@ -3290,15 +3347,34 @@ impl ZakuraDiscoveryBook {
         let node_id = record.body.node_id;
         if let Some(entry) = self.entries.get_mut(&node_id) {
             let was_confirmed = entry.last_confirmed.is_some();
+            let old_source = entry.source;
             let outcome = update_existing_entry(entry, record, metadata);
             if !was_confirmed && entry.last_confirmed.is_some() {
                 self.confirmations += 1;
             }
+            let new_source = entry.source;
+            if new_source != old_source {
+                self.unattribute(old_source);
+                self.attribute(new_source);
+            }
             return Ok(outcome);
+        }
+        // A relay may add only so many new entries. An update keeps the
+        // book's size, so it is never refused for its source.
+        if let Some(source) = metadata.source.filter(|source| *source != node_id) {
+            let attributed = self.source_counts.get(&source).copied().unwrap_or(0);
+            if attributed >= self.limits.max_records_per_source {
+                return Err(DiscoveryBookError::Limit {
+                    field: "records per source",
+                    actual: attributed + 1,
+                    max: self.limits.max_records_per_source,
+                });
+            }
         }
         if metadata.last_confirmed.is_some() {
             self.confirmations += 1;
         }
+        self.attribute(metadata.source);
 
         self.entries.insert(
             node_id,
@@ -3355,7 +3431,31 @@ impl ZakuraDiscoveryBook {
             let Some(node_id) = self.next_eviction_candidate(now) else {
                 break;
             };
-            self.entries.remove(&node_id);
+            if let Some(entry) = self.entries.remove(&node_id) {
+                self.unattribute(entry.source);
+            }
+        }
+    }
+
+    /// Counts one more entry for `source`.
+    fn attribute(&mut self, source: Option<NodeId>) {
+        if let Some(source) = source {
+            *self.source_counts.entry(source).or_default() += 1;
+        }
+    }
+
+    /// Counts one fewer entry for `source`.
+    fn unattribute(&mut self, source: Option<NodeId>) {
+        let Some(source) = source else {
+            return;
+        };
+        if let std::collections::hash_map::Entry::Occupied(mut count) =
+            self.source_counts.entry(source)
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
         }
     }
 
@@ -7204,7 +7304,10 @@ mod tests {
         let record = runtime_record_with(1, service(9), test_addr(9));
         let node_id = record.body.node_id;
 
-        handle.import_peer_records([record], None).await;
+        handle
+            .import_peer_records([record], None)
+            .await
+            .expect("authentic test records import");
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert_eq!(handle.active_services(node_id).await, None);
@@ -7388,7 +7491,10 @@ mod tests {
             panic!("PEERS response decoded as a different message");
         };
 
-        handle.import_peer_records(records, None).await;
+        handle
+            .import_peer_records(records, None)
+            .await
+            .expect("authentic test records import");
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert_eq!(handle.live_service_summaries_at(node_id, NOW).await, None);
@@ -8110,7 +8216,10 @@ mod tests {
             panic!("PEERS response decoded as a different message");
         };
 
-        handle.import_peer_records(records, None).await;
+        handle
+            .import_peer_records(records, None)
+            .await
+            .expect("authentic test records import");
         connected_tx.send_replace(vec![peer_id_for(peer_node_id), peer_id_for(node_id)]);
 
         assert_eq!(handle.live_service_summaries_at(node_id, now).await, None);
@@ -8361,7 +8470,10 @@ mod tests {
         no_addr.expires_at_unix_secs = current_unix_secs() + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
         let invalid = ZakuraNodeRecord::sign(no_addr, &signing_secret).expect("record signs");
 
-        let outcome = handle.import_peer_records([valid, invalid], None).await;
+        let outcome = handle
+            .import_peer_records([valid, invalid], None)
+            .await
+            .expect("an address policy failure only drops its record");
 
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.added, 1);
@@ -8371,12 +8483,10 @@ mod tests {
     /// Regression test for `claude-discovery-expensive-work-under-global-mutex`.
     ///
     /// An authenticated discovery peer can send a full `Peers` batch whose records carry
-    /// invalid signatures. Each record still triggers a full Ed25519 verification — the
-    /// expensive, attacker-driven work. Previously that verification ran while holding the
-    /// global discovery mutex, so an attacker could repeatedly stall every other discovery
-    /// operation (admission, sampling, dial selection). Signatures are now verified outside
-    /// the lock, and an all-invalid batch never needs the lock at all, so the import makes
-    /// progress even while another task holds the mutex.
+    /// invalid signatures. Each record triggers a full Ed25519 verification — the
+    /// expensive, attacker-driven work. Verification runs in a blocking task under a
+    /// verification slot, never under the global discovery mutex, so other discovery
+    /// operations make progress while a batch waits for or holds a slot.
     #[tokio::test]
     async fn import_peer_records_verifies_signatures_without_holding_global_mutex() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8384,7 +8494,7 @@ mod tests {
 
         // A full Peers batch of records with valid bodies but tampered signatures: bumping
         // the sequence after signing leaves body validation passing while the Ed25519 check
-        // (re-encoding the body and verifying) runs in full and fails.
+        // runs in full and fails.
         let mut batch = Vec::with_capacity(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         for index in 0..MAX_DISCOVERY_RECORDS_PER_RESPONSE {
             let octet = u8::try_from(index + 1).expect("test batch index fits in u8");
@@ -8394,23 +8504,154 @@ mod tests {
             batch.push(record);
         }
 
-        // Hold the global discovery mutex for the entire import call.
-        let guard = handle.inner.lock().await;
+        let held = handle.verify_slots.hold_free();
+        let import = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.import_peer_records(batch, None).await }
+        });
+        // Let the batch reach the slot wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let guard = tokio::time::timeout(Duration::from_secs(5), handle.inner.lock())
+            .await
+            .expect("a batch waiting for verification does not hold the global mutex");
+        assert!(
+            !import.is_finished(),
+            "the batch waits for a verification slot"
+        );
+        drop(guard);
+        drop(held);
 
-        // Verification and rejection of the whole batch must make progress without the lock;
-        // if it were still performed under the mutex this would deadlock until the timeout.
+        let verdict = tokio::time::timeout(Duration::from_secs(5), import)
+            .await
+            .expect("the batch verifies once a slot frees")
+            .expect("the import task does not panic");
+        assert!(matches!(
+            verdict,
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+    }
+
+    /// Relayed records follow the relay verdict table: a forged record anywhere in the
+    /// batch disconnects the relay before any record is imported, and records that only
+    /// fail local or compatibility checks drop alone.
+    #[tokio::test]
+    async fn relayed_batch_verdicts() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let relay = secret_key().public();
+        let valid = || runtime_record_with(1, service(1), test_addr(1));
+
+        for position in 0..3 {
+            let handle = discovery_handle_with_connected(connected_rx.clone());
+            let mut batch: Vec<_> = (0..3)
+                .map(|index| runtime_record_with(1, service(index), test_addr(10 + index as u8)))
+                .collect();
+            batch[position].body.sequence += 1;
+            assert!(matches!(
+                handle.import_peer_records(batch, Some(relay)).await,
+                Err(DiscoveryRecordError::InvalidSignature)
+            ));
+            assert_eq!(
+                handle.inner.lock().await.book.len(),
+                0,
+                "position {position}"
+            );
+        }
+
+        let handle = discovery_handle_with_connected(connected_rx.clone());
+        let now = current_unix_secs();
+        let signer = secret_key();
+        let mut incompatible = body(&signer);
+        incompatible.zakura_protocol_min = u16::MAX - 1;
+        incompatible.zakura_protocol_max = u16::MAX;
+        incompatible.expires_at_unix_secs = now + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
+        let incompatible = ZakuraNodeRecord::sign(incompatible, &signer).expect("record signs");
+        let signer = secret_key();
+        let mut expired = body(&signer);
+        expired.expires_at_unix_secs = now - 3_600;
+        let expired = ZakuraNodeRecord::sign(expired, &signer).expect("record signs");
+        let outcome = handle
+            .import_peer_records([incompatible, expired, valid()], Some(relay))
+            .await
+            .expect("incompatible and expired records only drop");
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.rejected, 2);
+
+        // An expired record with a bad signature is forged, not stale.
+        let signer = secret_key();
+        let mut forged = body(&signer);
+        forged.expires_at_unix_secs = now - 3_600;
+        let mut forged = ZakuraNodeRecord::sign(forged, &signer).expect("record signs");
+        forged.body.sequence += 1;
+        assert!(matches!(
+            handle.import_peer_records([forged], Some(relay)).await,
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+    }
+
+    /// A record identical to the stored one is not verified again.
+    #[tokio::test]
+    async fn identical_relayed_records_skip_verification() {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let record = runtime_record_with(1, service(1), test_addr(1));
+        handle
+            .import_peer_records([record.clone()], None)
+            .await
+            .expect("an authentic record imports");
+
+        let _held = handle.verify_slots.hold_free();
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            handle.import_peer_records(batch, None),
+            handle.import_peer_records([record], None),
         )
         .await
-        .expect("import_peer_records must verify signatures without holding the global mutex");
+        .expect("an identical record needs no verification slot")
+        .expect("an authentic record imports");
+        assert_eq!(outcome.metadata_updated, 1);
+    }
 
-        drop(guard);
+    /// One source adds at most its quota of new entries. Updates and other sources
+    /// still import, and eviction returns the source's attribution.
+    #[test]
+    fn per_source_quota_bounds_new_entries() {
+        const QUOTA: usize = 3;
+        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
+            max_records_per_source: QUOTA,
+            ..ZakuraDiscoveryBookLimits::default()
+        });
+        let relay = secret_key().public();
+        let other_relay = secret_key().public();
+        let mut records = Vec::new();
+        for index in 0..QUOTA {
+            let octet = u8::try_from(index + 1).expect("small test index fits in u8");
+            let record = long_lived_record_with(1, service(index), test_addr(octet));
+            book.import_record(record.clone(), Some(relay), NOW, &context())
+                .expect("the relay is under its quota");
+            records.push(record);
+        }
+        let extra = long_lived_record_with(1, service(9), test_addr(50));
+        assert!(matches!(
+            book.import_record(extra.clone(), Some(relay), NOW, &context()),
+            Err(DiscoveryBookError::Limit {
+                field: "records per source",
+                ..
+            })
+        ));
+        book.import_record(records[0].clone(), Some(relay), NOW, &context())
+            .expect("an update adds no entry");
+        book.import_record(extra, Some(other_relay), NOW, &context())
+            .expect("another relay has its own quota");
 
-        assert_eq!(outcome.attempted, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        assert_eq!(outcome.rejected, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        assert_eq!(outcome.added, 0);
+        // Re-attributing an entry to another relay frees room for the first.
+        book.import_record(records[1].clone(), Some(other_relay), NOW, &context())
+            .expect("an update adds no entry");
+        book.import_record(
+            long_lived_record_with(1, service(10), test_addr(51)),
+            Some(relay),
+            NOW,
+            &context(),
+        )
+        .expect("the relay is back under its quota");
     }
 
     /// A third-party gossiped record is a local dial hint only. Until its owner confirms
@@ -8719,7 +8960,8 @@ mod tests {
         // service id cannot reveal whether that record reached this node's book.
         handle
             .import_peer_records([custom_record.clone()], Some(secret_key().public()))
-            .await;
+            .await
+            .expect("authentic test records import");
         assert!(handle
             .sample_peers(requester, 10, std::slice::from_ref(&custom_service), &[])
             .await
@@ -8998,11 +9240,15 @@ mod tests {
         let author = old.body.node_id;
         handle
             .import_peer_records([old.clone()], Some(author))
-            .await;
+            .await
+            .expect("authentic test records import");
         let sample = handle
             .sample_peers(secret_key().public(), 1, &[], &[])
             .await;
-        handle.import_peer_records([new], Some(author)).await;
+        handle
+            .import_peer_records([new], Some(author))
+            .await
+            .expect("authentic test records import");
 
         assert_eq!(sample, vec![old]);
     }

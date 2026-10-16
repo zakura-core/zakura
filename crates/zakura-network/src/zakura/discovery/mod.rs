@@ -7,6 +7,7 @@ mod dialer;
 mod pipe;
 mod protocol;
 mod redial;
+mod requester;
 mod runtime;
 mod service;
 mod serving;

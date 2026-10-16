@@ -31,7 +31,7 @@ cloud-init status --wait >/dev/null 2>&1 || true
 for _ in $(seq 1 120); do pgrep -x apt-get >/dev/null || break; sleep 5; done
 apt-get -o DPkg::Lock::Timeout=600 update -qq
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
-  build-essential clang cmake pkg-config libssl-dev protobuf-compiler \
+  build-essential clang cmake pkg-config libssl-dev \
   git curl zstd jq python3
 # CPU-profiling tools for zakura-perf-bench.yml (best-effort: perf still gets
 # installed at run time if the kernel-matched package is missing here);

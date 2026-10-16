@@ -102,6 +102,9 @@ jobs:
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
+        with:
+          # `cargo xtask check-rpc-artifacts` below regenerates the gRPC code.
+          protoc: 'true'
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --features default-release-binaries
       - name: Check locked all-feature build

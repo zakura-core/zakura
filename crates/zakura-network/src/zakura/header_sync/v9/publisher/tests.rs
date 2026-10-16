@@ -1830,13 +1830,17 @@ async fn follow(
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
     use super::super::{subscriber::Subscriber, test_support::status};
+    use crate::zakura::{regulation::WriterFence, CloseCause};
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
-    let mut subscriber = Subscriber::<HB>::new();
+    let mut subscriber = Subscriber::<HB>::new(WriterFence::new(
+        CancellationToken::new(),
+        CloseCause::default(),
+    ));
     let open = subscriber
         .open(
             &status::<HB>(chain[9]),
@@ -1844,7 +1848,8 @@ async fn the_subscriber_follows_the_publisher() {
             AuxSchema::None,
             6,
         )
-        .expect("the first Open is recorded");
+        .expect("the first Open is recorded")
+        .0;
     assert_eq!(harness.apply(open).await, Ok(Applied::Live));
     assert_eq!(
         pages(&follow(&mut harness, &mut subscriber, 6).await),
@@ -1875,7 +1880,8 @@ async fn the_subscriber_follows_the_publisher() {
             AuxSchema::None,
             6,
         )
-        .expect("the terminal outcome freed the slot");
+        .expect("the terminal outcome freed the slot")
+        .0;
     assert_eq!(harness.apply(open).await, Ok(Applied::Live));
     assert!(follow(&mut harness, &mut subscriber, 6).await.is_empty());
     port.grow(1);

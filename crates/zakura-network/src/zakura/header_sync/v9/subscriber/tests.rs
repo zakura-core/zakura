@@ -21,8 +21,9 @@ use crate::zakura::{
     },
     regulation::Publications,
     wire_codec::{decode_frame, encode_frame},
-    Frame,
+    CloseCause, Frame,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -32,6 +33,16 @@ type Sub = Subscriber<HB>;
 
 /// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
+
+/// A subscriber on a session whose fence closes `connection`.
+fn fenced(connection: &CancellationToken) -> Sub {
+    Sub::new(WriterFence::new(connection.clone(), CloseCause::default()))
+}
+
+/// A subscriber on a session whose connection the test ignores.
+fn subscriber() -> Sub {
+    fenced(&CancellationToken::new())
+}
 
 /// A peer `Status` that advertises `tip`.
 fn status(tip: Frontier) -> Status {
@@ -147,8 +158,8 @@ struct Fixture {
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
     fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
-        let mut sub = Sub::new();
-        let open = sub
+        let mut sub = subscriber();
+        let (open, _) = sub
             .open(&status(target), locators, AuxSchema::None, staging)
             .expect("the first Open is recorded");
         let open = wire(&open);
@@ -207,11 +218,12 @@ fn chain(length: u32) -> (HeaderTree, Vec<Frontier>) {
 #[test]
 fn open_records_its_reservation_first() {
     let (_tree, chain) = chain(6);
-    let mut sub = Sub::new();
+    let mut sub = subscriber();
     let locators = [chain[3], chain[1], chain[0]];
     let open = wire(
         &sub.open(&status(chain[6]), &locators, AuxSchema::None, 10)
-            .expect("the first Open is recorded"),
+            .expect("the first Open is recorded")
+            .0,
     );
     assert_eq!(open.operation, Operation::Open);
     assert_eq!(open.update_sequence, 0);
@@ -252,8 +264,9 @@ fn open_records_its_reservation_first() {
     // A conformant subscriber holds one subscription: a target change waits
     // for the terminal outcome, and the live credit stays.
     assert_eq!(
-        sub.open(&status(chain[5]), &locators, AuxSchema::None, 10),
-        Err(SubscribeError::Tools(SubscribeRefused::AtCapacity))
+        sub.open(&status(chain[5]), &locators, AuxSchema::None, 10)
+            .err(),
+        Some(SubscribeError::Tools(SubscribeRefused::AtCapacity))
     );
     assert_eq!(sub.live(), Some(open.subscription_id));
     sub.receive_outcome(&outcome(
@@ -262,7 +275,7 @@ fn open_records_its_reservation_first() {
         HeadersOutcomeCode::TargetNotSelected,
     ))
     .expect("legal before the first page");
-    let next = sub
+    let (next, _) = sub
         .open(&status(chain[6]), &locators, AuxSchema::None, 10)
         .expect("the terminal outcome freed the slot");
     assert_ne!(next.subscription_id, open.subscription_id, "a new ID");
@@ -273,11 +286,11 @@ fn open_records_its_reservation_first() {
 #[test]
 fn open_refuses_what_the_publisher_would_fault() {
     let (_tree, chain) = chain(20);
-    let mut sub = Sub::new();
+    let mut sub = subscriber();
     let target = status(chain[20]);
     assert_eq!(
-        sub.open(&target, &[], AuxSchema::None, 10),
-        Err(SubscribeError::Locators)
+        sub.open(&target, &[], AuxSchema::None, 10).err(),
+        Some(SubscribeError::Locators)
     );
     assert_eq!(
         sub.open(
@@ -285,22 +298,23 @@ fn open_refuses_what_the_publisher_would_fault() {
             &[chain[2], chain[1], chain[2]],
             AuxSchema::None,
             10
-        ),
-        Err(SubscribeError::Locators)
+        )
+        .err(),
+        Some(SubscribeError::Locators)
     );
     assert_eq!(
-        sub.open(&target, &chain[..14], AuxSchema::None, 10),
-        Err(SubscribeError::Locators)
+        sub.open(&target, &chain[..14], AuxSchema::None, 10).err(),
+        Some(SubscribeError::Locators)
     );
     let mut plain = status(chain[20]);
     plain.tree_aux_schema_mask = 0;
     assert_eq!(
-        sub.open(&plain, &[chain[1]], AuxSchema::V1, 10),
-        Err(SubscribeError::Schema)
+        sub.open(&plain, &[chain[1]], AuxSchema::V1, 10).err(),
+        Some(SubscribeError::Schema)
     );
     assert_eq!(
-        sub.open(&target, &[chain[1]], AuxSchema::None, 0),
-        Err(SubscribeError::NoStaging)
+        sub.open(&target, &[chain[1]], AuxSchema::None, 0).err(),
+        Some(SubscribeError::NoStaging)
     );
     assert_eq!(sub.live(), None);
     assert_eq!(sub.precheck().lock().len(), 0);
@@ -308,7 +322,8 @@ fn open_refuses_what_the_publisher_would_fault() {
     // A schema-1 Open's byte credit fits a schema-1 page.
     let open = wire(
         &sub.open(&target, &[chain[1]], AuxSchema::V1, 1)
-            .expect("one header of staging is enough"),
+            .expect("one header of staging is enough")
+            .0,
     );
     assert_eq!(open.added_credit.objects, 1);
     assert_eq!(
@@ -569,7 +584,7 @@ fn outcomes_fault_outside_their_window() {
         Err(SubscriberFault::Target)
     );
     assert_eq!(
-        Sub::new().receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
+        subscriber().receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
         Err(SubscriptionFault::Unknown.into())
     );
 }
@@ -707,7 +722,7 @@ fn a_failed_validation_is_never_acknowledged() {
 
 /// Local failover keeps the subscription's credit: after `Close`, pages
 /// within it are admitted, no `Grant` follows, and `SubscriptionClosed` ends
-/// it. An `Open` that was never written is retracted.
+/// it.
 #[test]
 fn close_keeps_credit_and_admits_pages() {
     let (tree, chain) = chain(6);
@@ -730,14 +745,66 @@ fn close_keeps_credit_and_admits_pages() {
         .outcome(HeadersOutcomeCode::SubscriptionClosed)
         .expect("legal after Close");
     assert_eq!(ended.accepted, page.cursor);
+}
 
-    let mut sub = Sub::new();
-    let open = sub
-        .open(&status(chain[6]), &[chain[0]], AuxSchema::None, 4)
-        .expect("recorded");
-    assert!(sub.retract(open.subscription_id));
+/// An `Open` holds its session's exchange until the terminal outcome. A
+/// session that ends after the `Open`'s first byte closes the connection, an
+/// outcome releases the exchange, and retracting an `Open` closes the
+/// connection only if a byte was written. A retired fence opens nothing.
+#[test]
+fn an_open_holds_its_exchange_until_the_outcome() {
+    let (_tree, chain) = chain(2);
+    let open = |sub: &mut Sub, written: bool| {
+        let (open, writer) = sub
+            .open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
+            .expect("recorded");
+        if written {
+            assert!(writer.publish(|| {}) && writer.try_start(|| true));
+        }
+        open.subscription_id
+    };
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    open(&mut sub, true);
+    drop(sub);
+    assert!(
+        connection.is_cancelled(),
+        "a written Open lost its receiver"
+    );
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    let id = open(&mut sub, true);
+    sub.receive_outcome(&outcome(
+        id,
+        chain[2].hash,
+        HeadersOutcomeCode::TargetNotSelected,
+    ))
+    .expect("legal before the first page");
+    let id = open(&mut sub, false);
+    assert!(sub.retract(id));
     assert_eq!(sub.live(), None);
-    assert_eq!(sub.precheck().lock().len(), 0);
+    drop(sub);
+    assert!(!connection.is_cancelled());
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    let id = open(&mut sub, true);
+    assert!(sub.retract(id));
+    assert!(
+        connection.is_cancelled(),
+        "the peer may answer a written Open"
+    );
+
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let mut sub = Sub::new(fence.clone());
+    assert!(fence.retire());
+    assert_eq!(
+        sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
+            .err(),
+        Some(SubscribeError::Fenced)
+    );
 }
 
 /// A scripted publisher's view of its subscription.
@@ -1138,7 +1205,7 @@ impl Session {
                     .sub
                     .open(&status(target), &locators, schema, self.staging)
                 {
-                    Ok(open) => {
+                    Ok((open, _)) => {
                         assert!(live.is_none());
                         assert!(
                             self.opened.insert(open.subscription_id),
@@ -1211,7 +1278,7 @@ fn run(ops: Vec<Op>) {
     let tip = *tree.extend(genesis, 4).last().expect("four headers");
     let mut session = Session {
         tree,
-        sub: Sub::new(),
+        sub: subscriber(),
         script: Script::new(tip),
         to_subscriber: VecDeque::new(),
         to_publisher: VecDeque::new(),

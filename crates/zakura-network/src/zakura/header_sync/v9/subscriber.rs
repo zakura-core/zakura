@@ -58,8 +58,8 @@ use super::{
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
     regulation::{
-        SharedSubscriptions, SubscribeRefused, SubscriptionFault, SubscriptionLimits,
-        Subscriptions, Update,
+        ExchangeWriter, SharedSubscriptions, SubscribeRefused, SubscriptionFault,
+        SubscriptionLimits, Subscriptions, Update, WriterFence,
     },
     wire_codec::WireMessage,
     Credit,
@@ -87,6 +87,9 @@ pub(crate) enum SubscribeError {
     /// The subscription has a page that failed validation.
     #[error("the subscription failed validation")]
     Failed,
+    /// The session's fence retired, or its connection closed.
+    #[error("the session's writers are fenced")]
+    Fenced,
 }
 
 /// A page or outcome that breaks a subscriber rule. Each case is a protocol
@@ -211,6 +214,9 @@ struct Live {
 #[derive(Debug)]
 pub(crate) struct Subscriber<const HEADER_BYTES: usize> {
     tools: SharedSubscriptions<u64, Cursor>,
+    /// The session's fence. Each `Open` holds an exchange of it until the
+    /// terminal outcome.
+    fence: WriterFence,
     /// At most one: `SUBSCRIBE_HEADERS` allows one live or closing
     /// subscription, and the tools refuse a second.
     live: Option<Live>,
@@ -222,8 +228,8 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// when it adds no header.
     const SMALLEST_PAGE: usize = smallest_page(HEADER_BYTES, AuxSchema::None);
 
-    /// A subscriber with no subscription.
-    pub(crate) fn new() -> Self {
+    /// A subscriber with no subscription, on the session that `fence` guards.
+    pub(crate) fn new(fence: WriterFence) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         Self {
@@ -231,6 +237,7 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
                 limits,
                 Message::<HEADER_BYTES>::RULES,
             )),
+            fence,
             live: None,
             next_id: 1,
         }
@@ -265,20 +272,24 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         (Self::window(staging, AuxSchema::None).objects / 2).max(1)
     }
 
-    /// Record an `Open` to the selected tip of `status`, and return it to
-    /// write.
+    /// Record an `Open` to the selected tip of `status`, and return it with
+    /// the writer to send it through `FramedSend::send_fenced`.
     ///
     /// `locators` are this node's locators, highest first; the first is the
     /// start cursor. `staging` is the header staging budget reserved for the
     /// subscription. The `Open` grants the whole window, which fits one page
     /// under `schema`. A locator equal to the target reaches it at `Open`.
+    ///
+    /// The subscription holds the `Open`'s exchange until its terminal
+    /// outcome, so a session that ends after the `Open` was written and
+    /// before the outcome closes the connection.
     pub(crate) fn open(
         &mut self,
         status: &Status,
         locators: &[Frontier],
         schema: AuxSchema,
         staging: u32,
-    ) -> Result<SubscribeHeaders, SubscribeError> {
+    ) -> Result<(SubscribeHeaders, ExchangeWriter), SubscribeError> {
         let Some(&start) = locators.first() else {
             return Err(SubscribeError::Locators);
         };
@@ -306,7 +317,9 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             headers: 0,
             bytes: 0,
         };
-        let update = self.tools.lock().open(id, window, start)?;
+        let exchange = self.fence.open().ok_or(SubscribeError::Fenced)?;
+        let writer = exchange.writer();
+        let update = self.tools.lock().open_fenced(id, window, start, exchange)?;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let target = status.selected_tip_hash;
         let target_locator = locators
@@ -327,11 +340,12 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
         };
         let message = live.message(Operation::Open, update);
         self.live = Some(live);
-        Ok(message)
+        Ok((message, writer))
     }
 
-    /// Remove an `Open` that was never written, when the send failed locally
-    /// before the first byte.
+    /// Remove a subscription whose `Open` failed to send. If no byte was
+    /// written, nothing else happens. If its first byte was written, the peer
+    /// may answer, so dropping the exchange closes the connection.
     pub(crate) fn retract(&mut self, id: u64) -> bool {
         if self.live.as_ref().is_none_or(|live| live.id != id) {
             return false;

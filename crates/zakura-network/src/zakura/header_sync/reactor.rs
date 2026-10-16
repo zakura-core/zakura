@@ -21,7 +21,10 @@ use super::{
     events::{HeaderPortOperation, PortDispatch},
     scheduler::{
         completed_targets::CompletedHeaderTargets,
-        peer_work::{HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult},
+        peer_work::{
+            HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult,
+            MAX_HEADER_CHUNK_RESERVATION_V1,
+        },
         repair::{RepairPolicyState, RepairRequirement, RepairRequirementSlot},
         status::StatusPublisher,
     },
@@ -179,6 +182,7 @@ fn build_header_sync_reactor(
         peer_work_queue: PeerWorkQueue::default(),
         request_deadlines: HashMap::new(),
         completed_targets: CompletedHeaderTargets::default(),
+        ordinary_resource_stall: None,
         vct_repair: RepairRequirementSlot::default(),
         vct_repair_stall: None,
         vct_local_operation: None,
@@ -201,6 +205,14 @@ struct PeerState {
     session: PeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
+    /// Whether `last_status` already had its one chance to start ordinary work.
+    ///
+    /// Staging spends a status, as does a status received during an ordinary attempt or
+    /// one that cannot yield work under the current header authority. Fresh status or
+    /// header authority restores it. Unstarted work deferred by local capacity, a committed
+    /// stall, or repair preemption also keeps its offer until the blocker clears.
+    /// Failed locator reads, sends, and ordinary attempts remain spent.
+    status_spent: bool,
     waiting_for_serving_slot: bool,
     capacity_signal: Option<zakura_node_services::header_chain::ServingCapacitySignal>,
     capacity_wait_cancel: Option<CancellationToken>,
@@ -282,6 +294,8 @@ struct HeaderSyncReactor {
     peer_work_queue: PeerWorkQueue,
     request_deadlines: HashMap<ZakuraPeerId, Instant>,
     completed_targets: CompletedHeaderTargets,
+    /// State version of the latest ordinary admission refused by a committed resource stall.
+    ordinary_resource_stall: Option<zakura_header_chain::StateVersion>,
     vct_repair: RepairRequirementSlot,
     /// Escalation state for a repair generation that has not completed.
     vct_repair_stall: Option<VctRepairStall>,
@@ -820,6 +834,7 @@ impl HeaderSyncReactor {
                     }
                 }
             }
+            self.schedule_cached_statuses();
         };
         self.retire_all_peer_work(terminal_outcome);
     }
@@ -990,6 +1005,7 @@ impl HeaderSyncReactor {
                 session,
                 status_publisher,
                 last_status: None,
+                status_spent: false,
                 waiting_for_serving_slot: false,
                 capacity_signal: None,
                 capacity_wait_cancel: None,
@@ -1130,6 +1146,7 @@ impl HeaderSyncReactor {
         }
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
+            state.status_spent = false;
         }
         if let Some(task) = self.vct_repair.current_mut() {
             task.observe_supplier_status(source_id_from_peer(&peer));
@@ -1139,6 +1156,11 @@ impl HeaderSyncReactor {
         self.consider_advertised_header_target(peer, session_id, status);
     }
 
+    /// Stage ordinary work for `peer`'s latest status.
+    ///
+    /// A status held back by another peer's ownership, full slots, missing headroom, or a
+    /// resource stall stays unspent. [`Self::schedule_cached_statuses`] stages it once that
+    /// condition clears.
     fn consider_advertised_header_target(
         &mut self,
         peer: ZakuraPeerId,
@@ -1156,19 +1178,31 @@ impl HeaderSyncReactor {
             status,
         };
         let work_order = target.claimed_work_order(local);
-        let eligible = target.is_discovery_eligible(local);
-        if !eligible {
+        let covered = self.completed_targets.contains(
+            local.header_generation,
+            zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash),
+        );
+        // A status too small for one header can never start a request.
+        let eligible = target.is_discovery_eligible(local)
+            && self.negotiated_response_limits(&target.status).1 != 0;
+        if !eligible || covered {
             self.peer_work_queue.remove_unstarted(&peer);
+            self.spend_status(&peer);
+            if covered {
+                metrics::counter!("sync.header.target.covered").increment(1);
+            }
             return;
         }
-        let branch =
-            zakura_header_chain::BranchId::new(local.frontiers.finalized.hash, target_tip_hash);
-        if self
-            .completed_targets
-            .contains(local.header_generation, branch)
-        {
+        if let Some(active) = self.peer_work_queue.active(&peer) {
+            // Exact selected-range repair does not use the advertised ordinary offer.
+            if matches!(active.purpose, HeaderTargetPurpose::Normal) {
+                self.spend_status(&peer);
+            }
+            metrics::counter!("sync.header.target.already_active").increment(1);
+            return;
+        }
+        if self.ordinary_discovery_paused() || self.ordinary_headroom(&peer, &target.status) == 0 {
             self.peer_work_queue.remove_unstarted(&peer);
-            metrics::counter!("sync.header.target.covered").increment(1);
             return;
         }
         match self.peer_work_queue.stage_distinct_target(
@@ -1177,6 +1211,7 @@ impl HeaderSyncReactor {
             PeerWorkPriority::from_work_order(work_order),
         ) {
             QueueWorkResult::NeedsLocator => {
+                self.spend_status(&peer);
                 if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                     peer: peer.clone(),
                     session_id,
@@ -1198,41 +1233,143 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn reconsider_advertised_header_targets(
-        &mut self,
-        previous: Option<(&zakura_header_chain::EngineSnapshot, usize)>,
-    ) {
-        let Some(current) = self.committed_snapshot.as_ref() else {
+    /// Stage the unspent statuses of idle peers into free ordinary slots.
+    ///
+    /// The reactor runs this after every event. A slot, headroom, or stall that any path
+    /// releases therefore reaches a waiting peer before the released peer's next status.
+    /// Staging spends a status, so this pass never retries a failed attempt by itself.
+    fn schedule_cached_statuses(&mut self) {
+        let Some(local) = self.committed_snapshot.as_ref() else {
             return;
         };
-        let claimed = self.peer_work_queue.claimed_header_count();
-        let targets: Vec<_> = self
+        if self.ordinary_discovery_paused()
+            || self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1
+        {
+            return;
+        }
+        let mut offers: Vec<_> = self
             .peer_state
             .iter()
+            .filter(|(peer, state)| !state.status_spent && !self.peer_work_queue.has_work(peer))
             .filter_map(|(peer, state)| {
-                state
-                    .last_status
-                    .as_ref()
-                    .filter(|status| {
-                        Self::request_header_prefix_remaining(
-                            current,
-                            claimed,
-                            status.selected_tip_height,
-                        ) > 0
-                            && previous.is_none_or(|(old, claimed_before)| {
-                                Self::request_header_prefix_remaining(
-                                    old,
-                                    claimed_before,
-                                    status.selected_tip_height,
-                                ) == 0
-                            })
-                    })
-                    .map(|status| (peer.clone(), state.session.session_id(), status.clone()))
+                let status = state.last_status.as_ref()?;
+                let target = AdvertisedHeaderTarget {
+                    scope: zakura_header_chain::HeaderWorkAuthority::for_target(
+                        local,
+                        status.selected_tip_hash,
+                    ),
+                    session_id: state.session.session_id(),
+                    status: status.clone(),
+                };
+                let priority = PeerWorkPriority::from_work_order(target.claimed_work_order(local));
+                Some((priority, peer.clone(), target))
             })
             .collect();
-        for (peer, session_id, status) in targets {
-            self.consider_advertised_header_target(peer, session_id, status);
+        offers.sort_by(
+            |(left_priority, left_peer, _), (right_priority, right_peer, _)| {
+                right_priority
+                    .cmp(left_priority)
+                    .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
+            },
+        );
+        for (_, peer, target) in offers {
+            if self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1 {
+                break;
+            }
+            // Leave a held-back status unspent without counting it as refused on every event.
+            if self
+                .peer_work_queue
+                .is_target_assigned(target.status.selected_tip_hash)
+                || self.ordinary_headroom(&peer, &target.status) == 0
+            {
+                continue;
+            }
+            self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
+    }
+
+    fn spend_status(&mut self, peer: &ZakuraPeerId) {
+        if let Some(state) = self.peer_state.get_mut(peer) {
+            state.status_spent = true;
+        }
+    }
+
+    /// Return an unstarted ordinary offer to the scheduler when a local blocker defers it.
+    fn defer_ordinary_target(&mut self, peer: &ZakuraPeerId) {
+        self.peer_work_queue.remove_unstarted(peer);
+        if let Some(state) = self.peer_state.get_mut(peer) {
+            state.status_spent = false;
+        }
+    }
+
+    /// Whether a committed resource stall still holds back new ordinary attempts.
+    ///
+    /// Every supplier would hit the same local stall, so discovery waits until the committed
+    /// state version advances past the stall receipt.
+    fn ordinary_discovery_paused(&self) -> bool {
+        self.ordinary_resource_stall.is_some_and(|stalled_at| {
+            self.committed_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.state_version <= stalled_at)
+        })
+    }
+
+    /// Return the headers that one ordinary request to `status`'s sender could reserve now.
+    ///
+    /// Locator reads in flight for other peers count at their negotiated size, because each
+    /// one reserves that headroom when it completes.
+    fn ordinary_headroom(&self, peer: &ZakuraPeerId, status: &Status) -> u32 {
+        let Some(local) = self.committed_snapshot.as_ref() else {
+            return 0;
+        };
+        let pending = self
+            .peer_work_queue
+            .awaiting_targets()
+            .filter(|(owner, _)| *owner != peer)
+            .map(|(_, target)| {
+                usize::try_from(self.negotiated_response_limits(&target.status).1)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_HEADER_CHUNK_RESERVATION_V1)
+            })
+            .fold(0, usize::saturating_add);
+        let claimed = self
+            .peer_work_queue
+            .claimed_header_count()
+            .saturating_add(pending);
+        self.peer_work_queue
+            .reservable_header_count(self.negotiated_response_limits(status).1.min(
+                Self::request_header_prefix_remaining(local, claimed, status.selected_tip_height),
+            ))
+    }
+
+    /// Return the response schema and the most headers that one response from `status`'s
+    /// sender can carry under both sides' advertised limits.
+    fn negotiated_response_limits(&self, status: &Status) -> (AuxSchema, u32) {
+        let tree_aux_schema = if status.tree_aux_schema_mask
+            & self.serving_limits.tree_aux_schema_mask()
+            & AuxSchema::V1.mask_bit()
+            != 0
+        {
+            AuxSchema::V1
+        } else {
+            AuxSchema::None
+        };
+        let byte_limited_count = headers_response_capacity(
+            &self.startup.network,
+            tree_aux_schema,
+            usize::try_from(
+                status
+                    .max_message_bytes
+                    .min(self.serving_limits.max_message_bytes()),
+            )
+            .unwrap_or(usize::MAX),
+        );
+        let header_count = status
+            .max_headers_per_response
+            .min(self.serving_limits.max_headers_per_response())
+            .min(byte_limited_count)
+            .min(MAX_HS_RANGE);
+        (tree_aux_schema, header_count)
     }
 
     fn handle_wire_response(
@@ -1446,6 +1583,8 @@ impl HeaderSyncReactor {
             return;
         }
         let active_target_tip_hash = active.target.status.selected_tip_hash;
+        let ordinary_scope =
+            (active.purpose == HeaderTargetPurpose::Normal).then_some(active.target.scope);
         if !self
             .peer_work_queue
             .consume_response_capacity(&peer, response.entries.len())
@@ -1459,6 +1598,11 @@ impl HeaderSyncReactor {
             && returned_ancestor.hash == response.target_tip_hash
             && response.target_tip_hash == active_target_tip_hash
         {
+            if let Some(scope) = ordinary_scope {
+                // The target is already in the local DAG, so no other peer needs to fetch it.
+                self.completed_targets
+                    .mark(scope.header_generation, scope.branch);
+            }
             self.retire_peer_work(&peer, HeaderRequestTerminal::AlreadyKnown);
             metrics::counter!("sync.header.target.already_known.total").increment(1);
             return;
@@ -1939,7 +2083,11 @@ impl HeaderSyncReactor {
             HeaderTargetAdmissionResult::Failed(error) => {
                 self.handle_typed_failure(peer, source, &error);
             }
-            HeaderTargetAdmissionResult::ResourceStalled(_) => {}
+            HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
+                self.ordinary_resource_stall = self
+                    .ordinary_resource_stall
+                    .max(Some(receipt.state_version));
+            }
         }
     }
 
@@ -2752,6 +2900,10 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.target.stale_locator").increment(1);
             return;
         }
+        if self.ordinary_discovery_paused() {
+            self.defer_ordinary_target(&peer);
+            return;
+        }
         let Some(session) = self
             .peer_state
             .get(&peer)
@@ -2761,32 +2913,8 @@ impl HeaderSyncReactor {
             return;
         };
 
-        let tree_aux_schema = if target.status.tree_aux_schema_mask
-            & self.serving_limits.tree_aux_schema_mask()
-            & AuxSchema::V1.mask_bit()
-            != 0
-        {
-            AuxSchema::V1
-        } else {
-            AuxSchema::None
-        };
-        let byte_limited_count = headers_response_capacity(
-            &self.startup.network,
-            tree_aux_schema,
-            usize::try_from(
-                target
-                    .status
-                    .max_message_bytes
-                    .min(self.serving_limits.max_message_bytes()),
-            )
-            .unwrap_or(usize::MAX),
-        );
-        let negotiated_header_count = target
-            .status
-            .max_headers_per_response
-            .min(self.serving_limits.max_headers_per_response())
-            .min(byte_limited_count)
-            .min(MAX_HS_RANGE);
+        let (tree_aux_schema, negotiated_header_count) =
+            self.negotiated_response_limits(&target.status);
         let max_header_count = negotiated_header_count.min(Self::request_header_prefix_remaining(
             &local,
             self.peer_work_queue.claimed_header_count(),
@@ -2800,7 +2928,7 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .reserve_request(&peer, max_header_count)
         {
-            self.peer_work_queue.remove_unstarted(&peer);
+            self.defer_ordinary_target(&peer);
             return;
         }
         let source = source_id_from_peer(&peer);
@@ -2949,7 +3077,6 @@ impl HeaderSyncReactor {
                 || old.frontiers.finalized != snapshot.frontiers.finalized
         });
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
-        let claimed_before = self.peer_work_queue.claimed_header_count();
         self.retire_obsolete_work(&snapshot);
         let old_tip = self
             .committed_snapshot
@@ -2963,7 +3090,7 @@ impl HeaderSyncReactor {
         };
         let status = Status::from_snapshot(&snapshot, &self.serving_limits);
         let now = Instant::now();
-        let previous = self.committed_snapshot.replace(snapshot);
+        self.committed_snapshot = Some(snapshot);
         self.schedule_current_vct_repair();
         self.request_vct_repair_context();
         for state in self.peer_state.values_mut() {
@@ -2984,10 +3111,14 @@ impl HeaderSyncReactor {
         }
         self.refresh_statuses();
         if header_authority_changed {
-            self.reconsider_advertised_header_targets(None);
-        } else if let Some(previous) = previous.as_ref() {
-            self.reconsider_advertised_header_targets(Some((previous, claimed_before)));
+            // Eligibility, completed targets, and locators all follow the header authority.
+            for (peer, state) in &mut self.peer_state {
+                if !self.peer_work_queue.has_work(peer) {
+                    state.status_spent = false;
+                }
+            }
         }
+        self.schedule_cached_statuses();
     }
 
     fn emit_snapshot_observed(
@@ -3320,7 +3451,10 @@ impl HeaderSyncReactor {
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
         for (peer, source, session, mut status, request_count) in candidates {
-            self.peer_work_queue.remove_unstarted(&peer);
+            if self.peer_work_queue.awaiting_target(&peer).is_some() {
+                // Preemption returns the ordinary offer even if reserving or sending repair fails.
+                self.defer_ordinary_target(&peer);
+            }
             if self
                 .peer_work_queue
                 .reservable_repair_header_count(request_count)

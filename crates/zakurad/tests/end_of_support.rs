@@ -14,19 +14,23 @@ mod log_capture;
 use zakura_chain::{
     block::Height,
     chain_tip::mock::MockChainTip,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 use zakurad::components::sync::end_of_support::{
-    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_BLOCKS_PER_DAY,
-    ESTIMATED_RELEASE_HEIGHT,
+    self, EOS_WARN_MESSAGE_HEADER, ESTIMATED_BLOCKS_PER_DAY, ESTIMATED_RELEASE_HEIGHT,
 };
+
+/// The release supports this height and halts at the next block.
+fn last_supported_height() -> Height {
+    Height(3_541_074)
+}
 
 /// Test that the `end_of_support` function is working as expected.
 #[test]
-#[should_panic(expected = "Zakura refuses to run if the release date is older than")]
+#[should_panic(expected = "Zakura refuses to run past the last supported Mainnet height")]
 fn end_of_support_panic() {
     // We are in panic
-    let panic = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
+    let panic = last_supported_height().0 + 1;
 
     end_of_support::check(Height(panic), &Network::Mainnet);
 }
@@ -37,15 +41,16 @@ fn end_of_support_function() {
     let (logs, dispatch) = log_capture::capture_logs();
     let _log_guard = tracing::dispatcher::set_default(&dispatch);
     // We are away from warn or panic
-    let no_warn = ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY)
-        - (30 * ESTIMATED_BLOCKS_PER_DAY);
+    let no_warn = last_supported_height().0 - 3 * ESTIMATED_BLOCKS_PER_DAY;
 
     end_of_support::check(Height(no_warn), &Network::Mainnet);
     assert!(logs.contains("Checking if Zakura release is inside support range ..."));
     assert!(logs.contains("Zakura release is supported"));
 
+    assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
+
     // We are in warn range
-    let warn = ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY) + 1;
+    let warn = no_warn + 1;
 
     end_of_support::check(Height(warn), &Network::Mainnet);
     assert!(logs.contains("Checking if Zakura release is inside support range ..."));
@@ -57,8 +62,7 @@ fn end_of_support_function() {
 /// Test that end of support is only reported and enforced on Mainnet.
 #[test]
 fn end_of_support_height_per_network() {
-    let last_supported_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let last_supported_height = last_supported_height();
     assert_eq!(
         end_of_support::end_of_support_height(&Network::Mainnet),
         Some(last_supported_height)
@@ -73,14 +77,14 @@ fn end_of_support_height_per_network() {
 /// Test the end of support values reported to the metrics endpoint.
 #[test]
 fn end_of_support_remaining_blocks() {
-    let last_supported_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY));
-    let warning_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let last_supported_height = last_supported_height();
+    let warning_height = Height(last_supported_height.0 - 3 * ESTIMATED_BLOCKS_PER_DAY);
 
     assert_eq!(
         end_of_support::remaining_blocks(Height(ESTIMATED_RELEASE_HEIGHT), &Network::Mainnet),
-        Some(i64::from(EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY)),
+        Some(i64::from(
+            last_supported_height.0 - ESTIMATED_RELEASE_HEIGHT
+        )),
     );
     assert_eq!(
         end_of_support::remaining_blocks(warning_height, &Network::Mainnet),
@@ -124,20 +128,10 @@ fn end_of_support_date() {
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
 
-/// Keep Mainnet EOS before November 2, 2026 until NU7 is scheduled there.
+/// Keep Mainnet EOS within one block before November 5, 2026.
 #[test]
-fn mainnet_end_of_support_precedes_november_2_without_nu7() {
+fn mainnet_end_of_support_precedes_november_5() {
     let network = Network::Mainnet;
-    // Require an exact NU7 entry: `activation_height` can fall back to a later
-    // upgrade, which does not mean NU7 has been scheduled.
-    if network
-        .activation_list()
-        .values()
-        .any(|upgrade| *upgrade == NetworkUpgrade::Nu7)
-    {
-        return;
-    }
-
     // Fixed projection anchor from the September 22 Mainnet release-state
     // bundle's `mainnet-vct-manifest.json`. Keep this independent of release
     // height bumps and later bundle imports so they cannot move the deadline.
@@ -147,7 +141,7 @@ fn mainnet_end_of_support_precedes_november_2_without_nu7() {
         .expect("the reference timestamp is valid");
     let reference_height = Height(3_490_665);
     let deadline = Utc
-        .with_ymd_and_hms(2026, 11, 2, 0, 0, 0)
+        .with_ymd_and_hms(2026, 11, 5, 0, 0, 0)
         .single()
         .expect("the EOS deadline is valid");
     let first_unsupported_height = end_of_support::end_of_support_height(&network)
@@ -159,10 +153,11 @@ fn mainnet_end_of_support_precedes_november_2_without_nu7() {
         + chrono::Duration::seconds(remaining_blocks * i64::from(POST_BLOSSOM_POW_TARGET_SPACING));
 
     assert!(
-        estimated_halt < deadline,
-        "Mainnet EOS must be before {deadline} unless an exact NU7 activation \
-         height is set for Mainnet; estimated halt is {estimated_halt} at \
-         {first_unsupported_height:?}. Shorten EOS_PANIC_AFTER or set Mainnet NU7.",
+        estimated_halt < deadline
+            && deadline - estimated_halt
+                < chrono::Duration::seconds(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
+        "Mainnet EOS must be within one block before {deadline}; estimated halt \
+         is {estimated_halt} at {first_unsupported_height:?}.",
     );
 }
 

@@ -627,30 +627,14 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         })
         .await
         .expect("the second target status reaches the reactor");
-    let second_scope = match next_action(&mut actions).await {
-        HeaderPortOperation::QueryHeaderLocator {
-            target_tip_hash,
-            scope,
-            ..
-        } if target_tip_hash == second_target => scope,
-        other => panic!("expected second locator query, got {other:?}"),
-    };
-    handle
-        .send(Event::HeaderLocatorReady {
-            peer: second_peer,
-            session_id: 0,
-            target_tip_hash: second_target,
-            scope: second_scope,
-            locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
-                snapshot.frontiers.header_best,
-            )),
-        })
-        .await
-        .expect("the second locator reaches the reactor");
     assert!(
-        time::timeout(std::time::Duration::from_millis(20), second_outbound.recv())
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
             .await
             .is_err(),
+        "the first request's durable reservation leaves no headroom for a second locator read"
+    );
+    assert!(
+        second_outbound.try_recv().is_err(),
         "the first request's durable reservation prevents a duplicate wire request"
     );
 

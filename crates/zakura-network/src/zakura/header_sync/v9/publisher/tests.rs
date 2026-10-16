@@ -1822,7 +1822,7 @@ async fn follow(
 /// last header ends with `SubscriptionSuperseded`.
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
-    use super::super::{subscriber::Subscriber, Status};
+    use super::super::{subscriber::Subscriber, Status, MAX_HS_SUBSCRIPTIONS};
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());

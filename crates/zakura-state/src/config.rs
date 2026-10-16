@@ -79,14 +79,14 @@ pub struct Config {
 
     /// Whether to use an ephemeral database.
     ///
-    /// Ephemeral databases are stored in a temporary directory created using [`tempfile::tempdir()`].
+    /// Ephemeral databases are stored in a new temporary directory.
     /// They are deleted when Zebra exits successfully.
     /// (If Zebra panics or crashes, the ephemeral database won't be deleted.)
     ///
     /// Set to `false` by default. If this is set to `true`, [`cache_dir`] is ignored.
     ///
     /// Ephemeral directories are created in the [`std::env::temp_dir()`].
-    /// Zebra names each directory after the state version and network, for example: `zakura-state-v21-mainnet-XnyGnE`.
+    /// Zebra names each directory after the state version and network, for example: `zebra-state-v21-mainnet-12345.678901234.0`.
     ///
     /// [`cache_dir`]: struct.Config.html#structfield.cache_dir
     pub ephemeral: bool,
@@ -214,9 +214,7 @@ pub struct Config {
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
-    tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
+    zakura_chain::common::TempDir::new_in(std::env::temp_dir(), prefix)
         .expect("temporary directory is created successfully")
         .keep()
 }

@@ -56,7 +56,6 @@ rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
-tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 rayon = { workspace = true }
@@ -83,6 +82,7 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0", features = ["test-support"] }
 color-eyre = { workspace = true }

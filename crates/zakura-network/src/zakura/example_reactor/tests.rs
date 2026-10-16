@@ -410,7 +410,11 @@ impl StreamConformance for ExampleConformance {
 
 stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
 stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);
-stream_conformance_suite!(watch_only_stream_conformance, WATCH_ONLY, ExampleConformance);
+stream_conformance_suite!(
+    watch_only_stream_conformance,
+    WATCH_ONLY,
+    ExampleConformance
+);
 
 /// A one-page credit window still exercises Close while its page waits on send capacity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

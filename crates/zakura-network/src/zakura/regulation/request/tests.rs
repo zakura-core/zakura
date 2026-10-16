@@ -6,7 +6,10 @@ use std::time::Duration;
 use futures::FutureExt;
 
 use super::*;
-use crate::zakura::discovery::{DiscoveryMessage, DiscoveryWireError, MAX_DISCOVERY_MESSAGE_BYTES};
+use crate::zakura::{
+    discovery::{wire::PEERS_MAX_BYTES, DiscoveryMessage},
+    wire_codec::{decode_frame, encode_frame, WireError},
+};
 
 impl ResponsePermit {
     pub(crate) fn weak_resources(&self) -> std::sync::Weak<WorkResources> {
@@ -27,12 +30,7 @@ impl RequestPolicy for GetPeersPolicy {
     type Error = String;
 
     fn decode(&self, frame: Frame) -> Result<GetPeersRequest, String> {
-        if frame.message_type != 1 || frame.flags != 0 {
-            return Err("invalid discovery envelope".into());
-        }
-        match DiscoveryMessage::decode(&frame.payload)
-            .map_err(|e: DiscoveryWireError| e.to_string())?
-        {
+        match decode_frame::<DiscoveryMessage>(&frame).map_err(|e: WireError| e.to_string())? {
             DiscoveryMessage::GetPeers { limit, .. } => Ok(GetPeersRequest { limit }),
             _ => Err("expected GetPeers".into()),
         }
@@ -40,24 +38,17 @@ impl RequestPolicy for GetPeersPolicy {
 
     fn response_cap(&self, request: &GetPeersRequest) -> u64 {
         assert!(request.limit > 0);
-        // Today's codec caps the complete discovery response, independently of
-        // the smaller per-record limits proposed in the regulation draft.
-        u64::try_from(MAX_DISCOVERY_MESSAGE_BYTES).unwrap()
+        u64::try_from(PEERS_MAX_BYTES).unwrap()
     }
 }
 
 pub(super) fn frame(limit: u16) -> Frame {
-    Frame {
-        message_type: 1,
-        flags: 0,
-        payload: DiscoveryMessage::GetPeers {
-            limit,
-            wanted_services: vec![],
-            exclude_node_ids: vec![],
-        }
-        .encode()
-        .unwrap(),
-    }
+    encode_frame(&DiscoveryMessage::GetPeers {
+        limit,
+        wanted_services: vec![],
+        exclude_node_ids: vec![],
+    })
+    .unwrap()
 }
 
 fn peer(byte: u8) -> ZakuraPeerId {
@@ -96,18 +87,11 @@ async fn finite_discovery_response_retains_work_through_its_write() {
     assert!(work.try_start());
     assert!(!work.clone().try_start());
     let (send, mut recv) = worker_framed_channel(1);
-    let payload = DiscoveryMessage::Peers { records: vec![] }
-        .encode()
-        .unwrap();
-    let payload_bytes = u64::try_from(payload.len()).unwrap();
-    send.try_reserve_guarded().unwrap().send(
-        Frame {
-            message_type: 1,
-            flags: 0,
-            payload,
-        },
-        response.frame_guard(payload_bytes),
-    );
+    let frame = encode_frame(&DiscoveryMessage::Peers { records: vec![] }).unwrap();
+    let payload_bytes = u64::try_from(frame.payload.len()).unwrap();
+    send.try_reserve_guarded()
+        .unwrap()
+        .send(frame, response.frame_guard(payload_bytes));
     let queued = recv.recv().await.unwrap();
     drop(response);
     drop(work);

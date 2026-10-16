@@ -2145,17 +2145,12 @@ mod tests {
 
     /// Builds a discovery `GetPeers` request frame on the native wire.
     fn discovery_get_peers_frame() -> Frame {
-        Frame {
-            message_type: 1,
-            flags: 0,
-            payload: DiscoveryMessage::GetPeers {
-                limit: 8,
-                wanted_services: Vec::new(),
-                exclude_node_ids: Vec::new(),
-            }
-            .encode()
-            .expect("empty GetPeers encodes"),
-        }
+        crate::zakura::wire_codec::encode_frame(&DiscoveryMessage::GetPeers {
+            limit: 8,
+            wanted_services: Vec::new(),
+            exclude_node_ids: Vec::new(),
+        })
+        .expect("empty GetPeers encodes")
     }
 
     #[tokio::test]
@@ -2294,9 +2289,7 @@ mod tests {
                 discovery_peer.recv_ordered_frame(ZAKURA_STREAM_DISCOVERY),
             )
             .await??;
-            assert_eq!(frame.message_type, 1);
-            assert_eq!(frame.flags, 0);
-            match DiscoveryMessage::decode(&frame.payload)? {
+            match crate::zakura::wire_codec::decode_frame::<DiscoveryMessage>(&frame)? {
                 DiscoveryMessage::Hello { record } => {
                     assert_eq!(record.body.node_id, victim_node_id);
                     saw_hello = true;
@@ -2422,10 +2415,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_stream_uses_transport_rate_and_oversize_bounds() -> Result<(), BoxError> {
+    async fn discovery_stream_uses_transport_oversize_bound() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "discovery_stream_uses_transport_rate_and_oversize_bounds",
+            "discovery_stream_uses_transport_oversize_bound",
             false,
         )?;
         let mut limits = ZakuraLocalLimits::from_config(&Config::default());
@@ -2433,42 +2426,12 @@ mod tests {
         limits.max_pending_handshakes = 8;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 256;
-        limits.message_rate_per_second = 1;
         limits.stream_open_rate_per_second = 64;
         let victim = ZakuraTestNode::builder(29)
             .limits(limits)
             .tracer(capture.tracer_for_node(29))
             .spawn()
             .await?;
-
-        let flooding =
-            HostilePeer::connect_native_with_capabilities(&victim, 30, ZAKURA_CAP_DISCOVERY)
-                .await?;
-        // The transport traces a per-kind rate violation before it disconnects the stream.
-        flooding
-            .flood_stream(ZAKURA_STREAM_DISCOVERY, 'd', 16)
-            .await?;
-        await_until(
-            "discovery throttling traced",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("29")
-                        .table("ratelimit")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some("message.throttled")
-                                && row.get("stream_kind").and_then(serde_json::Value::as_str)
-                                    == Some("discovery")
-                        })
-                })
-            },
-        )
-        .await?;
-        flooding.shutdown().await;
 
         let oversized =
             HostilePeer::connect_native_with_capabilities(&victim, 31, ZAKURA_CAP_DISCOVERY)

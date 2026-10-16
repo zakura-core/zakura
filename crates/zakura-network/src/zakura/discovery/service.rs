@@ -3,10 +3,9 @@
 //! Discovery is a single long-lived ordered stream per peer. Each side runs a
 //! [`DiscoverySink`] (the reader, which imports peer records and answers
 //! `GetPeers`) and a [`DiscoverySource`] (the writer, which periodically gossips
-//! the local self-record and asks for more peers). The wire format is the
-//! [`DiscoveryMessage`] payload carried inside a generic transport [`Frame`]
-//! (`message_type = DISCOVERY_FRAME_MESSAGE_TYPE`, `flags = 0`), identical to the
-//! original native-discovery wire so peers interoperate.
+//! the local self-record and asks for more peers). Each [`DiscoveryMessage`]
+//! travels in one transport frame whose type is the message's discriminator;
+//! `wire` defines the payloads and their bounds.
 
 use std::{
     collections::HashMap,
@@ -23,21 +22,21 @@ use zakura_quic::NodeId;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
-    CloseCause, Event, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, OrderedSendError,
-    Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection,
+    CloseCause, Event, Flow, FramedRecv, FramedSend, HeaderSyncHandle, OrderedSendError, Peer,
+    PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection,
     SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId,
-    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
+    FRAME_HEADER_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 
-#[cfg(test)]
-use super::pipe::decode_discovery_frame;
-use super::pipe::{discovery_pipe, DsEnv, DsLocal, DISCOVERY_FRAME_MESSAGE_TYPE};
+use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
     BlockSyncServiceSummary, DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError,
     GetServices, HeaderSyncServiceSummary, ServiceSummaryEnvelope, Services, ZakuraDiscoveryHandle,
     ZakuraNodeRecord, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_RECORDS_PER_RESPONSE, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
+use super::wire::{PEERS_MAX_BYTES, RULES};
+use crate::zakura::wire_codec::encode_frame;
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,10 +44,14 @@ const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
-    frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+    // The largest payload plus its header is far below u32::MAX.
+    frame_cap: (PEERS_MAX_BYTES + FRAME_HEADER_BYTES) as u32,
     capability: ZAKURA_CAP_DISCOVERY,
+    messages: Some(RULES),
     ..Stream::PERSISTENT
 }];
+
+const _: () = Stream::validate_layout(&DISCOVERY_SERVICE_STREAMS);
 
 /// Service-declared streams for native discovery.
 pub(crate) fn discovery_streams() -> &'static [Stream] {
@@ -129,14 +132,9 @@ impl DiscoveryPeerSession {
     }
 
     fn try_send_message(&self, message: DiscoveryMessage) -> Result<(), OrderedSendError> {
-        let payload = message
-            .encode()
-            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        match self.send.try_send(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-            flags: 0,
-            payload,
-        }) {
+        let frame =
+            encode_frame(&message).map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
+        match self.send.try_send(frame) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_frame)) => {
                 Err(OrderedSendError::Full)
@@ -918,9 +916,9 @@ impl DiscoverySource {
             .handle
             .peer_sample_limit()
             .await
-            .min(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
-        // `peer_sample_limit` is bounded by MAX_DISCOVERY_RECORDS_PER_RESPONSE
-        // (<= u16::MAX), so the cast cannot truncate.
+            .clamp(1, MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+        // The wire limit is 1..=MAX_DISCOVERY_RECORDS_PER_RESPONSE, and that
+        // maximum fits in u16, so the cast cannot truncate.
         let exclude_node_ids = self.handle.peer_sample_exclusions().await;
         self.handle_send_result(self.session.try_send_get_peers(
             limit as u16,
@@ -1046,6 +1044,7 @@ mod tests {
         ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
         ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
     };
+    use crate::zakura::{wire_codec::decode_frame, Frame};
     use zakura_chain::{block, parameters::Network};
 
     #[test]
@@ -1129,11 +1128,7 @@ mod tests {
     }
 
     fn discovery_frame(message: DiscoveryMessage) -> Result<Frame, crate::BoxError> {
-        Ok(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-            flags: 0,
-            payload: message.encode()?,
-        })
+        Ok(encode_frame(&message)?)
     }
 
     fn signed_discovery_record(
@@ -1171,7 +1166,7 @@ mod tests {
             let frame = tokio::time::timeout(Duration::from_secs(2), peer_recv.recv())
                 .await?
                 .expect("discovery source sends exchange frames");
-            match decode_discovery_frame(&frame)? {
+            match decode_frame::<DiscoveryMessage>(&frame)? {
                 DiscoveryMessage::Hello { .. } => saw_hello = true,
                 DiscoveryMessage::GetPeers { .. } => saw_get_peers = true,
                 DiscoveryMessage::GetServices(_) => saw_get_services = true,
@@ -1260,20 +1255,16 @@ mod tests {
         ));
 
         peer_send
-            .send(Frame {
-                message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-                flags: 0,
-                payload: DiscoveryMessage::GetServices(GetServices {
-                    wanted_services: vec![ZakuraServiceId::discovery()],
-                })
-                .encode()?,
-            })
+            .send(encode_frame(&DiscoveryMessage::GetServices(GetServices {
+                wanted_services: vec![ZakuraServiceId::discovery()],
+            }))?)
             .await?;
 
         let services = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let frame = peer_recv.recv().await.expect("discovery stream stays open");
-                let message = decode_discovery_frame(&frame).expect("outbound frame decodes");
+                let message =
+                    decode_frame::<DiscoveryMessage>(&frame).expect("outbound frame decodes");
                 if let DiscoveryMessage::Services(services) = message {
                     return services;
                 }
@@ -1357,20 +1348,16 @@ mod tests {
         ));
 
         peer_send
-            .send(Frame {
-                message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-                flags: 0,
-                payload: DiscoveryMessage::GetServices(GetServices {
-                    wanted_services: vec![ZakuraServiceId::block_sync()],
-                })
-                .encode()?,
-            })
+            .send(encode_frame(&DiscoveryMessage::GetServices(GetServices {
+                wanted_services: vec![ZakuraServiceId::block_sync()],
+            }))?)
             .await?;
 
         let services = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let frame = peer_recv.recv().await.expect("discovery stream stays open");
-                let message = decode_discovery_frame(&frame).expect("outbound frame decodes");
+                let message =
+                    decode_frame::<DiscoveryMessage>(&frame).expect("outbound frame decodes");
                 if let DiscoveryMessage::Services(services) = message {
                     return services;
                 }
@@ -1449,16 +1436,11 @@ mod tests {
             expected_disconnect_after_exchange: false,
         };
         peer_send
-            .send(Frame {
-                message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-                flags: 0,
-                payload: DiscoveryMessage::Services(Services {
-                    node_id: peer_node_id,
-                    expires_at_unix_secs: u64::MAX,
-                    summaries: vec![ServiceSummaryEnvelope::discovery(&summary)?],
-                })
-                .encode()?,
-            })
+            .send(encode_frame(&DiscoveryMessage::Services(Services {
+                node_id: peer_node_id,
+                expires_at_unix_secs: u64::MAX,
+                summaries: vec![ServiceSummaryEnvelope::discovery(&summary)?],
+            }))?)
             .await?;
 
         let cached = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2259,7 +2241,9 @@ mod tests {
                     .recv()
                     .await
                     .expect("discovery refresh stream remains open");
-                if let DiscoveryMessage::Hello { record } = decode_discovery_frame(&frame)? {
+                if let DiscoveryMessage::Hello { record } =
+                    decode_frame::<DiscoveryMessage>(&frame)?
+                {
                     return Ok(record);
                 }
             }

@@ -1253,17 +1253,20 @@ async fn setup(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
@@ -1304,17 +1307,20 @@ async fn setup_with_misbehavior_receiver(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,

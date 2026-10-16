@@ -34,6 +34,8 @@ pub(super) struct Job {
     pub(super) part_len: usize,
     /// Wait for a permit here before producing.
     pub(super) gate: Option<Arc<Semaphore>>,
+    /// Wait for a permit here before each part.
+    pub(super) per_part: Option<Arc<Semaphore>>,
     /// Run a blocking operation under this probe first.
     pub(super) blocking: Option<Arc<ExecutionProbe>>,
     /// Let the blocking operation outlive `produce`.
@@ -92,6 +94,12 @@ impl Produce for Scripted {
             return Err(ServeEnd::Cancelled);
         }
         for part in 0..job.parts {
+            if let Some(gate) = &job.per_part {
+                gate.acquire()
+                    .await
+                    .expect("test gates are never closed")
+                    .forget();
+            }
             if job.fail_after == Some(part) {
                 return Err(ServeEnd::LocalFault("scripted failure".into()));
             }
@@ -139,11 +147,25 @@ pub(super) struct Session {
     pub(super) cancel: CancellationToken,
 }
 
+/// Both output orders, for properties that hold under either.
+pub(super) const ORDERS: [OutputOrder; 2] = [OutputOrder::Admission, OutputOrder::Ready];
+
 pub(super) fn session(capacity: &ServeCapacity, peer_n: u8, advertised: u32) -> Session {
+    session_in(OutputOrder::Admission, capacity, peer_n, advertised)
+}
+
+/// [`session`], writing responses in `order`.
+pub(super) fn session_in(
+    order: OutputOrder,
+    capacity: &ServeCapacity,
+    peer_n: u8,
+    advertised: u32,
+) -> Session {
     let (send, output) = framed_channel(64);
     let cancel = CancellationToken::new();
     Session {
-        serve: capacity.session(
+        serve: capacity.session_with_order(
+            order,
             Arc::new(Scripted),
             &peer(peer_n),
             advertised,
@@ -186,27 +208,29 @@ fn gated(gate: &Arc<Semaphore>) -> Job {
 
 #[tokio::test]
 async fn a_request_ends_with_its_parts_then_one_ending() {
-    let capacity = capacity(LIMITS);
-    let mut session = session(&capacity, 1, 4);
-    session
-        .serve
-        .admit(Job {
-            parts: 2,
-            part_len: 3,
-            ..job()
-        })
-        .unwrap();
-    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 3]));
-    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 3]));
-    assert_eq!(next(&mut session.output).await, Probe::Done(2));
-    settle().await;
-    assert!(
-        session.output.try_recv().is_err(),
-        "one ending, then nothing"
-    );
-    assert_eq!(session.serve.open(), 0);
-    assert_eq!(capacity.node_output_held(), 0);
-    assert_eq!(capacity.node_execution_held(), 0);
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let mut session = session_in(order, &capacity, 1, 4);
+        session
+            .serve
+            .admit(Job {
+                parts: 2,
+                part_len: 3,
+                ..job()
+            })
+            .unwrap();
+        assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 3]));
+        assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 3]));
+        assert_eq!(next(&mut session.output).await, Probe::Done(2));
+        settle().await;
+        assert!(
+            session.output.try_recv().is_err(),
+            "one ending, then nothing"
+        );
+        assert_eq!(session.serve.open(), 0);
+        assert_eq!(capacity.node_output_held(), 0);
+        assert_eq!(capacity.node_execution_held(), 0);
+    }
 }
 
 #[tokio::test]
@@ -238,6 +262,119 @@ async fn output_is_whole_responses_in_admission_order() {
     assert_eq!(next(&mut session.output).await, Probe::Done(1));
     assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 2]));
     assert_eq!(next(&mut session.output).await, Probe::Done(1));
+}
+
+#[tokio::test]
+async fn ready_output_does_not_wait_for_an_earlier_response() {
+    let capacity = capacity(LIMITS);
+    let mut session = session_in(OutputOrder::Ready, &capacity, 1, 4);
+    let first = Arc::new(Semaphore::new(0));
+    session
+        .serve
+        .admit(Job {
+            parts: 1,
+            part_len: 1,
+            ..gated(&first)
+        })
+        .unwrap();
+    session
+        .serve
+        .admit(Job {
+            parts: 1,
+            part_len: 2,
+            ..job()
+        })
+        .unwrap();
+    // The second response is written whole while the first is still blocked.
+    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 2]));
+    assert_eq!(next(&mut session.output).await, Probe::Done(1));
+    settle().await;
+    assert!(session.output.try_recv().is_err());
+    assert_eq!(session.serve.open(), 1);
+    first.add_permits(1);
+    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 1]));
+    assert_eq!(next(&mut session.output).await, Probe::Done(1));
+    assert_eq!(session.serve.open(), 0);
+    session.cancel.cancel();
+}
+
+#[tokio::test]
+async fn ready_output_interleaves_responses_and_returns_each_grant_at_its_last_write() {
+    let capacity = capacity(LIMITS);
+    let mut session = session_in(OutputOrder::Ready, &capacity, 1, 4);
+    let first = Arc::new(Semaphore::new(0));
+    let second = Arc::new(Semaphore::new(0));
+    session
+        .serve
+        .admit(Job {
+            parts: 2,
+            part_len: 1,
+            per_part: Some(first.clone()),
+            ..job()
+        })
+        .unwrap();
+    session
+        .serve
+        .admit(Job {
+            parts: 1,
+            part_len: 2,
+            per_part: Some(second.clone()),
+            ..job()
+        })
+        .unwrap();
+    // Queue the first response's first part, the whole second response, then
+    // the rest of the first response.
+    for gate in [&first, &second, &first] {
+        gate.add_permits(1);
+        settle().await;
+    }
+    assert_eq!(capacity.node_execution_held(), 0);
+    assert!(capacity.node_output_held() > 0, "nothing is written yet");
+    // Each frame is written as it is read here. A response's slot returns only
+    // with its ending, even though the later response ends first.
+    for (message, unwritten_responses) in [
+        (Probe::Part(vec![7; 1]), 2),
+        (Probe::Part(vec![7; 2]), 2),
+        (Probe::Done(1), 1),
+        (Probe::Part(vec![7; 1]), 1),
+        (Probe::Done(2), 0),
+    ] {
+        assert_eq!(next(&mut session.output).await, message);
+        assert_eq!(
+            capacity.node_output_responses.reserved(),
+            unwritten_responses
+        );
+    }
+    assert_eq!(capacity.node_output_held(), 0);
+    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+    assert_eq!(session.serve.open(), 0);
+    session.cancel.cancel();
+}
+
+#[tokio::test]
+async fn ready_output_sends_a_local_failure_ending_past_a_blocked_response() {
+    let capacity = capacity(LIMITS);
+    let mut session = session_in(OutputOrder::Ready, &capacity, 1, 4);
+    let blocked = Arc::new(Semaphore::new(0));
+    session.serve.admit(gated(&blocked)).unwrap();
+    session
+        .serve
+        .admit(Job {
+            parts: 3,
+            part_len: 1,
+            fail_after: Some(2),
+            ..job()
+        })
+        .unwrap();
+    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
+    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
+    assert_eq!(next(&mut session.output).await, Probe::Failed(2));
+    assert!(!session.cancel.is_cancelled());
+    assert_eq!(session.serve.open(), 1);
+    blocked.add_permits(1);
+    assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    assert_eq!(session.serve.open(), 0);
+    session.cancel.cancel();
 }
 
 #[tokio::test]
@@ -351,49 +488,53 @@ async fn a_retired_sessions_running_jobs_do_not_count_against_the_next_session()
 
 #[tokio::test]
 async fn cancellation_lets_produce_finish_before_its_slot_returns() {
-    let capacity = capacity(LIMITS);
-    let gate = Arc::new(Semaphore::new(0));
-    let session = session(&capacity, 1, 4);
-    session.serve.admit(gated(&gate)).unwrap();
-    settle().await;
-    session.cancel.cancel();
-    settle().await;
-    assert_eq!(
-        capacity.node_execution_held(),
-        1,
-        "cancellation does not abort produce"
-    );
-    gate.add_permits(1);
-    settle().await;
-    assert_eq!(capacity.node_execution_held(), 0);
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let gate = Arc::new(Semaphore::new(0));
+        let session = session_in(order, &capacity, 1, 4);
+        session.serve.admit(gated(&gate)).unwrap();
+        settle().await;
+        session.cancel.cancel();
+        settle().await;
+        assert_eq!(
+            capacity.node_execution_held(),
+            1,
+            "cancellation does not abort produce"
+        );
+        gate.add_permits(1);
+        settle().await;
+        assert_eq!(capacity.node_execution_held(), 0);
+    }
 }
 
 #[tokio::test]
 async fn cancellation_keeps_the_node_slot_until_the_work_ends() {
-    let capacity = capacity(LIMITS);
-    let probe = ExecutionProbe::new(true, false);
-    let _release = probe.release_on_drop();
-    let session = session(&capacity, 1, 4);
-    session
-        .serve
-        .admit(Job {
-            blocking: Some(probe.clone()),
-            ..job()
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let probe = ExecutionProbe::new(true, false);
+        let _release = probe.release_on_drop();
+        let session = session_in(order, &capacity, 1, 4);
+        session
+            .serve
+            .admit(Job {
+                blocking: Some(probe.clone()),
+                ..job()
+            })
+            .unwrap();
+        probe.wait_started(1).await;
+        session.cancel.cancel();
+        settle().await;
+        assert_eq!(capacity.node_execution_held(), 1);
+        probe.release();
+        probe.wait_finished(1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while capacity.node_execution_held() != 0 {
+                tokio::task::yield_now().await;
+            }
         })
-        .unwrap();
-    probe.wait_started(1).await;
-    session.cancel.cancel();
-    settle().await;
-    assert_eq!(capacity.node_execution_held(), 1);
-    probe.release();
-    probe.wait_finished(1).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while capacity.node_execution_held() != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the slot frees once the blocking operation ends");
+        .await
+        .expect("the slot frees once the blocking operation ends");
+    }
 }
 
 #[tokio::test]
@@ -490,75 +631,13 @@ fn the_node_slot_returns_before_the_peer_slot() {
 
 #[tokio::test]
 async fn a_non_reading_peer_holds_output_bytes_but_no_execution_slot() {
-    let capacity = capacity(LIMITS);
-    // A one-frame output queue that nobody reads.
-    let (send, _output) = framed_channel(1);
-    let cancel = CancellationToken::new();
-    let serve = capacity.session(
-        Arc::new(Scripted),
-        &peer(1),
-        4,
-        send,
-        cancel.clone(),
-        cancel.clone(),
-        crate::zakura::CloseCause::default(),
-    );
-    for _ in 0..4 {
-        serve
-            .admit(Job {
-                parts: 3,
-                part_len: 64,
-                ..job()
-            })
-            .unwrap();
-    }
-    settle().await;
-    assert_eq!(capacity.node_execution_held(), 0);
-    assert!(capacity.node_output_held() > 0);
-    assert_eq!(serve.open(), 0, "queued endings free their commitments");
-    cancel.cancel();
-}
-
-#[tokio::test]
-async fn output_bytes_return_only_when_the_last_frame_is_written() {
-    let capacity = capacity(LIMITS);
-    let mut session = session(&capacity, 1, 4);
-    session
-        .serve
-        .admit(Job {
-            parts: 2,
-            part_len: 8,
-            ..job()
-        })
-        .unwrap();
-    settle().await;
-    // Every frame sits in the transport queue; none is written.
-    assert_eq!(capacity.node_execution_held(), 0);
-    assert!(capacity.node_output_held() > 0);
-    next(&mut session.output).await;
-    next(&mut session.output).await;
-    assert!(capacity.node_output_held() > 0, "the ending is unwritten");
-    assert_eq!(capacity.node_output_responses.reserved(), 1);
-    next(&mut session.output).await;
-    assert_eq!(capacity.node_output_held(), 0);
-    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
-    assert_eq!(capacity.node_output_responses.reserved(), 0);
-}
-
-/// Tiny responses must stop on bookkeeping capacity before encoded bytes fill.
-#[tokio::test]
-async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
-    let capacity = capacity(ServeLimits {
-        peer_output_responses: 32,
-        node_output_responses: 64,
-        peer_output_bytes: 64 * 1024,
-        node_output_bytes: 64 * 1024,
-        ..LIMITS
-    });
-    let (send, output) = framed_channel(1);
-    let cancel = CancellationToken::new();
-    let mut session = Session {
-        serve: capacity.session(
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        // A one-frame output queue that nobody reads.
+        let (send, _output) = framed_channel(1);
+        let cancel = CancellationToken::new();
+        let serve = capacity.session_with_order(
+            order,
             Arc::new(Scripted),
             &peer(1),
             4,
@@ -566,43 +645,113 @@ async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
             cancel.clone(),
             cancel.clone(),
             crate::zakura::CloseCause::default(),
-        ),
-        output,
-        cancel,
-    };
-    for _ in 0..32 {
-        session.serve.admit(job()).unwrap();
+        );
+        for _ in 0..4 {
+            serve
+                .admit(Job {
+                    parts: 3,
+                    part_len: 64,
+                    ..job()
+                })
+                .unwrap();
+        }
         settle().await;
-        assert_eq!(session.serve.open(), 0);
+        assert_eq!(capacity.node_execution_held(), 0);
+        assert!(capacity.node_output_held() > 0);
+        assert_eq!(serve.open(), 0, "queued endings free their commitments");
+        cancel.cancel();
     }
-    let peer_budgets = capacity.peer(&peer(1));
-    assert_eq!(capacity.node_output_responses.reserved(), 32);
-    assert_eq!(peer_budgets.output_responses.reserved(), 32);
-    assert_eq!(capacity.node_output_held(), 32 * 12);
-    assert_eq!(capacity.node_execution_held(), 0);
+}
 
-    // The reader still admits the bounded commitment margin without waiting.
-    for _ in 0..8 {
-        session.serve.admit(job()).unwrap();
+#[tokio::test]
+async fn output_bytes_return_only_when_the_last_frame_is_written() {
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let mut session = session_in(order, &capacity, 1, 4);
+        session
+            .serve
+            .admit(Job {
+                parts: 2,
+                part_len: 8,
+                ..job()
+            })
+            .unwrap();
         settle().await;
+        // Every frame sits in the transport queue; none is written.
+        assert_eq!(capacity.node_execution_held(), 0);
+        assert!(capacity.node_output_held() > 0);
+        next(&mut session.output).await;
+        next(&mut session.output).await;
+        assert!(capacity.node_output_held() > 0, "the ending is unwritten");
+        assert_eq!(capacity.node_output_responses.reserved(), 1);
+        next(&mut session.output).await;
+        assert_eq!(capacity.node_output_held(), 0);
+        assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+        assert_eq!(capacity.node_output_responses.reserved(), 0);
     }
-    assert_eq!(session.serve.open(), 8);
-    assert_eq!(capacity.node_output_held(), 32 * 12);
-    assert!(!session.cancel.is_cancelled());
+}
 
-    // Completing one write lets exactly one waiting response run.
-    assert_eq!(next(&mut session.output).await, Probe::Done(0));
-    settle().await;
-    assert_eq!(session.serve.open(), 7);
-    assert_eq!(capacity.node_output_responses.reserved(), 32);
-    assert_eq!(capacity.node_output_held(), 32 * 12);
+/// Tiny responses must stop on bookkeeping capacity before encoded bytes fill.
+#[tokio::test]
+async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
+    for order in ORDERS {
+        let capacity = capacity(ServeLimits {
+            peer_output_responses: 32,
+            node_output_responses: 64,
+            peer_output_bytes: 64 * 1024,
+            node_output_bytes: 64 * 1024,
+            ..LIMITS
+        });
+        let (send, output) = framed_channel(1);
+        let cancel = CancellationToken::new();
+        let mut session = Session {
+            serve: capacity.session_with_order(
+                order,
+                Arc::new(Scripted),
+                &peer(1),
+                4,
+                send,
+                cancel.clone(),
+                cancel.clone(),
+                crate::zakura::CloseCause::default(),
+            ),
+            output,
+            cancel,
+        };
+        for _ in 0..32 {
+            session.serve.admit(job()).unwrap();
+            settle().await;
+            assert_eq!(session.serve.open(), 0);
+        }
+        let peer_budgets = capacity.peer(&peer(1));
+        assert_eq!(capacity.node_output_responses.reserved(), 32);
+        assert_eq!(peer_budgets.output_responses.reserved(), 32);
+        assert_eq!(capacity.node_output_held(), 32 * 12);
+        assert_eq!(capacity.node_execution_held(), 0);
 
-    session.cancel.cancel();
-    drop(session);
-    settle().await;
-    assert_eq!(capacity.node_output_responses.reserved(), 0);
-    assert_eq!(peer_budgets.output_responses.reserved(), 0);
-    assert_eq!(capacity.node_output_held(), 0);
+        // The reader still admits the bounded commitment margin without waiting.
+        for _ in 0..8 {
+            session.serve.admit(job()).unwrap();
+            settle().await;
+        }
+        assert_eq!(session.serve.open(), 8);
+        assert_eq!(capacity.node_output_held(), 32 * 12);
+        assert!(!session.cancel.is_cancelled());
+
+        // Completing one write lets exactly one waiting response run.
+        assert_eq!(next(&mut session.output).await, Probe::Done(0));
+        settle().await;
+        assert_eq!(session.serve.open(), 7);
+        assert_eq!(capacity.node_output_responses.reserved(), 32);
+        assert_eq!(capacity.node_output_held(), 32 * 12);
+
+        session.cancel.cancel();
+        drop(session);
+        settle().await;
+        assert_eq!(capacity.node_output_responses.reserved(), 0);
+        assert_eq!(peer_budgets.output_responses.reserved(), 0);
+        assert_eq!(capacity.node_output_held(), 0);
+    }
 }
 
 #[tokio::test]
@@ -689,74 +838,80 @@ async fn a_stalled_produce_on_one_peer_does_not_block_another() {
 
 #[tokio::test]
 async fn a_local_failure_after_a_prefix_sends_the_failure_ending() {
-    let capacity = capacity(LIMITS);
-    let mut session = session(&capacity, 1, 4);
-    session
-        .serve
-        .admit(Job {
-            parts: 3,
-            part_len: 1,
-            fail_after: Some(2),
-            ..job()
-        })
-        .unwrap();
-    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
-    assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
-    assert_eq!(next(&mut session.output).await, Probe::Failed(2));
-    // The session stays usable.
-    session.serve.admit(job()).unwrap();
-    assert_eq!(next(&mut session.output).await, Probe::Done(0));
-    assert!(!session.cancel.is_cancelled());
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let mut session = session_in(order, &capacity, 1, 4);
+        session
+            .serve
+            .admit(Job {
+                parts: 3,
+                part_len: 1,
+                fail_after: Some(2),
+                ..job()
+            })
+            .unwrap();
+        assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
+        assert_eq!(next(&mut session.output).await, Probe::Part(vec![7]));
+        assert_eq!(next(&mut session.output).await, Probe::Failed(2));
+        // The session stays usable.
+        session.serve.admit(job()).unwrap();
+        assert_eq!(next(&mut session.output).await, Probe::Done(0));
+        assert!(!session.cancel.is_cancelled());
+    }
 }
 
 #[tokio::test]
 async fn the_ending_frees_the_commitment_before_execution_ends() {
-    let capacity = capacity(LIMITS);
-    let session = session(&capacity, 1, 1);
-    let hold = Arc::new(Semaphore::new(0));
-    let completed = Completions::default();
-    let completion = completed.track(1);
-    let id = completion.id();
-    session
-        .serve
-        .admit_tracked(
-            Job {
-                hold_after: Some(hold.clone()),
-                ..job()
-            },
-            completion,
-        )
-        .unwrap();
-    settle().await;
-    let mut records = Vec::new();
-    completed.drain(|id| records.push(id));
-    assert_eq!(
-        records,
-        [id],
-        "the ending completes before the producer exits"
-    );
-    assert_eq!(session.serve.open(), 0);
-    assert_eq!(capacity.node_execution_held(), 1);
-    hold.add_permits(1);
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let session = session_in(order, &capacity, 1, 1);
+        let hold = Arc::new(Semaphore::new(0));
+        let completed = Completions::default();
+        let completion = completed.track(1);
+        let id = completion.id();
+        session
+            .serve
+            .admit_tracked(
+                Job {
+                    hold_after: Some(hold.clone()),
+                    ..job()
+                },
+                completion,
+            )
+            .unwrap();
+        settle().await;
+        let mut records = Vec::new();
+        completed.drain(|id| records.push(id));
+        assert_eq!(
+            records,
+            [id],
+            "the ending completes before the producer exits"
+        );
+        assert_eq!(session.serve.open(), 0);
+        assert_eq!(capacity.node_execution_held(), 1);
+        hold.add_permits(1);
+    }
 }
 
 #[tokio::test]
 async fn cancelling_a_session_frees_every_budget() {
-    let capacity = capacity(LIMITS);
-    let gate = Arc::new(Semaphore::new(0));
-    let session = session(&capacity, 1, 4);
-    for _ in 0..8 {
-        session.serve.admit(gated(&gate)).unwrap();
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let gate = Arc::new(Semaphore::new(0));
+        let session = session_in(order, &capacity, 1, 4);
+        for _ in 0..8 {
+            session.serve.admit(gated(&gate)).unwrap();
+        }
+        settle().await;
+        session.cancel.cancel();
+        gate.add_permits(8);
+        settle().await;
+        assert_eq!(session.serve.open(), 0);
+        assert_eq!(capacity.node_execution_held(), 0);
+        assert_eq!(capacity.node_output_held(), 0);
+        assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+        assert_eq!(capacity.active_and_waiting(), (0, 0));
     }
-    settle().await;
-    session.cancel.cancel();
-    gate.add_permits(8);
-    settle().await;
-    assert_eq!(session.serve.open(), 0);
-    assert_eq!(capacity.node_execution_held(), 0);
-    assert_eq!(capacity.node_output_held(), 0);
-    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
-    assert_eq!(capacity.active_and_waiting(), (0, 0));
 }
 
 /// A sink for one `Get`, its queued frames, and its session's commitments.
@@ -998,47 +1153,54 @@ async fn queued_requests_allocate_only_commitments_until_dispatch() {
 
 #[tokio::test]
 async fn serving_output_keeps_a_queue_slot_for_control_messages() {
-    let capacity = capacity(LIMITS);
-    let (send, mut output) = framed_channel(4);
-    let cancel = CancellationToken::new();
-    let serve = capacity.session(
-        Arc::new(Scripted),
-        &peer(1),
-        4,
-        send.clone(),
-        cancel.clone(),
-        cancel.clone(),
-        crate::zakura::CloseCause::default(),
-    );
-    serve
-        .admit(Job {
-            parts: 10,
-            part_len: 1,
-            ..job()
-        })
-        .unwrap();
-    settle().await;
-    let control = crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap();
-    send.try_send(control)
-        .expect("serving must leave room for our control traffic");
-    let mut messages = Vec::new();
-    for _ in 0..12 {
-        messages.push(next(&mut output).await);
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let (send, mut output) = framed_channel(4);
+        let cancel = CancellationToken::new();
+        let serve = capacity.session_with_order(
+            order,
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send.clone(),
+            cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
+        );
+        serve
+            .admit(Job {
+                parts: 10,
+                part_len: 1,
+                ..job()
+            })
+            .unwrap();
+        settle().await;
+        let control = crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap();
+        send.try_send(control)
+            .expect("serving must leave room for our control traffic");
+        let mut messages = Vec::new();
+        for _ in 0..12 {
+            messages.push(next(&mut output).await);
+        }
+        assert!(messages[..4].contains(&Probe::Ping(7)));
+        assert_eq!(messages.last(), Some(&Probe::Done(10)));
+        cancel.cancel();
     }
-    assert!(messages[..4].contains(&Probe::Ping(7)));
-    assert_eq!(messages.last(), Some(&Probe::Done(10)));
-    cancel.cancel();
 }
 
 #[tokio::test]
 async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
-    for panic_cap in [true, false] {
+    for (order, panic_cap) in ORDERS
+        .into_iter()
+        .flat_map(|order| [(order, true), (order, false)])
+    {
         let capacity = capacity(LIMITS);
         let (send, output) = framed_channel(1);
         let cancel = CancellationToken::new();
         let connection = CancellationToken::new();
         let close_cause = crate::zakura::CloseCause::default();
-        let serve = capacity.session(
+        let serve = capacity.session_with_order(
+            order,
             Arc::new(Scripted),
             &peer(1),
             4,
@@ -1051,8 +1213,8 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
         let leases = [completed.track(1), completed.track(2), completed.track(3)];
         let expected = leases.each_ref().map(Completion::id);
         let [first, panicking, queued] = leases;
-        // The first frame occupies the only queue slot. The writer waits on
-        // the rest of this response and cannot observe dispatch's channel closing.
+        // The first frame occupies the only queue slot. The writer waits for
+        // another slot and cannot observe dispatch's channel closing.
         serve
             .admit_tracked(
                 Job {
@@ -1147,36 +1309,39 @@ async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
 /// A one-slot legacy queue promises eventual control progress once serving drains.
 #[tokio::test]
 async fn one_slot_serving_drains_before_control_uses_the_slot() {
-    let capacity = capacity(LIMITS);
-    let (send, mut output) = framed_channel(1);
-    let cancel = CancellationToken::new();
-    let serve = capacity.session(
-        Arc::new(Scripted),
-        &peer(1),
-        4,
-        send.clone(),
-        cancel.clone(),
-        cancel.clone(),
-        crate::zakura::CloseCause::default(),
-    );
-    serve
-        .admit(Job {
-            parts: 2,
-            part_len: 8,
-            ..job()
-        })
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let (send, mut output) = framed_channel(1);
+        let cancel = CancellationToken::new();
+        let serve = capacity.session_with_order(
+            order,
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send.clone(),
+            cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
+        );
+        serve
+            .admit(Job {
+                parts: 2,
+                part_len: 8,
+                ..job()
+            })
+            .unwrap();
+        for _ in 0..3 {
+            next(&mut output).await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send(crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap()),
+        )
+        .await
+        .unwrap()
         .unwrap();
-    for _ in 0..3 {
-        next(&mut output).await;
+        assert_eq!(next(&mut output).await, Probe::Ping(7));
+        assert!(!cancel.is_cancelled());
+        cancel.cancel();
     }
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        send.send(crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap()),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(next(&mut output).await, Probe::Ping(7));
-    assert!(!cancel.is_cancelled());
-    cancel.cancel();
 }

@@ -3,8 +3,11 @@
 //! These fixes are applied at the JSON-RPC call level,
 //! after the RPC request is parsed and split into calls.
 
+use std::future::Future;
+
 use jsonrpsee::{
-    server::middleware::rpc::{layer::ResponseFuture, RpcServiceT},
+    core::middleware::{Batch, Notification},
+    server::middleware::rpc::RpcServiceT,
     MethodResponse,
 };
 use jsonrpsee_types::ErrorObject;
@@ -33,15 +36,27 @@ impl<S> FixRpcResponseMiddleware<S> {
     }
 }
 
-impl<'a, S> RpcServiceT<'a> for FixRpcResponseMiddleware<S>
+impl<S> RpcServiceT for FixRpcResponseMiddleware<S>
 where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S: RpcServiceT<
+            MethodResponse = MethodResponse,
+            NotificationResponse = MethodResponse,
+            BatchResponse = MethodResponse,
+        > + Send
+        + Sync
+        + Clone
+        + 'static,
 {
-    type Future = ResponseFuture<futures::future::BoxFuture<'a, jsonrpsee::MethodResponse>>;
+    type MethodResponse = MethodResponse;
+    type NotificationResponse = MethodResponse;
+    type BatchResponse = MethodResponse;
 
-    fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
+    fn call<'a>(
+        &self,
+        request: jsonrpsee::types::Request<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
-        ResponseFuture::future(Box::pin(async move {
+        async move {
             let response = service.call(request).await;
             if response.is_error() {
                 let original_error_code = response
@@ -52,9 +67,8 @@ where
                     tracing::debug!(
                         "Replacing RPC error: {original_error_code} with {new_error_code}"
                     );
-                    let json: serde_json::Value =
-                        serde_json::from_str(response.into_parts().0.as_str())
-                            .expect("response string should be valid json");
+                    let json: serde_json::Value = serde_json::from_str(response.into_json().get())
+                        .expect("response string should be valid json");
                     let id = match &json["id"] {
                         serde_json::Value::Null => Some(jsonrpsee::types::Id::Null),
                         serde_json::Value::Number(n) => {
@@ -79,6 +93,17 @@ where
                 }
             }
             response
-        }))
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.batch(batch)
+    }
+
+    fn notification<'a>(
+        &self,
+        notification: Notification<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        self.service.notification(notification)
     }
 }

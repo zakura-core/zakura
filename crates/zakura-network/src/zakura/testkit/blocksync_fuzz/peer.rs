@@ -68,6 +68,8 @@ async fn serve_loop(
 ) {
     let mut rng = peer_rng(scenario_seed, spec);
     let mut responses: u64 = 0;
+    // `GetBlocks` taken off the stream after a `Wedge` took effect.
+    let mut wedge_drained: u32 = 0;
     // Wall-clock anchor for a mid-run `Degrade` (measured from this peer's connect time).
     let started = tokio::time::Instant::now();
 
@@ -81,13 +83,20 @@ async fn serve_loop(
 
     loop {
         // A `Wedge` degradation stops the peer reading our stream entirely once it has
-        // been connected for `degrade.at`: it neither drains the node's outbound queue nor
-        // answers. The node's `outbound_capacity()` then falls to zero and stays there —
-        // the truly-wedged session the liveness timer must still park. Wait on
-        // shutdown/disconnect only; never read again.
-        let wedged = spec.serve.degrade.is_some_and(|degrade| {
-            matches!(degrade.mode, DegradeMode::Wedge) && started.elapsed() >= degrade.at
-        });
+        // been connected for `degrade.at` and has drained its last `drained_requests`:
+        // it neither drains the node's outbound queue nor answers. The node's
+        // `outbound_capacity()` then falls to zero and stays there — the truly-wedged
+        // session the liveness timer must still park. Wait on shutdown/disconnect only;
+        // never read again.
+        let wedged = spec
+            .serve
+            .degrade
+            .is_some_and(|degrade| match degrade.mode {
+                DegradeMode::Wedge { drained_requests } => {
+                    started.elapsed() >= degrade.at && wedge_drained >= drained_requests
+                }
+                _ => false,
+            });
         if wedged {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
@@ -115,18 +124,20 @@ async fn serve_loop(
 
         // A mid-run degradation takes effect once the peer has been connected for
         // `degrade.at`. `GoSilent` models a peer that wedges (drops everything from now
-        // on); `SlowTo` overrides the serve bandwidth/RTT so the peer keeps delivering but
-        // far more slowly.
+        // on); `Wedge` drops what it drains before it stops reading; `SlowTo` overrides
+        // the serve bandwidth/RTT so the peer keeps delivering but far more slowly.
         let degraded_mode = spec
             .serve
             .degrade
             .filter(|degrade| started.elapsed() >= degrade.at)
             .map(|degrade| degrade.mode);
-        if matches!(
-            degraded_mode,
-            Some(DegradeMode::GoSilent | DegradeMode::Wedge)
-        ) {
-            continue;
+        match degraded_mode {
+            Some(DegradeMode::GoSilent) => continue,
+            Some(DegradeMode::Wedge { .. }) => {
+                wedge_drained = wedge_drained.saturating_add(1);
+                continue;
+            }
+            _ => {}
         }
         let (effective_first_block_latency, effective_bandwidth) = match degraded_mode {
             Some(DegradeMode::SlowTo {
@@ -140,6 +151,18 @@ async fn serve_loop(
         let drop_p = spec.serve.drop_probability.clamp(0.0, 1.0);
         if drop_p > 0.0 && rng.gen_bool(drop_p) {
             continue;
+        }
+
+        // Late answer: the node times this request out, but it still gets a full,
+        // ended response.
+        let late = spec.serve.late.filter(|late| {
+            let late_p = late.probability.clamp(0.0, 1.0);
+            late_p > 0.0 && rng.gen_bool(late_p)
+        });
+        if let Some(late) = late {
+            if sleep_or_cancel(shutdown, late.delay).await {
+                return;
+            }
         }
 
         // Withheld range: this peer is missing it.

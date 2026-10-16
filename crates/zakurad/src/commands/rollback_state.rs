@@ -2,14 +2,13 @@
 
 use std::path::PathBuf;
 
-use abscissa_core::{Application, Command, Runnable};
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::Result;
 
 use zakura_chain::{block, parameters::Network};
 use zakura_state::{RollbackFinalizedStateOptions, RollbackFinalizedStateSummary, StorageMode};
 
-use crate::prelude::APPLICATION;
+use crate::config::ZakuradConfig;
 
 /// Storage modes accepted by the rollback command.
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -19,7 +18,7 @@ enum RollbackStorageMode {
 }
 
 /// Roll back Zebra's finalized state to a previous height
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct RollbackStateCmd {
     /// Roll back finalized state to this block height.
     #[clap(long, help = "finalized block height to keep as the new tip")]
@@ -60,23 +59,16 @@ pub struct RollbackStateCmd {
     dry_run: bool,
 }
 
-impl Runnable for RollbackStateCmd {
-    /// `rollback-state` sub-command entrypoint.
-    fn run(&self) {
-        let config = APPLICATION.config();
-
-        if let Err(error) =
-            self.run_with_config(config.mirrored_state_config(), config.consensus.clone())
-        {
-            tracing::error!("Failed to roll back finalized state: {error}");
-            // Exit non-zero so the subcommand matches the standalone `zakura-rollback-state` binary
-            // and scripts can detect the failure (abscissa would otherwise exit 0).
-            std::process::exit(1);
-        }
-    }
-}
-
 impl RollbackStateCmd {
+    /// `rollback-state` sub-command entrypoint.
+    ///
+    /// Returns an error after logging it, so `zakurad` exits non-zero like the standalone
+    /// `zakura-rollback-state` binary, and scripts can detect the failure.
+    pub(crate) fn run(&self, config: &ZakuradConfig) -> Result<()> {
+        self.run_with_config(config.mirrored_state_config(), config.consensus.clone())
+            .inspect_err(|error| tracing::error!("Failed to roll back finalized state: {error}"))
+    }
+
     /// Runs rollback using `state_config` as the base state configuration.
     ///
     /// `consensus_config` supplies `checkpoint_sync`, which sets the max checkpoint height used to

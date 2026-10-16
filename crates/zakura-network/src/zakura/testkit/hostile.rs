@@ -1,10 +1,10 @@
 //! Raw peer harness for adversarial Zakura tests.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tokio::sync::Mutex;
-use zakura_quic::{Conn as Connection, QuicEndpoint, RecvStream, SendStream, VarInt};
+use zakura_quic::{Conn as Connection, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
@@ -12,10 +12,10 @@ use crate::{
         legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
         HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
         ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
-        ZAKURA_STREAM_HEADER_SYNC,
+        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
+        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
@@ -47,8 +47,25 @@ impl HostilePeer {
         seed: u64,
         capabilities: u64,
     ) -> Result<Self, BoxError> {
+        Self::connect_native_with_transport(
+            victim,
+            seed,
+            capabilities,
+            victim.limits().quic.clone(),
+        )
+        .await
+    }
+
+    /// Connect with explicit QUIC windows for transport backpressure tests.
+    pub(crate) async fn connect_native_with_transport(
+        victim: &ZakuraTestNode,
+        seed: u64,
+        capabilities: u64,
+        quic: QuicConfig,
+    ) -> Result<Self, BoxError> {
         let limits = victim.limits().clone();
         let endpoint = LocalEndpointFactory::with_limits(&limits)
+            .quic_config(quic)
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
@@ -169,6 +186,26 @@ impl HostilePeer {
         send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
             .await?;
         Ok(())
+    }
+
+    /// Open an ordered stream at `stream_version` and return both halves, so a
+    /// caller can write and read it concurrently.
+    #[cfg(test)]
+    pub(crate) async fn split_ordered_stream(
+        &self,
+        stream_kind: u16,
+        stream_version: u16,
+    ) -> Result<(SendStream, RecvStream), BoxError> {
+        let (mut send, recv) = self.connection.open_bi().await?;
+        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+            .await?;
+        Ok((send, recv))
+    }
+
+    /// Largest frame this peer reads or writes.
+    #[cfg(test)]
+    pub(crate) fn max_frame_bytes(&self) -> u32 {
+        self.limits.max_frame_bytes
     }
 
     /// Receive the next frame written by the victim on this ordered stream.
@@ -330,6 +367,29 @@ impl HostilePeer {
         Ok(())
     }
 
+    /// Accept the next request stream, send the frames built from its request id
+    /// `gap` apart, and keep the response side open without finishing it.
+    pub async fn trickle_next_request_without_finishing(
+        &mut self,
+        gap: Duration,
+        build_frames: impl FnOnce(u64) -> Vec<Frame>,
+    ) -> Result<(), BoxError> {
+        let (mut send, mut recv) = self.connection.accept_bi().await?;
+        let prelude = Self::read_prelude(&mut recv).await?;
+        let request_id = prelude
+            .request_id
+            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        for (index, frame) in build_frames(request_id).into_iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(gap).await;
+            }
+            send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+                .await?;
+        }
+        self.held_streams.push(send);
+        Ok(())
+    }
+
     /// Open one stream of `stream_kind` and send `count` valid frames on it.
     ///
     /// Unlike [`send_frame`](Self::send_frame), every frame travels on the SAME
@@ -417,7 +477,7 @@ impl HostilePeer {
             ZAKURA_STREAM_GOSSIP => LEGACY_GOSSIP_VERSION,
             ZAKURA_STREAM_DISCOVERY => ZAKURA_DISCOVERY_STREAM_VERSION,
             ZAKURA_STREAM_HEADER_SYNC => ZAKURA_HEADER_SYNC_STREAM_VERSION,
-            ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
             _ => 1,
         }
     }

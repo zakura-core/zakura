@@ -137,7 +137,7 @@ pub(crate) struct Shared {
 
 impl Shared {
     /// A connection's transport config, with its own instrumented controller
-    /// (OBS-12) and, with the `qlog` feature, its own qlog file (CTRL-25).
+    /// (OBS-12).
     pub(crate) fn connection_transport(
         &self,
         probe: Arc<CongestionProbe>,
@@ -148,35 +148,8 @@ impl Shared {
             self.config.congestion_factory(),
             probe,
         )));
-        #[cfg(feature = "qlog")]
-        if let Some(dir) = &self.config.qlog_dir {
-            transport.qlog_stream(qlog_stream(dir));
-        }
         Arc::new(transport)
     }
-}
-
-/// Opens a fresh qlog file in `dir` (CTRL-25).
-#[cfg(feature = "qlog")]
-fn qlog_stream(dir: &std::path::Path) -> Option<quinn_proto::QlogStream> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis());
-    let path = dir.join(format!(
-        "zakura-{millis}-{}.qlog",
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = std::fs::File::create(&path)
-        .inspect_err(
-            |error| tracing::warn!(target: "zakura_quic", ?path, %error, "can't create qlog file"),
-        )
-        .ok()?;
-    let mut config = quinn_proto::QlogConfig::default();
-    config
-        .writer(Box::new(std::io::BufWriter::new(file)))
-        .title(Some("zakura".into()));
-    config.into_stream()
 }
 
 /// A QUIC endpoint: one endpoint task per bound socket (SOCK-1).

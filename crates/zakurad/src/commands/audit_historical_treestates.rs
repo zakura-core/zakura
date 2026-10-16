@@ -10,7 +10,6 @@
 
 use std::{path::PathBuf, sync::Mutex, time::Duration};
 
-use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result};
 
@@ -20,7 +19,7 @@ use zakura_state::{
     VctTreestateInventory,
 };
 
-use crate::prelude::APPLICATION;
+use crate::config::ZakuradConfig;
 
 /// Bounds audit bookkeeping and catches accidentally enormous CLI ranges before any allocation.
 const MAX_AUDIT_SAMPLES: u64 = 5_000_000;
@@ -35,7 +34,7 @@ const MAX_AUDIT_SAMPLES: u64 = 5_000_000;
 const AUDIT_REPLAY_BLOCKS: u64 = u64::MAX;
 
 /// Audit historical note commitment treestate serving in an existing state database
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct AuditHistoricalTreestatesCmd {
     /// Path to Zakura's cached state.
     #[clap(long, short, help = "path to directory with the Zakura chain state")]
@@ -125,18 +124,14 @@ pub struct AuditHistoricalTreestatesCmd {
     no_scan: bool,
 }
 
-impl Runnable for AuditHistoricalTreestatesCmd {
+impl AuditHistoricalTreestatesCmd {
     /// `audit-historical-treestates` sub-command entrypoint.
     #[allow(clippy::print_stderr)]
-    fn run(&self) {
-        if let Err(error) = self.run_with_config(APPLICATION.config().mirrored_state_config()) {
-            eprintln!("Failed to audit historical treestates: {error:#}");
-            std::process::exit(1);
-        }
+    pub(crate) fn run(&self, config: &ZakuradConfig) -> Result<()> {
+        self.run_with_config(config.mirrored_state_config())
+            .inspect_err(|error| eprintln!("Failed to audit historical treestates: {error:#}"))
     }
-}
 
-impl AuditHistoricalTreestatesCmd {
     /// Runs the audit using `state_config` as the base state configuration.
     #[allow(clippy::print_stdout)]
     pub fn run_with_config(&self, mut state_config: zakura_state::Config) -> Result<()> {

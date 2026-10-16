@@ -151,12 +151,16 @@ impl HeaderChainEngine {
     }
 
     fn from_validated_state(
-        graph: MemHeaderStore,
+        mut graph: MemHeaderStore,
         metadata: EngineMetadata,
         selected: Vec<crate::Frontier>,
         verified: Vec<crate::Frontier>,
         deliveries: Vec<AuxDelivery>,
     ) -> Result<Self, EngineHydrationError> {
+        graph.prefer_header_tip(
+            (metadata.mode == crate::EngineMode::Integrated)
+                .then_some(metadata.frontiers.header_best),
+        );
         if graph.finalized_frontier() != metadata.frontiers.finalized {
             return Err(EngineHydrationError::Incoherent(
                 "graph finality disagrees with metadata",
@@ -329,6 +333,10 @@ impl HeaderChainEngine {
     fn install_verified_plan(&mut self, plan: &EngineTransition) -> Result<(), GraphError> {
         self.graph.apply_delta(plan.graph_delta())?;
         self.metadata = plan.change_set().metadata.clone();
+        self.graph.prefer_header_tip(
+            (self.metadata.mode == crate::EngineMode::Integrated)
+                .then_some(self.metadata.frontiers.header_best),
+        );
         merge_projection_delta(
             &mut self.selected_projection,
             &plan.change_set().selected_projection,

@@ -58,9 +58,7 @@ pub(crate) struct BlockApplyCompletion {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     mut actions: mpsc::Receiver<BlockSyncAction>,
-    // Retained so the disconnect capability stays wired into the driver, even
-    // though peer scoring no longer drives disconnects (misbehavior is record-only).
-    _supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
+    supervisor: zakura_network::zakura::ZakuraSupervisorHandle,
     endpoint: Option<ZakuraEndpoint>,
     block_sync: BlockSyncHandle,
     latest_chain_tip: impl ChainTip + Clone + Send + Sync + 'static,
@@ -440,8 +438,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 }
             }
             BlockSyncAction::Misbehavior { peer, reason } => {
-                // Record-only: peer scoring no longer drives disconnects.
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
+                supervisor
+                    .enforce_block_sync_misbehavior(&peer, &reason)
+                    .await;
             }
             BlockSyncAction::QueryNeededBlocks {
                 query_id,
@@ -486,91 +486,6 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             ?error,
                             "failed to query Zakura block-sync needed blocks"
                         );
-                    }
-                }
-            }
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                trace.trace_block_range_query_started(&peer, start, count);
-                let started = Instant::now();
-                match tokio::time::timeout(
-                    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-                    read_state
-                        .clone()
-                        .oneshot(zakura_state::ReadRequest::BlocksByHeightRange { start, count }),
-                )
-                .await
-                {
-                    Ok(Ok(zakura_state::ReadResponse::Blocks(blocks))) => {
-                        trace.trace_block_range_query_succeeded(
-                            &peer,
-                            start,
-                            blocks.len(),
-                            started,
-                        );
-                        trace.trace_block_range_event(
-                            "block_range_response_ready",
-                            &peer,
-                            start,
-                            count,
-                        );
-                        let _ = block_sync.send_control(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        });
-                    }
-                    Ok(Ok(response)) => {
-                        trace.trace_block_range_query_failed(
-                            &peer,
-                            start,
-                            count,
-                            "unexpected_response",
-                            started,
-                        );
-                        warn!(?peer, ?response, "unexpected BlocksByHeightRange response");
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Ok(Err(error)) => {
-                        trace.trace_block_range_query_failed(
-                            &peer,
-                            start,
-                            count,
-                            &format!("{error}"),
-                            started,
-                        );
-                        warn!(
-                            ?peer,
-                            ?error,
-                            "failed to read Zakura Blocks response from state"
-                        );
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
-                    }
-                    Err(_elapsed) => {
-                        trace.trace_block_range_query_timed_out(&peer, start, count, started);
-                        warn!(?peer, "timed out reading Zakura block-sync serving range");
-                        trace.trace_block_range_finished(&peer, start, count, 0);
-                        let _ =
-                            block_sync.send_control(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            });
                     }
                 }
             }
@@ -1921,7 +1836,8 @@ mod tests {
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, _reactor_actions, reactor_task) =
-            zakura_network::zakura::spawn_block_sync_reactor(startup);
+            zakura_network::zakura::spawn_block_sync_reactor(startup)
+                .expect("valid block-sync config");
         let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
             panic!("unexpected read request: {request:?}");
             #[allow(unreachable_code)]

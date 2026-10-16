@@ -10,7 +10,10 @@ use std::{
 
 use color_eyre::Report;
 use tokio::time::{self, timeout};
-use tower::{util::BoxCloneService, ServiceBuilder, ServiceExt};
+use tower::{
+    util::{BoxCloneService, BoxService},
+    ServiceBuilder, ServiceExt,
+};
 
 use rand::{seq::SliceRandom, thread_rng};
 use zakura_chain::{
@@ -36,7 +39,8 @@ use crate::components::{
 type MockPeerSet = MockService<zn::Request, zn::Response, PanicAssertion>;
 
 /// The unmocked Zebra state service's type.
-type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type StateService =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
@@ -50,7 +54,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
         },
     );
     assert_eq!(
-        transaction_cooldown_peer(&policy_error, None, NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(&policy_error, None, NetworkUpgrade::Nu6_3, None),
         None
     );
 
@@ -73,7 +77,8 @@ fn policy_rejection_does_not_start_a_cooldown() {
         transaction_cooldown_peer(
             &invalid_error,
             Some(block::Height(100)),
-            NetworkUpgrade::Nu6_3
+            NetworkUpgrade::Nu6_3,
+            None
         ),
         Some(advertiser_addr)
     );
@@ -92,15 +97,25 @@ fn stale_verification_failures_do_not_start_cooldowns() {
     };
 
     assert_eq!(
-        transaction_cooldown_peer(&error, Some(block::Height(101)), NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(
+            &error,
+            Some(block::Height(101)),
+            NetworkUpgrade::Nu6_3,
+            None
+        ),
         None
     );
     assert_eq!(
-        transaction_cooldown_peer(&error, None, NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(&error, None, NetworkUpgrade::Nu6_3, None),
         None
     );
     assert_eq!(
-        transaction_cooldown_peer(&error, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(
+            &error,
+            Some(block::Height(100)),
+            NetworkUpgrade::Nu6_3,
+            None
+        ),
         Some(peer)
     );
 }
@@ -128,7 +143,12 @@ fn context_dependent_failures_do_not_start_cooldowns() {
             retried_after_tip_reset: false,
         };
         assert_eq!(
-            transaction_cooldown_peer(&error, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &error,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             None
         );
     }
@@ -169,14 +189,24 @@ fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
     ] {
         let fresh = relayed_transaction_failure(error.clone(), transaction_version);
         assert_eq!(
-            transaction_cooldown_peer(&fresh, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &fresh,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             Some(test_peer()),
             "{error:?}"
         );
 
         let failure = retried(error.clone(), transaction_version);
         assert_eq!(
-            transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &failure,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             None,
             "{error:?}"
         );
@@ -260,7 +290,8 @@ fn transaction_data_failures_ban_every_version() {
                 transaction_cooldown_peer(
                     &failure,
                     Some(block::Height(100)),
-                    NetworkUpgrade::Nu6_3
+                    NetworkUpgrade::Nu6_3,
+                    None
                 ),
                 None,
                 "a banned peer does not also start a cooldown"
@@ -309,7 +340,12 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
         let v4_failure = relayed_transaction_failure(error.clone(), 4);
         assert_eq!(transaction_ban_peer(&v4_failure), None, "{error:?}");
         assert_eq!(
-            transaction_cooldown_peer(&v4_failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &v4_failure,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             Some(test_peer()),
             "{error:?}"
         );
@@ -353,7 +389,12 @@ fn sprout_deposits_start_cooldowns() {
         let failure = relayed_transaction_failure(error.clone(), transaction_version);
         assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
         assert_eq!(
-            transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &failure,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             Some(test_peer()),
             "{error:?}"
         );
@@ -380,12 +421,155 @@ fn transactions_declaring_a_later_upgrade_start_no_cooldown() {
             transaction_cooldown_peer(
                 &failure(transaction_network_upgrade),
                 Some(block::Height(100)),
-                NetworkUpgrade::Canopy
+                NetworkUpgrade::Canopy,
+                None
             ),
             cooldown_peer,
             "{transaction_network_upgrade:?}"
         );
     }
+}
+
+#[test]
+fn upgrade_grace_period_covers_the_first_blocks_of_each_upgrade() {
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    let mainnet = Network::Mainnet;
+    let nu6_3 = NetworkUpgrade::Nu6_3
+        .activation_height(&mainnet)
+        .expect("NU6.3 activates on Mainnet");
+    for (height, previous_upgrade) in [
+        (block::Height(0), None),
+        (block::Height(1), None),
+        (nu6_3.previous().expect("NU6.3 is above genesis"), None),
+        (nu6_3, Some(NetworkUpgrade::Nu6_2)),
+        (
+            (nu6_3 + 39).expect("valid height"),
+            Some(NetworkUpgrade::Nu6_2),
+        ),
+        ((nu6_3 + 40).expect("valid height"), None),
+    ] {
+        assert_eq!(
+            upgrade_grace_period(&mainnet, height),
+            previous_upgrade,
+            "{height:?}"
+        );
+    }
+
+    // When NU6.2 and NU6.3 activate at one height, peers that lag that height
+    // relay transactions for the upgrade before both.
+    let regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu6_1: Some(400),
+            nu6_2: Some(500),
+            nu6_3: Some(500),
+            nu7: Some(1_000),
+            ..Default::default()
+        }
+        .into(),
+    );
+    assert_eq!(
+        upgrade_grace_period(&regtest, block::Height(500)),
+        Some(NetworkUpgrade::Nu6_1)
+    );
+    assert_eq!(
+        upgrade_grace_period(&regtest, block::Height(1_000)),
+        Some(NetworkUpgrade::Nu6_3)
+    );
+}
+
+/// Shortly after an upgrade activates, transactions built for the previous
+/// upgrade start no cooldown, but transactions for the tip's upgrade still do.
+#[test]
+fn transactions_for_the_previous_upgrade_start_no_cooldown_in_its_grace_period() {
+    let failure = |error, transaction_version, transaction_network_upgrade| {
+        TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr: Some(test_peer()),
+            tip_height: Some(block::Height(100)),
+            transaction_version,
+            transaction_network_upgrade,
+            retried_after_tip_reset: false,
+        }
+    };
+    let script_invalid = TransactionError::Script(zakura_script::Error::ScriptInvalid);
+
+    for (failure, tip_upgrade, previous_upgrade, cooldown_in_grace_period) in [
+        (
+            failure(script_invalid.clone(), 4, None),
+            NetworkUpgrade::Nu6_3,
+            NetworkUpgrade::Nu6_2,
+            false,
+        ),
+        (
+            failure(
+                TransactionError::DisabledAddToSproutPool,
+                4,
+                Some(NetworkUpgrade::Nu6_2),
+            ),
+            NetworkUpgrade::Nu6_3,
+            NetworkUpgrade::Nu6_2,
+            false,
+        ),
+        // An older declared upgrade is outside the immediately previous upgrade's grace.
+        (
+            failure(
+                TransactionError::DisabledAddToSproutPool,
+                4,
+                Some(NetworkUpgrade::Nu6_1),
+            ),
+            NetworkUpgrade::Nu6_3,
+            NetworkUpgrade::Nu6_2,
+            true,
+        ),
+        (
+            failure(
+                TransactionError::DisabledAddToSproutPool,
+                5,
+                Some(NetworkUpgrade::Nu6_3),
+            ),
+            NetworkUpgrade::Nu6_3,
+            NetworkUpgrade::Nu6_2,
+            true,
+        ),
+    ] {
+        let tip_height = Some(block::Height(100));
+        assert_eq!(
+            transaction_cooldown_peer(&failure, tip_height, tip_upgrade, None),
+            Some(test_peer()),
+            "{failure:?}"
+        );
+        assert_eq!(
+            transaction_cooldown_peer(&failure, tip_height, tip_upgrade, Some(previous_upgrade)),
+            cooldown_in_grace_period.then_some(test_peer()),
+            "{failure:?}"
+        );
+    }
+
+    // The base branch exempts these failures independently of upgrade grace.
+    for error in [
+        TransactionError::WrongConsensusBranchId,
+        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
+        expired_transaction(block::Height(99), block::Height(101)),
+    ] {
+        let failure = failure(error, 4, Some(NetworkUpgrade::Nu6_2));
+        for grace in [None, Some(NetworkUpgrade::Nu6_2)] {
+            assert_eq!(
+                transaction_cooldown_peer(
+                    &failure,
+                    Some(block::Height(100)),
+                    NetworkUpgrade::Nu6_3,
+                    grace,
+                ),
+                None,
+                "{failure:?}"
+            );
+        }
+    }
+
+    // The grace period does not change bans.
+    let v5_script_failure = failure(script_invalid, 5, Some(NetworkUpgrade::Nu6_3));
+    assert_eq!(transaction_ban_peer(&v5_script_failure), Some(test_peer()));
 }
 
 /// Branch mismatches receive no penalty in either direction.
@@ -410,7 +594,7 @@ fn branch_id_mismatches_never_start_cooldowns() {
         let failure = failure(transaction_network_upgrade);
         assert_eq!(transaction_ban_peer(&failure), None);
         assert_eq!(
-            transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3, None),
             cooldown_peer,
             "{transaction_network_upgrade:?}"
         );
@@ -419,7 +603,7 @@ fn branch_id_mismatches_never_start_cooldowns() {
     // A branch ID that this node does not know starts nothing.
     let failure = relayed_transaction_failure(TransactionError::MissingConsensusBranchId, 5);
     assert_eq!(
-        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3, None),
         None
     );
 }
@@ -429,7 +613,12 @@ fn unrun_scripts_start_no_cooldown() {
     let failure =
         relayed_transaction_failure(TransactionError::Script(zakura_script::Error::TxIndex), 4);
     assert_eq!(
-        transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(
+            &failure,
+            Some(block::Height(100)),
+            NetworkUpgrade::Nu6_3,
+            None
+        ),
         None
     );
 }
@@ -702,35 +891,67 @@ async fn zcashd_compat_peer_is_never_penalized() -> Result<(), Report> {
     let script_invalid = TransactionError::Script(zakura_script::Error::ScriptInvalid);
     for peer in [sidecar, mapped_sidecar] {
         assert_eq!(
-            peer_penalties(peer, script_invalid.clone()).await,
+            peer_penalties(peer, script_invalid.clone(), &Network::Mainnet).await,
             (false, false)
         );
         assert_eq!(
-            peer_penalties(peer, TransactionError::NoInputs).await,
+            peer_penalties(peer, TransactionError::NoInputs, &Network::Mainnet).await,
             (false, false)
         );
     }
 
     assert_eq!(
-        peer_penalties(other_peer, script_invalid).await,
+        peer_penalties(other_peer, script_invalid, &Network::Mainnet).await,
         (true, false)
     );
     assert_eq!(
-        peer_penalties(other_peer, TransactionError::NoInputs).await,
+        peer_penalties(other_peer, TransactionError::NoInputs, &Network::Mainnet).await,
         (false, true)
     );
 
     Ok(())
 }
 
-/// Relays a transaction from `peer` that fails with `error`, on a mempool
-/// configured with a zcashd-compat sidecar at `127.0.0.1`.
+/// A v4 signature hash uses the tip's branch ID, so a peer that lags an upgrade
+/// activation relays v4 transactions that fail script checks. Those failures
+/// start no cooldown in the upgrade's grace period.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_grace_period_suppresses_cooldowns() -> Result<(), Report> {
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    // The test state's tip is at genesis, so the next block is the first
+    // NU6.3 block.
+    let regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let script_invalid = TransactionError::Script(zakura_script::Error::ScriptInvalid);
+    assert_eq!(
+        peer_penalties(peer, script_invalid, &regtest).await,
+        (false, false)
+    );
+
+    // `zcashd_compat_peer_is_never_penalized` shows that the same failure
+    // starts a cooldown on Mainnet, where the next block has no grace period.
+    Ok(())
+}
+
+/// Relays a transaction from `peer` that fails with `error`, on a `network`
+/// mempool with a current tip at genesis and a zcashd-compat sidecar at
+/// `127.0.0.1`.
 ///
 /// Returns whether the mempool started a cooldown for `peer`, and whether it
 /// banned `peer`.
-async fn peer_penalties(peer: PeerSocketAddr, error: TransactionError) -> (bool, bool) {
-    let network = Network::Mainnet;
-    let transaction = network
+async fn peer_penalties(
+    peer: PeerSocketAddr,
+    error: TransactionError,
+    network: &Network,
+) -> (bool, bool) {
+    let transaction = Network::Mainnet
         .unmined_transactions_in_blocks(2..)
         .next()
         .expect("mainnet test vectors contain an unmined transaction")
@@ -744,12 +965,12 @@ async fn peer_penalties(peer: PeerSocketAddr, error: TransactionError) -> (bool,
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-    ) = setup_with_mempool_config(&network, mempool::Config::default(), true).await;
+    ) = setup_with_mempool_config(network, mempool::Config::default(), true).await;
     let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
     mempool.misbehavior_sender = misbehavior_sender;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
     // Cooldowns only start when the mempool's validation context is current.
-    let _chain_tip_sender = mempool.use_current_chain_tip(&network);
+    let _chain_tip_sender = mempool.use_current_chain_tip(network);
     mempool.enable(&mut recent_syncs).await;
 
     let transaction_id = transaction.id();

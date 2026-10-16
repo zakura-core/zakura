@@ -1047,20 +1047,20 @@ fn mock_services<Tip>(
             zakura_test::mock_service::PropTestAssertion,
         >,
         tower::buffer::Buffer<
-            zakura_test::mock_service::MockService<
+            zakura_state::Request,
+            <zakura_test::mock_service::MockService<
                 zakura_state::Request,
                 zakura_state::Response,
                 zakura_test::mock_service::PropTestAssertion,
-            >,
-            zakura_state::Request,
+            > as tower::Service<zakura_state::Request>>::Future,
         >,
         tower::buffer::Buffer<
-            zakura_test::mock_service::MockService<
+            zakura_state::ReadRequest,
+            <zakura_test::mock_service::MockService<
                 zakura_state::ReadRequest,
                 zakura_state::ReadResponse,
                 zakura_test::mock_service::PropTestAssertion,
-            >,
-            zakura_state::ReadRequest,
+            > as tower::Service<zakura_state::ReadRequest>>::Future,
         >,
         Tip,
         MockAddressBookPeers,

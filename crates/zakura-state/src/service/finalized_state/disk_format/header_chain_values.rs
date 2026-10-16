@@ -905,6 +905,23 @@ impl HeaderNodeDisk {
         self,
         direct_reasons: impl IntoIterator<Item = EligibilityReason>,
     ) -> Result<HeaderNode, HeaderChainValueError> {
+        let header = zakura_header_chain::HashedHeader::new(self.header.clone());
+        self.into_domain_hashed(header, direct_reasons)
+    }
+
+    /// Like [`Self::into_domain`], reusing the hash [`Self::decode_hashed`] computed for this row's
+    /// header. The evidence is used only if it holds this row's own header allocation; any other
+    /// header is hashed again.
+    pub fn into_domain_hashed(
+        self,
+        header: zakura_header_chain::HashedHeader,
+        direct_reasons: impl IntoIterator<Item = EligibilityReason>,
+    ) -> Result<HeaderNode, HeaderChainValueError> {
+        let header = if Arc::ptr_eq(header.header(), &self.header) {
+            header
+        } else {
+            zakura_header_chain::HashedHeader::new(self.header.clone())
+        };
         let block_work = self
             .header
             .difficulty_threshold
@@ -929,8 +946,8 @@ impl HeaderNodeDisk {
                 BodyValidationState::Unavailable(summary)
             }
         };
-        HeaderNode::from_durable_parts(
-            self.header,
+        HeaderNode::from_hashed_durable_parts(
+            header,
             self.hash,
             self.parent_hash,
             self.height,
@@ -948,6 +965,60 @@ impl HeaderNodeDisk {
             self.aux_delivery_ids,
         )
         .map_err(|_| HeaderChainValueError::Header)
+    }
+}
+
+impl HeaderNodeDisk {
+    /// Decode one node row, also returning the header hash computed by the integrity check.
+    ///
+    /// The returned [`zakura_header_chain::HashedHeader`] holds the same header allocation as the
+    /// returned row.
+    pub fn decode_hashed(
+        bytes: &[u8],
+    ) -> Result<(Self, zakura_header_chain::HashedHeader), HeaderChainValueError> {
+        let mut decoder = Decoder::new(bytes);
+        let header_bytes = decoder.bounded("header", MAX_HEADER_BYTES)?;
+        let header: block::Header = header_bytes
+            .zcash_deserialize_into()
+            .map_err(|_| HeaderChainValueError::Header)?;
+        let hash = block::Hash(decoder.array()?);
+        let hashed = zakura_header_chain::HashedHeader::new(Arc::new(header));
+        if hashed.hash() != hash
+            || hashed
+                .header()
+                .zcash_serialize_to_vec()
+                .map_err(|_| HeaderChainValueError::Header)?
+                != header_bytes
+        {
+            return Err(HeaderChainValueError::HeaderHashMismatch);
+        }
+        let parent_hash = block::Hash(decoder.array()?);
+        let height = block::Height(decoder.u32()?);
+        let block_work = U256::from_big_endian(&decoder.array::<32>()?);
+        let work_origin = block::Hash(decoder.array()?);
+        let cumulative_work = U256::from_big_endian(&decoder.array::<32>()?);
+        let deferred_until = decoder.optional(get_time)?;
+        let inherited_from = decoder.optional(|decoder| decoder.array().map(block::Hash))?;
+        let body_validation_state = get_body_validation_state(&mut decoder)?;
+        let aux_delivery_ids =
+            decoder.counted("aux_delivery_ids", MAX_AUX_DELIVERY_IDS, |decoder| {
+                decoder.array().map(EvidenceId::from_digest)
+            })?;
+        decoder.finish()?;
+        let node = Self {
+            header: hashed.header().clone(),
+            hash,
+            parent_hash,
+            height,
+            block_work,
+            work_origin,
+            cumulative_work,
+            deferred_until,
+            inherited_from,
+            body_validation_state,
+            aux_delivery_ids,
+        };
+        Ok((node, hashed))
     }
 }
 
@@ -984,46 +1055,7 @@ impl FallibleDiskValue for HeaderNodeDisk {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
-        let mut decoder = Decoder::new(bytes);
-        let header_bytes = decoder.bounded("header", MAX_HEADER_BYTES)?;
-        let header: block::Header = header_bytes
-            .zcash_deserialize_into()
-            .map_err(|_| HeaderChainValueError::Header)?;
-        let hash = block::Hash(decoder.array()?);
-        if header.hash() != hash
-            || header
-                .zcash_serialize_to_vec()
-                .map_err(|_| HeaderChainValueError::Header)?
-                != header_bytes
-        {
-            return Err(HeaderChainValueError::HeaderHashMismatch);
-        }
-        let parent_hash = block::Hash(decoder.array()?);
-        let height = block::Height(decoder.u32()?);
-        let block_work = U256::from_big_endian(&decoder.array::<32>()?);
-        let work_origin = block::Hash(decoder.array()?);
-        let cumulative_work = U256::from_big_endian(&decoder.array::<32>()?);
-        let deferred_until = decoder.optional(get_time)?;
-        let inherited_from = decoder.optional(|decoder| decoder.array().map(block::Hash))?;
-        let body_validation_state = get_body_validation_state(&mut decoder)?;
-        let aux_delivery_ids =
-            decoder.counted("aux_delivery_ids", MAX_AUX_DELIVERY_IDS, |decoder| {
-                decoder.array().map(EvidenceId::from_digest)
-            })?;
-        decoder.finish()?;
-        Ok(Self {
-            header: Arc::new(header),
-            hash,
-            parent_hash,
-            height,
-            block_work,
-            work_origin,
-            cumulative_work,
-            deferred_until,
-            inherited_from,
-            body_validation_state,
-            aux_delivery_ids,
-        })
+        Self::decode_hashed(bytes).map(|(node, _)| node)
     }
 }
 

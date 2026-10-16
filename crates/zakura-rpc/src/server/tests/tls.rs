@@ -3,7 +3,7 @@
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use jsonrpsee::{
-    server::{stop_channel, Server, ServerHandle},
+    server::{stop_channel, Server, ServerConfig, ServerHandle},
     RpcModule,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
@@ -74,7 +74,9 @@ impl TestTlsListener {
                 "done"
             })
             .unwrap();
-        let services = Server::builder().http_only().to_service_builder();
+        let services = Server::builder()
+            .set_config(ServerConfig::builder().http_only().build())
+            .to_service_builder();
         let task = tokio::spawn(run_tls_listener(
             listener,
             TlsAcceptor::from(Arc::new(config)),

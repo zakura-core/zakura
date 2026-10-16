@@ -697,7 +697,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.block_sync]
         replace_legacy_syncer = true
-        max_blocks_per_response = 5
         status_refresh_interval = "12s"
 
         [zakura.quic]
@@ -724,7 +723,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
-    assert!(serialized.contains("max_blocks_per_response = 5"));
     assert!(serialized.contains("status_refresh_interval = \"12s\""));
     assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     assert!(
@@ -1481,5 +1479,32 @@ fn activation_height_overlay_is_only_for_configured_testnets() {
             error.contains("Mainnet and public Testnet parameters are fixed"),
             "unexpected configuration error: {error}"
         );
+    }
+}
+
+/// A loaded config must fund at least one GetBlocks request per block-sync
+/// session slot: 3,633 inbound plus outbound slots load, 3,634 do not.
+#[test]
+fn loaded_block_sync_session_slots_must_fund_one_request_each() {
+    let _init_guard = zakura_test::init();
+
+    let load = |inbound: u64, outbound: u64| {
+        toml::from_str::<Config>(&format!(
+            r#"
+            [zakura.block_sync.peer_limits]
+            max_inbound_peers = {inbound}
+            max_outbound_peers = {outbound}
+            "#
+        ))
+    };
+
+    assert!(load(256, 256).is_ok(), "defaults load");
+    assert!(load(0, 0).is_ok(), "zero slots load and serve nobody");
+    assert!(load(3_000, 633).is_ok());
+    for (inbound, outbound) in [(3_000, 634), (i64::MAX as u64, i64::MAX as u64)] {
+        let error = load(inbound, outbound)
+            .expect_err("unfundable session slots must not load")
+            .to_string();
+        assert!(error.contains("at most 3,633"), "unexpected error: {error}");
     }
 }

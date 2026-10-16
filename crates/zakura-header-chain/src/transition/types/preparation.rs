@@ -13,6 +13,40 @@ use crate::{EvidenceId, Frontier, HeaderValidationState};
 
 use super::error::TransitionTypeError;
 
+/// A block header together with the hash this process computed from exactly that header.
+///
+/// The fields are private and the only constructor hashes the header it stores, so the hash is
+/// bound to these immutable bytes. It lets the code that just hashed a header hand that hash to
+/// later checks in the same operation instead of hashing the same bytes again; it is not a cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashedHeader {
+    header: Arc<block::Header>,
+    hash: block::Hash,
+}
+
+impl HashedHeader {
+    /// Hash `header` and keep the result with it.
+    pub fn new(header: Arc<block::Header>) -> Self {
+        let hash = header.hash();
+        Self { header, hash }
+    }
+
+    /// The header.
+    pub fn header(&self) -> &Arc<block::Header> {
+        &self.header
+    }
+
+    /// The hash computed from [`Self::header`].
+    pub const fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// The header, dropping the hash.
+    pub fn into_header(self) -> Arc<block::Header> {
+        self.header
+    }
+}
+
 /// One immutable predecessor fact sealed into a validation lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderContextFact {
@@ -46,20 +80,47 @@ impl ValidationLease {
         network: zakura_chain::parameters::Network,
         trust_anchor_digest: [u8; 32],
     ) -> Self {
+        Self::from_hashed_predecessors(
+            parent,
+            predecessors
+                .into_iter()
+                .map(|fact| (fact.frontier, HashedHeader::new(fact.header)))
+                .collect(),
+            network,
+            trust_anchor_digest,
+        )
+    }
+
+    /// Like [`Self::new`], for predecessor headers whose hashes were already computed.
+    ///
+    /// The digest and the lease are identical to [`Self::new`] with the same frontiers and headers:
+    /// each header's digest input is its [`HashedHeader::hash`], which is that header's hash.
+    pub fn from_hashed_predecessors(
+        parent: Frontier,
+        predecessors: Vec<(Frontier, HashedHeader)>,
+        network: zakura_chain::parameters::Network,
+        trust_anchor_digest: [u8; 32],
+    ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(b"zakura-header-chain-validation-lease-v1");
         hasher.update(parent.height.0.to_le_bytes());
         hasher.update(parent.hash.0);
         hasher.update(trust_anchor_digest);
         hash_network_policy(&mut hasher, &network);
-        for fact in &predecessors {
-            hasher.update(fact.frontier.height.0.to_le_bytes());
-            hasher.update(fact.frontier.hash.0);
-            hasher.update(fact.header.hash().0);
+        for (frontier, header) in &predecessors {
+            hasher.update(frontier.height.0.to_le_bytes());
+            hasher.update(frontier.hash.0);
+            hasher.update(header.hash().0);
         }
         Self {
             parent,
-            predecessors,
+            predecessors: predecessors
+                .into_iter()
+                .map(|(frontier, header)| HeaderContextFact {
+                    frontier,
+                    header: header.into_header(),
+                })
+                .collect(),
             network,
             trust_anchor_digest,
             context_digest: hasher.finalize().into(),
@@ -368,6 +429,57 @@ mod tests {
             Network::new_regtest(RegtestParameters::default()),
             TRUST_ANCHOR_DIGEST,
         )
+    }
+
+    #[test]
+    fn hashed_header_holds_the_hash_of_its_own_header() {
+        for fact in context_chain(3) {
+            let hashed = HashedHeader::new(fact.header.clone());
+            assert_eq!(hashed.hash(), fact.header.hash());
+            assert!(Arc::ptr_eq(hashed.header(), &fact.header));
+        }
+    }
+
+    #[test]
+    fn hashed_predecessor_lease_equals_the_rehashing_constructor() {
+        let network = Network::new_regtest(RegtestParameters::default());
+        let facts: Vec<_> = context_chain(40).into_iter().rev().collect();
+        let parent = facts[0].frontier;
+        let rehashed =
+            ValidationLease::new(parent, facts.clone(), network.clone(), TRUST_ANCHOR_DIGEST);
+        let hashed = ValidationLease::from_hashed_predecessors(
+            parent,
+            facts
+                .iter()
+                .map(|fact| (fact.frontier, HashedHeader::new(fact.header.clone())))
+                .collect(),
+            network.clone(),
+            TRUST_ANCHOR_DIGEST,
+        );
+        assert_eq!(hashed, rehashed);
+        assert_eq!(hashed.context_digest, rehashed.context_digest);
+
+        // A frontier that disagrees with its header still changes the digest exactly as before:
+        // the digest covers both the claimed frontier hash and the header's own hash.
+        let mut mismatched = facts.clone();
+        mismatched[3].frontier = Frontier::new(mismatched[3].frontier.height, block::Hash([7; 32]));
+        let rehashed_mismatch = ValidationLease::new(
+            parent,
+            mismatched.clone(),
+            network.clone(),
+            TRUST_ANCHOR_DIGEST,
+        );
+        let hashed_mismatch = ValidationLease::from_hashed_predecessors(
+            parent,
+            mismatched
+                .iter()
+                .map(|fact| (fact.frontier, HashedHeader::new(fact.header.clone())))
+                .collect(),
+            network,
+            TRUST_ANCHOR_DIGEST,
+        );
+        assert_eq!(hashed_mismatch, rehashed_mismatch);
+        assert_ne!(hashed_mismatch.context_digest, rehashed.context_digest);
     }
 
     #[test]

@@ -69,8 +69,10 @@ pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
 
 // Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
 // Do not assign it to another service.
-// Bit `1 << 3` identifies block sync in `block_sync::wire`.
+// Bit `1 << 3` identified the retired block-sync stream version 2. Do not reuse it.
 // Bit `1 << 4` identifies the retired predecessor header-sync protocol.
+// Bits 6 and 7 are reserved for spentness hints and wallet transaction submission.
+// Bit `1 << 8` identifies block sync (stream version 3) in `block_sync::wire`.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;

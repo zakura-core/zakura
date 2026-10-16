@@ -11,29 +11,35 @@ use super::{
     wire::{Message, Range, GET_BLOCKS},
 };
 use crate::zakura::{
-    block_sync::{BlockSyncMessage, BlockSyncStatus},
+    block_sync::{BlockSyncMessage, BlockSyncStatus, MAX_BS_RESPONSE_BYTES},
     framed_channel,
     regulation::{ServeCapacity, ServeLimits},
     wire_codec::{decode_frame, encode_frame, WireMessage},
     Frame, ZakuraPeerId,
 };
 
+#[derive(Debug)]
 struct Store {
-    blocks: Vec<(block::Height, Arc<block::Block>)>,
+    blocks: Vec<(block::Height, Vec<u8>)>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     fail: bool,
+    panic: bool,
 }
 
 impl Source for Store {
     fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
         let blocks = self.blocks.clone();
         let fail = self.fail;
+        let panic = self.panic;
         let started = self.started.clone();
         let release = self.release.clone();
         Box::pin(async move {
             if fail {
                 return Err("storage failure".into());
+            }
+            if panic {
+                panic!("injected serving panic");
             }
             Ok(tokio::task::spawn_blocking(move || {
                 if !request.lease.try_start() {
@@ -57,21 +63,59 @@ impl Source for Store {
 }
 
 fn store(blocks: &[&[u8]], open: bool) -> Arc<Store> {
-    Arc::new(Store {
-        blocks: blocks
+    stored_at(
+        blocks
             .iter()
             .enumerate()
             .map(|(index, bytes)| {
                 (
                     block::Height(u32::try_from(index + 1).unwrap()),
-                    Arc::new(bytes.zcash_deserialize_into().unwrap()),
+                    bytes.to_vec(),
                 )
             })
             .collect(),
+        open,
+    )
+}
+
+/// Builds a store that returns `blocks` as stored, whatever their heights.
+fn stored_at(blocks: Vec<(block::Height, Vec<u8>)>, open: bool) -> Arc<Store> {
+    Arc::new(Store {
+        blocks,
         started: Arc::new(Semaphore::new(0)),
         release: Arc::new(Semaphore::new(if open { 128 } else { 0 })),
         fail: false,
+        panic: false,
     })
+}
+
+/// Serves `range` once from `source` and returns the frames up to the ending.
+async fn serve_once(source: Arc<Store>, max_body_bytes: u32, range: Range) -> Vec<Message> {
+    let capacity = capacity(max_body_bytes);
+    let (send, mut recv) = framed_channel(4);
+    let cancel = CancellationToken::new();
+    let server = capacity.session(
+        Arc::new(Server::new(source, 128, max_body_bytes).unwrap()),
+        &ZakuraPeerId::new(vec![6; 32]).unwrap(),
+        2,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    server.admit(range).unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let message = receive(&mut recv).await;
+        let ended = !matches!(message, Message::Block(_));
+        frames.push(message);
+        if ended {
+            break;
+        }
+    }
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+    frames
 }
 
 fn capacity(body_bytes: u32) -> ServeCapacity {
@@ -94,7 +138,8 @@ fn capacity(body_bytes: u32) -> ServeCapacity {
     .unwrap()
 }
 
-async fn receive(recv: &mut crate::zakura::FramedRecv) -> Message {
+/// Decode the next production response with a bounded wait.
+pub(super) async fn receive(recv: &mut crate::zakura::FramedRecv) -> Message {
     let frame = tokio::time::timeout(Duration::from_secs(5), recv.recv())
         .await
         .unwrap()
@@ -236,6 +281,124 @@ async fn body_limit_excludes_tags_and_ending_and_stops_at_a_prefix() {
     cancel.cancel();
 }
 
+/// A source that returns `blocks` at the given heights, whatever was asked.
+fn store_at(blocks: &[(u32, &[u8])]) -> Arc<Store> {
+    Arc::new(Store {
+        blocks: blocks
+            .iter()
+            .map(|(height, bytes)| (block::Height(*height), bytes.to_vec()))
+            .collect(),
+        started: Arc::new(Semaphore::new(0)),
+        release: Arc::new(Semaphore::new(128)),
+        fail: false,
+        panic: false,
+    })
+}
+
+/// Serving trusts no source ordering. It sends only the contiguous prefix from
+/// the requested start, within its block limit, and ends with the count it sent.
+#[tokio::test]
+async fn serving_stops_at_the_first_noncontiguous_or_excess_source_block() {
+    let first: &[u8] = &BLOCK_MAINNET_1_BYTES;
+    let second: &[u8] = &BLOCK_MAINNET_2_BYTES;
+    let limit = u32::try_from(first.len() + second.len()).unwrap();
+    let range = Range::new(block::Height(1), 2).unwrap();
+    let prefix = vec![
+        Message::Block(first.to_vec()),
+        Message::BlocksDone {
+            start: range.start,
+            returned: 1,
+        },
+    ];
+    let unavailable = vec![Message::RangeUnavailable(range)];
+    for (source, max_blocks, expected) in [
+        (vec![(1, first), (3, second)], 128, prefix.clone()),
+        (vec![(1, first), (1, first)], 128, prefix.clone()),
+        (vec![(2, second)], 128, unavailable.clone()),
+        (vec![(1, first), (2, second)], 1, prefix.clone()),
+        (vec![], 128, unavailable.clone()),
+    ] {
+        let capacity = capacity(limit);
+        let (send, mut recv) = framed_channel(4);
+        let cancel = CancellationToken::new();
+        let server = capacity.session(
+            Arc::new(Server::new(store_at(&source), max_blocks, limit).unwrap()),
+            &ZakuraPeerId::new(vec![6; 32]).unwrap(),
+            2,
+            send,
+            cancel.clone(),
+            cancel.clone(),
+            crate::zakura::CloseCause::default(),
+        );
+        server.admit(range).unwrap();
+        for message in &expected {
+            assert_eq!(&receive(&mut recv).await, message, "source {source:?}");
+        }
+        assert!(
+            !cancel.is_cancelled(),
+            "a short source is not a local fault"
+        );
+        cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn served_block_frames_carry_the_stored_bytes_unchanged() {
+    // Not a decodable block, so any decode or reserialization would change it.
+    let stored = vec![0xa5; 64];
+    let frames = serve_once(
+        store(&[&BLOCK_MAINNET_1_BYTES, &stored], true),
+        MAX_BS_RESPONSE_BYTES,
+        Range::new(block::Height(1), 2).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        frames,
+        [
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec()),
+            Message::Block(stored),
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 2
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_height_gap_from_the_source_ends_the_prefix() {
+    let frames = serve_once(
+        stored_at(
+            vec![
+                (block::Height(1), BLOCK_MAINNET_1_BYTES.to_vec()),
+                (block::Height(3), BLOCK_MAINNET_2_BYTES.to_vec()),
+            ],
+            true,
+        ),
+        MAX_BS_RESPONSE_BYTES,
+        Range::new(block::Height(1), 3).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        frames,
+        [
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec()),
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 1
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_stored_block_over_the_block_byte_limit_is_not_served() {
+    let oversized = vec![0; usize::try_from(block::MAX_BLOCK_BYTES).unwrap() + 1];
+    let range = Range::new(block::Height(1), 1).unwrap();
+    let frames = serve_once(store(&[&oversized], true), MAX_BS_RESPONSE_BYTES, range).await;
+    assert_eq!(frames, [Message::RangeUnavailable(range)]);
+}
+
 #[tokio::test]
 async fn too_small_body_budget_returns_original_unavailable_range() {
     let source = store(&[&BLOCK_MAINNET_1_BYTES], true);
@@ -368,7 +531,25 @@ async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
 #[test]
 fn envelope_allocations_are_bounded_by_the_payload() {
     for frame in [
+        encode_frame(&Message::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height::MAX,
+            tip_hash: block::Hash([7; 32]),
+            max_blocks_per_response: 128,
+            max_inflight_requests: 32_768,
+            max_response_bytes: 33_554_432,
+        }))
+        .unwrap(),
         encode_frame(&Message::GetBlocks(
+            Range::new(block::Height(1), 128).unwrap(),
+        ))
+        .unwrap(),
+        encode_frame(&Message::BlocksDone {
+            start: block::Height(1),
+            returned: 128,
+        })
+        .unwrap(),
+        encode_frame(&Message::RangeUnavailable(
             Range::new(block::Height(1), 128).unwrap(),
         ))
         .unwrap(),
@@ -385,4 +566,327 @@ fn envelope_allocations_are_bounded_by_the_payload() {
                 <= Message::max_heap_bytes(frame.message_type, frame.payload.len())
         );
     }
+}
+
+struct LiveServing {
+    close_cause: crate::zakura::CloseCause,
+    service: crate::zakura::BlockSyncService,
+    input: crate::zakura::FramedSend,
+    output: crate::zakura::FramedRecv,
+    cancel: CancellationToken,
+    session_cancel: CancellationToken,
+}
+
+impl Drop for LiveServing {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
+    use crate::zakura::{
+        BlockSyncService, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC,
+    };
+    let config = ZakuraBlockSyncConfig {
+        max_response_bytes: max_bytes,
+        peer_limits: crate::zakura::ServicePeerLimits {
+            max_outbound_peers: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let close_cause = crate::zakura::CloseCause::default();
+    let session_cancel = cancel.child_token();
+    let mut startup =
+        super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
+    startup.shutdown = cancel.clone();
+    let (handle, _actions, _task) =
+        super::super::spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let service = BlockSyncService::new_with_handle(handle);
+    let resources = service
+        .reserve_session(ServicePeerDirection::Outbound)
+        .unwrap()
+        .unwrap();
+    resources.admitted();
+    let (input, recv) = framed_channel(4);
+    let (send, output) = framed_channel(4);
+    let send = send.with_session_resources(Some(resources));
+    service.add_peer(Peer::new_with_service_streams(
+        0,
+        ZakuraPeerId::new(vec![11; 32]).unwrap(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        std::collections::HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            crate::zakura::transport::ServiceStream::new(
+                0,
+                ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+                recv,
+                send,
+                session_cancel.clone(),
+            ),
+        )]),
+        cancel.clone(),
+        close_cause.clone(),
+    ));
+    LiveServing {
+        close_cause,
+        service,
+        input,
+        output,
+        cancel,
+        session_cancel,
+    }
+}
+
+async fn next_response(output: &mut crate::zakura::FramedRecv) -> Message {
+    loop {
+        let message = receive(output).await;
+        if !matches!(message, Message::Status(_)) {
+            return message;
+        }
+    }
+}
+
+/// Session cancellation stops serving and returns its sole slot without closing the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_serving_session_cancellation_releases_the_slot_without_closing_the_connection() {
+    use crate::zakura::{Service, ServicePeerDirection};
+
+    let source = store(&[&BLOCK_MAINNET_1_BYTES], false);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let live = live_serving(source.clone(), super::super::MAX_BS_RESPONSE_BYTES);
+    // If serving uses the connection token by mistake, these responses fill the
+    // unread output and pin the writer after the routine's session has stopped.
+    for height in 1..=5 {
+        live.input
+            .send(
+                BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(height),
+                    count: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), source.started.acquire_many(5))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    live.session_cancel.cancel();
+    assert!(!live.cancel.is_cancelled());
+    source.release.add_permits(5);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(Some(slot)) = live.service.reserve_session(ServicePeerDirection::Outbound) {
+                drop(slot);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled serving releases the sole session slot without reading output");
+    assert!(!live.cancel.is_cancelled());
+}
+
+/// A serving panic must reach the production connection token, with no download fence involved.
+///
+/// The encoder copies stored bytes and has no data-dependent panic, so the
+/// source injects the panic inside the producer instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_serving_panic_closes_the_connection_without_downloads() {
+    let mut source = store(&[&BLOCK_MAINNET_1_BYTES], true);
+    Arc::get_mut(&mut source).unwrap().panic = true;
+    let live = live_serving(source, super::super::MAX_BS_RESPONSE_BYTES);
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
+        .await
+        .unwrap();
+    assert_eq!(live.close_cause.get_or("cancelled"), "service_panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_routine_serves_bounded_prefixes_and_allows_reuse_after_each_ending() {
+    let source = store(&[&BLOCK_MAINNET_1_BYTES, &BLOCK_MAINNET_2_BYTES], true);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let mut live = live_serving(
+        source.clone(),
+        u32::try_from(BLOCK_MAINNET_1_BYTES.len()).unwrap(),
+    );
+    for _ in 0..32 {
+        source.release.add_permits(1);
+        live.input
+            .send(
+                BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(1),
+                    count: 2,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next_response(&mut live.output).await,
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec())
+        );
+        assert_eq!(
+            next_response(&mut live.output).await,
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 1
+            }
+        );
+        assert!(!live.cancel.is_cancelled());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_routine_rejects_overlaps_and_retains_the_session_until_storage_stops() {
+    use crate::zakura::{Service, ServicePeerDirection};
+    let source = store(&[], false);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let live = live_serving(source.clone(), 1);
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 2,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), source.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(2),
+                count: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
+        .await
+        .unwrap();
+    assert!(live
+        .service
+        .reserve_session(ServicePeerDirection::Outbound)
+        .is_err());
+    assert_eq!(
+        source.started.available_permits(),
+        0,
+        "the overlap starts no second read"
+    );
+    source.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if live
+                .service
+                .reserve_session(ServicePeerDirection::Outbound)
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[derive(Debug)]
+struct TimedOutRead {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl Source for TimedOutRead {
+    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            let entered = started.clone();
+            tokio::task::spawn_blocking(move || {
+                assert!(request.lease.try_start());
+                entered.add_permits(1);
+                futures::executor::block_on(release.acquire())
+                    .unwrap()
+                    .forget();
+                drop(request.lease);
+            });
+            started.acquire().await.unwrap().forget();
+            Err("state read timed out while its blocking job is still running".into())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
+    let source = Arc::new(TimedOutRead {
+        started: Arc::new(Semaphore::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    });
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let capacity = capacity(1);
+    let peer = ZakuraPeerId::new(vec![12; 32]).unwrap();
+    let (send, mut recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let serving = capacity.session(
+        Arc::new(Server::new(source.clone(), 1, 1).unwrap()),
+        &peer,
+        1,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    let range = Range::new(block::Height(1), 1).unwrap();
+    serving.admit(range).unwrap();
+    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    cancel.cancel();
+    drop(serving);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while capacity.node_output_held() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recv.recv().await.is_none(),
+            "the retired session drops its writer"
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(capacity.node_execution_held(), 1);
+    assert_eq!(
+        capacity.peer_held(&peer),
+        (1, 0),
+        "a reconnect must find the still-running peer execution budget"
+    );
 }

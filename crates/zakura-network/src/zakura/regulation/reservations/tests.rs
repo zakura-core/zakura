@@ -287,6 +287,57 @@ fn a_refused_precheck_allocates_no_decoded_body() {
     assert!(allowed.requested_bytes >= 64);
 }
 
+/// A reader may queue every frame of every live response ahead of the
+/// handler, and nothing more. Taking and claiming frames keeps the total exact.
+#[test]
+fn queued_frames_never_exceed_what_the_live_reservations_owe() {
+    let pool = pool(4);
+    let mut map = reservations(&pool, &[1, 2]);
+    let over_owed = |frames, bytes| Err(ClaimRefused::OverOwed { frames, bytes });
+
+    // Two full conformant responses: two parts and an ending each.
+    for (message_type, len) in [
+        (message_type::PART, 65),
+        (message_type::PART, 65),
+        (message_type::PART, 65),
+        (message_type::PART, 65),
+        (message_type::DONE, 4),
+        (message_type::DONE, 4),
+    ] {
+        assert_eq!(map.admit(message_type, len), Ok(()));
+    }
+    // A seventh frame was never requested, however small.
+    assert_eq!(map.admit(message_type::DONE, 4), over_owed(6, 268));
+    // So is one more byte than requested, even within the frame count.
+    let mut fresh = reservations(&pool, &[3]);
+    assert_eq!(fresh.admit(message_type::PART, 65), Ok(()));
+    assert_eq!(fresh.admit(message_type::PART, 65), Ok(()));
+    assert_eq!(fresh.admit(message_type::DONE, 5), over_owed(3, 134));
+    drop(fresh);
+
+    // The handler takes and claims key 1's response; key 2's stays queued.
+    for (message_type, len) in [(message_type::PART, 65), (message_type::PART, 65)] {
+        map.take_admitted(len);
+        map.claim_frame(&1, message_type, len).unwrap();
+    }
+    map.take_admitted(4);
+    map.claim_end(&1, message_type::DONE, 4).unwrap();
+    assert_eq!(map.admit(message_type::DONE, 4), over_owed(3, 134));
+
+    // A refused claim changes neither total.
+    assert!(map.claim_frame(&9, message_type::PART, 65).is_err());
+    assert_eq!(map.admit(message_type::DONE, 4), over_owed(3, 134));
+
+    // A new reservation owes its own response; a retracted one owes nothing.
+    let entry = pool.try_entry().unwrap();
+    map.reserve(4, message_type::GET, CAP, entry).unwrap();
+    assert!(map.retract(&4));
+    assert_eq!(map.admit(message_type::DONE, 4), over_owed(3, 134));
+    let entry = pool.try_entry().unwrap();
+    map.reserve(5, message_type::GET, CAP, entry).unwrap();
+    assert_eq!(map.admit(message_type::DONE, 4), Ok(()));
+}
+
 #[test]
 fn the_shared_precheck_maps_refusals_to_frame_rejections() {
     let pool = pool(4);

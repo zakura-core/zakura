@@ -46,7 +46,6 @@ use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
 use jsonrpsee_proc_macros::rpc;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
-use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -5097,7 +5096,7 @@ impl GetBlockchainInfoResponse {
 }
 
 /// A request for [`RpcServer::get_address_balance`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(from = "DGetAddressBalanceRequest")]
 pub struct GetAddressBalanceRequest {
     /// A list of transparent address strings.
@@ -5118,7 +5117,7 @@ impl From<DGetAddressBalanceRequest> for GetAddressBalanceRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressBalanceRequest`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressBalanceRequest {
     /// A list of address strings.
@@ -5190,16 +5189,7 @@ pub struct GetAddressBalanceResponse {
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Deserialize,
-    serde::Serialize,
-    Getters,
-    CopyGetters,
-    new,
-    JsonSchema,
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, CopyGetters, new,
 )]
 #[serde(from = "DGetAddressUtxosRequest")]
 pub struct GetAddressUtxosRequest {
@@ -5232,7 +5222,7 @@ impl From<DGetAddressUtxosRequest> for GetAddressUtxosRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressUtxosRequest`].
-#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressUtxosRequest {
     /// A single address string.
@@ -5869,9 +5859,7 @@ impl Utxo {
 /// Parameters of [`RpcServer::get_address_tx_ids`] RPC method.
 ///
 /// See [`RpcServer::get_address_tx_ids`] for more details.
-#[derive(
-    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
 #[serde(from = "DGetAddressTxIdsRequest")]
 pub struct GetAddressTxIdsRequest {
     /// A list of addresses. The RPC method will get transactions IDs that sent or received
@@ -5919,7 +5907,7 @@ impl From<DGetAddressTxIdsRequest> for GetAddressTxIdsRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressTxIdsRequest`].
-#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressTxIdsRequest {
     /// A single address string.
@@ -6288,7 +6276,7 @@ where
 }
 
 /// Commands for the `addnode` RPC method.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AddNodeCommand {
     /// Add a node to the address book.
     #[serde(rename = "add")]

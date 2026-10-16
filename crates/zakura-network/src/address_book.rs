@@ -565,6 +565,8 @@ impl AddressBook {
             // This prevents Zebra from caching nodes that are likely unreachable,
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
+            // An inbound peer's entry holds its ephemeral source port, not a listener.
+            .filter(|addr| !addr.is_inbound())
             .cloned()
             .collect()
     }
@@ -879,7 +881,10 @@ impl AddressBook {
         self.peers
             .ordered_values()
             .filter(move |peer| {
-                peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
+                // Inbound entries stay in the book for liveness, bans, and per-IP dial
+                // limits, but their ephemeral source ports are not listeners to dial.
+                !peer.is_inbound()
+                    && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
             .cloned()

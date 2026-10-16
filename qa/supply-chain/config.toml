@@ -64,12 +64,6 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
-[policy.zakura-tower-batch-control]
-audit-as-crates-io = false
-
-[policy.zakura-tower-fallback]
-audit-as-crates-io = false
-
 [policy.zakura-utils]
 audit-as-crates-io = false
 
@@ -425,11 +419,6 @@ criteria = "safe-to-deploy"
 notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
 
 [[exemptions.zakura-jubjub]]
-version = "3.0.0"
-criteria = "safe-to-deploy"
-notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."
-
-[[exemptions.zakura-keys]]
 version = "3.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Common v3.0.0 release; carry the existing exact-version fork audit backlog forward. Direct package audit remains pending; this is not an audit certification."

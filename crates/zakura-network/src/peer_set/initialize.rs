@@ -154,7 +154,7 @@ pub async fn init<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
 )
@@ -187,7 +187,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
     Option<ZakuraEndpoint>,
@@ -224,7 +224,7 @@ pub async fn init_with_zakura<S, C>(
     custom_services: Vec<CustomService>,
 ) -> Result<
     (
-        Buffer<BoxService<Request, Response, BoxError>, Request>,
+        Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,

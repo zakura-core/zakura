@@ -1,6 +1,6 @@
 use std::pin::Pin;
 
-use futures::{Future, FutureExt};
+use futures::Future;
 use tower::retry::Policy;
 
 /// A very basic retry policy with a limited number of retry attempts.
@@ -21,15 +21,14 @@ impl RetryLimit {
 }
 
 impl<Req: Clone + std::fmt::Debug, Res, E: std::fmt::Debug> Policy<Req, Res, E> for RetryLimit {
-    type Future = Pin<Box<dyn Future<Output = Self> + Send + Sync + 'static>>;
+    type Future = Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>;
 
-    fn retry(&self, req: &Req, result: Result<&Res, &E>) -> Option<Self::Future> {
+    fn retry(&mut self, req: &mut Req, result: &mut Result<Res, E>) -> Option<Self::Future> {
         if let Err(e) = result {
             if self.remaining_tries > 0 {
                 tracing::debug!(?req, ?e, remaining_tries = self.remaining_tries, "retrying");
 
-                let remaining_tries = self.remaining_tries - 1;
-                let retry_outcome = RetryLimit { remaining_tries };
+                self.remaining_tries -= 1;
 
                 Some(
                     // Let other tasks run, so we're more likely to choose a different peer,
@@ -40,7 +39,7 @@ impl<Req: Clone + std::fmt::Debug, Res, E: std::fmt::Debug> Policy<Req, Res, E> 
                     // We want to choose different peers for retries, so we have a better chance of getting each block.
                     // This is implemented by the connection state machine sending synthetic `notfound`s to the
                     // `InventoryRegistry`, as well as forwarding actual `notfound`s from peers.
-                    Box::pin(tokio::task::yield_now().map(move |()| retry_outcome)),
+                    Box::pin(tokio::task::yield_now()),
                 )
             } else {
                 None
@@ -50,7 +49,7 @@ impl<Req: Clone + std::fmt::Debug, Res, E: std::fmt::Debug> Policy<Req, Res, E> 
         }
     }
 
-    fn clone_request(&self, req: &Req) -> Option<Req> {
+    fn clone_request(&mut self, req: &Req) -> Option<Req> {
         Some(req.clone())
     }
 }

@@ -6,7 +6,6 @@ use futures::FutureExt;
 use tower::buffer::Buffer;
 
 use zcash_address::{ToAddress, ZcashAddress};
-use zcash_keys::address::Address;
 use zcash_protocol::consensus::NetworkType;
 use zcash_transparent::address::TransparentAddress;
 
@@ -43,7 +42,7 @@ use crate::methods::{
     tests::utils::fake_history_tree,
     types::get_block_template::{
         constants::{CAPABILITIES_FIELD, MUTABLE_FIELD, NONCE_RANGE_FIELD},
-        GetBlockTemplateRequestMode,
+        GetBlockTemplateRequestMode, MinerAddress,
     },
 };
 
@@ -3597,10 +3596,17 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     assert!(!get_block_template.coinbase_txn.data.as_ref().is_empty());
     assert_eq!(get_block_template.coinbase_txn.depends.len(), 0);
 
-    let taddr = Address::try_from_zcash_address(&net, addr.clone())
+    let taddr = match MinerAddress::try_from_zcash_address(&net, addr.clone())
         .expect("address should be convertible")
-        .to_transparent_address()
-        .expect("address should have a transparent component");
+    {
+        MinerAddress::Transparent(taddr)
+        | MinerAddress::Unified {
+            transparent: Some(taddr),
+            ..
+        } => taddr,
+        MinerAddress::Tex(data) => TransparentAddress::PublicKeyHash(data),
+        _ => panic!("address should have a transparent component"),
+    };
 
     if matches!(taddr, TransparentAddress::PublicKeyHash(_)) {
         // there is one sig operation if miner address is p2pkh.

@@ -23,6 +23,13 @@
 //! requester's bookkeeping has a node-wide bound. A full pool makes the node
 //! wait before its next request; it never acts against a peer.
 //!
+//! The live reservations also owe the peer a total: each one's frames left
+//! plus its ending, and its bytes left. A reader that queues frames before the
+//! handler claims them charges each against that total with
+//! [`Reservations::admit`], so the queue never holds more than this node
+//! requested. A frame past it is a violation that no conformant responder can
+//! cause.
+//!
 //! [`Reservations::reserve_fenced`] makes a reservation own its request's
 //! [`Exchange`]. The ending's claim ends the exchange. Dropping the map at the
 //! session's end drops the rest, and a started one closes the connection.
@@ -37,6 +44,7 @@
 //! | No time passing removes a reservation | `no_time_passing_removes_a_reservation` |
 //! | Reserving is local and bounded | `reserving_is_local_and_bounded` |
 //! | The precheck needs a live reservation with room | `the_precheck_needs_a_live_reservation_with_room` |
+//! | Queued frames never exceed what the live reservations owe | `queued_frames_never_exceed_what_the_live_reservations_owe` |
 //! | A refused precheck allocates no decoded body | `a_refused_precheck_allocates_no_decoded_body` |
 //! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
 //! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
@@ -161,6 +169,14 @@ pub(crate) enum ClaimRefused {
         /// Payload bytes the reservation allows.
         bytes: u64,
     },
+    /// Queued frames exceed what the live reservations still owe.
+    #[error("queued responses exceed the {frames} frames and {bytes} bytes still owed")]
+    OverOwed {
+        /// Frames, endings included, the live reservations still owe.
+        frames: u64,
+        /// Payload bytes the live reservations still owe.
+        bytes: u64,
+    },
 }
 
 impl ClaimRefused {
@@ -172,6 +188,7 @@ impl ClaimRefused {
             Self::WrongRole { .. } => "wrong_role",
             Self::OverFrames { .. } => "over_frames",
             Self::OverBytes { .. } => "over_bytes",
+            Self::OverOwed { .. } => "over_owed",
         }
     }
 }
@@ -211,6 +228,33 @@ impl Reservation {
     fn remaining_bytes(&self) -> u64 {
         self.cap.bytes - self.bytes
     }
+
+    /// The frames left, its ending included, and the bytes left.
+    fn owed(&self) -> Load {
+        Load {
+            frames: u64::from(self.cap.frames - self.frames) + 1,
+            bytes: self.remaining_bytes(),
+        }
+    }
+}
+
+/// Response frames and payload bytes.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct Load {
+    frames: u64,
+    bytes: u64,
+}
+
+impl Load {
+    fn add(&mut self, other: Self) {
+        self.frames += other.frames;
+        self.bytes += other.bytes;
+    }
+
+    fn sub(&mut self, other: Self) {
+        self.frames -= other.frames;
+        self.bytes -= other.bytes;
+    }
 }
 
 /// Live response reservations for one session, keyed by `K`.
@@ -222,6 +266,10 @@ pub(crate) struct Reservations<K> {
     /// Remaining payload bytes of the live reservations, as a multiset per
     /// request type, so the precheck finds the largest in `O(log n)`.
     remaining: HashMap<u16, BTreeMap<u64, usize>>,
+    /// What the live reservations still owe, summed.
+    owed: Load,
+    /// Frames a reader admitted that the handler has not yet taken.
+    queued: Load,
 }
 
 impl<K: Eq + Hash> Reservations<K> {
@@ -236,6 +284,8 @@ impl<K: Eq + Hash> Reservations<K> {
             cap,
             live: HashMap::new(),
             remaining: HashMap::new(),
+            owed: Load::default(),
+            queued: Load::default(),
         }
     }
 
@@ -305,6 +355,7 @@ impl<K: Eq + Hash> Reservations<K> {
             exchange,
         };
         self.track(request_type, reservation.remaining_bytes());
+        self.owed.add(reservation.owed());
         self.live.insert(key, reservation);
         Ok(())
     }
@@ -317,7 +368,9 @@ impl<K: Eq + Hash> Reservations<K> {
         let Some(reservation) = self.live.remove(key) else {
             return false;
         };
+        shrink_after_peak(&mut self.live);
         self.untrack(reservation.request, reservation.remaining_bytes());
+        self.owed.sub(reservation.owed());
         true
     }
 
@@ -359,6 +412,52 @@ impl<K: Eq + Hash> Reservations<K> {
         Ok(())
     }
 
+    /// Check a response header as [`Self::precheck`] does, and charge it to
+    /// the queue until [`Self::take_admitted`] releases it.
+    ///
+    /// The queue holds at most what the live reservations still owe, so a
+    /// reader that admits frames ahead of the handler never buffers more than
+    /// this node requested. A conformant responder sends at most that.
+    pub(crate) fn admit(
+        &mut self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(), ClaimRefused> {
+        self.precheck(message_type, payload_len)?;
+        // Widening usize to u64 is lossless on supported targets.
+        let frame = Load {
+            frames: 1,
+            bytes: payload_len as u64,
+        };
+        if self.queued.frames + frame.frames > self.owed.frames
+            || self.queued.bytes + frame.bytes > self.owed.bytes
+        {
+            metrics::counter!("zakura.p2p.reservation.refused", "reason" => "over_owed")
+                .increment(1);
+            return Err(ClaimRefused::OverOwed {
+                frames: self.owed.frames,
+                bytes: self.owed.bytes,
+            });
+        }
+        self.queued.add(frame);
+        Ok(())
+    }
+
+    /// Release an admitted frame when the handler takes it, before its claim.
+    pub(crate) fn take_admitted(&mut self, payload_len: usize) {
+        // Widening usize to u64 is lossless on supported targets.
+        let frame = Load {
+            frames: 1,
+            bytes: payload_len as u64,
+        };
+        debug_assert!(
+            self.queued.frames >= frame.frames && self.queued.bytes >= frame.bytes,
+            "only an admitted frame is taken"
+        );
+        self.queued.frames = self.queued.frames.saturating_sub(frame.frames);
+        self.queued.bytes = self.queued.bytes.saturating_sub(frame.bytes);
+    }
+
     /// Charge a frame that does not end the exchange, before decode.
     pub(crate) fn claim_frame(
         &mut self,
@@ -386,6 +485,7 @@ impl<K: Eq + Hash> Reservations<K> {
             .live
             .remove(key)
             .expect("charge found this reservation and nothing removed it since");
+        shrink_after_peak(&mut self.live);
         if let Some(exchange) = &mut reservation.exchange {
             exchange.end();
         }
@@ -441,18 +541,26 @@ impl<K: Eq + Hash> Reservations<K> {
                 bytes: reservation.cap.bytes,
             }));
         }
+        let owed_before = reservation.owed();
         reservation.bytes += len;
         if !ends {
             reservation.frames += 1;
         }
-        if reservation.abandoned {
+        // An ending removes the reservation, so only a frame still owes.
+        let owed_after = (!ends).then(|| reservation.owed());
+        let abandoned = reservation.abandoned;
+        self.owed.sub(owed_before);
+        if let Some(owed_after) = owed_after {
+            self.owed.add(owed_after);
+        }
+        if abandoned {
             metrics::counter!(
                 "zakura.p2p.reservation.unwanted",
                 "message_type" => message_type.to_string(),
             )
             .increment(1);
         }
-        Ok((request, before, before - len, reservation.abandoned))
+        Ok((request, before, before - len, abandoned))
     }
 
     fn track(&mut self, request: u16, remaining: u64) {
@@ -620,5 +728,14 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+}
+
+/// Return a drained map's peak capacity, so the pool, not each session's
+/// busiest moment, bounds retained bookkeeping. Halving at a quarter keeps
+/// removals amortized O(1).
+pub(crate) fn shrink_after_peak<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 4 * map.len().max(16) {
+        map.shrink_to(2 * map.len());
     }
 }

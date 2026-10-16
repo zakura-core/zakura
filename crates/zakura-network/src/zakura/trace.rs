@@ -345,7 +345,6 @@ pub mod block_sync_trace {
     /// Peer reported a requested range as unavailable.
     pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
     /// Local node queued a block range response for transport.
-    pub const BLOCK_RANGE_RESPONSE_SENT: &str = "block_range_response_sent";
     /// Work-queue producer added needed heights to the pending set.
     pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
     /// A peer claimed a contiguous chunk of pending work for issuance.
@@ -378,6 +377,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
     /// Block-sync service session locally parked for a liveness reason.
     pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
+    /// Block-sync session closed because a peer withheld a range's ending past its deadline.
+    pub const BLOCK_PEER_ENDING_TIMEOUT: &str = "block_peer_ending_timeout";
 }
 
 /// Shared discovery trace event names and field keys.

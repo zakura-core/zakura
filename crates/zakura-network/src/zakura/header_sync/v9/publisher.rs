@@ -14,12 +14,14 @@
 //! [`TerminalPermit::send`] describes.
 //!
 //! Pages come from the retained-path leases in [`Port`], one lease per page,
-//! acquired and read back to back. Each page after the first acquires with the
-//! last header sent as its only locator, which state's continuation index
-//! answers without a new ancestry walk. So a lease's idle deadline covers one
-//! read, and no subscription ends because a lease expired. After the initial
-//! target, the leases run from the last header sent to the tip of
-//! [`Port::selected_chain`]. Local failures wait for an update, a
+//! acquired and read back to back, so a lease's idle deadline covers one read
+//! and no subscription ends because a lease expired. Each page after the first
+//! acquires with the last header sent as its only locator. State's
+//! continuation index answers that without a new ancestry walk only while the
+//! lease target stays the same. That holds on the path to the initial target.
+//! After it, the leases run from the last header sent to the tip of
+//! [`Port::selected_chain`], so each tip change costs one walk, and so does
+//! each lease [`still_selected`] takes. Local failures wait for an update, a
 //! selected-chain change, or a capacity release, never for a timer.
 
 use std::{

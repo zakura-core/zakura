@@ -3,6 +3,9 @@
 //! The reader admits each request without waiting and keeps reading. `Serve`
 //! takes response slots, output bytes, and execution before `produce` runs,
 //! and sends exactly one response per admitted request.
+//!
+//! Discovery's limits are its own, not the throughput target's: a requester
+//! asks each row at most once per answer, and every answer is small.
 
 use std::sync::Arc;
 
@@ -18,11 +21,11 @@ use super::{
 };
 use crate::zakura::{
     regulation::{
-        sizing, Produce, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
-        ServeLimits, SinkProgress, WorkLease,
+        Produce, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd, ServeLimits,
+        SinkProgress, WorkLease,
     },
     BlockSyncHandle, CloseCause, FramedSend, HeaderSyncHandle, MessageRole, MessageRule,
-    ZakuraPeerId,
+    ZakuraPeerId, DEFAULT_ZAKURA_MAX_CONNECTIONS,
 };
 
 /// Node-wide `produce` steps for one discovery request row. Each step reads
@@ -30,14 +33,28 @@ use crate::zakura::{
 const NODE_EXECUTION: usize = 4;
 /// Each row allows one request in flight per peer, so one step serves it.
 const PEER_EXECUTION: usize = 1;
+/// Unsent answers one peer may hold on a row. A conformant requester asks
+/// again only after it reads the answer, so it holds at most one. The second
+/// lets a reconnected peer's answer pass one that its retired session left
+/// unsent. A peer that stops reading makes its next request wait, and
+/// requests past the commitment margin then close the connection.
+const PEER_OUTPUT_RESPONSES: usize = 2;
+/// Unsent answers the node may hold on a row: every connection's share at
+/// the default connection limit.
+const NODE_OUTPUT_RESPONSES: usize = PEER_OUTPUT_RESPONSES * DEFAULT_ZAKURA_MAX_CONNECTIONS;
 
 /// The serving limits of a discovery request row whose largest response is
 /// `largest` payload bytes.
 fn serving_limits(largest: ResponseCap) -> ServeLimits {
+    let largest = largest.output_bytes();
+    // Widening usize to u64 is lossless on supported targets.
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(largest.output_bytes(), sizing::TARGET_RTT)
+        peer_output_responses: PEER_OUTPUT_RESPONSES,
+        node_output_responses: NODE_OUTPUT_RESPONSES,
+        peer_output_bytes: PEER_OUTPUT_RESPONSES as u64 * largest,
+        node_output_bytes: NODE_OUTPUT_RESPONSES as u64 * largest,
     }
 }
 

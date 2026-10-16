@@ -14,12 +14,14 @@
 //! [`TerminalPermit::send`] describes.
 //!
 //! Pages come from the retained-path leases in [`Port`], one lease per page,
-//! acquired and read back to back. Each page after the first acquires with the
-//! last header sent as its only locator, which state's continuation index
-//! answers without a new ancestry walk. So a lease's idle deadline covers one
-//! read, and no subscription ends because a lease expired. After the initial
-//! target, the leases run from the last header sent to the tip of
-//! [`Port::selected_chain`]. Local failures wait for an update, a
+//! acquired and read back to back, so a lease's idle deadline covers one read
+//! and no subscription ends because a lease expired. Each page after the first
+//! acquires with the last header sent as its only locator. State's
+//! continuation index answers that without a new ancestry walk only while the
+//! lease target stays the same. That holds on the path to the initial target.
+//! After it, the leases run from the last header sent to the tip of
+//! [`Port::selected_chain`], so each tip change costs one walk, and so does
+//! each lease [`still_selected`] takes. Local failures wait for an update, a
 //! selected-chain change, or a capacity release, never for a timer.
 
 use std::{
@@ -71,6 +73,10 @@ pub(crate) use tests::FakePort;
 /// Lease attempts one page makes before it waits for a wake.
 const LEASE_ATTEMPTS: usize = 2;
 
+/// Leases one following page's recheck takes while the selected tip keeps
+/// moving; see [`still_selected`].
+const RECHECK_LEASES: usize = 2;
+
 /// The serving limits this node advertises in its `Status`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PageLimits {
@@ -114,12 +120,14 @@ struct Fixed {
     schema: AuxSchema,
 }
 
-/// Why a subscription waits without a page in progress.
+/// Why a subscription waits without a page in progress. Either kind retries
+/// after a `Grant` or a selected-chain change.
 #[derive(Clone, Debug)]
 enum Stall {
-    /// State refused a lease for capacity. Wait for its release.
+    /// State refused a lease for capacity. Also retry when the signal is
+    /// released, because state may release it only on a later lease.
     Capacity(ServingCapacitySignal),
-    /// A local failure. Wait for the next update or selected-chain change.
+    /// A local failure.
     Local,
 }
 
@@ -302,11 +310,9 @@ impl Shared {
                         update.added_credit,
                     )?
                 };
-                // New credit may let a locally stalled subscription retry.
+                // New credit lets a stalled subscription retry.
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    if matches!(subscription.stall, Some(Stall::Local)) {
-                        subscription.stall = None;
-                    }
+                    subscription.stall = None;
                 }
                 Ok(applied)
             }
@@ -368,8 +374,12 @@ impl Shared {
             .is_some_and(|credit| credit.consumed().objects > 0)
     }
 
-    /// Queue `outcome` for `id`, adjusted into its window.
+    /// Queue `outcome` for `id`, adjusted into its window. After `Close`
+    /// arrived, the subscription ends with `SubscriptionClosed` instead.
     fn queue_end(&mut self, id: u64, outcome: HeadersOutcomeCode) {
+        if self.publications.is_closing(&id) {
+            return;
+        }
         let pages_sent = self.pages_sent(&id);
         if let Some(subscription) = self.subscriptions.get_mut(&id) {
             subscription.end = Some(in_window(
@@ -475,7 +485,11 @@ impl Shared {
     }
 
     /// Record a finished job's result for its subscription.
-    fn finish(&mut self, id: u64, output: Output) {
+    ///
+    /// A local stall waits for the next selected-chain change, so it is not
+    /// recorded when the chain `moved` since the job read it: that change
+    /// already passed.
+    fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
@@ -491,6 +505,9 @@ impl Shared {
             Output::Stall(stall, reason) => {
                 metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
+                if moved && matches!(stall, Stall::Local) {
+                    return;
+                }
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
                     subscription.stall = Some(stall);
                 }
@@ -548,13 +565,13 @@ impl Shared {
         true
     }
 
-    /// Clear the local stalls after the selected chain changed, or else the
+    /// Clear every stall after the selected chain changed, or else the
     /// capacity stalls whose signal was released.
-    fn clear_stalls(&mut self, local: bool) {
+    fn clear_stalls(&mut self, all: bool) {
         for subscription in self.subscriptions.values_mut() {
             let clear = match &subscription.stall {
-                Some(Stall::Local) => local,
-                Some(Stall::Capacity(signal)) => !local && signal.is_released(),
+                Some(Stall::Local) => all,
+                Some(Stall::Capacity(signal)) => all || signal.is_released(),
                 None => false,
             };
             if clear {
@@ -722,13 +739,15 @@ async fn publish<const HEADER_BYTES: usize>(
 ) {
     let mut selected = task.port.selected_chain();
     let mut selected_open = true;
-    let mut work: Option<(u64, Work<'_>)> = None;
+    // The page in progress, with its subscription and the selected chain its
+    // job read.
+    let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
     loop {
         let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
         for (id, frame, terminal) in ended {
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
-            if work.as_ref().is_some_and(|(working, _)| *working == id) {
+            if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
             // A full queue must not keep a cancelled session's task alive or
@@ -753,8 +772,9 @@ async fn publish<const HEADER_BYTES: usize>(
             drop(shared);
             if let Some(job) = job {
                 let id = job.id;
+                let seen = job.selected.clone();
                 let page = start_page::<HEADER_BYTES>(&task, job, &send, selected.clone());
-                work = Some((id, page));
+                work = Some((id, seen, page));
             }
             if ending {
                 continue;
@@ -768,10 +788,10 @@ async fn publish<const HEADER_BYTES: usize>(
             () = cancel.cancelled() => return,
             // See `Publisher::spawn`.
             Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-            progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
+            progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
                 if work.is_some() =>
             {
-                let (id, _) = work.take().expect("the page in progress just finished");
+                let (id, seen, _) = work.take().expect("the page in progress just finished");
                 match progress {
                     // A page whose subscription closed meanwhile spends
                     // nothing and drops its slot.
@@ -780,7 +800,10 @@ async fn publish<const HEADER_BYTES: usize>(
                             slot.send(page.frame);
                         }
                     }
-                    Progress::Other(output) => lock(&task.shared).finish(id, output),
+                    Progress::Other(output) => {
+                        let moved = selected.borrow().as_ref() != seen.as_ref();
+                        lock(&task.shared).finish(id, output, moved);
+                    }
                     Progress::Closed => return,
                 }
             }
@@ -870,10 +893,15 @@ fn start_page<'a, const HEADER_BYTES: usize>(
 /// It checks only when the selected tip moved, and only a lease that confirms
 /// the page keeps it. Anything else drops the page, and the next pass leases
 /// again from the last header sent, where the usual stall and outcome rules
-/// apply. The lease is state work, so it waits for execution slots through `push` as the
-/// page's read did. The chain can move during that wait or the lease, so the
-/// check repeats until the tip it judged against is still the selected one.
-/// That closes the window up to the page's commit, not the write after it.
+/// apply. The lease is state work, so it waits for execution slots through
+/// `push` as the page's read did.
+///
+/// The chain can move during that wait or the lease, so a lease whose tip is
+/// no longer selected is taken again toward the newer tip, at most
+/// [`RECHECK_LEASES`] times. After that the last verdict stands, judged
+/// against a tip at most one lease old, and the slots go back to other work.
+/// A reorganization can overtake any page after it is written anyway, and the
+/// next lease ends that subscription as superseded.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
@@ -884,6 +912,7 @@ async fn still_selected(
     last: Frontier,
 ) -> bool {
     let mut execution = None;
+    let mut leases = 0;
     loop {
         let Some(latest) = selected.borrow().clone() else {
             return true;
@@ -910,11 +939,12 @@ async fn still_selected(
                 false
             }
         };
+        leases += 1;
         let current = selected
             .borrow()
             .as_ref()
             .map(|selected| selected.frontiers.header_best);
-        if current == Some(tip) {
+        if current == Some(tip) || leases >= RECHECK_LEASES {
             return contains;
         }
     }

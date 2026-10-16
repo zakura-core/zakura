@@ -10,6 +10,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::zakura::{
+    framed_channel,
     header_sync::{
         config::REGTEST_HEADER_BYTES,
         v9::{
@@ -19,10 +20,11 @@ use crate::zakura::{
         },
         wire::HeaderEntry,
     },
-    regulation::Publications,
+    regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    Frame,
+    CloseCause, Frame, FrameRejection,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -33,9 +35,32 @@ type Sub = Subscriber;
 /// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
 
-/// A peer `Status` that advertises `tip`.
+/// A subscriber on an in-process session whose fence closes `connection`.
+fn fenced(connection: &CancellationToken) -> Sub {
+    let fence = WriterFence::new(connection.clone(), CloseCause::default());
+    Sub::new(HB, fence, &framed_channel(1).1)
+}
+
+/// A subscriber on a session whose connection the test ignores.
+fn subscriber() -> Sub {
+    fenced(&CancellationToken::new())
+}
+
+/// A peer `Status` that advertises `tip` and the scripted publisher's page
+/// caps.
 fn status(tip: Frontier) -> Status {
-    super::super::test_support::status::<HB>(tip)
+    Status {
+        max_headers_per_response: PAGE_HEADERS,
+        max_message_bytes: page_bytes(PAGE_HEADERS, AuxSchema::V1),
+        ..super::super::test_support::status::<HB>(tip)
+    }
+}
+
+/// Bytes of a page of `count` headers under `schema`.
+fn page_bytes(count: u32, schema: AuxSchema) -> u32 {
+    // Widening u32 to usize is lossless on supported targets.
+    u32::try_from(HEADERS_RESPONSE_FIXED_BYTES + count as usize * entry_bytes(HB, schema))
+        .expect("a small page fits u32")
 }
 
 impl HeaderTree {
@@ -147,9 +172,16 @@ struct Fixture {
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
     fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
-        let mut sub = Sub::new(HB);
-        let open = sub
-            .open(&status(target), locators, AuxSchema::None, staging)
+        Self::open_with(tree, &status(target), locators, staging)
+    }
+
+    /// Open to the tip of `status` with `locators` and `staging` reserved
+    /// headers.
+    fn open_with(tree: HeaderTree, status: &Status, locators: &[Frontier], staging: u32) -> Self {
+        let target = Frontier::new(status.selected_tip_height, status.selected_tip_hash);
+        let mut sub = subscriber();
+        let (open, _) = sub
+            .open(status, locators, AuxSchema::None, staging)
             .expect("the first Open is recorded");
         let open = wire(&open);
         Self {
@@ -177,11 +209,8 @@ impl Fixture {
             marker,
             self.schema,
         );
+        self.sub.admit(&frame)?;
         let (page, len) = decode_page(&frame);
-        self.sub
-            .precheck()
-            .lock()
-            .precheck(frame.message_type, len)?;
         self.sub.receive_page(&page, len)
     }
 
@@ -207,11 +236,12 @@ fn chain(length: u32) -> (HeaderTree, Vec<Frontier>) {
 #[test]
 fn open_records_its_reservation_first() {
     let (_tree, chain) = chain(6);
-    let mut sub = Sub::new(HB);
+    let mut sub = subscriber();
     let locators = [chain[3], chain[1], chain[0]];
     let open = wire(
         &sub.open(&status(chain[6]), &locators, AuxSchema::None, 10)
-            .expect("the first Open is recorded"),
+            .expect("the first Open is recorded")
+            .0,
     );
     assert_eq!(open.operation, Operation::Open);
     assert_eq!(open.update_sequence, 0);
@@ -241,7 +271,7 @@ fn open_records_its_reservation_first() {
         }
     );
     assert_eq!(
-        sub.precheck()
+        sub.tools
             .lock()
             .credit(&open.subscription_id)
             .map(|credit| credit.granted().objects),
@@ -252,8 +282,9 @@ fn open_records_its_reservation_first() {
     // A conformant subscriber holds one subscription: a target change waits
     // for the terminal outcome, and the live credit stays.
     assert_eq!(
-        sub.open(&status(chain[5]), &locators, AuxSchema::None, 10),
-        Err(SubscribeError::Tools(SubscribeRefused::AtCapacity))
+        sub.open(&status(chain[5]), &locators, AuxSchema::None, 10)
+            .err(),
+        Some(SubscribeError::Tools(SubscribeRefused::AtCapacity))
     );
     assert_eq!(sub.live(), Some(open.subscription_id));
     sub.receive_outcome(&outcome(
@@ -262,7 +293,7 @@ fn open_records_its_reservation_first() {
         HeadersOutcomeCode::TargetNotSelected,
     ))
     .expect("legal before the first page");
-    let next = sub
+    let (next, _) = sub
         .open(&status(chain[6]), &locators, AuxSchema::None, 10)
         .expect("the terminal outcome freed the slot");
     assert_ne!(next.subscription_id, open.subscription_id, "a new ID");
@@ -273,11 +304,11 @@ fn open_records_its_reservation_first() {
 #[test]
 fn open_refuses_what_the_publisher_would_fault() {
     let (_tree, chain) = chain(20);
-    let mut sub = Sub::new(HB);
+    let mut sub = subscriber();
     let target = status(chain[20]);
     assert_eq!(
-        sub.open(&target, &[], AuxSchema::None, 10),
-        Err(SubscribeError::Locators)
+        sub.open(&target, &[], AuxSchema::None, 10).err(),
+        Some(SubscribeError::Locators)
     );
     assert_eq!(
         sub.open(
@@ -285,35 +316,69 @@ fn open_refuses_what_the_publisher_would_fault() {
             &[chain[2], chain[1], chain[2]],
             AuxSchema::None,
             10
-        ),
-        Err(SubscribeError::Locators)
+        )
+        .err(),
+        Some(SubscribeError::Locators)
     );
     assert_eq!(
-        sub.open(&target, &chain[..14], AuxSchema::None, 10),
-        Err(SubscribeError::Locators)
+        sub.open(&target, &chain[..14], AuxSchema::None, 10).err(),
+        Some(SubscribeError::Locators)
     );
     let mut plain = status(chain[20]);
     plain.tree_aux_schema_mask = 0;
     assert_eq!(
-        sub.open(&plain, &[chain[1]], AuxSchema::V1, 10),
-        Err(SubscribeError::Schema)
+        sub.open(&plain, &[chain[1]], AuxSchema::V1, 10).err(),
+        Some(SubscribeError::Schema)
     );
     assert_eq!(
-        sub.open(&target, &[chain[1]], AuxSchema::None, 0),
-        Err(SubscribeError::NoStaging)
+        sub.open(&target, &[chain[1]], AuxSchema::None, 0).err(),
+        Some(SubscribeError::NoStaging)
     );
     assert_eq!(sub.live(), None);
-    assert_eq!(sub.precheck().lock().len(), 0);
+    assert_eq!(sub.tools.lock().len(), 0);
 
     // A schema-1 Open's byte credit fits a schema-1 page.
     let open = wire(
         &sub.open(&target, &[chain[1]], AuxSchema::V1, 1)
-            .expect("one header of staging is enough"),
+            .expect("one header of staging is enough")
+            .0,
     );
     assert_eq!(open.added_credit.objects, 1);
     assert_eq!(
         open.added_credit.bytes as usize,
         smallest_page(HB, AuxSchema::V1)
+    );
+}
+
+/// The constructor attaches the frame header check to a transport reader,
+/// which refuses an unsolicited page before its payload is read. Without a
+/// reader, `admit` runs the same check before decode.
+#[test]
+fn the_frame_header_check_runs_before_decode() {
+    let (tree, chain) = chain(2);
+    let frame = page_frame(
+        &tree,
+        1,
+        chain[2].hash,
+        chain[0],
+        &chain[1..2],
+        false,
+        AuxSchema::None,
+    );
+    let slot = PrecheckSlot::default();
+    let (_, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let sub = Sub::new(HB, fence, &recv);
+    let reader = slot.get().expect("the subscriber attaches its check");
+    assert_eq!(
+        reader.check(frame.message_type, frame.payload.len()),
+        Err(FrameRejection::Unsolicited)
+    );
+    assert_eq!(sub.admit(&frame), Ok(()), "the reader already checked it");
+    assert_eq!(
+        subscriber().admit(&frame),
+        Err(SubscriptionFault::Unknown.into())
     );
 }
 
@@ -502,6 +567,54 @@ fn misplaced_pages_fault() {
     );
 }
 
+/// A path that reaches the target's height without the target never reaches
+/// it: a first page from a sent locator above the target, or a page whose
+/// last header sits at the target's height under another hash.
+#[test]
+fn a_path_to_the_target_height_without_it_faults() {
+    let (mut tree, chain) = chain(8);
+    let beside = tree.extend(chain[6], 1);
+    let above = tree.extend(chain[8], 1);
+    // chain[8] descends from the target, chain[7]. chain[5] is its ancestor.
+    let locators = [chain[8], chain[5], chain[0]];
+    let mut fixture = Fixture::open(tree, chain[7], &locators, 100);
+    assert_eq!(
+        fixture.page(chain[8], &above, false),
+        Err(SubscriberFault::PastTarget)
+    );
+    assert_eq!(
+        fixture.page(chain[5], &[chain[6], beside[0]], false),
+        Err(SubscriberFault::PastTarget)
+    );
+}
+
+/// A page above the header count or bytes the publisher advertised faults,
+/// and a later `Status` that raises them lets larger pages through.
+#[test]
+fn pages_fit_the_advertised_caps() {
+    let (tree, chain) = chain(4);
+    let caps = Status {
+        max_headers_per_response: 1,
+        max_message_bytes: page_bytes(2, AuxSchema::None),
+        ..status(chain[4])
+    };
+    let mut fixture = Fixture::open_with(tree, &caps, &[chain[0]], 100);
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..3], false),
+        Err(SubscriberFault::AboveAdvertised),
+        "two headers where one was advertised"
+    );
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..4], false),
+        Err(SubscriberFault::AboveAdvertised),
+        "three headers' bytes where two were advertised"
+    );
+    fixture.sub.observe(&status(chain[4]));
+    fixture
+        .page(chain[0], &chain[1..4], false)
+        .expect("the later Status raised both caps");
+}
+
 /// Each outcome is legal exactly in its window: before the first page, before
 /// the target, at any time, or after `Close`. Outside it, or for another
 /// subscription or target, it faults.
@@ -569,7 +682,7 @@ fn outcomes_fault_outside_their_window() {
         Err(SubscriberFault::Target)
     );
     assert_eq!(
-        Sub::new(HB).receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
+        subscriber().receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
         Err(SubscriptionFault::Unknown.into())
     );
 }
@@ -622,7 +735,7 @@ fn grants_refill_half_window_prefixes() {
     let granted = |fixture: &Fixture| {
         fixture
             .sub
-            .precheck()
+            .tools
             .lock()
             .credit(&id)
             .expect("live")
@@ -707,7 +820,7 @@ fn a_failed_validation_is_never_acknowledged() {
 
 /// Local failover keeps the subscription's credit: after `Close`, pages
 /// within it are admitted, no `Grant` follows, and `SubscriptionClosed` ends
-/// it. An `Open` that was never written is retracted.
+/// it.
 #[test]
 fn close_keeps_credit_and_admits_pages() {
     let (tree, chain) = chain(6);
@@ -730,14 +843,66 @@ fn close_keeps_credit_and_admits_pages() {
         .outcome(HeadersOutcomeCode::SubscriptionClosed)
         .expect("legal after Close");
     assert_eq!(ended.accepted, page.cursor);
+}
 
-    let mut sub = Sub::new(HB);
-    let open = sub
-        .open(&status(chain[6]), &[chain[0]], AuxSchema::None, 4)
-        .expect("recorded");
-    assert!(sub.retract(open.subscription_id));
+/// An `Open` holds its session's exchange until the terminal outcome. A
+/// session that ends after the `Open`'s first byte closes the connection, an
+/// outcome releases the exchange, and retracting an `Open` closes the
+/// connection only if a byte was written. A retired fence opens nothing.
+#[test]
+fn an_open_holds_its_exchange_until_the_outcome() {
+    let (_tree, chain) = chain(2);
+    let open = |sub: &mut Sub, written: bool| {
+        let (open, writer) = sub
+            .open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
+            .expect("recorded");
+        if written {
+            assert!(writer.publish(|| {}) && writer.try_start(|| true));
+        }
+        open.subscription_id
+    };
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    open(&mut sub, true);
+    drop(sub);
+    assert!(
+        connection.is_cancelled(),
+        "a written Open lost its receiver"
+    );
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    let id = open(&mut sub, true);
+    sub.receive_outcome(&outcome(
+        id,
+        chain[2].hash,
+        HeadersOutcomeCode::TargetNotSelected,
+    ))
+    .expect("legal before the first page");
+    let id = open(&mut sub, false);
+    assert!(sub.retract(id));
     assert_eq!(sub.live(), None);
-    assert_eq!(sub.precheck().lock().len(), 0);
+    drop(sub);
+    assert!(!connection.is_cancelled());
+
+    let connection = CancellationToken::new();
+    let mut sub = fenced(&connection);
+    let id = open(&mut sub, true);
+    assert!(sub.retract(id));
+    assert!(
+        connection.is_cancelled(),
+        "the peer may answer a written Open"
+    );
+
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let mut sub = Sub::new(HB, fence.clone(), &framed_channel(1).1);
+    assert!(fence.retire());
+    assert_eq!(
+        sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
+            .err(),
+        Some(SubscribeError::Fenced)
+    );
 }
 
 /// A scripted publisher's view of its subscription.
@@ -1025,8 +1190,7 @@ impl Session {
             "an update acknowledges only a start or a validated cursor"
         );
         if update.operation == Operation::Grant {
-            let tools = self.sub.precheck();
-            let tools = tools.lock();
+            let tools = self.sub.tools.lock();
             let credit = tools.credit(&update.subscription_id).expect("live");
             let window = self.sub.window(self.staging, update.tree_aux_schema);
             assert!(
@@ -1053,9 +1217,7 @@ impl Session {
                 return;
             };
             self.sub
-                .precheck()
-                .lock()
-                .precheck(frame.message_type, frame.payload.len())
+                .admit(&frame)
                 .expect("a conformant frame header passes");
             match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames")
             {
@@ -1138,7 +1300,7 @@ impl Session {
                     .sub
                     .open(&status(target), &locators, schema, self.staging)
                 {
-                    Ok(open) => {
+                    Ok((open, _)) => {
                         assert!(live.is_none());
                         assert!(
                             self.opened.insert(open.subscription_id),
@@ -1211,7 +1373,7 @@ fn run(ops: Vec<Op>) {
     let tip = *tree.extend(genesis, 4).last().expect("four headers");
     let mut session = Session {
         tree,
-        sub: Sub::new(HB),
+        sub: subscriber(),
         script: Script::new(tip),
         to_subscriber: VecDeque::new(),
         to_publisher: VecDeque::new(),

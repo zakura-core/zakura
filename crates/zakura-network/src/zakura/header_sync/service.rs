@@ -17,11 +17,14 @@ use super::{
     events::*,
     pipe::run_peer,
     v9::{
-        CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeHeaders, Subscriber,
+        CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeError,
+        SubscribeHeaders, Subscriber,
     },
     wire::*,
     Status,
 };
+#[cfg(test)]
+use crate::zakura::framed_channel;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -84,11 +87,10 @@ struct PeerSessionInner {
     cancel_token: CancellationToken,
     connection_cancel_token: CancellationToken,
     close_cause: CloseCause,
-    /// The subscription this session holds on the peer.
+    /// The subscription this session holds on the peer, fenced so that
+    /// retiring the session cannot orphan a subscription the peer still
+    /// serves.
     subscriber: StdMutex<Subscriber>,
-    /// Fences this session's `Open`, so retiring the session cannot orphan a
-    /// subscription that the peer still serves.
-    fence: WriterFence,
     /// The connection's `Status` cadence.
     status: StatusCadence,
 }
@@ -100,8 +102,7 @@ type StatusCadence = Arc<StdMutex<CadenceSender<CommonMessage>>>;
 
 impl PeerSession {
     /// A session for `peer_id` that sends through `send`, subscribes with
-    /// `subscriber` under `fence`, and shares its connection's `status`
-    /// cadence.
+    /// `subscriber`, and shares its connection's `status` cadence.
     #[allow(clippy::too_many_arguments)]
     fn new(
         peer_id: ZakuraPeerId,
@@ -112,7 +113,6 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
         subscriber: Subscriber,
-        fence: WriterFence,
         status: StatusCadence,
     ) -> Self {
         Self {
@@ -125,7 +125,6 @@ impl PeerSession {
                 connection_cancel_token,
                 close_cause,
                 subscriber: StdMutex::new(subscriber),
-                fence,
                 status,
             }),
         }
@@ -208,6 +207,8 @@ impl PeerSession {
         close_cause: CloseCause,
     ) -> Self {
         let fence = WriterFence::new(connection_cancel_token.clone(), close_cause.clone());
+        // An in-process reader with no frame header check.
+        let subscriber = Subscriber::new(REGTEST_HEADER_BYTES, fence, &framed_channel(1).1);
         Self::new(
             peer_id,
             session_id,
@@ -216,8 +217,7 @@ impl PeerSession {
             cancel_token,
             connection_cancel_token,
             close_cause,
-            Subscriber::new(REGTEST_HEADER_BYTES),
-            fence,
+            subscriber,
             Arc::new(StdMutex::new(CadenceSender::new())),
         )
     }
@@ -298,12 +298,14 @@ impl PeerSession {
         staging: u32,
     ) -> Result<HeaderSyncRequestId, OrderedSendError> {
         let slot = self.reserve()?;
-        let exchange = self.inner.fence.open().ok_or(OrderedSendError::Closed)?;
-        let writer = exchange.writer();
         let mut subscriber = self.subscriber();
-        let update = subscriber
-            .open_fenced(status, locators, schema, staging, exchange)
-            .map_err(|error| OrderedSendError::Encode(error.into()))?;
+        let (update, writer) =
+            subscriber
+                .open(status, locators, schema, staging)
+                .map_err(|error| match error {
+                    SubscribeError::Fenced => OrderedSendError::Closed,
+                    error => OrderedSendError::Encode(error.into()),
+                })?;
         let id = update.subscription_id;
         if slot
             .send_fenced(update_frame(subscriber.header_bytes(), update), &writer)
@@ -642,10 +644,9 @@ impl Service for HeaderSyncService {
             .or_insert_with(|| Arc::new(StdMutex::new(CadenceSender::new())))
             .clone();
         let header_bytes = header_sync_header_bytes_for_network(&self.header_sync.network);
-        let subscriber = Subscriber::new(header_bytes);
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
-        recv.attach_precheck(Arc::new(subscriber.precheck()));
+        let subscriber = Subscriber::new(header_bytes, fence, &recv);
         let session = PeerSession::new(
             peer_id.clone(),
             session_id,
@@ -655,7 +656,6 @@ impl Service for HeaderSyncService {
             connection_cancel_token.clone(),
             close_cause.clone(),
             subscriber,
-            fence,
             status,
         );
         let (publisher, publishing) = spawn_publisher(

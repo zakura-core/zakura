@@ -11,7 +11,7 @@ mod wire;
 #[cfg(test)]
 pub(crate) use publisher::FakePort;
 pub(crate) use publisher::{LeaseOwner, PageLimits, Publisher};
-pub(crate) use subscriber::{Admitted, Ended, Subscriber};
+pub(crate) use subscriber::{Admitted, Ended, SubscribeError, Subscriber};
 
 use super::config::COMMON_HEADER_BYTES;
 use crate::zakura::regulation::{sizing, ServeCapacity, ServeLimits};

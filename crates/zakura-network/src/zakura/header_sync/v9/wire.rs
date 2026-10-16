@@ -69,7 +69,7 @@ const BODY_SIZE_BYTES: usize = 4;
 const FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
 
 /// Frame message types.
-mod message_type {
+pub(crate) mod message_type {
     pub(crate) const STATUS: u16 = 1;
     pub(crate) const SUBSCRIBE_HEADERS: u16 = 2;
     pub(crate) const HEADERS: u16 = 3;

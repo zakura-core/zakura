@@ -9,10 +9,11 @@
 //!
 //! # Updates
 //!
-//! [`Subscriber::open_fenced`], the grants, and [`Subscriber::close`] record each
+//! [`Subscriber::open`], the grants, and [`Subscriber::close`] record each
 //! update in the subscription tools before returning it, so the caller writes
 //! only updates the tools already counted. The session reader checks each
-//! frame header against the same tools through [`Subscriber::precheck`].
+//! frame header against the same tools, which [`Subscriber::new`] attaches to
+//! it, or through [`Subscriber::admit`] on a channel without a reader check.
 //!
 //! # Page linkage
 //!
@@ -43,8 +44,20 @@
 //! before validation time. A `Grant` costs 107 bytes per prefix of up to 2,000
 //! headers, so smaller prefixes would add updates without adding throughput.
 //!
+//! The overlap needs pages of at most `W / 2` headers. A cursor names one
+//! page, so acceptance moves a whole page at a time, and a larger page spends
+//! the window before its own acceptance. The publisher caps each page at its
+//! advertised `max_headers_per_response`, 1,000 by default, so a full window
+//! keeps the overlap. A window of at most twice that cap, such as the
+//! 250-header fair share of the staging budget, moves about one window per
+//! round trip plus validation. Capping unspent credit at half the window would
+//! split pages, but only half the window would then be in flight, which is no
+//! faster unless validation takes longer than the round trip.
+//!
 //! Nothing here uses a timer or takes credit back, as the specification's
 //! "Header sync — stream 5, version 9" section requires.
+
+use std::sync::Arc;
 
 use thiserror::Error;
 use zakura_chain::block;
@@ -58,10 +71,10 @@ use super::{
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
     regulation::{
-        Exchange, SharedSubscriptions, SubscribeRefused, SubscriptionFault, SubscriptionLimits,
-        Subscriptions, Update,
+        ExchangeWriter, SharedSubscriptions, SubscribeRefused, SubscriptionFault,
+        SubscriptionLimits, Subscriptions, Update, WriterFence,
     },
-    Credit,
+    Credit, Frame, FramedRecv,
 };
 
 #[cfg(test)]
@@ -86,6 +99,9 @@ pub(crate) enum SubscribeError {
     /// The subscription has a page that failed validation.
     #[error("the subscription failed validation")]
     Failed,
+    /// The session's fence retired, or its connection closed.
+    #[error("the session's writers are fenced")]
+    Fenced,
 }
 
 /// A page or outcome that breaks a subscriber rule. Each case is a protocol
@@ -113,7 +129,8 @@ pub(crate) enum SubscriberFault {
     /// first page extended.
     #[error("the path passes a higher sent locator")]
     LowerLocator,
-    /// A page continues past the target before the subscription reached it.
+    /// A page continues past the target, or reaches its height without it,
+    /// before the subscription reached it.
     #[error("a page continues past the initial target")]
     PastTarget,
     /// The target marker disagrees with whether the page ends at the target.
@@ -125,6 +142,9 @@ pub(crate) enum SubscriberFault {
     /// An outcome outside its window.
     #[error("{0:?} arrived outside its window")]
     OutcomeWindow(HeadersOutcomeCode),
+    /// A page above the header count or byte cap the publisher advertised.
+    #[error("the page exceeds the publisher's advertised caps")]
+    AboveAdvertised,
 }
 
 impl SubscriberFault {
@@ -141,6 +161,7 @@ impl SubscriberFault {
             Self::Marker => "marker",
             Self::SecondMarker => "second_marker",
             Self::OutcomeWindow(_) => "outcome_window",
+            Self::AboveAdvertised => "above_advertised",
         }
     }
 
@@ -178,7 +199,8 @@ pub struct Ended {
     pub(crate) pages: u64,
     /// Whether it reached its initial target.
     pub(crate) reached: bool,
-    /// The last cursor the reactor accepted, or the start.
+    /// The last cursor the reactor accepted, or the start. Pages admitted
+    /// after it and not yet accepted are not included.
     pub(crate) accepted: Cursor,
 }
 
@@ -187,6 +209,12 @@ pub struct Ended {
 struct Live {
     id: u64,
     target: block::Hash,
+    /// The target's height in the `Status` that named it.
+    target_height: block::Height,
+    /// The largest page caps the publisher advertised since the `Open`. A
+    /// page follows the `Status` that allowed it on the ordered stream.
+    max_headers: u32,
+    max_bytes: u32,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
     /// The sent locator that equals the target, if any. The subscription
@@ -207,6 +235,11 @@ struct Live {
 #[derive(Debug)]
 pub(crate) struct Subscriber {
     tools: SharedSubscriptions<u64, Cursor>,
+    /// Whether a transport reader checks frame headers against `tools`.
+    transport_admits: bool,
+    /// The session's fence. Each `Open` holds an exchange of it until the
+    /// terminal outcome.
+    fence: WriterFence,
     /// At most one: `SUBSCRIBE_HEADERS` allows one live or closing
     /// subscription, and the tools refuse a second.
     live: Option<Live>,
@@ -217,12 +250,18 @@ pub(crate) struct Subscriber {
 
 impl Subscriber {
     /// A subscriber with no subscription, on a network whose headers take
-    /// `header_bytes`.
-    pub(crate) fn new(header_bytes: usize) -> Self {
+    /// `header_bytes`, for the session that `fence` guards and `recv` reads.
+    /// It attaches its frame header check to `recv`'s transport reader, if
+    /// `recv` has one.
+    pub(crate) fn new(header_bytes: usize, fence: WriterFence, recv: &FramedRecv) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
+        let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes)));
+        let transport_admits = recv.attach_precheck(Arc::new(tools.clone()));
         Self {
-            tools: SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes))),
+            tools,
+            transport_admits,
+            fence,
             live: None,
             next_id: 1,
             header_bytes,
@@ -234,9 +273,38 @@ impl Subscriber {
         self.header_bytes
     }
 
-    /// The table the session reader checks frame headers against.
-    pub(crate) fn precheck(&self) -> SharedSubscriptions<u64, Cursor> {
-        self.tools.clone()
+    /// Check a page or outcome frame header before its payload is decoded.
+    ///
+    /// A transport reader already ran this check. In-process channels have
+    /// none, so this runs the same check for them.
+    ///
+    /// It also holds a page to the publisher's advertised byte cap. Only a
+    /// page can exceed a cap that the `Status` decoder accepted.
+    pub(crate) fn admit(&self, frame: &Frame) -> Result<(), SubscriberFault> {
+        let len = frame.payload.len();
+        if !self.transport_admits {
+            self.tools
+                .lock()
+                .precheck(frame.message_type, len)
+                .map_err(|fault| SubscriberFault::from(fault).counted())?;
+        }
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| len > usize::try_from(live.max_bytes).unwrap_or(usize::MAX))
+        {
+            return Err(SubscriberFault::AboveAdvertised.counted());
+        }
+        Ok(())
+    }
+
+    /// Record a later `Status` from the peer. Pages may use the largest caps
+    /// it advertised since the `Open`.
+    pub(crate) fn observe(&mut self, status: &Status) {
+        if let Some(live) = self.live.as_mut() {
+            live.max_headers = live.max_headers.max(status.max_headers_per_response);
+            live.max_bytes = live.max_bytes.max(status.max_message_bytes);
+        }
     }
 
     /// The headers of the credit window for `staging` reserved headers: at
@@ -263,53 +331,31 @@ impl Subscriber {
     }
 
     /// The most headers the reactor validates before it accepts a cursor:
-    /// half the window for `staging` reserved headers, and at least one. The
-    /// module docs explain why grants overlap delivery at this size.
+    /// half the window for `staging` reserved headers, and at least one. A
+    /// larger page is accepted whole. The module docs explain why grants
+    /// overlap delivery at this size, and when pages are too large for it.
     pub(crate) fn prefix(staging: u32) -> u32 {
         (Self::window_headers(staging) / 2).max(1)
     }
 
-    /// Record an unfenced `Open`, as [`Self::open_with`] describes.
-    #[cfg(test)]
+    /// Record an `Open` to the selected tip of `status`, and return it with
+    /// the writer to send it through `FramedSend::send_fenced`.
+    ///
+    /// `locators` are this node's locators, highest first; the first is the
+    /// start cursor. `staging` is the header staging budget reserved for the
+    /// subscription. The `Open` grants the whole window, which fits one page
+    /// under `schema`. A locator equal to the target reaches it at `Open`.
+    ///
+    /// The subscription holds the `Open`'s exchange until its terminal
+    /// outcome, so a session that ends after the `Open` was written and
+    /// before the outcome closes the connection.
     pub(crate) fn open(
         &mut self,
         status: &Status,
         locators: &[Frontier],
         schema: AuxSchema,
         staging: u32,
-    ) -> Result<SubscribeHeaders, SubscribeError> {
-        self.open_with(status, locators, schema, staging, None)
-    }
-
-    /// Record an `Open` as [`Self::open_with`] describes, and keep `exchange`
-    /// until the terminal outcome ends it. Retiring the session's fence while the
-    /// `Open` was written and no outcome arrived closes the connection.
-    pub(crate) fn open_fenced(
-        &mut self,
-        status: &Status,
-        locators: &[Frontier],
-        schema: AuxSchema,
-        staging: u32,
-        exchange: Exchange,
-    ) -> Result<SubscribeHeaders, SubscribeError> {
-        self.open_with(status, locators, schema, staging, Some(exchange))
-    }
-
-    /// Record an `Open` to the selected tip of `status`, fenced by `exchange`
-    /// if there is one, and return it to write.
-    ///
-    /// `locators` are this node's locators, highest first; the first is the
-    /// start cursor. `staging` is the header staging budget reserved for the
-    /// subscription. The `Open` grants the whole window, which fits one page
-    /// under `schema`. A locator equal to the target reaches it at `Open`.
-    fn open_with(
-        &mut self,
-        status: &Status,
-        locators: &[Frontier],
-        schema: AuxSchema,
-        staging: u32,
-        exchange: Option<Exchange>,
-    ) -> Result<SubscribeHeaders, SubscribeError> {
+    ) -> Result<(SubscribeHeaders, ExchangeWriter), SubscribeError> {
         let Some(&start) = locators.first() else {
             return Err(SubscribeError::Locators);
         };
@@ -337,10 +383,9 @@ impl Subscriber {
             headers: 0,
             bytes: 0,
         };
-        let update = match exchange {
-            Some(exchange) => self.tools.lock().open_fenced(id, window, start, exchange)?,
-            None => self.tools.lock().open(id, window, start)?,
-        };
+        let exchange = self.fence.open().ok_or(SubscribeError::Fenced)?;
+        let writer = exchange.writer();
+        let update = self.tools.lock().open_fenced(id, window, start, exchange)?;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let target = status.selected_tip_hash;
         let target_locator = locators
@@ -350,6 +395,9 @@ impl Subscriber {
         let live = Live {
             id,
             target,
+            target_height: status.selected_tip_height,
+            max_headers: status.max_headers_per_response,
+            max_bytes: status.max_message_bytes,
             locators: locators.to_vec(),
             target_locator,
             schema,
@@ -361,11 +409,12 @@ impl Subscriber {
         };
         let message = live.message(Operation::Open, update);
         self.live = Some(live);
-        Ok(message)
+        Ok((message, writer))
     }
 
-    /// Remove an `Open` that was never written, when the send failed locally
-    /// before the first byte.
+    /// Remove a subscription whose `Open` failed to send. If no byte was
+    /// written, nothing else happens. If its first byte was written, the peer
+    /// may answer, so dropping the exchange closes the connection.
     pub(crate) fn retract(&mut self, id: u64) -> bool {
         if self.live.as_ref().is_none_or(|live| live.id != id) {
             return false;
@@ -430,6 +479,16 @@ impl Subscriber {
             return Err(SubscriptionFault::OverCredit.into());
         };
         let last_hash = last.header.hash();
+        // A page beyond u32::MAX headers exceeds any credit.
+        let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
+        let height = parent
+            .height
+            .0
+            .checked_add(count)
+            .expect("the decoder rejects a page whose last height overflows");
+        if count > live.max_headers {
+            return Err(SubscriberFault::AboveAdvertised);
+        }
         if live.reached {
             if page.reaches_initial_target {
                 return Err(SubscriberFault::SecondMarker);
@@ -455,17 +514,15 @@ impl Subscriber {
             {
                 return Err(SubscriberFault::LowerLocator);
             }
+            // Only the target is at its height on the path to it, so a page
+            // that reaches that height elsewhere never reaches the target.
+            if !reaches && height >= live.target_height.0 {
+                return Err(SubscriberFault::PastTarget);
+            }
             if page.reaches_initial_target != reaches {
                 return Err(SubscriberFault::Marker);
             }
         }
-        // A page beyond u32::MAX headers exceeds any credit.
-        let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
-        let height = parent
-            .height
-            .0
-            .checked_add(count)
-            .expect("the decoder rejects a page whose last height overflows");
         let consumed = tools
             .credit(&live.id)
             .expect("the live subscription is in the tools")
@@ -534,6 +591,10 @@ impl Subscriber {
     /// Call it only after validation passes. The next update acknowledges
     /// `cursor`. `staging` is the header staging budget now reserved for the
     /// subscription.
+    ///
+    /// After the terminal outcome, the subscription is gone, so a page it
+    /// admitted that the reactor had not yet accepted returns `Unknown`. That
+    /// is expected: no update can acknowledge it any more.
     pub(crate) fn accept_through(
         &mut self,
         id: u64,
@@ -596,9 +657,15 @@ impl Subscriber {
         if !starved && headers < u64::from(Self::prefix(staging)) {
             return None;
         }
-        if !live.reached && (unspent.objects + headers == 0 || unspent.bytes + bytes < page) {
-            return None;
-        }
+        // Pages spend at most one smallest page of bytes per header, and
+        // grants refill both windows together, so unspent bytes always cover
+        // unspent headers at one smallest page each, and only a grant that
+        // adds a header gets here. The credit therefore fits a page, as the
+        // specification requires before the target.
+        debug_assert!(
+            headers >= 1 && unspent.bytes + bytes >= (unspent.objects + headers) * page,
+            "a grant leaves credit for a page"
+        );
         let added = Credit {
             objects: u32::try_from(headers).expect("the room is within the header window"),
             bytes: u32::try_from(bytes).expect("the room is within the byte window"),

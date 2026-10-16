@@ -5,7 +5,7 @@ use zakura_chain::{block, parameters::Network};
 use super::{
     events::{Event, HeaderSyncHandle},
     service::PeerSession,
-    v9::{Headers, Message, Publisher},
+    v9::{message_type, Headers, Message, Publisher},
     wire::{HeaderSyncWireError, TreeAuxWire},
 };
 use crate::zakura::{wire_codec::decode_frame, FramedRecv, SinkReject};
@@ -45,14 +45,26 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
             },
         };
         let payload_len = frame.payload.len();
+        if matches!(
+            frame.message_type,
+            message_type::HEADERS | message_type::HEADERS_OUTCOME
+        ) {
+            session
+                .subscriber()
+                .admit(&frame)
+                .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
+        }
         let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
             .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
         let event = match message {
-            Message::Status(status) => Event::Status {
-                peer: peer.clone(),
-                session_id,
-                status,
-            },
+            Message::Status(status) => {
+                session.subscriber().observe(&status);
+                Event::Status {
+                    peer: peer.clone(),
+                    session_id,
+                    status,
+                }
+            }
             Message::SubscribeHeaders(update) => {
                 publisher
                     .apply(&update)

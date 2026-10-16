@@ -564,7 +564,7 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
             zakura_chain::sprout::commitment::NoteCommitment::from([2; 32]),
             zakura_chain::sprout::commitment::NoteCommitment::from([3; 32]),
         ],
-        ephemeral_key: zakura_chain::primitives::x25519::PublicKey::from([0; 32]),
+        ephemeral_key: zakura_chain::sprout::keys::EphemeralPublicKey::from([0; 32]),
         random_seed: zakura_chain::sprout::RandomSeed::from([0; 32]),
         vmacs: [
             zakura_chain::sprout::note::Mac::from([0; 32]),

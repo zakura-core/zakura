@@ -156,16 +156,15 @@ fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills()
     reactor
         .peer_work_queue
         .set_capacity_for_test(&peer, 250, 250);
-    reactor.handle_headers(
+    reactor.deliver_page(
         peer.clone(),
         owner.session_id(),
-        owner.header_authority(),
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: staged_tip.height,
             common_ancestor_hash: staged_tip.hash,
-            complete: false,
+            reaches_initial_target: false,
             tree_aux_schema: AuxSchema::None,
             entries: response_entries,
         },
@@ -229,16 +228,15 @@ fn requester_admits_its_owned_prefix_when_the_chunk_budget_is_exhausted() {
         .peer_work_queue
         .set_capacity_for_test(&peer, HEADER_CHUNK_BUDGET_CAPACITY_V1 - 1, 1);
 
-    reactor.handle_headers(
+    reactor.deliver_page(
         peer.clone(),
         owner.session_id(),
-        owner.header_authority(),
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: staged_tip.height,
             common_ancestor_hash: staged_tip.hash,
-            complete: false,
+            reaches_initial_target: false,
             tree_aux_schema: AuxSchema::None,
             entries: vec![next_entry],
         },
@@ -352,16 +350,15 @@ fn requester_admits_prefix_at_durable_graph_headroom_before_chunk_budget_is_full
     let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
 
-    reactor.handle_headers(
+    reactor.deliver_page(
         peer.clone(),
         owner.session_id(),
-        owner.header_authority(),
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: staged_tip.height,
             common_ancestor_hash: staged_tip.hash,
-            complete: false,
+            reaches_initial_target: false,
             tree_aux_schema: AuxSchema::None,
             entries: vec![next_entry],
         },
@@ -532,12 +529,9 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
 
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -559,15 +553,15 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: u32::MAX,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(remote_status.clone()),
+            status: remote_status.clone(),
         })
         .await
         .expect("the target status reaches the reactor");
@@ -591,15 +585,8 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         })
         .await
         .expect("the locator reaches the reactor");
-    let request = match handle
-        .codec()
-        .decode_frame(outbound.recv().await.expect("GetHeaders is sent"), None)
-        .expect("GetHeaders decodes")
-    {
-        HeaderSyncMessage::GetHeaders(request) => request,
-        other => panic!("expected GetHeaders, got {other:?}"),
-    };
-    assert_eq!(request.max_header_count, durable_prefix_count);
+    let open = update(outbound.recv().await.expect("Open is sent"));
+    assert_eq!(open.added_credit.objects, durable_prefix_count);
 
     let (second_send, mut second_outbound) = framed_channel(8);
     let second_peer =
@@ -620,10 +607,10 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
     let mut second_remote_status = remote_status;
     second_remote_status.selected_tip_hash = second_target;
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: second_peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(second_remote_status),
+            status: second_remote_status,
         })
         .await
         .expect("the second target status reaches the reactor");
@@ -638,44 +625,50 @@ async fn requester_shares_durable_graph_headroom_across_wire_requests() {
         "the first request's durable reservation prevents a duplicate wire request"
     );
 
-    let mut first_header = *regtest_genesis_block().header;
-    first_header.previous_block_hash = snapshot.frontiers.header_best.hash;
-    first_header.time += chrono::Duration::seconds(1);
-    let first_header = Arc::new(first_header);
-    handle
-        .send(Event::SessionResponse {
-            peer,
-            session_id: 0,
-            scope,
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: request.request_id,
-                target_tip_hash: target,
-                common_ancestor_height: snapshot.frontiers.header_best.height,
-                common_ancestor_hash: snapshot.frontiers.header_best.hash,
-                complete: false,
-                tree_aux_schema: AuxSchema::None,
-                entries: vec![HeaderEntry {
-                    header: first_header.clone(),
-                    body_size: 0,
-                    tree_aux: None,
-                }],
-            }),
-        })
-        .await
-        .expect("the partial response reaches the reactor");
-    let continuation = match handle
-        .codec()
-        .decode_frame(
-            outbound.recv().await.expect("the continuation is sent"),
-            None,
-        )
-        .expect("the continuation decodes")
-    {
-        HeaderSyncMessage::GetHeaders(request) => request,
-        other => panic!("expected continuation GetHeaders, got {other:?}"),
+    // Two one-header pages spend the Open's credit, which reaches the shared
+    // headroom, so the requester prepares its prefix instead of granting more.
+    let mut parent = snapshot.frontiers.header_best;
+    for second in 1..=2 {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(second);
+        let header = Arc::new(header);
+        handle
+            .send(page_event(
+                &session,
+                Headers {
+                    subscription_id: open.subscription_id,
+                    initial_target_tip_hash: target,
+                    common_ancestor_height: parent.height,
+                    common_ancestor_hash: parent.hash,
+                    reaches_initial_target: false,
+                    tree_aux_schema: AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header: header.clone(),
+                        body_size: 0,
+                        tree_aux: None,
+                    }],
+                },
+            ))
+            .await
+            .expect("the page reaches the reactor");
+        parent = zakura_header_chain::Frontier::new(
+            parent.height.next().expect("the fixture height fits"),
+            header.hash(),
+        );
+    }
+    let HeaderPortOperation::PrepareHeaderTarget {
+        entries, target, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("the spent credit prepares the durable prefix");
     };
-    assert_eq!(continuation.max_header_count, 1);
-    assert_eq!(continuation.locator_hashes, vec![first_header.hash()]);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(target, parent);
+    assert!(
+        outbound.try_recv().is_err(),
+        "the prepared prefix needs no Grant"
+    );
 
     shutdown.cancel();
     task.await.expect("the reactor exits cleanly");
@@ -713,15 +706,15 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(remote_status.clone()),
+            status: remote_status.clone(),
         })
         .await
         .expect("the target status reaches the reactor");
@@ -770,7 +763,7 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
         time::timeout(std::time::Duration::from_millis(20), outbound.recv())
             .await
             .is_err(),
-        "a stale locator cannot send GetHeaders under the new generation"
+        "a stale locator cannot open a subscription under the new generation"
     );
     assert!(
         time::timeout(std::time::Duration::from_millis(20), actions.recv())
@@ -790,13 +783,10 @@ async fn stale_locator_completion_cannot_rebase_onto_a_new_generation() {
         })
         .await
         .expect("the current locator reaches the reactor");
-    assert!(matches!(
-        handle
-            .codec()
-            .decode_frame(outbound.recv().await.expect("GetHeaders is sent"), None)
-            .expect("GetHeaders decodes"),
-        HeaderSyncMessage::GetHeaders(_)
-    ));
+    assert_eq!(
+        update(outbound.recv().await.expect("Open is sent")).operation,
+        v9::Operation::Open
+    );
 
     shutdown.cancel();
     task.await.expect("the reactor exits cleanly");
@@ -814,22 +804,12 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         spawn_header_sync_reactor(startup).expect("the requester fixture starts");
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the peer connects");
-    let status_frame = outbound.recv().await.expect("initial status is sent");
-    assert!(matches!(
-        handle
-            .codec()
-            .decode_frame(status_frame, None)
-            .expect("status decodes"),
-        HeaderSyncMessage::Status(_)
-    ));
+    decode_status(outbound.recv().await.expect("initial status is sent"));
 
     let mut first_header = *regtest_genesis_block().header;
     first_header.previous_block_hash = anchor.hash;
@@ -849,15 +829,15 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: u32::MAX,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
     };
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(remote_status.clone()),
+            status: remote_status.clone(),
         })
         .await
         .expect("the target status reaches the reactor");
@@ -879,70 +859,51 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
         })
         .await
         .expect("the locator reaches the reactor");
-    let first_request = match handle
-        .codec()
-        .decode_frame(outbound.recv().await.expect("first request is sent"), None)
-        .expect("first request decodes")
-    {
-        HeaderSyncMessage::GetHeaders(request) => request,
-        other => panic!("expected GetHeaders, got {other:?}"),
-    };
+    let first_request = update(outbound.recv().await.expect("Open is sent"));
     assert_eq!(
-        first_request.max_header_count,
+        first_request.added_credit.objects,
         u32::try_from(MAX_HEADER_CHUNK_RESERVATION_V1)
             .expect("the fair reservation fits on the wire")
     );
+    // The first page leaves credit for the rest, so no Grant follows it.
     handle
-        .send(Event::SessionResponse {
-            peer: peer.clone(),
-            session_id: 0,
-            scope,
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: first_request.request_id,
-                target_tip_hash: target.hash,
+        .send(page_event(
+            &session,
+            Headers {
+                subscription_id: first_request.subscription_id,
+                initial_target_tip_hash: target.hash,
                 common_ancestor_height: anchor.height,
                 common_ancestor_hash: anchor.hash,
-                complete: false,
+                reaches_initial_target: false,
                 tree_aux_schema: AuxSchema::None,
                 entries: vec![HeaderEntry {
                     header: first_header.clone(),
                     body_size: 0,
                     tree_aux: None,
                 }],
-            }),
-        })
+            },
+        ))
         .await
-        .expect("the first response page reaches the reactor");
-    let continuation = match handle
-        .codec()
-        .decode_frame(outbound.recv().await.expect("continuation is sent"), None)
-        .expect("continuation decodes")
-    {
-        HeaderSyncMessage::GetHeaders(request) => request,
-        other => panic!("expected continuation GetHeaders, got {other:?}"),
-    };
-    assert_eq!(continuation.locator_hashes, vec![first.hash]);
+        .expect("the first page reaches the reactor");
     handle
-        .send(Event::SessionResponse {
-            peer: peer.clone(),
-            session_id: 0,
-            scope,
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: continuation.request_id,
-                target_tip_hash: target.hash,
+        .send(page_event(
+            &session,
+            Headers {
+                subscription_id: first_request.subscription_id,
+                initial_target_tip_hash: target.hash,
                 common_ancestor_height: first.height,
                 common_ancestor_hash: first.hash,
-                complete: true,
+                reaches_initial_target: true,
                 tree_aux_schema: AuxSchema::None,
                 entries: vec![HeaderEntry {
                     header: second_header,
                     body_size: 0,
                     tree_aux: None,
                 }],
-            }),
-        })
+            },
+        ))
         .await
-        .expect("the completion page reaches the reactor");
+        .expect("the target page reaches the reactor");
     let HeaderPortOperation::PrepareHeaderTarget {
         source,
         owner,
@@ -954,10 +915,15 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     else {
         panic!("the complete target must produce one admission action");
     };
+    assert_eq!(
+        update(outbound.recv().await.expect("Close is sent")).operation,
+        v9::Operation::Close,
+        "reaching the target closes the subscription instead of following the tip"
+    );
     assert_eq!(common_ancestor, anchor);
     assert_eq!(admitted_target, target);
     assert_eq!(entries.len(), 2);
-    assert_eq!(owner.request_id().get(), first_request.request_id);
+    assert_eq!(owner.request_id().get(), first_request.subscription_id);
     let anchor_header = regtest_genesis_block().header.clone();
     let lease = zakura_header_chain::ValidationLease::new(
         anchor,
@@ -1128,10 +1094,10 @@ async fn requester_stages_all_pages_before_one_exact_admission() {
     let mut advisory_height_changed = remote_status;
     advisory_height_changed.selected_tip_height = block::Height(200);
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer,
             session_id: 0,
-            msg: HeaderSyncMessage::Status(advisory_height_changed),
+            status: advisory_height_changed,
         })
         .await
         .expect("the duplicate target with a changed advisory height reaches the reactor");
@@ -1158,12 +1124,9 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
         spawn_header_sync_reactor(startup).expect("the requester fixture starts");
     let (send, mut outbound) = framed_channel(16);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the peer connects");
     let _initial_status = outbound.recv().await.expect("initial status is sent");
@@ -1177,7 +1140,7 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
     };
@@ -1185,14 +1148,15 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
     for outcome in [
         HeadersOutcomeCode::TargetNotRetained,
         HeadersOutcomeCode::HistoryPruned,
-        HeadersOutcomeCode::Busy,
+        HeadersOutcomeCode::TargetNotSelected,
+        HeadersOutcomeCode::SubscriptionSuperseded,
         HeadersOutcomeCode::NoLocatorIntersection,
     ] {
         handle
-            .send(Event::WireMessage {
+            .send(Event::Status {
                 peer: peer.clone(),
                 session_id: 0,
-                msg: HeaderSyncMessage::Status(remote_status.clone()),
+                status: remote_status.clone(),
             })
             .await
             .expect("the refreshed status reaches the reactor");
@@ -1214,34 +1178,25 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
             })
             .await
             .expect("the locator reaches the reactor");
-        let request = match handle
-            .codec()
-            .decode_frame(outbound.recv().await.expect("the request is sent"), None)
-            .expect("the request decodes")
-        {
-            HeaderSyncMessage::GetHeaders(request) => request,
-            other => panic!("expected GetHeaders, got {other:?}"),
-        };
+        let open = update(outbound.recv().await.expect("Open is sent"));
         handle
-            .send(Event::SessionResponse {
-                peer: peer.clone(),
-                session_id: 0,
-                scope,
-                msg: HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
-                    request_id: request.request_id,
-                    target_tip_hash: target,
+            .send(outcome_event(
+                &session,
+                HeadersOutcome {
+                    subscription_id: open.subscription_id,
+                    initial_target_tip_hash: target,
                     outcome,
-                }),
-            })
+                },
+            ))
             .await
             .expect("the explicit outcome reaches the reactor");
     }
 
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer,
             session_id: 0,
-            msg: HeaderSyncMessage::Status(remote_status),
+            status: remote_status,
         })
         .await
         .expect("the next bounded status refresh reaches the reactor");
@@ -1283,10 +1238,10 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
             .peer_work_queue
             .set_capacity_for_test(&other, 2_000, 0);
         let target = block::Hash([0x53; 32]);
-        reactor.handle_wire_message(
+        reactor.handle_status(
             supplier.clone(),
             0,
-            HeaderSyncMessage::Status(Status {
+            Status {
                 work_anchor_height: anchor.height,
                 work_anchor_hash: anchor.hash,
                 selected_tip_height: block::Height(10_000),
@@ -1294,10 +1249,10 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
                 suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
                 oldest_retained_height: anchor.height,
                 max_headers_per_response: advertised_limit,
-                max_inflight_requests: 1,
+                max_subscriptions: 1,
                 max_message_bytes: 2_000_000,
                 tree_aux_schema_mask: 0,
-            }),
+            },
         );
         let HeaderPortOperation::QueryHeaderLocator { scope, .. } = actions.try_recv().unwrap()
         else {
@@ -1312,15 +1267,9 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
                 snapshot.frontiers.header_best,
             )),
         );
-        let HeaderSyncMessage::GetHeaders(first) = reactor
-            .codec
-            .decode_frame(outbound.try_recv().unwrap(), None)
-            .unwrap()
-        else {
-            panic!("the first wire request must be GetHeaders");
-        };
+        let first = update(outbound.try_recv().unwrap());
         assert_eq!(
-            first.max_header_count, 1,
+            first.added_credit.objects, 1,
             "the other request owns the remaining credits"
         );
         reactor.retire_peer_work(&other, HeaderRequestTerminal::LocalError);
@@ -1329,16 +1278,15 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
         header.previous_block_hash = snapshot.frontiers.header_best.hash;
         header.time += chrono::Duration::seconds(1);
         let header = Arc::new(header);
-        reactor.handle_headers(
+        reactor.deliver_page(
             supplier.clone(),
             0,
-            scope,
             Headers {
-                request_id: first.request_id,
-                target_tip_hash: target,
+                subscription_id: first.subscription_id,
+                initial_target_tip_hash: target,
                 common_ancestor_height: snapshot.frontiers.header_best.height,
                 common_ancestor_hash: snapshot.frontiers.header_best.hash,
-                complete: false,
+                reaches_initial_target: false,
                 tree_aux_schema: AuxSchema::None,
                 entries: vec![HeaderEntry {
                     header: header.clone(),
@@ -1347,25 +1295,23 @@ fn header_continuation_uses_credits_released_after_a_small_first_request() {
                 }],
             },
         );
-        let HeaderSyncMessage::GetHeaders(next) = reactor
-            .codec
-            .decode_frame(outbound.try_recv().unwrap(), None)
-            .unwrap()
-        else {
-            panic!("the partial response must trigger a continuation");
-        };
+        let next = update(outbound.try_recv().unwrap());
+        assert_eq!(next.operation, v9::Operation::Grant);
         assert_eq!(
-            next.max_header_count,
+            next.added_credit.objects,
             advertised_limit.min(250),
             "the negotiated peer and byte limits still bound the page"
         );
         if advertised_limit > 1 {
-            assert!(next.max_header_count > first.max_header_count);
+            assert!(next.added_credit.objects > first.added_credit.objects);
         }
-        assert_eq!(next.locator_hashes, vec![header.hash()]);
+        assert_eq!(
+            next.acknowledged, first.acknowledged,
+            "a Grant acknowledges no header before validation"
+        );
         assert_eq!(
             reactor.peer_work_queue.claimed_header_count(),
-            1 + usize::try_from(next.max_header_count).unwrap()
+            1 + usize::try_from(next.added_credit.objects).unwrap()
         );
     }
 }

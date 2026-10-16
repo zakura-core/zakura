@@ -23,15 +23,25 @@ fn offers_reactor() -> (
 }
 
 fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedRecv) {
+    let (peer, outbound, _) = connect_with_sender(reactor, byte);
+    (peer, outbound)
+}
+
+/// [`connect`], also returning the session's sender, so a test can fill its
+/// queue.
+fn connect_with_sender(
+    reactor: &mut HeaderSyncReactor,
+    byte: u8,
+) -> (ZakuraPeerId, FramedRecv, crate::zakura::FramedSend) {
     let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length");
     let (send, mut outbound) = framed_channel(8);
     reactor.handle_peer_connected(PeerSession::from_parts(
         peer.clone(),
-        send,
+        send.clone(),
         CancellationToken::new(),
     ));
     outbound.try_recv().expect("the initial status was sent");
-    (peer, outbound)
+    (peer, outbound, send)
 }
 
 fn status_for(snapshot: &zakura_header_chain::EngineSnapshot, target: block::Hash) -> Status {
@@ -44,7 +54,7 @@ fn status_for(snapshot: &zakura_header_chain::EngineSnapshot, target: block::Has
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: 0,
     }
@@ -80,7 +90,7 @@ fn assert_quiescent(
     );
 }
 
-/// Starts `peer`'s request for `target` and returns the sent `GetHeaders`.
+/// Starts `peer`'s request for `target` and returns the sent `Open`.
 fn start_request(
     reactor: &mut HeaderSyncReactor,
     peer: &ZakuraPeerId,
@@ -88,7 +98,7 @@ fn start_request(
     scope: zakura_header_chain::HeaderWorkAuthority,
     target: block::Hash,
     locator: zakura_header_chain::Frontier,
-) -> GetHeaders {
+) -> v9::SubscribeHeaders {
     reactor.handle_header_locator_ready(
         peer.clone(),
         0,
@@ -98,18 +108,14 @@ fn start_request(
             locator,
         )),
     );
-    let HeaderSyncMessage::GetHeaders(request) = reactor
-        .codec
-        .decode_frame(outbound.try_recv().expect("the request is sent"), None)
-        .expect("the request decodes")
-    else {
-        panic!("the locator must start a GetHeaders request");
-    };
-    request
+    let open = update(outbound.try_recv().expect("the Open is sent"));
+    assert_eq!(open.operation, v9::Operation::Open);
+    open
 }
 
-/// Starts `peer`'s request for `target`, answers it with Busy, and ends the event.
-fn answer_busy(
+/// Starts `peer`'s request for `target`, ends it with `TargetNotRetained`, and
+/// ends the event.
+fn answer_unretained(
     reactor: &mut HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
     peer: &ZakuraPeerId,
@@ -125,14 +131,13 @@ fn answer_busy(
         target,
         snapshot.frontiers.header_best,
     );
-    reactor.handle_headers_outcome(
+    reactor.deliver_outcome(
         peer.clone(),
         0,
-        scope,
         HeadersOutcome {
-            request_id: request.request_id,
-            target_tip_hash: target,
-            outcome: HeadersOutcomeCode::Busy,
+            subscription_id: request.subscription_id,
+            initial_target_tip_hash: target,
+            outcome: HeadersOutcomeCode::TargetNotRetained,
         },
     );
     reactor.schedule_cached_statuses();
@@ -168,26 +173,22 @@ fn applying_target_status(reactor: &HeaderSyncReactor, owner: &ZakuraPeerId) -> 
 }
 
 #[test]
-fn busy_owner_hands_its_target_to_a_cached_alternate() {
+fn unretained_owner_hands_its_target_to_a_cached_alternate() {
     let (mut reactor, mut actions, snapshot) = offers_reactor();
     let (owner, mut owner_outbound) = connect(&mut reactor, 0x71);
     let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
 
-    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(owner.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &owner, target);
-    reactor.handle_wire_message(
-        alternate.clone(),
-        0,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(alternate.clone(), 0, status.clone());
     assert!(
         actions.try_recv().is_err(),
         "the owned target holds back the alternate's status"
     );
 
-    answer_busy(
+    answer_unretained(
         &mut reactor,
         &snapshot,
         &owner,
@@ -196,10 +197,10 @@ fn busy_owner_hands_its_target_to_a_cached_alternate() {
         target,
     );
     expect_locator_query(&mut actions, &alternate, target);
-    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(owner.clone(), 0, status);
     assert!(
         actions.try_recv().is_err(),
-        "the Busy owner's next status cannot take the target back"
+        "the failed owner's next status cannot take the target back"
     );
     assert!(reactor.peer_work_queue.awaiting_target(&owner).is_none());
     assert_eq!(
@@ -219,13 +220,9 @@ fn status_sent_during_the_owners_attempt_cannot_reclaim_its_target() {
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
 
-    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(owner.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &owner, target);
-    reactor.handle_wire_message(
-        alternate.clone(),
-        0,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(alternate.clone(), 0, status.clone());
     let request = start_request(
         &mut reactor,
         &owner,
@@ -234,16 +231,15 @@ fn status_sent_during_the_owners_attempt_cannot_reclaim_its_target() {
         target,
         snapshot.frontiers.header_best,
     );
-    // The owner re-advertises before it answers Busy.
-    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status));
-    reactor.handle_headers_outcome(
+    // The owner re-advertises before its outcome arrives.
+    reactor.handle_status(owner.clone(), 0, status);
+    reactor.deliver_outcome(
         owner.clone(),
         0,
-        scope,
         HeadersOutcome {
-            request_id: request.request_id,
-            target_tip_hash: target,
-            outcome: HeadersOutcomeCode::Busy,
+            subscription_id: request.subscription_id,
+            initial_target_tip_hash: target,
+            outcome: HeadersOutcomeCode::TargetNotRetained,
         },
     );
     reactor.schedule_cached_statuses();
@@ -260,10 +256,10 @@ fn peers_that_both_fail_a_target_wait_for_a_fresh_status() {
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
 
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(first.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &first, target);
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
-    answer_busy(
+    reactor.handle_status(second.clone(), 0, status);
+    answer_unretained(
         &mut reactor,
         &snapshot,
         &first,
@@ -272,7 +268,7 @@ fn peers_that_both_fail_a_target_wait_for_a_fresh_status() {
         target,
     );
     let scope = expect_locator_query(&mut actions, &second, target);
-    answer_busy(
+    answer_unretained(
         &mut reactor,
         &snapshot,
         &second,
@@ -293,10 +289,10 @@ fn fresh_status_restores_the_peers_attempt() {
     let (second, mut second_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(first.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &first, target);
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status.clone()));
-    answer_busy(
+    reactor.handle_status(second.clone(), 0, status.clone());
+    answer_unretained(
         &mut reactor,
         &snapshot,
         &first,
@@ -306,12 +302,12 @@ fn fresh_status_restores_the_peers_attempt() {
     );
     let scope = expect_locator_query(&mut actions, &second, target);
 
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(first.clone(), 0, status);
     assert!(
         actions.try_recv().is_err(),
         "the second peer still owns the target"
     );
-    answer_busy(
+    answer_unretained(
         &mut reactor,
         &snapshot,
         &second,
@@ -329,9 +325,9 @@ fn header_authority_change_restores_spent_statuses() {
     let (second, _second_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(first.clone(), 0, status.clone());
     expect_locator_query(&mut actions, &first, target);
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(second.clone(), 0, status);
     reactor.retire_peer_work(&first, HeaderRequestTerminal::LocalError);
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &second, target);
@@ -377,17 +373,13 @@ fn status_held_back_at_capacity_is_staged_when_a_slot_frees() {
     let (held_back, _held_back_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
 
-    reactor.handle_wire_message(
-        held_back.clone(),
-        0,
-        HeaderSyncMessage::Status(status_for(&snapshot, target)),
-    );
+    reactor.handle_status(held_back.clone(), 0, status_for(&snapshot, target));
     assert!(
         actions.try_recv().is_err(),
         "the full queue holds back the status"
     );
 
-    reactor.retire_peer_work(&fillers[0], HeaderRequestTerminal::Busy);
+    reactor.retire_peer_work(&fillers[0], HeaderRequestTerminal::LocalError);
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &held_back, target);
 }
@@ -400,7 +392,7 @@ fn completion_release_stages_a_cached_alternate() {
     seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
     let status = applying_target_status(&reactor, &owner);
     let target = status.selected_tip_hash;
-    reactor.handle_wire_message(alternate.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(alternate.clone(), 0, status);
     assert!(actions.try_recv().is_err());
 
     reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
@@ -417,7 +409,7 @@ fn applied_target_is_not_staged_for_alternates() {
     let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
     let (source, owner_scope, _) = seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
     let status = applying_target_status(&reactor, &owner);
-    reactor.handle_wire_message(alternate, 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(alternate, 0, status);
     reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: owner,
         source,
@@ -434,34 +426,20 @@ fn already_known_target_is_not_staged_for_alternates() {
     let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
-    reactor.handle_wire_message(owner.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(owner.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &owner, target);
-    reactor.handle_wire_message(alternate, 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(alternate, 0, status);
 
-    // The locator already contains the target, so the owner answers with an empty page.
+    // The locator already contains the target, so no subscription opens.
     let known = zakura_header_chain::Frontier::new(block::Height(2), target);
-    let request = start_request(
-        &mut reactor,
-        &owner,
-        &mut owner_outbound,
-        scope,
-        target,
-        known,
-    );
-    reactor.handle_headers(
+    reactor.handle_header_locator_ready(
         owner.clone(),
         0,
+        target,
         scope,
-        Headers {
-            request_id: request.request_id,
-            target_tip_hash: target,
-            common_ancestor_height: known.height,
-            common_ancestor_hash: known.hash,
-            complete: true,
-            tree_aux_schema: AuxSchema::None,
-            entries: Vec::new(),
-        },
+        Some(zakura_header_chain::HeaderLocator::for_continuation(known)),
     );
+    assert!(owner_outbound.try_recv().is_err());
     assert!(reactor.peer_work_queue.active(&owner).is_none());
     assert_quiescent(&mut reactor, &mut actions);
 }
@@ -474,11 +452,7 @@ fn resource_stall_waits_before_staging_an_alternate() {
     let (source, owner_scope, branch) =
         seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
     let status = applying_target_status(&reactor, &owner);
-    reactor.handle_wire_message(
-        alternate.clone(),
-        0,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(alternate.clone(), 0, status.clone());
     reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: owner,
         source,
@@ -491,11 +465,7 @@ fn resource_stall_waits_before_staging_an_alternate() {
             },
         ),
     });
-    reactor.handle_wire_message(
-        alternate.clone(),
-        0,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(alternate.clone(), 0, status.clone());
     assert_quiescent(&mut reactor, &mut actions);
 
     let mut newer = snapshot;
@@ -512,8 +482,8 @@ fn status_too_small_for_one_header_is_not_staged() {
     let mut status = status_for(&snapshot, block::Hash([0x42; 32]));
     status.max_message_bytes = 1;
 
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(first.clone(), 0, status.clone());
+    reactor.handle_status(second.clone(), 0, status);
     assert_quiescent(&mut reactor, &mut actions);
     assert!(reactor.peer_work_queue.awaiting_target(&first).is_none());
     assert!(reactor.peer_work_queue.awaiting_target(&second).is_none());
@@ -526,9 +496,9 @@ fn failed_locator_reads_do_not_alternate_between_cached_statuses() {
     let (second, _second_outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(first.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &first, target);
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(second.clone(), 0, status);
 
     complete_locator(&mut reactor, &snapshot, &first, scope, target, false);
     let scope = expect_locator_query(&mut actions, &second, target);
@@ -545,9 +515,9 @@ fn failed_sends_do_not_alternate_between_cached_statuses() {
     drop(second_outbound);
     let target = block::Hash([0x42; 32]);
     let status = status_for(&snapshot, target);
-    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_status(first.clone(), 0, status.clone());
     let scope = expect_locator_query(&mut actions, &first, target);
-    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(second.clone(), 0, status);
 
     complete_locator(&mut reactor, &snapshot, &first, scope, target, true);
     assert!(reactor.peer_work_queue.active(&first).is_none());
@@ -568,7 +538,11 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
         .set_capacity_for_test(&owner, 3998, 0);
     let one_header_bytes = (1..=4096)
         .find(|bytes| {
-            headers_response_capacity(&reactor.startup.network, AuxSchema::None, *bytes) == 1
+            v9::page_capacity(
+                header_sync_header_bytes_for_network(&reactor.startup.network),
+                AuxSchema::None,
+                *bytes,
+            ) == 1
         })
         .expect("some message size fits exactly one header");
 
@@ -577,26 +551,22 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
     let mut byte_limited_status = status_for(&snapshot, block::Hash([0x72; 32]));
     byte_limited_status.max_headers_per_response = 250;
     byte_limited_status.max_message_bytes = u32::try_from(one_header_bytes).unwrap();
-    reactor.handle_wire_message(
-        byte_limited.clone(),
-        0,
-        HeaderSyncMessage::Status(byte_limited_status),
-    );
+    reactor.handle_status(byte_limited.clone(), 0, byte_limited_status);
     expect_locator_query(&mut actions, &byte_limited, block::Hash([0x72; 32]));
 
     let (second, _second_outbound) = connect(&mut reactor, 0x73);
-    reactor.handle_wire_message(
+    reactor.handle_status(
         second.clone(),
         0,
-        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([0x73; 32]))),
+        status_for(&snapshot, block::Hash([0x73; 32])),
     );
     expect_locator_query(&mut actions, &second, block::Hash([0x73; 32]));
 
     let (third, _third_outbound) = connect(&mut reactor, 0x74);
-    reactor.handle_wire_message(
+    reactor.handle_status(
         third.clone(),
         0,
-        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([0x74; 32]))),
+        status_for(&snapshot, block::Hash([0x74; 32])),
     );
     assert!(
         actions.try_recv().is_err(),
@@ -620,7 +590,7 @@ fn locator_losing_headroom_keeps_offer_for_body_progress() {
     let target = block::Hash([0x42; 32]);
     let mut status = status_for(&snapshot, target);
     status.selected_tip_height = block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1);
-    reactor.handle_wire_message(waiting.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(waiting.clone(), 0, status);
     let scope = expect_locator_query(&mut actions, &waiting, target);
 
     // A continuation can enlarge its claim while the locator read is in flight.
@@ -656,11 +626,7 @@ fn in_flight_locator_waits_for_committed_resource_stall_to_clear() {
         seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
     let (waiting, mut outbound) = connect(&mut reactor, 0x72);
     let target = block::Hash([0x42; 32]);
-    reactor.handle_wire_message(
-        waiting.clone(),
-        0,
-        HeaderSyncMessage::Status(status_for(&snapshot, target)),
-    );
+    reactor.handle_status(waiting.clone(), 0, status_for(&snapshot, target));
     let scope = expect_locator_query(&mut actions, &waiting, target);
     reactor.handle_event(Event::HeaderTargetAdmissionReady {
         peer: owner,
@@ -739,11 +705,11 @@ fn assert_failed_repair_preserves_offer(full_budget: bool) {
     snapshot.frontiers.header_best =
         zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
     reactor.observe_latest_committed_snapshot(snapshot.clone());
-    let (supplier, mut outbound) = connect(&mut reactor, 0x71);
+    let (supplier, mut outbound, send) = connect_with_sender(&mut reactor, 0x71);
     let target = block::Hash([0x42; 32]);
     let mut status = status_for(&snapshot, target);
     status.tree_aux_schema_mask = AuxSchema::V1.mask_bit();
-    reactor.handle_wire_message(supplier.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(supplier.clone(), 0, status);
     expect_locator_query(&mut actions, &supplier, target);
     let (owner, _owner_outbound) = connect(&mut reactor, 0x72);
     if full_budget {
@@ -753,9 +719,12 @@ fn assert_failed_repair_preserves_offer(full_budget: bool) {
             .set_capacity_for_test(&owner, 4000, 0);
     } else {
         // Fill the ordered stream so the repair send fails without disconnecting it.
-        let session = &reactor.peer_state[&supplier].session;
-        while session
-            .try_send_status(&reactor.codec, status_for(&snapshot, target))
+        while send
+            .try_send(Frame {
+                message_type: 1,
+                flags: 0,
+                payload: Vec::new(),
+            })
             .is_ok()
         {}
     }
@@ -794,26 +763,40 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
     let target = block::Hash([0x42; 32]);
     let mut status = status_for(&snapshot, target);
     status.tree_aux_schema_mask = AuxSchema::V1.mask_bit();
-    reactor.handle_wire_message(
-        supplier.clone(),
-        0,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(supplier.clone(), 0, status.clone());
     assert!(matches!(
         reactor.peer_work_queue.active(&supplier).unwrap().purpose,
         HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
     ));
-    outbound.try_recv().expect("repair request sent");
+    let repair = update(outbound.try_recv().expect("repair Open sent"));
     assert!(
         !reactor.peer_state[&supplier].status_spent,
         "the status that assigns repair still offers ordinary work"
     );
-    reactor.handle_wire_message(supplier.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_status(supplier.clone(), 0, status);
     assert!(
         !reactor.peer_state[&supplier].status_spent,
         "a fresh status during repair is not an ordinary attempt"
     );
     reactor.retire_vct_repair();
+    assert_eq!(
+        update(outbound.try_recv().expect("repair Close sent")).operation,
+        v9::Operation::Close
+    );
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the next Open waits for the repair's terminal outcome"
+    );
+    reactor.deliver_outcome(
+        supplier.clone(),
+        0,
+        HeadersOutcome {
+            subscription_id: repair.subscription_id,
+            initial_target_tip_hash: repair.initial_target_tip_hash,
+            outcome: HeadersOutcomeCode::SubscriptionClosed,
+        },
+    );
     reactor.schedule_cached_statuses();
     let scope = expect_locator_query(&mut actions, &supplier, target);
     start_request(

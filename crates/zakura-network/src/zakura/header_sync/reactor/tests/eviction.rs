@@ -73,8 +73,8 @@ impl EvictionFixture {
         self.reactor.retire_timed_out_requests(deadline);
     }
 
-    /// Stage one request in the receiving phase, returning its owning scope.
-    fn start_receiving(&mut self, session_id: u64) -> zakura_header_chain::HeaderWorkAuthority {
+    /// Stage one request in the receiving phase.
+    fn start_receiving(&mut self, session_id: u64) {
         seed_applying_request(
             &mut self.reactor,
             &self.snapshot,
@@ -88,13 +88,12 @@ impl EvictionFixture {
             .expect("the seeded request is active");
         active.phase = HeaderTargetPhase::Receiving;
         active.common_ancestor = None;
-        active.owner.header_authority()
     }
 
     /// Answer the active request with one usable header, completing its target.
     fn answer_with_one_header(&mut self, session_id: u64) {
         let anchor = self.snapshot.frontiers.finalized;
-        let scope = self.start_receiving(session_id);
+        self.start_receiving(session_id);
         let active = self
             .reactor
             .peer_work_queue
@@ -105,11 +104,11 @@ impl EvictionFixture {
             .pop()
             .expect("the seeded request stages exactly one entry");
         let response = Headers {
-            request_id: active.request_id.get(),
-            target_tip_hash: active.target.status.selected_tip_hash,
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
             common_ancestor_height: anchor.height,
             common_ancestor_hash: anchor.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
             entries: vec![entry],
         };
@@ -118,7 +117,7 @@ impl EvictionFixture {
             .peer_work_queue
             .set_capacity_for_test(&self.peer, 0, 1);
         self.reactor
-            .handle_headers(self.peer.clone(), session_id, scope, response);
+            .deliver_page(self.peer.clone(), session_id, response);
         // The port owns the completed target.
         // Clear the request so the next request can enter staging.
         self.reactor.clear_peer_work_for_test(&self.peer);

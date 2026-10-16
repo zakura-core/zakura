@@ -17,11 +17,11 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.common_ancestor = None;
     active.entries.clear();
     let wrong_ancestor_response = Headers {
-        request_id: owner.request_id().get(),
-        target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: wrong_ancestor.height,
         common_ancestor_hash: wrong_ancestor.hash,
-        complete: false,
+        reaches_initial_target: false,
         tree_aux_schema: AuxSchema::None,
         entries: vec![HeaderEntry {
             header: Arc::new(wrong_ancestor_header),
@@ -30,18 +30,13 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
         }],
     };
     assert!(
-        reactor
-            .codec
-            .encode(&HeaderSyncMessage::Headers(wrong_ancestor_response.clone()))
-            .is_ok(),
+        encode_frame(&v9::RegtestMessage::Headers(
+            wrong_ancestor_response.clone()
+        ))
+        .is_ok(),
         "the wrong locator member is otherwise wire-valid"
     );
-    reactor.handle_headers(
-        peer.clone(),
-        0,
-        owner.header_authority(),
-        wrong_ancestor_response,
-    );
+    reactor.deliver_page(peer.clone(), 0, wrong_ancestor_response);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::MalformedMessage);
 
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
@@ -57,16 +52,15 @@ fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
     active.entries.clear();
     let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
-    reactor.handle_headers(
+    reactor.deliver_page(
         peer.clone(),
         0,
-        owner.header_authority(),
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: owner.request_id().get(),
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
             entries: vec![HeaderEntry {
                 header: Arc::new(wrong_target_header),
@@ -172,64 +166,45 @@ fn typed_taxonomy_scores_only_exact_attributed_header_peer_faults() {
     }
 }
 
+/// A page or outcome for another subscription leaves the active request,
+/// the peer, and the scheduler untouched.
 #[test]
-fn response_completion_requires_the_reserved_branch_scope() {
+fn pages_and_outcomes_of_another_subscription_have_no_effect() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
-    let expected = reactor
+    let active = reactor
         .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has active work")
-        .clone();
-    let mut wrong_scope = owner.header_authority();
-    wrong_scope.header_generation = wrong_scope
-        .header_generation
-        .checked_next()
-        .expect("the fixture generation has a successor");
-    reactor.handle_headers(
+        .active_mut(&peer)
+        .expect("the fixture has active work");
+    active.phase = HeaderTargetPhase::Receiving;
+    let entry = active.entries[0].clone();
+    let expected = active.clone();
+    let other = owner.request_id().get() + 1;
+    reactor.deliver_page(
         peer.clone(),
         0,
-        wrong_scope,
         Headers {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            subscription_id: other,
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
             common_ancestor_height: snapshot.frontiers.finalized.height,
             common_ancestor_hash: snapshot.frontiers.finalized.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
-            entries: Vec::new(),
+            entries: vec![entry],
         },
     );
-    assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
-    assert!(
-        actions.try_recv().is_err(),
-        "a scope-mismatched page has no peer or scheduling effect"
-    );
-
-    let (mut reactor, mut actions, _snapshot, peer, _source, owner) = peer_violation_fixture();
-    let expected = reactor
-        .peer_work_queue
-        .active(&peer)
-        .expect("the fixture has active work")
-        .clone();
-    let mut wrong_scope = owner.header_authority();
-    wrong_scope.branch = zakura_header_chain::BranchId::new(
-        owner.header_authority().branch.anchor_hash,
-        block::Hash([0x73; 32]),
-    );
-    reactor.handle_headers_outcome(
+    reactor.deliver_outcome(
         peer.clone(),
         0,
-        wrong_scope,
         HeadersOutcome {
-            request_id: owner.request_id().get(),
-            target_tip_hash: owner.header_authority().branch.target_tip_hash,
-            outcome: HeadersOutcomeCode::Busy,
+            subscription_id: other,
+            initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            outcome: HeadersOutcomeCode::TargetNotRetained,
         },
     );
     assert_eq!(reactor.peer_work_queue.active(&peer), Some(&expected));
     assert!(
         actions.try_recv().is_err(),
-        "a scope-mismatched outcome has no peer or scheduling effect"
+        "a page or outcome of another subscription has no peer or scheduling effect"
     );
 }
 
@@ -247,15 +222,15 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     let _ = active;
     reactor.peer_work_queue.set_capacity_for_test(&peer, 0, 1);
     let response = Headers {
-        request_id: owner.request_id().get(),
-        target_tip_hash: owner.header_authority().branch.target_tip_hash,
+        subscription_id: owner.request_id().get(),
+        initial_target_tip_hash: owner.header_authority().branch.target_tip_hash,
         common_ancestor_height: returned_ancestor.height,
         common_ancestor_hash: returned_ancestor.hash,
-        complete: false,
+        reaches_initial_target: false,
         tree_aux_schema: AuxSchema::None,
         entries: vec![entry; 2],
     };
-    reactor.handle_headers(peer.clone(), 0, owner.header_authority(), response);
+    reactor.deliver_page(peer.clone(), 0, response);
 
     assert!(
         reactor.peer_work_queue.active(&peer).is_none(),

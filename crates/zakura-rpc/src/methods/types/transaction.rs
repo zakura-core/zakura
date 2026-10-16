@@ -31,7 +31,6 @@ use zakura_state::IntoDisk;
 use zcash_primitives::transaction::{
     builder::{cached_orchard_proving_key, BuildConfig, Builder},
     components::orchard::{bundle_version_for_branch, ACTION_SIZE},
-    fees::fixed::FeeRule,
     TxVersion,
 };
 use zcash_protocol::{
@@ -439,15 +438,8 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        let build_result = builder.build(
-            &Default::default(),
-            Default::default(),
-            Default::default(),
-            rand_10::rng(),
-            &NoSaplingProver,
-            &NoSaplingProver,
-            &FeeRule::non_standard(Zatoshis::ZERO),
-        )?;
+        let build_result =
+            builder.build_coinbase(rand_10::rng(), &NoSaplingProver, &NoSaplingProver)?;
 
         let tx = build_result.transaction();
         let mut data = vec![];

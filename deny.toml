@@ -161,6 +161,7 @@ skip-tree = [
 # More documentation about the 'sources' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
 [sources]
+allow-git = ["https://github.com/zakura-core/common"]
 # Lint level for what to happen when a crate from a crate registry that is not
 # in the allow list is encountered
 unknown-registry = "deny"
@@ -174,7 +175,6 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
 
 [sources.allow-org]
 github = [

@@ -436,3 +436,39 @@ fn failed_sends_do_not_alternate_between_cached_statuses() {
         "each cached status gets one failed send until its peer sends a fresh status"
     );
 }
+
+#[test]
+fn fresh_status_clears_the_replay_skip() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (first, mut first_outbound) = connect(&mut reactor, 0x71);
+    let (second, mut second_outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    let scope = expect_locator_query(&mut actions, &first, target);
+    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    answer_busy(
+        &mut reactor,
+        &snapshot,
+        &first,
+        &mut first_outbound,
+        scope,
+        target,
+    );
+    let scope = expect_locator_query(&mut actions, &second, target);
+
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status));
+    assert!(
+        actions.try_recv().is_err(),
+        "the second peer still owns the target"
+    );
+    answer_busy(
+        &mut reactor,
+        &snapshot,
+        &second,
+        &mut second_outbound,
+        scope,
+        target,
+    );
+    expect_locator_query(&mut actions, &first, target);
+}

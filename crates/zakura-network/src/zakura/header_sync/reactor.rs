@@ -206,7 +206,8 @@ struct PeerState {
     /// request, or a locator read or `GetHeaders` send that failed before the request started.
     ///
     /// A status replay skips this peer for that target, so two peers that both fail it
-    /// wait for a fresh status instead of handing the target back and forth.
+    /// wait for a fresh status instead of handing the target back and forth. A fresh
+    /// status clears it.
     retired_target: Option<zakura_header_chain::HeaderWorkAuthority>,
     waiting_for_serving_slot: bool,
     capacity_signal: Option<zakura_node_services::header_chain::ServingCapacitySignal>,
@@ -1152,6 +1153,7 @@ impl HeaderSyncReactor {
         }
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
+            state.retired_target = None;
         }
         if let Some(task) = self.vct_repair.current_mut() {
             task.observe_supplier_status(source_id_from_peer(&peer));

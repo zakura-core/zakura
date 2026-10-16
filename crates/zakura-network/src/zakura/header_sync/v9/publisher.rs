@@ -409,11 +409,11 @@ impl Shared {
                     continue;
                 }
             }
-            if subscription.stall.is_some() {
-                continue;
-            }
             let schema = subscription.fixed.schema;
             let count = page_room(unspent, schema, limits, HEADER_BYTES);
+            if subscription.stall.is_some() || count == 0 {
+                continue;
+            }
             let job = if let Position::Following(last) = subscription.position {
                 let Some(selected) = selected else {
                     continue;
@@ -421,9 +421,6 @@ impl Shared {
                 let tip = selected.frontiers.header_best;
                 // The check above ended a tip at or below the last header.
                 if tip.height <= last.height {
-                    continue;
-                }
-                if count == 0 {
                     continue;
                 }
                 Job {
@@ -439,9 +436,6 @@ impl Shared {
                     selected: Some(selected.clone()),
                 }
             } else {
-                if count == 0 {
-                    continue;
-                }
                 let target = subscription.fixed.target;
                 let last = subscription.position.last();
                 Job {
@@ -544,20 +538,16 @@ impl Shared {
         true
     }
 
-    /// Clear capacity stalls whose signal was released.
-    fn clear_released(&mut self) {
+    /// Clear the local stalls after the selected chain changed, or else the
+    /// capacity stalls whose signal was released.
+    fn clear_stalls(&mut self, local: bool) {
         for subscription in self.subscriptions.values_mut() {
-            if matches!(&subscription.stall, Some(Stall::Capacity(signal)) if signal.is_released())
-            {
-                subscription.stall = None;
-            }
-        }
-    }
-
-    /// Clear local stalls after the selected chain changed.
-    fn clear_local(&mut self) {
-        for subscription in self.subscriptions.values_mut() {
-            if matches!(subscription.stall, Some(Stall::Local)) {
+            let clear = match &subscription.stall {
+                Some(Stall::Local) => local,
+                Some(Stall::Capacity(signal)) => !local && signal.is_released(),
+                None => false,
+            };
+            if clear {
                 subscription.stall = None;
             }
         }
@@ -780,12 +770,12 @@ async fn publish<const HEADER_BYTES: usize>(
             () = task.wake.notified() => {}
             changed = selected.changed(), if selected_open => {
                 if changed.is_ok() {
-                    lock(&task.shared).clear_local();
+                    lock(&task.shared).clear_stalls(true);
                 } else {
                     selected_open = false;
                 }
             }
-            () = any_released(capacity) => lock(&task.shared).clear_released(),
+            () = any_released(capacity) => lock(&task.shared).clear_stalls(false),
         }
     }
 }
@@ -977,11 +967,6 @@ async fn run_job<const HEADER_BYTES: usize>(
             // A stale selected tip: the next selected-chain change retries.
             Ok(AcquirePathReply::TargetNotRetained) if job.following => {
                 return Output::Stall(Stall::Local, "selected_tip")
-            }
-            // History from the last header sent is gone and will not return,
-            // and `HistoryPruned` is past its window.
-            Ok(AcquirePathReply::HistoryPruned) if job.following => {
-                return Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
                 return Output::End(HeadersOutcomeCode::TargetNotRetained)

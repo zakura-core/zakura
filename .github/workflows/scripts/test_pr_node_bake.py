@@ -39,11 +39,28 @@ class SnapshotHeight(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
             "assert sys.argv[1] == '-c'\n"
-            "assert pathlib.Path(sys.argv[2]).read_text() == "
+            "config = pathlib.Path(sys.argv[2]).read_text()\n"
+            "if sys.argv[3:] == ['start']:\n"
+            " import tomllib\n"
+            " settings = tomllib.loads(config)\n"
+            " assert settings['state']['storage_mode'] == 'pruned'\n"
+            " assert settings['state']['debug_stop_at_height'] == 0\n"
+            " cache = pathlib.Path(settings['state']['cache_dir'])\n"
+            " assert (cache / 'restored').exists()\n"
+            " assert settings['consensus']['checkpoint_sync']\n"
+            " assert settings['consensus']['vct_fast_sync']\n"
+            " assert settings['network']['p2p_stack'] == 'zakura'\n"
+            " assert settings['network']['network'].lower() == cache.parent.name\n"
+            " status = int(os.environ.get('UPGRADE_STATUS', '0'))\n"
+            " if status: sys.exit(status)\n"
+            " (cache / 'upgraded').touch()\n"
+            " sys.exit(0)\n"
+            "assert config == "
             "'[state]\\nstorage_mode = \"pruned\"\\n'\n"
             "assert sys.argv[3:5] == ['tip-height', '--cache-dir']\n"
             "assert (pathlib.Path(sys.argv[5]) / 'restored').exists()\n"
             "assert sys.argv[6] == '--network'\n"
+            "if os.environ.get('REQUIRE_UPGRADE'): assert (pathlib.Path(sys.argv[5]) / 'upgraded').exists()\n"
             "output, status = json.loads(os.environ['DB_RESULTS'])[sys.argv[7]]\n"
             "print(output, end='')\n"
             "sys.exit(status)\n"
@@ -91,7 +108,7 @@ class SnapshotHeight(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
 
-    def bake_tips(self, results, testnet_metadata=None):
+    def bake_tips(self, results, testnet_metadata=None, upgrade_status=0):
         # Exercise the shipped restore/measure/write order for both networks.
         source = pathlib.Path(__file__).with_name("pr-node-bake.sh").read_text()
         body = source.split("  # Mainnet tip:", 1)[1].split("\nfi\n\nsync", 1)[0]
@@ -112,7 +129,11 @@ class SnapshotHeight(unittest.TestCase):
                 metadata = testnet_metadata
             (self.root / f"{network}.json").write_text(json.dumps(metadata))
         return self.run_script(
-            shell_function("read_state_height") + shell_function("fetch_tip_state") + r"""
+            shell_function("read_state_height")
+            + shell_function("fetch_tip_state")
+            + shell_function("upgrade_tip_state")
+            + f"\nexport REQUIRE_UPGRADE=1 UPGRADE_STATUS={upgrade_status}\n"
+            + r"""
 MAINNET_MNT="$PWD/mainnet"
 TESTNET_MNT="$PWD/testnet"
 TIP_MAINNET_LATEST_JSON=mainnet-latest
@@ -219,6 +240,18 @@ python3() {
                 self.assertEqual(selected["id"], expected)
                 self.assertLess(do_provision.height(selected), checkpoint)
         self.assertEqual(do_provision.height(states[1]), int(measured))
+
+    def test_bake_stops_when_snapshot_upgrade_fails(self):
+        for status in (1, 124):
+            with self.subTest(status=status):
+                result = self.bake_tips(
+                    {"Mainnet": ("3470916\n", 0), "Testnet": ("4405728\n", 0)},
+                    upgrade_status=status,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("could not upgrade restored Mainnet database", result.stderr)
+                self.assertFalse((self.root / "mainnet-state-height").exists())
+                self.assertFalse((self.root / "testnet-state-height").exists())
 
     def test_bake_stops_without_publishing_an_unreadable_database_height(self):
         for network in ("Mainnet", "Testnet"):

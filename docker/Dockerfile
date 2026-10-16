@@ -37,7 +37,6 @@ ARG BUILDPLATFORM
 RUN apt-get -qq update && \
     apt-get -qq install -y --no-install-recommends \
     libclang-dev \
-    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* /tmp/*
 
 # Build arguments and variables

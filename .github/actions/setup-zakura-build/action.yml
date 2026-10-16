@@ -1,12 +1,21 @@
 name: 'Setup Zakura Build Environment'
-description: 'Install libclang, protoc, and RocksDB as system libraries'
+description: 'Install libclang and RocksDB as system libraries, and optionally protoc'
+inputs:
+  protoc:
+    description: >-
+      Also install protoc. Only `cargo xtask check-rpc-artifacts` and
+      `cargo xtask generate-rpc-artifacts` need it: builds use the checked-in
+      generated code.
+    required: false
+    default: 'false'
 runs:
   using: 'composite'
   steps:
-    - name: Install libclang, protoc, and librocksdb-dev on Ubuntu
+    - name: Install libclang and librocksdb-dev on Ubuntu
       if: runner.os == 'Linux'
       shell: bash
       env:
+        INSTALL_PROTOC: ${{ inputs.protoc }}
         # Wall-clock budget for the whole package phase. A healthy runner needs
         # about 20 seconds, and a degraded package mirror has needed 13 minutes.
         # GitHub ignores `timeout-minutes` on composite action steps, so this
@@ -16,7 +25,10 @@ runs:
       run: |
         set -euo pipefail
 
-        packages=(clang libclang-dev protobuf-compiler librocksdb-dev)
+        packages=(clang libclang-dev librocksdb-dev)
+        if [[ "${INSTALL_PROTOC}" == 'true' ]]; then
+          packages+=(protobuf-compiler)
+        fi
         apt_options=(
           # Retry an individual transfer before the whole command fails.
           -o Acquire::Retries=3
@@ -70,11 +82,16 @@ runs:
         run_apt install apt-get "${apt_options[@]}" install -y --no-install-recommends "${packages[@]}"
         echo "ROCKSDB_LIB_DIR=/usr/lib/" >> "$GITHUB_ENV"
 
-    - name: Install protoc and RocksDB on macOS
+    - name: Install RocksDB on macOS
       if: runner.os == 'macOS'
       shell: bash
+      env:
+        INSTALL_PROTOC: ${{ inputs.protoc }}
       run: |
-        brew install protobuf rocksdb
+        brew install rocksdb
+        if [[ "${INSTALL_PROTOC}" == 'true' ]]; then
+          brew install protobuf
+        fi
         # Set ROCKSDB_LIB_DIR for both Intel and Apple Silicon Macs
         if [ -d "/opt/homebrew/lib" ]; then
           echo "ROCKSDB_LIB_DIR=/opt/homebrew/lib" >> $GITHUB_ENV
@@ -83,7 +100,7 @@ runs:
         fi
 
     - name: Install protoc on Windows
-      if: runner.os == 'Windows'
+      if: runner.os == 'Windows' && inputs.protoc == 'true'
       shell: bash
       run: |
         choco install protoc -y

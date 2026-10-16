@@ -103,10 +103,13 @@ For crates.io publishing:
    runs the same script as the `crates.io publish graph` job in
    `tests-unit.yml` (part of `test success`), so a missing cascade bump
    cannot merge. It is also step 5 of `make pre-release`.
-7. Reserve any crate name the release adds. The same check warns when a
-   selected crate has never been published; CI cannot bootstrap it, because
+7. Reserve any crate name the release adds. The same check fails when a
+   selected crate has never been published, blocking merge;
+   CI cannot bootstrap it, because
    its crates.io Trusted Publishing entry lives on a crate that must already
-   exist. Publish the name manually and configure it before the release.
+   exist. Publish an initial version manually and configure it before merging.
+   Pending version bumps of existing crates remain allowed, and crates with
+   `publish = false` are exempt. The GitHub-only override cannot bypass this gate.
 
 Partial version graphs are allowed, but all tooling must handle them. Do not
 assume every publishable crate has the `zakura` package version.

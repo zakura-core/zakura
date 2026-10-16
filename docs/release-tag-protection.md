@@ -167,7 +167,11 @@ Reserve the name manually with a narrowly scoped token from a trusted
 maintainer machine, add the configuration, and only then let CI publish it;
 never store that bootstrap token in GitHub. `publish` mode refuses to run when
 the plan contains an unpublished crate name, rather than discovering it
-mid-upload.
+mid-upload. The required `test success` check also rejects publishable workspace
+crates whose names do not yet exist on crates.io, before they can merge. This
+requires an initial publication, not publication of every pending version bump.
+Crates with `publish = false` are exempt. The GitHub-only release override does
+not bypass this check.
 
 The workflow filename is part of the crates.io configuration: it is matched
 against the OIDC `workflow_ref` claim, which names the workflow a run _starts

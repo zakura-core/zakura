@@ -15,8 +15,6 @@ independently.
 
 ### Added
 
-- Preserve automatic staging-to-Testnet selection and support explicitly
-  configured Mainnet selection after verified NU7 activation
 - Added the `[network.zakura.quic]` config section for the native P2P
   transport's socket buffers, congestion control, flow-control windows, timers
   and admission limits. The defaults keep the previous behavior except for two

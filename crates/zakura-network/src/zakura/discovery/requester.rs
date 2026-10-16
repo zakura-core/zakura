@@ -24,11 +24,11 @@ use super::{
 };
 use crate::zakura::{
     regulation::{
-        sizing, ClaimRefused, FencedSendError, ReservationPool, Reservations, SharedReservations,
-        WriterFence,
+        sizing, ClaimRefused, FencedSendError, ReservationPool, Reservations, ResponsePrecheck,
+        SharedReservations, WriterFence,
     },
     wire_codec::{encode_frame, WireMessage},
-    CloseCause, FramedRecv, FramedSend,
+    CloseCause, FrameRejection, FramedRecv, FramedSend,
 };
 
 /// A discovery query, keying its response's reservation.
@@ -80,6 +80,9 @@ pub(super) struct Queries {
     snapshots: Arc<Mutex<Snapshots>>,
     pool: ReservationPool,
     fence: WriterFence,
+    /// Whether a transport reader charges each queued answer to the
+    /// reservations, so the claim releases it.
+    transport_admits: bool,
 }
 
 impl Queries {
@@ -95,14 +98,17 @@ impl Queries {
             snapshots: Arc::default(),
             pool,
             fence: WriterFence::new(connection, close_cause),
+            transport_admits: false,
         }
     }
 
     /// Checks each response header on `recv`'s transport reader before its
-    /// payload is read. In-process channels have no transport reader; the
-    /// reader's claim applies the same checks before decode.
-    pub(super) fn attach_precheck(&self, recv: &FramedRecv) {
-        recv.attach_precheck(Arc::new(self.reservations.clone()));
+    /// payload is read, and charges the queued answer until the reader claims
+    /// it. In-process channels have no transport reader; the reader's claim
+    /// applies the same checks before decode.
+    pub(super) fn attach_precheck(&mut self, recv: &FramedRecv) {
+        self.transport_admits =
+            recv.attach_precheck(Arc::new(QueriesPrecheck(self.reservations.clone())));
     }
 
     /// Reserves the answer to `message`, a `GetPeers` or a `GetServices`, then
@@ -173,11 +179,7 @@ impl Queries {
     /// does, so the claim also checks the request's own cap,
     /// `2 + limit × 648` bytes.
     pub(super) fn claim_peers(&self, payload_len: usize) -> Result<u16, ClaimRefused> {
-        self.reservations.lock().claim_end(
-            &QueryKind::Peers,
-            u16::from(MSG_DISCOVERY_PEERS),
-            payload_len,
-        )?;
+        self.claim(QueryKind::Peers, MSG_DISCOVERY_PEERS, payload_len)?;
         let limit = self
             .snapshots
             .lock()
@@ -201,11 +203,7 @@ impl Queries {
         &self,
         payload_len: usize,
     ) -> Result<Vec<ZakuraServiceId>, ClaimRefused> {
-        self.reservations.lock().claim_end(
-            &QueryKind::Services,
-            u16::from(MSG_DISCOVERY_SERVICES),
-            payload_len,
-        )?;
+        self.claim(QueryKind::Services, MSG_DISCOVERY_SERVICES, payload_len)?;
         let wanted = std::mem::take(
             &mut self
                 .snapshots
@@ -221,10 +219,42 @@ impl Queries {
         Ok(wanted)
     }
 
+    /// Releases the queued answer the transport reader charged, then claims
+    /// the `kind` reservation with it.
+    fn claim(
+        &self,
+        kind: QueryKind,
+        message_type: u8,
+        payload_len: usize,
+    ) -> Result<(), ClaimRefused> {
+        let mut reservations = self.reservations.lock();
+        if self.transport_admits {
+            reservations.take_admitted(payload_len);
+        }
+        reservations
+            .claim_end(&kind, u16::from(message_type), payload_len)
+            .map(|_| ())
+    }
+
     /// Ends the session's queries: an unwritten query is skipped, and an
     /// unanswered written query closes the connection.
     pub(super) fn retire(&self) {
         self.fence.retire();
+    }
+}
+
+/// The transport reader's header check for both answers. It charges each
+/// queued answer to the reservations, so the queue holds at most the answers
+/// this node is owed.
+#[derive(Debug)]
+struct QueriesPrecheck(SharedReservations<QueryKind>);
+
+impl ResponsePrecheck for QueriesPrecheck {
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        self.0
+            .lock()
+            .admit(message_type, payload_len)
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
@@ -360,6 +390,51 @@ mod tests {
             .expect("an answered query frees its kind");
         recv.recv().await.expect("GetServices was queued");
         assert_eq!(queries.claim_services(services_len(0)), Ok(Vec::new()));
+    }
+
+    /// The transport reader queues at most the one `Peers` this node is owed.
+    /// Its claim releases the queued answer.
+    #[tokio::test]
+    async fn the_transport_reader_queues_at_most_the_owed_peers() {
+        let (mut queries, _connection, _close_cause) = new_queries();
+        queries.transport_admits = true;
+        let precheck = QueriesPrecheck(queries.reservations.clone());
+        let (send, mut recv) = framed_channel(4);
+        let cancel = CancellationToken::new();
+        let peers = u16::from(MSG_DISCOVERY_PEERS);
+
+        assert_eq!(
+            precheck.check(peers, peers_len(1)),
+            Err(FrameRejection::Unsolicited)
+        );
+        queries
+            .send_query(&send, &cancel, get_peers(1))
+            .await
+            .expect("the query is sent");
+        recv.recv().await.expect("the query was queued");
+
+        precheck
+            .check(peers, peers_len(1))
+            .expect("the owed answer queues");
+        assert!(matches!(
+            precheck.check(peers, peers_len(1)),
+            Err(FrameRejection::AboveOwed { .. })
+        ));
+        assert_eq!(queries.claim_peers(peers_len(1)), Ok(1));
+        assert_eq!(
+            precheck.check(peers, peers_len(1)),
+            Err(FrameRejection::Unsolicited)
+        );
+
+        // The claim released the queued answer, so the next answer queues.
+        queries
+            .send_query(&send, &cancel, get_peers(1))
+            .await
+            .expect("an answered query frees its kind");
+        recv.recv().await.expect("the query was queued");
+        precheck
+            .check(peers, peers_len(1))
+            .expect("the next owed answer queues");
     }
 
     /// Retiring the queries closes the connection only when a written query

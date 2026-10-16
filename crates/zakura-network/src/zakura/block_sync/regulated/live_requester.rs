@@ -41,14 +41,6 @@ impl Shared {
     }
 }
 
-fn frame_rejection(error: ClaimRefused) -> FrameRejection {
-    match error {
-        ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-        ClaimRefused::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
-        _ => FrameRejection::Unsolicited,
-    }
-}
-
 /// The transport reader's gate. Every response it queues stays charged until
 /// [`LiveRequester::authorize`] takes it, so the queue never holds more than
 /// the live ranges owe.
@@ -57,7 +49,9 @@ impl ResponsePrecheck for Shared {
         if !(3..=5).contains(&tag) {
             return Ok(());
         }
-        self.lock().admit(tag, len).map_err(frame_rejection)
+        self.lock()
+            .admit(tag, len)
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
@@ -198,7 +192,7 @@ impl LiveRequester {
             self.shared
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
-                .map_err(|error| SinkReject::protocol(frame_rejection(error)))?;
+                .map_err(|error| SinkReject::protocol(error.frame_rejection()))?;
             let header = block::Header::zcash_deserialize(&frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
             let result = self

@@ -792,7 +792,9 @@ pub const DEFAULT_MAX_DISCOVERY_BOOK_RECORDS: usize = 10_000;
 ///
 /// An honest relay discloses at most one window of 32 records per requester per
 /// 10-minute epoch, so this holds eight epochs of distinct windows. It stops one
-/// relay from filling the book and from forcing evictions on every insert.
+/// relay from filling the book. It does not bound eviction work: a relay's
+/// expired entries leave the book and return their room, so the `Peers`
+/// reservation, 32 records per `GetPeers`, bounds the inserts.
 pub const DEFAULT_MAX_DISCOVERY_RECORDS_PER_SOURCE: usize = 256;
 
 const HIGH_DIAL_FAILURE_COUNT: u32 = 3;
@@ -2623,6 +2625,12 @@ impl ZakuraDiscoveryHandle {
             .map(|entry| entry.live_summaries.clone())
     }
 
+    /// Holds every free verification slot until the returned permits drop.
+    #[cfg(test)]
+    pub(super) fn hold_verify_slots(&self) -> Vec<crate::zakura::regulation::SlotPermit> {
+        self.verify_slots.hold_free()
+    }
+
     /// Returns a stored discovery record for `node_id`, if present.
     pub async fn record_for(&self, node_id: NodeId) -> Option<ZakuraNodeRecord> {
         let inner = self.inner.lock().await;
@@ -2946,8 +2954,9 @@ impl ZakuraDiscoveryBook {
     /// for to other peers.
     ///
     /// Each disclosure epoch has one shuffled snapshot of the eligible node ids. A
-    /// requester's window is the `max_imported_records_per_response` ids that start at an
-    /// offset keyed by the book's process-local `disclosure_key` over `(requester, epoch)`.
+    /// requester's window is the `max_imported_records_per_response` ids, at most 32, that
+    /// start at an offset keyed by the book's process-local `disclosure_key` over
+    /// `(requester, epoch)`.
     /// The requester-controlled service filter and exclusion list apply only inside that
     /// window, so repeated queries from one requester within an epoch reveal one stable
     /// bounded subset of the book, no matter how the requester varies its limits, filters,
@@ -2972,7 +2981,7 @@ impl ZakuraDiscoveryBook {
         now: u64,
         requester: NodeId,
     ) -> Vec<ZakuraNodeRecord> {
-        let window = self.limits.max_imported_records_per_response;
+        let window = self.sample_window();
         let limit = limit.min(window);
         self.refresh_sample_snapshot(now);
         let snapshot = self
@@ -3005,6 +3014,15 @@ impl ZakuraDiscoveryBook {
         records
     }
 
+    /// A requester's window: the import limit, and never more than one
+    /// response's records, so a larger configured limit cannot widen what a
+    /// requester learns in an epoch.
+    fn sample_window(&self) -> usize {
+        self.limits
+            .max_imported_records_per_response
+            .min(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
+    }
+
     /// Whether `entry` may appear in a peer sample now.
     fn is_sample_eligible(&self, entry: &ZakuraDiscoveryEntry, now: u64) -> bool {
         self.local_node_id != Some(entry.record.body.node_id)
@@ -3018,7 +3036,7 @@ impl ZakuraDiscoveryBook {
     /// See [`Self::sample_peers`] for when a rebuild happens.
     fn refresh_sample_snapshot(&mut self, now: u64) {
         let epoch = now / DISCOVERY_DISCLOSURE_EPOCH.as_secs();
-        let window = self.limits.max_imported_records_per_response;
+        let window = self.sample_window();
         let stale = self.sample_snapshot.as_ref().is_none_or(|snapshot| {
             snapshot.epoch != epoch
                 || (snapshot.node_ids.len() <= window
@@ -3345,12 +3363,26 @@ impl ZakuraDiscoveryBook {
         validate_discovery_direct_addrs(&record, direct_addr_policy)?;
 
         let node_id = record.body.node_id;
+        // A relay may hold only so many entries. The author of a record is
+        // not a relay.
+        let relay_attributed = metadata
+            .source
+            .filter(|source| *source != node_id)
+            .map(|source| self.source_counts.get(&source).copied().unwrap_or(0));
+        let relay_full = relay_attributed
+            .is_some_and(|attributed| attributed >= self.limits.max_records_per_source);
         if let Some(entry) = self.entries.get_mut(&node_id) {
             let was_confirmed = entry.last_confirmed.is_some();
             let old_source = entry.source;
             let outcome = update_existing_entry(entry, record, metadata);
             if !was_confirmed && entry.last_confirmed.is_some() {
                 self.confirmations += 1;
+            }
+            // An update keeps the book's size, so it is never refused. A full
+            // relay keeps the entry's old source, so two relays cannot pass
+            // entries back and forth to add without bound.
+            if relay_full {
+                entry.source = old_source;
             }
             let new_source = entry.source;
             if new_source != old_source {
@@ -3359,17 +3391,12 @@ impl ZakuraDiscoveryBook {
             }
             return Ok(outcome);
         }
-        // A relay may add only so many new entries. An update keeps the
-        // book's size, so it is never refused for its source.
-        if let Some(source) = metadata.source.filter(|source| *source != node_id) {
-            let attributed = self.source_counts.get(&source).copied().unwrap_or(0);
-            if attributed >= self.limits.max_records_per_source {
-                return Err(DiscoveryBookError::Limit {
-                    field: "records per source",
-                    actual: attributed + 1,
-                    max: self.limits.max_records_per_source,
-                });
-            }
+        if let Some(attributed) = relay_attributed.filter(|_| relay_full) {
+            return Err(DiscoveryBookError::Limit {
+                field: "records per source",
+                actual: attributed + 1,
+                max: self.limits.max_records_per_source,
+            });
         }
         if metadata.last_confirmed.is_some() {
             self.confirmations += 1;
@@ -3488,11 +3515,14 @@ impl ZakuraDiscoveryBook {
                     .map(|(node_id, _)| *node_id)
             })
             .or_else(|| {
+                // Unconfirmed relayed records go first, so relays cannot
+                // evict the confirmed entries that peer samples disclose.
                 self.entries
                     .iter()
                     .filter(|(_, entry)| !entry.is_static)
                     .min_by_key(|(node_id, entry)| {
                         (
+                            entry.last_confirmed.is_some(),
                             entry.last_success.unwrap_or(0),
                             entry.last_seen,
                             node_id_sort_key(node_id),
@@ -6734,6 +6764,73 @@ mod tests {
         assert_eq!(book.discovered_len(), 2);
     }
 
+    /// A full book evicts unconfirmed relayed records before confirmed ones,
+    /// so relays cannot empty the sample snapshot's windows.
+    #[test]
+    fn relayed_records_cannot_evict_confirmed_entries() {
+        let mut book = small_book(2);
+        let requester = test_requester();
+        // The confirmed entry is the least recently seen.
+        let confirmed = signed_record_with(1, service(1), test_addr(1));
+        let author = confirmed.body.node_id;
+        book.import_record(confirmed.clone(), Some(author), NOW - 1, &context())
+            .expect("a first-party record imports");
+        assert_eq!(
+            book.sample_peers(32, &[], &[], NOW, requester),
+            vec![confirmed.clone()]
+        );
+
+        let relay = secret_key().public();
+        for index in 2..=5u8 {
+            book.import_record(
+                signed_record_with(index.into(), service(index.into()), test_addr(index)),
+                Some(relay),
+                NOW,
+                &context(),
+            )
+            .expect("a relayed record imports");
+        }
+        assert_eq!(book.discovered_len(), 2);
+        assert_eq!(
+            book.sample_peers(32, &[], &[], NOW, requester),
+            vec![confirmed]
+        );
+    }
+
+    /// A configured import limit above one response's records does not widen
+    /// a requester's window.
+    #[test]
+    fn sample_window_never_exceeds_one_response() {
+        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
+            max_imported_records_per_response: 2 * MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+            ..ZakuraDiscoveryBookLimits::default()
+        });
+        let requester = test_requester();
+        for index in 1..=40u8 {
+            import_confirmed_record(
+                &mut book,
+                signed_record_with(index.into(), service(index.into()), test_addr(index)),
+            )
+            .unwrap();
+        }
+        let first = book.sample_peers(MAX_DISCOVERY_RECORDS_PER_RESPONSE, &[], &[], NOW, requester);
+        assert_eq!(first.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+        let mut exclude: Vec<[u8; 32]> = first
+            .iter()
+            .map(|record| *record.body.node_id.as_bytes())
+            .collect();
+        exclude.sort_unstable();
+        assert!(book
+            .sample_peers(
+                MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+                &[],
+                &exclude,
+                NOW,
+                requester,
+            )
+            .is_empty());
+    }
+
     #[test]
     fn discovery_book_samples_are_bounded_excluded_and_service_filtered() {
         let mut book = ZakuraDiscoveryBook::default();
@@ -8652,6 +8749,25 @@ mod tests {
             &context(),
         )
         .expect("the relay is back under its quota");
+
+        // A relay at its quota cannot take over another relay's entry.
+        book.import_record(
+            long_lived_record_with(1, service(11), test_addr(52)),
+            Some(other_relay),
+            NOW,
+            &context(),
+        )
+        .expect("the other relay is under its quota");
+        book.import_record(records[0].clone(), Some(other_relay), NOW, &context())
+            .expect("an update adds no entry");
+        assert_eq!(
+            book.get(&records[0].body.node_id)
+                .expect("the entry is stored")
+                .source,
+            Some(relay)
+        );
+        assert_eq!(book.source_counts.get(&relay), Some(&QUOTA));
+        assert_eq!(book.source_counts.get(&other_relay), Some(&QUOTA));
     }
 
     /// A third-party gossiped record is a local dial hint only. Until its owner confirms

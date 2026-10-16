@@ -17,6 +17,8 @@ use crate::zakura::{
 pub(crate) use wire::*;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
 mod wire_tests;
 
 /// Decode fuzz bytes as one version 9 frame, and check that a decoded message

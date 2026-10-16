@@ -8,14 +8,16 @@ use std::{sync::Arc, time::Duration};
 use proptest::{collection::hash_set, prelude::*};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block, merkle::AuthDataRoot},
-    ironwood, orchard,
     parameters::Network,
-    sapling,
     serialization::{ZcashDeserialize, ZcashSerialize},
     work::difficulty::U256,
 };
 
-use super::{replay_header_sync_v9_codec_bytes, wire::*};
+use super::{
+    replay_header_sync_v9_codec_bytes,
+    test_support::{p, record, smallest_status, OUTCOME_CODES},
+    wire::*,
+};
 use crate::zakura::{
     check_frame_filter,
     header_sync::{
@@ -64,11 +66,6 @@ fn hash(byte: u8) -> block::Hash {
     block::Hash([byte; 32])
 }
 
-/// `P` on a network with `HEADER_BYTES`-byte headers.
-fn p<const HEADER_BYTES: usize>() -> u32 {
-    u32::try_from(smallest_page(HEADER_BYTES, AuxSchema::None)).expect("a page fits u32")
-}
-
 /// The genesis header of `network`.
 fn genesis_header(network: &Network) -> Arc<block::Header> {
     let bytes: &[u8] = match network {
@@ -99,41 +96,11 @@ fn header_bytes(header: &block::Header) -> Vec<u8> {
         .expect("a valid header encodes")
 }
 
-/// A schema-1 record with every root and count at its empty default.
-fn empty_aux(height: block::Height) -> TreeAuxRecordV1 {
-    TreeAuxRecordV1 {
-        height,
-        sapling_root: sapling::tree::Root::default(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx_count: 0,
-        orchard_tx_count: 0,
-        ironwood_tx_count: 0,
-        auth_data_root: AuthDataRoot::from([0; 32]),
-    }
-}
-
-/// A legal `Status` with every height and cap at its minimum.
-fn smallest_status<const HEADER_BYTES: usize>() -> Status {
-    Status {
-        work_anchor_height: block::Height(0),
-        work_anchor_hash: hash(0x11),
-        selected_tip_height: block::Height(0),
-        selected_tip_hash: hash(0x22),
-        suffix_cumulative_work: U256::zero(),
-        oldest_retained_height: block::Height(0),
-        max_headers_per_response: 1,
-        max_subscriptions: MAX_HS_SUBSCRIPTIONS,
-        max_message_bytes: p::<HEADER_BYTES>(),
-        tree_aux_schema_mask: 0,
-    }
-}
-
 /// A page of `count` copies of a real header, with the largest body-size
 /// hint and, under schema 1, an empty record each.
 fn page<const HEADER_BYTES: usize>(count: u32, schema: AuxSchema) -> Headers {
     let header = sample_header::<HEADER_BYTES>();
-    let record = empty_aux(block::Height(0));
+    let record = record(block::Height(0));
     Headers {
         subscription_id: 7,
         initial_target_tip_hash: hash(0x22),
@@ -172,15 +139,6 @@ fn outcome(subscription_id: u64, code: HeadersOutcomeCode) -> HeadersOutcome {
         outcome: code,
     }
 }
-
-const OUTCOME_CODES: [HeadersOutcomeCode; 6] = [
-    HeadersOutcomeCode::TargetNotRetained,
-    HeadersOutcomeCode::NoLocatorIntersection,
-    HeadersOutcomeCode::HistoryPruned,
-    HeadersOutcomeCode::TargetNotSelected,
-    HeadersOutcomeCode::SubscriptionSuperseded,
-    HeadersOutcomeCode::SubscriptionClosed,
-];
 
 impl WireSample for Work {
     fn boundary_values() -> Vec<U256> {
@@ -331,7 +289,7 @@ fn arbitrary_update<const HEADER_BYTES: usize>() -> BoxedStrategy<SubscribeHeade
 /// Valid pages of one to four copies of a real header.
 fn arbitrary_page<const HEADER_BYTES: usize>() -> BoxedStrategy<Headers> {
     let header = sample_header::<HEADER_BYTES>();
-    let record = empty_aux(block::Height(0));
+    let record = record(block::Height(0));
     let entry = (
         0..=2_000_000u32,
         HeightLe::arbitrary(),
@@ -593,7 +551,7 @@ impl RawPage {
     /// One real header with an empty schema-1 record.
     fn with_record(header: &block::Header) -> Self {
         let mut records = Vec::new();
-        empty_aux(block::Height(11))
+        record(block::Height(11))
             .encode_to(&mut records)
             .expect("a record encodes");
         Self {
@@ -964,7 +922,7 @@ fn fixtures<const HEADER_BYTES: usize>(network: &Network) -> Vec<(Frame, Message
         page(RawPage::valid(&header), None),
         page(
             RawPage::with_record(&header),
-            Some(empty_aux(block::Height(11))),
+            Some(record(block::Height(11))),
         ),
         (
             frame(4, outcome_payload(u64::MAX, 7)),

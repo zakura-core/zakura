@@ -202,9 +202,10 @@ struct PeerState {
     session: PeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
-    /// Authority of this session's last unsuccessful remote ordinary request.
+    /// Authority of this session's last failed ordinary attempt: an unsuccessful remote
+    /// request, or a locator read or `GetHeaders` send that failed before the request started.
     ///
-    /// A status replay skips this peer for that target, so two peers that both answer Busy
+    /// A status replay skips this peer for that target, so two peers that both fail it
     /// wait for a fresh status instead of handing the target back and forth.
     retired_target: Option<zakura_header_chain::HeaderWorkAuthority>,
     waiting_for_serving_slot: bool,
@@ -1184,7 +1185,9 @@ impl HeaderSyncReactor {
         };
         let work_order = target.claimed_work_order(local);
         let eligible = target.is_discovery_eligible(local);
-        if !eligible {
+        // A status too small for one header would only spend a locator read before its
+        // slot is released and replayed.
+        if !eligible || self.negotiated_response_limits(&target.status).1 == 0 {
             self.peer_work_queue.remove_unstarted(&peer);
             return;
         }
@@ -2772,7 +2775,7 @@ impl HeaderSyncReactor {
             return;
         };
         let Some(locator) = locator else {
-            self.peer_work_queue.remove_unstarted(&peer);
+            self.abandon_unstarted_attempt(&peer, target.scope);
             metrics::counter!("sync.header.target.locator_unavailable").increment(1);
             return;
         };
@@ -2804,32 +2807,8 @@ impl HeaderSyncReactor {
             return;
         };
 
-        let tree_aux_schema = if target.status.tree_aux_schema_mask
-            & self.serving_limits.tree_aux_schema_mask()
-            & AuxSchema::V1.mask_bit()
-            != 0
-        {
-            AuxSchema::V1
-        } else {
-            AuxSchema::None
-        };
-        let byte_limited_count = headers_response_capacity(
-            &self.startup.network,
-            tree_aux_schema,
-            usize::try_from(
-                target
-                    .status
-                    .max_message_bytes
-                    .min(self.serving_limits.max_message_bytes()),
-            )
-            .unwrap_or(usize::MAX),
-        );
-        let negotiated_header_count = target
-            .status
-            .max_headers_per_response
-            .min(self.serving_limits.max_headers_per_response())
-            .min(byte_limited_count)
-            .min(MAX_HS_RANGE);
+        let (tree_aux_schema, negotiated_header_count) =
+            self.negotiated_response_limits(&target.status);
         let max_header_count = negotiated_header_count.min(Self::request_header_prefix_remaining(
             &local,
             self.peer_work_queue.claimed_header_count(),
@@ -2900,7 +2879,7 @@ impl HeaderSyncReactor {
             }
             Err(error) => {
                 self.peer_work_queue.cancel_request_reservation(&peer);
-                self.peer_work_queue.remove_unstarted(&peer);
+                self.abandon_unstarted_attempt(&peer, target.scope);
                 self.emit_queue_send_failed(&peer, &session, "GetHeaders", &error, None);
                 metrics::counter!(
                     "sync.header.target.send_failed",
@@ -2908,6 +2887,49 @@ impl HeaderSyncReactor {
                 )
                 .increment(1);
             }
+        }
+    }
+
+    /// Returns the response schema and the most headers one response from `status`'s sender
+    /// can carry under both sides' advertised limits.
+    fn negotiated_response_limits(&self, status: &Status) -> (AuxSchema, u32) {
+        let tree_aux_schema = if status.tree_aux_schema_mask
+            & self.serving_limits.tree_aux_schema_mask()
+            & AuxSchema::V1.mask_bit()
+            != 0
+        {
+            AuxSchema::V1
+        } else {
+            AuxSchema::None
+        };
+        let byte_limited_count = headers_response_capacity(
+            &self.startup.network,
+            tree_aux_schema,
+            usize::try_from(
+                status
+                    .max_message_bytes
+                    .min(self.serving_limits.max_message_bytes()),
+            )
+            .unwrap_or(usize::MAX),
+        );
+        let header_count = status
+            .max_headers_per_response
+            .min(self.serving_limits.max_headers_per_response())
+            .min(byte_limited_count)
+            .min(MAX_HS_RANGE);
+        (tree_aux_schema, header_count)
+    }
+
+    /// Drops `peer`'s unstarted work after an attempt on `scope` failed before its request
+    /// started, and records it in `PeerState::retired_target` so replay skips it.
+    fn abandon_unstarted_attempt(
+        &mut self,
+        peer: &ZakuraPeerId,
+        scope: zakura_header_chain::HeaderWorkAuthority,
+    ) {
+        self.peer_work_queue.remove_unstarted(peer);
+        if let Some(state) = self.peer_state.get_mut(peer) {
+            state.retired_target = Some(scope);
         }
     }
 

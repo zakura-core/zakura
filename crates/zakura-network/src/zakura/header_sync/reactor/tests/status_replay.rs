@@ -355,3 +355,84 @@ fn replay_accounts_for_pending_locator_headroom() {
         "one remaining header slot must not launch two locator reads"
     );
 }
+
+/// Completes `peer`'s locator read through the port-completion path, which runs the replay.
+fn complete_locator(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: &ZakuraPeerId,
+    scope: zakura_header_chain::HeaderWorkAuthority,
+    target: block::Hash,
+    available: bool,
+) {
+    let peer = peer.clone();
+    let locator = available.then(|| {
+        zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.header_best)
+    });
+    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
+        reactor.handle_header_locator_ready(peer, 0, target, scope, locator);
+    })));
+}
+
+#[test]
+fn status_too_small_for_one_header_is_not_staged() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (first, _first_outbound) = connect(&mut reactor, 0x71);
+    let (second, _second_outbound) = connect(&mut reactor, 0x72);
+    let mut status = status_for(&snapshot, block::Hash([0x42; 32]));
+    status.max_message_bytes = 1;
+
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.replay_retained_statuses(&HashSet::new());
+    assert!(
+        actions.try_recv().is_err(),
+        "a status that cannot carry one header must not spend a locator read"
+    );
+    assert!(reactor.peer_work_queue.awaiting_target(&first).is_none());
+    assert!(reactor.peer_work_queue.awaiting_target(&second).is_none());
+}
+
+#[test]
+fn failed_locator_reads_do_not_alternate_between_cached_statuses() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (first, _first_outbound) = connect(&mut reactor, 0x71);
+    let (second, _second_outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    let scope = expect_locator_query(&mut actions, &first, target);
+    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+
+    complete_locator(&mut reactor, &snapshot, &first, scope, target, false);
+    let scope = expect_locator_query(&mut actions, &second, target);
+    complete_locator(&mut reactor, &snapshot, &second, scope, target, false);
+    assert!(
+        actions.try_recv().is_err(),
+        "each cached status gets one failed locator read until its peer sends a fresh status"
+    );
+}
+
+#[test]
+fn failed_sends_do_not_alternate_between_cached_statuses() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (first, first_outbound) = connect(&mut reactor, 0x71);
+    let (second, second_outbound) = connect(&mut reactor, 0x72);
+    drop(first_outbound);
+    drop(second_outbound);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    let scope = expect_locator_query(&mut actions, &first, target);
+    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+
+    complete_locator(&mut reactor, &snapshot, &first, scope, target, true);
+    assert!(reactor.peer_work_queue.active(&first).is_none());
+    let scope = expect_locator_query(&mut actions, &second, target);
+    complete_locator(&mut reactor, &snapshot, &second, scope, target, true);
+    assert!(reactor.peer_work_queue.active(&second).is_none());
+    assert!(
+        actions.try_recv().is_err(),
+        "each cached status gets one failed send until its peer sends a fresh status"
+    );
+}

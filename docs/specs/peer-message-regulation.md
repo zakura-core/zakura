@@ -395,7 +395,7 @@ renew validity. The handler MUST NOT suppress renewal merely because service val
 
 ### Header sync — stream 5, version 9
 
-Header sync version 9 uses capability bit 9. It replaces version 8 without a compatibility path.
+Header sync version 9 uses capability bit 10. It replaces version 8 without a compatibility path.
 Capability bit 5, which identified version 8, is retired and MUST NOT be reused. A peer that offers
 only version 8 negotiates no header sync stream.
 

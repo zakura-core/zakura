@@ -54,7 +54,7 @@
 //! becomes `SubscriptionSuperseded`.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     future::Future,
     num::NonZeroU32,
     ops::Bound,
@@ -76,7 +76,7 @@ use zakura_node_services::header_chain::{
 
 use super::{
     entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
-    SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, MAX_HS_SUBSCRIPTIONS, SUBSCRIBE_HEADERS,
+    SubscribeHeaders, HEADERS_RESPONSE_FIXED_BYTES, SUBSCRIBE_HEADERS,
 };
 use crate::zakura::{
     header_sync::{
@@ -124,7 +124,8 @@ pub(crate) enum PublisherFault {
     /// A rule the subscription tools enforce.
     #[error(transparent)]
     Subscription(#[from] SubscriptionFault),
-    /// A `Grant` or `Close` whose target or schema differs from its `Open`.
+    /// A `Grant` or `Close` on a live subscription whose target or schema
+    /// differs from its `Open`.
     #[error("the update changes its subscription's target or schema")]
     ChangedFields,
     /// An `Open` that asks for a schema this node does not advertise.
@@ -192,9 +193,6 @@ struct Shared {
     publications: Publications<u64, Cursor>,
     /// Live and closing subscriptions, in the same set as `publications`.
     subscriptions: BTreeMap<u64, Subscription>,
-    /// The fixed fields of tombstoned subscriptions, oldest first. It mirrors
-    /// the tombstones in `publications`.
-    ended: VecDeque<(u64, Fixed)>,
     /// The subscription served last, so two subscriptions take turns.
     last_served: Option<u64>,
 }
@@ -227,7 +225,6 @@ impl Publisher {
         let shared = Arc::new(Mutex::new(Shared {
             publications: Publications::new(limits_row),
             subscriptions: BTreeMap::new(),
-            ended: VecDeque::new(),
             last_served: None,
         }));
         let wake = Arc::new(Notify::new());
@@ -312,14 +309,6 @@ impl Shared {
                     update.added_credit,
                     update.acknowledged,
                 )?;
-                // `Publications::open` clears the oldest tombstones by this
-                // rule. Its module docs explain why.
-                let keep = usize::from(MAX_HS_SUBSCRIPTIONS)
-                    .saturating_sub(1)
-                    .saturating_sub(self.subscriptions.len());
-                while self.ended.len() > keep {
-                    self.ended.pop_front();
-                }
                 self.subscriptions.insert(
                     id,
                     Subscription {
@@ -333,21 +322,13 @@ impl Shared {
                 Ok(Applied::Live)
             }
             Operation::Grant | Operation::Close => {
-                let known = self
-                    .subscriptions
-                    .get(&id)
-                    .map(|subscription| subscription.fixed)
-                    .or_else(|| {
-                        self.ended
-                            .iter()
-                            .find(|(key, _)| *key == id)
-                            .map(|(_, fixed)| *fixed)
-                    });
-                if known.is_some_and(|known| known != fixed) {
+                // A tombstone matches by ID and sequence only, so only a
+                // live subscription checks the fixed fields.
+                let live = self.subscriptions.get(&id);
+                if live.is_some_and(|subscription| subscription.fixed != fixed) {
                     return Err(PublisherFault::ChangedFields);
                 }
-                let close = update.operation == Operation::Close;
-                let applied = if close {
+                let applied = if update.operation == Operation::Close {
                     self.publications
                         .close(&id, update.update_sequence, &update.acknowledged)?
                 } else {
@@ -358,19 +339,11 @@ impl Shared {
                         update.added_credit,
                     )?
                 };
-                match applied {
-                    Applied::Live => {
-                        // New credit may let a locally stalled subscription
-                        // retry.
-                        if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                            if matches!(subscription.stall, Some(Stall::Local)) {
-                                subscription.stall = None;
-                            }
-                        }
+                // New credit may let a locally stalled subscription retry.
+                if let Some(subscription) = self.subscriptions.get_mut(&id) {
+                    if matches!(subscription.stall, Some(Stall::Local)) {
+                        subscription.stall = None;
                     }
-                    // A crossed `Close` consumes its tombstone.
-                    Applied::Crossed if close => self.ended.retain(|(key, _)| *key != id),
-                    Applied::Crossed => {}
                 }
                 Ok(applied)
             }
@@ -407,11 +380,6 @@ impl Shared {
                     "the publisher queued {outcome:?} outside its window"
                 );
                 let terminal = self.publications.end(&id)?;
-                self.ended.push_back((id, subscription.fixed));
-                // `Publications::end` keeps this many tombstones.
-                while self.ended.len() > usize::from(MAX_HS_SUBSCRIPTIONS) * 2 {
-                    self.ended.pop_front();
-                }
                 metrics::counter!(
                     "sync.header.v9.publisher.outcome",
                     "outcome" => outcome_label(outcome),

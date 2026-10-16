@@ -8,7 +8,7 @@
 //! the publisher and from the mirror.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::Duration,
 };
 
@@ -1122,6 +1122,11 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
         .expect("a conformant grant applies");
     let crossing = harness.subscriber.grant(3, 0).expect("the window has room");
     assert_eq!(harness.apply(crossing.clone()).await, Ok(Applied::Crossed));
+    // A tombstone matches by ID and sequence, not by the fixed fields.
+    let mut moved = harness.subscriber.grant(3, 0).expect("the window has room");
+    moved.initial_target_tip_hash = block::Hash([4; 32]);
+    assert_eq!(harness.apply(moved.clone()).await, Ok(Applied::Crossed));
+    let crossing = moved;
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(HistoryPruned)]

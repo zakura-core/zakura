@@ -1962,7 +1962,7 @@ async fn run(ops: Vec<Op>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256)))]
 
     /// Generated sessions follow every page, marker, window, credit, and
     /// ownership rule, and the publisher's ledger matches the mirror.

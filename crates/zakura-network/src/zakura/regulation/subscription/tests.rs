@@ -964,7 +964,7 @@ fn pick<T: Copy + Ord>(keys: impl Iterator<Item = T>, pick: usize) -> Option<T> 
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(512)))]
 
     /// A conformant subscriber and publisher, joined by two ordered queues,
     /// never fault each other under any interleaving of updates, pages, and

@@ -1444,7 +1444,7 @@ fn run(ops: Vec<Op>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(512)))]
 
     /// A conformant publisher's pages and outcomes never fault the subscriber,
     /// and the subscriber's updates never fault the publisher's ledger, under

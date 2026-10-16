@@ -1027,7 +1027,7 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
 }
 
 /// `Close` with pages queued ends after them, and every update after `Close`
-/// faults before the end.
+/// faults, before and after the end.
 #[tokio::test(start_paused = true)]
 async fn close_with_pages_queued_ends_after_them() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -1070,15 +1070,16 @@ async fn close_with_pages_queued_ends_after_them() {
         received.last(),
         Some(&Received::Ended(HeadersOutcomeCode::SubscriptionClosed))
     );
-    // After the end, the tombstone answers as the subscription tools do.
-    assert_ne!(harness.apply(grant).await, Ok(Applied::Live));
+    // After the end, the tombstone remembers the Close, so the update still
+    // faults.
+    assert_eq!(harness.apply(grant).await, after_close);
     assert!(harness.deliver_all().await.is_empty());
     harness.check_quiet().await;
 }
 
 /// Updates that cross `SubscriptionSuperseded` or `HistoryPruned` are dropped
-/// up to the window, a crossing `Close` consumes the tombstone, and the next
-/// `Open` clears it.
+/// up to the window past the consumed credit and fault beyond it, a crossing
+/// `Close` consumes the tombstone, and the next `Open` clears it.
 #[tokio::test(start_paused = true)]
 async fn crossing_updates_drop_on_each_outcome_tombstone() {
     use HeadersOutcomeCode::*;
@@ -1100,20 +1101,22 @@ async fn crossing_updates_drop_on_each_outcome_tombstone() {
         assert_eq!(harness.apply(grant.clone()).await, Ok(Applied::Crossed));
         last = Some(grant);
     }
-    // One header beyond the window answers as the subscription tools do.
+    // The crossing grants used the whole window past the consumed credit, so
+    // one more header faults and changes nothing.
     let mut beyond = last.expect("the window had room");
     beyond.update_sequence += 1;
-    let applied = harness.apply(beyond.clone()).await;
-    assert_ne!(applied, Ok(Applied::Live));
+    assert_eq!(
+        harness.apply(beyond.clone()).await,
+        Err(PublisherFault::Subscription(
+            SubscriptionFault::CrossedAboveWindow
+        ))
+    );
     let mut close = beyond;
     close.operation = Operation::Close;
     close.added_credit = Credit {
         objects: 0,
         bytes: 0,
     };
-    if applied.is_ok() {
-        close.update_sequence += 1;
-    }
     assert_eq!(harness.apply(close.clone()).await, Ok(Applied::Crossed));
     let mut late = close;
     late.update_sequence += 1;

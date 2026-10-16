@@ -7,7 +7,7 @@ use futures::FutureExt;
 
 use super::*;
 use crate::zakura::{
-    discovery::{wire::PEERS_MAX_BYTES, DiscoveryMessage},
+    discovery::{wire::PEERS_MAX_BYTES, DiscoveryMessage, GetPeers},
     wire_codec::{decode_frame, encode_frame, WireError},
 };
 
@@ -31,7 +31,7 @@ impl RequestPolicy for GetPeersPolicy {
 
     fn decode(&self, frame: Frame) -> Result<GetPeersRequest, String> {
         match decode_frame::<DiscoveryMessage>(&frame).map_err(|e: WireError| e.to_string())? {
-            DiscoveryMessage::GetPeers { limit, .. } => Ok(GetPeersRequest { limit }),
+            DiscoveryMessage::GetPeers(GetPeers { limit, .. }) => Ok(GetPeersRequest { limit }),
             _ => Err("expected GetPeers".into()),
         }
     }
@@ -43,11 +43,11 @@ impl RequestPolicy for GetPeersPolicy {
 }
 
 pub(super) fn frame(limit: u16) -> Frame {
-    encode_frame(&DiscoveryMessage::GetPeers {
+    encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
         limit,
         wanted_services: vec![],
         exclude_node_ids: vec![],
-    })
+    }))
     .unwrap()
 }
 

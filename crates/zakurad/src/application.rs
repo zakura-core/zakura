@@ -1,4 +1,4 @@
-//! Zakurad Abscissa Application
+//! The `zakurad` process lifecycle.
 //!
 //! This is the code that starts `zakurad`, and launches its tasks and services.
 //! See [the crate docs](crate) and [the start docs](crate::commands::start) for more details.
@@ -6,34 +6,22 @@
 use std::{
     env,
     fmt::Write as _,
-    io::Write as _,
     process,
     sync::{Arc, OnceLock},
 };
 
-use abscissa_core::{
-    application::{self, AppCell},
-    config::CfgCell,
-    status_err,
-    terminal::{component::Terminal, stderr, stdout, ColorChoice},
-    Application, Component, Configurable, FrameworkError, Shutdown, StandardPaths,
-};
+use clap::Parser;
+use color_eyre::eyre::{eyre, Report};
 use semver::{BuildMetadata, Version};
-
 use tokio::sync::watch;
+
 use zakura_state::{state_database_format_version_in_code, state_database_format_version_on_disk};
 
-use crate::{commands::EntryPoint, components::tracing::Tracing, config::ZakuradConfig};
-
-/// See <https://docs.rs/abscissa_core/latest/src/abscissa_core/application/exit.rs.html#7-10>
-/// Print a fatal error message and exit
-fn fatal_error(app_name: String, err: &dyn std::error::Error) -> ! {
-    status_err!("{} fatal error: {}", app_name, err);
-    process::exit(1)
-}
-
-/// Application state
-pub static APPLICATION: AppCell<ZakuradApp> = AppCell::new();
+use crate::{
+    commands::EntryPoint,
+    components::{metrics, tracing::Tracing},
+    config::ZakuradConfig,
+};
 
 lazy_static::lazy_static! {
     /// The last log event that occurred in the application.
@@ -64,7 +52,7 @@ pub fn build_version() -> Version {
     // Docker builds do not include `.git`, so use the explicitly supplied
     // commit when `git describe` could not add build metadata.
     if version.build == BuildMetadata::EMPTY {
-        if let Some(git_commit) = ZakuradApp::git_commit() {
+        if let Some(git_commit) = git_commit() {
             let short_commit: String = git_commit.chars().take(12).collect();
             if let Ok(build) = BuildMetadata::new(&format!("g{short_commit}")) {
                 version.build = build;
@@ -163,6 +151,19 @@ fn vergen_build_version() -> Option<Version> {
     semver.parse().ok()
 }
 
+/// Returns the git commit for this build, if available.
+///
+/// # Accuracy
+///
+/// If the user makes changes, but does not commit them, the git commit will
+/// not match the compiled source code.
+pub fn git_commit() -> Option<&'static str> {
+    const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
+    const GIT_COMMIT_VERGEN: Option<&str> = option_env!("VERGEN_GIT_SHA");
+
+    GIT_COMMIT_GCLOUD.or(GIT_COMMIT_VERGEN)
+}
+
 /// The Zebra current release version, without any build metadata.
 pub fn release_version() -> Version {
     let mut release_version = build_version();
@@ -182,352 +183,253 @@ pub fn user_agent() -> String {
     format!("/Zakura:{release_version}/")
 }
 
-/// Zakurad Application
-#[derive(Debug, Default)]
-pub struct ZakuradApp {
-    /// Application configuration.
-    config: CfgCell<ZakuradConfig>,
+/// Runs `zakurad` with the process's command-line arguments, then exits the process.
+///
+/// Invalid arguments, `--help` and `--version` exit with the argument parser's status.
+/// Startup errors are printed to stderr and exit with status 1. Otherwise the command
+/// runs, its logs are flushed, and the process exits with status 0 if the command
+/// succeeded, or 1 if it failed.
+///
+/// A panic unwinds through [`run`], which drops the log writer and flushes its logs.
+pub fn boot() -> ! {
+    let args =
+        EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
+    let command = EntryPoint::try_parse_from(args).unwrap_or_else(|err| err.exit());
 
-    /// Application state.
-    state: application::State<Self>,
+    let status = run(&command);
+
+    process::exit(status)
 }
 
-impl ZakuradApp {
-    /// Returns the git commit for this build, if available.
-    ///
-    ///
-    /// # Accuracy
-    ///
-    /// If the user makes changes, but does not commit them, the git commit will
-    /// not match the compiled source code.
-    pub fn git_commit() -> Option<&'static str> {
-        const GIT_COMMIT_GCLOUD: Option<&str> = option_env!("SHORT_SHA");
-        const GIT_COMMIT_VERGEN: Option<&str> = option_env!("VERGEN_GIT_SHA");
+/// Sets up `zakurad` for `command`, runs it, and returns the process exit status.
+///
+/// Commands report their own errors, so a failed command only changes the status.
+/// The log writer is dropped before this returns, including while a panic unwinds,
+/// so the logs written while the command stops are flushed.
+fn run(command: &EntryPoint) -> i32 {
+    let (config, _tracing) = match start(command) {
+        Ok(started) => started,
+        Err(error) => {
+            report_fatal_error(&error);
+            return 1;
+        }
+    };
 
-        GIT_COMMIT_GCLOUD.or(GIT_COMMIT_VERGEN)
+    match command.cmd().run(config) {
+        Ok(()) => 0,
+        Err(_) => 1,
     }
 }
 
-impl Application for ZakuradApp {
-    /// Entrypoint command for this application.
-    type Cmd = EntryPoint;
+/// Prints an error that stopped `zakurad` from starting.
+#[allow(clippy::print_stderr)]
+fn report_fatal_error(error: &Report) {
+    eprintln!("error: {} fatal error: {error}", env!("CARGO_PKG_NAME"));
+}
 
-    /// Application configuration.
-    type Cfg = ZakuradConfig;
-
-    /// Paths to resources within the application.
-    type Paths = StandardPaths;
-
-    /// Accessor for application configuration.
-    fn config(&self) -> Arc<ZakuradConfig> {
-        self.config.read()
-    }
-
-    /// Borrow the application state immutably.
-    fn state(&self) -> &application::State<Self> {
-        &self.state
-    }
-
-    /// Returns the framework components used by this application.
-    fn framework_components(
-        &mut self,
-        _command: &Self::Cmd,
-    ) -> Result<Vec<Box<dyn Component<Self>>>, FrameworkError> {
-        // TODO: Open a PR in abscissa to add a TerminalBuilder for opting out
-        //       of the `color_eyre::install` part of `Terminal::new` without
-        //       ColorChoice::Never?
-
-        // The Tracing component uses stdout directly and will apply colors automatically.
-        //
-        // Note: It's important to use `ColorChoice::Never` here to avoid panicking in
-        //       `register_components()` below if `color_eyre::install()` is called
-        //       after `color_spantrace` has been initialized.
-        let terminal = Terminal::new(ColorChoice::Never);
-
-        Ok(vec![Box::new(terminal)])
-    }
-
-    /// Register all components used by this application.
-    ///
-    /// If you would like to add additional components to your application
-    /// beyond the default ones provided by the framework, this is the place
-    /// to do so.
-    #[allow(clippy::print_stderr)]
-    #[allow(clippy::unwrap_in_result)]
-    fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};
-
-        let mut components = self.framework_components(command)?;
-
-        // Load config *after* framework components so that we can
-        // report an error to the terminal if it occurs (unless used with a command that doesn't need the config).
-        let config = match ZakuradConfig::load(command.config_path()) {
-            Ok(config) => config,
-            // Ignore errors loading the config for some commands.
-            Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
-            Err(e) => {
-                status_err!(
-                    "Zakura could not load the provided configuration file and/or environment variables.\
-                     This might mean you are using a deprecated format of the file, or are attempting to
+/// Loads the configuration for `command`, then sets up error reporting, the Rayon
+/// thread pool and tracing. Server commands also get the metrics endpoint.
+///
+/// The order matches what earlier releases did, so a config error is reported before
+/// anything else is set up, and later setup steps are logged. The one change is that
+/// `start` now builds its async runtime after the metrics endpoint opens, which logs
+/// nothing.
+#[allow(clippy::print_stderr, clippy::unwrap_in_result)]
+fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> {
+    let config = match ZakuradConfig::load(command.config_path()) {
+        Ok(config) => config,
+        // Ignore errors loading the config for some commands.
+        Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
+        Err(e) => {
+            // The line break and the indentation after it are part of the message that
+            // `zakurad` has always printed.
+            eprintln!(
+                "error: Zakura could not load the provided configuration file and/or environment variables.\
+                 This might mean you are using a deprecated format of the file, or are attempting to
                      configure deprecated or unknown fields via environment variables.\
-                     You can generate a valid config by running \"zakurad generate\", \
-                     and diff it against yours to examine any format inconsistencies."
-                );
-                // Report the configuration error through the framework.
-                let io_error = std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Configuration error: {}", e),
-                );
-                return Err(FrameworkError::from(io_error));
-            }
-        };
+                 You can generate a valid config by running \"zakurad generate\", \
+                 and diff it against yours to examine any format inconsistencies."
+            );
+            return Err(eyre!("I/O operation failed: Configuration error: {e}"));
+        }
+    };
 
-        let config = command.process_config(config)?;
+    let config = command.process_config(config)?;
 
-        let theme = if config.tracing.use_color_stdout_and_stderr() {
-            color_eyre::config::Theme::dark()
-        } else {
-            color_eyre::config::Theme::new()
-        };
+    let theme = if config.tracing.use_color_stdout_and_stderr() {
+        color_eyre::config::Theme::dark()
+    } else {
+        color_eyre::config::Theme::new()
+    };
 
-        // collect the common metadata for the panic report,
-        // skipping any env vars that aren't present
+    // collect the common metadata for the panic report,
+    // skipping any env vars that aren't present
 
-        // reads state disk version file, doesn't open RocksDB database
-        let disk_db_version = match state_database_format_version_on_disk(
-            &config.mirrored_state_config(),
-            &config.network.network,
-        ) {
-            Ok(Some(version)) => version.to_string(),
-            // This "version" is specially formatted to match a relaxed version regex in CI
-            Ok(None) => "creating.new.database".to_string(),
-            Err(error) => {
-                let mut error = format!("error: {error:?}");
-                error.truncate(100);
-                error
-            }
-        };
+    // reads state disk version file, doesn't open RocksDB database
+    let disk_db_version = match state_database_format_version_on_disk(
+        &config.mirrored_state_config(),
+        &config.network.network,
+    ) {
+        Ok(Some(version)) => version.to_string(),
+        // This "version" is specially formatted to match a relaxed version regex in CI
+        Ok(None) => "creating.new.database".to_string(),
+        Err(error) => {
+            let mut error = format!("error: {error:?}");
+            error.truncate(100);
+            error
+        }
+    };
 
-        let app_metadata = [
-            // build-time constant: cargo or git tag + short commit
-            ("version", build_version().to_string()),
-            // config
-            ("Zcash network", config.network.network.to_string()),
-            // code constant
-            (
-                "running state version",
-                state_database_format_version_in_code().to_string(),
-            ),
-            // state disk file, doesn't open database
-            ("initial disk state version", disk_db_version),
-            // build-time constant
-            ("features", env!("VERGEN_CARGO_FEATURES").to_string()),
-        ];
+    let app_metadata = [
+        // build-time constant: cargo or git tag + short commit
+        ("version", build_version().to_string()),
+        // config
+        ("Zcash network", config.network.network.to_string()),
+        // code constant
+        (
+            "running state version",
+            state_database_format_version_in_code().to_string(),
+        ),
+        // state disk file, doesn't open database
+        ("initial disk state version", disk_db_version),
+        // build-time constant
+        ("features", env!("VERGEN_CARGO_FEATURES").to_string()),
+    ];
 
-        // git env vars can be skipped if there is no `.git` during the
-        // build, so they must all be optional
-        let git_metadata: &[(_, Option<_>)] = &[
-            ("branch", option_env!("VERGEN_GIT_BRANCH")),
-            ("git commit", Self::git_commit()),
-            (
-                "commit timestamp",
-                option_env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
-            ),
-        ];
-        // skip missing metadata
-        let git_metadata: Vec<(_, String)> = git_metadata
-            .iter()
-            .filter_map(|(k, v)| Some((k, (*v)?)))
-            .map(|(k, v)| (*k, v.to_string()))
-            .collect();
-
-        let build_metadata: Vec<_> = [
-            ("target triple", env!("VERGEN_CARGO_TARGET_TRIPLE")),
-            ("rust compiler", env!("VERGEN_RUSTC_SEMVER")),
-            ("rust release date", env!("VERGEN_RUSTC_COMMIT_DATE")),
-            ("optimization level", env!("VERGEN_CARGO_OPT_LEVEL")),
-            ("debug checks", env!("VERGEN_CARGO_DEBUG")),
-        ]
+    // git env vars can be skipped if there is no `.git` during the
+    // build, so they must all be optional
+    let git_metadata: &[(_, Option<_>)] = &[
+        ("branch", option_env!("VERGEN_GIT_BRANCH")),
+        ("git commit", git_commit()),
+        (
+            "commit timestamp",
+            option_env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
+        ),
+    ];
+    // skip missing metadata
+    let git_metadata: Vec<(_, String)> = git_metadata
         .iter()
+        .filter_map(|(k, v)| Some((k, (*v)?)))
         .map(|(k, v)| (*k, v.to_string()))
         .collect();
 
-        let panic_metadata: Vec<_> = app_metadata
-            .iter()
-            .chain(git_metadata.iter())
-            .chain(build_metadata.iter())
-            .collect();
+    let build_metadata: Vec<_> = [
+        ("target triple", env!("VERGEN_CARGO_TARGET_TRIPLE")),
+        ("rust compiler", env!("VERGEN_RUSTC_SEMVER")),
+        ("rust release date", env!("VERGEN_RUSTC_COMMIT_DATE")),
+        ("optimization level", env!("VERGEN_CARGO_OPT_LEVEL")),
+        ("debug checks", env!("VERGEN_CARGO_DEBUG")),
+    ]
+    .iter()
+    .map(|(k, v)| (*k, v.to_string()))
+    .collect();
 
-        let mut metadata_section = "Diagnostic metadata:".to_string();
-        for (k, v) in panic_metadata {
-            write!(&mut metadata_section, "\n{k}: {v}")
-                .expect("unexpected failure writing to string");
-        }
+    let panic_metadata: Vec<_> = app_metadata
+        .iter()
+        .chain(git_metadata.iter())
+        .chain(build_metadata.iter())
+        .collect();
 
-        let builder = color_eyre::config::HookBuilder::default()
-            .theme(theme)
-            .panic_section(metadata_section.clone());
+    let mut metadata_section = "Diagnostic metadata:".to_string();
+    for (k, v) in panic_metadata {
+        write!(&mut metadata_section, "\n{k}: {v}").expect("unexpected failure writing to string");
+    }
 
-        // This MUST happen after `Terminal::new` to ensure our preferred panic
-        // handler is the last one installed
-        let (panic_hook, eyre_hook) = builder.into_hooks();
-        eyre_hook.install().expect("eyre_hook.install() error");
-        panic_hook.install();
+    let builder = color_eyre::config::HookBuilder::default()
+        .theme(theme)
+        .panic_section(metadata_section.clone());
 
-        // Apply the configured number of threads to the thread pool.
-        //
-        // TODO:
-        // - set rayon panic handler to a function that takes `Box<dyn Any + Send + 'static>`,
-        //   which reports through the panic hook. If possible, use eyre's panic report for formatting.
-        // - do we also need to call this code in `zakura_consensus::init()`,
-        //   when that crate is being used by itself?
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.sync.parallel_cpu_threads)
-            .thread_name(|thread_index| format!("rayon {thread_index}"))
-            .build_global()
-            .expect("unable to initialize rayon thread pool");
+    let (panic_hook, eyre_hook) = builder.into_hooks();
+    eyre_hook.install().expect("eyre_hook.install() error");
+    panic_hook.install();
 
-        let default_filter = command.cmd().default_tracing_filter(command.verbose);
-        let is_server = command.cmd().is_server();
+    // Apply the configured number of threads to the thread pool.
+    //
+    // Known limits, kept from earlier releases:
+    // - Rayon uses its default panic handler, which doesn't report through the panic hook.
+    // - `zakura_consensus::init()` doesn't configure this pool when that crate is used by
+    //   itself.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(config.sync.parallel_cpu_threads)
+        .thread_name(|thread_index| format!("rayon {thread_index}"))
+        .build_global()
+        .expect("unable to initialize rayon thread pool");
 
-        // Ignore the configured tracing filter for short-lived utility commands
-        let mut tracing_config = config.tracing.clone();
-        let metrics_config = config.metrics.clone();
-        if is_server {
-            // Override the default tracing filter based on the command-line verbosity.
-            tracing_config.filter = tracing_config
-                .filter
-                .clone()
-                .or_else(|| Some(default_filter.to_owned()));
+    let default_filter = command.cmd().default_tracing_filter(command.verbose);
+    let is_server = command.cmd().is_server();
+
+    // Ignore the configured tracing filter for short-lived utility commands
+    let mut tracing_config = config.tracing.clone();
+    if is_server {
+        // Override the default tracing filter based on the command-line verbosity.
+        tracing_config.filter = tracing_config
+            .filter
+            .clone()
+            .or_else(|| Some(default_filter.to_owned()));
+    } else {
+        // Don't apply the configured filter for short-lived commands.
+        tracing_config.filter = Some(default_filter.to_owned());
+    }
+
+    let tracing = Tracing::new(
+        &config.network.network,
+        tracing_config,
+        command.cmd().uses_intro(),
+    )?;
+
+    // Log git metadata and platform info when zakurad starts up
+    if is_server {
+        info!("{metadata_section}");
+
+        if command.config_path().is_some() {
+            info!("Using config file at: {:?}", command.config_path().unwrap());
         } else {
-            // Don't apply the configured filter for short-lived commands.
-            tracing_config.filter = Some(default_filter.to_owned());
-        }
-        components.push(Box::new(Tracing::new(
-            &config.network.network,
-            tracing_config,
-            command.cmd().uses_intro(),
-        )?));
-
-        // Log git metadata and platform info when zakurad starts up
-        if is_server {
-            info!("{metadata_section}");
-
-            if command.config_path().is_some() {
-                info!("Using config file at: {:?}", command.config_path().unwrap());
-            } else {
-                info!("No config file provided, using default configuration");
-            }
-
-            // Log only selected diagnostics. The full config can contain credentials.
-            info!(
-                network = %config.network.network,
-                p2p_stack = ?config.network.p2p_stack.resolve(&config.network.network),
-                peerset_initial_target_size = config.network.peerset_initial_target_size,
-                ephemeral_state = config.state.ephemeral,
-                "loaded node configuration",
-            );
-
-            // Explicitly log the configured miner address so CI can assert env override
-            if let Some(miner_address) = &config.mining.miner_address {
-                info!(%miner_address, "configured miner address");
-            }
+            info!("No config file provided, using default configuration");
         }
 
-        // Activate the global span, so it's visible when we load the other
-        // components. Space is at a premium here, so we use an empty message,
-        // short commit hash, and the unique part of the network name.
-        let net = config.network.network.to_string();
-        let net = match net.as_str() {
-            default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
-            other_net_name => other_net_name,
-        };
-        let global_span = if let Some(git_commit) = ZakuradApp::git_commit() {
-            error_span!("", zakurad = git_commit, net)
-        } else {
-            error_span!("", net)
-        };
-
-        let global_guard = global_span.enter();
-        // leak the global span, to make sure it stays active
-        std::mem::forget(global_guard);
-
-        tracing::info!(
-            num_threads = rayon::current_num_threads(),
-            "initialized rayon thread pool for CPU-bound tasks",
+        // Log only selected diagnostics. The full config can contain credentials.
+        info!(
+            network = %config.network.network,
+            p2p_stack = ?config.network.p2p_stack.resolve(&config.network.network),
+            peerset_initial_target_size = config.network.peerset_initial_target_size,
+            ephemeral_state = config.state.ephemeral,
+            "loaded node configuration",
         );
 
-        // Launch network and async endpoints only for long-running commands.
-        if is_server {
-            components.push(Box::new(TokioComponent::new()?));
-            components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
-        }
-
-        self.state.components_mut().register(components)?;
-
-        // Fire callback to signal state in the application lifecycle
-        self.after_config(config)
-    }
-
-    /// Load this application's configuration and initialize its components.
-    #[allow(clippy::unwrap_in_result)]
-    fn init(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        // Create and register components with the application.
-        // We do this first to calculate a proper dependency ordering before
-        // application configuration is processed
-        self.register_components(command)
-    }
-
-    /// Post-configuration lifecycle callback.
-    ///
-    /// Called regardless of whether config is loaded to indicate this is the
-    /// time in app lifecycle when configuration would be loaded if
-    /// possible.
-    fn after_config(&mut self, config: Self::Cfg) -> Result<(), FrameworkError> {
-        // Configure components
-        self.state.components_mut().after_config(&config)?;
-        self.config.set_once(config);
-
-        Ok(())
-    }
-
-    fn shutdown(&self, shutdown: Shutdown) -> ! {
-        // Some OSes require a flush to send all output to the terminal.
-        // zakurad's logging uses Abscissa, so we flush its streams.
-        //
-        // TODO:
-        // - if this doesn't work, send an empty line as well
-        // - move this code to the tracing component's `before_shutdown()`
-        let _ = stdout().lock().flush();
-        let _ = stderr().lock().flush();
-
-        let shutdown_result = self.state().components().shutdown(self, shutdown);
-
-        self.state()
-            .components_mut()
-            .get_downcast_mut::<Tracing>()
-            .map(Tracing::shutdown);
-
-        if let Err(e) = shutdown_result {
-            let app_name = self.name().to_string();
-            fatal_error(app_name, &e);
-        }
-
-        match shutdown {
-            Shutdown::Graceful => process::exit(0),
-            Shutdown::Forced => process::exit(1),
-            Shutdown::Crash => process::exit(2),
+        // Explicitly log the configured miner address so CI can assert env override
+        if let Some(miner_address) = &config.mining.miner_address {
+            info!(%miner_address, "configured miner address");
         }
     }
-}
 
-/// Boot the given application, parsing subcommand and options from
-/// command-line arguments, and terminating when complete.
-// <https://docs.rs/abscissa_core/0.7.0/src/abscissa_core/application.rs.html#174-178>
-pub fn boot(app_cell: &'static AppCell<ZakuradApp>) -> ! {
-    let args =
-        EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
+    // Activate the global span, so it's visible when we load the other
+    // components. Space is at a premium here, so we use an empty message,
+    // short commit hash, and the unique part of the network name.
+    let net = config.network.network.to_string();
+    let net = match net.as_str() {
+        default_net_name @ ("Testnet" | "Mainnet") => &default_net_name[..4],
+        other_net_name => other_net_name,
+    };
+    let global_span = if let Some(git_commit) = git_commit() {
+        error_span!("", zakurad = git_commit, net)
+    } else {
+        error_span!("", net)
+    };
 
-    ZakuradApp::run(app_cell, args);
-    process::exit(0);
+    let global_guard = global_span.enter();
+    // leak the global span, to make sure it stays active
+    std::mem::forget(global_guard);
+
+    tracing::info!(
+        num_threads = rayon::current_num_threads(),
+        "initialized rayon thread pool for CPU-bound tasks",
+    );
+
+    // Start the metrics endpoint while the global span is still open, so its logs are in
+    // that span, as in earlier releases.
+    if is_server {
+        metrics::start_endpoint(&config.metrics);
+    }
+
+    Ok((Arc::new(config), tracing))
 }

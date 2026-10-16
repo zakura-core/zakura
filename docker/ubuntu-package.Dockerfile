@@ -18,7 +18,6 @@ RUN apt-get update && \
     git \
     libclang-dev \
     pkg-config \
-    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_HOME=/root/.cargo

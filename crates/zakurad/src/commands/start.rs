@@ -80,7 +80,6 @@ use std::{
     sync::Arc,
 };
 
-use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
@@ -110,11 +109,10 @@ use crate::{
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
-        tokio::{RuntimeRun, TokioComponent},
+        tokio::{new_runtime, RuntimeRun},
         zcashd_compat, ChainSync, Inbound,
     },
     config::ZakuradConfig,
-    prelude::*,
 };
 
 struct BlockSyncDriverExitGuard {
@@ -149,7 +147,7 @@ fn supervise_block_sync_driver(
 use crate::components;
 
 /// Start the application (default command)
-#[derive(Command, Debug, Default, clap::Parser)]
+#[derive(Debug, Default, clap::Parser)]
 pub struct StartCmd {
     /// Filter strings which override the config file and defaults
     #[clap(help = "tracing filters which override the zakura.toml config")]
@@ -1331,38 +1329,46 @@ impl StartCmd {
     }
 }
 
-impl Runnable for StartCmd {
-    /// Start the application.
-    fn run(&self) {
-        info!("Starting zakurad");
-        let rt = APPLICATION
-            .state()
-            .components_mut()
-            .get_downcast_mut::<TokioComponent>()
-            .expect("TokioComponent should be available")
-            .rt
-            .take();
-
-        rt.expect("runtime should not already be taken")
-            .run_with_graceful_shutdown(|shutdown, shutdown_cleanup_required| {
-                self.start(
-                    APPLICATION.config(),
-                    Vec::new(),
-                    None,
-                    shutdown,
-                    shutdown_cleanup_required,
-                )
-            });
-
-        info!("stopping zakurad");
-    }
+/// Returns an error for a config that `start` can't run with.
+///
+/// The message keeps the "I/O operation failed" prefix that `zakurad` has always printed
+/// for these errors, so existing log searches keep matching.
+fn config_error(error: impl std::fmt::Display) -> Report {
+    eyre!("I/O operation failed: {error}")
 }
 
-impl config::Override<ZakuradConfig> for StartCmd {
-    // Process the given command line options, overriding settings from
-    // a configuration file using explicit flags taken from command-line
-    // arguments.
-    fn override_config(&self, mut config: ZakuradConfig) -> Result<ZakuradConfig, FrameworkError> {
+impl StartCmd {
+    /// Creates the async runtime, runs the node on it until a shutdown signal or a fatal
+    /// error, then stops the runtime.
+    ///
+    /// Returns the node's error after logging it.
+    pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
+        let runtime = new_runtime();
+
+        info!("Starting zakurad");
+
+        runtime.run_with_graceful_shutdown(|shutdown, shutdown_cleanup_required| {
+            self.start(
+                config,
+                Vec::new(),
+                None,
+                shutdown,
+                shutdown_cleanup_required,
+            )
+        })?;
+
+        info!("stopping zakurad");
+
+        Ok(())
+    }
+
+    /// Process the given command line options, overriding settings from
+    /// a configuration file using explicit flags taken from command-line
+    /// arguments, then checks the resulting config.
+    pub(crate) fn override_config(
+        &self,
+        mut config: ZakuradConfig,
+    ) -> Result<ZakuradConfig, Report> {
         if !self.filters.is_empty() {
             config.tracing.filter = Some(self.filters.join(","));
         }
@@ -1375,27 +1381,25 @@ impl config::Override<ZakuradConfig> for StartCmd {
         }
 
         if !config.zcashd_compat.enabled && !config.zcashd_compat.block_gossip_peer_ips.is_empty() {
-            return Err(std::io::Error::other(
+            return Err(config_error(
                 "zcashd_compat.block_gossip_peer_ips requires zcashd_compat.enabled = true",
-            )
-            .into());
+            ));
         }
 
         if config.zcashd_compat.enabled {
             if !config.network.legacy_p2p() {
-                return Err(std::io::Error::other(
+                return Err(config_error(
                     "zcashd-compat P2P sidecar mode requires the legacy Zcash P2P stack, \
                      because zcashd syncs from Zakura over it; set network.p2p_stack to \
                      \"legacy\" or \"dual\"",
-                )
-                .into());
+                ));
             }
 
             if config.zcashd_compat.manage_zcashd {
                 zcashd_compat::reject_peer_selection_extra_args(
                     &config.zcashd_compat.zcashd_extra_args,
                 )
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+                .map_err(config_error)?;
             }
 
             if config.zcashd_compat.manage_zcashd {
@@ -1403,23 +1407,20 @@ impl config::Override<ZakuradConfig> for StartCmd {
                     Ok(zcashd_compat::ZcashdBinarySource::Path(path))
                         if !zcashd_compat::is_command_resolvable(Path::new(&path)) =>
                     {
-                        return Err(std::io::Error::other(format!(
+                        return Err(config_error(format!(
                             "zcashd-compat mode could not resolve zcashd_path={}",
                             path.display()
-                        ))
-                        .into());
+                        )));
                     }
                     Ok(_) => {}
-                    Err(err) => return Err(std::io::Error::other(err.to_string()).into()),
+                    Err(err) => return Err(config_error(err)),
                 }
             }
         }
 
-        Self::validate_consensus_config(&config)
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-        Self::validate_debug_blocksync_throughput_config(&config)
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-        config.rpc.validate().map_err(std::io::Error::other)?;
+        Self::validate_consensus_config(&config).map_err(config_error)?;
+        Self::validate_debug_blocksync_throughput_config(&config).map_err(config_error)?;
+        config.rpc.validate().map_err(config_error)?;
 
         Ok(config)
     }
@@ -1427,7 +1428,6 @@ impl config::Override<ZakuradConfig> for StartCmd {
 
 #[cfg(test)]
 mod tests {
-    use abscissa_core::config::Override;
     use color_eyre::eyre::eyre;
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;

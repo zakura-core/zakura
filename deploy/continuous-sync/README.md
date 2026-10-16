@@ -518,7 +518,7 @@ For a fresh Ubuntu x86_64 host:
    apt-get update
    apt-get install -y \
      build-essential clang cmake git libclang-dev pkg-config \
-     protobuf-compiler python3 logrotate
+     python3 logrotate
    ```
 
 5. Install the Rust toolchain specified by `rust-toolchain.toml`.

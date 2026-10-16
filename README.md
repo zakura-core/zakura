@@ -85,8 +85,7 @@ compiler. Below are quick summaries for installing these dependencies.
    - **libclang**, which is a library that comes under various names, typically
      `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
    - **clang** or another C++ compiler (`g++`, which is for all platforms, or
-     `Xcode`, which is for macOS);
-   - **[`protoc`](https://grpc.io/docs/protoc-installation/)** (optional).
+     `Xcode`, which is for macOS).
 
 </details>
 
@@ -99,7 +98,7 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 ```sh
-sudo pacman -S rust clang protobuf
+sudo pacman -S rust clang
 ```
 
 Note that the package `clang` includes `libclang` as well.

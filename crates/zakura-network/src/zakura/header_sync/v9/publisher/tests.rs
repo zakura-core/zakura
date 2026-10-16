@@ -1223,6 +1223,32 @@ async fn a_page_job_panic_reaches_the_session_owner() {
     assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
+/// A following page whose headers leave the selected chain while it is in
+/// progress is dropped and read again toward the new tip.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_that_leaves_the_selected_chain_is_read_again() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read while the chain reorgs
+    // onto a branch that forks at the last header sent.
+    port.grow(2);
+    harness.drain().await;
+    assert_eq!(port.store().reads_running, 1);
+    let side = port.store().extend(chain[2], 3);
+    port.select(side[2]);
+    port.gate.add_permits(1);
+    let received = harness.deliver_all().await;
+    let h = block::Height;
+    assert_eq!(pages(&received), [(h(3), h(6), false)], "{received:?}");
+    assert!(matches!(received[0], Received::Page { last, .. } if last == side[2]));
+    harness.check_quiet().await;
+}
+
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,
 /// and an unadvertised schema fault.
 #[tokio::test(start_paused = true)]

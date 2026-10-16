@@ -18,14 +18,13 @@
 
 use std::{fs, path::PathBuf};
 
-use abscissa_core::{Command, Runnable};
 use clap::Parser;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 
 use zakura_chain::{block::Height, parameters::Network};
 
 /// Prove a historical subtree-root artifact against a note commitment frontier
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct VerifyHistoricalTreestatesCmd {
     /// The network the artifact was generated for.
     #[clap(
@@ -61,17 +60,14 @@ pub struct VerifyHistoricalTreestatesCmd {
     frontier_grid_input: Option<PathBuf>,
 }
 
-impl Runnable for VerifyHistoricalTreestatesCmd {
-    /// `verify-historical-treestates` sub-command entrypoint.
-    fn run(&self) {
-        if let Err(error) = self.verify() {
-            tracing::error!("Subtree-root artifact verification failed: {error:#}");
-            std::process::exit(1);
-        }
-    }
-}
-
 impl VerifyHistoricalTreestatesCmd {
+    /// `verify-historical-treestates` sub-command entrypoint.
+    pub(crate) fn run(&self) -> Result<()> {
+        self.verify().inspect_err(|error| {
+            tracing::error!("Subtree-root artifact verification failed: {error:#}")
+        })
+    }
+
     /// Runs the check, returning an error if any root could not be proven.
     #[allow(clippy::print_stdout)]
     fn verify(&self) -> Result<()> {

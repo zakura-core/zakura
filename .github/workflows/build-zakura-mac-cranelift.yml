@@ -43,7 +43,7 @@ jobs:
           set -euo pipefail
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          brew install cmake protobuf
+          brew install cmake
           rustup toolchain install nightly-2026-09-30 --profile minimal \
             --component rust-src --component rustc-dev --component llvm-tools --component rustfmt
           git clone https://github.com/rust-lang/rustc_codegen_cranelift.git "$RUNNER_TEMP/backend"

@@ -1,10 +1,8 @@
 //! Zakurad Subcommands
 
-#![allow(non_local_definitions)]
+use std::{path::PathBuf, sync::Arc};
 
-use std::path::PathBuf;
-
-use abscissa_core::{config::Override, Command, Configurable, FrameworkError, Runnable};
+use color_eyre::eyre::Report;
 
 use zakura_chain::common::preference_dir;
 
@@ -40,7 +38,7 @@ pub const CONFIG_FILE: &str = "zakura.toml";
 const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 
 /// Zakurad Subcommands
-#[derive(Command, Debug, clap::Subcommand)]
+#[derive(Debug, clap::Subcommand)]
 pub enum ZakuradCmd {
     /// Audit historical note commitment treestate serving in the state database
     AuditHistoricalTreestates(AuditHistoricalTreestatesCmd),
@@ -139,26 +137,28 @@ impl ZakuradCmd {
             "debug"
         }
     }
-}
 
-impl Runnable for ZakuradCmd {
-    fn run(&self) {
+    /// Runs this command with the loaded `config`.
+    ///
+    /// A command reports its own failure before returning an error, so callers only need
+    /// to turn the error into an exit status.
+    pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
         match self {
-            AuditHistoricalTreestates(cmd) => cmd.run(),
+            AuditHistoricalTreestates(cmd) => cmd.run(&config),
             Generate(cmd) => cmd.run(),
-            PruneState(cmd) => cmd.run(),
-            RollbackState(cmd) => cmd.run(),
-            Start(cmd) => cmd.run(),
-            TipHeight(cmd) => cmd.run(),
+            PruneState(cmd) => cmd.run(&config),
+            RollbackState(cmd) => cmd.run(&config),
+            Start(cmd) => cmd.run(config),
+            TipHeight(cmd) => cmd.run(&config),
             VerifyHistoricalTreestates(cmd) => cmd.run(),
         }
     }
-}
 
-/// This trait allows you to define how application configuration is loaded.
-impl Configurable<ZakuradConfig> for ZakuradCmd {
-    /// Location of the configuration file
-    fn config_path(&self) -> Option<PathBuf> {
+    /// Returns the config file in the preference directory, if there is one.
+    ///
+    /// Prefers `zakura.toml`, and falls back to a legacy `zebrad.toml` with a
+    /// deprecation warning.
+    pub(crate) fn config_path(&self) -> Option<PathBuf> {
         let if_exists = |f: PathBuf| if f.exists() { Some(f) } else { None };
 
         preference_dir().and_then(|path| {
@@ -183,12 +183,8 @@ impl Configurable<ZakuradConfig> for ZakuradCmd {
         // edits in generate.rs
     }
 
-    /// Apply changes to the config after it's been loaded, e.g. overriding
-    /// values in a config file using command-line options.
-    ///
-    /// This can be safely deleted if you don't want to override config
-    /// settings from command-line options.
-    fn process_config(&self, config: ZakuradConfig) -> Result<ZakuradConfig, FrameworkError> {
+    /// Applies this command's options to the loaded `config`, and checks the result.
+    pub(crate) fn process_config(&self, config: ZakuradConfig) -> Result<ZakuradConfig, Report> {
         match self {
             ZakuradCmd::Start(cmd) => cmd.override_config(config),
             _ => Ok(config),

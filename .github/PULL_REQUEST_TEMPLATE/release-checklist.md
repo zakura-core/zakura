@@ -181,6 +181,12 @@ Check that the release will work:
       warns when publishable crates changed since the latest release tag without
       a package version bump. This warning is local-only and advisory; unchanged
       crates are not bumped or published.
+- [ ] For every new publishable crate, link its reservation PR in
+      [`zakura-core/reserved`](https://github.com/zakura-core/reserved), confirm
+      its initial publication exists on crates.io, and verify that Sean Bowe
+      (`ebfull`) appears in `cargo owner --list <crate-name>` after accepting
+      any invitation. Configure the trusted publisher before publication; see
+      the [setup instructions](https://github.com/zakura-core/zakura/blob/main/docs/release-tag-protection.md#one-time-setup).
 - [ ] Confirm the crates.io publish graph resolves at workspace versions
       (`./scripts/check-crate-publish-graph.sh`, step 5 of `make
       pre-release`). PR CI already runs this as the `crates.io publish

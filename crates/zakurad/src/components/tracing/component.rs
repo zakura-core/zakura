@@ -1,12 +1,11 @@
-//! The Abscissa component for Zakura's `tracing` implementation.
+//! Zakura's `tracing` setup.
 
 use std::{
     fs::{self, File},
     io::Write,
 };
 
-use abscissa_core::{Component, FrameworkError};
-
+use color_eyre::eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
 use tracing_error::ErrorLayer;
@@ -40,10 +39,18 @@ use super::non_blocking::{non_blocking, WorkerGuard};
 // paste -d "\0" logo.utf8 heart.utf8 > zakura.utf8
 static ZAKURA_ART: [u8; include_bytes!("zakura.utf8").len()] = *include_bytes!("zakura.utf8");
 
+#[cfg(all(test, feature = "opentelemetry"))]
+mod tests;
+
+/// Returns a tracing setup error, with the prefix `zakurad` has always printed for it.
+fn io_error(error: std::io::Error) -> Report {
+    eyre!("I/O operation failed: {error}")
+}
+
 /// A type-erased boxed writer that can be sent between threads safely.
 pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
-/// Abscissa component for initializing the `tracing` subsystem
+/// The global `tracing` subscriber's log writer and OpenTelemetry exporter.
 pub struct Tracing {
     /// The OpenTelemetry tracer provider, if enabled.
     #[cfg(feature = "opentelemetry")]
@@ -64,11 +71,7 @@ impl Tracing {
     //
     // This method should only print to stderr, because stdout is for tracing logs.
     #[allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
-    pub fn new(
-        network: &Network,
-        config: Config,
-        uses_intro: bool,
-    ) -> Result<Self, FrameworkError> {
+    pub fn new(network: &Network, config: Config, uses_intro: bool) -> Result<Self, Report> {
         // Only use color if tracing output is being sent to a terminal or if it was explicitly
         // forced to.
         let use_color = config.use_color_stdout();
@@ -130,7 +133,11 @@ impl Tracing {
                 // We want this to appear on stdout instead of the usual log messages.
                 println!("Sending logs to {log_file:?}...");
             }
-            let log_file = File::options().append(true).create(true).open(log_file)?;
+            let log_file = File::options()
+                .append(true)
+                .create(true)
+                .open(log_file)
+                .map_err(io_error)?;
             Box::new(log_file) as BoxWrite
         } else {
             let stdout = std::io::stdout();
@@ -138,7 +145,8 @@ impl Tracing {
         };
 
         // Queue logs for the background writer, dropping new logs when full.
-        let (non_blocking, worker_guard) = non_blocking(writer, config.buffer_limit.max(100))?;
+        let (non_blocking, worker_guard) =
+            non_blocking(writer, config.buffer_limit.max(100)).map_err(io_error)?;
 
         // Construct a format subscriber with the supplied global logging filter.
         //
@@ -191,10 +199,7 @@ impl Tracing {
 
         #[cfg(feature = "journald")]
         let journaldlayer = if config.use_journald {
-            use abscissa_core::FrameworkErrorKind;
-
-            let layer = tracing_journald::layer()
-                .map_err(|e| FrameworkErrorKind::ComponentError.context(e))?;
+            let layer = tracing_journald::layer().map_err(|e| eyre!("component error: {e}"))?;
 
             // If the global filter can't be used, add a per-layer filter instead.
             // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
@@ -312,6 +317,9 @@ impl Tracing {
 
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
+    ///
+    /// Shuts down the OpenTelemetry exporter first, so its errors are logged. Calling this
+    /// more than once, or dropping `Tracing` afterwards, does nothing more.
     pub fn shutdown(&mut self) {
         #[cfg(feature = "opentelemetry")]
         if let Some(provider) = self.otel_provider.take() {
@@ -324,19 +332,20 @@ impl Tracing {
     }
 }
 
-impl std::fmt::Debug for Tracing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tracing").finish()
+impl Drop for Tracing {
+    /// Shuts down tracing, then flushes the standard output streams.
+    fn drop(&mut self) {
+        self.shutdown();
+
+        // Some OSes require a flush to send all output to the terminal.
+        let _ = std::io::stdout().lock().flush();
+        let _ = std::io::stderr().lock().flush();
     }
 }
 
-impl<A: abscissa_core::Application> Component<A> for Tracing {
-    fn id(&self) -> abscissa_core::component::Id {
-        abscissa_core::component::Id::new("zakurad::components::tracing::component::Tracing")
-    }
-
-    fn version(&self) -> abscissa_core::Version {
-        build_version()
+impl std::fmt::Debug for Tracing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tracing").finish()
     }
 }
 

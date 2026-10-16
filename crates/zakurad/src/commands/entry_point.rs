@@ -1,7 +1,7 @@
 //! Zakurad EntryPoint
 
-use abscissa_core::{Command, Configurable, FrameworkError, Runnable};
 use clap::Parser;
+use color_eyre::eyre::Report;
 use std::{ffi::OsString, path::PathBuf};
 
 use crate::config::ZakuradConfig;
@@ -85,32 +85,9 @@ impl EntryPoint {
     }
 }
 
-impl Runnable for EntryPoint {
-    fn run(&self) {
-        self.cmd().run()
-    }
-}
-
-impl Command for EntryPoint {
-    /// Name of this program as a string
-    fn name() -> &'static str {
-        ZakuradCmd::name()
-    }
-
-    /// Description of this program
-    fn description() -> &'static str {
-        ZakuradCmd::description()
-    }
-
-    /// Authors of this program
-    fn authors() -> &'static str {
-        ZakuradCmd::authors()
-    }
-}
-
-impl Configurable<ZakuradConfig> for EntryPoint {
+impl EntryPoint {
     /// Path to the command's configuration file
-    fn config_path(&self) -> Option<PathBuf> {
+    pub fn config_path(&self) -> Option<PathBuf> {
         match &self.config {
             // Use explicit `-c`/`--config` argument if passed
             Some(cfg) => Some(cfg.clone()),
@@ -122,7 +99,7 @@ impl Configurable<ZakuradConfig> for EntryPoint {
 
     /// Process the configuration after it has been loaded, potentially
     /// modifying it or returning an error if options are incompatible
-    fn process_config(&self, config: ZakuradConfig) -> Result<ZakuradConfig, FrameworkError> {
+    pub fn process_config(&self, config: ZakuradConfig) -> Result<ZakuradConfig, Report> {
         self.cmd().process_config(config)
     }
 }

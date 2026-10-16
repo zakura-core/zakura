@@ -1704,19 +1704,13 @@ proptest! {
 }
 
 /// Feed every written frame to the real subscriber, accepting each page as
-/// validated and applying each due `Grant`. Returns each page's parent and
-/// last heights with its marker, and the outcome, if one ended the
-/// subscription.
+/// validated and applying each due `Grant`.
 async fn follow(
     harness: &mut Harness,
     subscriber: &mut super::super::subscriber::Subscriber<HB>,
     staging: u32,
-) -> (
-    Vec<(block::Height, block::Height, bool)>,
-    Option<HeadersOutcomeCode>,
-) {
-    let mut pages = Vec::new();
-    let mut ended = None;
+) -> Vec<Received> {
+    let mut received = Vec::new();
     harness.drain().await;
     while let Some(frame) = harness.inbox.pop_front() {
         subscriber
@@ -1729,11 +1723,11 @@ async fn follow(
                 let admitted = subscriber
                     .receive_page(&page, frame.payload.len())
                     .expect("the publisher's pages pass the subscriber");
-                pages.push((
-                    admitted.parent.height,
-                    admitted.cursor.height,
-                    admitted.reaches_target,
-                ));
+                received.push(Received::Page {
+                    parent: admitted.parent,
+                    last: Frontier::new(admitted.cursor.height, admitted.cursor.hash),
+                    marker: admitted.reaches_target,
+                });
                 let grant = subscriber
                     .accept_through(admitted.id, &admitted.cursor, staging)
                     .expect("a received page is accepted");
@@ -1745,15 +1739,15 @@ async fn follow(
                 }
             }
             Message::HeadersOutcome(outcome) => {
-                let end = subscriber
+                let ended = subscriber
                     .receive_outcome(&outcome)
                     .expect("the publisher's outcomes land in their windows");
-                ended = Some(end.outcome);
+                received.push(Received::Ended(ended.outcome));
             }
             other => panic!("the publisher wrote {other:?}"),
         }
     }
-    (pages, ended)
+    received
 }
 
 /// The real subscriber follows the real publisher. A small staging budget
@@ -1780,24 +1774,25 @@ async fn the_subscriber_follows_the_publisher() {
         )
         .expect("the first Open is recorded");
     assert_eq!(harness.apply(open).await, Ok(Applied::Live));
-    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
     assert_eq!(
-        pages,
+        pages(&follow(&mut harness, &mut subscriber, 6).await),
         [
             (h(3), h(6), false),
             (h(6), h(9), false),
             (h(9), h(10), true)
         ]
     );
-    assert_eq!(ended, None);
     port.grow(4);
-    let (pages, _) = follow(&mut harness, &mut subscriber, 6).await;
-    assert_eq!(pages, [(h(10), h(13), false), (h(13), h(14), false)]);
+    assert_eq!(
+        pages(&follow(&mut harness, &mut subscriber, 6).await),
+        [(h(10), h(13), false), (h(13), h(14), false)]
+    );
     let close = subscriber.close().expect("Close is recorded");
     assert_eq!(harness.apply(close).await, Ok(Applied::Live));
-    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
-    assert!(pages.is_empty());
-    assert_eq!(ended, Some(HeadersOutcomeCode::SubscriptionClosed));
+    assert_eq!(
+        follow(&mut harness, &mut subscriber, 6).await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionClosed)]
+    );
 
     // A locator at the target: no path page, then a push that extends it.
     let tip = port.tip();
@@ -1810,17 +1805,17 @@ async fn the_subscriber_follows_the_publisher() {
         )
         .expect("the terminal outcome freed the slot");
     assert_eq!(harness.apply(open).await, Ok(Applied::Live));
-    assert_eq!(
-        follow(&mut harness, &mut subscriber, 6).await,
-        (vec![], None)
-    );
+    assert!(follow(&mut harness, &mut subscriber, 6).await.is_empty());
     port.grow(1);
-    let (pages, _) = follow(&mut harness, &mut subscriber, 6).await;
-    assert_eq!(pages, [(h(14), h(15), false)]);
+    assert_eq!(
+        pages(&follow(&mut harness, &mut subscriber, 6).await),
+        [(h(14), h(15), false)]
+    );
     let side = port.store().tree.extend(chain[8], 7);
     port.select(side[6]);
-    let (pages, ended) = follow(&mut harness, &mut subscriber, 6).await;
-    assert!(pages.is_empty());
-    assert_eq!(ended, Some(HeadersOutcomeCode::SubscriptionSuperseded));
+    assert_eq!(
+        follow(&mut harness, &mut subscriber, 6).await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
     harness.check_quiet().await;
 }

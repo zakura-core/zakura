@@ -6,6 +6,7 @@ pub(super) struct CapacityPort(pub(super) port::ServingCapacitySignal);
 impl port::Port for CapacityPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,

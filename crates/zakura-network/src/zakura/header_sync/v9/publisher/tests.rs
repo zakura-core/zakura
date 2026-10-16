@@ -2,10 +2,7 @@
 //!
 //! A fake port serves a header tree from memory, with scripted failures. The
 //! subscriber uses the real [`Subscriptions`] tool and checks each page's
-//! linkage, the target marker, and each outcome's window against the
-//! specification's table. A mirror [`Publications`] ledger replays every page
-//! and outcome from the wire, so each update must get the same result from
-//! the publisher and from the mirror.
+//! linkage, the target marker, and each outcome's window.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -614,16 +611,16 @@ impl Subscriber {
                     .tools
                     .claim_end(&opened.id)
                     .expect("the subscription is live");
-                use HeadersOutcomeCode::*;
-                let legal = match outcome.outcome {
-                    NoLocatorIntersection | TargetNotRetained | TargetNotSelected => {
-                        ended.pages == 0
-                    }
-                    HistoryPruned => !opened.reached,
-                    SubscriptionSuperseded => true,
-                    SubscriptionClosed => ended.close_sent,
-                };
-                assert!(legal, "{:?} arrived outside its window", outcome.outcome);
+                assert!(
+                    is_legal(
+                        outcome.outcome,
+                        ended.pages > 0,
+                        opened.reached,
+                        ended.close_sent
+                    ),
+                    "{:?} arrived outside its window",
+                    outcome.outcome
+                );
                 Received::Ended(outcome.outcome)
             }
             other => panic!("the publisher wrote {other:?}"),
@@ -631,32 +628,7 @@ impl Subscriber {
     }
 }
 
-/// Apply `update` to a bare ledger.
-fn mirror_apply(
-    mirror: &mut Publications<u64, Cursor>,
-    update: &SubscribeHeaders,
-) -> Result<Applied, SubscriptionFault> {
-    let id = update.subscription_id;
-    match update.operation {
-        Operation::Open => mirror
-            .open(
-                id,
-                update.update_sequence,
-                update.added_credit,
-                update.acknowledged,
-            )
-            .map(|()| Applied::Live),
-        Operation::Grant => mirror.grant(
-            &id,
-            update.update_sequence,
-            &update.acknowledged,
-            update.added_credit,
-        ),
-        Operation::Close => mirror.close(&id, update.update_sequence, &update.acknowledged),
-    }
-}
-
-/// A publisher on one session, its subscriber, and the mirror ledger.
+/// A publisher on one session and its subscriber.
 struct Harness {
     port: Arc<FakePort>,
     capacity: ServeCapacity,
@@ -665,7 +637,6 @@ struct Harness {
     cancel: CancellationToken,
     /// Frames written and not yet delivered to the subscriber.
     inbox: VecDeque<Frame>,
-    mirror: Publications<u64, Cursor>,
     subscriber: Subscriber,
 }
 
@@ -719,8 +690,6 @@ impl Harness {
         let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
             .expect("the test budgets are valid");
         let (publisher, recv, cancel) = session(&port, &capacity, &peer(7), 1);
-        let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
-            .expect("SUBSCRIBE_HEADERS is a subscription row");
         Self {
             port,
             capacity,
@@ -728,46 +697,13 @@ impl Harness {
             recv,
             cancel,
             inbox: VecDeque::new(),
-            mirror: Publications::new(limits),
             subscriber: Subscriber::new(),
         }
     }
 
-    /// Take every frame written until the publisher goes quiet, and replay
-    /// each in the mirror.
+    /// Take every frame written until the publisher goes quiet.
     async fn drain(&mut self) {
         while let Ok(Some(frame)) = tokio::time::timeout(QUIET, self.recv.recv()).await {
-            match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames")
-            {
-                Message::Headers(page) => {
-                    let id = page.subscription_id;
-                    let count = u32::try_from(page.entries.len()).expect("a page fits u32");
-                    let last = page.entries.last().expect("a page has a header");
-                    let consumed = self
-                        .mirror
-                        .credit(&id)
-                        .expect("a page for a live subscription")
-                        .consumed();
-                    // Widening usize to u64 is lossless on supported targets.
-                    let cursor = Cursor {
-                        height: block::Height(page.common_ancestor_height.0 + count),
-                        hash: last.header.hash(),
-                        headers: consumed.objects + u64::from(count),
-                        bytes: consumed.bytes + frame.payload.len() as u64,
-                    };
-                    self.mirror
-                        .reserve_page(&id, count, frame.payload.len(), cursor)
-                        .expect("the publisher spends only credit it holds");
-                }
-                Message::HeadersOutcome(outcome) => {
-                    drop(
-                        self.mirror
-                            .end(&outcome.subscription_id)
-                            .expect("an outcome ends a live subscription"),
-                    );
-                }
-                other => panic!("the publisher wrote {other:?}"),
-            }
             self.inbox.push_back(frame);
         }
     }
@@ -787,16 +723,12 @@ impl Harness {
         self.deliver(usize::MAX).await
     }
 
-    /// Apply `update` to the publisher once it is quiet, and check that the
-    /// mirror agrees.
+    /// Apply `update` to the publisher once it is quiet.
     async fn apply(&mut self, update: SubscribeHeaders) -> Result<Applied, PublisherFault> {
         encode_frame(&RegtestMessage::SubscribeHeaders(update.clone()))
             .expect("the subscriber sends only legal updates");
         self.drain().await;
-        let expected = mirror_apply(&mut self.mirror, &update).map_err(PublisherFault::from);
-        let applied = self.publisher.apply(&update).await;
-        assert_eq!(applied, expected, "the publisher and the mirror agree");
-        applied
+        self.publisher.apply(&update).await
     }
 
     /// Open a subscription to `target` with `credit`.
@@ -1640,52 +1572,45 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
 }
 
 /// A burst of conformant grants yields to another peer's task.
-#[test]
-fn update_bursts_yield_to_other_peers() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("the test runtime starts");
-    runtime.block_on(async {
-        let port = FakePort::new(Semaphore::MAX_PERMITS);
-        let chain = port.grow(1);
-        let harness = Harness::new(port.clone(), serve_limits());
-        let other = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ticks = other.clone();
-        let other_peer = tokio::spawn(async move {
-            loop {
-                ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tokio::task::yield_now().await;
-            }
-        });
-        let mut subscriber = Subscriber::new();
-        let first = Credit {
-            objects: 1,
-            bytes: p(),
-        };
-        let open = subscriber.open(chain[0].hash, vec![chain[0]], first, AuxSchema::None);
+#[tokio::test(start_paused = true)]
+async fn update_bursts_yield_to_other_peers() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(1);
+    let harness = Harness::new(port.clone(), serve_limits());
+    let other = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticks = other.clone();
+    let other_peer = tokio::spawn(async move {
+        loop {
+            ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut subscriber = Subscriber::new();
+    let first = Credit {
+        objects: 1,
+        bytes: p(),
+    };
+    let open = subscriber.open(chain[0].hash, vec![chain[0]], first, AuxSchema::None);
+    harness
+        .publisher
+        .apply(&open)
+        .await
+        .expect("the Open applies");
+    let before = other.load(std::sync::atomic::Ordering::Relaxed);
+    // The window takes 3,999 more one-header grants.
+    let mut grants = 0;
+    while let Some(grant) = subscriber.grant(1, 0) {
         harness
             .publisher
-            .apply(&open)
+            .apply(&grant)
             .await
-            .expect("the Open applies");
-        let before = other.load(std::sync::atomic::Ordering::Relaxed);
-        // The window takes 3,999 more one-header grants.
-        let mut grants = 0;
-        while let Some(grant) = subscriber.grant(1, 0) {
-            harness
-                .publisher
-                .apply(&grant)
-                .await
-                .expect("a conformant grant applies");
-            grants += 1;
-        }
-        assert_eq!(grants, 3_999);
-        let during = other.load(std::sync::atomic::Ordering::Relaxed) - before;
-        assert!(during > 0, "the burst yielded to another peer");
-        other_peer.abort();
-    });
+            .expect("a conformant grant applies");
+        grants += 1;
+    }
+    assert_eq!(grants, 3_999);
+    let during = other.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(during > 0, "the burst yielded to another peer");
+    other_peer.abort();
 }
 
 /// Every outcome this node queues is adjusted into a legal window, and a

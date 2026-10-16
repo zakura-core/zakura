@@ -16,7 +16,7 @@ use zakura_quic::{NodeId, NodeSecretKey};
 
 use super::{
     protocol::{
-        BlockSyncServiceSummary, DiscoveryMessage, DiscoveryServiceSummary, GetServices,
+        BlockSyncServiceSummary, DiscoveryMessage, DiscoveryServiceSummary, GetPeers, GetServices,
         ServiceSummaryEnvelope, Services, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
         MAX_DIRECT_ADDRS_PER_RECORD, MAX_DISCOVERY_EXCLUDED_NODE_IDS,
         MAX_DISCOVERY_RECORDS_PER_RESPONSE, MAX_GET_PEERS_WANTED_SERVICES, MAX_GET_SERVICES_WANTED,
@@ -120,7 +120,7 @@ fn longest_body(node_id: NodeId) -> ZakuraNodeRecordBody {
 }
 
 fn longest_get_peers() -> DiscoveryMessage {
-    DiscoveryMessage::GetPeers {
+    DiscoveryMessage::GetPeers(GetPeers {
         limit: MAX_DISCOVERY_RECORDS_PER_RESPONSE as u16,
         wanted_services: (0..MAX_GET_PEERS_WANTED_SERVICES)
             .map(longest_service)
@@ -129,7 +129,7 @@ fn longest_get_peers() -> DiscoveryMessage {
             .iter()
             .map(|node_id| *node_id.as_bytes())
             .collect(),
-    }
+    })
 }
 
 fn longest_peers() -> DiscoveryMessage {
@@ -396,11 +396,11 @@ impl MessageSample for DiscoveryMessage {
                     ..shortest_body(node_ids()[1])
                 }),
             },
-            Self::GetPeers {
+            Self::GetPeers(GetPeers {
                 limit: 1,
                 wanted_services: Vec::new(),
                 exclude_node_ids: Vec::new(),
-            },
+            }),
             longest_get_peers(),
             Self::Peers {
                 records: Vec::new(),
@@ -435,11 +435,11 @@ impl MessageSample for DiscoveryMessage {
                 ),
             )
                 .prop_map(|(limit, wanted_services, exclude_node_ids)| {
-                    Self::GetPeers {
+                    Self::GetPeers(GetPeers {
                         limit,
                         wanted_services,
                         exclude_node_ids,
-                    }
+                    })
                 }),
             proptest::collection::vec(arbitrary_record(), 0..=4).prop_map(|mut records| {
                 dedup_by_key(&mut records, |record| record.body.node_id);
@@ -736,11 +736,11 @@ message_suite!(discovery_family, DiscoveryMessage);
 #[test]
 fn the_encoder_refuses_what_the_decoder_rejects() {
     let get_peers = |limit: u16, wanted: Vec<ZakuraServiceId>, excluded: Vec<NodeId>| {
-        DiscoveryMessage::GetPeers {
+        DiscoveryMessage::GetPeers(GetPeers {
             limit,
             wanted_services: wanted,
             exclude_node_ids: excluded.iter().map(|id| *id.as_bytes()).collect(),
-        }
+        })
     };
     let services = |summaries: Vec<ServiceSummaryEnvelope>| {
         DiscoveryMessage::Services(Services {

@@ -15,8 +15,8 @@ use zakura_quic::NodeId;
 
 use super::protocol::{
     network_id_from_code, summary_tag_service, validate_known_summary_payload,
-    validate_record_body_bounds, DiscoveryMessage, GetServices, ServiceSummaryEnvelope, Services,
-    ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, MAX_DIRECT_ADDRS_PER_RECORD,
+    validate_record_body_bounds, DiscoveryMessage, GetPeers, GetServices, ServiceSummaryEnvelope,
+    Services, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, MAX_DIRECT_ADDRS_PER_RECORD,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
     MAX_GET_PEERS_WANTED_SERVICES, MAX_GET_SERVICES_WANTED, MAX_NODE_RECORD_BODY_BYTES,
     MAX_NODE_RECORD_BYTES, MAX_SERVICES_PER_RECORD, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
@@ -68,19 +68,29 @@ const GET_PEERS_MAX_BYTES: usize = 2
     + 2
     + MAX_DISCOVERY_EXCLUDED_NODE_IDS * NODE_ID_BYTES;
 /// The largest `Peers` payload.
-pub(crate) const PEERS_MAX_BYTES: usize =
-    2 + MAX_DISCOVERY_RECORDS_PER_RESPONSE * MAX_NODE_RECORD_BYTES;
+pub(crate) const PEERS_MAX_BYTES: usize = peers_bytes(MAX_DISCOVERY_RECORDS_PER_RESPONSE);
+/// The cap of the largest `Peers`, one response's records.
+pub(crate) const LARGEST_PEERS: ResponseCap = ResponseCap {
+    frames: 0,
+    // Widening usize to u64 is lossless on supported targets.
+    bytes: PEERS_MAX_BYTES as u64,
+};
+
+/// A `Peers` payload's record count and `records` of the largest records.
+const fn peers_bytes(records: usize) -> usize {
+    2 + records * MAX_NODE_RECORD_BYTES
+}
 
 /// The most a `Peers` answer to a `GetPeers` with `limit` may carry: one frame
-/// with the record count and at most `limit` records. The responder's `Serve`
-/// reserves output for it.
+/// with at most `limit` records.
 pub(crate) fn peers_cap(limit: u16) -> ResponseCap {
-    // Widening usize to u64 is lossless on supported targets.
     ResponseCap {
         frames: 0,
-        bytes: 2 + u64::from(limit) * MAX_NODE_RECORD_BYTES as u64,
+        // Widening usize to u64 is lossless on supported targets.
+        bytes: peers_bytes(usize::from(limit)) as u64,
     }
 }
+
 const GET_SERVICES_MAX_BYTES: usize = 2 + MAX_GET_SERVICES_WANTED * SERVICE_ID_MAX_BYTES;
 /// A `Services` payload's fixed prefix: node id, expiry, and summary count.
 pub(crate) const SERVICES_FIXED_BYTES: usize = NODE_ID_BYTES + 8 + 2;
@@ -173,7 +183,7 @@ impl WireMessage for DiscoveryMessage {
     fn message_type(&self) -> u16 {
         u16::from(match self {
             Self::Hello { .. } => MSG_DISCOVERY_HELLO,
-            Self::GetPeers { .. } => MSG_DISCOVERY_GET_PEERS,
+            Self::GetPeers(_) => MSG_DISCOVERY_GET_PEERS,
             Self::Peers { .. } => MSG_DISCOVERY_PEERS,
             Self::GetServices(_) => MSG_DISCOVERY_GET_SERVICES,
             Self::Services(_) => MSG_DISCOVERY_SERVICES,
@@ -183,16 +193,12 @@ impl WireMessage for DiscoveryMessage {
     fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         match self {
             Self::Hello { record } => write_record(record, out),
-            Self::GetPeers {
-                limit,
-                wanted_services,
-                exclude_node_ids,
-            } => {
-                check_limit(*limit)?;
-                out.extend_from_slice(&limit.to_le_bytes());
-                write_wanted(wanted_services, MAX_GET_PEERS_WANTED_SERVICES, out)?;
+            Self::GetPeers(query) => {
+                check_limit(query.limit)?;
+                out.extend_from_slice(&query.limit.to_le_bytes());
+                write_wanted(&query.wanted_services, MAX_GET_PEERS_WANTED_SERVICES, out)?;
                 write_list(
-                    exclude_node_ids,
+                    &query.exclude_node_ids,
                     MAX_DISCOVERY_EXCLUDED_NODE_IDS,
                     out,
                     |node_id, out| {
@@ -200,7 +206,7 @@ impl WireMessage for DiscoveryMessage {
                         Ok(())
                     },
                 )?;
-                check_sorted_unique(exclude_node_ids)
+                check_sorted_unique(&query.exclude_node_ids)
             }
             Self::Peers { records } => {
                 write_list(
@@ -261,11 +267,11 @@ impl WireMessage for DiscoveryMessage {
                     |reader| reader.array("excluded node id"),
                 )?;
                 check_sorted_unique(&exclude_node_ids)?;
-                Self::GetPeers {
+                Self::GetPeers(GetPeers {
                     limit,
                     wanted_services,
                     exclude_node_ids,
-                }
+                })
             }
             MSG_DISCOVERY_PEERS => {
                 let records = read_list(

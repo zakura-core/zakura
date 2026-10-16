@@ -11,6 +11,7 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use rand::seq::SliceRandom;
 use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zakura_chain::{
@@ -93,7 +94,7 @@ pub const DEFAULT_DISCOVERY_CONNECTION_HEADROOM: usize = 4;
 pub const DEFAULT_DISCOVERY_ZAKURA_MAX_CONNECTIONS: usize = 32;
 /// Default lifetime for first-party live service summaries.
 pub const DEFAULT_LIVE_SERVICE_SUMMARY_TTL: Duration = Duration::from_secs(30);
-/// Epoch length for per-requester peer-sample disclosure sets.
+/// Epoch length for per-requester peer-sample windows.
 ///
 /// Fixed rather than configurable: it is a disclosure-policy bound, not a tuning knob, and a
 /// per-node override would only weaken the property for that node's peers.
@@ -362,6 +363,18 @@ pub struct DiscoveryRecordValidationContext {
     pub clock_skew_tolerance: Duration,
 }
 
+/// Bounded peer sample request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GetPeers {
+    /// Maximum requested records.
+    pub limit: u16,
+    /// Optional service filter.
+    pub wanted_services: Vec<ZakuraServiceId>,
+    /// Node ids the responder should not return, as raw bytes in ascending
+    /// order.
+    pub exclude_node_ids: Vec<[u8; 32]>,
+}
+
 /// First-party live service summary request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GetServices {
@@ -610,15 +623,7 @@ pub enum DiscoveryMessage {
         record: ZakuraNodeRecord,
     },
     /// Request a bounded peer sample.
-    GetPeers {
-        /// Maximum requested records.
-        limit: u16,
-        /// Optional service filter.
-        wanted_services: Vec<ZakuraServiceId>,
-        /// Node ids the responder should not return, as raw bytes in
-        /// ascending order.
-        exclude_node_ids: Vec<[u8; 32]>,
-    },
+    GetPeers(GetPeers),
     /// Bounded signed peer records.
     Peers {
         /// Signed node records.
@@ -1047,17 +1052,18 @@ pub struct ZakuraDiscoveryBook {
     static_candidates: HashMap<NodeId, ZakuraStaticDiscoveryCandidate>,
     limits: ZakuraDiscoveryBookLimits,
     local_node_id: Option<NodeId>,
-    /// Process-local SipHash key for per-requester peer-sample disclosure ranking.
+    /// Process-local SipHash key that places each requester's sample window.
     ///
-    /// Never leaves this process; a remote peer must not be able to predict — or grind a
-    /// node id against — the disclosure set another requester receives. `RandomState` is
-    /// used for its randomly generated 128-bit key, not for hashing any collection.
+    /// Never leaves this process; a remote peer must not be able to predict the window
+    /// another requester receives. `RandomState` is used for its randomly generated
+    /// 128-bit key, not for hashing any collection.
     disclosure_key: RandomState,
     /// The shuffled sample candidates of the current disclosure epoch.
     sample_snapshot: Option<SampleSnapshot>,
-    /// Entries that became confirmed, counted so a small snapshot can tell
-    /// when a rebuild would add candidates.
-    confirmations: u64,
+    /// Changes that can add sample candidates: a new or newly confirmed
+    /// entry, or a new record for an entry. A small snapshot compares it to
+    /// tell when a rebuild would add candidates.
+    generation: u64,
 }
 
 /// One disclosure epoch's peer-sample candidates, in random order.
@@ -1069,8 +1075,8 @@ pub struct ZakuraDiscoveryBook {
 struct SampleSnapshot {
     epoch: u64,
     node_ids: Vec<NodeId>,
-    /// The book's `confirmations` when this snapshot was built.
-    confirmations: u64,
+    /// The book's `generation` when this snapshot was built.
+    generation: u64,
 }
 
 /// Passive runtime limits and timing policy for native Zakura discovery.
@@ -1078,13 +1084,13 @@ struct SampleSnapshot {
 pub struct ZakuraDiscoveryConfig {
     /// Lifetime of locally authored self-records.
     pub record_ttl: Duration,
-    /// Minimum interval for future active refresh logic.
+    /// How long before its expiry the self-record is re-signed.
     pub refresh_interval: Duration,
     /// Default peer sample size for future exchange logic.
     pub peer_sample_limit: usize,
     /// Discovery book storage limits.
     pub book_limits: ZakuraDiscoveryBookLimits,
-    /// Maximum node ids accepted in an exclusion list.
+    /// Maximum node ids this node excludes in its own `GetPeers`.
     pub max_excluded_node_ids: usize,
     /// Base backoff for future discovery dials.
     pub dial_backoff_base: Duration,
@@ -1600,13 +1606,6 @@ impl ZakuraDiscoveryHandle {
     #[cfg(test)]
     pub(crate) async fn lock_for_test(&self) -> impl Sized + '_ {
         self.inner.lock().await
-    }
-
-    /// Returns the configured interval at which the self-record is re-signed
-    /// before it expires.
-    pub async fn refresh_interval(&self) -> Duration {
-        let inner = self.inner.lock().await;
-        inner.config.refresh_interval
     }
 
     /// Return the currently cached discovery peer slot snapshot.
@@ -2727,7 +2726,7 @@ impl ZakuraDiscoveryBook {
             local_node_id: None,
             disclosure_key: RandomState::new(),
             sample_snapshot: None,
-            confirmations: 0,
+            generation: 0,
         }
     }
 
@@ -2925,8 +2924,9 @@ impl ZakuraDiscoveryBook {
     /// A request costs one keyed hash, at most one map lookup per window slot, and at most
     /// `limit` record clones, whatever the book size. Collecting the snapshot scans the book
     /// once per epoch. While the snapshot is no longer than a window, every window covers
-    /// all of it, so it is rebuilt whenever an entry became confirmed since. A new node
-    /// therefore discloses its first peers without waiting for the next epoch.
+    /// all of it, so it is rebuilt whenever the book gained a candidate since: a new or
+    /// newly confirmed entry, or a new record for an entry. A new node therefore discloses
+    /// its first peers without waiting for the next epoch.
     ///
     /// `exclude_node_ids` must be in ascending byte order.
     pub fn sample_peers(
@@ -2937,6 +2937,10 @@ impl ZakuraDiscoveryBook {
         now: u64,
         requester: NodeId,
     ) -> Vec<ZakuraNodeRecord> {
+        debug_assert!(
+            exclude_node_ids.is_sorted(),
+            "the decoder admits only sorted exclusions"
+        );
         let window = self.sample_window();
         let limit = limit.min(window);
         self.refresh_sample_snapshot(now);
@@ -2966,7 +2970,8 @@ impl ZakuraDiscoveryBook {
             .take(limit)
             .map(|entry| entry.record.clone())
             .collect();
-        rand::seq::SliceRandom::shuffle(records.as_mut_slice(), &mut rand::thread_rng());
+        // The order would reveal each record's place in the snapshot.
+        records.shuffle(&mut rand::thread_rng());
         records
     }
 
@@ -2995,8 +3000,7 @@ impl ZakuraDiscoveryBook {
         let window = self.sample_window();
         let stale = self.sample_snapshot.as_ref().is_none_or(|snapshot| {
             snapshot.epoch != epoch
-                || (snapshot.node_ids.len() <= window
-                    && snapshot.confirmations != self.confirmations)
+                || (snapshot.node_ids.len() <= window && snapshot.generation != self.generation)
         });
         if stale {
             let mut node_ids: Vec<NodeId> = self
@@ -3005,11 +3009,11 @@ impl ZakuraDiscoveryBook {
                 .filter(|(_, entry)| self.is_sample_eligible(entry, now))
                 .map(|(node_id, _)| *node_id)
                 .collect();
-            rand::seq::SliceRandom::shuffle(node_ids.as_mut_slice(), &mut rand::thread_rng());
+            node_ids.shuffle(&mut rand::thread_rng());
             self.sample_snapshot = Some(SampleSnapshot {
                 epoch,
                 node_ids,
-                confirmations: self.confirmations,
+                generation: self.generation,
             });
         }
     }
@@ -3143,7 +3147,7 @@ impl ZakuraDiscoveryBook {
         if let Some(entry) = self.entries.get_mut(node_id) {
             entry.last_success = Some(now);
             if entry.last_confirmed.replace(now).is_none() {
-                self.confirmations += 1;
+                self.generation += 1;
             }
             entry.failure_count = 0;
         }
@@ -3323,13 +3327,15 @@ impl ZakuraDiscoveryBook {
         if let Some(entry) = self.entries.get_mut(&node_id) {
             let was_confirmed = entry.last_confirmed.is_some();
             let outcome = update_existing_entry(entry, record, metadata, now);
-            if !was_confirmed && entry.last_confirmed.is_some() {
-                self.confirmations += 1;
+            if outcome == ImportOutcome::Updated
+                || (!was_confirmed && entry.last_confirmed.is_some())
+            {
+                self.generation += 1;
             }
             return Ok(outcome);
         }
         if metadata.last_confirmed.is_some() {
-            self.confirmations += 1;
+            self.generation += 1;
         }
 
         self.entries.insert(
@@ -3348,6 +3354,14 @@ impl ZakuraDiscoveryBook {
             },
         );
         self.evict_to_limits(now);
+        if !self.entries.contains_key(&node_id) {
+            // Every other entry outranks the new one, so it was evicted.
+            return Err(DiscoveryBookError::Limit {
+                field: "records",
+                actual: self.limits.max_records + 1,
+                max: self.limits.max_records,
+            });
+        }
         Ok(ImportOutcome::Added)
     }
 
@@ -4522,7 +4536,7 @@ mod tests {
 
     /// The authenticated requester used by peer-sample tests.
     ///
-    /// The disclosure ranking is keyed by a per-book random `RandomState`, so tests assert
+    /// Window placement is keyed by a per-book random `RandomState`, so tests assert
     /// the set properties — stability within an epoch, rotation across epochs, and the
     /// disclosure bound — rather than any specific node id ordering.
     fn test_requester() -> NodeId {
@@ -4848,11 +4862,11 @@ mod tests {
             DiscoveryMessage::Hello {
                 record: record.clone(),
             },
-            DiscoveryMessage::GetPeers {
+            DiscoveryMessage::GetPeers(GetPeers {
                 limit: 2,
                 wanted_services: services.clone(),
                 exclude_node_ids: excluded.to_vec(),
-            },
+            }),
             DiscoveryMessage::Peers {
                 records: vec![record.clone(), other.clone()],
             },
@@ -5361,11 +5375,11 @@ mod tests {
         .is_err());
 
         let wanted_services = (0..=MAX_SERVICES_PER_RECORD).map(service).collect();
-        assert!(DiscoveryMessage::GetPeers {
+        assert!(DiscoveryMessage::GetPeers(GetPeers {
             limit: 1,
             wanted_services,
             exclude_node_ids: Vec::new(),
-        }
+        })
         .encode()
         .is_err());
 
@@ -5376,12 +5390,12 @@ mod tests {
                 .is_err()
         );
 
-        assert!(DiscoveryMessage::GetPeers {
+        assert!(DiscoveryMessage::GetPeers(GetPeers {
             limit: u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE + 1)
                 .expect("test limit fits in u16"),
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),
-        }
+        })
         .encode()
         .is_err());
 
@@ -5923,11 +5937,11 @@ mod tests {
         let exclude_node_ids = handle.peer_sample_exclusions().await;
         assert_eq!(exclude_node_ids.len(), MAX_DISCOVERY_EXCLUDED_NODE_IDS);
         assert!(exclude_node_ids.windows(2).all(|pair| pair[0] < pair[1]));
-        DiscoveryMessage::GetPeers {
+        DiscoveryMessage::GetPeers(GetPeers {
             limit: 1,
             wanted_services: Vec::new(),
             exclude_node_ids,
-        }
+        })
         .encode()
         .expect("the local exclusion list encodes");
     }
@@ -6500,13 +6514,17 @@ mod tests {
             .expect("static record imports");
 
         for index in 2..=10 {
-            book.import_record(
-                signed_record_with(index.into(), service(index as usize), test_addr(index)),
-                Some(secret_key().public()),
-                NOW,
-                &context(),
-            )
-            .expect("flood record imports");
+            // Each flood record either replaces the last one or is evicted
+            // itself.
+            assert!(matches!(
+                book.import_record(
+                    signed_record_with(index.into(), service(index as usize), test_addr(index)),
+                    Some(secret_key().public()),
+                    NOW,
+                    &context(),
+                ),
+                Ok(ImportOutcome::Added) | Err(DiscoveryBookError::Limit { .. })
+            ));
         }
 
         assert!(book
@@ -6570,19 +6588,97 @@ mod tests {
 
         let relay = secret_key().public();
         for index in 2..=5u8 {
-            book.import_record(
-                signed_record_with(index.into(), service(index.into()), test_addr(index)),
-                Some(relay),
-                NOW,
-                &context(),
-            )
-            .expect("a relayed record imports");
+            // Each relayed record either replaces the other unconfirmed
+            // entry or is evicted itself.
+            assert!(matches!(
+                book.import_record(
+                    signed_record_with(index.into(), service(index.into()), test_addr(index)),
+                    Some(relay),
+                    NOW,
+                    &context(),
+                ),
+                Ok(ImportOutcome::Added) | Err(DiscoveryBookError::Limit { .. })
+            ));
         }
         assert_eq!(book.discovered_len(), 2);
         assert_eq!(
             book.sample_peers(32, &[], &[], NOW, requester),
-            vec![confirmed]
+            vec![confirmed.clone()]
         );
+
+        // A book full of confirmed entries refuses a relayed record, because
+        // the record would evict itself.
+        let mut full = small_book(1);
+        import_confirmed_record(&mut full, confirmed).expect("a first-party record imports");
+        let relayed = signed_record_with(6, service(6), test_addr(6));
+        let relayed_node_id = relayed.body.node_id;
+        assert!(matches!(
+            full.import_record(relayed, Some(relay), NOW, &context()),
+            Err(DiscoveryBookError::Limit { .. })
+        ));
+        assert!(full.get(&relayed_node_id).is_none());
+    }
+
+    /// A small snapshot is rebuilt when an entry it left out for expiry gets a
+    /// new record, so the entry returns to samples within the epoch.
+    #[test]
+    fn a_renewed_record_rejoins_a_small_snapshot() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let requester = test_requester();
+        let secret = secret_key();
+        let mut first = body(&secret);
+        first.sequence = 1;
+        let first = ZakuraNodeRecord::sign(first, &secret).expect("test record signs");
+        import_confirmed_record(&mut book, first).expect("a first-party record imports");
+
+        // The record expires at `NOW + 60`, inside the epoch that starts before `NOW`.
+        let later = NOW + 120;
+        assert_eq!(
+            later / DISCOVERY_DISCLOSURE_EPOCH.as_secs(),
+            NOW / DISCOVERY_DISCLOSURE_EPOCH.as_secs()
+        );
+        assert!(book.sample_peers(32, &[], &[], later, requester).is_empty());
+
+        let mut renewed = body(&secret);
+        renewed.sequence = 2;
+        renewed.expires_at_unix_secs = later + 60;
+        let renewed = ZakuraNodeRecord::sign(renewed, &secret).expect("test record signs");
+        assert_eq!(
+            book.import_record(renewed.clone(), Some(secret.public()), later, &context())
+                .expect("a renewed first-party record imports"),
+            ImportOutcome::Updated
+        );
+        assert_eq!(
+            book.sample_peers(32, &[], &[], later, requester),
+            vec![renewed]
+        );
+    }
+
+    /// Each requester's window starts at its own keyed offset, so requesters
+    /// see different windows of a book larger than one window.
+    #[test]
+    fn windows_depend_on_the_requester() {
+        let mut book = ZakuraDiscoveryBook::default();
+        for index in 1..=4 * MAX_DISCOVERY_RECORDS_PER_RESPONSE {
+            let index = u8::try_from(index).expect("128 records fit u8 indices");
+            import_confirmed_record(
+                &mut book,
+                signed_record_with(index.into(), service(index.into()), test_addr(index)),
+            )
+            .expect("a first-party record imports");
+        }
+        let windows: HashSet<Vec<NodeId>> = (0..8)
+            .map(|_| {
+                let mut window: Vec<NodeId> = book
+                    .sample_peers(32, &[], &[], NOW, test_requester())
+                    .into_iter()
+                    .map(|record| record.body.node_id)
+                    .collect();
+                window.sort_by_key(|node_id| *node_id.as_bytes());
+                window
+            })
+            .collect();
+        assert!(windows.len() > 1, "eight requesters share one window");
     }
 
     /// A configured import limit above one response's records does not widen
@@ -8453,10 +8549,10 @@ mod tests {
     }
 
     /// `sample_peers` answers each requester from a bounded per-`(requester, epoch)`
-    /// disclosure set, and carries forward the sampling clone/scan bound from
+    /// window, and carries forward the sampling clone/scan bound from
     /// `claude-discovery-expensive-work-under-global-mutex`: no matter how a requester
     /// varies limits, filters, and exclusions, one `(requester, epoch)` scope can only ever
-    /// observe — and force clones of — one bounded disclosure set.
+    /// observe — and force clones of — one bounded window.
     #[test]
     fn discovery_book_sample_disclosure_set_is_stable_and_bounded_within_epoch() {
         const DISCLOSURE_LIMIT: usize = 4;
@@ -8486,7 +8582,7 @@ mod tests {
         );
 
         // Exclude everything already returned and query each record's unique service id.
-        // Nothing outside the epoch's disclosure set is ever revealed.
+        // Nothing outside the epoch's window is ever revealed.
         let mut seen = disclosure_set.clone();
         let mut excluded: Vec<_> = seen.iter().map(|id| *id.as_bytes()).collect();
         excluded.sort_unstable();
@@ -8502,7 +8598,7 @@ mod tests {
         }
         assert_eq!(
             seen, disclosure_set,
-            "filters and exclusions must not reveal records outside the disclosure set"
+            "filters and exclusions must not reveal records outside the window"
         );
 
         // The set is keyed by requester and epoch. Walking `now` forward one epoch at a time
@@ -8518,7 +8614,7 @@ mod tests {
         }
         assert!(
             across_epochs.len() > disclosure_set.len(),
-            "disclosure sets must rotate across epochs"
+            "windows must rotate across epochs"
         );
     }
 
@@ -8693,7 +8789,7 @@ mod tests {
 
     /// A custom (non-built-in) service id in a `GetPeers` filter must not reveal any record
     /// a plain unfiltered query would not. Confirmation gates injected records out of
-    /// samples, and the per-requester disclosure set bounds the rest: a filter selects
+    /// samples, and the per-requester window bounds the rest: a filter selects
     /// strictly inside the set the requester can already see in full. The filter is
     /// therefore left free-form rather than restricted to an allowlist of built-in ids,
     /// which would add nothing and would silently stop filtering whenever a new service id

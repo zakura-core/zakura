@@ -153,7 +153,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, DsLocal, DsEnv>, frame: Frame) -> 
 
     match &msg {
         DiscoveryMessage::Hello { .. }
-        | DiscoveryMessage::GetPeers { .. }
+        | DiscoveryMessage::GetPeers(_)
         | DiscoveryMessage::Peers { .. }
         | DiscoveryMessage::GetServices(_)
         | DiscoveryMessage::Services(_) => {
@@ -173,7 +173,7 @@ fn decode(frame: Frame) -> Flow<DiscoveryMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::wire_codec::encode_frame;
+    use crate::zakura::{discovery::protocol::GetPeers, wire_codec::encode_frame};
 
     const MESSAGE_BRANCHES: [&str; 5] = ["Hello", "GetPeers", "Peers", "GetServices", "Services"];
 
@@ -186,11 +186,11 @@ mod tests {
     #[test]
     fn run_one_hands_off_decoded_message() {
         let mut pipe = discovery_pipe(peer());
-        let frame = encode_frame(&DiscoveryMessage::GetPeers {
+        let frame = encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
             limit: 8,
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),
-        })
+        }))
         .expect("message encodes");
 
         let flow = pipe.run_one(frame);
@@ -199,7 +199,7 @@ mod tests {
         assert!(
             matches!(
                 pipe.local_mut().take_decoded(),
-                Some(DiscoveryMessage::GetPeers { .. })
+                Some(DiscoveryMessage::GetPeers(_))
             ),
             "the decoded message is handed off to the async runner"
         );

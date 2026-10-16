@@ -1333,6 +1333,94 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     harness.check_quiet().await;
 }
 
+/// A recheck that waits for execution slots judges the page against the
+/// selected tip after that wait, not the one before it.
+#[tokio::test(start_paused = true)]
+async fn a_following_page_recheck_reads_the_tip_after_admission() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let serve = ServeLimits {
+        node_execution: 1,
+        ..serve_limits()
+    };
+    let mut harness = Harness::new(port.clone(), serve);
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 waits in its read, holding the node slot.
+    let main = port.grow(2);
+    harness.drain().await;
+
+    // Another peer's page queues for that slot, then blocks in its own read.
+    let other_port = FakePort::new(0);
+    let other_chain = other_port.grow(1);
+    let (other, mut other_recv, _other_cancel) =
+        session(&other_port, &harness.capacity, &peer(9), 1);
+    let mut other_subscriber = Subscriber::new();
+    let open = other_subscriber.open(
+        other_chain[0].hash,
+        vec![other_port.genesis],
+        credit(),
+        AuxSchema::None,
+    );
+    other.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+
+    // The chain grows, so the page is still selected, and the read ends.
+    // The recheck then waits behind the other peer's read.
+    let grown = port.store().extend(main[1], 1);
+    port.select(grown[0]);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(harness.capacity.node_execution_held(), 1);
+
+    // While it waits, the chain reorgs away from the page.
+    let side = port.store().extend(chain[2], 4);
+    port.select(side[3]);
+    other_port.gate.add_permits(1);
+    let h = block::Height;
+    assert_eq!(
+        pages(&harness.deliver_all().await),
+        [(h(3), h(6), false), (h(6), h(7), false)]
+    );
+    let other_page = other_recv
+        .try_recv()
+        .expect("the other peer's page arrived");
+    assert!(matches!(
+        other_subscriber.receive(&other_page),
+        Received::Page { .. }
+    ));
+    harness.check_quiet().await;
+}
+
+/// A follower stalled on a capacity refusal still ends as superseded when
+/// the selected tip drops below its last header.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(4);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[3].hash, vec![chain[3]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let signal = ServingCapacitySignal::default();
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(signal.clone())));
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    // The refusal is never released.
+    port.select(chain[1]);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    assert!(!signal.is_released());
+    harness.check_quiet().await;
+}
+
 /// The margin admits a second `Open`. A third, a reused ID, a changed target,
 /// and an unadvertised schema fault.
 #[tokio::test(start_paused = true)]

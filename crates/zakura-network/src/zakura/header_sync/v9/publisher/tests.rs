@@ -1763,29 +1763,17 @@ async fn follow(
 /// last header ends with `SubscriptionSuperseded`.
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
-    use super::super::{subscriber::Subscriber, Status, MAX_HS_SUBSCRIPTIONS};
+    use super::super::{subscriber::Subscriber, test_support::status};
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());
-    let status = |tip: Frontier| Status {
-        work_anchor_height: block::Height(0),
-        work_anchor_hash: port.genesis.hash,
-        selected_tip_height: tip.height,
-        selected_tip_hash: tip.hash,
-        suffix_cumulative_work: U256::from(tip.height.0),
-        oldest_retained_height: block::Height(0),
-        max_headers_per_response: limits().max_headers,
-        max_subscriptions: MAX_HS_SUBSCRIPTIONS,
-        max_message_bytes: limits().max_bytes,
-        tree_aux_schema_mask: limits().aux_schema_mask,
-    };
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
     let mut subscriber = Subscriber::<HB>::new();
     let open = subscriber
         .open(
-            &status(chain[9]),
+            &status::<HB>(chain[9]),
             &[chain[2], port.genesis],
             AuxSchema::None,
             6,
@@ -1815,7 +1803,7 @@ async fn the_subscriber_follows_the_publisher() {
     let tip = port.tip();
     let open = subscriber
         .open(
-            &status(tip),
+            &status::<HB>(tip),
             &[tip, chain[3], port.genesis],
             AuxSchema::None,
             6,

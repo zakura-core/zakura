@@ -4,25 +4,19 @@
 //! its own [`Publications`] ledger, so every update the subscriber writes must
 //! apply there without a fault.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use std::collections::{HashSet, VecDeque};
 
 use proptest::prelude::*;
-use zakura_chain::{
-    block::{genesis::regtest_genesis_block, merkle::AuthDataRoot},
-    fmt::HexDebug,
-    ironwood, orchard, sapling,
-    work::difficulty::U256,
-};
-use zakura_header_chain::TreeAuxRecordV1;
 
 use super::*;
 use crate::zakura::{
     header_sync::{
         config::REGTEST_HEADER_BYTES,
-        v9::{entry_bytes, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES},
+        v9::{
+            entry_bytes,
+            test_support::{record, HeaderTree, OUTCOME_CODES},
+            RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
+        },
         wire::HeaderEntry,
     },
     regulation::Publications,
@@ -36,82 +30,15 @@ const HB: usize = REGTEST_HEADER_BYTES;
 /// The subscriber under test.
 type Sub = Subscriber<HB>;
 
-/// Headers per page in the scripted publisher's `Status`.
+/// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
 
-/// A schema-1 record with every root at its empty default.
-fn record(height: block::Height) -> TreeAuxRecordV1 {
-    TreeAuxRecordV1 {
-        height,
-        sapling_root: sapling::tree::Root::default(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx_count: 0,
-        orchard_tx_count: 0,
-        ironwood_tx_count: 0,
-        auth_data_root: AuthDataRoot::from([0; 32]),
-    }
+/// A peer `Status` that advertises `tip`.
+fn status(tip: Frontier) -> Status {
+    super::super::test_support::status::<HB>(tip)
 }
 
-/// A header tree over the Regtest genesis header.
-struct Tree {
-    nodes: HashMap<block::Hash, (Frontier, Arc<block::Header>)>,
-    genesis: Frontier,
-    /// Distinguishes sibling headers.
-    next_nonce: u32,
-}
-
-impl Tree {
-    /// A tree holding only the Regtest genesis header.
-    fn new() -> Self {
-        let header = regtest_genesis_block().header.clone();
-        let genesis = Frontier::new(block::Height(0), header.hash());
-        Self {
-            nodes: HashMap::from([(genesis.hash, (genesis, header))]),
-            genesis,
-            next_nonce: 0,
-        }
-    }
-
-    /// Add `count` headers above `parent`, and return them.
-    fn extend(&mut self, parent: Frontier, count: u32) -> Vec<Frontier> {
-        let mut added = Vec::new();
-        let mut parent = parent;
-        for _ in 0..count {
-            let mut header = *self.nodes[&parent.hash].1;
-            header.previous_block_hash = parent.hash;
-            self.next_nonce += 1;
-            let mut nonce = [0; 32];
-            nonce[..4].copy_from_slice(&self.next_nonce.to_le_bytes());
-            header.nonce = HexDebug(nonce);
-            let child = Frontier::new(
-                parent.height.next().expect("test heights are small"),
-                header.hash(),
-            );
-            self.nodes.insert(child.hash, (child, Arc::new(header)));
-            added.push(child);
-            parent = child;
-        }
-        added
-    }
-
-    /// The parent of `frontier`, if the tree holds both.
-    fn parent(&self, frontier: Frontier) -> Option<Frontier> {
-        let (_, header) = self.nodes.get(&frontier.hash)?;
-        self.nodes
-            .get(&header.previous_block_hash)
-            .map(|(parent, _)| *parent)
-    }
-
-    /// The ancestor of `of` at `height`, or `of` itself at its own height.
-    fn ancestor(&self, of: Frontier, height: block::Height) -> Option<Frontier> {
-        let mut at = of;
-        while at.height > height {
-            at = self.parent(at)?;
-        }
-        (at.height == height).then_some(at)
-    }
-
+impl HeaderTree {
     /// The headers after `from` through `to`, if `to` descends from `from`.
     fn path(&self, from: Frontier, to: Frontier) -> Option<Vec<Frontier>> {
         if self.ancestor(to, from.height) != Some(from) {
@@ -155,29 +82,9 @@ impl Tree {
     }
 }
 
-/// A peer `Status` that advertises `tip` and both schemas.
-fn status(tip: Frontier) -> Status {
-    Status {
-        work_anchor_height: block::Height(0),
-        work_anchor_hash: block::Hash([0; 32]),
-        selected_tip_height: tip.height,
-        selected_tip_hash: tip.hash,
-        suffix_cumulative_work: U256::from(tip.height.0),
-        oldest_retained_height: block::Height(0),
-        max_headers_per_response: PAGE_HEADERS,
-        max_subscriptions: 1,
-        // Widening u32 to usize is lossless on supported targets.
-        max_message_bytes: u32::try_from(
-            HEADERS_RESPONSE_FIXED_BYTES + PAGE_HEADERS as usize * entry_bytes(HB, AuxSchema::V1),
-        )
-        .expect("a small page fits u32"),
-        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-    }
-}
-
 /// The encoded frame of a page of `headers` above `parent`.
 fn page_frame(
-    tree: &Tree,
+    tree: &HeaderTree,
     id: u64,
     target: block::Hash,
     parent: Frontier,
@@ -230,7 +137,7 @@ fn outcome(id: u64, target: block::Hash, code: HeadersOutcomeCode) -> HeadersOut
 
 /// A subscriber with one subscription, and the pieces that built it.
 struct Fixture {
-    tree: Tree,
+    tree: HeaderTree,
     sub: Sub,
     id: u64,
     target: Frontier,
@@ -239,7 +146,7 @@ struct Fixture {
 
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
-    fn open(tree: Tree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
+    fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
         let mut sub = Sub::new();
         let open = sub
             .open(&status(target), locators, AuxSchema::None, staging)
@@ -286,8 +193,8 @@ impl Fixture {
 }
 
 /// A tree with a chain of `length` headers, returned with the chain.
-fn chain(length: u32) -> (Tree, Vec<Frontier>) {
-    let mut tree = Tree::new();
+fn chain(length: u32) -> (HeaderTree, Vec<Frontier>) {
+    let mut tree = HeaderTree::new();
     let genesis = tree.genesis;
     let mut chain = vec![genesis];
     chain.extend(tree.extend(genesis, length));
@@ -601,14 +508,6 @@ fn misplaced_pages_fault() {
 #[test]
 fn outcomes_fault_outside_their_window() {
     use HeadersOutcomeCode::*;
-    let codes = [
-        TargetNotRetained,
-        NoLocatorIntersection,
-        HistoryPruned,
-        TargetNotSelected,
-        SubscriptionSuperseded,
-        SubscriptionClosed,
-    ];
     // (pages, reached, close sent)
     let states = [
         (0, false, false),
@@ -617,7 +516,7 @@ fn outcomes_fault_outside_their_window() {
         (2, true, false),
         (2, true, true),
     ];
-    for code in codes {
+    for code in OUTCOME_CODES {
         for (pages, reached, close) in states {
             let (tree, chain) = chain(6);
             let mut fixture = Fixture::open(tree, chain[6], &[chain[3], chain[0]], 100);
@@ -874,7 +773,7 @@ impl Script {
     }
 
     /// Apply one update, which must never fault.
-    fn apply(&mut self, tree: &Tree, update: &SubscribeHeaders) {
+    fn apply(&mut self, tree: &HeaderTree, update: &SubscribeHeaders) {
         let id = update.subscription_id;
         match update.operation {
             Operation::Open => {
@@ -953,7 +852,7 @@ impl Script {
 
     /// Write up to `pages` pages that the credit allows, and any terminal
     /// outcome that is due.
-    fn pump(&mut self, tree: &Tree, out: &mut VecDeque<Frame>, mut pages: usize) {
+    fn pump(&mut self, tree: &HeaderTree, out: &mut VecDeque<Frame>, mut pages: usize) {
         loop {
             let Some(served) = self.served.as_mut() else {
                 return;
@@ -1090,13 +989,13 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Fail),
         2 => prop_oneof![1..12_u16, Just(4_000_u16)].prop_map(Op::Staging),
         1 => Just(Op::Close),
-        1 => (0..5_u8).prop_map(Op::End),
+        1 => (0..6_u8).prop_map(Op::End),
     ]
 }
 
 /// The reactor's side of a generated session.
 struct Session {
-    tree: Tree,
+    tree: HeaderTree,
     sub: Sub,
     script: Script,
     /// Frames to the subscriber, in stream order.
@@ -1297,17 +1196,9 @@ impl Session {
                     self.send(close);
                 }
             }
-            Op::End(index) => {
-                use HeadersOutcomeCode::*;
-                let codes = [
-                    TargetNotRetained,
-                    NoLocatorIntersection,
-                    TargetNotSelected,
-                    HistoryPruned,
-                    SubscriptionSuperseded,
-                ];
-                self.script.end(codes[usize::from(index) % codes.len()]);
-            }
+            Op::End(index) => self
+                .script
+                .end(OUTCOME_CODES[usize::from(index) % OUTCOME_CODES.len()]),
         }
         self.script.pump(&self.tree, &mut self.to_subscriber, 0);
     }
@@ -1315,7 +1206,7 @@ impl Session {
 
 /// Run `ops`, then close and drain both directions.
 fn run(ops: Vec<Op>) {
-    let mut tree = Tree::new();
+    let mut tree = HeaderTree::new();
     let genesis = tree.genesis;
     let tip = *tree.extend(genesis, 4).last().expect("four headers");
     let mut session = Session {

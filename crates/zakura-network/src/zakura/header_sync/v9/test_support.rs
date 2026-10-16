@@ -60,6 +60,19 @@ pub(crate) fn smallest_status<const HEADER_BYTES: usize>() -> Status {
     }
 }
 
+/// A legal `Status` that advertises `tip` and schema 1, with the smallest
+/// caps otherwise.
+pub(crate) fn status<const HEADER_BYTES: usize>(tip: Frontier) -> Status {
+    Status {
+        selected_tip_height: tip.height,
+        selected_tip_hash: tip.hash,
+        max_message_bytes: u32::try_from(smallest_page(HEADER_BYTES, AuxSchema::V1))
+            .expect("a page fits u32"),
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+        ..smallest_status::<HEADER_BYTES>()
+    }
+}
+
 /// A header tree over the Regtest genesis header. Siblings differ by nonce,
 /// so every header has its own hash.
 #[derive(Debug)]

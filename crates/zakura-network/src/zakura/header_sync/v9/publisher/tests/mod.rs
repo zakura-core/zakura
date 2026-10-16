@@ -35,6 +35,8 @@ use crate::zakura::{
     Credit, FramedRecv, ZakuraPeerId,
 };
 
+mod load;
+
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
 
@@ -654,14 +656,15 @@ fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("a 32-byte peer ID is valid")
 }
 
-/// Start a publisher for `peer` on `capacity`, writing to a transport queue
-/// of `queue` frames.
+/// Start a publisher for `peer` on `capacity` that advertises `pages`,
+/// writing to a transport queue of `queue` frames.
 fn session(
     port: &Arc<FakePort>,
     capacity: &ServeCapacity,
     peer: &ZakuraPeerId,
     session_id: u64,
     queue: usize,
+    pages: PageLimits,
 ) -> (
     Publisher,
     FramedRecv,
@@ -678,7 +681,7 @@ fn session(
             peer: SourceId::from_digest(peer.digest()),
             session_id,
         },
-        limits(),
+        pages,
         cancel.clone(),
     );
     (publisher, recv, cancel, task)
@@ -704,9 +707,14 @@ impl Publisher {
 impl Harness {
     /// A publisher over `port` with `serve` budgets.
     fn new(port: Arc<FakePort>, serve: ServeLimits) -> Self {
+        Self::advertising(port, serve, limits())
+    }
+
+    /// A publisher over `port` with `serve` budgets that advertises `pages`.
+    fn advertising(port: Arc<FakePort>, serve: ServeLimits, pages: PageLimits) -> Self {
         let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
             .expect("the test budgets are valid");
-        let (publisher, recv, cancel, _task) = session(&port, &capacity, &peer(7), 1, 64);
+        let (publisher, recv, cancel, _task) = session(&port, &capacity, &peer(7), 1, 64, pages);
         Self {
             port,
             capacity,
@@ -1070,7 +1078,7 @@ async fn a_page_job_panic_reaches_the_session_owner() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
-    let (publisher, _recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
+    let (publisher, _recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64, limits());
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1089,7 +1097,7 @@ async fn cancel_stops_a_terminal_that_waits_for_a_full_queue() {
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
     // One slot, which the first page fills because nobody reads it.
-    let (publisher, _recv, cancel, task) = session(&port, &capacity, &peer(7), 1, 1);
+    let (publisher, _recv, cancel, task) = session(&port, &capacity, &peer(7), 1, 1, limits());
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1118,7 +1126,7 @@ async fn an_abandoned_page_job_panic_reaches_the_session_owner() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
-    let (publisher, mut recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64);
+    let (publisher, mut recv, _cancel, task) = session(&port, &capacity, &peer(7), 1, 64, limits());
     let mut subscriber = Subscriber::new();
     let open = subscriber.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
     publisher.apply(&open).await.expect("the Open applies");
@@ -1276,7 +1284,7 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
     let other_port = FakePort::new(0);
     let other_chain = other_port.grow(1);
     let (other, mut other_recv, _other_cancel, _other_task) =
-        session(&other_port, &harness.capacity, &peer(9), 1, 64);
+        session(&other_port, &harness.capacity, &peer(9), 1, 64, limits());
     let mut other_subscriber = Subscriber::new();
     let open = other_subscriber.open(
         other_chain[0].hash,
@@ -1654,8 +1662,14 @@ async fn a_blocked_read_keeps_its_permit_through_disconnect_and_churn() {
     let mut sessions = Vec::new();
     for round in 0..4_u8 {
         let peer = peer(10 + round % 2);
-        let (publisher, recv, cancel, _task) =
-            session(&port, &harness.capacity, &peer, u64::from(round) + 2, 64);
+        let (publisher, recv, cancel, _task) = session(
+            &port,
+            &harness.capacity,
+            &peer,
+            u64::from(round) + 2,
+            64,
+            limits(),
+        );
         let mut subscriber = Subscriber::new();
         let open = subscriber.open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None);
         publisher.apply(&open).await.expect("the Open applies");

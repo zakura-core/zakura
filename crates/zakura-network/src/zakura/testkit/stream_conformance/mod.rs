@@ -26,10 +26,7 @@
 //!   serving answers each request with one part, if the request row has a
 //!   part row, then one ending. It publishes each subscription row through
 //!   `Publications`: one page per cursor while credit lasts, and the ending
-//!   row after `Close`. It subscribes through fenced `Subscriptions`,
-//!   accepting each page as it arrives and renewing credit as it frees. Each
-//!   member that carries responses checks their headers through one
-//!   `PrecheckByRequest` over the session's reservations and subscriptions.
+//!   row after `Close`. It subscribes through fenced `Subscriptions`.
 //! - Two [`SiblingService`]s share each connection. They echo probes, and
 //!   they can stop reading to hold their stream windows.
 //! - [`RawLayoutPeer`] opens or accepts a layout by hand and can send any

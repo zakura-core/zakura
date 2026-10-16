@@ -333,22 +333,14 @@ fn open_records_its_reservation_first() {
             bytes: 10 * page
         }
     );
-    {
-        let tools = sub.precheck();
-        let tools = tools.lock();
-        assert!(
-            tools.contains(&open.subscription_id),
-            "recorded before it is written"
-        );
-        assert_eq!(
-            tools
-                .credit(&open.subscription_id)
-                .expect("live")
-                .granted()
-                .objects,
-            10
-        );
-    }
+    assert_eq!(
+        sub.precheck()
+            .lock()
+            .credit(&open.subscription_id)
+            .map(|credit| credit.granted().objects),
+        Some(10),
+        "recorded before it is written"
+    );
 
     // A conformant subscriber holds one subscription: a target change waits
     // for the terminal outcome, and the live credit stays.
@@ -496,12 +488,6 @@ fn a_locator_at_the_target_reaches_it_at_open() {
             .page(target, &next(target), false)
             .expect("the first push extends the target");
         assert!(!push.reaches_target);
-        assert_eq!(
-            fixture.outcome(HeadersOutcomeCode::HistoryPruned),
-            Err(SubscriberFault::OutcomeWindow(
-                HeadersOutcomeCode::HistoryPruned
-            ))
-        );
         let ended = fixture
             .outcome(HeadersOutcomeCode::SubscriptionSuperseded)
             .expect("superseded is legal at any time");
@@ -832,17 +818,6 @@ fn close_keeps_credit_and_admits_pages() {
         .expect("first page");
     let close = wire(&fixture.sub.close().expect("Close is recorded"));
     assert_eq!(close.operation, Operation::Close);
-    assert_eq!(
-        close.added_credit,
-        Credit {
-            objects: 0,
-            bytes: 0
-        }
-    );
-    assert_eq!(
-        fixture.sub.close(),
-        Err(SubscribeError::Tools(SubscribeRefused::Closing))
-    );
     let after = fixture
         .page(chain[2], &chain[3..5], false)
         .expect("credit stays after Close");

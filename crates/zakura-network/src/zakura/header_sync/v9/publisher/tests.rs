@@ -986,6 +986,20 @@ async fn lease_failures_after_the_first_page_end_in_their_window() {
         harness.deliver_all().await,
         [Received::Ended(SubscriptionSuperseded)]
     );
+
+    // History between the selected tip and the last header is gone: the
+    // lease reports `HistoryPruned`, past its window.
+    port.select(chain[4]);
+    harness
+        .open(chain[4].hash, vec![chain[4]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let above = port.grow(2);
+    port.store().nodes.remove(&above[0].hash);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(SubscriptionSuperseded)]
+    );
     harness.check_quiet().await;
 }
 

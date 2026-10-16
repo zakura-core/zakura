@@ -940,10 +940,13 @@ async fn run_job<const HEADER_BYTES: usize>(
                 return Output::End(HeadersOutcomeCode::NoLocatorIntersection)
             }
             // A stale selected tip: the next selected-chain change retries.
-            Ok(AcquirePathReply::TargetNotRetained | AcquirePathReply::HistoryPruned)
-                if job.following =>
-            {
+            Ok(AcquirePathReply::TargetNotRetained) if job.following => {
                 return Output::Stall(Stall::Local, "selected_tip")
+            }
+            // History from the last header sent is gone and will not return,
+            // and `HistoryPruned` is past its window.
+            Ok(AcquirePathReply::HistoryPruned) if job.following => {
+                return Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
             }
             Ok(AcquirePathReply::TargetNotRetained) => {
                 return Output::End(HeadersOutcomeCode::TargetNotRetained)

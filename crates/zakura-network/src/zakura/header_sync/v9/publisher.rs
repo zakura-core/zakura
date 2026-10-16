@@ -729,10 +729,12 @@ async fn publish<const HEADER_BYTES: usize>(
             if work.as_ref().is_some_and(|(working, _)| *working == id) {
                 work = None;
             }
-            // A full queue must not keep a cancelled session's task alive.
+            // A full queue must not keep a cancelled session's task alive or
+            // hide a page job's panic.
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
+                Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
                 sent = terminal.send(&send, frame) => if !sent {
                     return;
                 },

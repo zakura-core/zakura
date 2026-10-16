@@ -1,11 +1,7 @@
 #![allow(dead_code, unused_imports)] // activation removes this: the reactor still speaks version 8
 
-//! Header sync version 9: the subscription protocol on stream 5.
-//!
-//! Version 9 replaces `GetHeaders` with `SubscribeHeaders`, whose `Open`,
-//! `Grant`, and `Close` updates control a credit window of pushed `Headers`
-//! pages. The rules are in the peer message regulation specification, section
-//! "Header sync — stream 5, version 9".
+//! Header sync version 9, which the peer message regulation specification
+//! defines in "Header sync — stream 5, version 9".
 //!
 //! This module holds the wire codec and the message table. Nothing negotiates
 //! or uses them yet: the reactor, its stream declaration, and the capability

@@ -199,7 +199,8 @@ pub(crate) struct Ended {
     pub(crate) pages: u64,
     /// Whether it reached its initial target.
     pub(crate) reached: bool,
-    /// The last cursor the reactor accepted, or the start.
+    /// The last cursor the reactor accepted, or the start. Pages admitted
+    /// after it and not yet accepted are not included.
     pub(crate) accepted: Cursor,
 }
 
@@ -583,6 +584,10 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
     /// Call it only after validation passes. The next update acknowledges
     /// `cursor`. `staging` is the header staging budget now reserved for the
     /// subscription.
+    ///
+    /// After the terminal outcome, the subscription is gone, so a page it
+    /// admitted that the reactor had not yet accepted returns `Unknown`. That
+    /// is expected: no update can acknowledge it any more.
     pub(crate) fn accept_through(
         &mut self,
         id: u64,

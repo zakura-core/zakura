@@ -69,7 +69,6 @@ bytes = "1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = "4.5"
 color-eyre = { version = "0.6.3", default-features = false }
-console-subscriber = "0.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
 crossbeam-channel = "0.5.14"
 curve25519-dalek = "4.1"
@@ -346,7 +345,6 @@ lto = "off"
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(tokio_unstable)', # Used by tokio-console
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zakura and librustzcash
 ] }
 

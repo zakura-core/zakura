@@ -39,7 +39,7 @@ proptest-impl = [
     "proptest-derive",
     "rand_chacha_10",
     "rand_core_10",
-    "tokio/tracing",
+    "tokio/sync",
     "zakura-test",
 ]
 
@@ -140,7 +140,7 @@ rand_10 = { workspace = true }
 rand_chacha_10 = { workspace = true }
 rand_core_10 = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }
 

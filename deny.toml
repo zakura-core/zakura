@@ -100,10 +100,6 @@ skip-tree = [
     # wait for ordered-map to release a dependency fix
     { name = "ordered-map", version = "=0.4.2" },
 
-    # wait for hdrhistogram (via tower's `load` feature and console-subscriber) to update base64;
-    # hdrhistogram 7.6 does, but it pulls in nom 8 alongside nom 7
-    { name = "hdrhistogram", version = "=7.5.4" },
-
     # wait for all librustzcash crates to update sha2, secp256k1, and ripemd
     { name = "sha2", version = "=0.10.9" },
     { name = "ripemd", version = "=0.1.3" },

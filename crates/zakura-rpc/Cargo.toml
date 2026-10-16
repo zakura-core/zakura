@@ -71,7 +71,7 @@ subtle = { workspace = true }
 # Error handling
 color-eyre = { workspace = true }
 
-tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros"] }
 tower = { workspace = true }
 
 # gRPC server dependencies
@@ -131,7 +131,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 proptest = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = [
     "proptest-impl",

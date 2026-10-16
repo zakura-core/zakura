@@ -61,7 +61,7 @@ thiserror = { workspace = true }
 
 rayon = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "tracing", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 tower = { workspace = true, features = ["buffer", "util"] }
 tracing = { workspace = true }
 
@@ -101,7 +101,7 @@ rand = { workspace = true }
 halo2 = { workspace = true }
 orchard = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }

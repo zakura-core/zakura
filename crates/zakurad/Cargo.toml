@@ -146,19 +146,6 @@ zakura-checkpoints = [
     "zakura-utils/zakura-checkpoints",
 ]
 
-# tokio-console support
-#
-# To activate this feature, run:
-# ```sh
-# RUSTFLAGS="--cfg tokio_unstable" cargo build --no-default-features --features="tokio-console" --bin zakurad
-# ```
-#
-# The console-subscriber is incompatible with the tracing/max_level_* features.
-#
-# For more details, see:
-# https://github.com/tokio-rs/console/blob/main/console-subscriber/README.md#enabling-tokio-instrumentation
-tokio-console = ["console-subscriber"]
-
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0" }
 zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
@@ -189,7 +176,7 @@ toml = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }
-tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal", "process", "io-util"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "signal", "process", "io-util"] }
 tokio-stream = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
@@ -244,9 +231,6 @@ log = { workspace = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-# test feature tokio-console
-console-subscriber = { workspace = true, optional = true }
-
 derive-new.workspace = true
 hex.workspace = true
 
@@ -261,7 +245,7 @@ insta = { workspace = true, features = ["json"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
@@ -289,7 +273,6 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7-rc0" }
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are used indirectly or constrain transitive resolution.
 normal = [
-    "console-subscriber",  # Used behind the tokio-console feature flag
     "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]

@@ -239,7 +239,7 @@ jobs:
     env:
       # rustdoc on nightly 2026-09-07 and later hits a next-trait-solver ICE
       # ("did not expect successful goal when collecting ambiguity errors",
-      # rust-lang/rust#124834) on the tower-batch-control `Service` impls in
+      # rust-lang/rust#124834) on `Service` impls in
       # zakura-consensus, zakura-network, and zakura-state. Pin the last good
       # nightly, and drop the pin once a current nightly documents these
       # crates again. cargo-public-api has no toolchain option, so the rustup

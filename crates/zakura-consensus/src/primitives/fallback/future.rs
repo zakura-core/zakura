@@ -11,7 +11,7 @@ use futures_core::ready;
 use pin_project::pin_project;
 use tower::Service;
 
-use crate::BoxedError;
+use super::BoxedError;
 
 /// Future that completes either with the first service's successful response, or
 /// with the second service's response.

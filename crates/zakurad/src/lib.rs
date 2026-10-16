@@ -93,8 +93,6 @@
 //! [The Zakura monorepo](https://github.com/zakura-core/zakura) is a collection of the following
 //! crates:
 //!
-//! - [zakura-tower-batch-control](https://docs.rs/zakura-tower-batch-control/latest/tower_batch_control/)
-//! - [zakura-tower-fallback](https://docs.rs/zakura-tower-fallback/latest/tower_fallback/)
 //! - [zakura-chain](https://docs.rs/zakura-chain/latest/zakura_chain/)
 //! - [zakura-consensus](https://docs.rs/zakura-consensus/latest/zakura_consensus/)
 //! - [zakura-network](https://docs.rs/zakura-network/latest/zakura_network/)

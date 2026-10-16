@@ -1,6 +1,15 @@
-//! Tower middleware for batch request processing
+//! Tower middleware for batch request processing.
 //!
-//! This crate provides generic middleware for handling management of
+//! # Legal
+//!
+//! This module is derived from a 2019 version of Tower's
+//! [`buffer`](https://github.com/tower-rs/tower/tree/master/tower/src/buffer) middleware.
+//! Unlike the rest of Zakura, it is licensed only under the MIT license, whose
+//! copyright and permission notice is in the `LICENSE` file next to this module.
+//!
+//! # Overview
+//!
+//! This module provides generic middleware for handling management of
 //! latency/throughput tradeoffs for batch processing. It provides a
 //! [`BatchControl<R>`](BatchControl) enum with [`Item(R)`](BatchControl::Item)
 //! and [`Flush`](BatchControl::Flush) variants, and provides a
@@ -77,7 +86,7 @@
 //!
 //! The remaining problem to address is the latency-throughput tradeoff. The
 //! logic to manage this tradeoff is independent of the specific batching
-//! procedure, and this crate provides a generic `Batch` wrapper that does so.
+//! procedure, and this module provides a generic `Batch` wrapper that does so.
 //! The wrapper makes use of a [`BatchControl<R>`](BatchControl) enum with
 //! [`Item(R)`](BatchControl::Item) and [`Flush`](BatchControl::Flush) variants.
 //! Given `S: Service<BatchControl<R>>`, the [`Batch<S>`](Batch) wrapper provides
@@ -90,15 +99,17 @@
 //! The `tower-batch-control` code was modified from a 2019 version of:
 //! <https://github.com/tower-rs/tower/tree/master/tower/src/buffer>
 //!
-//! A modified fork of this crate is available on crates.io as `tower-batch`.
+//! A modified fork of this code is available on crates.io as `tower-batch`.
 //! It is focused on batching disk writes.
 
 pub mod error;
 pub mod future;
-mod layer;
 mod message;
 mod service;
 mod worker;
+
+#[cfg(test)]
+mod tests;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -118,7 +129,6 @@ impl<Req: RequestWeight> From<Req> for BatchControl<Req> {
     }
 }
 
-pub use self::layer::BatchLayer;
 pub use self::service::Batch;
 
 /// A trait for reading the weight of a request to [`BatchControl`] services.

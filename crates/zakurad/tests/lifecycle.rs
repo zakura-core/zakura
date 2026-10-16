@@ -17,10 +17,13 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::sync::mpsc;
 
 use tempfile::TempDir;
 use zakura_chain::parameters::Network;
@@ -32,6 +35,7 @@ use zakurad::config::ZakuradConfig;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The log line written once every startup task has been spawned.
+#[cfg(unix)]
 const STARTED: &str = "spawned initial Zakura tasks";
 
 /// The last log line of a node that stopped without an error.
@@ -162,6 +166,7 @@ impl Scratch {
 struct Node {
     child: Child,
     /// Each stdout line as it is read, including a final line without a newline.
+    #[cfg(unix)]
     stdout_lines: mpsc::Receiver<String>,
     /// All stdout bytes read so far.
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -174,9 +179,15 @@ impl Node {
         let mut child = command.spawn().expect("zakurad starts");
         let stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr = child.stderr.take().expect("stderr is piped");
+        #[cfg(unix)]
         let (lines_tx, stdout_lines) = mpsc::channel();
         let collected = Arc::new(Mutex::new(Vec::new()));
-        let stdout_reader = Self::read_lines(stdout, lines_tx, collected.clone());
+        let stdout_reader = Self::read_lines(
+            stdout,
+            #[cfg(unix)]
+            lines_tx,
+            collected.clone(),
+        );
         let stderr_reader = thread::spawn(move || {
             let mut output = Vec::new();
             let _ = stderr.read_to_end(&mut output);
@@ -185,6 +196,7 @@ impl Node {
 
         Self {
             child,
+            #[cfg(unix)]
             stdout_lines,
             stdout: collected,
             stdout_reader: Some(stdout_reader),
@@ -194,7 +206,7 @@ impl Node {
 
     fn read_lines(
         stdout: ChildStdout,
-        lines_tx: mpsc::Sender<String>,
+        #[cfg(unix)] lines_tx: mpsc::Sender<String>,
         collected: Arc<Mutex<Vec<u8>>>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
@@ -205,6 +217,7 @@ impl Node {
                     .lock()
                     .expect("no reader panics while holding the lock")
                     .extend_from_slice(&line);
+                #[cfg(unix)]
                 let _ = lines_tx.send(String::from_utf8_lossy(&line).into_owned());
                 line.clear();
             }
@@ -218,6 +231,7 @@ impl Node {
     /// Waits until a stdout line contains `text`, or panics with the output so far.
     ///
     /// The deadline applies even if the node stops writing output.
+    #[cfg(unix)]
     fn wait_for_stdout(&mut self, text: &str) {
         let deadline = Instant::now() + PROCESS_TIMEOUT;
         loop {
@@ -349,6 +363,7 @@ impl Run {
     }
 
     /// Asserts that the last stdout line is the clean shutdown line.
+    #[cfg(unix)]
     fn assert_stopped_cleanly(&self) -> &Self {
         self.assert_status(0);
         let last_line = self.stdout.lines().last().unwrap_or_default();

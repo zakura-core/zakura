@@ -146,3 +146,36 @@ and immediately schedules cached offers when the last owner releases a permit.
 A permanently stuck accepted operation permanently occupies its permit; a timeout
 cannot safely manufacture replacement capacity. Read failures still consume their
 ordinary attempt, as required by the status-offer policy.
+
+## Cached-offer scheduling opportunities
+
+The end-of-event pass first compares five constant-size inputs: the root policy
+revision, queue ownership revision, claimed header count, available locator permits,
+and committed resource-stall state. Unchanged inputs skip peer traversal, offer
+clones, sorting and duplicate/headroom checks. The existing deterministic priority
+order and immediate end-of-event scheduling remain unchanged.
+
+The root revision changes for session membership, a new eligible idle offer,
+explicit offer deferral and committed snapshots (including body-only advancement).
+Repeated identical blocked statuses and statuses consumed by active ordinary
+attempts do not change it. The queue revision changes when target ownership or an
+awaiting target changes, or an awaiting request becomes active. No-op removals do
+not change it. Capacity counters are read directly because the last RAII lease
+can be dropped outside a queue mutation. A watch notification wakes the reactor
+on final header-capacity release; locator permits use their semaphore wakeup.
+
+The cached key is captured **before** scanning. A release during the scan must
+remain visible to the next pass; caching the post-scan counters could swallow that
+wakeup. A pass that changes its own queue can cause one further scan, after which
+unchanged blocked offers are quiescent again. New offers and real opportunity
+changes retain the existing bounded sorting cost. This does not optimize serving
+notifications or other independent per-peer reactor work.
+
+The deterministic work test uses 16, 64, 256 and 512 admitted peers, covering the
+configured 256 inbound plus 256 outbound slots. It holds duplicate-target or
+zero-headroom offers across 3,000 end-of-event passes, including repeated blocked
+and active-owner Status messages. It asserts zero additional cached-offer peer
+visits after the initial pass. This measures eliminated scheduler work, not
+production throughput or a saturation threshold. Header-sync v9 cadence changes
+can reduce event frequency, but activation must retain these opportunity inputs
+and release notifications when replacing the ordinary request state machine.

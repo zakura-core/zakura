@@ -2648,10 +2648,11 @@ impl ZakuraDiscoveryInner {
                 .get(&node_id)
                 .is_some_and(|entry| entry.record() == &record),
             Ok(ImportOutcome::IgnoredOlder) => false,
-            Err(error) if is_direct_address_import_error(error) => self
-                .book
-                .get(&node_id)
-                .is_none_or(|entry| connected_record_is_fresh_for_stored_record(&record, entry)),
+            Err(error) if is_direct_address_import_error(error) => {
+                self.book.get(&node_id).is_none_or(|entry| {
+                    connected_record_is_fresh_for_stored_record(&record, entry, now)
+                })
+            }
             Err(_) => false,
         };
 
@@ -3644,7 +3645,12 @@ fn update_existing_entry(
 fn connected_record_is_fresh_for_stored_record(
     record: &ZakuraNodeRecord,
     entry: &ZakuraDiscoveryEntry,
+    now: u64,
 ) -> bool {
+    // An expired record no longer orders the peer's records.
+    if entry_is_expired(entry, now) {
+        return true;
+    }
     match record.body.sequence.cmp(&entry.record.body.sequence) {
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => entry.record() == record,
@@ -7701,6 +7707,35 @@ mod tests {
             .await
             .connected
             .is_empty());
+    }
+
+    /// A peer that reset its sequence and dropped its addresses regains its
+    /// services once its old dialable record expires.
+    #[tokio::test]
+    async fn addressless_reset_hello_replaces_an_expired_dialable_record() {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handle = discovery_handle_with_connected(connected_rx);
+        let secret = secret_key();
+        let node_id = secret.public();
+        connected_tx.send_replace(vec![peer_id_for(node_id)]);
+        // Expired, but within the clock-skew tolerance, so it imports.
+        let mut old = runtime_record_with_secret(&secret, 10, service(2), test_addr(2)).body;
+        old.expires_at_unix_secs = current_unix_secs() - 1;
+        let old = ZakuraNodeRecord::sign(old, &secret).expect("record signs");
+        handle
+            .import_connected_peer_record(old, node_id)
+            .await
+            .expect("a dialable record imports");
+
+        let reset = runtime_record_with_secret_and_addrs(&secret, 1, service(3), Vec::new());
+        assert!(matches!(
+            handle.import_connected_peer_record(reset, node_id).await,
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+        assert_eq!(
+            handle.active_services(node_id).await,
+            Some(vec![service(3)])
+        );
     }
 
     #[tokio::test]

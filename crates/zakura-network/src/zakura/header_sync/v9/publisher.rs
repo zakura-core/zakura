@@ -477,7 +477,11 @@ impl Shared {
     }
 
     /// Record a finished job's result for its subscription.
-    fn finish(&mut self, id: u64, output: Output) {
+    ///
+    /// A local stall waits for the next selected-chain change, so it is not
+    /// recorded when the chain `moved` since the job read it: that change
+    /// already passed.
+    fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
@@ -493,6 +497,9 @@ impl Shared {
             Output::Stall(stall, reason) => {
                 metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
+                if moved && matches!(stall, Stall::Local) {
+                    return;
+                }
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
                     subscription.stall = Some(stall);
                 }
@@ -724,13 +731,15 @@ async fn publish<const HEADER_BYTES: usize>(
 ) {
     let mut selected = task.port.selected_chain();
     let mut selected_open = true;
-    let mut work: Option<(u64, Work<'_>)> = None;
+    // The page in progress, with its subscription and the selected chain its
+    // job read.
+    let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
     loop {
         let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
         for (id, frame, terminal) in ended {
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
-            if work.as_ref().is_some_and(|(working, _)| *working == id) {
+            if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
             // A full queue must not keep a cancelled session's task alive or
@@ -755,8 +764,9 @@ async fn publish<const HEADER_BYTES: usize>(
             drop(shared);
             if let Some(job) = job {
                 let id = job.id;
+                let seen = job.selected.clone();
                 let page = start_page::<HEADER_BYTES>(&task, job, &send, selected.clone());
-                work = Some((id, page));
+                work = Some((id, seen, page));
             }
             if ending {
                 continue;
@@ -770,10 +780,10 @@ async fn publish<const HEADER_BYTES: usize>(
             () = cancel.cancelled() => return,
             // See `Publisher::spawn`.
             Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-            progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
+            progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
                 if work.is_some() =>
             {
-                let (id, _) = work.take().expect("the page in progress just finished");
+                let (id, seen, _) = work.take().expect("the page in progress just finished");
                 match progress {
                     // A page whose subscription closed meanwhile spends
                     // nothing and drops its slot.
@@ -782,7 +792,10 @@ async fn publish<const HEADER_BYTES: usize>(
                             slot.send(page.frame);
                         }
                     }
-                    Progress::Other(output) => lock(&task.shared).finish(id, output),
+                    Progress::Other(output) => {
+                        let moved = selected.borrow().as_ref() != seen.as_ref();
+                        lock(&task.shared).finish(id, output, moved);
+                    }
                     Progress::Closed => return,
                 }
             }

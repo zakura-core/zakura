@@ -1370,6 +1370,34 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.check_quiet().await;
 }
 
+/// A local stall from a job that read an older selected chain is not
+/// recorded, because the change that would clear it already passed.
+#[tokio::test(start_paused = true)]
+async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // A following page's lease waits in state toward height 4.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.grow(1);
+    harness.drain().await;
+    // The chain moves on, and the wake for it passes while the lease waits.
+    // Then state calls the old tip stale.
+    port.grow(1);
+    harness.drain().await;
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::TargetNotRetained));
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    harness.check_quiet().await;
+}
+
 /// A follower stalled on a capacity refusal still ends as superseded when
 /// the selected tip drops below its last header.
 #[tokio::test(start_paused = true)]

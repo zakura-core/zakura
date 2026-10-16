@@ -156,7 +156,6 @@ tonic-prost = "0.14"
 # `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,
 # pulldown-cmark-to-cmark and unicase; xtask does not need it.
 tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
-tonic-reflection = "0.14"
 tower = "0.5.3"
 tracing = "0.1.41"
 tracing-error = "0.2"

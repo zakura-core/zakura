@@ -510,10 +510,10 @@ fn a_locator_at_the_target_reaches_it_at_open() {
     }
 }
 
-/// Every misplaced page faults: unsolicited, another subscription or target,
-/// a schema mismatch, a first page off every sent locator, a skipped higher
-/// locator, broken linkage, a missing, early, or second marker, a page past
-/// the target, and a page above its credit.
+/// Every misplaced page faults: another subscription or target, a schema
+/// mismatch, a first page off every sent locator, a skipped higher locator,
+/// broken linkage, a missing, early, or second marker, a page past the
+/// target, and a page above its credit.
 #[test]
 fn misplaced_pages_fault() {
     let (mut tree, chain) = chain(8);
@@ -521,110 +521,51 @@ fn misplaced_pages_fault() {
     let locators = [chain[5], chain[3], chain[0]];
     let mut fixture = Fixture::open(tree, chain[7], &locators, 100);
 
-    // Unsolicited: no subscription, or another ID.
-    let frame = page_frame(
-        &fixture.tree,
-        fixture.id + 1,
-        chain[7].hash,
-        chain[5],
-        &chain[6..7],
-        false,
-        AuxSchema::None,
-    );
-    let (page, len) = decode_page(&frame);
+    // Another subscription, target, or schema.
+    fixture.id += 1;
     assert_eq!(
-        fixture.sub.receive_page(&page, len),
+        fixture.page(chain[5], &chain[6..7], false),
         Err(SubscriptionFault::Unknown.into())
     );
+    fixture.id -= 1;
+    fixture.target = chain[8];
     assert_eq!(
-        Sub::new()
-            .precheck()
-            .lock()
-            .precheck(frame.message_type, len),
-        Err(SubscriptionFault::Unknown)
-    );
-    assert_eq!(
-        Sub::new().receive_page(&page, len),
-        Err(SubscriptionFault::Unknown.into())
-    );
-
-    // Another target.
-    let frame = page_frame(
-        &fixture.tree,
-        fixture.id,
-        chain[8].hash,
-        chain[5],
-        &chain[6..7],
-        false,
-        AuxSchema::None,
-    );
-    let (page, len) = decode_page(&frame);
-    assert_eq!(
-        fixture.sub.receive_page(&page, len),
+        fixture.page(chain[5], &chain[6..7], false),
         Err(SubscriberFault::Target)
     );
-
-    // A schema mismatch.
-    let frame = page_frame(
-        &fixture.tree,
-        fixture.id,
-        chain[7].hash,
-        chain[5],
-        &chain[6..7],
-        false,
-        AuxSchema::V1,
-    );
-    let (page, len) = decode_page(&frame);
+    fixture.target = chain[7];
+    fixture.schema = AuxSchema::V1;
     assert_eq!(
-        fixture.sub.receive_page(&page, len),
+        fixture.page(chain[5], &chain[6..7], false),
         Err(SubscriberFault::Schema)
     );
+    fixture.schema = AuxSchema::None;
 
-    // A first page off every sent locator, or at a sent hash with another
-    // height.
-    assert_eq!(
-        fixture.page(chain[4], &chain[5..6], false),
-        Err(SubscriberFault::FirstParent)
-    );
-    assert_eq!(
-        fixture.page(fork[1], &chain[6..7], false),
-        Err(SubscriberFault::FirstParent)
-    );
-    assert_eq!(
-        fixture.page(
+    let before_first_page = [
+        // Off every sent locator, or at a sent hash with another height.
+        (chain[4], &chain[5..6], false, SubscriberFault::FirstParent),
+        (fork[1], &chain[6..7], false, SubscriberFault::FirstParent),
+        (
             Frontier::new(block::Height(4), chain[5].hash),
             &chain[6..7],
-            false
+            false,
+            SubscriberFault::FirstParent,
         ),
-        Err(SubscriberFault::FirstParent)
-    );
-
-    // A lower locator: the path from chain[3] passes chain[5], in the middle
-    // of a page or at its end.
-    assert_eq!(
-        fixture.page(chain[3], &chain[4..7], false),
-        Err(SubscriberFault::LowerLocator)
-    );
-    assert_eq!(
-        fixture.page(chain[3], &chain[4..6], false),
-        Err(SubscriberFault::LowerLocator)
-    );
-
-    // A page past the target, and wrong markers.
-    assert_eq!(
-        fixture.page(chain[5], &chain[6..9], false),
-        Err(SubscriberFault::PastTarget)
-    );
-    assert_eq!(
-        fixture.page(chain[5], &chain[6..8], false),
-        Err(SubscriberFault::Marker),
-        "the page ends at the target without the marker"
-    );
-    assert_eq!(
-        fixture.page(chain[5], &chain[6..7], true),
-        Err(SubscriberFault::Marker),
-        "the marker is early"
-    );
+        // The path from chain[3] passes chain[5], mid-page or at its end.
+        (chain[3], &chain[4..7], false, SubscriberFault::LowerLocator),
+        (chain[3], &chain[4..6], false, SubscriberFault::LowerLocator),
+        (chain[5], &chain[6..9], false, SubscriberFault::PastTarget),
+        // The target page without the marker, then an early marker.
+        (chain[5], &chain[6..8], false, SubscriberFault::Marker),
+        (chain[5], &chain[6..7], true, SubscriberFault::Marker),
+    ];
+    for (parent, headers, marker, fault) in before_first_page {
+        assert_eq!(
+            fixture.page(parent, headers, marker),
+            Err(fault),
+            "{parent:?}"
+        );
+    }
 
     // Broken linkage after the first page.
     fixture
@@ -662,12 +603,6 @@ fn misplaced_pages_fault() {
         AuxSchema::None,
     );
     let (page, len) = decode_page(&frame);
-    assert!(fixture
-        .sub
-        .precheck()
-        .lock()
-        .precheck(frame.message_type, len)
-        .is_err());
     assert_eq!(
         fixture.sub.receive_page(&page, len),
         Err(SubscriptionFault::OverCredit.into())

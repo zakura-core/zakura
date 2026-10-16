@@ -16,34 +16,40 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    protocol::{DiscoveryMessage, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS},
-    wire::{peers_cap, GET_PEERS},
+    protocol::{
+        DiscoveryMessage, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS,
+        MSG_DISCOVERY_SERVICES,
+    },
+    wire::{peers_cap, services_cap, GET_PEERS, GET_SERVICES},
 };
 use crate::zakura::{
     regulation::{
-        sizing, ClaimRefused, FencedSendError, ReservationPool, Reservations, ResponsePrecheck,
-        SharedReservations, WriterFence,
+        sizing, ClaimRefused, FencedSendError, ReservationPool, Reservations, SharedReservations,
+        WriterFence,
     },
     wire_codec::{encode_frame, WireMessage},
-    CloseCause, FrameRejection, FramedRecv, FramedSend,
+    CloseCause, FramedRecv, FramedSend,
 };
 
 /// A discovery query, keying its response's reservation.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) enum QueryKind {
     Peers,
+    Services,
 }
 
 /// The node-wide pool of discovery reservations.
 ///
-/// It holds enough `GetPeers` reservations to keep twice the bandwidth-delay
-/// product reserved, so it never limits a node that keeps its sessions within
-/// the peer limits.
+/// It holds enough entries for sessions that each reserve the largest `Peers`
+/// and the largest `Services` to keep twice the bandwidth-delay product
+/// reserved, so it never limits a node that keeps its sessions within the
+/// peer limits.
 pub(super) fn reservation_pool() -> ReservationPool {
-    let largest = peers_cap(
+    let largest_peers = peers_cap(
         u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE).expect("the largest limit fits u16"),
     );
-    ReservationPool::new(sizing::reservation_entries(largest.output_bytes()))
+    let session_bytes = largest_peers.output_bytes() + services_cap(0).output_bytes();
+    ReservationPool::new(2 * sizing::reservation_entries(session_bytes))
         .expect("the derived pool size is nonzero and far below the semaphore maximum")
 }
 
@@ -57,13 +63,21 @@ pub(super) enum QueryUnsent {
     Closed,
 }
 
+/// What a live query asked for, which bounds its answer.
+#[derive(Debug, Default)]
+struct Snapshots {
+    /// The `GetPeers` limit, which bounds the record count of `Peers`.
+    peers_limit: u16,
+    /// The `GetServices` wanted list. A nonempty list bounds the service IDs
+    /// of `Services`.
+    wanted_services: Vec<ZakuraServiceId>,
+}
+
 /// One session's live queries.
 #[derive(Clone, Debug)]
 pub(super) struct Queries {
     reservations: SharedReservations<QueryKind>,
-    /// The `GetPeers` limit of the live reservation, which bounds the record
-    /// count of its answer.
-    peers_limit: Arc<Mutex<u16>>,
+    snapshots: Arc<Mutex<Snapshots>>,
     pool: ReservationPool,
     fence: WriterFence,
 }
@@ -77,8 +91,8 @@ impl Queries {
         close_cause: CloseCause,
     ) -> Self {
         Self {
-            reservations: SharedReservations::new(Reservations::new(DiscoveryMessage::RULES, 1)),
-            peers_limit: Arc::new(Mutex::new(0)),
+            reservations: SharedReservations::new(Reservations::new(DiscoveryMessage::RULES, 2)),
+            snapshots: Arc::default(),
             pool,
             fence: WriterFence::new(connection, close_cause),
         }
@@ -88,23 +102,31 @@ impl Queries {
     /// payload is read. In-process channels have no transport reader; the
     /// reader's claim applies the same checks before decode.
     pub(super) fn attach_precheck(&self, recv: &FramedRecv) {
-        recv.attach_precheck(Arc::new(PeersPrecheck(self.reservations.clone())));
+        recv.attach_precheck(Arc::new(self.reservations.clone()));
     }
 
-    /// Reserves the answer to a `GetPeers` with `limit`, then sends the
-    /// request on `send`. A request that is never written gives its
+    /// Reserves the answer to `message`, a `GetPeers` or a `GetServices`, then
+    /// sends the request on `send`. A request that is never written gives its
     /// reservation back.
-    pub(super) async fn send_get_peers(
+    pub(super) async fn send_query(
         &self,
         send: &FramedSend,
         cancel: &CancellationToken,
         message: DiscoveryMessage,
     ) -> Result<(), QueryUnsent> {
-        let DiscoveryMessage::GetPeers { limit, .. } = message else {
-            unreachable!("send_get_peers sends only GetPeers");
+        let (kind, request_type, cap) = match &message {
+            DiscoveryMessage::GetPeers { limit, .. } => {
+                (QueryKind::Peers, GET_PEERS.message_type, peers_cap(*limit))
+            }
+            DiscoveryMessage::GetServices(query) => (
+                QueryKind::Services,
+                GET_SERVICES.message_type,
+                services_cap(query.wanted_services.len()),
+            ),
+            _ => unreachable!("send_query sends only GetPeers and GetServices"),
         };
         let frame = encode_frame(&message).map_err(|error| {
-            tracing::debug!(?error, "failed to encode Zakura discovery GetPeers");
+            tracing::debug!(?error, ?kind, "failed to encode Zakura discovery query");
             QueryUnsent::NotDue
         })?;
         let exchange = self.fence.open().ok_or(QueryUnsent::Closed)?;
@@ -112,18 +134,21 @@ impl Queries {
         let entry = self.pool.try_entry().ok_or(QueryUnsent::NotDue)?;
         self.reservations
             .lock()
-            .reserve_fenced(
-                QueryKind::Peers,
-                GET_PEERS.message_type,
-                peers_cap(limit),
-                entry,
-                exchange,
-            )
+            .reserve_fenced(kind, request_type, cap, entry, exchange)
             .map_err(|_| QueryUnsent::NotDue)?;
-        *self
-            .peers_limit
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = limit;
+        {
+            let mut snapshots = self
+                .snapshots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match message {
+                DiscoveryMessage::GetPeers { limit, .. } => snapshots.peers_limit = limit,
+                DiscoveryMessage::GetServices(query) => {
+                    snapshots.wanted_services = query.wanted_services;
+                }
+                _ => unreachable!("the match above admits only GetPeers and GetServices"),
+            }
+        }
 
         let sent = tokio::select! {
             biased;
@@ -133,7 +158,7 @@ impl Queries {
         match sent {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.reservations.lock().retract(&QueryKind::Peers);
+                self.reservations.lock().retract(&kind);
                 Err(match error {
                     FencedSendError::Fenced | FencedSendError::Closed => QueryUnsent::Closed,
                 })
@@ -153,16 +178,47 @@ impl Queries {
             u16::from(MSG_DISCOVERY_PEERS),
             payload_len,
         )?;
-        let limit = *self
-            .peers_limit
+        let limit = self
+            .snapshots
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner)
+            .peers_limit;
         let cap = peers_cap(limit).bytes;
         // Widening usize to u64 is lossless on supported targets.
         if payload_len as u64 > cap {
             return Err(ClaimRefused::OverBytes { bytes: cap });
         }
         Ok(limit)
+    }
+
+    /// Claims the live `GetServices` reservation for a `Services` of
+    /// `payload_len` bytes, before its payload is decoded. Returns the
+    /// request's wanted list.
+    ///
+    /// As with [`Self::claim_peers`], the claim also checks the request's own
+    /// cap, `42 + min(n, 8) × 294` bytes for `n` wanted services.
+    pub(super) fn claim_services(
+        &self,
+        payload_len: usize,
+    ) -> Result<Vec<ZakuraServiceId>, ClaimRefused> {
+        self.reservations.lock().claim_end(
+            &QueryKind::Services,
+            u16::from(MSG_DISCOVERY_SERVICES),
+            payload_len,
+        )?;
+        let wanted = std::mem::take(
+            &mut self
+                .snapshots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .wanted_services,
+        );
+        let cap = services_cap(wanted.len()).bytes;
+        // Widening usize to u64 is lossless on supported targets.
+        if payload_len as u64 > cap {
+            return Err(ClaimRefused::OverBytes { bytes: cap });
+        }
+        Ok(wanted)
     }
 
     /// Ends the session's queries: an unwritten query is skipped, and an
@@ -172,25 +228,12 @@ impl Queries {
     }
 }
 
-/// The transport reader's header check for `Peers`.
-///
-/// `Services` keeps its row checks alone until its own reservation lands.
-#[derive(Debug)]
-struct PeersPrecheck(SharedReservations<QueryKind>);
-
-impl ResponsePrecheck for PeersPrecheck {
-    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
-        if message_type != u16::from(MSG_DISCOVERY_PEERS) {
-            return Ok(());
-        }
-        self.0.check(message_type, payload_len)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zakura::{framed_channel, regulation::UNFINISHED_EXCHANGE};
+    use crate::zakura::{
+        discovery::protocol::GetServices, framed_channel, regulation::UNFINISHED_EXCHANGE,
+    };
 
     fn get_peers(limit: u16) -> DiscoveryMessage {
         DiscoveryMessage::GetPeers {
@@ -225,11 +268,11 @@ mod tests {
             Err(ClaimRefused::Unsolicited { .. })
         ));
         queries
-            .send_get_peers(&send, &cancel, get_peers(3))
+            .send_query(&send, &cancel, get_peers(3))
             .await
             .expect("the first query is sent");
         assert!(matches!(
-            queries.send_get_peers(&send, &cancel, get_peers(3)).await,
+            queries.send_query(&send, &cancel, get_peers(3)).await,
             Err(QueryUnsent::NotDue)
         ));
         recv.recv().await.expect("the query was queued");
@@ -240,7 +283,7 @@ mod tests {
             Err(ClaimRefused::Unsolicited { .. })
         ));
         queries
-            .send_get_peers(&send, &cancel, get_peers(1))
+            .send_query(&send, &cancel, get_peers(1))
             .await
             .expect("an answered query frees its kind");
         recv.recv().await.expect("the query was queued");
@@ -248,6 +291,75 @@ mod tests {
             queries.claim_peers(peers_len(1) + 1),
             Err(ClaimRefused::OverBytes { .. })
         ));
+    }
+
+    fn get_services(wanted_services: Vec<ZakuraServiceId>) -> DiscoveryMessage {
+        DiscoveryMessage::GetServices(GetServices { wanted_services })
+    }
+
+    /// A `GetServices` reservation is independent of the `GetPeers` one. Its
+    /// answer claims it once, returns the wanted list, and stays within
+    /// `42 + min(n, 8) × 294` bytes.
+    #[tokio::test]
+    async fn get_services_is_reserved_beside_get_peers_and_claimed_once() {
+        let (queries, _connection, _close_cause) = new_queries();
+        let (send, mut recv) = framed_channel(8);
+        let cancel = CancellationToken::new();
+        let wanted = vec![ZakuraServiceId::discovery()];
+        let services_len =
+            |wanted| usize::try_from(services_cap(wanted).bytes).expect("a small cap fits usize");
+
+        assert!(matches!(
+            queries.claim_services(services_len(0)),
+            Err(ClaimRefused::Unsolicited { .. })
+        ));
+        queries
+            .send_query(&send, &cancel, get_peers(1))
+            .await
+            .expect("GetPeers is sent");
+        queries
+            .send_query(&send, &cancel, get_services(wanted.clone()))
+            .await
+            .expect("GetServices is sent beside GetPeers");
+        assert!(matches!(
+            queries
+                .send_query(&send, &cancel, get_services(Vec::new()))
+                .await,
+            Err(QueryUnsent::NotDue)
+        ));
+        recv.recv().await.expect("GetPeers was queued");
+        recv.recv().await.expect("GetServices was queued");
+
+        assert_eq!(queries.claim_services(services_len(1)), Ok(wanted));
+        assert!(matches!(
+            queries.claim_services(services_len(1)),
+            Err(ClaimRefused::Unsolicited { .. })
+        ));
+        assert_eq!(queries.claim_peers(peers_len(1)), Ok(1));
+
+        // One wanted service allows one summary, below the row's largest
+        // answer.
+        queries
+            .send_query(
+                &send,
+                &cancel,
+                get_services(vec![ZakuraServiceId::discovery()]),
+            )
+            .await
+            .expect("an answered query frees its kind");
+        recv.recv().await.expect("GetServices was queued");
+        assert!(matches!(
+            queries.claim_services(services_len(1) + 1),
+            Err(ClaimRefused::OverBytes { .. })
+        ));
+
+        // An empty wanted list reserves the largest answer.
+        queries
+            .send_query(&send, &cancel, get_services(Vec::new()))
+            .await
+            .expect("an answered query frees its kind");
+        recv.recv().await.expect("GetServices was queued");
+        assert_eq!(queries.claim_services(services_len(0)), Ok(Vec::new()));
     }
 
     /// Retiring the queries closes the connection only when a written query
@@ -260,7 +372,7 @@ mod tests {
         // Queued but never written: the transport skips it.
         let (queries, connection, _close_cause) = new_queries();
         queries
-            .send_get_peers(&send, &cancel, get_peers(1))
+            .send_query(&send, &cancel, get_peers(1))
             .await
             .expect("the query is queued");
         queries.retire();
@@ -270,7 +382,7 @@ mod tests {
         // Written and answered.
         let (queries, connection, _close_cause) = new_queries();
         queries
-            .send_get_peers(&send, &cancel, get_peers(1))
+            .send_query(&send, &cancel, get_peers(1))
             .await
             .expect("the query is queued");
         recv.recv().await.expect("the query is written");
@@ -281,7 +393,7 @@ mod tests {
         // Written and unanswered.
         let (queries, connection, close_cause) = new_queries();
         queries
-            .send_get_peers(&send, &cancel, get_peers(1))
+            .send_query(&send, &cancel, get_peers(1))
             .await
             .expect("the query is queued");
         recv.recv().await.expect("the query is written");

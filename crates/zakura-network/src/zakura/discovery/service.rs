@@ -32,8 +32,8 @@ use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
     DiscoveryBookError, DiscoveryMessage, DiscoveryRecordError, GetServices,
     HeaderSyncServiceSummary, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord, ZakuraServiceId,
-    MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS, ZAKURA_DISCOVERY_STREAM_VERSION,
-    ZAKURA_STREAM_DISCOVERY,
+    MAX_DISCOVERY_RECORDS_PER_RESPONSE, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
+    ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use super::requester::{reservation_pool, Queries, QueryUnsent};
 use super::serving::{
@@ -745,10 +745,21 @@ async fn run_discovery_pipe(
         };
 
         // A response claims its reservation before its payload is decoded.
-        let peers_limit = (frame.message_type == u16::from(MSG_DISCOVERY_PEERS))
-            .then(|| sink.queries.claim_peers(frame.payload.len()))
-            .transpose()
-            .map_err(SinkReject::protocol)?;
+        let claimed = match frame.message_type {
+            message_type if message_type == u16::from(MSG_DISCOVERY_PEERS) => Some(
+                sink.queries
+                    .claim_peers(frame.payload.len())
+                    .map(Claimed::Peers),
+            ),
+            message_type if message_type == u16::from(MSG_DISCOVERY_SERVICES) => Some(
+                sink.queries
+                    .claim_services(frame.payload.len())
+                    .map(Claimed::Services),
+            ),
+            _ => None,
+        }
+        .transpose()
+        .map_err(SinkReject::protocol)?;
 
         match pipe.run_one(frame) {
             Flow::Continue(()) | Flow::Done => {}
@@ -758,17 +769,26 @@ async fn run_discovery_pipe(
         let Some(message) = pipe.local_mut().take_decoded() else {
             continue;
         };
-        sink.handle_message(message, peers_limit).await?;
+        sink.handle_message(message, claimed).await?;
     }
 }
 
+/// What a response's claimed reservation asked for.
+#[derive(Debug)]
+enum Claimed {
+    /// The `GetPeers` limit.
+    Peers(u16),
+    /// The `GetServices` wanted list.
+    Services(Vec<ZakuraServiceId>),
+}
+
 impl DiscoverySink {
-    /// Handles one decoded message. A `Peers` carries the limit of the
-    /// `GetPeers` whose reservation it claimed.
+    /// Handles one decoded message. A response carries what its claimed
+    /// reservation asked for.
     async fn handle_message(
         &self,
         message: DiscoveryMessage,
-        peers_limit: Option<u16>,
+        claimed: Option<Claimed>,
     ) -> Result<(), SinkReject> {
         if !self
             .handle
@@ -793,7 +813,9 @@ impl DiscoverySink {
                 })
                 .map_err(SinkReject::protocol),
             DiscoveryMessage::Peers { records } => {
-                let limit = peers_limit.expect("the reader claims every Peers frame before decode");
+                let Some(Claimed::Peers(limit)) = claimed else {
+                    unreachable!("the reader claims every Peers frame before decode");
+                };
                 if records.len() > usize::from(limit) {
                     return Err(SinkReject::protocol(
                         "Zakura discovery PEERS carries more records than its GetPeers limit",
@@ -809,14 +831,37 @@ impl DiscoverySink {
             DiscoveryMessage::GetServices(query) => {
                 self.get_services.admit(query).map_err(SinkReject::protocol)
             }
-            DiscoveryMessage::Services(services) => self.handle_services(services).await,
+            DiscoveryMessage::Services(services) => {
+                let Some(Claimed::Services(wanted)) = claimed else {
+                    unreachable!("the reader claims every Services frame before decode");
+                };
+                self.handle_services(services, &wanted).await
+            }
         }
     }
 
-    async fn handle_services(&self, services: Services) -> Result<(), SinkReject> {
+    /// Imports the peer's own summaries. A nonempty `wanted` list from the
+    /// claimed `GetServices` bounds the summaries' service IDs. The decoder
+    /// already checked that they are unique, so the count stays within the
+    /// reserved count.
+    async fn handle_services(
+        &self,
+        services: Services,
+        wanted: &[ZakuraServiceId],
+    ) -> Result<(), SinkReject> {
         if services.node_id != self.peer_node_id {
             return Err(SinkReject::protocol(
                 "Zakura discovery SERVICES authored by a different node id",
+            ));
+        }
+        if !wanted.is_empty()
+            && services
+                .summaries
+                .iter()
+                .any(|summary| !wanted.contains(&summary.service_id))
+        {
+            return Err(SinkReject::protocol(
+                "Zakura discovery SERVICES carries a summary its GetServices did not ask for",
             ));
         }
 
@@ -829,14 +874,14 @@ impl DiscoverySink {
         self.progress.mark_services();
 
         if let Some(header_sync) = &self.header_sync {
+            // An advisory summary never blocks the reader: header sync drops
+            // it when its queue is full, and the next exchange sends a newer
+            // one.
             for summary in header_summaries {
-                if let Err(error) = header_sync
-                    .send(Event::AdvisorySummary {
-                        peer: self.session.peer_id().clone(),
-                        summary,
-                    })
-                    .await
-                {
+                if let Err(error) = header_sync.try_send(Event::AdvisorySummary {
+                    peer: self.session.peer_id().clone(),
+                    summary,
+                }) {
                     tracing::debug!(
                         ?error,
                         peer = ?self.session.peer_id(),
@@ -982,14 +1027,24 @@ impl DiscoverySource {
         };
         match self
             .queries
-            .send_get_peers(&self.session.send, &self.session.cancel, get_peers)
+            .send_query(&self.session.send, &self.session.cancel, get_peers)
             .await
         {
             Ok(()) | Err(QueryUnsent::NotDue) => {}
             Err(QueryUnsent::Closed) => return Err(()),
         }
 
-        self.handle_send_result(self.session.try_send_get_services(Vec::new()))
+        let get_services = DiscoveryMessage::GetServices(GetServices {
+            wanted_services: Vec::new(),
+        });
+        match self
+            .queries
+            .send_query(&self.session.send, &self.session.cancel, get_services)
+            .await
+        {
+            Ok(()) | Err(QueryUnsent::NotDue) => Ok(()),
+            Err(QueryUnsent::Closed) => Err(()),
+        }
     }
 
     /// Offers `record` to the `Hello` cadence and sends it once its interval
@@ -1547,7 +1602,7 @@ mod tests {
         connected_tx.send_replace(vec![peer_id.clone()]);
 
         let (peer_send, service_recv) = framed_channel(8);
-        let (service_send, _peer_recv) = framed_channel(8);
+        let (service_send, mut peer_recv) = framed_channel(8);
         let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
 
         service.add_peer(Peer::new(
@@ -1563,6 +1618,19 @@ mod tests {
             max_records_per_response: 11,
             expected_disconnect_after_exchange: false,
         };
+        // A Services answers the node's own GetServices.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(frame) = peer_recv.recv().await {
+                if matches!(
+                    decode_frame::<DiscoveryMessage>(&frame),
+                    Ok(DiscoveryMessage::GetServices(_))
+                ) {
+                    return;
+                }
+            }
+            panic!("the node sends GetServices before its stream ends");
+        })
+        .await?;
         peer_send
             .send(encode_frame(&DiscoveryMessage::Services(Services {
                 node_id: peer_node_id,
@@ -2055,10 +2123,104 @@ mod tests {
             signed_discovery_record(&NodeSecretKey::from_bytes(&[59u8; 32]), &handshake)?,
         ];
         assert!(matches!(
-            sink.handle_message(DiscoveryMessage::Peers { records }, Some(1))
+            sink.handle_message(DiscoveryMessage::Peers { records }, Some(Claimed::Peers(1)))
                 .await,
             Err(SinkReject::Protocol(_))
         ));
+        Ok(())
+    }
+
+    /// The reader claims each `Services` before decoding it: a `Services`
+    /// with no unanswered `GetServices` disconnects, and so does a second
+    /// answer. A summary outside a nonempty wanted list disconnects.
+    #[tokio::test]
+    async fn services_needs_its_get_services_and_stays_within_its_wanted_list(
+    ) -> Result<(), crate::BoxError> {
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[62u8; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let peer_node_id = NodeSecretKey::from_bytes(&[63u8; 32]).public();
+        let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
+        assert_eq!(
+            handle
+                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .await,
+            ServiceAdmissionDecision::Admit
+        );
+        let discovery_summary = ServiceSummaryEnvelope::discovery(&DiscoveryServiceSummary {
+            peer_exchange_slots_free: 1,
+            max_records_per_response: 32,
+            expected_disconnect_after_exchange: false,
+        })?;
+        let services = |summaries| {
+            DiscoveryMessage::Services(Services {
+                node_id: peer_node_id,
+                expires_at_unix_secs: u64::MAX,
+                summaries,
+            })
+        };
+        let spawn_reader = |sink: DiscoverySink| {
+            let peer_id = peer_id.clone();
+            let (to_sink, recv) = framed_channel(4);
+            let reader = tokio::spawn(async move {
+                let mut pipe = discovery_pipe(peer_id);
+                run_discovery_pipe(&mut pipe, recv, sink).await
+            });
+            (to_sink, reader)
+        };
+
+        // Unsolicited.
+        let (sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let (to_sink, reader) = spawn_reader(sink);
+        to_sink.send(discovery_frame(services(Vec::new()))?).await?;
+        let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
+        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+
+        // Answered once, then a second answer.
+        let (sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let queries = sink.queries.clone();
+        let (query_send, mut query_recv) = framed_channel(4);
+        queries
+            .send_query(
+                &query_send,
+                &CancellationToken::new(),
+                DiscoveryMessage::GetServices(GetServices {
+                    wanted_services: vec![ZakuraServiceId::discovery()],
+                }),
+            )
+            .await
+            .expect("the query is sent");
+        query_recv.recv().await.expect("the query is written");
+        let (to_sink, reader) = spawn_reader(sink);
+        to_sink
+            .send(discovery_frame(services(vec![discovery_summary.clone()]))?)
+            .await?;
+        to_sink.send(discovery_frame(services(Vec::new()))?).await?;
+        let rejected = tokio::time::timeout(Duration::from_secs(2), reader).await??;
+        assert!(matches!(rejected, Err(SinkReject::Protocol(_))));
+
+        // A summary the wanted list does not name.
+        let (sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
+        let wanted = || Some(Claimed::Services(vec![ZakuraServiceId::header_sync()]));
+        assert!(matches!(
+            sink.handle_message(services(vec![discovery_summary]), wanted())
+                .await,
+            Err(SinkReject::Protocol(_))
+        ));
+        sink.handle_message(services(Vec::new()), wanted()).await?;
         Ok(())
     }
 

@@ -1399,6 +1399,36 @@ impl DiskDb {
             .collect()
     }
 
+    /// Collect the rows under each raw key prefix, in prefix order, with one iterator.
+    ///
+    /// Returns the same rows as [`Self::raw_range_cf`] over each prefix's half-open range,
+    /// without creating an iterator per prefix.
+    pub(crate) fn raw_prefixes_cf<C, P>(
+        &self,
+        cf: &C,
+        prefixes: impl IntoIterator<Item = P>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        P: AsRef<[u8]>,
+    {
+        let mut iterator = self.db.raw_iterator_cf(cf);
+        let mut rows = Vec::new();
+        for prefix in prefixes {
+            let prefix = prefix.as_ref();
+            iterator.seek(prefix);
+            while let (Some(key), Some(value)) = (iterator.key(), iterator.value()) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                rows.push((key.to_vec(), value.to_vec()));
+                iterator.next();
+            }
+            iterator.status()?;
+        }
+        Ok(rows)
+    }
+
     // Read methods are located in the ReadDisk trait
 
     // Write methods

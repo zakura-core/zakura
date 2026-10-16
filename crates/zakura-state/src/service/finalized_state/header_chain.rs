@@ -5883,26 +5883,29 @@ impl HeaderChainStore {
         hash: block::Hash,
     ) -> Result<Vec<EligibilityReason>, HeaderChainStoreError> {
         let mut reasons = Vec::new();
-        for tag in 0..=4 {
+        let prefixes = (0..=4).map(|tag| {
             let mut prefix = Vec::with_capacity(33);
             prefix.push(tag);
             prefix.extend(hash.0);
-            for (key, value) in self.scan_prefix(HEADER_ELIGIBILITY_ROOT, &prefix)? {
-                if key.len() != 65 {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "invalid eligibility-root key width",
-                    ));
-                }
-                let key = HeaderEligibilityRootKey::try_from_bytes(&key)
-                    .map_err(|_| HeaderChainStoreError::Incoherent("invalid eligibility key"))?;
-                let reason = HeaderEligibilityReasonDisk::decode(&value)?.into_domain();
-                if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "eligibility key/value mismatch",
-                    ));
-                }
-                reasons.push(reason);
+            prefix
+        });
+        let cf = self.cf(HEADER_ELIGIBILITY_ROOT)?;
+        // One iterator for the five tag prefixes: creating an iterator costs more than its seeks.
+        for (key, value) in self.db.raw_prefixes_cf(&cf, prefixes)? {
+            if key.len() != 65 {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "invalid eligibility-root key width",
+                ));
             }
+            let key = HeaderEligibilityRootKey::try_from_bytes(&key)
+                .map_err(|_| HeaderChainStoreError::Incoherent("invalid eligibility key"))?;
+            let reason = HeaderEligibilityReasonDisk::decode(&value)?.into_domain();
+            if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "eligibility key/value mismatch",
+                ));
+            }
+            reasons.push(reason);
         }
         Ok(reasons)
     }

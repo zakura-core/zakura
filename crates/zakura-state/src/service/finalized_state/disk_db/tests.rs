@@ -209,3 +209,75 @@ fn file_limit_query_errors_cannot_fabricate_capacity() {
         || Err(io::ErrorKind::PermissionDenied.into()),
     );
 }
+
+/// One-iterator prefix scans return exactly the rows of one bounded range scan per prefix.
+#[test]
+fn raw_prefixes_match_one_range_scan_per_prefix() {
+    let _init_guard = zakura_test::init();
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "raw-prefixes-test",
+        &Version::new(1, 0, 0),
+        &Network::Mainnet,
+        ["raw_prefixes".to_owned()],
+        false,
+    )
+    .expect("the ephemeral database configuration is valid");
+    let cf = db
+        .cf_handle("raw_prefixes")
+        .expect("the test column family was configured");
+
+    let keys: [&[u8]; 9] = [
+        b"\x00",
+        b"\x00a",
+        b"\x00a\xff",
+        b"\x00b",
+        b"\x01a",
+        b"\x01a\x00",
+        b"\x02",
+        b"\xff",
+        b"\xff\xff",
+    ];
+    for (index, key) in keys.iter().enumerate() {
+        db.put_cf(cf, key, [u8::try_from(index).expect("few keys")])
+            .expect("writing a test row should succeed");
+    }
+    // A deleted row must stay invisible, like in a bounded range scan.
+    db.delete_cf(cf, b"\x01a")
+        .expect("deleting a test row should succeed");
+
+    let prefixes: [&[u8]; 8] = [
+        b"\x00a",
+        b"\x01",
+        b"\x01b",
+        b"\x00",
+        b"\xff",
+        b"\xff\xff",
+        b"",
+        b"\x03",
+    ];
+    let mut expected = Vec::new();
+    for prefix in prefixes {
+        let mut end = prefix.to_vec();
+        let upper = loop {
+            match end.pop() {
+                Some(u8::MAX) => continue,
+                Some(byte) => {
+                    end.push(byte + 1);
+                    break Some(end);
+                }
+                None => break None,
+            }
+        };
+        expected.extend(
+            db.raw_range_cf(&cf, prefix, upper.as_deref())
+                .expect("range scans of the test family succeed"),
+        );
+    }
+
+    assert_eq!(
+        db.raw_prefixes_cf(&cf, prefixes)
+            .expect("prefix scans of the test family succeed"),
+        expected
+    );
+}

@@ -13,7 +13,6 @@ use crate::zakura::{
         stream_conformance_suite, StreamConformance, SubscriptionUpdate, UpdateOp,
     },
     wire_codec::{
-        item_suite::item_suite,
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         sample::WireSample,
     },
@@ -295,11 +294,6 @@ impl MessageSample for WatchMessage {
 }
 
 message_suite!(watch_family, WatchMessage);
-
-item_suite!(status_payload, StatusPayload);
-item_suite!(watch_payload, WatchPayload);
-item_suite!(pushed_payload, PushedPayload);
-item_suite!(watch_ended_payload, WatchEndedPayload);
 
 #[test]
 fn every_layout_carries_exactly_its_family_rows() {

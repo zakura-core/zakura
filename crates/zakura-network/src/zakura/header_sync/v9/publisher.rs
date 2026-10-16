@@ -116,12 +116,14 @@ struct Fixed {
     schema: AuxSchema,
 }
 
-/// Why a subscription waits without a page in progress.
+/// Why a subscription waits without a page in progress. Either kind retries
+/// after a `Grant` or a selected-chain change.
 #[derive(Clone, Debug)]
 enum Stall {
-    /// State refused a lease for capacity. Wait for its release.
+    /// State refused a lease for capacity. Also retry when the signal is
+    /// released, because state may release it only on a later lease.
     Capacity(ServingCapacitySignal),
-    /// A local failure. Wait for the next update or selected-chain change.
+    /// A local failure.
     Local,
 }
 
@@ -304,11 +306,9 @@ impl Shared {
                         update.added_credit,
                     )?
                 };
-                // New credit may let a locally stalled subscription retry.
+                // New credit lets a stalled subscription retry.
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                    if matches!(subscription.stall, Some(Stall::Local)) {
-                        subscription.stall = None;
-                    }
+                    subscription.stall = None;
                 }
                 Ok(applied)
             }
@@ -561,13 +561,13 @@ impl Shared {
         true
     }
 
-    /// Clear the local stalls after the selected chain changed, or else the
+    /// Clear every stall after the selected chain changed, or else the
     /// capacity stalls whose signal was released.
-    fn clear_stalls(&mut self, local: bool) {
+    fn clear_stalls(&mut self, all: bool) {
         for subscription in self.subscriptions.values_mut() {
             let clear = match &subscription.stall {
-                Some(Stall::Local) => local,
-                Some(Stall::Capacity(signal)) => !local && signal.is_released(),
+                Some(Stall::Local) => all,
+                Some(Stall::Capacity(signal)) => all || signal.is_released(),
                 None => false,
             };
             if clear {

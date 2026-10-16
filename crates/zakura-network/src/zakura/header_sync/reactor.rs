@@ -184,10 +184,6 @@ fn build_header_sync_reactor(
         vct_repair_stall: None,
         vct_local_operation: None,
         vct_supplier_order: VecDeque::new(),
-        served_paths: HashMap::new(),
-        served_path_deadlines: HashMap::new(),
-        pending_lease_releases: VecDeque::new(),
-        lease_release_retry_at: None,
         last_snapshot_refresh_trace_at: Cell::new(None),
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
@@ -212,50 +208,6 @@ struct PeerState {
     status_spent: bool,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
-}
-
-#[derive(Copy, Clone, Debug)]
-struct PendingServedRequest {
-    request_id: HeaderSyncRequestId,
-    max_header_count: u32,
-    tree_aux_schema: AuxSchema,
-}
-
-#[derive(Debug)]
-enum ServedPathState {
-    Acquiring {
-        session_id: u64,
-        request_id: HeaderSyncRequestId,
-        target_tip_hash: block::Hash,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-    },
-    Active {
-        session_id: u64,
-        lease_id: u64,
-        target: zakura_header_chain::Frontier,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        next_after: zakura_header_chain::Frontier,
-        pending_request: PendingServedRequest,
-    },
-}
-
-#[derive(Clone, Debug)]
-struct PendingLeaseRelease {
-    peer: ZakuraPeerId,
-    session_id: u64,
-    lease_id: u64,
-    scope: zakura_header_chain::HeaderWorkAuthority,
-}
-
-impl PendingLeaseRelease {
-    fn action(&self) -> HeaderPortOperation {
-        HeaderPortOperation::ReleaseHeaderPath {
-            peer: self.peer.clone(),
-            session_id: self.session_id,
-            lease_id: self.lease_id,
-            scope: self.scope,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -296,10 +248,6 @@ struct HeaderSyncReactor {
     ///
     /// The admitted peer limits bound this queue. New identities enter behind established peers.
     vct_supplier_order: VecDeque<ZakuraPeerId>,
-    served_paths: HashMap<ZakuraPeerId, ServedPathState>,
-    served_path_deadlines: HashMap<ZakuraPeerId, Instant>,
-    pending_lease_releases: VecDeque<PendingLeaseRelease>,
-    lease_release_retry_at: Option<Instant>,
     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
 }
 
@@ -666,75 +614,6 @@ fn port_header_entry(entry: HeaderEntry) -> zakura_node_services::header_chain::
 }
 
 #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
-fn assemble_port_header_path_page(
-    lease_id: u64,
-    page: zakura_node_services::header_chain::RetainedHeaderPathPage,
-    requested_schema: AuxSchema,
-) -> Option<HeaderPathPage> {
-    if page.headers.len() != page.aux_deliveries.len()
-        || page.headers.len() != page.finalized_tree_aux.len()
-        || page.headers.len() != page.finalized_body_sizes.len()
-    {
-        return None;
-    }
-    let tree_aux_schema = if requested_schema == AuxSchema::V1
-        && page
-            .aux_deliveries
-            .iter()
-            .zip(&page.finalized_tree_aux)
-            .all(|(deliveries, finalized_tree_aux)| {
-                finalized_tree_aux.is_some()
-                    || selected_port_aux_delivery(deliveries, AuxSchema::V1).is_some()
-            }) {
-        AuxSchema::V1
-    } else {
-        AuxSchema::None
-    };
-    let entries = page
-        .headers
-        .into_iter()
-        .zip(page.aux_deliveries)
-        .zip(page.finalized_tree_aux)
-        .zip(page.finalized_body_sizes)
-        .map(
-            |(((header, deliveries), finalized_tree_aux), finalized_body_size)| {
-                let delivery_schema =
-                    if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
-                        AuxSchema::V1
-                    } else {
-                        AuxSchema::None
-                    };
-                let delivery = selected_port_aux_delivery(&deliveries, delivery_schema);
-                HeaderEntry {
-                    header,
-                    body_size: finalized_body_size
-                        .or_else(|| {
-                            zakura_header_chain::AuxDelivery::advertised_body_size(&deliveries)
-                        })
-                        .map_or(0, NonZeroU32::get),
-                    tree_aux: (tree_aux_schema == AuxSchema::V1)
-                        .then(|| {
-                            finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux))
-                        })
-                        .flatten(),
-                }
-            },
-        )
-        .collect();
-    Some(HeaderPathPage {
-        lease_id,
-        common_ancestor: page.common_ancestor,
-        target: page.target,
-        scope: page.scope,
-        tree_aux_schema,
-        entries,
-        complete: page.complete,
-    })
-}
-
-/// The delivery to serve under `schema`: a non-rejected one that carries what
-/// the schema needs, preferring an authenticated delivery.
-#[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
 pub(super) fn selected_port_aux_delivery(
     deliveries: &[zakura_header_chain::AuxDelivery],
     schema: AuxSchema,
@@ -876,30 +755,6 @@ impl HeaderSyncReactor {
             Event::VctRepairContextReady { owner, result } => {
                 self.handle_vct_repair_context_ready(owner, result)
             }
-            #[cfg(any(test, feature = "zakura-testkit"))]
-            Event::PathLeaseReady {
-                peer,
-                session_id,
-                scope,
-                request,
-                result,
-            } => self.handle_header_path_lease_ready(peer, session_id, scope, request, result),
-            #[cfg(any(test, feature = "zakura-testkit"))]
-            Event::HeaderPathPageReady {
-                peer,
-                session_id,
-                scope,
-                request_id,
-                target_tip_hash,
-                result,
-            } => self.handle_header_path_page_ready(
-                peer,
-                session_id,
-                scope,
-                request_id,
-                target_tip_hash,
-                result,
-            ),
             #[cfg(any(test, feature = "zakura-testkit"))]
             Event::HeaderTargetPrepared {
                 peer,
@@ -1104,27 +959,8 @@ impl HeaderSyncReactor {
         if state.session.session_id() != session_id {
             return;
         }
-        let status = match message {
-            HeaderSyncMessage::Status(status) => status,
-            HeaderSyncMessage::GetHeaders(request) => {
-                self.handle_get_headers(peer, session_id, request);
-                return;
-            }
-            HeaderSyncMessage::Headers(_) => {
-                tracing::debug!(?peer, "ignored response without an ownership reservation");
-                return;
-            }
-            HeaderSyncMessage::HeadersOutcome(_) => {
-                tracing::debug!(?peer, "ignored outcome without an ownership reservation");
-                return;
-            }
-        };
         metrics::counter!("sync.header.peer.status.received").increment(1);
         self.emit_status(hs_trace::HEADER_STATUS_RECEIVED, &peer, session_id, &status);
-        if status.work_anchor_height > status.selected_tip_height {
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
-            return;
-        }
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
             state.status_spent = false;
@@ -1386,99 +1222,6 @@ impl HeaderSyncReactor {
         response: Headers,
         admitted: Admitted,
     ) {
-        let Some(state) = self.peer_state.get(&peer) else {
-            return;
-        };
-        if state.session.session_id() != session_id {
-            return;
-        }
-        match message {
-            HeaderSyncMessage::Headers(response) => {
-                self.handle_headers(peer, session_id, scope, response)
-            }
-            HeaderSyncMessage::HeadersOutcome(response) => {
-                self.handle_headers_outcome(peer, session_id, scope, response)
-            }
-            HeaderSyncMessage::Status(_) | HeaderSyncMessage::GetHeaders(_) => {
-                tracing::debug!(?peer, "ignored non-response in an ownership reservation");
-            }
-        }
-    }
-
-    fn handle_get_headers(&mut self, peer: ZakuraPeerId, session_id: u64, request: GetHeaders) {
-        let request_id = HeaderSyncRequestId::new(request.request_id)
-            .expect("the bounded decoder rejects zero request IDs");
-        let max_header_count =
-            self.served_page_count(request.max_header_count, request.tree_aux_schema);
-        if max_header_count == 0 {
-            self.send_headers_outcome(
-                &peer,
-                request.request_id,
-                request.target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-            return;
-        }
-
-        if self.served_paths.contains_key(&peer) {
-            if self.send_capacity_busy(&peer, request.request_id, request.target_tip_hash) {
-                if let Some(state) = self.peer_state.get_mut(&peer) {
-                    state.waiting_for_serving_slot = true;
-                }
-            }
-            return;
-        }
-
-        let Some(local) = self.committed_snapshot.as_ref() else {
-            self.send_headers_outcome(
-                &peer,
-                request.request_id,
-                request.target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-            return;
-        };
-        let scope =
-            zakura_header_chain::HeaderWorkAuthority::for_target(local, request.target_tip_hash);
-        self.served_paths.insert(
-            peer.clone(),
-            ServedPathState::Acquiring {
-                session_id,
-                request_id,
-                target_tip_hash: request.target_tip_hash,
-                scope,
-            },
-        );
-        self.served_path_deadlines
-            .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-        if !self.dispatch_action(HeaderPortOperation::AcquirePath {
-            peer: peer.clone(),
-            session_id,
-            scope,
-            request: request.clone(),
-        }) {
-            self.served_paths.remove(&peer);
-            self.served_path_deadlines.remove(&peer);
-            self.send_headers_outcome(
-                &peer,
-                request.request_id,
-                request.target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-        }
-    }
-
-    fn handle_headers(
-        &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
-        response_scope: zakura_header_chain::HeaderWorkAuthority,
-        response: Headers,
-    ) {
-        let Some(request_id) = HeaderSyncRequestId::new(response.request_id) else {
-            self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
-            return;
-        };
         let Some(active) = self.peer_work_queue.active(&peer) else {
             metrics::counter!("sync.header.target.late_response.total").increment(1);
             return;
@@ -1597,24 +1340,6 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         }
-        if response.complete
-            && response.entries.is_empty()
-            && returned_ancestor.hash == response.target_tip_hash
-            && response.target_tip_hash == active_target_tip_hash
-        {
-            if let Some(scope) = ordinary_scope {
-                // The target is already in the local DAG, so no other peer needs to fetch it.
-                self.completed_targets
-                    .mark(scope.header_generation, scope.branch);
-            }
-            self.retire_peer_work(&peer, HeaderRequestTerminal::AlreadyKnown);
-            metrics::counter!("sync.header.target.already_known.total").increment(1);
-            return;
-        }
-        debug_assert!(
-            !response.entries.is_empty(),
-            "the wire decoder accepts empty header pages only for already-known targets",
-        );
         self.reset_unproductive_requests(&peer, session_id);
         self.request_deadlines
             .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
@@ -1848,11 +1573,6 @@ impl HeaderSyncReactor {
         {
             return;
         }
-        if active.owner.header_authority() != response_scope {
-            metrics::counter!("sync.header.target.late_response.total").increment(1);
-            return;
-        }
-        let matches = active.accepts_outcome(request_id, response.target_tip_hash);
         let is_repair = matches!(
             active.purpose,
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
@@ -2573,260 +2293,6 @@ impl HeaderSyncReactor {
                 self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
             }
         }
-    }
-
-    fn handle_header_path_lease_ready(
-        &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        request: GetHeaders,
-        result: HeaderPathLeaseResult,
-    ) {
-        let request_id = HeaderSyncRequestId::new(request.request_id)
-            .expect("state echoes a request accepted by the bounded decoder");
-        let Some(state) = self.served_paths.remove(&peer) else {
-            if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
-            }
-            return;
-        };
-        let ServedPathState::Acquiring {
-            session_id: expected_session,
-            request_id: expected_request,
-            target_tip_hash: expected_target,
-            scope: expected_scope,
-        } = state
-        else {
-            self.served_paths.insert(peer.clone(), state);
-            if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
-            }
-            return;
-        };
-        if expected_session != session_id
-            || expected_request != request_id
-            || expected_target != request.target_tip_hash
-            || expected_scope != scope
-        {
-            self.served_paths.insert(
-                peer.clone(),
-                ServedPathState::Acquiring {
-                    session_id: expected_session,
-                    request_id: expected_request,
-                    target_tip_hash: expected_target,
-                    scope: expected_scope,
-                },
-            );
-            if let HeaderPathLeaseResult::Acquired(lease) = result {
-                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
-            }
-            return;
-        }
-
-        let lease = match result {
-            HeaderPathLeaseResult::CapacityBusy(signal) => {
-                self.served_path_deadlines.remove(&peer);
-                if self.send_capacity_busy(&peer, request.request_id, request.target_tip_hash) {
-                    self.watch_capacity(&peer, signal);
-                }
-                return;
-            }
-            HeaderPathLeaseResult::Outcome(outcome) => {
-                self.served_path_deadlines.remove(&peer);
-                self.send_headers_outcome(
-                    &peer,
-                    request.request_id,
-                    request.target_tip_hash,
-                    outcome,
-                );
-                return;
-            }
-            HeaderPathLeaseResult::Acquired(lease)
-                if lease.target.hash == request.target_tip_hash
-                    && request.locator_hashes.contains(&lease.common_ancestor.hash)
-                    && lease.scope == scope =>
-            {
-                lease
-            }
-            HeaderPathLeaseResult::Acquired(lease) => {
-                self.served_path_deadlines.remove(&peer);
-                self.send_headers_outcome(
-                    &peer,
-                    request.request_id,
-                    request.target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                );
-                self.release_lease(peer, session_id, lease.lease_id, lease.scope);
-                return;
-            }
-        };
-        let max_header_count =
-            self.served_page_count(request.max_header_count, request.tree_aux_schema);
-        self.served_paths.insert(
-            peer.clone(),
-            ServedPathState::Active {
-                session_id,
-                lease_id: lease.lease_id,
-                target: lease.target,
-                scope: lease.scope,
-                next_after: lease.common_ancestor,
-                pending_request: PendingServedRequest {
-                    request_id,
-                    max_header_count,
-                    tree_aux_schema: request.tree_aux_schema,
-                },
-            },
-        );
-        self.served_path_deadlines
-            .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-        if !self.dispatch_action(HeaderPortOperation::ReadPath {
-            peer: peer.clone(),
-            session_id,
-            lease_id: lease.lease_id,
-            scope: lease.scope,
-            request_id,
-            target_tip_hash: lease.target.hash,
-            after_hash: lease.common_ancestor.hash,
-            max_header_count,
-            tree_aux_schema: request.tree_aux_schema,
-        }) {
-            self.release_served_path(&peer);
-        }
-    }
-
-    fn handle_header_path_page_ready(
-        &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-        request_id: HeaderSyncRequestId,
-        target_tip_hash: block::Hash,
-        result: HeaderPathPageResult,
-    ) {
-        let Some(state) = self.served_paths.remove(&peer) else {
-            return;
-        };
-        let ServedPathState::Active {
-            session_id: expected_session,
-            lease_id,
-            target,
-            scope: expected_scope,
-            next_after,
-            pending_request,
-        } = state
-        else {
-            self.served_paths.insert(peer, state);
-            return;
-        };
-        if expected_session != session_id
-            || expected_scope != scope
-            || target.hash != target_tip_hash
-            || pending_request.request_id != request_id
-        {
-            self.served_paths.insert(
-                peer,
-                ServedPathState::Active {
-                    session_id: expected_session,
-                    lease_id,
-                    target,
-                    scope: expected_scope,
-                    next_after,
-                    pending_request,
-                },
-            );
-            return;
-        }
-        let HeaderPathPageResult::Page(page) = result else {
-            self.served_path_deadlines.remove(&peer);
-            self.send_headers_outcome(
-                &peer,
-                request_id.get(),
-                target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-            self.release_lease(peer, session_id, lease_id, expected_scope);
-            return;
-        };
-        if page.lease_id != lease_id
-            || page.target != target
-            || page.scope != expected_scope
-            || page.common_ancestor != next_after
-            || page.entries.len()
-                > usize::try_from(pending_request.max_header_count).unwrap_or(usize::MAX)
-            || !pending_request.tree_aux_schema.admits(page.tree_aux_schema)
-        {
-            self.served_path_deadlines.remove(&peer);
-            self.send_headers_outcome(
-                &peer,
-                request_id.get(),
-                target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-            self.release_lease(peer, session_id, lease_id, expected_scope);
-            return;
-        }
-
-        let complete = page.complete;
-        let response = Headers {
-            request_id: request_id.get(),
-            target_tip_hash,
-            common_ancestor_height: page.common_ancestor.height,
-            common_ancestor_hash: page.common_ancestor.hash,
-            complete,
-            tree_aux_schema: page.tree_aux_schema,
-            entries: page.entries,
-        };
-        let header_count = response.entries.len();
-        let common_ancestor_height = response.common_ancestor_height;
-        let common_ancestor_hash = response.common_ancestor_hash;
-        let response_schema = response.tree_aux_schema;
-        let sent = self
-            .peer_state
-            .get(&peer)
-            .map(|state| state.session.clone())
-            .is_some_and(
-                |session| match session.try_send_headers(&self.codec, response) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        self.emit_queue_send_failed(
-                            &peer,
-                            &session,
-                            "Headers",
-                            &error,
-                            Some(request_id.get()),
-                        );
-                        false
-                    }
-                },
-            );
-        if sent {
-            self.emit_header_response(
-                hs_trace::HEADER_RESPONSE_SERVED,
-                &peer,
-                session_id,
-                expected_scope,
-                request_id.get(),
-                target_tip_hash,
-                common_ancestor_height,
-                common_ancestor_hash,
-                header_count,
-                complete,
-                response_schema,
-            );
-        }
-        self.served_path_deadlines.remove(&peer);
-        if !sent {
-            self.send_headers_outcome(
-                &peer,
-                request_id.get(),
-                target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
-        }
-        // The next request reacquires this target by hash. A peer never holds serving
-        // capacity while waiting to request its next page.
-        self.release_lease(peer, session_id, lease_id, expected_scope);
     }
 
     fn finish_header_locator_query(
@@ -3744,62 +3210,6 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn watch_capacity(
-        &mut self,
-        peer: &ZakuraPeerId,
-        signal: zakura_node_services::header_chain::ServingCapacitySignal,
-    ) {
-        let Some(state) = self.peer_state.get_mut(peer) else {
-            return;
-        };
-        if state.capacity_signal.as_ref() == Some(&signal) {
-            return;
-        }
-        let cancel = CancellationToken::new();
-        if let Some(previous) = state.capacity_wait_cancel.replace(cancel.clone()) {
-            previous.cancel();
-        }
-        state.capacity_signal = Some(signal.clone());
-        self.capacity_waiters.push(Box::pin(async move {
-            tokio::select! {
-                _ = cancel.cancelled() => {},
-                _ = signal.released() => {},
-            }
-        }));
-    }
-
-    fn schedule_capacity_notifications(&mut self) {
-        let now = Instant::now();
-        for (peer, state) in &mut self.peer_state {
-            if state.session.cancel_token().is_cancelled() {
-                continue;
-            }
-
-            let Some(publisher) = state.status_publisher.as_mut() else {
-                continue;
-            };
-            let slot_available =
-                state.waiting_for_serving_slot && !self.served_paths.contains_key(peer);
-            let state_available = state
-                .capacity_signal
-                .as_ref()
-                .is_some_and(|signal| signal.is_released());
-            if slot_available {
-                state.waiting_for_serving_slot = false;
-            }
-            if state_available {
-                state.capacity_signal = None;
-                if let Some(cancel) = state.capacity_wait_cancel.take() {
-                    cancel.cancel();
-                }
-            }
-            if slot_available || state_available {
-                // The Busy send precedes this publication on the ordered outbound queue.
-                publisher.request_refresh(now);
-            }
-        }
-    }
-
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         if self.report_fatal_vct_local_operation(now) {
@@ -4012,170 +3422,6 @@ impl HeaderSyncReactor {
                 }
             }
         }
-    }
-
-    fn release_idle_served_paths(&mut self, now: Instant) {
-        let expired: Vec<_> = self
-            .served_path_deadlines
-            .iter()
-            .filter(|(_, deadline)| **deadline <= now)
-            .map(|(peer, _)| peer.clone())
-            .collect();
-        for peer in expired {
-            if matches!(
-                self.served_paths.get(&peer),
-                Some(ServedPathState::Active { .. })
-            ) {
-                self.release_served_path(&peer);
-            } else {
-                if let Some(ServedPathState::Acquiring {
-                    request_id,
-                    target_tip_hash,
-                    ..
-                }) = self.served_paths.remove(&peer)
-                {
-                    self.send_headers_outcome(
-                        &peer,
-                        request_id.get(),
-                        target_tip_hash,
-                        HeadersOutcomeCode::Busy,
-                    );
-                }
-                self.served_path_deadlines.remove(&peer);
-            }
-            metrics::counter!("sync.header.serve.timed_out.total").increment(1);
-        }
-    }
-
-    fn served_page_count(&self, requested: u32, tree_aux_schema: AuxSchema) -> u32 {
-        let byte_limited = headers_response_capacity(
-            &self.startup.network,
-            tree_aux_schema,
-            usize::try_from(self.serving_limits.max_message_bytes()).unwrap_or(usize::MAX),
-        );
-        requested
-            .min(self.serving_limits.max_headers_per_response())
-            .min(byte_limited)
-            .min(MAX_HS_RANGE)
-    }
-
-    fn send_capacity_busy(
-        &self,
-        peer: &ZakuraPeerId,
-        request_id: u64,
-        target: block::Hash,
-    ) -> bool {
-        let sent = self.send_headers_outcome(peer, request_id, target, HeadersOutcomeCode::Busy);
-        if !sent {
-            if let Some(state) = self.peer_state.get(peer) {
-                // Close the stream when its queue cannot retain the terminal response.
-                state.session.cancel_token().cancel();
-            }
-        }
-        sent
-    }
-
-    fn send_headers_outcome(
-        &self,
-        peer: &ZakuraPeerId,
-        request_id: u64,
-        target_tip_hash: block::Hash,
-        outcome: HeadersOutcomeCode,
-    ) -> bool {
-        let Some(state) = self.peer_state.get(peer) else {
-            return false;
-        };
-        if let Err(error) = state.session.try_send_headers_outcome(
-            &self.codec,
-            HeadersOutcome {
-                request_id,
-                target_tip_hash,
-                outcome,
-            },
-        ) {
-            self.emit_queue_send_failed(
-                peer,
-                &state.session,
-                "HeadersOutcome",
-                &error,
-                Some(request_id),
-            );
-            false
-        } else {
-            let session_id = state.session.session_id();
-            let direction = state.session.direction();
-            self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
-                row.insert(hs_trace::EVENT.into(), hs_trace::HEADER_OUTCOME.into());
-                row.insert(hs_trace::PEER.into(), trace_peer_label(peer).into());
-                row.insert(hs_trace::SESSION_ID.into(), session_id.into());
-                row.insert(
-                    hs_trace::DIRECTION.into(),
-                    header_direction_label(direction).into(),
-                );
-                row.insert(hs_trace::REQUEST_ID.into(), request_id.into());
-                row.insert(
-                    hs_trace::TARGET_HASH.into(),
-                    target_tip_hash.to_string().into(),
-                );
-                row.insert(
-                    hs_trace::OUTCOME.into(),
-                    headers_outcome_label(outcome).into(),
-                );
-            });
-            true
-        }
-    }
-
-    fn release_served_path(&mut self, peer: &ZakuraPeerId) {
-        self.served_path_deadlines.remove(peer);
-        let Some(ServedPathState::Active {
-            session_id,
-            lease_id,
-            target,
-            scope,
-            pending_request,
-            ..
-        }) = self.served_paths.remove(peer)
-        else {
-            return;
-        };
-        self.send_headers_outcome(
-            peer,
-            pending_request.request_id.get(),
-            target.hash,
-            HeadersOutcomeCode::Busy,
-        );
-        self.release_lease(peer.clone(), session_id, lease_id, scope);
-    }
-
-    fn release_lease(
-        &mut self,
-        peer: ZakuraPeerId,
-        session_id: u64,
-        lease_id: u64,
-        scope: zakura_header_chain::HeaderWorkAuthority,
-    ) {
-        let release = PendingLeaseRelease {
-            peer,
-            session_id,
-            lease_id,
-            scope,
-        };
-        if !self.dispatch_action(release.action()) {
-            self.pending_lease_releases.push_back(release);
-            self.lease_release_retry_at = Some(Instant::now() + LEASE_RELEASE_RETRY_INTERVAL);
-        }
-    }
-
-    fn retry_pending_lease_releases(&mut self, now: Instant) {
-        while let Some(release) = self.pending_lease_releases.pop_front() {
-            if !self.dispatch_action(release.action()) {
-                self.pending_lease_releases.push_front(release);
-                self.lease_release_retry_at = Some(now + LEASE_RELEASE_RETRY_INTERVAL);
-                return;
-            }
-        }
-        self.lease_release_retry_at = None;
     }
 
     fn admitted_count(&self, direction: ServicePeerDirection) -> usize {
@@ -4549,154 +3795,6 @@ impl HeaderSyncReactor {
                         }) as HeaderSyncPortCompletion
                     })
                 }
-                HeaderPortOperation::AcquirePath {
-                    peer,
-                    session_id,
-                    scope,
-                    request,
-                } => Box::pin(async move {
-                    let reply = header_chain
-                        .acquire_header_path(port::AcquirePath {
-                            source: source_id_from_peer(&peer),
-                            session_id,
-                            scope,
-                            target_tip_hash: request.target_tip_hash,
-                            locator_hashes: request.locator_hashes.clone(),
-                        })
-                        .await;
-                    let (result, acquired) = match reply {
-                        Ok(port::AcquirePathReply::Acquired(path)) => {
-                            let lease_id = path.handle_id();
-                            (
-                                HeaderPathLeaseResult::Acquired(HeaderPathLease {
-                                    lease_id,
-                                    common_ancestor: path.common_ancestor,
-                                    target: path.target,
-                                    scope: path.scope,
-                                }),
-                                Some((lease_id, path)),
-                            )
-                        }
-                        Ok(port::AcquirePathReply::CapacityBusy(signal)) => {
-                            (HeaderPathLeaseResult::CapacityBusy(signal), None)
-                        }
-                        Ok(reply) => (
-                            HeaderPathLeaseResult::Outcome(match reply {
-                                port::AcquirePathReply::TargetNotRetained => {
-                                    HeadersOutcomeCode::TargetNotRetained
-                                }
-                                port::AcquirePathReply::NoLocatorIntersection => {
-                                    HeadersOutcomeCode::NoLocatorIntersection
-                                }
-                                port::AcquirePathReply::HistoryPruned => {
-                                    HeadersOutcomeCode::HistoryPruned
-                                }
-                                port::AcquirePathReply::Busy => HeadersOutcomeCode::Busy,
-                                port::AcquirePathReply::Acquired(_)
-                                | port::AcquirePathReply::CapacityBusy(_) => {
-                                    unreachable!(
-                                        "acquired paths and capacity signals are handled above"
-                                    )
-                                }
-                            }),
-                            None,
-                        ),
-                        Err(error) => {
-                            tracing::debug!(?peer, ?error, "retained header path unavailable");
-                            (
-                                HeaderPathLeaseResult::Outcome(HeadersOutcomeCode::Busy),
-                                None,
-                            )
-                        }
-                    };
-                    Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        if let Some((lease_id, path)) = acquired {
-                            reactor.retained_paths.insert(lease_id, *path);
-                        }
-                        reactor.handle_header_path_lease_ready(
-                            peer, session_id, scope, request, result,
-                        );
-                    }) as HeaderSyncPortCompletion
-                }),
-                HeaderPortOperation::ReadPath {
-                    peer,
-                    session_id,
-                    lease_id,
-                    scope,
-                    request_id,
-                    target_tip_hash,
-                    after_hash,
-                    max_header_count,
-                    tree_aux_schema,
-                } => {
-                    let Some(path) = self.retained_paths.get(&lease_id).cloned() else {
-                        return false;
-                    };
-                    if path.scope != scope {
-                        return false;
-                    }
-                    Box::pin(async move {
-                        let result = match header_chain
-                            .read_header_path(
-                                path,
-                                port::ReadPath {
-                                    after_hash,
-                                    max_header_count,
-                                    want_tree_aux: tree_aux_schema == AuxSchema::V1,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(port::ReadPathReply::Page(page)) => {
-                                assemble_port_header_path_page(lease_id, *page, tree_aux_schema)
-                                    .map(|page| HeaderPathPageResult::Page(Box::new(page)))
-                                    .unwrap_or(HeaderPathPageResult::Unavailable)
-                            }
-                            Ok(port::ReadPathReply::Unavailable) => {
-                                HeaderPathPageResult::Unavailable
-                            }
-                            Err(error) => {
-                                tracing::debug!(?peer, ?error, "retained header page unavailable");
-                                HeaderPathPageResult::Unavailable
-                            }
-                        };
-                        Box::new(move |reactor: &mut HeaderSyncReactor| {
-                            reactor.handle_header_path_page_ready(
-                                peer,
-                                session_id,
-                                scope,
-                                request_id,
-                                target_tip_hash,
-                                result,
-                            );
-                        }) as HeaderSyncPortCompletion
-                    })
-                }
-                HeaderPortOperation::ReleaseHeaderPath {
-                    peer: _,
-                    session_id: _,
-                    lease_id,
-                    scope,
-                } => {
-                    let Some(path) = self.retained_paths.remove(&lease_id) else {
-                        return true;
-                    };
-                    if path.scope != scope {
-                        return true;
-                    }
-                    Box::pin(async move {
-                        let result = header_chain.release_header_path(path).await;
-                        Box::new(move |_reactor: &mut HeaderSyncReactor| {
-                            if let Err(error) = result {
-                                tracing::debug!(
-                                    lease_id,
-                                    ?error,
-                                    "failed to release retained header path"
-                                );
-                            }
-                        }) as HeaderSyncPortCompletion
-                    })
-                }
                 HeaderPortOperation::PrepareHeaderTarget {
                     purpose,
                     peer,
@@ -4851,51 +3949,6 @@ impl HeaderSyncReactor {
                 None,
                 Some((*owner).into()),
                 None,
-                None,
-            ),
-            HeaderPortOperation::AcquirePath {
-                peer,
-                session_id,
-                scope,
-                request,
-            } => (
-                "acquire_header_path",
-                Some(peer.clone()),
-                Some(*session_id),
-                Some(*scope),
-                None,
-                Some(request.target_tip_hash),
-                None,
-            ),
-            HeaderPortOperation::ReadPath {
-                peer,
-                session_id,
-                lease_id,
-                scope,
-                target_tip_hash,
-                ..
-            } => (
-                "read_header_path",
-                Some(peer.clone()),
-                Some(*session_id),
-                Some(*scope),
-                None,
-                Some(*target_tip_hash),
-                Some(*lease_id),
-            ),
-            HeaderPortOperation::ReleaseHeaderPath {
-                peer,
-                session_id,
-                lease_id,
-                scope,
-            } => (
-                "release_header_path",
-                Some(peer.clone()),
-                Some(*session_id),
-                Some(*scope),
-                None,
-                None,
-                Some(*lease_id),
             ),
             HeaderPortOperation::PrepareHeaderTarget {
                 peer,
@@ -5078,37 +4131,6 @@ impl HeaderSyncReactor {
                 } else {
                     self.retire_peer_work(peer, HeaderRequestTerminal::LocalError);
                 }
-            }
-        }
-
-        let owns_served_path = self.served_paths.get(peer).is_some_and(|state| {
-            let (session_id, scope, lease_id) = match state {
-                ServedPathState::Acquiring {
-                    session_id, scope, ..
-                } => (*session_id, *scope, None),
-                ServedPathState::Active {
-                    session_id,
-                    scope,
-                    lease_id,
-                    ..
-                } => (*session_id, *scope, Some(*lease_id)),
-            };
-            Some(session_id) == context.session_id
-                && Some(scope) == context.scope
-                && context
-                    .lease_id
-                    .is_none_or(|expected| lease_id == Some(expected))
-        });
-        if owns_served_path {
-            self.served_path_deadlines.remove(peer);
-            if let Some(ServedPathState::Active {
-                session_id,
-                lease_id,
-                scope,
-                ..
-            }) = self.served_paths.remove(peer)
-            {
-                self.release_lease(peer.clone(), session_id, lease_id, scope);
             }
         }
     }
@@ -5476,15 +4498,6 @@ fn aux_schema_label(schema: AuxSchema) -> &'static str {
     match schema {
         AuxSchema::None => "none",
         AuxSchema::V1 => "v1",
-    }
-}
-
-fn headers_outcome_label(outcome: HeadersOutcomeCode) -> &'static str {
-    match outcome {
-        HeadersOutcomeCode::TargetNotRetained => "target_not_retained",
-        HeadersOutcomeCode::NoLocatorIntersection => "no_locator_intersection",
-        HeadersOutcomeCode::HistoryPruned => "history_pruned",
-        HeadersOutcomeCode::Busy => "busy",
     }
 }
 

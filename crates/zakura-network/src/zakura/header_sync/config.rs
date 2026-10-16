@@ -68,11 +68,6 @@ impl ZakuraHeaderSyncConfig {
         self.max_headers_per_response.clamp(1, MAX_HS_RANGE)
     }
 
-    /// Return the locally capped in-flight advertisement for status messages.
-    pub fn advertised_max_inflight_requests(&self) -> u16 {
-        LOCAL_MAX_HS_INFLIGHT_PER_PEER
-    }
-
     /// Return the status refresh interval, clamped to the publication-rate floor.
     pub fn effective_status_refresh_interval(&self) -> Duration {
         self.status_refresh_interval.max(Duration::from_secs(1))

@@ -39,12 +39,6 @@ jobs:
             rss_mb: 4096
             max_len: 512
             detect_leaks: 1
-          - target: header_codec
-            seconds: 900
-            weekly_seconds: 3600
-            rss_mb: 2048
-            max_len: 2097152
-            detect_leaks: 1
           - target: header_codec_v9
             seconds: 900
             weekly_seconds: 3600

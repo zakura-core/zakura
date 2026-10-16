@@ -547,10 +547,6 @@ mod tests {
             )
             .spawn()
             .await?;
-        let header_sync = victim
-            .header_sync()
-            .expect("the real header service is enabled");
-        let codec = header_sync.codec();
         let mut actions = victim
             .take_header_sync_actions()
             .await

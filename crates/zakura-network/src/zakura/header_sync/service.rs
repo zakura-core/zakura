@@ -456,14 +456,6 @@ pub(crate) struct HeaderSyncService {
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
 }
 
-#[derive(Debug)]
-struct HeaderSyncPeerRecord {
-    conn_id: ZakuraConnId,
-    session_id: u64,
-    direction: ServicePeerDirection,
-    cancel_token: CancellationToken,
-}
-
 impl HeaderSyncService {
     pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {

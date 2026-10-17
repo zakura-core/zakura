@@ -458,7 +458,7 @@ impl LegacyRequestFrame {
             }
             MSG_REQUEST_PUSH_TRANSACTION => {
                 let mut bytes = frame.payload.as_slice();
-                let transaction = Transaction::zcash_deserialize_from_slice(&mut bytes)?;
+                let transaction = Transaction::zcash_deserialize_bounded(&mut bytes)?;
                 if !bytes.is_empty() {
                     return Err(LegacyGossipError::TrailingBytes);
                 }
@@ -694,7 +694,7 @@ impl LegacyResponseCodec {
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
                         let mut remaining = bytes.as_slice();
-                        let block = Arc::new(Block::zcash_deserialize_from_slice(&mut remaining)?);
+                        let block = Arc::new(Block::zcash_deserialize_bounded(&mut remaining)?);
                         if !remaining.is_empty() {
                             return Err(LegacyGossipError::TrailingBytes);
                         }
@@ -718,8 +718,7 @@ impl LegacyResponseCodec {
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
                         let mut remaining = bytes.as_slice();
-                        let transaction =
-                            Transaction::zcash_deserialize_from_slice(&mut remaining)?;
+                        let transaction = Transaction::zcash_deserialize_bounded(&mut remaining)?;
                         if !remaining.is_empty() {
                             return Err(LegacyGossipError::TrailingBytes);
                         }

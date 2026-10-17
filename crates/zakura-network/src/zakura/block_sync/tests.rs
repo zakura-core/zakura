@@ -2087,6 +2087,20 @@ fn codec_rejects_oversized_frame_and_oversized_block() {
 }
 
 #[test]
+fn codec_rejects_oversized_block_before_parsing() {
+    let max = usize::try_from(block::MAX_BLOCK_BYTES).expect("max block bytes fits in usize");
+    let mut payload = vec![0; 1 + max + 1];
+    payload[0] = MSG_BS_BLOCK;
+
+    assert!(payload.len() <= MAX_BS_MESSAGE_BYTES);
+    assert!(matches!(
+        BlockSyncMessage::decode(&payload),
+        Err(BlockSyncWireError::OversizedBlock { actual, max: limit })
+            if actual == max + 1 && limit == max
+    ));
+}
+
+#[test]
 fn codec_rejects_count_and_returned_over_cap() {
     let over_cap = MAX_BS_BLOCKS_PER_REQUEST + 1;
 

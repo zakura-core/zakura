@@ -600,7 +600,7 @@ fn block_limits_multi_tx() {
     assert!(data.len() <= MAX_BLOCK_BYTES as usize);
 
     // Deserialize by now is ok as we are lower than the limit
-    let block2 = Block::zcash_deserialize(&data[..])
+    let block2 = Block::zcash_deserialize_bounded(&mut &data[..])
         .expect("block should deserialize as we are just below limit");
     assert_eq!(block, block2);
 
@@ -615,8 +615,18 @@ fn block_limits_multi_tx() {
 
     assert!(data.len() > MAX_BLOCK_BYTES as usize);
 
-    // Deserialize will now fail
-    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+    // Untrusted decoding rejects it before parsing
+    let mut input = &data[..];
+    assert!(matches!(
+        Block::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "block is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), data.len(), "nothing should be parsed");
+
+    // The parser itself does not enforce the size limit
+    assert_eq!(Block::zcash_deserialize(&data[..]).unwrap(), block);
 }
 
 #[test]
@@ -637,7 +647,7 @@ fn block_limits_single_tx() {
     assert!(data.len() <= MAX_BLOCK_BYTES as usize);
 
     // Deserialize by now is ok as we are lower than the limit
-    Block::zcash_deserialize(&data[..])
+    Block::zcash_deserialize_bounded(&mut &data[..])
         .expect("block should deserialize as we are just below limit");
 
     // Add 1 more input to the transaction, limit will be reached
@@ -651,7 +661,12 @@ fn block_limits_single_tx() {
     assert!(data.len() > MAX_BLOCK_BYTES as usize);
 
     // Will fail as block overall size is above limit
-    Block::zcash_deserialize(&data[..]).expect_err("block should not deserialize");
+    assert!(matches!(
+        Block::zcash_deserialize_bounded(&mut &data[..]),
+        Err(SerializationError::Parse(
+            "block is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
 }
 
 /// Test wrapper for `BlockHeader.time_is_valid_at`.

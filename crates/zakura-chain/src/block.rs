@@ -42,6 +42,7 @@ pub use commitment::{
 pub use hash::Hash;
 pub use header::{BlockTimeError, CountedHeader, Header, ZCASH_BLOCK_VERSION};
 pub use height::{Height, HeightDiff, TryIntoHeight};
+pub(crate) use serialize::check_max_block_bytes;
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 
 /// Re-assert the signed Zcash block-header version rule on an in-memory header.

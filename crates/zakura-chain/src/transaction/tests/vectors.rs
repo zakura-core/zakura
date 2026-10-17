@@ -532,9 +532,19 @@ fn deserialize_large_transaction() {
     // Check that the transaction is oversized.
     assert!(tx_data.len() > MAX_BLOCK_BYTES as usize);
 
-    // The deserialization should fail because the transaction is too big.
+    // Untrusted decoding rejects it before parsing, because it is too big.
+    let mut input = &tx_data[..];
+    assert!(matches!(
+        Transaction::zcash_deserialize_bounded(&mut input),
+        Err(SerializationError::Parse(
+            "transaction is larger than MAX_BLOCK_BYTES"
+        ))
+    ));
+    assert_eq!(input.len(), tx_data.len(), "nothing should be parsed");
+
+    // The parser itself does not enforce the size limit.
     Transaction::zcash_deserialize(&tx_data[..])
-        .expect_err("transaction should not deserialize due to its size");
+        .expect("the parser should not enforce the size limit");
 }
 
 // Transaction V5 test vectors

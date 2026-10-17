@@ -65,9 +65,7 @@ use zakura_chain::{
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{
-        BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-    },
+    serialization::{BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -2311,8 +2309,9 @@ where
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
         let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex)
             .map_error(server::error::LegacyCode::Deserialization)?;
-        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
-            .map_error(server::error::LegacyCode::Deserialization)?;
+        let raw_transaction =
+            Transaction::zcash_deserialize_bounded(&mut raw_transaction_bytes.as_slice())
+                .map_error(server::error::LegacyCode::Deserialization)?;
 
         let transaction_hash = raw_transaction.hash();
 
@@ -3808,7 +3807,7 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
+        let block = match Block::zcash_deserialize_bounded(&mut block_bytes.as_slice()) {
             Ok(block) => block,
             Err(error) => {
                 tracing::info!(

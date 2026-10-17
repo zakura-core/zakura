@@ -13,7 +13,7 @@ use zakura_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::mock::MockChainTip,
     parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
-    serialization::{DateTime32, Duration32},
+    serialization::{DateTime32, Duration32, ZcashDeserializeInto},
 };
 use zakura_network::address_book_peers::MockAddressBookPeers;
 use zakura_node_services::BoxError;

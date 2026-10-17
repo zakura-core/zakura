@@ -853,7 +853,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_from_slice(reader)))
+                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_bounded(reader)))
             })
         });
 
@@ -875,7 +875,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_from_slice(reader)))
+                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_bounded(reader)))
             })
         });
 

@@ -5587,10 +5587,10 @@ impl LegacyResponseReadState {
         let mut remaining = self.active_chunk.as_slice();
         match kind {
             LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
+                Block::zcash_deserialize_bounded(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
+                Transaction::zcash_deserialize_bounded(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders

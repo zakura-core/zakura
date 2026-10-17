@@ -185,6 +185,7 @@ fn build_header_sync_reactor(
         unproductive_peer_cooldowns: HashMap::new(),
         peer_work_queue: PeerWorkQueue::default(),
         request_deadlines: HashMap::new(),
+        close_deadlines: HashMap::new(),
         completed_targets: CompletedHeaderTargets::default(),
         ordinary_resource_stall: None,
         vct_repair: RepairRequirementSlot::default(),
@@ -275,6 +276,9 @@ struct HeaderSyncReactor {
     unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
     request_deadlines: HashMap<ZakuraPeerId, Instant>,
+    /// Sessions whose subscription this node closed, with the deadline for
+    /// its terminal outcome. See [`HeaderSyncReactor::close_subscription`].
+    close_deadlines: HashMap<ZakuraPeerId, (u64, Instant)>,
     completed_targets: CompletedHeaderTargets,
     /// State version of the latest ordinary admission refused by a committed resource stall.
     ordinary_resource_stall: Option<zakura_header_chain::StateVersion>,
@@ -888,6 +892,8 @@ impl HeaderSyncReactor {
         if replaces_existing_peer && !owns_local_repair_operation {
             self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
         }
+        // The replaced session's `Close` dies with it.
+        self.close_deadlines.remove(&peer);
         if let Some(previous) = self.peer_state.insert(
             peer.clone(),
             PeerState {
@@ -973,6 +979,7 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
         self.peer_state.remove(peer);
+        self.close_deadlines.remove(peer);
         self.vct_supplier_order.retain(|queued| queued != peer);
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
@@ -1044,6 +1051,13 @@ impl HeaderSyncReactor {
         let eligible = target.is_discovery_eligible(local)
             && self.negotiated_response_limits(&target.status).1 != 0;
         let pruned = self.pruned_pause_holds(&peer, local.frontiers.header_best);
+        if pruned || !eligible || covered {
+            // No round can follow, so an idle subscription kept for the next
+            // round only holds the session's connection hostage.
+            if self.peer_work_queue.active(&peer).is_none() {
+                self.close_subscription(&peer);
+            }
+        }
         if pruned {
             // The same attempt would end `HistoryPruned` again, so another
             // peer's status takes the target.
@@ -1166,7 +1180,7 @@ impl HeaderSyncReactor {
     ///
     /// Any other live subscription is closed, and the peer's status waits for
     /// its terminal outcome, because the next `Open` must follow it.
-    fn subscription_ready(&self, peer: &ZakuraPeerId, target: block::Hash) -> bool {
+    fn subscription_ready(&mut self, peer: &ZakuraPeerId, target: block::Hash) -> bool {
         let Some(state) = self.peer_state.get(peer) else {
             return false;
         };
@@ -1179,7 +1193,7 @@ impl HeaderSyncReactor {
             return true;
         }
         drop(subscriber);
-        let _ = state.session.try_close();
+        self.close_subscription(peer);
         false
     }
 
@@ -1495,9 +1509,7 @@ impl HeaderSyncReactor {
         if complete {
             // Stop the pages that would follow the target. Pages already in
             // flight are dropped.
-            if let Some(state) = self.peer_state.get(&peer) {
-                let _ = state.session.try_close();
-            }
+            self.close_subscription(&peer);
         } else if self.peer_work_queue.reserved_header_count(&peer) != 0 {
             // The rest of this round's credit is still on its way.
             return;
@@ -1687,6 +1699,15 @@ impl HeaderSyncReactor {
     /// arrives. An outcome for work that already holds its pages, or for a
     /// subscription this node closed, changes nothing.
     fn handle_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, ended: Ended) {
+        // The session holds one live or closing subscription, so this is the
+        // outcome of any `Close` this node sent it.
+        if self
+            .close_deadlines
+            .get(&peer)
+            .is_some_and(|(closing, _)| *closing == session_id)
+        {
+            self.close_deadlines.remove(&peer);
+        }
         let Some(active) = self.peer_work_queue.active(&peer) else {
             return;
         };
@@ -2562,7 +2583,7 @@ impl HeaderSyncReactor {
         });
         if session.subscriber().live().is_some() && resumed.is_none() {
             // The next `Open` follows the live subscription's outcome.
-            let _ = session.try_close();
+            self.close_subscription(&peer);
             self.defer_ordinary_target(&peer);
             return;
         }
@@ -2652,7 +2673,7 @@ impl HeaderSyncReactor {
                     self.request_deadlines
                         .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
                 } else {
-                    let _ = session.try_close();
+                    self.close_subscription(&peer);
                     self.peer_work_queue.remove_unstarted(&peer);
                 }
                 metrics::counter!("sync.header.target.requested").increment(1);
@@ -3021,6 +3042,7 @@ impl HeaderSyncReactor {
         // predecessor hash; the admission path rejects anything else.
         let mut rejections = VctSupplierRejections::default();
         let mut candidates = Vec::new();
+        let mut closing = Vec::new();
         for peer in &self.vct_supplier_order {
             let Some(state) = self.peer_state.get(peer) else {
                 continue;
@@ -3084,7 +3106,7 @@ impl HeaderSyncReactor {
             }
             if state.session.subscriber().live().is_some() {
                 // A repair opens its own subscription after this one ends.
-                let _ = state.session.try_close();
+                closing.push(peer.clone());
                 rejections.already_serving += 1;
                 continue;
             }
@@ -3112,6 +3134,9 @@ impl HeaderSyncReactor {
                 status.clone(),
                 supported_count,
             ));
+        }
+        for peer in closing {
+            self.close_subscription(&peer);
         }
         if candidates.is_empty() {
             self.note_vct_repair_stall(
@@ -3203,7 +3228,7 @@ impl HeaderSyncReactor {
                 .assign(task.owner, wire_owner, selected_context.clone())
                 .is_err()
             {
-                let _ = session.try_close();
+                self.close_subscription(&peer);
                 self.peer_work_queue.cancel_request_reservation(&peer);
                 return;
             }
@@ -3241,7 +3266,7 @@ impl HeaderSyncReactor {
                     selected_context.episode,
                 )
             {
-                let _ = session.try_close();
+                self.close_subscription(&peer);
                 self.peer_work_queue.cancel_request_reservation(&peer);
                 self.retry_vct_repair(
                     wire_owner,
@@ -3375,6 +3400,7 @@ impl HeaderSyncReactor {
         }
         self.refresh_vct_repair_stall(now);
         self.retire_timed_out_requests(now);
+        self.retire_unanswered_closes(now);
         if self.prune_unproductive_cooldowns(now) {
             self.publish_peer_state();
         }
@@ -3410,6 +3436,7 @@ impl HeaderSyncReactor {
         status_deadline
             .into_iter()
             .chain(self.request_deadlines.values().copied())
+            .chain(self.close_deadlines.values().map(|(_, deadline)| *deadline))
             .chain(
                 self.vct_repair
                     .current()
@@ -4535,31 +4562,84 @@ impl HeaderSyncReactor {
 
     /// Close `active`'s subscription, unless a `Grant` can continue it toward
     /// its target after a committed prefix.
-    fn cancel_active_request(&self, active: &ActiveHeaderRequest) {
+    ///
+    /// A subscription kept for the next round still holds its `Open`'s
+    /// started exchange, so retiring the session while it is open closes the
+    /// connection, as during a round. The next round resumes it, or the peer's
+    /// next status that cannot closes it; see
+    /// [`Self::consider_advertised_header_target`].
+    fn cancel_active_request(&mut self, active: &ActiveHeaderRequest) {
         let Some(state) = self.peer_state.get(&active.peer) else {
             return;
         };
         if state.session.session_id() == active.owner.session_id()
             && state.session.subscriber().resumable().is_none()
         {
-            let _ = state.session.try_close();
+            self.close_subscription(&active.peer);
+        }
+    }
+
+    /// Close `peer`'s live subscription unless it is already closing, and
+    /// give its terminal outcome until the request timeout. A session that
+    /// has not answered by then is dropped as unresponsive, so a publisher
+    /// that never ends the subscription cannot park the peer.
+    fn close_subscription(&mut self, peer: &ZakuraPeerId) {
+        let Some(state) = self.peer_state.get(peer) else {
+            return;
+        };
+        let _ = state.session.try_close();
+        if state.session.subscriber().live().is_none() {
+            return;
+        }
+        let session_id = state.session.session_id();
+        if self
+            .close_deadlines
+            .get(peer)
+            .is_none_or(|(closing, _)| *closing != session_id)
+        {
+            self.close_deadlines.insert(
+                peer.clone(),
+                (session_id, Instant::now() + self.startup.request_timeout),
+            );
+        }
+    }
+
+    /// Drop each session that has not ended a subscription this node closed
+    /// by its deadline.
+    fn retire_unanswered_closes(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .close_deadlines
+            .iter()
+            .filter(|(_, (_, deadline))| *deadline <= now)
+            .map(|(peer, (session_id, _))| (peer.clone(), *session_id))
+            .collect();
+        for (peer, session_id) in expired {
+            self.close_deadlines.remove(&peer);
+            let unanswered = self.peer_state.get(&peer).is_some_and(|state| {
+                state.session.session_id() == session_id
+                    && state.session.subscriber().live().is_some()
+            });
+            if unanswered {
+                metrics::counter!("sync.header.subscription.close_timed_out.total").increment(1);
+                self.drop_unproductive_peer(&peer, session_id, "unresponsive");
+            }
         }
     }
 
     /// Close the subscription of the session that `source` and `owner` name.
     fn cancel_owned_request(
-        &self,
+        &mut self,
         source: zakura_header_chain::SourceId,
         owner: zakura_header_chain::HeaderSyncWorkOwner,
     ) {
-        let Some(state) = self.peer_state.iter().find_map(|(peer, state)| {
+        let Some(peer) = self.peer_state.iter().find_map(|(peer, state)| {
             (state.session.session_id() == owner.session_id()
                 && source_id_from_peer(peer) == source)
-                .then_some(state)
+                .then(|| peer.clone())
         }) else {
             return;
         };
-        let _ = state.session.try_close();
+        self.close_subscription(&peer);
     }
 
     /// Count `error`, and dispatch it as `peer`'s violation when it is an

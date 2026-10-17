@@ -11,7 +11,7 @@ use super::*;
 use crate::zakura::FramedRecv;
 
 /// A reactor at the Regtest genesis.
-fn fallback_reactor() -> (
+pub(super) fn fallback_reactor() -> (
     HeaderSyncReactor,
     mpsc::Receiver<HeaderPortOperation>,
     zakura_header_chain::EngineSnapshot,
@@ -27,7 +27,7 @@ fn fallback_reactor() -> (
 }
 
 /// Connect the peer `byte` and drop its initial status.
-fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedRecv) {
+pub(super) fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedRecv) {
     let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has the required length");
     let (send, mut outbound) = framed_channel(8);
     reactor.handle_peer_connected(PeerSession::from_parts(
@@ -41,7 +41,10 @@ fn connect(reactor: &mut HeaderSyncReactor, byte: u8) -> (ZakuraPeerId, FramedRe
 
 /// A status for `target` whose work anchor covers every round, so only the
 /// fallback can drop schema 1.
-fn pruned_status(snapshot: &zakura_header_chain::EngineSnapshot, target: block::Hash) -> Status {
+pub(super) fn pruned_status(
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    target: block::Hash,
+) -> Status {
     Status {
         work_anchor_height: block::Height(5_000),
         work_anchor_hash: snapshot.frontiers.finalized.hash,
@@ -57,14 +60,14 @@ fn pruned_status(snapshot: &zakura_header_chain::EngineSnapshot, target: block::
 }
 
 /// Deliver `status` from `peer` and run the scheduler.
-fn refresh(reactor: &mut HeaderSyncReactor, peer: &ZakuraPeerId, status: &Status) {
+pub(super) fn refresh(reactor: &mut HeaderSyncReactor, peer: &ZakuraPeerId, status: &Status) {
     reactor.handle_status(peer.clone(), 0, status.clone());
     reactor.schedule_cached_statuses();
 }
 
 /// Answer `peer`'s locator query for `target` with the validated tip, and
 /// return the subscription update the round sends.
-fn answer_locator(
+pub(super) fn answer_locator(
     reactor: &mut HeaderSyncReactor,
     actions: &mut mpsc::Receiver<HeaderPortOperation>,
     peer: &ZakuraPeerId,
@@ -97,7 +100,7 @@ fn answer_locator(
 }
 
 /// The next subscription update on `outbound`, skipping `Status` frames.
-fn next_update(outbound: &mut FramedRecv) -> v9::SubscribeHeaders {
+pub(super) fn next_update(outbound: &mut FramedRecv) -> v9::SubscribeHeaders {
     loop {
         let frame = outbound.try_recv().expect("the round sent an update");
         if let Ok(v9::Message::SubscribeHeaders(update)) =
@@ -109,7 +112,7 @@ fn next_update(outbound: &mut FramedRecv) -> v9::SubscribeHeaders {
 }
 
 /// End `open`'s subscription with `outcome` and run the scheduler.
-fn end(
+pub(super) fn end(
     reactor: &mut HeaderSyncReactor,
     peer: &ZakuraPeerId,
     open: &v9::SubscribeHeaders,

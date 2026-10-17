@@ -3,18 +3,14 @@
 //! This is a port of the duration parser and formatter from
 //! [`humantime` 2.4.0](https://github.com/chronotope/humantime), which is also licensed
 //! `MIT OR Apache-2.0`. Config files store durations in this format, so parsing and formatting
-//! must stay byte-for-byte compatible with that version.
+//! stay compatible with that version, except that week, month, and year units aren't supported.
+//! Durations of a month or more are written in days instead.
 
 use std::{fmt, str::Chars, time::Duration};
 
 #[cfg(test)]
 mod tests;
 
-/// Seconds in a month, as 30.44 days.
-const SECONDS_PER_MONTH: u64 = 2_630_016;
-/// Seconds in a year, as 365.25 days.
-const SECONDS_PER_YEAR: u64 = 31_557_600;
-const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
 const SECONDS_PER_DAY: u64 = 86_400;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -38,8 +34,7 @@ pub(crate) enum ParseDurationError {
 /// Each number needs a unit, except a bare `0`. Supported units are:
 /// `nanos`/`nsec`/`ns`, `usec`/`us`/`µs`, `millis`/`msec`/`ms`,
 /// `seconds`/`second`/`secs`/`sec`/`s`, `minutes`/`minute`/`mins`/`min`/`m`,
-/// `hours`/`hour`/`hrs`/`hr`/`h`, `days`/`day`/`d`, `weeks`/`week`/`wks`/`wk`/`w`,
-/// `months`/`month`/`M`, and `years`/`year`/`yrs`/`yr`/`y`.
+/// `hours`/`hour`/`hrs`/`hr`/`h`, and `days`/`day`/`d`.
 pub(crate) fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
     if s == "0" {
         return Ok(Duration::ZERO);
@@ -53,6 +48,8 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
 }
 
 /// Formats `duration` with the largest units first, such as `1day 2h 3m 4s 5ms`.
+///
+/// Days are the largest unit, so a year is written as `365days 6h`.
 ///
 /// [`parse_duration`] parses the result back to the same duration.
 pub(crate) fn format_duration(duration: Duration) -> FormattedDuration {
@@ -72,16 +69,10 @@ impl fmt::Display for FormattedDuration {
             return f.write_str("0s");
         }
 
-        let years = secs / SECONDS_PER_YEAR;
-        let year_secs = secs % SECONDS_PER_YEAR;
-        let months = year_secs / SECONDS_PER_MONTH;
-        let month_secs = year_secs % SECONDS_PER_MONTH;
-        let days = month_secs / SECONDS_PER_DAY;
-        let day_secs = month_secs % SECONDS_PER_DAY;
+        let days = secs / SECONDS_PER_DAY;
+        let day_secs = secs % SECONDS_PER_DAY;
 
         let mut started = false;
-        write_plural_unit(f, &mut started, years, "year")?;
-        write_plural_unit(f, &mut started, months, "month")?;
         write_plural_unit(f, &mut started, days, "day")?;
         write_unit(f, &mut started, day_secs / 3600, "h")?;
         write_unit(f, &mut started, day_secs % 3600 / 60, "m")?;
@@ -141,9 +132,6 @@ enum Unit {
     Minute,
     Hour,
     Day,
-    Week,
-    Month,
-    Year,
 }
 
 impl Unit {
@@ -156,9 +144,6 @@ impl Unit {
             "minutes" | "minute" | "min" | "mins" | "m" => Self::Minute,
             "hours" | "hour" | "hr" | "hrs" | "h" => Self::Hour,
             "days" | "day" | "d" => Self::Day,
-            "weeks" | "week" | "wk" | "wks" | "w" => Self::Week,
-            "months" | "month" | "M" => Self::Month,
-            "years" | "year" | "yr" | "yrs" | "y" => Self::Year,
             _ => return None,
         })
     }
@@ -173,9 +158,6 @@ impl Unit {
             Self::Minute => (checked_mul(value, 60)?, 0),
             Self::Hour => (checked_mul(value, 3600)?, 0),
             Self::Day => (checked_mul(value, SECONDS_PER_DAY)?, 0),
-            Self::Week => (checked_mul(value, SECONDS_PER_WEEK)?, 0),
-            Self::Month => (checked_mul(value, SECONDS_PER_MONTH)?, 0),
-            Self::Year => (checked_mul(value, SECONDS_PER_YEAR)?, 0),
         })
     }
 
@@ -198,9 +180,6 @@ impl Unit {
             Self::Minute => (0, exact(60 * NANOS_PER_SECOND)?),
             Self::Hour => (exact(3600)?, 0),
             Self::Day => (exact(SECONDS_PER_DAY)?, 0),
-            Self::Week => (exact(SECONDS_PER_WEEK)?, 0),
-            Self::Month => (exact(SECONDS_PER_MONTH)?, 0),
-            Self::Year => (exact(SECONDS_PER_YEAR)?, 0),
         })
     }
 }

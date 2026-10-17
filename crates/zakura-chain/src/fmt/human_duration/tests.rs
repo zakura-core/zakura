@@ -40,19 +40,6 @@ fn parses_every_unit_name() {
         ("1day", Duration::new(86_400, 0)),
         ("2days", Duration::new(172_800, 0)),
         ("365d", Duration::new(31_536_000, 0)),
-        ("1week", Duration::new(604_800, 0)),
-        ("7weeks", Duration::new(4_233_600, 0)),
-        ("104wks", Duration::new(2 * 31_449_600, 0)),
-        ("100wk", Duration::new(60_480_000, 0)),
-        ("52w", Duration::new(31_449_600, 0)),
-        ("1month", Duration::new(2_630_016, 0)),
-        ("3months", Duration::new(3 * 2_630_016, 0)),
-        ("12M", Duration::new(31_560_192, 0)),
-        ("1year", Duration::new(31_557_600, 0)),
-        ("7years", Duration::new(7 * 31_557_600, 0)),
-        ("15yrs", Duration::new(15 * 31_557_600, 0)),
-        ("10yr", Duration::new(10 * 31_557_600, 0)),
-        ("17y", Duration::new(536_479_200, 0)),
     ] {
         assert_eq!(parsed(input), expected, "{input:?}");
     }
@@ -113,7 +100,17 @@ fn rejects_malformed_numbers_and_units() {
     assert_eq!(parse_duration(""), Err(Empty));
     assert_eq!(parse_duration("  "), Err(Empty));
     assert_eq!(parse_duration("18446744073709551616s"), Err(NumberOverflow));
-    assert_eq!(parse_duration("18446744073709551615y"), Err(NumberOverflow));
+    assert_eq!(parse_duration("18446744073709551615d"), Err(NumberOverflow));
+}
+
+#[test]
+fn rejects_week_month_and_year_units() {
+    for input in [
+        "1w", "1wk", "2wks", "1week", "2weeks", "1M", "1month", "2months", "1y", "1yr", "2yrs",
+        "1year", "2years",
+    ] {
+        assert_eq!(parse_duration(input), Err(UnknownUnit), "{input:?}");
+    }
 }
 
 #[test]
@@ -143,14 +140,11 @@ fn formats_largest_units_first() {
         (Duration::from_secs(3600), "1h"),
         (Duration::from_secs(86_400), "1day"),
         (Duration::from_secs(2 * 86_400 + 1), "2days 1s"),
-        (Duration::from_secs(2_630_016), "1month"),
-        (Duration::from_secs(31_557_600), "1year"),
+        (Duration::from_secs(31 * 86_400), "31days"),
+        (Duration::from_secs(31_557_600), "365days 6h"),
         (
-            Duration::new(
-                2 * 31_557_600 + 2 * 2_630_016 + 3 * 86_400 + 4 * 3600 + 5 * 60 + 6,
-                7,
-            ),
-            "2years 2months 3days 4h 5m 6s 7ns",
+            Duration::new(400 * 86_400 + 4 * 3600 + 5 * 60 + 6, 7),
+            "400days 4h 5m 6s 7ns",
         ),
     ] {
         assert_eq!(format_duration(duration).to_string(), expected);

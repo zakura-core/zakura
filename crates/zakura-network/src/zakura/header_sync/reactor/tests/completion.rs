@@ -1137,9 +1137,9 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
 /// A peer that reorganizes ends its subscription with
 /// `SubscriptionSuperseded` and advertises the new tip. The new target starts
 /// once both arrive, in either order, without waiting for another `Status`.
-/// The peer sends that `Status` at most one second after the commit, the
-/// floor that `StatusPublisher` enforces, so recovery takes at most the floor
-/// plus the round trips.
+/// The specification lets the peer send that `Status` up to two seconds after
+/// its commit, and `StatusPublisher` sends it within its one-second floor, so
+/// recovery takes at most that delay plus the round trips.
 #[tokio::test(start_paused = true)]
 async fn superseded_recovery_starts_at_once_in_either_order() {
     let shutdown = CancellationToken::new();

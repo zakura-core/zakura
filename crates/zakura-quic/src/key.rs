@@ -92,11 +92,6 @@ impl NodeId {
             .map_err(|_| SignatureError)
     }
 
-    /// Returns the first 5 bytes as hex, for logs.
-    pub fn fmt_short(&self) -> String {
-        hex::encode(&self.0[..5])
-    }
-
     fn verifying_key(&self) -> VerificationKey {
         VerificationKey::try_from(self.0)
             .expect("from_bytes checked that the bytes decompress to a curve point")

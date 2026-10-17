@@ -204,15 +204,6 @@ impl Config {
     pub fn use_color_stderr(&self) -> bool {
         self.force_use_color || (self.use_color && std::io::stderr().is_terminal())
     }
-
-    /// Returns `true` if output that could go to standard output or standard error
-    /// should use color escapes. Automatically checks if Zebra is running in a terminal.
-    pub fn use_color_stdout_and_stderr(&self) -> bool {
-        self.force_use_color
-            || (self.use_color
-                && std::io::stdout().is_terminal()
-                && std::io::stderr().is_terminal())
-    }
 }
 
 impl Default for InnerConfig {

@@ -162,6 +162,9 @@ struct Subscription {
     /// The `Open` locators, until the subscription reaches its target.
     locators: Vec<block::Hash>,
     position: Position,
+    /// A selected tip that a check without page credit found extending the
+    /// last header sent; see [`check_following`].
+    checked_tip: Option<block::Hash>,
     /// This node's outcome, queued until the task writes it.
     end: Option<HeadersOutcomeCode>,
     stall: Option<Stall>,
@@ -284,6 +287,7 @@ impl Shared {
                         fixed,
                         locators: update.locator_hashes.clone(),
                         position: Position::Path(None),
+                        checked_tip: None,
                         end: None,
                         stall: None,
                     },
@@ -429,7 +433,7 @@ impl Shared {
             }
             let schema = subscription.fixed.schema;
             let count = page_room(unspent, schema, limits, HEADER_BYTES);
-            if subscription.stall.is_some() || count == 0 {
+            if subscription.stall.is_some() {
                 continue;
             }
             let job = if let Position::Following(last) = subscription.position {
@@ -439,6 +443,11 @@ impl Shared {
                 let tip = selected.frontiers.header_best;
                 // The check above ended a tip at or below the last header.
                 if tip.height <= last.height {
+                    continue;
+                }
+                // With no room for a page, check each new tip once, without
+                // a page.
+                if count == 0 && subscription.checked_tip == Some(tip.hash) {
                     continue;
                 }
                 Job {
@@ -454,6 +463,9 @@ impl Shared {
                     selected: Some(selected.clone()),
                 }
             } else {
+                if count == 0 {
+                    continue;
+                }
                 let target = subscription.fixed.target;
                 let last = subscription.position.last();
                 Job {
@@ -496,6 +508,11 @@ impl Shared {
                 }
             }
             Output::End(outcome) => self.queue_end(id, outcome),
+            Output::Extends(tip) => {
+                if let Some(subscription) = self.subscriptions.get_mut(&id) {
+                    subscription.checked_tip = Some(tip);
+                }
+            }
             Output::Retry(reason) => {
                 metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => reason)
                     .increment(1);
@@ -554,6 +571,7 @@ impl Shared {
         {
             return false;
         }
+        subscription.checked_tip = None;
         subscription.position = if page.reaches_target || subscription.position.reached() {
             subscription.locators = Vec::new();
             Position::Following(page.last)
@@ -703,6 +721,9 @@ enum Output {
     Stall(Stall, &'static str),
     /// The page left the selected chain while in progress. Read again.
     Retry(&'static str),
+    /// A check without page credit found this selected tip extending the
+    /// last header sent.
+    Extends(block::Hash),
 }
 
 /// Everything the publisher task owns besides its stream.
@@ -954,6 +975,9 @@ async fn run_job<const HEADER_BYTES: usize>(
     owner: LeaseOwner,
     job: &Job,
 ) -> Output {
+    if job.count == 0 {
+        return check_following(port, owner, job).await;
+    }
     if let Some(tip) = job.probe {
         let selected = job.selected.as_ref();
         match acquire(port, owner, selected, tip.hash, vec![job.initial_target]).await {
@@ -1080,6 +1104,43 @@ fn log_port_failure(id: u64, operation: &'static str, error: &PortError) {
     );
 }
 
+/// Check, without a page, that the selected chain still extends a following
+/// subscription's last header. It runs once per selected tip while no page
+/// fits the subscription's credit, because a conformant subscriber need not
+/// keep page credit after its target, and the publisher still owes it
+/// `SubscriptionSuperseded` when the chain stops extending that header.
+async fn check_following(port: &dyn Port, owner: LeaseOwner, job: &Job) -> Output {
+    let Some(last) = job.parent else {
+        return Output::Stall(Stall::Local, "check_parent");
+    };
+    let reply = acquire(
+        port,
+        owner,
+        job.selected.as_ref(),
+        job.lease_target,
+        vec![last.hash],
+    )
+    .await;
+    match reply {
+        Ok(AcquirePathReply::Acquired(path)) => {
+            release(port, *path).await;
+            Output::Extends(job.lease_target)
+        }
+        Ok(AcquirePathReply::NoLocatorIntersection) => {
+            Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
+        }
+        // `in_window` turns this into `SubscriptionSuperseded`.
+        Ok(AcquirePathReply::HistoryPruned) => Output::End(HeadersOutcomeCode::HistoryPruned),
+        Ok(AcquirePathReply::CapacityBusy(signal)) => {
+            Output::Stall(Stall::Capacity(signal), "capacity")
+        }
+        Ok(AcquirePathReply::TargetNotRetained | AcquirePathReply::Busy) => {
+            Output::Stall(Stall::Local, "selected_tip")
+        }
+        Err(error) => port_failure(job.id, "check", &error),
+    }
+}
+
 /// Ask `port` for a lease on the path from `locators` to `target`.
 async fn acquire(
     port: &dyn Port,
@@ -1119,9 +1180,12 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
 
 /// Build and encode `job`'s page from a state page.
 ///
-/// A schema-1 page stops before the first header without a record. With none
-/// for its first header, the subscription waits, because a page's schema must
-/// match its subscription.
+/// A schema-1 page stops before the first header without a record, because a
+/// page's schema must match its subscription and a page cannot skip a header.
+/// With none for its first header, a subscription on the path to its target
+/// ends with `HistoryPruned`: a pruned node never gains records below its
+/// index height, so waiting would stall the subscriber forever. A following
+/// subscription waits instead, because `HistoryPruned` is past its window.
 fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPage) -> Output {
     let count = page.headers.len();
     // Widening u32 to usize is lossless on supported targets.
@@ -1164,7 +1228,11 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
         });
     }
     let Some(last) = entries.last() else {
-        return Output::Stall(Stall::Local, "aux_unavailable");
+        return if job.following {
+            Output::Stall(Stall::Local, "aux_unavailable")
+        } else {
+            Output::End(HeadersOutcomeCode::HistoryPruned)
+        };
     };
     let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
     let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {

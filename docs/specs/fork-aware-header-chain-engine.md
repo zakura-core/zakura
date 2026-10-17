@@ -509,7 +509,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 | ---: | --- | --- |
 | `1` | `TargetNotRetained` | target was absent or evicted before the server acquired its snapshot |
 | `2` | `NoLocatorIntersection` | none of the sent locator hashes is on the target path |
-| `3` | `HistoryPruned` | an intersection may exist below the server’s retained boundary but cannot be served |
+| `3` | `HistoryPruned` | history the path needs is unavailable for the requested schema: headers below the server’s retained boundary, or auxiliary records it cannot produce |
 | `4` | `Busy` | bounded temporary concurrency/resource refusal |
 
 **LC-WIRE-02 [ZW] — Atomic status snapshot.** `Status` MUST describe one atomic durable snapshot: the selected `header_best`, the finalized/work anchor it descends from, locally recomputed suffix work exclusive of the anchor and inclusive of the selected tip, retention floor, and effective serving caps. A receiver MUST treat height and work as advisory until it downloads and validates headers.

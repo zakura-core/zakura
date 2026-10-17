@@ -25,10 +25,6 @@ pub struct ZcashReader<R> {
     inner: R,
     remaining: Option<usize>,
     /// Bytes the innermost [`Self::with_limit`] still allows, or `None` without a limit.
-    ///
-    /// The limit is a field rather than a wrapper type so nested decoders keep
-    /// decoding from the same `ZcashReader<R>`. Wrapping the reader in `io::Take`
-    /// gave every limited nesting depth its own copy of every decoder.
     limit: Option<u64>,
 }
 

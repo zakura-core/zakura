@@ -650,30 +650,46 @@ fn pages_fit_the_advertised_caps() {
         .expect("the later Status raised both caps");
 }
 
-/// Past four cap pairs that trade one cap for the other, the subscription
-/// keeps one pair of the largest of each, which faults no page any of them
-/// allowed.
+/// However many `Status` messages trade one cap for the other, each keeps
+/// its own pair: a page that takes the header count of one and the bytes of
+/// another faults.
 #[test]
-fn trading_caps_merge_past_the_bound() {
-    let (tree, chain) = chain(4);
-    let bytes = page_bytes(2, AuxSchema::None);
-    let mut fixture = Fixture::open(tree, chain[4], &[chain[0]], 100);
-    for headers in 1..=MAX_PAGE_CAPS {
-        let headers = u32::try_from(headers).expect("small");
-        fixture.sub.observe(&Status {
-            max_headers_per_response: PAGE_HEADERS + headers,
-            max_message_bytes: bytes - headers,
-            ..status(chain[4])
-        });
-    }
-    let caps = &fixture.sub.live.as_ref().expect("live").caps;
-    assert_eq!(
-        caps[..],
-        [PageCaps {
-            headers: PAGE_HEADERS + 4,
-            bytes: page_bytes(PAGE_HEADERS, AuxSchema::V1),
-        }]
+fn trading_caps_stay_paired() {
+    let (tree, chain) = chain(8);
+    let bytes = |count| page_bytes(count, AuxSchema::None);
+    let advertise = |headers, max_bytes| Status {
+        max_headers_per_response: headers,
+        max_message_bytes: max_bytes,
+        ..status(chain[8])
+    };
+    let mut fixture = Fixture::open_with(
+        tree,
+        &advertise(1, bytes(7)),
+        &[chain[0]],
+        AuxSchema::None,
+        100,
     );
+    // Each pair allows more headers and fewer bytes than the one before, and
+    // none allows four headers with four headers' bytes.
+    for (headers, max_bytes) in [
+        (2, bytes(6)),
+        (3, bytes(5)),
+        (4, bytes(4) - 1),
+        (5, bytes(4) - 2),
+        (6, bytes(4) - 3),
+        (7, bytes(4) - 4),
+    ] {
+        fixture.sub.observe(&advertise(headers, max_bytes));
+    }
+    assert_eq!(fixture.sub.live.as_ref().expect("live").caps.len(), 7);
+    assert_eq!(
+        fixture.page(chain[0], &chain[1..5], false),
+        Err(SubscriberFault::AboveAdvertised)
+    );
+    fixture.sub.observe(&advertise(4, bytes(4)));
+    fixture
+        .page(chain[0], &chain[1..5], false)
+        .expect("a Status allowing both arrived");
 }
 
 /// Each outcome is legal exactly in its window: before the first page, before

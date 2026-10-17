@@ -204,9 +204,6 @@ pub(crate) struct Ended {
     pub(crate) accepted: Cursor,
 }
 
-/// Most page cap pairs a subscription keeps apart before it merges them.
-const MAX_PAGE_CAPS: usize = 4;
-
 /// The page caps one `Status` advertises.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct PageCaps {
@@ -244,7 +241,9 @@ struct Live {
     /// The page caps each `Status` advertised since the `Open`, keeping only
     /// pairs that no other covers. A page must fit one of them: it follows
     /// the `Status` that allowed it on the ordered stream, even if a later
-    /// `Status` changed the caps before the page arrived.
+    /// `Status` changed the caps before the page arrived. Kept pairs have
+    /// distinct header counts, and the `Status` decoder bounds those at
+    /// `MAX_HS_RANGE`, so the list stays bounded.
     caps: Vec<PageCaps>,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
@@ -712,22 +711,13 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
 }
 
 impl Live {
-    /// Add one `Status`'s page caps, dropping pairs they cover. Past
-    /// [`MAX_PAGE_CAPS`] pairs, keep the largest count and bytes as one pair,
-    /// which still allows every page that an advertised pair allowed.
+    /// Add one `Status`'s page caps, dropping pairs they cover.
     fn advertise(&mut self, caps: PageCaps) {
         if self.caps.iter().any(|kept| kept.covers(caps)) {
             return;
         }
         self.caps.retain(|kept| !caps.covers(*kept));
         self.caps.push(caps);
-        if self.caps.len() > MAX_PAGE_CAPS {
-            let merged = self.caps.iter().fold(caps, |merged, kept| PageCaps {
-                headers: merged.headers.max(kept.headers),
-                bytes: merged.bytes.max(kept.bytes),
-            });
-            self.caps = vec![merged];
-        }
     }
 
     /// The wire message for `update`. Only an `Open` carries the locators.

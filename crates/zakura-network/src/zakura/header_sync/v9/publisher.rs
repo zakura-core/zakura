@@ -67,6 +67,8 @@ use crate::zakura::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::FakePort;
 
 /// Lease attempts one page makes before it waits for a wake.
 const LEASE_ATTEMPTS: usize = 2;
@@ -77,7 +79,7 @@ const RECHECK_LEASES: usize = 2;
 
 /// The serving limits this node advertises in its `Status`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PageLimits {
+pub struct PageLimits {
     /// `max_headers_per_response`.
     pub(crate) max_headers: u32,
     /// `max_message_bytes`.
@@ -756,8 +758,8 @@ type Work<'a> = Pin<Box<dyn Future<Output = Progress<'a>> + Send + 'a>>;
 enum Admission {
     /// A page's output and execution slots.
     Page(PushPermit),
-    /// A check's execution slots. It writes nothing.
-    Check(ExecutionSlots),
+    /// A check's execution slots, held until it finishes. It writes nothing.
+    Check { _slots: ExecutionSlots },
 }
 
 /// How a page in progress finished.
@@ -926,7 +928,9 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let check = job.count == 0;
     Box::pin(async move {
         let permit = if check {
-            Admission::Check(push.execution().await)
+            Admission::Check {
+                _slots: push.execution().await,
+            }
         } else {
             Admission::Page(push.acquire(bytes).await)
         };

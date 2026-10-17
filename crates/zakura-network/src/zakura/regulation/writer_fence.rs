@@ -47,7 +47,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::zakura::{transport::FrameWriteClaim, CloseCause, Frame, FramedSend};
+use crate::zakura::{
+    transport::{FrameWriteClaim, GuardedFrameSlot},
+    CloseCause, Frame, FramedSend,
+};
 
 #[cfg(test)]
 mod tests;
@@ -323,17 +326,7 @@ impl FramedSend {
             .reserve_guarded()
             .await
             .map_err(|_| FencedSendError::Closed)?;
-        let mut queued = false;
-        if !writer.publish(|| {
-            queued = slot.send_request(frame, Arc::new(FencedWrite(writer.clone())));
-        }) {
-            return Err(FencedSendError::Fenced);
-        }
-        if queued {
-            Ok(())
-        } else {
-            Err(FencedSendError::Closed)
-        }
+        slot.send_fenced(frame, writer)
     }
 
     /// Wait for a queue slot, then queue `frame` to follow the request of
@@ -351,7 +344,41 @@ impl FramedSend {
             .reserve_guarded()
             .await
             .map_err(|_| FencedSendError::Closed)?;
-        if slot.send_request(frame, Arc::new(FollowingWrite(writer.clone()))) {
+        slot.send_following(frame, writer)
+    }
+}
+
+impl GuardedFrameSlot<'_> {
+    /// Publish `frame` into this reserved slot under `writer`'s fence, as
+    /// [`FramedSend::send_fenced`] does without waiting.
+    pub(crate) fn send_fenced(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        let slot = self;
+        let mut queued = false;
+        if !writer.publish(|| {
+            queued = slot.send_request(frame, Arc::new(FencedWrite(writer.clone())));
+        }) {
+            return Err(FencedSendError::Fenced);
+        }
+        if queued {
+            Ok(())
+        } else {
+            Err(FencedSendError::Closed)
+        }
+    }
+
+    /// Queue `frame` into this reserved slot to follow the request of
+    /// `writer`'s exchange, as [`FramedSend::send_following`] does without
+    /// waiting.
+    pub(crate) fn send_following(
+        self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        if self.send_request(frame, Arc::new(FollowingWrite(writer.clone()))) {
             Ok(())
         } else {
             Err(FencedSendError::Closed)

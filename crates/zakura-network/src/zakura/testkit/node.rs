@@ -225,6 +225,8 @@ pub struct ZakuraTestNodeBuilder {
     header_sync: Option<TestHeaderSyncStartup>,
     header_sync_config: ZakuraHeaderSyncConfig,
     header_sync_request_timeout: Option<Duration>,
+    /// The port header-sync publishers read pages from.
+    header_sync_port: Option<Arc<dyn zakura_node_services::header_chain::Port>>,
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
     block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
@@ -281,6 +283,7 @@ impl ZakuraTestNodeBuilder {
             header_sync: None,
             header_sync_config: ZakuraHeaderSyncConfig::default(),
             header_sync_request_timeout: None,
+            header_sync_port: None,
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
             block_range_source: None,
@@ -377,6 +380,17 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Serve header-sync pages from `port`, keeping the external action
+    /// driver for everything else.
+    #[cfg(test)]
+    pub(crate) fn header_sync_port(
+        mut self,
+        port: Arc<dyn zakura_node_services::header_chain::Port>,
+    ) -> Self {
+        self.header_sync_port = Some(port);
+        self
+    }
+
     /// Restrict the capability mask advertised by this test node.
     pub fn supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.supported_capabilities = Some(supported_capabilities);
@@ -454,6 +468,9 @@ impl ZakuraTestNodeBuilder {
             );
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
+            }
+            if let Some(port) = self.header_sync_port {
+                startup.header_chain_port = port;
             }
             startup.status_refresh_interval = Duration::from_millis(200);
             if let Some(state_driver) = state_driver {

@@ -15,13 +15,6 @@ zakura-network = { path = "../../../crates/zakura-network", features = ["header-
 zakura-state = { path = "../../../crates/zakura-state", features = ["header-fuzz"] }
 
 [[bin]]
-name = "header_codec"
-path = "fuzz_targets/header_codec.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "header_codec_v9"
 path = "fuzz_targets/header_codec_v9.rs"
 test = false

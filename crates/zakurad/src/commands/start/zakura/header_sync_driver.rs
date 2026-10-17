@@ -729,7 +729,7 @@ where
             zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
         ))
     })?;
-    let owner = insert.owner;
+    let (owner, source, target_tip_hash) = (insert.owner, insert.source, insert.target_tip_hash);
     let prepared = authority.from_registered_header_attempt(insert);
     match wait_for_header_target_apply(
         owner,
@@ -758,33 +758,68 @@ where
                 "unexpected state response: {response:?}"
             )))),
         )),
-        Err(error) if error_chain_contains_auxiliary_capacity_refusal(error.as_ref()) => {
-            Err(Arc::new(
-                zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(error)),
-            ))
-        }
-        Err(error) => Err(header_target_apply_failure(
+        Err(error) => Err(classify_header_apply_failure(
+            error,
+            source,
             owner,
-            "state_error",
-            Some(error),
+            target_tip_hash,
         )),
     }
 }
 
-fn error_chain_contains_auxiliary_capacity_refusal(
-    error: &(dyn std::error::Error + 'static),
-) -> bool {
+/// Classify state's refusal of a prepared header target.
+///
+/// Only a contextual difficulty or time failure is the supplying peer's. The
+/// session reader and `prepare_headers` already checked everything else that
+/// the peer's headers control, so any other refusal, such as a pruned parent
+/// or a stale preparation, is local.
+fn classify_header_apply_failure(
+    error: zakura_state::BoxError,
+    source: zakura_header_chain::SourceId,
+    owner: zakura_header_chain::HeaderSyncWorkOwner,
+    target_tip_hash: block::Hash,
+) -> Arc<zakura_header_chain::HeaderChainError> {
+    use zakura_header_chain::{
+        HeaderValidationCheck, HeaderValidationSource, HeaderViolation, InvalidTransitionEvidence,
+        TransitionFailure,
+    };
+
+    match transition_failure(error.as_ref()) {
+        Some(TransitionFailure::AuxiliaryLimitExceeded) => Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(error)),
+        ),
+        Some(TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::Header(
+            HeaderViolation::Validation {
+                source: HeaderValidationSource::Prepared,
+                check: HeaderValidationCheck::ContextualValidation,
+            },
+        ))) => {
+            let rule = zakura_header_chain::HeaderRule::ContextualDifficultyAndTime.rule_ids()[0];
+            Arc::new(zakura_header_chain::HeaderChainError::invalid_header(
+                zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                rule,
+                header_failure_evidence(source, owner, target_tip_hash, rule),
+                source,
+                Some(error),
+            ))
+        }
+        _ => header_target_apply_failure(owner, "state_error", Some(error)),
+    }
+}
+
+/// Return the planner failure in `error`'s source chain, if state's
+/// transition planner refused the request.
+fn transition_failure<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a zakura_header_chain::TransitionFailure> {
     let mut current = Some(error);
     while let Some(error) = current {
-        if matches!(
-            error.downcast_ref::<zakura_header_chain::TransitionFailure>(),
-            Some(zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded)
-        ) {
-            return true;
+        if let Some(failure) = error.downcast_ref() {
+            return Some(failure);
         }
         current = error.source();
     }
-    false
+    None
 }
 
 async fn wait_for_header_target_apply<F>(
@@ -1832,8 +1867,14 @@ mod tests {
         );
     }
 
+    /// Only a contextual failure of the peer's headers is the peer's. Every
+    /// other refusal stays local, and each is found through a wrapping error.
     #[test]
-    fn driver_recognizes_auxiliary_capacity_through_the_state_error_chain() {
+    fn driver_attributes_only_contextual_apply_failures_to_the_header_peer() {
+        use zakura_header_chain::{
+            ErrorCategory, HeaderValidationCheck, InvalidTransitionEvidence, TransitionFailure,
+        };
+
         #[derive(Debug)]
         struct Wrapped(zakura_header_chain::TransitionFailure);
 
@@ -1849,15 +1890,44 @@ mod tests {
             }
         }
 
-        let refusal = zakura_header_chain::TransitionFailure::AuxiliaryLimitExceeded;
-        assert!(error_chain_contains_auxiliary_capacity_refusal(&refusal));
+        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+        let classify = |error: zakura_state::BoxError| {
+            classify_header_apply_failure(error, source, owner(), block::Hash([2; 32]))
+        };
 
-        let wrapped = Wrapped(refusal);
-        assert!(error_chain_contains_auxiliary_capacity_refusal(&wrapped));
+        let contextual = classify(Box::new(Wrapped(
+            InvalidTransitionEvidence::prepared_header(HeaderValidationCheck::ContextualValidation)
+                .into(),
+        )));
+        assert_eq!(contextual.category, ErrorCategory::InvalidHeader);
+        assert_eq!(
+            contextual.attribution,
+            zakura_header_chain::Attribution::HeaderPeer(source)
+        );
+        assert!(
+            classify(Box::new(Wrapped(TransitionFailure::AuxiliaryLimitExceeded)))
+                .is_auxiliary_capacity_refusal()
+        );
 
-        let classified =
-            zakura_header_chain::HeaderChainError::auxiliary_capacity(Some(Box::new(wrapped)));
-        assert!(classified.is_auxiliary_capacity_refusal());
+        for local in [
+            // A parent that local retention pruned.
+            TransitionFailure::Graph(zakura_header_chain::GraphError::UnknownParent {
+                header: block::Hash([2; 32]),
+                parent: block::Hash([1; 32]),
+            }),
+            TransitionFailure::StalePreparation,
+            TransitionFailure::MissingDurableFacts("retained predecessor context is incomplete"),
+            InvalidTransitionEvidence::prepared_header(
+                HeaderValidationCheck::IncompleteDifficultyContext,
+            )
+            .into(),
+        ] {
+            let error = classify(Box::new(Wrapped(local)));
+            assert_eq!(error.category, ErrorCategory::LocalResourceOrStorage);
+            assert!(!error.is_automatic_header_peer_fault());
+        }
+        let restart = classify("header-chain writer exited".into());
+        assert!(!restart.is_automatic_header_peer_fault());
     }
 
     #[test]

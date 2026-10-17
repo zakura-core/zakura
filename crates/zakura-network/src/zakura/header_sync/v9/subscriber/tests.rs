@@ -16,7 +16,7 @@ use crate::zakura::{
         v9::{
             entry_bytes,
             test_support::{record, HeaderTree, OUTCOME_CODES},
-            RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
+            Message, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
         },
         wire::HeaderEntry,
     },
@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 const HB: usize = REGTEST_HEADER_BYTES;
 
 /// The subscriber under test.
-type Sub = Subscriber<HB>;
+type Sub = Subscriber;
 
 /// Headers per page that the scripted publisher sends.
 const PAGE_HEADERS: u32 = 3;
@@ -38,7 +38,7 @@ const PAGE_HEADERS: u32 = 3;
 /// A subscriber on an in-process session whose fence closes `connection`.
 fn fenced(connection: &CancellationToken) -> Sub {
     let fence = WriterFence::new(connection.clone(), CloseCause::default());
-    Sub::new(fence, &framed_channel(1).1)
+    Sub::new(HB, fence, &framed_channel(1).1)
 }
 
 /// A subscriber on a session whose connection the test ignores.
@@ -405,7 +405,7 @@ fn the_frame_header_check_runs_before_decode() {
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
     let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
-    let mut sub = Sub::new(fence, &recv);
+    let mut sub = Sub::new(HB, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
     let len = frame.payload.len();
     assert_eq!(
@@ -1128,7 +1128,7 @@ fn an_open_holds_its_exchange_until_the_outcome() {
     );
 
     let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
-    let mut sub = Sub::new(fence.clone(), &framed_channel(1).1);
+    let mut sub = Sub::new(HB, fence.clone(), &framed_channel(1).1);
     assert!(fence.retire());
     assert_eq!(
         sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 4)
@@ -1424,7 +1424,7 @@ impl Session {
         if update.operation == Operation::Grant {
             let tools = self.sub.tools.lock();
             let credit = tools.credit(&update.subscription_id).expect("live");
-            let window = Sub::window(self.staging, update.tree_aux_schema);
+            let window = self.sub.window(self.staging, update.tree_aux_schema);
             assert!(
                 credit.granted().objects - update.acknowledged.headers <= u64::from(window.objects),
                 "a Grant keeps the window within the staging budget"
@@ -1638,7 +1638,7 @@ fn run(ops: Vec<Op>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(512)))]
 
     /// A conformant publisher's pages and outcomes never fault the subscriber,
     /// and the subscriber's updates never fault the publisher's ledger, under

@@ -238,7 +238,7 @@ const _: () =
     assert!(LEGACY_REQUEST_STREAM_KIND == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS);
 const _: () = assert!(DISCOVERY_STREAM_KIND == super::discovery::ZAKURA_STREAM_DISCOVERY);
 const _: () = assert!(HEADER_SYNC_STREAM_KIND == super::header_sync::ZAKURA_STREAM_HEADER_SYNC);
-const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 8);
+const _: () = assert!(ZAKURA_HEADER_SYNC_STREAM_VERSION == 9);
 const _: () =
     assert!(LEGACY_REQUEST_BLOCKS_BY_HASH == super::legacy_gossip::MSG_REQUEST_BLOCKS_BY_HASH);
 const _: () = assert!(
@@ -5965,11 +5965,8 @@ fn inbound_frame_cap_for_stream(limits: &ZakuraConnectionLimits, stream: Stream)
 
 fn minimum_ordered_queue_capacity(streams: &[Stream]) -> usize {
     // Regulation needs independent room for a response and requests/control.
-    // Layouts without block sync keep one slot per stream.
-    let slots = if streams
-        .iter()
-        .any(|stream| stream.kind == crate::zakura::ZAKURA_STREAM_BLOCK_SYNC)
-    {
+    // Layouts without a message table keep one slot per stream.
+    let slots = if streams.iter().any(|stream| stream.messages.is_some()) {
         2
     } else {
         1
@@ -7985,7 +7982,6 @@ mod tests {
         let (_snapshot_tx, snapshot_rx) = watch::channel(Some(snapshot));
         startup.committed_snapshots = Some(snapshot_rx);
         let (header_sync, _actions, reactor_task) = spawn_header_sync_reactor(startup)?;
-        let codec = header_sync.codec();
         let service = HeaderSyncService::new(header_sync);
         let peer = test_peer(18);
         let connection_cancel = CancellationToken::new();
@@ -8020,10 +8016,11 @@ mod tests {
             .expect("the first outbound source is immediately ready")
             .expect("the admitted source remains open");
         assert!(matches!(
-            codec
-                .decode_frame(frame, None)
-                .expect("the first outbound frame decodes"),
-            crate::zakura::HeaderSyncMessage::Status(_)
+            crate::zakura::wire_codec::decode_frame::<
+                crate::zakura::header_sync::v9::CommonMessage,
+            >(&frame)
+            .expect("the first outbound frame decodes"),
+            crate::zakura::header_sync::v9::Message::Status(_)
         ));
         assert!(!connection_cancel.is_cancelled());
 
@@ -10812,15 +10809,17 @@ mod tests {
             "header-sync v5 is rejected after the expanded Ironwood root-record wire break"
         );
         assert!(
-            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 7),
+            !is_supported_stream(&registry, HEADER_SYNC_STREAM_KIND, 8),
             "the predecessor header-sync stream version is rejected"
         );
-        assert!(
-            registry
-                .persistent_streams_for_negotiated(1 << 4)
-                .is_empty(),
-            "the retired predecessor capability opens no header-sync stream"
-        );
+        for retired in [1 << 4, 1 << 5] {
+            assert!(
+                registry
+                    .persistent_streams_for_negotiated(retired)
+                    .is_empty(),
+                "a retired header-sync capability opens no header-sync stream"
+            );
+        }
 
         assert_eq!(stream_kind_label(2), "gossip");
         assert_eq!(stream_kind_label(3), "legacy_request");

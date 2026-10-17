@@ -406,8 +406,27 @@ impl<'de> Deserializer<'de> for ConfigValue {
         visitor.visit_enum(ConfigEnum { variant, payload })
     }
 
+    /// Reject arrays here instead of forwarding to `deserialize_any`, so derived
+    /// struct visitors never instantiate `visit_seq` for the loader.
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        match self.0 {
+            Value::Boolean(value) => visitor.visit_bool(value),
+            Value::Integer(value) => visitor.visit_i64(value),
+            Value::Float(value) => visitor.visit_f64(value),
+            Value::String(value) => visitor.visit_string(value),
+            Value::Nil => visitor.visit_unit(),
+            Value::Array(_) => Err(de::Error::invalid_type(de::Unexpected::Seq, &visitor)),
+            Value::Table(values) => visitor.visit_map(ConfigMap::new(values)),
+        }
+    }
+
     serde::forward_to_deserialize_any! {
-        char bytes byte_buf seq map struct unit identifier ignored_any
+        char bytes byte_buf seq map unit identifier ignored_any
         unit_struct tuple_struct tuple i128 u128
     }
 }
@@ -454,10 +473,10 @@ impl<'de> de::VariantAccess<'de> for ConfigEnum {
 
     fn struct_variant<V: Visitor<'de>>(
         self,
-        _fields: &'static [&'static str],
+        fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        self.payload()?.deserialize_map(visitor)
+        self.payload()?.deserialize_struct("", fields, visitor)
     }
 }
 

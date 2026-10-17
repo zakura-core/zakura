@@ -65,12 +65,13 @@ pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 9;
 /// Capability bit for the native header-sync service.
 ///
 /// Bit `1 << 4` belonged to the retired predecessor protocol and remains unused.
-pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 10;
 
 // Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
 // Do not assign it to another service.
 // Bit `1 << 3` identified the retired block-sync stream version 2. Do not reuse it.
 // Bit `1 << 4` identifies the retired predecessor header-sync protocol.
+// Bit `1 << 5` identified the retired header-sync stream version 8. Do not reuse it.
 // Bits 6 and 7 are reserved for spentness hints and wallet transaction submission.
 // Bit `1 << 8` identifies block sync (stream version 3) in `block_sync::wire`.
 // Bit `1 << 2` identified the retired discovery stream version 1. Do not reuse it.

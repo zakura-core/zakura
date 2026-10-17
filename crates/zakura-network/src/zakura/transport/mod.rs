@@ -23,8 +23,9 @@ pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
-    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
-    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame, ResponseFrameSlot,
+    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
+    GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
+    ResponseFrameSlot,
 };
 pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]
@@ -33,9 +34,11 @@ pub use message_rule::{
     frame_filter::FrameRejection, layout::LayoutError, Cadence, Credit, MessageRole, MessageRule,
     PayloadLen,
 };
+#[cfg(feature = "internal-bench")]
+pub use pipe::supervised_spawn_bench;
 pub(crate) use pipe::{
-    handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
-    Node, NodeKind, Pipe, PipeCx, PipeShape,
+    handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_peer_task_unboxed,
+    spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub(crate) use registry::SessionLayout;
 pub use registry::{RegistryError, ServiceRegistry};

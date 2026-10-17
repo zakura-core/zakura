@@ -10,22 +10,23 @@ Exercise SubscribeHeaders through its Headers pages and one HeadersOutcome termi
 through its cadence. Use production framing, decode, subscription tools, serving, and cleanup. Add
 only the seams needed to control chain growth, header validation, capacity, and page delivery.
 
-Version 9 replaces version 8 without a compatibility path, so version 8 tests retire when
-version 9 activates.
+Version 9 replaced version 8 without a compatibility path, so the version 8 tests retired with
+it.
 
 ## Existing infrastructure
 
 | Capability | Existing path | Use |
 | --- | --- | --- |
-| Subscription tools | [Subscriptions and Publications](../../crates/zakura-network/src/zakura/regulation/subscription.rs) | Credit window, slots, tombstones, and crossed-update sequences |
+| Subscription tools | [Subscriptions and Publications](../../crates/zakura-network/src/zakura/regulation/subscription.rs) | Credit window, slots, tombstones with their own credit window, and crossed-update sequences |
 | Generated codec checks | [Message suite](../../crates/zakura-network/src/zakura/wire_codec/message_suite.rs) | Row coverage, tight bounds, round trips, mutations, and allocation |
 | Header checks | [Frame suite](../../crates/zakura-network/src/zakura/transport/message_rule/frame_suite.rs) | Every row against every reader of a layout |
-| Real QUIC properties | [Stream conformance suite](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) | Unsolicited responses, retirement, paused siblings, partial frames, and Close progress |
+| Real QUIC properties | [Stream conformance suite](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) | Unsolicited responses, pages beyond their credit, the subscription margin, retirement, paused siblings, partial frames, and Close progress |
 | Cadence buckets | [CadenceBuckets](../../crates/zakura-network/src/zakura/regulation/cadence.rs) | Status observation, outage bursts, and read-pause credit |
-| Reactor tests | [Header sync reactor tests](../../crates/zakura-network/src/zakura/header_sync/reactor/tests/mod.rs) | Version 8 serving, admission, peer faults, and timeouts to port |
-| Codec fuzzing | [header_codec](../../qa/fuzz/header-chain/fuzz_targets/header_codec.rs) | Arbitrary payload decode and re-encode |
+| Reactor tests | [Header sync reactor tests](../../crates/zakura-network/src/zakura/header_sync/reactor/tests/mod.rs) | Admission, completion, peer faults, repair, and timeouts over version 9 |
+| Codec fuzzing | [header_codec_v9](../../qa/fuzz/header-chain/fuzz_targets/header_codec_v9.rs) | Arbitrary payload decode and re-encode |
 | Multi-node harness | [Cluster](../../crates/zakura-network/src/zakura/testkit/cluster.rs) | Honest multi-node sync |
 | Monotonic test time | [TestClock](../../crates/zakura-network/src/zakura/testkit/clock.rs) | Existing clock-dependent checks |
+| Parameter evidence and load | [Publisher load tests](../../crates/zakura-network/src/zakura/header_sync/v9/publisher/tests/load.rs) | Production credit and ring, Grant floods, throughput, and many sessions |
 
 The subscription tools test their own counters with integer cursors.
 
@@ -103,13 +104,45 @@ side's header validation so its accepted cursor stops. Its peer must stop at the
 the stalled side must still apply the peer's Grants and Close. A paused handler must not trap
 control behind pages. State finite bounds and scheduling assumptions.
 
-Repeat the stream conformance properties over real QUIC for stream 5. A peer that offers only
+The stream conformance properties run over real QUIC for stream 5. A peer that offers only
 version 8 negotiates no header sync stream, and the connection stays usable.
 
 ## Load and reporting
 
-Run many peers following the tip, full pages from an empty start, Grant floods at the minimum
-size, Status floods, non-reading subscribers, and connection churn. Assert bounded execution,
-cursor history, and buffered pages, and opportunities for other runnable peers to progress.
+The publisher load test runs 40 sessions on each pull request and 512, every default session slot,
+in the full-coverage unit test runs on pushes to main, the merge queue, and the nightly schedule,
+which include ignored tests. A fifth of the sessions each follow the
+tip, read full pages from an empty start, flood one-header grants, never read, or churn. Reads first
+wait on a closed gate, so they stop at the node and peer execution limits of 8 and 2. After every
+scheduler pass the test checks that cursor history stays within the window and output within its
+bound. Every reading session must then finish. A non-reading session queues pages in every
+transport slot but the one kept for control, and its next page waits without spending credit.
+The pages carry Regtest headers, about 181 KB for 1,000 headers against roughly 1.7 MB on Mainnet
+with records, so the test checks counts and slots, not output bytes near production limits.
 
-Gather the evidence that the specification's parameter table lists.
+Each of these tests runs on a paused clock in one thread. A progress bound counts scheduler passes,
+at most one million, so a wait on a timer fails instead of advancing time. The port and transport
+are in memory, so the tests exclude storage reads, header validation, and QUIC buffering.
+Generated tests search for failures and don't prove every execution correct. The nightly run
+raises the publisher, subscriber, and crossed-update properties to 4,096 cases through
+`HEADER_SYNC_PROPTEST_CASES`.
+
+### Measured evidence
+
+These figures come from a release build on an Apple M3 Ultra. Rates on the paused clock are exact.
+
+| Specification row | Evidence |
+| --- | --- |
+| Header credit | Even one-header pages with records spend at most 6.9 MB of the 8 MiB byte window per full header window on Mainnet, so header credit binds first on every network. Over a fixed one-way delay and no bandwidth limit, the real subscriber and publisher move one 4,000-header window per round trip: 8,000 headers per second at the 500 ms target and 40,000 at 100 ms. At 500 ms that is about 13 MB/s of Mainnet pages, below the byte window's 16.8 MB/s and the 67 MB/s that QUIC's 32 MiB send window allows. Validation time adds to each round trip, because the subscriber acknowledges a page only after validation. |
+| Cursor-ring size | 4,000 unacknowledged one-header pages fit the 4,096-entry ring. The publisher stops at the header credit, and a one-header `Grant` renews it. The generated publisher, subscriber, and crossed-update properties cover `Open`, `Grant`, `Close`, crossing updates, reorganization, storage failures, and credit exhaustion. |
+| Grant minimum | A subscriber that never acknowledges can send 35,894 minimum updates on Regtest, or 9,331 on Mainnet, before its window is full. That is one fewer than the specification's bounds of 35,895 and 9,332, because `Open` must add both a header and `P` bytes. All of them apply while page output is blocked, at 60 ns each under the publisher's lock, with no allocation. The publisher spends credit only on the page its transport slot holds. |
+| `Status` interval | The specification lets a peer send its new `Status` up to two seconds after the commit. This node's `StatusPublisher` sends it within its one-second floor, which `initial_refresh_and_coalesced_change_deadlines_are_bounded` checks. The subscriber starts the new target as soon as it has both that `Status` and `SubscriptionSuperseded`, in either order, without a timer wait. So recovery takes at most two seconds plus the round trips against any conformant peer, and at most one second plus the round trips against this node. Before this evidence, a `Status` that arrived first was spent while the subscription was still active, and recovery waited for the peer's 30 s refresh. No longer floor is proposed. |
+| Load | 512 sessions finish in 1.4 s and 202 scheduler passes, and 40 in 0.23 s. Running reads reach the node limit of 8, and no peer holds more than its 2 slots. |
+
+`Status` floods start no repeated work. A 602-message burst of repeated statuses from each of 16
+peers starts one locator read and costs 7.3 µs per status. From each of 255 peers it costs 40 µs per
+status. About 30 µs of that is the pass over cached statuses that the reactor runs after every
+event, so the cost of each status grows with the number of connected peers. The 602-message burst
+is the cadence capacity, not a ceiling. Cadence exhaustion records and forwards, so one peer can
+keep sending. At 40 µs per status with 255 peers connected, about 25,000 statuses per second
+saturate the reactor. Sizing that as a denial-of-service bound is follow-up work.

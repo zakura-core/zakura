@@ -317,6 +317,8 @@ jobs:
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
+          # Nightly searches more header sync subscription sequences.
+          HEADER_SYNC_PROPTEST_CASES: ${{ github.event_name == 'schedule' && '4096' || '' }}
 
   zakura-config:
     name: zakura config compatibility

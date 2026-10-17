@@ -19,7 +19,8 @@ use super::super::{
     config::{COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
     wire::{
         AuxSchema, HeaderEntry, TreeAuxRecordV1, TreeAuxWire, KNOWN_TREE_AUX_SCHEMA_MASK,
-        MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES, ZAKURA_STREAM_HEADER_SYNC,
+        MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 use crate::zakura::{
@@ -27,14 +28,17 @@ use crate::zakura::{
         BlockHash, Bool, BoundedReader, HeightLe, LeU16, LeU32, LeU64, List, Wire, WireError,
         WireMessage, U8,
     },
-    Cadence, Credit, MessageRole, MessageRule, PayloadLen, Stream, FRAME_HEADER_BYTES,
+    Cadence, Credit, MessageRole, MessageRule, PayloadLen, Stream, StreamQueueDepths,
+    FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// The header sync stream version this module encodes.
-pub(crate) const STREAM_VERSION: u16 = 9;
+pub(crate) const STREAM_VERSION: u16 = ZAKURA_HEADER_SYNC_STREAM_VERSION;
 
-/// Capability bit 10, which identifies version 9.
-pub(crate) const CAPABILITY: u64 = 1 << 10;
+/// Frames the transport reader may queue for the session reader. Pages and
+/// control share the queue, so it keeps the two slots that regulation needs.
+/// Each page fits the frame cap, so the queue holds at most about 8 MiB.
+const INBOUND_QUEUE_DEPTH: usize = 4;
 
 /// Most header credit a subscription holds beyond its acknowledged cursor.
 pub(crate) const MAX_HS_PUSH_CREDIT_HEADERS: u32 = 4_000;
@@ -65,7 +69,7 @@ const BODY_SIZE_BYTES: usize = 4;
 const FRAME_CAP: u32 = (MAX_HS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32;
 
 /// Frame message types.
-mod message_type {
+pub(crate) mod message_type {
     pub(crate) const STATUS: u16 = 1;
     pub(crate) const SUBSCRIBE_HEADERS: u16 = 2;
     pub(crate) const HEADERS: u16 = 3;
@@ -205,6 +209,14 @@ pub(crate) const fn smallest_page(header_bytes: usize, schema: AuxSchema) -> usi
     HEADERS_RESPONSE_FIXED_BYTES + entry_bytes(header_bytes, schema)
 }
 
+/// The most headers a page under `schema` holds within `max_bytes`, on a
+/// network whose headers take `header_bytes`.
+pub(crate) fn page_capacity(header_bytes: usize, schema: AuxSchema, max_bytes: usize) -> u32 {
+    let count =
+        max_bytes.saturating_sub(HEADERS_RESPONSE_FIXED_BYTES) / entry_bytes(header_bytes, schema);
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 /// The `Headers` row's maximum: the largest page under either schema that
 /// fits [`MAX_HS_MESSAGE_BYTES`] and [`MAX_HS_RANGE`] headers.
 pub(crate) const fn largest_page(header_bytes: usize) -> usize {
@@ -240,6 +252,15 @@ pub(crate) type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
 const _: () = Stream::validate_layout(&CommonMessage::LAYOUT);
 const _: () = Stream::validate_layout(&RegtestMessage::LAYOUT);
 
+/// The version 9 rows of a network whose headers take `header_bytes`.
+pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
+    if header_bytes == REGTEST_HEADER_BYTES {
+        &RegtestMessage::ROWS
+    } else {
+        &CommonMessage::ROWS
+    }
+}
+
 /// The version 9 layout for `network`, chosen by its header size.
 pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
     if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
@@ -251,7 +272,7 @@ pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [S
 
 /// A `Status` advertisement: the sender's frontier and serving caps.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Status {
+pub struct Status {
     /// Height of the sender's finality anchor, excluded from the suffix work.
     pub(crate) work_anchor_height: block::Height,
     /// Hash of the work anchor.
@@ -278,7 +299,7 @@ pub(crate) struct Status {
 
 /// A `SubscribeHeaders` operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Operation {
+pub enum Operation {
     /// Opens a subscription with its locators and first credit.
     Open = 0,
     /// Acknowledges a cursor and adds credit.
@@ -290,7 +311,7 @@ pub(crate) enum Operation {
 
 /// A subscription cursor.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Cursor {
+pub struct Cursor {
     /// Height of the last accepted header, or of the first locator.
     pub(crate) height: block::Height,
     /// Hash of that header.
@@ -303,7 +324,7 @@ pub(crate) struct Cursor {
 
 /// One subscription update.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SubscribeHeaders {
+pub struct SubscribeHeaders {
     /// What the update does.
     pub(crate) operation: Operation,
     /// Nonzero subscription identifier.
@@ -325,7 +346,7 @@ pub(crate) struct SubscribeHeaders {
 
 /// One pushed page of headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Headers {
+pub struct Headers {
     /// Nonzero subscription identifier.
     pub(crate) subscription_id: u64,
     /// The subscription's initial target.
@@ -345,7 +366,7 @@ pub(crate) struct Headers {
 
 /// Why a subscription ended.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HeadersOutcomeCode {
+pub enum HeadersOutcomeCode {
     /// The publisher no longer retains the initial target.
     TargetNotRetained = 1,
     /// No locator hash lies on the target path.
@@ -377,7 +398,7 @@ impl HeadersOutcomeCode {
 
 /// A subscription's terminal outcome.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HeadersOutcome {
+pub struct HeadersOutcome {
     /// Nonzero subscription identifier.
     pub(crate) subscription_id: u64,
     /// The subscription's initial target.
@@ -404,14 +425,19 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
         HEADERS_OUTCOME,
     ];
 
-    /// This network's version 9 stream. Activation registers it in place of
-    /// the version 8 stream.
+    /// This network's version 9 stream.
     pub(crate) const LAYOUT: [Stream; 1] = [Stream {
         kind: ZAKURA_STREAM_HEADER_SYNC,
         version: STREAM_VERSION,
         frame_cap: FRAME_CAP,
-        capability: CAPABILITY,
+        capability: ZAKURA_CAP_HEADER_SYNC,
         messages: Some(&Self::ROWS),
+        queue_depths: Some(StreamQueueDepths {
+            inbound: INBOUND_QUEUE_DEPTH,
+            // Pages take output capacity before their slot, so writes keep
+            // the transport's depth.
+            outbound: usize::MAX,
+        }),
         ..Stream::PERSISTENT
     }];
 

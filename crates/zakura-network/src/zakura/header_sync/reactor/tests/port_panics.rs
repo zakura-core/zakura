@@ -450,7 +450,7 @@ fn churn_status(anchor: zakura_header_chain::Frontier, marker: u8) -> Status {
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 16,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 1_000_000,
         tree_aux_schema_mask: 0,
     }
@@ -489,11 +489,7 @@ async fn status_tip_churn_coalesces_to_one_in_flight_locator_query() {
 
     const STATUS_CHURN: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1 + 8;
     for marker in 0..STATUS_CHURN {
-        reactor.handle_wire_message(
-            peer.clone(),
-            session_id,
-            HeaderSyncMessage::Status(churn_status(anchor, marker as u8)),
-        );
+        reactor.handle_status(peer.clone(), session_id, churn_status(anchor, marker as u8));
     }
 
     assert_eq!(reactor.pending_port_operations.len(), 1);
@@ -522,18 +518,8 @@ async fn status_tip_churn_coalesces_to_one_in_flight_locator_query() {
         1,
         "status tip churn must not spawn unbounded locator futures"
     );
-    let frame = outbound
-        .recv()
-        .await
-        .expect("GetHeaders uses the latest tip");
-    let HeaderSyncMessage::GetHeaders(request) = reactor
-        .codec
-        .decode_frame(frame, None)
-        .expect("GetHeaders decodes")
-    else {
-        panic!("expected GetHeaders for the latest staged tip");
-    };
-    assert_eq!(request.target_tip_hash, latest.selected_tip_hash);
+    let open = update(outbound.recv().await.expect("Open uses the latest tip"));
+    assert_eq!(open.initial_target_tip_hash, latest.selected_tip_hash);
 }
 
 #[tokio::test]
@@ -568,11 +554,7 @@ async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
     let _ = outbound.recv().await;
 
     let status = churn_status(anchor, 1);
-    reactor.handle_wire_message(
-        peer.clone(),
-        session_id,
-        HeaderSyncMessage::Status(status.clone()),
-    );
+    reactor.handle_status(peer.clone(), session_id, status.clone());
     assert_eq!(reactor.pending_port_operations.len(), 1);
     assert_eq!(reactor.pending_locator_queries.len(), 1);
 
@@ -628,7 +610,7 @@ async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
         tokio::time::timeout(std::time::Duration::from_millis(20), outbound.recv())
             .await
             .is_err(),
-        "a stale locator cannot send GetHeaders under the new generation"
+        "a stale locator cannot open a subscription under the new generation"
     );
 }
 
@@ -700,16 +682,8 @@ async fn locator_timeout_after_tip_churn_rediscovers_the_latest_target() {
     ));
     let _ = outbound.recv().await;
 
-    reactor.handle_wire_message(
-        peer.clone(),
-        session_id,
-        HeaderSyncMessage::Status(churn_status(anchor, 1)),
-    );
-    reactor.handle_wire_message(
-        peer.clone(),
-        session_id,
-        HeaderSyncMessage::Status(churn_status(anchor, 2)),
-    );
+    reactor.handle_status(peer.clone(), session_id, churn_status(anchor, 1));
+    reactor.handle_status(peer.clone(), session_id, churn_status(anchor, 2));
     assert_eq!(reactor.pending_port_operations.len(), 1);
 
     let completion = reactor

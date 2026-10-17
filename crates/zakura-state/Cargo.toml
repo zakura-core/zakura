@@ -99,7 +99,7 @@ rand = { workspace = true }
 halo2 = { workspace = true }
 orchard = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }

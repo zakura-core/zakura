@@ -1,10 +1,10 @@
 mod admission;
-mod capacity;
+mod aux_fallback;
+mod closing;
 mod completion;
 mod eviction;
 mod peer_faults;
 mod port_panics;
-mod serving;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;
@@ -16,7 +16,11 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
 
 use super::*;
-use crate::zakura::{framed_channel, LOCAL_MAX_MESSAGE_BYTES};
+use crate::zakura::{
+    framed_channel,
+    wire_codec::{decode_frame, encode_frame},
+    Frame, LOCAL_MAX_MESSAGE_BYTES,
+};
 
 fn peer() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
@@ -69,13 +73,118 @@ fn invalid_header_failure(
     ))
 }
 
-fn request(request_id: u64, target: block::Hash, locator: block::Hash) -> GetHeaders {
-    GetHeaders {
-        request_id,
-        target_tip_hash: target,
-        locator_hashes: vec![locator],
-        max_header_count: 1,
-        tree_aux_schema: AuxSchema::V1,
+/// What `peer`'s subscriber admits for `page`: through the session's
+/// subscriber when it holds the page's subscription, as the session reader
+/// does, or as admitted when a test seeded the work without one.
+fn admit_page(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId, page: &Headers) -> v9::Admitted {
+    if let Some(state) = reactor.peer_state.get(peer) {
+        let mut subscriber = state.session.subscriber();
+        if subscriber.live() == Some(page.subscription_id) {
+            let frame = encode_frame(&v9::RegtestMessage::Headers(page.clone()))
+                .expect("the test page encodes");
+            return subscriber
+                .receive_page(page, frame.payload.len())
+                .expect("the test page is conformant");
+        }
+    }
+    let count = u32::try_from(page.entries.len()).expect("a page fits u32");
+    let last = page.entries.last().expect("a page has a header");
+    v9::Admitted {
+        id: page.subscription_id,
+        parent: zakura_header_chain::Frontier::new(
+            page.common_ancestor_height,
+            page.common_ancestor_hash,
+        ),
+        cursor: v9::Cursor {
+            height: block::Height(page.common_ancestor_height.0 + count),
+            hash: last.header.hash(),
+            headers: u64::from(count),
+            bytes: 0,
+        },
+        reaches_target: page.reaches_initial_target,
+        after_close: false,
+    }
+}
+
+impl HeaderSyncReactor {
+    /// Deliver `page` from `peer`'s session `session_id` once its subscriber
+    /// admitted it. See [`admit_page`].
+    fn deliver_page(&mut self, peer: ZakuraPeerId, session_id: u64, page: Headers) {
+        let admitted = admit_page(self, &peer, &page);
+        self.handle_page(peer, session_id, page, admitted);
+    }
+
+    /// Deliver `outcome` from `peer`'s session `session_id` as its subscriber
+    /// admits it, or as admitted when a test seeded the work without one.
+    fn deliver_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, outcome: HeadersOutcome) {
+        let live = self.peer_state.get(&peer).and_then(|state| {
+            let mut subscriber = state.session.subscriber();
+            (subscriber.live() == Some(outcome.subscription_id)).then(|| {
+                subscriber
+                    .receive_outcome(&outcome)
+                    .expect("the test outcome is conformant")
+            })
+        });
+        let ended = live.unwrap_or(v9::Ended {
+            id: outcome.subscription_id,
+            outcome: outcome.outcome,
+            pages: 0,
+            reached: false,
+            accepted: v9::Cursor {
+                height: block::Height(0),
+                hash: block::Hash([0; 32]),
+                headers: 0,
+                bytes: 0,
+            },
+        });
+        self.handle_outcome(peer, session_id, ended);
+    }
+}
+
+/// The subscription update in `frame`.
+fn update(frame: Frame) -> v9::SubscribeHeaders {
+    match decode_frame::<v9::RegtestMessage>(&frame).expect("the update decodes") {
+        v9::Message::SubscribeHeaders(update) => update,
+        other => panic!("expected a subscription update, got {other:?}"),
+    }
+}
+
+/// The `Status` in `frame`.
+fn decode_status(frame: Frame) -> Status {
+    match decode_frame::<v9::RegtestMessage>(&frame).expect("the status decodes") {
+        v9::Message::Status(status) => status,
+        other => panic!("expected a status, got {other:?}"),
+    }
+}
+
+/// The `Page` event for `page`, admitted by `session`'s subscriber as its
+/// session reader does.
+fn page_event(session: &PeerSession, page: Headers) -> Event {
+    let frame =
+        encode_frame(&v9::RegtestMessage::Headers(page.clone())).expect("the test page encodes");
+    let admitted = session
+        .subscriber()
+        .receive_page(&page, frame.payload.len())
+        .expect("the test page is conformant");
+    Event::Page {
+        peer: session.peer_id().clone(),
+        session_id: session.session_id(),
+        page,
+        admitted,
+    }
+}
+
+/// The `Outcome` event for `outcome`, admitted by `session`'s subscriber as
+/// its session reader does.
+fn outcome_event(session: &PeerSession, outcome: HeadersOutcome) -> Event {
+    let ended = session
+        .subscriber()
+        .receive_outcome(&outcome)
+        .expect("the test outcome is conformant");
+    Event::Outcome {
+        peer: session.peer_id().clone(),
+        session_id: session.session_id(),
+        ended,
     }
 }
 
@@ -161,7 +270,7 @@ fn seed_applying_request(
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
             oldest_retained_height: anchor.height,
             max_headers_per_response: 1,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 1_000,
             tree_aux_schema_mask: 0,
         },
@@ -188,6 +297,7 @@ fn seed_applying_request(
             tree_aux: None,
         }],
         phase: HeaderTargetPhase::Applying,
+        cursor: None,
         max_header_count: 1,
         tree_aux_schema: AuxSchema::None,
     }));

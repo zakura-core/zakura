@@ -81,7 +81,7 @@ pub(crate) mod header_sync_trace {
     pub(crate) const SELECTED_TIP_HEIGHT: &str = "selected_tip_height";
     pub(crate) const SELECTED_TIP_HASH: &str = "selected_tip_hash";
     pub(crate) const MAX_HEADERS_PER_RESPONSE: &str = "max_headers_per_response";
-    pub(crate) const MAX_INFLIGHT_REQUESTS: &str = "max_inflight_requests";
+    pub(crate) const MAX_SUBSCRIPTIONS: &str = "max_subscriptions";
     pub(crate) const MAX_MESSAGE_BYTES: &str = "max_message_bytes";
     pub(crate) const TREE_AUX_SCHEMA_MASK: &str = "tree_aux_schema_mask";
     pub(crate) const OLD_SELECTED_HEIGHT: &str = "old_selected_height";

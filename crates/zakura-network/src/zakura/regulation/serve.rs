@@ -491,7 +491,8 @@ impl ServingTasks {
         let cancel = self.cancel.clone();
         let connection = self.connection.clone();
         let close_cause = self.close_cause.clone();
-        crate::zakura::transport::spawn_supervised_peer_task(
+        // Dispatch spawns one task per served request, so keep it unboxed.
+        crate::zakura::transport::spawn_supervised_peer_task_unboxed(
             self.peer.clone(),
             || {},
             move || {

@@ -1,8 +1,8 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.8<br>
-Date: 2026-10-13<br>
+Version: 1.9<br>
+Date: 2026-10-16<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
@@ -14,6 +14,8 @@ Version 1.6 separates header scheduling from full-state equal-work selection. He
 Version 1.7 excludes targets advertised at or below local finality from ordinary discovery scheduling. Explicitly selected historical auxiliary repair remains separate. This adds no wire or disk fields.
 
 Version 1.8 preserves the durable selected header tip on equal work in integrated mode. Greater work or loss of eligibility still changes selection. Headers-only mode retains raw-hash ordering. This adds no wire or disk fields.
+
+Version 1.9 replaces header sync stream version 8 with version 9, defined in the [peer message regulation specification](peer-message-regulation.md#header-sync--stream-5-version-9). `SubscribeHeaders` replaces `GetHeaders`, a subscription's renewable credit replaces per-request continuations, and `Busy` is retired. Capability bit 10 offers version 9, and bit 5 is retired. There is no compatibility path. This adds no disk fields.
 
 ## Document overview
 
@@ -62,7 +64,7 @@ Defines how Zakura peers advertise and exchange competing header chains over the
 
 - **MUST** implement exactly one header-sync message set and codec, and enforce all message, count, and allocation bounds.
 - **MUST** treat advertised height and work as hints until the corresponding headers are downloaded and validated locally.
-- **MUST** bind every request and continuation to one exact target snapshot; a server may not silently substitute a newer chain.
+- **MUST** bind every subscription to one exact target snapshot; a server may not silently substitute a newer chain.
 - **MUST** validate request correlation, locator ancestry, header linkage, and the completed target before admitting a response.
 - **MUST NOT** implement a fallback, compatibility, or predecessor header-exchange path; a peer that does not speak this protocol is simply not a header-sync peer, and stale or unavailable history alone is not peer misbehavior.
 
@@ -414,7 +416,7 @@ VCT/tree-aux records are execution assistance. They can help reconstruct and aut
 
 A later known body-size hint for the same semantic payload MAY fill an unknown scheduling size once, without adding an evidence slot. A known size MUST NOT be replaced or erased, because the header hash fixes the body size. The original delivery and its verification provenance MUST remain unchanged. The fill MUST be pruned with its retained delivery. An ordinary header batch with auxiliary deliveries MUST bind replay identity to both the prepared batch and the delivery attempt, so a new supplier can fill a missing size without weakening conflicting-replay checks within an attempt.
 
-**LC-AUX-07 [LS] — Authoritative repair progress.** A repair request MUST claim an exact contiguous selected range and durable auxiliary-requirement episode. A durable auxiliary row constrains a repair when it carries a root or a rejected, disputed, or authenticated outcome. A rootless unauthenticated row does not constrain a repair: suppliers attach roots only to their finalized prefix, so such rows cover every header received near the network tip. State MUST use one target when the blocking height has a constraining row, a resource alarm, or no adjacent unconstrained gap. Otherwise, state MUST bound the range by the selected tip, the checkpoint handoff, the transition limit, the first constraining row, and the first header whose input bucket cannot admit another row. State MUST also bound the range by free aggregate slots plus slots reclaimable under LC-AUX-08. State MUST NOT advertise capacity that requires evicting authenticated input or commit-window input. A range episode MUST bind every selected frontier, every authentication boundary, the state version, and the absence of constraining rows. The state version binds any rootless rows in the range. Header sync MUST read a range context again when a newer committed state supersedes it before the request goes on wire. Header sync MUST select eligible suppliers in rotating queue order, without giving larger advertised batches priority over waiting suppliers. New or reconnected suppliers MUST join the back of that queue. Header sync MAY shorten the context to the largest prefix that the selected V1 supplier can serve. State MUST validate and admit the complete prefix atomically. State MUST reject a stale claim, a partial range, a changed selected path, new auxiliary evidence, a semantic payload that state already retains, or an input excluded by committed rejection or dispute evidence without changing state. Header sync MUST rotate away from a supplier after a successful repair or a supplier-attributed failure. A correlated `Busy` response MUST pause only that supplier until a later valid `Status` arrives from the same session, while other eligible suppliers remain available. An unchanged status refresh MUST make that supplier eligible again without requiring elapsed time or a new tip. A status received before the refusal, from another supplier, or from a departed session MUST NOT release the wait. Each subsequent `Busy` MUST require another status event. Header sync MUST NOT arm a retry deadline for `Busy`. Other supplier-attributed failures MUST NOT reuse that supplier in the same session. Header sync MUST NOT use a supplier that already occupies the target's rooted slot during the same episode. Live peer admission limits MUST bound supplier history. Header sync MUST remove failure-only identity state when a supplier disconnects or its session is replaced, even if the old disconnect event has not arrived. A late local completion from the departed session MUST NOT recreate failure history for its replacement. A transient local failure MAY retry after bounded backoff. Header sync MUST wait when state reports that repair admission lacks capacity. It MAY resume only after a newer state reports available capacity. When no eligible supplier remains, header sync MUST wait for a busy supplier’s later status, a new supplier, target, or episode. Periodic status publication under LC-WIRE-17 provides retry opportunities when the supplier’s tip is unchanged. Auxiliary repair failure MUST NOT affect fork choice.
+**LC-AUX-07 [LS] — Authoritative repair progress.** A repair request MUST claim an exact contiguous selected range and durable auxiliary-requirement episode. A durable auxiliary row constrains a repair when it carries a root or a rejected, disputed, or authenticated outcome. A rootless unauthenticated row does not constrain a repair: suppliers attach roots only to their finalized prefix, so such rows cover every header received near the network tip. State MUST use one target when the blocking height has a constraining row, a resource alarm, or no adjacent unconstrained gap. Otherwise, state MUST bound the range by the selected tip, the checkpoint handoff, the transition limit, the first constraining row, and the first header whose input bucket cannot admit another row. State MUST also bound the range by free aggregate slots plus slots reclaimable under LC-AUX-08. State MUST NOT advertise capacity that requires evicting authenticated input or commit-window input. A range episode MUST bind every selected frontier, every authentication boundary, the state version, and the absence of constraining rows. The state version binds any rootless rows in the range. Header sync MUST read a range context again when a newer committed state supersedes it before the request goes on wire. Header sync MUST select eligible suppliers in rotating queue order, without giving larger advertised batches priority over waiting suppliers. New or reconnected suppliers MUST join the back of that queue. Header sync MAY shorten the context to the largest prefix that the selected V1 supplier can serve. State MUST validate and admit the complete prefix atomically. State MUST reject a stale claim, a partial range, a changed selected path, new auxiliary evidence, a semantic payload that state already retains, or an input excluded by committed rejection or dispute evidence without changing state. Header sync MUST rotate away from a supplier after a successful repair or a supplier-attributed failure. A correlated `TargetNotSelected` outcome MUST pause only that supplier until a later valid `Status` arrives from the same session, while other eligible suppliers remain available. An unchanged status refresh MUST make that supplier eligible again without requiring elapsed time or a new tip. A status received before the refusal, from another supplier, or from a departed session MUST NOT release the wait. Each subsequent `TargetNotSelected` MUST require another status event. Header sync MUST NOT arm a retry deadline for `TargetNotSelected`. Other supplier-attributed failures MUST NOT reuse that supplier in the same session. Header sync MUST NOT use a supplier that already occupies the target's rooted slot during the same episode. Live peer admission limits MUST bound supplier history. Header sync MUST remove failure-only identity state when a supplier disconnects or its session is replaced, even if the old disconnect event has not arrived. A late local completion from the departed session MUST NOT recreate failure history for its replacement. A transient local failure MAY retry after bounded backoff. Header sync MUST wait when state reports that repair admission lacks capacity. It MAY resume only after a newer state reports available capacity. When no eligible supplier remains, header sync MUST wait for a paused supplier’s later status, a new supplier, target, or episode. Periodic status publication under LC-WIRE-17 provides retry opportunities when the supplier’s tip is unchanged. Auxiliary repair failure MUST NOT affect fork choice.
 
 An ambiguous boundary is an exception to the one-target and retained-payload rules above. A failed boundary check can dispute the blocking target's roots and its selected successor's auth-data root together, because either delivery can be wrong. Honest suppliers return identical payloads, so a one-header repair of the honest header could never progress. When one observation disputed a row of the blocking target and a row of its selected successor at the successor boundary, state MUST claim both headers in one two-header context. The checkpoint handoff MUST bound the successor. The two headers MUST have repair capacity together under LC-AUX-08. A full bucket MUST hold a non-authenticated row to replace, and the shared aggregate slots MUST cover a new payload at every other header. The episode MUST bind both targets, their authentication boundaries, and their durable rows. Header sync MUST NOT shorten that context or request it from a supplier that cannot serve both headers. Header sync MUST NOT use a supplier that occupies the rooted slot of both headers. Header sync and state MUST accept a response only when at least one payload is neither retained nor excluded and comes from a supplier without a rooted slot at that header. Admission MUST drop each retained payload and admit only the new payloads. State MUST reject a response without a new payload without changing state. Header-time authentication MUST verify every delivery pair at the boundary that has not failed together before it requests repair, so a wrong row that sorts first cannot hide an honest pair.
 
@@ -422,15 +424,15 @@ An ambiguous boundary is an exception to the one-target and retained-payload rul
 
 ## 5. Native fork-discovery protocol
 
-> **Planned change.** Header sync version 9, defined in the [peer message regulation specification](peer-message-regulation.md), replaces this section's stream version, message encodings, and `GetHeaders` request rules when it activates. LC-WIRE-05's path selection and serving reserve keep applying to version 9 pages, but a locator at the target ends with no page instead of an empty, complete response. The other rules here keep applying except where version 9 changes them, and it keeps one protocol at one stream version under LC-SCOPE-09. The activation change updates this section and PW-08.
-
 ### 5.1 Stream version and codec
 
-Header sync runs on one ordered Zakura v2 P2P stream at exactly one supported stream version, `8`. That number is a compatibility barrier, not a selector: it exists so that a node speaking the obsolete predecessor format (native stream version 7, or the draft version 1.2 16-byte work field) cannot open a header-sync stream at all. There is no negotiation among header-sync codecs, no per-stream codec enum, and no fallback path.
+Header sync runs on one ordered Zakura v2 P2P stream at exactly one supported stream version, `9`, which capability bit 10 offers. That number is a compatibility barrier, not a selector: it exists so that a node speaking an obsolete predecessor format (native stream versions 7 and 8, or the draft version 1.2 16-byte work field) cannot open a header-sync stream at all. Capability bit 5, which offered version 8, is retired and MUST NOT be reused. There is no negotiation among header-sync codecs, no per-stream codec enum, and no fallback path.
 
-Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; request IDs are nonzero `u64`; work is an unsigned 256-bit integer encoded as exactly 32 little-endian bytes. All messages retain the stream's application frame limit and the local 2 MiB hard message cap.
+The [peer message regulation specification](peer-message-regulation.md#header-sync--stream-5-version-9) defines version 9's credit limits, cursors, update rules, and outcome windows. This section states the header-chain rules that apply to them.
 
-**LC-WIRE-01 [ZW] — Bounded decoding.** The header-sync decoder MUST reject unknown discriminants, zero request IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either the stream frame limit or hard byte/count limits before allocation or CPU-heavy validation. A peer that does not offer stream version 8 MUST NOT be given a header-sync stream, and its messages MUST NOT be decoded by any other header-sync codec.
+Integers below are unsigned little-endian. Hashes are 32 raw internal bytes. Heights are `u32` constrained to `block::Height::MAX`; subscription IDs are nonzero `u64`; work is an unsigned 256-bit integer encoded as exactly 32 little-endian bytes. All messages retain the stream's application frame limit and the local 2 MiB hard message cap.
+
+**LC-WIRE-01 [ZW] — Bounded decoding.** The header-sync decoder MUST reject unknown discriminants, zero subscription IDs, invalid booleans, out-of-range heights, count/vector disagreement, trailing bytes, arithmetic overflow, and messages exceeding either the stream frame limit or hard byte/count limits before allocation or CPU-heavy validation. A peer that does not offer stream version 9 MUST NOT be given a header-sync stream, and its messages MUST NOT be decoded by any other header-sync codec.
 
 ### 5.2 Messages
 
@@ -439,7 +441,7 @@ The message discriminants are:
 | Code | Message |
 | ---: | --- |
 | `1` | `Status` |
-| `2` | `GetHeaders` |
+| `2` | `SubscribeHeaders` |
 | `3` | `Headers` |
 | `4` | `HeadersOutcome` |
 
@@ -453,42 +455,49 @@ selected_tip_hash         [u8; 32]
 suffix_cumulative_work    uint256 (32-byte little-endian)
 oldest_retained_height    u32
 max_headers_per_response  u32
-max_inflight_requests     u16
+max_subscriptions         u16 (exactly 1)
 max_message_bytes         u32
 tree_aux_schema_mask      u32
 ```
 
-`GetHeaders` is encoded as:
+`SubscribeHeaders` is encoded as:
 
 ```text
-request_id                nonzero u64
-target_tip_hash           [u8; 32]
-locator_count             u8 (1..=13)
+operation                 u8 (0 Open, 1 Grant, 2 Close)
+subscription_id           nonzero u64
+update_sequence           u32 (0 for Open, then one more per update)
+initial_target_tip_hash   [u8; 32]
+acknowledged_height       u32
+acknowledged_hash         [u8; 32]
+acknowledged_headers      u64
+acknowledged_bytes        u64
+locator_count             u8 (1..=13 for Open, 0 otherwise)
 locator_hashes            locator_count * [u8; 32]
-max_header_count          u32 (>0 and locally/peer capped)
-tree_aux_schema           u8 (0, or 1..=32 advertised by the server)
+added_header_credit       u32
+added_byte_credit         u32
+tree_aux_schema           u8 (0, or 1..=32 advertised by the publisher)
 ```
 
 `Headers` is encoded as:
 
 ```text
-request_id                nonzero u64
-target_tip_hash           [u8; 32]
+subscription_id           nonzero u64
+initial_target_tip_hash   [u8; 32]
 common_ancestor_height    u32
 common_ancestor_hash      [u8; 32]
-header_count              u32
-complete                  bool byte
-tree_aux_schema           u8 (0, or the exact requested schema)
+header_count              u32 (>0)
+reaches_initial_target    bool byte
+tree_aux_schema           u8 (the subscription's schema)
 headers                   header_count canonical headers
 body_size_hints           header_count * u32
 tree_aux_roots            absent, or header_count records of the selected schema
 ```
 
-`header_count` is positive except that it may be zero when `complete = 1` and the common-ancestor hash already equals `target_tip_hash`. Otherwise, `complete = 1` means the last returned header hash equals `target_tip_hash`. `complete = 0` means the response reached its count/byte limit; the requester continues with a fresh locator whose first entry is the returned suffix tip and the same snapshot target. All other empty success responses are forbidden.
+`Open` names the target of a received status snapshot, sends the locator, and grants credit. The first page extends a sent locator, and each later page extends the one before while credit remains. `reaches_initial_target = 1` exactly on the page whose last header hash equals `initial_target_tip_hash`. A locator at the target reaches it at `Open`, so no path page follows. `Grant` renews credit and acknowledges the last accepted cursor, and `Close` ends the subscription. Empty pages are forbidden.
 
 Each `body_size_hints` value is the advisory total canonical serialized block size. `0` means unknown; the only other legal values are `1..=2,000,000` (`block::MAX_BLOCK_BYTES`). A decoder rejects larger values. A receiver may use a legal nonzero hint for scheduling or byte-budget estimation, but it may not allocate a block buffer, grant admission credit, or relax an independent frame/body bound solely from the hint.
 
-`tree_aux_schema_mask` uses bit `n - 1` to advertise schema `n`; zero advertises no auxiliary schema. A requester sends `tree_aux_schema = 0` for no records, or one schema advertised in the status snapshot. A server may answer with schema `0` when the requested metadata is unavailable; otherwise the response schema MUST equal the request. Schema `0` has no records. Schema `1` has exactly one 156-byte record per header, encoded in this order:
+`tree_aux_schema_mask` uses bit `n - 1` to advertise schema `n`; zero advertises no auxiliary schema. A subscriber opens with `tree_aux_schema = 0` for no records, or one schema advertised in the status snapshot. Every page MUST carry the subscription's schema. Before the target, a publisher that lacks a record sends the pages it can serve and then ends the subscription with `HistoryPruned`, never skipping the record or downgrading the schema. Records are certain only through the publisher's work anchor, so an ordinary subscription asks for schema `1` only while its round ends at or below that anchor. A pruned publisher can lack records below its index height too. After such a `HistoryPruned`, the requester asks that peer for no records, and probes schema `1` again only after a bounded backoff. Auxiliary repair always asks for schema `1`. Schema `0` has no records. Schema `1` has exactly one 156-byte record per header, encoded in this order:
 
 ```text
 height                    u32
@@ -503,20 +512,24 @@ auth_data_root            [u8; 32]
 
 Each schema-1 height must equal its parallel header’s inferred height. Root decoders must apply their canonical field encodings. Orchard fields use the empty/default root and count zero below NU5; Ironwood fields use the empty/default root and count zero before the configured NU7 activation; `auth_data_root` is all zero below NU5. These defaults are syntactic schema values only and do not authenticate the metadata.
 
-`HeadersOutcome` contains `request_id`, `target_tip_hash`, and one outcome byte:
+`HeadersOutcome` contains `subscription_id`, `initial_target_tip_hash`, and one outcome byte. It ends the subscription. The regulation specification gives each outcome's legal window.
 
 | Code | Outcome | Meaning |
 | ---: | --- | --- |
 | `1` | `TargetNotRetained` | target was absent or evicted before the server acquired its snapshot |
 | `2` | `NoLocatorIntersection` | none of the sent locator hashes is on the target path |
 | `3` | `HistoryPruned` | history the path needs is unavailable for the requested schema: headers below the server’s retained boundary, or auxiliary records it cannot produce |
-| `4` | `Busy` | bounded temporary concurrency/resource refusal |
+| `5` | `TargetNotSelected` | the publisher's selected chain left the target between `Status` and `Open` |
+| `6` | `SubscriptionSuperseded` | the publisher's selected chain stopped extending the subscription cursor |
+| `7` | `SubscriptionClosed` | the publisher received `Close` |
+
+Byte `4`, version 8's `Busy`, is retired and MUST NOT be reused. Temporary resource exhaustion pauses page production instead of ending the subscription.
 
 **LC-WIRE-02 [ZW] — Atomic status snapshot.** `Status` MUST describe one atomic durable snapshot: the selected `header_best`, the finalized/work anchor it descends from, locally recomputed suffix work exclusive of the anchor and inclusive of the selected tip, retention floor, and effective serving caps. A receiver MUST treat height and work as advisory until it downloads and validates headers.
 
 **LC-WIRE-17 [ZW] — Status publication cadence.** `Status` is unsolicited and the protocol defines no status request. Each side MUST send its current status immediately after the header-sync stream opens, MUST send an updated snapshot after any committed transition that changes its selected tip, work anchor, retention floor, or advertised serving caps, and MUST refresh at least once per configured `status_refresh_interval` (default 30 seconds) as a liveness signal. Rapid successive changes MAY be coalesced, but the newest snapshot MUST be sent within 2 seconds of its commit, and a peer is never required to send more than one snapshot per second. Status silence or staleness is grounds for bounded rescheduling and deprioritization, never automatic misbehavior. Header-tip announcement inside a header-sync session is carried entirely by these status updates; full-block relay remains on the paths in LC-WIRE-16.
 
-**LC-WIRE-03 [ZW] — Locator construction.** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13. A continuation of an incomplete response instead uses the continuation locator defined in section 5.2, whose first entry is the returned suffix tip; every fresh target pursuit MUST use the locator above.
+**LC-WIRE-03 [ZW] — Locator construction.** The requester MUST build its locator from the current local selected tip, then ancestors at offsets `1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000`, and finally `finalized`; it MUST preserve that order, deduplicate hashes, and cap the list at 13. A subscription continues under renewed credit without a new locator. A round that resumes a subscription after admitting a bounded prefix uses a continuation locator whose first entry is the accepted cursor. Every fresh target pursuit MUST use the locator above.
 
 **LC-WIRE-04 [ZW] — Advertised-target scheduling.** `target_tip_hash` MUST come from the status snapshot being pursued. The requester MUST enforce the per-peer and global staged-target limits in LC-RETAIN-04. A newer status MAY supersede an older unstarted target from that peer.
 
@@ -531,29 +544,29 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 ### 5.3 Server snapshot contract
 
-**LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST resolve the exact target hash from the retained graph or canonical finalized indexes. It MUST select the highest locator ancestor on that target’s chain. It MUST serve only the contiguous path after that ancestor through the target. A locator at the target yields an empty, complete response. The server MUST apply these rules through one path-acquisition operation and one response cursor across the finalized boundary.
+**LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST resolve the exact target hash from the retained graph or canonical finalized indexes. It MUST select the highest locator ancestor on that target’s chain. It MUST serve only the contiguous path after that ancestor through the target. A locator at the target reaches the target at `Open`, so the server sends no path page. The server MUST apply these rules through one path-acquisition operation and one response cursor across the finalized boundary.
 
-The server MUST reserve serving capacity for bounded paths regardless of target storage. Ordinary transfers MUST NOT consume that reserve. A reserved lease admits at most 4,000 headers. Each header requires at most 2,048 encoded bytes, including the largest supported metadata and a complete response frame. The header cap therefore keeps the total response below 8 MiB; the byte allowance is not a separate admission check. An empty path requires one frame allowance. The wire codec tests MUST verify this allowance for each supported header format and auxiliary schema. Admission MUST reserve capacity before it takes the state writer or transition-engine lock. A reserved lease MUST stop its ancestry walk at 4,000 headers. A continuation MUST NOT extend the range that its admitted capacity class permits.
+The server MUST reserve serving capacity for bounded paths regardless of target storage. Ordinary transfers MUST NOT consume that reserve. A reserved lease admits at most 4,000 headers. Each header requires at most 2,048 encoded bytes, including the largest supported metadata and a complete response frame. The header cap therefore keeps the total response below 8 MiB; the byte allowance is not a separate admission check. The wire codec tests MUST verify this allowance for each supported header format and auxiliary schema. Admission MUST reserve capacity before it takes the state writer or transition-engine lock. A reserved lease MUST stop its ancestry walk at 4,000 headers. Each page acquires its own lease, and no page may extend the range that its admitted capacity class permits.
 
-**LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path. A local generation or finality advance alone MUST NOT cancel acquisition or serving of an unchanged exact path. Serving leases MUST NOT prevent local retention from evicting peer-requested forks to admit better-work branches. Retained ancestry lookup MUST run outside the state writer and transition-engine locks against a coherent snapshot, stop at the nearest locator ancestor, and recheck target availability when installing the serving cursor. Pruning MAY make an uncaptured page unavailable, but MUST NOT invalidate a page snapshot already captured. Page reads MUST use a coherent bounded snapshot without requiring an unchanged global state version. State MUST consume the serving lease before returning each successful page, including incomplete pages. A delayed release of that lease MUST NOT revoke a later acquisition. A continuation MUST reacquire the requested target by hash and MUST NOT reserve capacity between requests. State MAY reuse a completed page's immutable path index only for the same session, target, and next locator, after rechecking target availability and acquiring fresh ownership. This cache MUST hold at most 16 indexes, each bounded by the retained node limit, and MUST NOT hold disk snapshots or retention roots. Cache pressure MUST evict an idle index rather than refuse serving capacity. Reserved-capacity bounds and locator selection still apply. Session, lease, request, cursor, expiry, and capacity checks still apply. Finalized auxiliary records looked up by height MUST match the served path by hash before attachment.
+**LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more pages or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path. A local generation or finality advance alone MUST NOT cancel acquisition or serving of an unchanged exact path. Serving leases MUST NOT prevent local retention from evicting peer-requested forks to admit better-work branches. Retained ancestry lookup MUST run outside the state writer and transition-engine locks against a coherent snapshot, stop at the nearest locator ancestor, and recheck target availability when installing the serving cursor. Pruning MAY make an uncaptured page unavailable, but MUST NOT invalidate a page snapshot already captured. Page reads MUST use a coherent bounded snapshot without requiring an unchanged global state version. State MUST consume the serving lease before returning each successful page, including incomplete pages. A delayed release of that lease MUST NOT revoke a later acquisition. Each later page MUST reacquire the target by hash and MUST NOT reserve capacity between pages. State MAY reuse a completed page's immutable path index only for the same session, target, and next locator, after rechecking target availability and acquiring fresh ownership. This cache MUST hold at most 16 indexes, each bounded by the retained node limit, and MUST NOT hold disk snapshots or retention roots. Cache pressure MUST evict an idle index rather than refuse serving capacity. Reserved-capacity bounds and locator selection still apply. Session, lease, request, cursor, expiry, and capacity checks still apply. Finalized auxiliary records looked up by height MUST match the served path by hash before attachment.
 
-**LC-WIRE-07 [ZW] — Explicit response outcomes.** If the target is not retained, no locator intersects, required history was pruned, or resources are temporarily unavailable, the server MUST return the corresponding explicit outcome and no partial ambiguous success.
+**LC-WIRE-07 [ZW] — Explicit response outcomes.** If the target is not retained or no longer selected, no locator intersects, or required history was pruned, the server MUST return the corresponding explicit outcome in its window and no partial ambiguous success. Temporary resource exhaustion MUST pause page production rather than end the subscription.
 
 ### 5.4 Requester validation and discovery
 
-**LC-WIRE-08 [ZW] — Correlated response validation.** The requester MUST correlate request and target, verify that the returned common ancestor was in the exact sent locator, verify its local height/hash, validate every parent link and header rule, and require a completed sequence to end at the requested target hash.
+**LC-WIRE-08 [ZW] — Correlated response validation.** The requester MUST correlate subscription and target, verify that the first page's common ancestor was in the exact sent locator, verify its local height/hash, validate every parent link and header rule, and require `reaches_initial_target` exactly on the page that ends at the initial target hash. It MUST acknowledge a cursor only after state admits the headers through it.
 
-**LC-WIRE-09 [ZW] — Continuation target integrity.** Continuations MUST remain bound to the same target. The requester MUST NOT count advertised target work, unvalidated partial work, or a claimed common-ancestor height in fork choice.
+**LC-WIRE-09 [ZW] — Continuation target integrity.** Every page of a subscription MUST remain bound to its initial target. The requester MUST NOT count advertised target work, unvalidated partial work, or a claimed common-ancestor height in fork choice.
 
-**LC-WIRE-10 [ZW] — Non-punitive retry outcomes.** `TargetNotRetained`, `HistoryPruned`, and `Busy` MUST cause bounded status refresh/rescheduling without peer punishment. `NoLocatorIntersection` is non-punitive unless the response contradicts a locator membership fact cryptographically known from the same peer snapshot.
+**LC-WIRE-10 [ZW] — Non-punitive retry outcomes.** `TargetNotRetained`, `HistoryPruned`, `TargetNotSelected`, `SubscriptionSuperseded`, and `SubscriptionClosed` MUST cause bounded status refresh/rescheduling without peer punishment. `NoLocatorIntersection` is non-punitive unless the response contradicts a locator membership fact cryptographically known from the same peer snapshot.
 
-**LC-WIRE-11 [ZW] — Peer-attributable violations.** Unsolicited/mismatched request IDs, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
+**LC-WIRE-11 [ZW] — Peer-attributable violations.** Unsolicited/mismatched subscription IDs, a page or outcome outside its credit or window, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
 
 **LC-WIRE-12 [ZW] — Unknown-fork discovery.** For targets advertised above the local finalized height, a same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Ordinary discovery MUST skip targets advertised at or below the local finalized height. This scheduling restriction MUST NOT apply to explicitly selected historical auxiliary repair. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target advertised above local finality remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
 
 ### 5.5 Peers without this protocol
 
-A peer that does not offer stream version 8 has no header-sync relationship with this node. There is no compatibility codec, no height-range predecessor path, and no legacy Zcash `getheaders` fallback (LC-SCOPE-09). Such a peer is not scored, not probed for headers, and not counted as a header supplier; it may still participate in every other Zakura or legacy Zcash facility, none of which this engine changes. Fork connectivity that cannot be established through this protocol is a discovery limitation to be solved with more header-sync peers, never by manufacturing connectivity through a weaker exchange.
+A peer that does not offer stream version 9 has no header-sync relationship with this node. There is no compatibility codec, no height-range predecessor path, and no legacy Zcash `getheaders` fallback (LC-SCOPE-09). Such a peer is not scored, not probed for headers, and not counted as a header supplier; it may still participate in every other Zakura or legacy Zcash facility, none of which this engine changes. Fork connectivity that cannot be established through this protocol is a discovery limitation to be solved with more header-sync peers, never by manufacturing connectivity through a weaker exchange.
 
 ## 6. Consensus parity and intentional limits
 
@@ -630,12 +643,12 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 
 - **PW-01 `codec_and_fuzz`:** every message/outcome, exact integer/hash encoding including 32-byte little-endian work, zero IDs, booleans, bounds, trailing bytes, oversized payloads, vector lengths, rejection of every discriminant outside 1–4 (including a predecessor `NewBlock` payload), and mutation fuzzing.
 - **PW-02 `locator_vectors`:** tips from heights 0 through 2,000, exact exponential offsets, 1,000 offset, final anchor, deduplication, order, and 13-entry cap.
-- **PW-03 `target_snapshot_and_continuation`:** target changes during serve, selection changes during serve, count/byte continuations, same target across pages, exact completed tip, and no silent substitution.
-- **PW-04 `outcomes_and_attribution`:** all four explicit outcomes, stale refresh, busy status wait, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
+- **PW-03 `target_snapshot_and_continuation`:** target changes during serve, selection changes during serve, credit renewal across pages, same target across pages, exact completed tip, and no silent substitution.
+- **PW-04 `outcomes_and_attribution`:** every explicit outcome and its window, stale refresh, unselected-target status wait, malformed ancestor, mismatched target/ID, invalid header, and score/no-score assertions.
 - **PW-05 `multipeer_fork_discovery`:** shorter-higher-work, longer-lower-work, same-height equal-work, same-height greater-work, unknown fork, same-height status trigger, stable equal-work selection, and greater-work convergence across insertion orders.
 - **PW-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
 - **PW-07 `status_propagation`:** initial status immediately after the stream opens, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
-- **PW-08 `single_protocol_surface`:** a peer without stream version 8 is given no header-sync stream and no score; no compatibility, predecessor, or legacy `getheaders` code path exists in the header-sync module tree or its public API; and the legacy Zcash P2P message handlers are byte-identical to their pre-engine behavior.
+- **PW-08 `single_protocol_surface`:** a peer without stream version 9 is given no header-sync stream and no score; no compatibility, predecessor, or legacy `getheaders` code path exists in the header-sync module tree or its public API; and the legacy Zcash P2P message handlers are byte-identical to their pre-engine behavior.
 - **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance and work before a full-state finalization event. With no durable header preference, missing receipt metadata, and no operator preference, selected tips MUST agree by raw hash. With receipt metadata or an operator preference, equal-work tips may differ and the atomic verified frontier MUST follow full state.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
 

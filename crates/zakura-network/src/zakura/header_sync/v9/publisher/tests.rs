@@ -35,6 +35,8 @@ use crate::zakura::{
     Credit, FramedRecv, ZakuraPeerId,
 };
 
+mod load;
+
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
 
@@ -244,7 +246,7 @@ impl Store {
 }
 
 /// A port over a [`Store`], with a selected chain the test moves.
-struct FakePort {
+pub(crate) struct FakePort {
     key: AdapterKey,
     store: Mutex<Store>,
     genesis: Frontier,
@@ -260,7 +262,7 @@ struct FakePort {
 impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
-    fn new(gate: usize) -> Arc<Self> {
+    pub(crate) fn new(gate: usize) -> Arc<Self> {
         let store = Store::default();
         let genesis = store.tree.genesis;
         Arc::new(Self {
@@ -300,7 +302,7 @@ impl FakePort {
     }
 
     /// Extend the selected chain by `count` headers and select the new tip.
-    fn grow(&self, count: u32) -> Vec<Frontier> {
+    pub(crate) fn grow(&self, count: u32) -> Vec<Frontier> {
         let added = self.store().tree.extend(self.tip(), count);
         if let Some(&tip) = added.last() {
             self.select(tip);
@@ -671,6 +673,23 @@ fn session(
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
+    session_advertising(port, capacity, peer, session_id, queue, limits())
+}
+
+/// [`session`], advertising `pages` instead of the default page limits.
+fn session_advertising(
+    port: &Arc<FakePort>,
+    capacity: &ServeCapacity,
+    peer: &ZakuraPeerId,
+    session_id: u64,
+    queue: usize,
+    pages: PageLimits,
+) -> (
+    Publisher,
+    FramedRecv,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
     let (send, recv) = framed_channel(queue);
     let cancel = CancellationToken::new();
     let (publisher, task) = Publisher::spawn::<HB>(
@@ -681,7 +700,7 @@ fn session(
             peer: SourceId::from_digest(peer.digest()),
             session_id,
         },
-        limits(),
+        pages,
         cancel.clone(),
     );
     (publisher, recv, cancel, task)
@@ -707,9 +726,15 @@ impl Publisher {
 impl Harness {
     /// A publisher over `port` with `serve` budgets.
     fn new(port: Arc<FakePort>, serve: ServeLimits) -> Self {
+        Self::advertising(port, serve, limits())
+    }
+
+    /// A publisher over `port` with `serve` budgets that advertises `pages`.
+    fn advertising(port: Arc<FakePort>, serve: ServeLimits, pages: PageLimits) -> Self {
         let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
             .expect("the test budgets are valid");
-        let (publisher, recv, cancel, _task) = session(&port, &capacity, &peer(7), 1, 64);
+        let (publisher, recv, cancel, _task) =
+            session_advertising(&port, &capacity, &peer(7), 1, 64, pages);
         Self {
             port,
             capacity,
@@ -2293,7 +2318,7 @@ async fn run(ops: Vec<Op>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256)))]
 
     /// Generated sessions follow every page, marker, window, credit, and
     /// ownership rule, and the publisher's ledger matches the mirror.
@@ -2309,9 +2334,10 @@ proptest! {
 }
 
 /// The real subscriber, on an in-process session.
-fn real_subscriber() -> super::super::subscriber::Subscriber<HB> {
+fn real_subscriber() -> super::super::subscriber::Subscriber {
     use crate::zakura::{regulation::WriterFence, CloseCause};
     super::super::subscriber::Subscriber::new(
+        HB,
         WriterFence::new(CancellationToken::new(), CloseCause::default()),
         &framed_channel(1).1,
     )
@@ -2330,7 +2356,7 @@ fn advertised(tip: Frontier) -> super::super::Status {
 /// validated and applying each due `Grant`.
 async fn follow(
     harness: &mut Harness,
-    subscriber: &mut super::super::subscriber::Subscriber<HB>,
+    subscriber: &mut super::super::subscriber::Subscriber,
     staging: u32,
 ) -> Vec<Received> {
     let mut received = Vec::new();

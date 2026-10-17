@@ -13,7 +13,7 @@ use zakura_header_chain::{
 };
 
 use super::super::{
-    AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
+    v9::Cursor, AuxSchema, HeaderEntry, HeaderSyncRequestId, Status, ZakuraPeerId, MAX_HS_RANGE,
 };
 
 /// Exact aggregate header count owned across receiving, preparation, and application.
@@ -169,21 +169,17 @@ impl HeaderCountReservation {
         self.0.remaining.load(AtomicOrdering::SeqCst)
     }
 
+    /// Move `owned` headers of this reservation into owned capacity. The rest
+    /// stays reserved for the pages that its credit still authorizes.
     fn consume(&self, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
-        let reserved = self.0.remaining.swap(0, AtomicOrdering::SeqCst);
-        if reserved == 0 || owned > reserved {
-            if reserved != 0 {
-                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
-            }
-            return Err(());
-        }
-        match self.0.budget.consume(reserved, owned) {
-            Ok(lease) => Ok(lease),
-            Err(()) => {
-                self.0.remaining.store(reserved, AtomicOrdering::SeqCst);
-                Err(())
-            }
-        }
+        let reserved = self.remaining();
+        let rest = reserved
+            .checked_sub(owned)
+            .filter(|_| reserved != 0)
+            .ok_or(())?;
+        let lease = self.0.budget.consume(owned, owned)?;
+        self.0.remaining.store(rest, AtomicOrdering::SeqCst);
+        Ok(lease)
     }
 }
 
@@ -268,7 +264,6 @@ impl AdvertisedHeaderTarget {
             // auxiliary repair uses its own explicitly selected target path.
             && self.status.selected_tip_height > local.frontiers.finalized.height
             && self.status.max_headers_per_response != 0
-            && self.status.max_inflight_requests != 0
             && self.status.max_message_bytes != 0
     }
 }
@@ -296,6 +291,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
+    /// The subscription cursor of the last staged page.
+    pub cursor: Option<Cursor>,
     /// Negotiated page bound before temporary credit limits.
     /// Each request reserves its count against current shared headroom.
     pub max_header_count: u32,
@@ -853,18 +850,22 @@ impl PeerWorkQueue {
         self.request_reservations.remove(peer);
     }
 
-    /// Transfer one response's consumed count into owned staged capacity.
+    /// Transfer one page's header count from its round's reservation into
+    /// owned staged capacity.
     pub(in crate::zakura::header_sync) fn consume_response_capacity(
         &mut self,
         peer: &ZakuraPeerId,
         returned: usize,
     ) -> bool {
-        let Some(reservation) = self.request_reservations.remove(peer) else {
+        let Some(reservation) = self.request_reservations.get(peer) else {
             return false;
         };
         let Ok(lease) = reservation.consume(returned) else {
             return false;
         };
+        if reservation.remaining() == 0 {
+            self.request_reservations.remove(peer);
+        }
         if let Some(lease) = lease {
             self.staged_capacity
                 .entry(peer.clone())
@@ -1020,7 +1021,7 @@ mod tests {
                 suffix_cumulative_work: U256::from(u32::from(marker)),
                 oldest_retained_height: block::Height(10),
                 max_headers_per_response: 1_000,
-                max_inflight_requests: 1,
+                max_subscriptions: 1,
                 max_message_bytes: 2_000_000,
                 tree_aux_schema_mask: 1,
             },
@@ -1056,6 +1057,7 @@ mod tests {
             common_ancestor: Some(local.frontiers.finalized),
             entries,
             phase: HeaderTargetPhase::Receiving,
+            cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         }
@@ -1187,6 +1189,7 @@ mod tests {
             common_ancestor: None,
             entries: Vec::new(),
             phase: HeaderTargetPhase::Receiving,
+            cursor: None,
             max_header_count: 1_000,
             tree_aux_schema: AuxSchema::None,
         };
@@ -1441,15 +1444,24 @@ mod tests {
         let returned = MAX_HEADER_CHUNK_RESERVATION_V1 / 2;
         let lease = reservation
             .consume(returned)
-            .expect("a partial response fits its reservation")
-            .expect("a nonempty response returns an owned lease");
+            .expect("a partial page fits its reservation")
+            .expect("a nonempty page returns an owned lease");
+        assert_eq!(
+            budget.usage(),
+            HeaderChunkUsage {
+                reserved: MAX_HEADER_CHUNK_RESERVATION_V1 - returned,
+                owned: returned,
+            },
+            "the rest stays reserved for the credit still outstanding"
+        );
+        drop(reservation);
         assert_eq!(
             budget.usage(),
             HeaderChunkUsage {
                 reserved: 0,
                 owned: returned,
             },
-            "unused response capacity is returned immediately"
+            "ending the round returns its unused capacity"
         );
         drop(lease);
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
@@ -1459,8 +1471,9 @@ mod tests {
             .expect("released capacity can be reserved again");
         assert!(empty
             .consume(0)
-            .expect("an empty response consumes its reservation")
+            .expect("an empty page fits its reservation")
             .is_none());
+        drop(empty);
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
     }
 

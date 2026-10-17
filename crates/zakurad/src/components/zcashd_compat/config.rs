@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Source selector for supervised `zcashd` execution.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Default)]

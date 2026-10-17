@@ -720,13 +720,12 @@ this release tolerates, and keep each hard change explicit.
   opaque extension area, signed with the body and kept verbatim, so a node
   verifies and relays a record whose extensions it doesn't understand. New
   record contents, new address kinds included, MUST go in that area as TLVs
-  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV. A
-  relayed record whose body doesn't decode MUST be skipped and counted in
-  `zakura.p2p.discovery.records.undecodable`, without failing the message or
-  penalizing the relaying peer. A framing error (a truncated record, an
-  oversize body length or a count over the cap) still fails the message.
-  The record format version in the signature pre-image changes only when the
-  fixed fields change, which is a hard break.
+  (`u16` type, `u16` length, value). A reader MUST ignore an unknown TLV.
+  Because new contents go only in that area, every record a conformant relay
+  sends decodes. A record whose body doesn't decode therefore fails its
+  message, as a framing error does. The record format version in the
+  signature pre-image changes only when the fixed fields change, which is a
+  hard break.
 - **COMPAT-11.** Control hello and ack fields are append-only. A later release
   appends fields after the ones this release knows and raises
   `control_version`. This release accepts a `control_version` at or above its

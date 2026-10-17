@@ -231,8 +231,8 @@ impl Requester {
     }
 
     /// Release a frame the transport admitted, when the routine takes it.
-    pub(super) fn take_admitted(&mut self, len: usize) {
-        self.reservations.take_admitted(len);
+    pub(super) fn take_admitted(&mut self, tag: u16, len: usize) {
+        self.reservations.take_admitted(tag, len);
     }
 
     /// Claim the hash computed from this frame's header before decoding its

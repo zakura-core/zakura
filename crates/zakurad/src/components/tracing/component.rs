@@ -9,8 +9,6 @@ use color_eyre::eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
 use tracing_error::ErrorLayer;
-#[cfg(all(feature = "tokio-console", tokio_unstable))]
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
@@ -149,9 +147,6 @@ impl Tracing {
             non_blocking(writer, config.buffer_limit.max(100)).map_err(io_error)?;
 
         // Construct a format subscriber with the supplied global logging filter.
-        //
-        // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
-        #[cfg(not(all(feature = "tokio-console", tokio_unstable)))]
         let subscriber = {
             use tracing_subscriber::FmtSubscriber;
 
@@ -169,45 +164,11 @@ impl Tracing {
                 .with(ErrorLayer::default())
         };
 
-        // Construct a tracing registry with the supplied per-layer logging filter.
-        //
-        // TODO: when fmt::Subscriber supports per-layer filtering,
-        //       remove this registry code, and layer tokio-console on top of fmt::Subscriber
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let subscriber = {
-            use tracing_subscriber::{fmt, Layer};
-
-            let subscriber = tracing_subscriber::registry();
-            // TODO: find out why crawl_and_dial and try_to_sync evade this filter,
-            //       and why they also don't get the global net/commit span.
-            // Note: this might have been fixed by tracing 0.3.15, or by recent Zebra refactors.
-            //
-            // Using `registry` as the base subscriber, the logs from most other functions get filtered.
-            // Using `FmtSubscriber` as the base subscriber, all the logs get filtered.
-            let logger = fmt::Layer::new()
-                .with_ansi(use_color)
-                .with_writer(non_blocking)
-                .with_filter(EnvFilter::from(&filter));
-
-            let subscriber = subscriber.with(logger);
-
-            let span_logger = ErrorLayer::default().with_filter(EnvFilter::from(&filter));
-            subscriber.with(span_logger)
-        };
-
         // Add optional layers based on dynamic and compile-time configs
 
         #[cfg(feature = "journald")]
         let journaldlayer = if config.use_journald {
             let layer = tracing_journald::layer().map_err(|e| eyre!("component error: {e}"))?;
-
-            // If the global filter can't be used, add a per-layer filter instead.
-            // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
-            #[cfg(all(feature = "tokio-console", tokio_unstable))]
-            let layer = {
-                use tracing_subscriber::Layer;
-                layer.with_filter(EnvFilter::from(&filter))
-            };
 
             Some(layer)
         } else {
@@ -254,11 +215,6 @@ impl Tracing {
         #[cfg(feature = "opentelemetry")]
         let subscriber = subscriber.with(otel_layer);
 
-        // spawn the console server in the background, and apply the console layer
-        // TODO: set Builder::poll_duration_histogram_max() if needed
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let subscriber = subscriber.with(console_subscriber::spawn());
-
         // Initialise the global tracing subscriber
         subscriber.init();
 
@@ -280,13 +236,6 @@ impl Tracing {
                 );
             }
         }
-
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        info!(
-            TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-            LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-            "installed tokio-console tracing layer",
-        );
 
         // Log OpenTelemetry status
         #[cfg(feature = "opentelemetry")]

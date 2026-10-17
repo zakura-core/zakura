@@ -729,7 +729,7 @@ impl Config {
 
                 Ok(())
             }
-            Err(error) => Err(error.error),
+            Err(error) => Err(error),
         }
     }
 

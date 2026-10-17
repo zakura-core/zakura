@@ -302,9 +302,10 @@ struct HeaderSyncReactor {
     /// Sessions whose subscription this node closed, with the deadline for
     /// its terminal outcome. See [`HeaderSyncReactor::close_subscription`].
     close_deadlines: HashMap<ZakuraPeerId, (u64, Instant)>,
-    /// Sessions whose `Close` a full queue refused, by session ID. Each
-    /// maintenance pass tries again until the `Close` is queued.
-    pending_closes: HashMap<ZakuraPeerId, u64>,
+    /// Sessions whose `Close` a full queue refused, with the session ID and
+    /// when to try again. The time moves only after an actual attempt, so
+    /// steady traffic cannot keep postponing the retry.
+    pending_closes: HashMap<ZakuraPeerId, (u64, Instant)>,
     /// What `HistoryPruned` taught the reactor about each peer. It outlives
     /// the peer's sessions, so reconnecting cannot reset its backoff, and
     /// maintenance drops entries once they no longer matter.
@@ -3435,7 +3436,7 @@ impl HeaderSyncReactor {
         self.refresh_vct_repair_stall(now);
         self.retire_timed_out_requests(now);
         self.pruned_peers.retain(|_, pruned| pruned.relevant(now));
-        self.retry_pending_closes();
+        self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);
         if self.prune_unproductive_cooldowns(now) {
             self.publish_peer_state();
@@ -3473,7 +3474,7 @@ impl HeaderSyncReactor {
             .into_iter()
             .chain(self.request_deadlines.values().copied())
             .chain(self.close_deadlines.values().map(|(_, deadline)| *deadline))
-            .chain((!self.pending_closes.is_empty()).then(|| Instant::now() + CLOSE_RETRY_INTERVAL))
+            .chain(self.pending_closes.values().map(|(_, retry_at)| *retry_at))
             .chain(
                 self.vct_repair
                     .current()
@@ -4632,7 +4633,17 @@ impl HeaderSyncReactor {
         let refused = matches!(state.session.try_close(), Err(OrderedSendError::Full));
         let live = state.session.subscriber().live().is_some();
         if refused {
-            self.pending_closes.insert(peer.clone(), session_id);
+            // A Close already waiting for this session keeps its retry time.
+            if self
+                .pending_closes
+                .get(peer)
+                .is_none_or(|(pending, _)| *pending != session_id)
+            {
+                self.pending_closes.insert(
+                    peer.clone(),
+                    (session_id, Instant::now() + CLOSE_RETRY_INTERVAL),
+                );
+            }
             return;
         }
         self.pending_closes.remove(peer);
@@ -4651,11 +4662,17 @@ impl HeaderSyncReactor {
         }
     }
 
-    /// Try again each `Close` that a full queue refused, while its session
-    /// lasts.
-    fn retry_pending_closes(&mut self) {
-        let pending: Vec<_> = self.pending_closes.drain().collect();
-        for (peer, session_id) in pending {
+    /// Try again each `Close` that a full queue refused and is due by `now`,
+    /// while its session lasts.
+    fn retry_pending_closes(&mut self, now: Instant) {
+        let due: Vec<_> = self
+            .pending_closes
+            .iter()
+            .filter(|(_, (_, retry_at))| *retry_at <= now)
+            .map(|(peer, (session_id, _))| (peer.clone(), *session_id))
+            .collect();
+        for (peer, session_id) in due {
+            self.pending_closes.remove(&peer);
             if self
                 .peer_state
                 .get(&peer)

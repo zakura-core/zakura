@@ -147,8 +147,9 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
 }
 
 /// A `Close` that the session's full queue refuses starts no deadline,
-/// because the publisher has nothing to answer. The next maintenance pass
-/// after the queue drains sends it and starts the deadline.
+/// because the publisher has nothing to answer. Its retry time stays fixed
+/// while other events arrive, and the retry after the queue drains sends it
+/// and starts the deadline.
 #[test]
 fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
     let (mut reactor, mut actions, snapshot) = fallback_reactor();
@@ -173,8 +174,17 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
     assert!(reactor.close_deadlines.is_empty(), "nothing was queued");
     assert!(reactor.pending_closes.contains_key(&peer));
 
+    let (_, retry_at) = reactor.pending_closes[&peer];
+    assert_eq!(reactor.next_maintenance_deadline(), retry_at);
+    reactor.handle_status(peer.clone(), 0, pruned_status(&snapshot, target));
+    assert_eq!(
+        reactor.next_maintenance_deadline(),
+        retry_at,
+        "another event does not postpone the retry"
+    );
+
     while outbound.try_recv().is_ok() {}
-    reactor.refresh_statuses();
+    reactor.retry_pending_closes(retry_at);
     assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
     assert!(reactor.close_deadlines.contains_key(&peer));
     assert!(reactor.pending_closes.is_empty());

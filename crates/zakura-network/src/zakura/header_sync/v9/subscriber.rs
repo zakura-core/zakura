@@ -133,6 +133,10 @@ pub(crate) enum SubscriberFault {
     /// before the subscription reached it.
     #[error("a page continues past the initial target")]
     PastTarget,
+    /// The page ends at the target at another height than its `Status`
+    /// advertised.
+    #[error("the page reaches the target at another height than advertised")]
+    TargetHeight,
     /// The target marker disagrees with whether the page ends at the target.
     #[error("the target marker disagrees with the page's last header")]
     Marker,
@@ -158,6 +162,7 @@ impl SubscriberFault {
             Self::Parent => "parent",
             Self::LowerLocator => "lower_locator",
             Self::PastTarget => "past_target",
+            Self::TargetHeight => "target_height",
             Self::Marker => "marker",
             Self::SecondMarker => "second_marker",
             Self::OutcomeWindow(_) => "outcome_window",
@@ -539,6 +544,9 @@ impl<const HEADER_BYTES: usize> Subscriber<HEADER_BYTES> {
             // that reaches that height elsewhere never reaches the target.
             if !reaches && height >= live.target_height.0 {
                 return Err(SubscriberFault::PastTarget);
+            }
+            if reaches && height != live.target_height.0 {
+                return Err(SubscriberFault::TargetHeight);
             }
             if page.reaches_initial_target != reaches {
                 return Err(SubscriberFault::Marker);

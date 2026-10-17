@@ -609,6 +609,28 @@ fn a_path_to_the_target_height_without_it_faults() {
         fixture.page(chain[5], &[chain[6], beside[0]], false),
         Err(SubscriberFault::PastTarget)
     );
+
+    // A `Status` that put the target one height off: the page that reaches
+    // the target at its real height faults.
+    for advertised in [6, 8] {
+        let (tree, chain) = self::chain(8);
+        let misplaced = Status {
+            selected_tip_height: block::Height(advertised),
+            ..status(chain[7])
+        };
+        let mut fixture = Fixture::open_with(
+            tree,
+            &misplaced,
+            &[chain[5], chain[0]],
+            AuxSchema::None,
+            100,
+        );
+        assert_eq!(
+            fixture.page(chain[5], &chain[6..8], true),
+            Err(SubscriberFault::TargetHeight),
+            "the target at height 7 where {advertised} was advertised"
+        );
+    }
 }
 
 /// A page must fit the header count and bytes of one `Status` the publisher

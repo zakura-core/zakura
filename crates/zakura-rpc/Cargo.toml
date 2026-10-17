@@ -113,8 +113,6 @@ zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
-# Only used to read the validity dates of the configured RPC TLS certificates.
-der = "0.7.10"
 
 [dev-dependencies]
 

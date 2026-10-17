@@ -14,7 +14,6 @@ use std::{
 
 use chrono::{TimeZone, Utc};
 use cookie::Cookie;
-use der::{asn1::GeneralizedTime, Decode, Header, Reader, SliceReader, Tag};
 use hyper::{
     body::{Body, Bytes, Incoming},
     server::conn::http1,
@@ -734,30 +733,25 @@ fn warn_if_certificates_are_not_current(cert_chain: &[CertificateDer<'static>], 
 fn certificate_validity(
     certificate: &CertificateDer<'_>,
     now: i64,
-) -> Result<CertificateValidity, der::Error> {
-    let mut reader = SliceReader::new(certificate.as_ref())?;
-    let (tag, certificate) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
+) -> Result<CertificateValidity, InvalidCertificateDer> {
+    let mut input = certificate.as_ref();
+    let mut certificate = read_der_value_with_tag(&mut input, DER_SEQUENCE)?;
+    let mut tbs_certificate = read_der_value_with_tag(&mut certificate, DER_SEQUENCE)?;
 
-    let mut reader = SliceReader::new(certificate)?;
-    let (tag, tbs_certificate) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
-
-    let mut reader = SliceReader::new(tbs_certificate)?;
-    if reader.peek_header()?.tag.is_context_specific() {
+    if tbs_certificate
+        .first()
+        .is_some_and(|&tag| tag & DER_CLASS_MASK == DER_CONTEXT_SPECIFIC_CLASS)
+    {
         // `version` is only encoded when it isn't the default.
-        read_der_value(&mut reader)?;
+        read_der_value(&mut tbs_certificate)?;
     }
-    read_der_value(&mut reader)?; // serialNumber
-    read_der_value(&mut reader)?; // signature
-    read_der_value(&mut reader)?; // issuer
+    read_der_value(&mut tbs_certificate)?; // serialNumber
+    read_der_value(&mut tbs_certificate)?; // signature
+    read_der_value(&mut tbs_certificate)?; // issuer
 
-    let (tag, validity) = read_der_value(&mut reader)?;
-    tag.assert_eq(Tag::Sequence)?;
-
-    let mut reader = SliceReader::new(validity)?;
-    let not_before = read_x509_time(&mut reader)?;
-    let not_after = read_x509_time(&mut reader)?;
+    let mut validity = read_der_value_with_tag(&mut tbs_certificate, DER_SEQUENCE)?;
+    let not_before = read_x509_time(&mut validity)?;
+    let not_after = read_x509_time(&mut validity)?;
 
     Ok(if now < not_before {
         CertificateValidity::NotYetValid { not_before }
@@ -768,54 +762,122 @@ fn certificate_validity(
     })
 }
 
-/// Reads the next DER tag-length-value item, returning its tag and the bytes of its value.
-fn read_der_value<'a>(reader: &mut SliceReader<'a>) -> Result<(Tag, &'a [u8]), der::Error> {
-    let header = Header::decode(reader)?;
-    let value = reader.read_slice(header.length)?;
+/// Why [`certificate_validity`] couldn't read a certificate's validity dates.
+#[derive(Debug, Eq, PartialEq)]
+struct InvalidCertificateDer(&'static str);
 
-    Ok((header.tag, value))
+/// The DER `SEQUENCE` tag, which is always constructed.
+const DER_SEQUENCE: u8 = 0x30;
+/// The DER `UTCTime` tag.
+const DER_UTC_TIME: u8 = 0x17;
+/// The DER `GeneralizedTime` tag.
+const DER_GENERALIZED_TIME: u8 = 0x18;
+/// The class bits of a DER tag.
+const DER_CLASS_MASK: u8 = 0xc0;
+/// The class bits of a context-specific DER tag.
+const DER_CONTEXT_SPECIFIC_CLASS: u8 = 0x80;
+/// The low tag bits that mark a multi-byte tag number.
+const DER_MULTI_BYTE_TAG: u8 = 0x1f;
+/// The length byte bit that marks a long-form length.
+const DER_LONG_FORM_LENGTH: u8 = 0x80;
+
+/// Reads the next DER tag-length-value item from the front of `input`,
+/// returning its tag and the bytes of its value.
+///
+/// Only accepts single-byte tags and minimal definite lengths of up to four bytes,
+/// which covers every field up to and including the certificate's validity.
+fn read_der_value<'a>(input: &mut &'a [u8]) -> Result<(u8, &'a [u8]), InvalidCertificateDer> {
+    let (&tag, rest) = input
+        .split_first()
+        .ok_or(InvalidCertificateDer("missing tag"))?;
+    if tag & DER_MULTI_BYTE_TAG == DER_MULTI_BYTE_TAG {
+        return Err(InvalidCertificateDer("unsupported multi-byte tag"));
+    }
+
+    let (&length_byte, mut rest) = rest
+        .split_first()
+        .ok_or(InvalidCertificateDer("missing length"))?;
+    let length = if length_byte & DER_LONG_FORM_LENGTH == 0 {
+        usize::from(length_byte)
+    } else {
+        // The low bits count the big-endian length bytes that follow.
+        // Zero is BER's indefinite length, which DER forbids.
+        let length_byte_count = usize::from(length_byte & !DER_LONG_FORM_LENGTH);
+        if !(1..=4).contains(&length_byte_count) {
+            return Err(InvalidCertificateDer("unsupported length encoding"));
+        }
+
+        let (length_bytes, after_length) = rest
+            .split_at_checked(length_byte_count)
+            .ok_or(InvalidCertificateDer("truncated length"))?;
+        rest = after_length;
+
+        // At most four bytes, so the length fits in a `u32`.
+        let length = length_bytes
+            .iter()
+            .fold(0_u32, |length, &byte| (length << 8) | u32::from(byte));
+        if length_bytes[0] == 0 || length < u32::from(DER_LONG_FORM_LENGTH) {
+            return Err(InvalidCertificateDer("non-minimal length"));
+        }
+
+        usize::try_from(length)
+            .map_err(|_| InvalidCertificateDer("length does not fit in memory"))?
+    };
+
+    let (value, rest) = rest
+        .split_at_checked(length)
+        .ok_or(InvalidCertificateDer("truncated value"))?;
+    *input = rest;
+
+    Ok((tag, value))
 }
 
-/// Reads an X.509 `Time` as Unix seconds.
+/// Reads the next DER item from the front of `input`, which must have the tag `expected_tag`,
+/// returning the bytes of its value.
+fn read_der_value_with_tag<'a>(
+    input: &mut &'a [u8],
+    expected_tag: u8,
+) -> Result<&'a [u8], InvalidCertificateDer> {
+    let (tag, value) = read_der_value(input)?;
+    if tag != expected_tag {
+        return Err(InvalidCertificateDer("unexpected tag"));
+    }
+
+    Ok(value)
+}
+
+/// Reads an X.509 `Time` as Unix seconds, including dates before the Unix epoch.
 ///
 /// RFC 5280 section 4.1.2.5 encodes years from 1950 through 2049 as
-/// `UTCTime`, and later years as `GeneralizedTime`.
-fn read_x509_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
-    match reader.peek_header()?.tag {
-        Tag::UtcTime => read_utc_time(reader),
-        Tag::GeneralizedTime => i64::try_from(
-            GeneralizedTime::decode(reader)?
-                .to_unix_duration()
-                .as_secs(),
-        )
-        .map_err(|_| Tag::GeneralizedTime.value_error()),
-        tag => Err(tag.value_error()),
-    }
-}
+/// `UTCTime` (`YYMMDDHHMMSSZ`), and later years as `GeneralizedTime` (`YYYYMMDDHHMMSSZ`).
+fn read_x509_time(input: &mut &[u8]) -> Result<i64, InvalidCertificateDer> {
+    let (tag, value) = read_der_value(input)?;
+    let invalid_time = || InvalidCertificateDer("invalid X.509 time");
+    let digits = value.strip_suffix(b"Z").ok_or_else(invalid_time)?;
 
-/// Reads an RFC 5280 `UTCTime`, including dates before the Unix epoch.
-///
-/// The [`der::asn1::UtcTime`] decoder only supports years from 1970 onward,
-/// while RFC 5280 requires support for the full 1950–2049 range.
-fn read_utc_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
-    let (tag, value) = read_der_value(reader)?;
-    tag.assert_eq(Tag::UtcTime)?;
-
-    let Some(digits) = value.strip_suffix(b"Z").filter(|digits| digits.len() == 12) else {
-        return Err(Tag::UtcTime.value_error());
+    let (year, digits) = match (tag, digits.len()) {
+        (DER_UTC_TIME, 12) => {
+            let short_year = i32::from(decode_two_digits_at(digits, 0)?);
+            let year = if short_year >= 50 {
+                1900 + short_year
+            } else {
+                2000 + short_year
+            };
+            (year, &digits[2..])
+        }
+        (DER_GENERALIZED_TIME, 14) => {
+            let century = i32::from(decode_two_digits_at(digits, 0)?);
+            let year_of_century = i32::from(decode_two_digits_at(digits, 2)?);
+            (century * 100 + year_of_century, &digits[4..])
+        }
+        _ => return Err(invalid_time()),
     };
 
-    let short_year = decode_two_digits_at(Tag::UtcTime, digits, 0)?;
-    let year = if short_year >= 50 {
-        1900 + i32::from(short_year)
-    } else {
-        2000 + i32::from(short_year)
-    };
-    let month = decode_two_digits_at(Tag::UtcTime, digits, 2)?;
-    let day = decode_two_digits_at(Tag::UtcTime, digits, 4)?;
-    let hour = decode_two_digits_at(Tag::UtcTime, digits, 6)?;
-    let minute = decode_two_digits_at(Tag::UtcTime, digits, 8)?;
-    let second = decode_two_digits_at(Tag::UtcTime, digits, 10)?;
+    let month = decode_two_digits_at(digits, 0)?;
+    let day = decode_two_digits_at(digits, 2)?;
+    let hour = decode_two_digits_at(digits, 4)?;
+    let minute = decode_two_digits_at(digits, 6)?;
+    let second = decode_two_digits_at(digits, 8)?;
 
     Utc.with_ymd_and_hms(
         year,
@@ -827,22 +889,16 @@ fn read_utc_time(reader: &mut SliceReader<'_>) -> Result<i64, der::Error> {
     )
     .single()
     .map(|date_time| date_time.timestamp())
-    .ok_or_else(|| Tag::UtcTime.value_error())
+    .ok_or_else(invalid_time)
 }
 
 /// Decodes two ASCII decimal digits at `offset`.
-fn decode_two_digits_at(tag: Tag, value: &[u8], offset: usize) -> Result<u8, der::Error> {
+fn decode_two_digits_at(value: &[u8], offset: usize) -> Result<u8, InvalidCertificateDer> {
     let Some(&[tens, ones]) = value.get(offset..offset.saturating_add(2)) else {
-        return Err(tag.value_error());
+        return Err(InvalidCertificateDer("missing time digits"));
     };
-
-    decode_two_digits(tag, tens, ones)
-}
-
-/// Decodes two validated ASCII decimal digits.
-fn decode_two_digits(tag: Tag, tens: u8, ones: u8) -> Result<u8, der::Error> {
     if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
-        return Err(tag.value_error());
+        return Err(InvalidCertificateDer("invalid time digits"));
     }
 
     // Each operand is at most 9, so the result fits in a `u8`.

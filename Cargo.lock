@@ -4339,7 +4339,6 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
- "der",
  "derive-new",
  "eyre",
  "futures",

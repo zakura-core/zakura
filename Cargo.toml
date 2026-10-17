@@ -54,6 +54,7 @@ zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
 zcash_primitives = { version = "=3.0.0", package = "zakura-primitives" }
 zcash_transparent = { version = "=3.0.0", package = "zakura-transparent" }
 zcash_protocol = { version = "=3.0.0", package = "zakura-protocol" }
+async-trait = "0.1.89"
 base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = { version = "=3.0.0", package = "zakura-bellman" }
@@ -91,9 +92,6 @@ idna_adapter = "~1.1.0"
 indexmap = "2.8"
 insta = "1.42"
 itertools = "0.14"
-jsonrpsee = "0.26.1"
-jsonrpsee-proc-macros = "0.26.1"
-jsonrpsee-types = "0.26.1"
 jubjub = { version = "=3.0.0", package = "zakura-jubjub" }
 lazy_static = "1.4"
 libc = "0.2"

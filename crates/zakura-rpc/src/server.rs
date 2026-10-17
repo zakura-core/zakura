@@ -20,17 +20,14 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::{
-    rt::{TokioIo, TokioTimer},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto,
     service::TowerToHyperService,
-};
-use jsonrpsee::server::{
-    middleware::rpc::RpcServiceBuilder, stop_channel, BatchRequestConfig, Server, ServerConfig,
-    ServerHandle, StopHandle,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{watch, Notify, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{timeout, timeout_at, Instant},
 };
@@ -48,24 +45,27 @@ use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
-    methods::{
-        rpc_method_access, RpcAccess, RpcImpl, RpcServer as _, RpcSurface, RPC_METHOD_ACCESS,
-    },
+    methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, RPC_METHOD_ACCESS},
     server::{
-        http_request_compatibility::HttpRequestMiddlewareLayer, rpc_batch::RpcBatchMiddleware,
-        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_logger::RpcLoggerMiddleware,
-        rpc_metrics::RpcMetricsMiddleware, rpc_tracing::RpcTracingMiddleware,
+        http::{HttpBody, JsonRpcHttpService},
+        http_request_compatibility::HttpRequestMiddlewareLayer,
+        rpc_call_compatibility::FixRpcResponseMiddleware,
+        rpc_logger::RpcLoggerMiddleware,
+        rpc_metrics::RpcMetricsMiddleware,
+        rpc_service::{RpcMethods, RpcService},
+        rpc_tracing::RpcTracingMiddleware,
     },
 };
 
 pub mod cookie;
 pub mod error;
+pub mod http;
 pub mod http_request_compatibility;
 pub mod jsonrpc;
-pub mod rpc_batch;
 pub mod rpc_call_compatibility;
 pub mod rpc_logger;
 pub mod rpc_metrics;
+pub mod rpc_service;
 pub mod rpc_tracing;
 
 #[cfg(test)]
@@ -133,10 +133,14 @@ const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum number of entries in a JSON-RPC batch, counting notifications and
 /// invalid entries.
 ///
-/// `jsonrpsee` decodes every entry of an admitted batch before running the first
+/// The server decodes every entry of an admitted batch before running the first
 /// one, and keeps them until the batch finishes. A larger batch is rejected after
 /// a shallow parse of the array, before any entry is decoded or run.
-const MAX_RPC_BATCH_REQUESTS: u32 = 1_000;
+const MAX_RPC_BATCH_REQUESTS: usize = 1_000;
+
+/// Time allowed for a plain HTTP client to send its first request, measured from
+/// TCP acceptance.
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of characters of each request or response payload in TRACE
 /// logs.
@@ -252,8 +256,7 @@ impl RpcServer {
             .expect("caller should make sure listen_addr is set");
 
         let rpc = rpc.with_rpc_surface(surface);
-        let mut methods = rpc.into_rpc();
-        configure_rpc_methods(&mut methods, surface)?;
+        let enabled_methods = enabled_rpc_methods(registered_methods(&rpc), surface)?;
 
         // The largest RPC request is submitblock, which sends a full block
         // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
@@ -268,36 +271,26 @@ impl RpcServer {
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 
-        let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
-
-        let server_config = ServerConfig::builder()
-            .http_only()
-            .max_response_body_size(
-                conf.max_response_body_size
-                    .try_into()
-                    .expect("should be valid"),
-            )
-            .set_batch_request_config(BatchRequestConfig::Limit(MAX_RPC_BATCH_REQUESTS))
-            .build();
-
         let max_response_body_size = conf.max_response_body_size;
-        let rpc_middleware = RpcServiceBuilder::new()
-            .layer_fn(move |service| RpcBatchMiddleware::new(service, max_response_body_size))
-            .layer_fn(|service| RpcLoggerMiddleware::new(service, MAX_RPC_LOG_CHARS))
-            .layer_fn(FixRpcResponseMiddleware::new)
-            .layer_fn(RpcMetricsMiddleware::new)
-            .layer_fn(RpcTracingMiddleware::new);
+        let rpc_service = RpcLoggerMiddleware::new(
+            FixRpcResponseMiddleware::new(RpcMetricsMiddleware::new(RpcTracingMiddleware::new(
+                RpcService::new(rpc, enabled_methods, max_response_body_size),
+            ))),
+            MAX_RPC_LOG_CHARS,
+        );
+        let service = tower::ServiceBuilder::new()
+            .layer(http_middleware_layer)
+            .service(JsonRpcHttpService::new(
+                rpc_service,
+                MAX_RPC_BATCH_REQUESTS,
+                max_response_body_size,
+            ));
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;
             let listener = TcpListener::bind(listen_addr).await?;
             let local_addr = listener.local_addr()?;
             let acceptor = TlsAcceptor::from(tls_config);
-            let service_builder = Server::builder()
-                .set_config(server_config)
-                .set_http_middleware(http_middleware)
-                .set_rpc_middleware(rpc_middleware)
-                .to_service_builder();
             let (stop_handle, server_handle) = stop_channel();
 
             info!("{opened_endpoint_msg}{local_addr}");
@@ -312,9 +305,7 @@ impl RpcServer {
                     TLS_HANDSHAKE_TIMEOUT,
                     MAX_TLS_CONNECTIONS,
                     move |stream, remote_addr, stop_handle| {
-                        let service = service_builder
-                            .clone()
-                            .build(methods.clone(), stop_handle.clone());
+                        let service = service.clone();
                         async move {
                             if let Err(error) = serve_tls_connection(
                                 stream,
@@ -338,17 +329,11 @@ impl RpcServer {
             }));
         }
 
-        let server = Server::builder()
-            .set_config(server_config)
-            .set_http_middleware(http_middleware)
-            .set_rpc_middleware(rpc_middleware)
-            .build(listen_addr)
-            .await?;
-
-        info!("{opened_endpoint_msg}{}", server.local_addr()?);
+        let listener = TcpListener::bind(listen_addr).await?;
+        info!("{opened_endpoint_msg}{}", listener.local_addr()?);
 
         Ok(tokio::spawn(async move {
-            server.start(methods).stopped().await;
+            run_listener(listener, service).await;
             Ok(())
         }))
     }
@@ -407,6 +392,103 @@ impl RpcServer {
             Ok(()) => (),
             Err(panic_object) => panic::resume_unwind(panic_object),
         })
+    }
+}
+
+/// Stops a listener and its connections.
+#[derive(Clone, Debug)]
+struct ServerHandle(Arc<watch::Sender<()>>);
+
+impl ServerHandle {
+    /// Tells the listener and its connections to stop.
+    fn stop(&self) -> Result<(), watch::error::SendError<()>> {
+        self.0.send(())
+    }
+}
+
+/// Lets a listener and its connections know when to stop.
+#[derive(Clone, Debug)]
+struct StopHandle(watch::Receiver<()>);
+
+impl StopHandle {
+    /// Waits until [`ServerHandle::stop`] is called, or every [`ServerHandle`] is dropped.
+    async fn shutdown(mut self) {
+        let _ = self.0.changed().await;
+    }
+}
+
+/// Returns a connected [`StopHandle`] and [`ServerHandle`].
+fn stop_channel() -> (StopHandle, ServerHandle) {
+    let (sender, receiver) = watch::channel(());
+    (StopHandle(receiver), ServerHandle(Arc::new(sender)))
+}
+
+/// Accepts plain HTTP connections and serves each one in its own task, until the task running
+/// this future is aborted.
+///
+/// Connections are served with HTTP/1 or HTTP/2, and closed if they don't send a request within
+/// [`FIRST_REQUEST_TIMEOUT`].
+async fn run_listener<S>(listener: TcpListener, service: S)
+where
+    S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    loop {
+        let (socket, remote_addr) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                debug!(?error, "Error while awaiting a new RPC connection");
+                continue;
+            }
+        };
+
+        if let Err(error) = socket.set_nodelay(true) {
+            warn!(?error, %remote_addr, "Could not set NODELAY on RPC socket");
+            continue;
+        }
+
+        let request_received = Arc::new(Notify::new());
+        let service = {
+            let request_received = request_received.clone();
+            let service = service.clone();
+            tower::service_fn(move |request| {
+                request_received.notify_one();
+                tower::ServiceExt::oneshot(service.clone(), request)
+            })
+        };
+
+        tokio::spawn(async move {
+            let builder = auto::Builder::new(TokioExecutor::new());
+            let connection = builder.serve_connection_with_upgrades(
+                TokioIo::new(socket),
+                TowerToHyperService::new(service),
+            );
+
+            let result = tokio::select! {
+                result = connection => result,
+                () = no_request_within(&request_received, FIRST_REQUEST_TIMEOUT) => {
+                    Err("no request received in time".into())
+                }
+            };
+
+            if let Err(error) = result {
+                debug!(?error, %remote_addr, "RPC connection failed");
+            }
+        });
+    }
+}
+
+/// Returns after `timeout` if `request_received` isn't notified by then, or never returns
+/// otherwise.
+async fn no_request_within(request_received: &Notify, timeout_duration: Duration) {
+    if timeout(timeout_duration, request_received.notified())
+        .await
+        .is_ok()
+    {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -512,8 +594,8 @@ where
 /// Serves HTTP/1 requests on an established TLS connection until the client
 /// closes it, it exceeds `header_read_timeout`, or `stopped` resolves.
 ///
-/// This replaces jsonrpsee's `serve_with_graceful_shutdown`, which configures
-/// no timer, so hyper's header read timeout never applies.
+/// Unlike plain HTTP connections, these only support HTTP/1, and close
+/// connections whose request headers are too slow.
 async fn serve_tls_connection<S, B>(
     stream: TlsStream<TcpStream>,
     service: S,
@@ -541,16 +623,20 @@ where
     connection.await.map_err(Into::into)
 }
 
-/// Validates the RPC method classification and removes methods that are not
-/// available on restricted unauthenticated listeners.
-fn configure_rpc_methods<Context>(
-    methods: &mut jsonrpsee::RpcModule<Context>,
+/// Returns the names of every method in `methods`.
+fn registered_methods<M: RpcMethods>(_methods: &M) -> &'static [&'static str] {
+    M::METHOD_NAMES
+}
+
+/// Validates the RPC method classification against the `registered` methods, and returns the
+/// methods that are available on `surface`.
+///
+/// Restricted unauthenticated listeners only get the methods classified as unauthenticated.
+fn enabled_rpc_methods(
+    registered: &[&'static str],
     surface: RpcSurface,
-) -> Result<(), std::io::Error>
-where
-    Context: Send + Sync + 'static,
-{
-    let registered: BTreeSet<_> = methods.method_names().collect();
+) -> Result<Vec<&'static str>, std::io::Error> {
+    let registered: BTreeSet<_> = registered.iter().copied().collect();
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
 
     if classified.len() != RPC_METHOD_ACCESS.len() {
@@ -568,17 +654,13 @@ where
         )));
     }
 
-    if surface == RpcSurface::Restricted {
-        for method_name in registered {
-            if rpc_method_access(method_name) != Some(RpcAccess::Unauthenticated) {
-                methods
-                    .remove_method(method_name)
-                    .expect("method exists because it came from method_names");
-            }
-        }
-    }
-
-    Ok(())
+    Ok(registered
+        .into_iter()
+        .filter(|method_name| {
+            surface != RpcSurface::Restricted
+                || rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated)
+        })
+        .collect())
 }
 
 /// Selects the primary listener's method surface.

@@ -11,7 +11,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use crossbeam_channel::bounded;
+use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
 
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
@@ -263,7 +263,7 @@ impl ZakuraDb {
 
         // No state service can commit while this synchronous startup operation is running.
         let initial_finalized_tip_height = self.finalized_tip_height();
-        let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+        let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
         format_change
             .run_format_change_or_check(self, initial_finalized_tip_height, &never_cancel_receiver)
             .map_err(|source| StateInitError::DatabaseFormatUpgrade {
@@ -431,7 +431,7 @@ impl ZakuraDb {
             if let Some(disk_version) = disk_version {
                 // We need to keep the cancel handle until the format check has finished,
                 // because dropping it cancels the format check.
-                let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+                let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.

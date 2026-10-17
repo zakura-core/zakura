@@ -209,6 +209,31 @@ async fn a_following_frame_needs_its_request_started() {
     }
 }
 
+/// A following frame's claim holds the fence until its write finishes, so
+/// retirement in between closes the connection, even after the request's
+/// exchange ended. A finished write leaves the connection reusable.
+#[test]
+fn retirement_during_a_following_write_closes_the_connection() {
+    for written in [false, true] {
+        let (fence, connection, cause) = fence();
+        let mut exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        exchange.end();
+        let follow = FollowingWrite(writer);
+        assert!(follow.try_start());
+        if written {
+            follow.written();
+        }
+        assert_eq!(fence.retire(), written);
+        assert_eq!(connection.is_cancelled(), !written);
+        if !written {
+            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ExpectedExchange {
     generation: usize,

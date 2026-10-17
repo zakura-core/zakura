@@ -1,18 +1,21 @@
 //! The node-wide budget for native peers' transport credit.
 //!
-//! Each native QUIC connection can make this node hold
-//! [`zakura_quic::connection_memory_bytes`] in QUIC buffers (zakura-quic
-//! CTRL-26), from its handshake until `quinn-proto` drains it after close.
-//! Regulation pauses reads on purpose, so that credit is where backpressure
-//! lands, and QUIC can't take it back. The budget therefore funds
-//! `peer_memory_budget_bytes / connection_memory_bytes` QUIC connections.
+//! Each live native QUIC connection, from its handshake until it closes, can
+//! make this node hold [`zakura_quic::connection_memory_bytes`] in QUIC
+//! buffers (zakura-quic CTRL-26). Regulation pauses reads on purpose, so that
+//! credit is where backpressure lands, and QUIC can't take it back. Once a
+//! connection closes, the driver releases its stream buffers, and it holds at
+//! most [`zakura_quic::CLOSING_CONNECTION_MEMORY_BYTES`] until it drains
+//! (ADM-13).
 //!
-//! The transport caps those connections, admitted or not (zakura-quic
-//! ADM-12). `max_pending_handshakes` of them are headroom for handshakes not
-//! yet admitted, extra address attempts of one dial and closed connections
-//! still draining. The node admits the rest. Half the headroom is a dial
-//! reserve that inbound attempts can't take, so peers that churn inbound
-//! connections can't stop this node's own dials.
+//! Each live slot the budget funds also funds
+//! [`ZAKURA_CLOSING_CONNECTIONS_PER_LIVE`] closing slots. The transport caps
+//! live connections, admitted or not (ADM-12), and closing ones separately,
+//! so closed connections never take a live slot. `max_pending_handshakes` of
+//! the live slots are headroom for handshakes not yet admitted and extra
+//! address attempts of one dial. The node admits the rest. Half the headroom
+//! is a dial reserve that inbound attempts can't take, so peers that churn
+//! inbound connections can't stop this node's own dials.
 //!
 //! The budget lowers the connection count, never the windows, so every
 //! connection keeps the throughput that regulation sizing assumes (see
@@ -50,12 +53,30 @@ pub fn min_budgeted_connections(bootstrap_peer_count: usize) -> usize {
         .max(MIN_ZAKURA_BUDGETED_CONNECTIONS)
 }
 
-/// Connections the default budget admits at the default windows: 102 QUIC
-/// connections less 32 of handshake headroom, 70.
+/// Closing connections the budget funds for each live one (ADM-13).
+pub const ZAKURA_CLOSING_CONNECTIONS_PER_LIVE: usize = 2;
+
+/// Connections the default budget admits at the default windows: 102 live
+/// QUIC connections, each with two closing slots, less 32 of handshake
+/// headroom, 70.
 pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = max_connections_for_budget(
     DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
-    zakura_quic::connection_memory_bytes(DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW),
+    live_slot_bytes(zakura_quic::connection_memory_bytes(
+        DEFAULT_ZAKURA_RECEIVE_WINDOW,
+        DEFAULT_ZAKURA_SEND_WINDOW,
+    )),
 ) - DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES;
+
+/// Returns what the budget charges per live slot: a live connection of
+/// `connection_bytes` and its [`ZAKURA_CLOSING_CONNECTIONS_PER_LIVE`] closing
+/// slots.
+pub const fn live_slot_bytes(connection_bytes: u64) -> u64 {
+    // Widening usize to u64 is lossless on supported targets.
+    connection_bytes.saturating_add(
+        zakura_quic::CLOSING_CONNECTION_MEMORY_BYTES
+            .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE as u64),
+    )
+}
 
 /// Returns how many connections of `connection_bytes` each fit in
 /// `budget_bytes`, rounding down.
@@ -78,20 +99,22 @@ pub const fn max_connections_for_budget(budget_bytes: u64, connection_bytes: u64
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 #[error(
     "invalid [network.zakura] peer_memory_budget_bytes: {budget_bytes} bytes funds \
-     {funded} QUIC connections of {connection_bytes} bytes each (the \
+     {funded} live QUIC connections of {connection_bytes} bytes each (the \
      [network.zakura.quic] receive_window_bytes and send_window_bytes plus the \
-     connection's datagram queue), and {headroom} of them are max_pending_handshakes \
-     headroom, which admits {admitted}; raise peer_memory_budget_bytes or lower those \
-     windows or max_pending_handshakes so it admits at least {required}"
+     connection's datagram queue, and two closing slots), and {headroom} of them are \
+     max_pending_handshakes headroom, which admits {admitted}; raise \
+     peer_memory_budget_bytes or lower those windows or max_pending_handshakes so it \
+     admits at least {required}"
 )]
 pub struct PeerMemoryBudgetError {
     /// The configured budget.
     pub budget_bytes: u64,
-    /// Transport bytes one connection can hold at the configured windows.
+    /// What the budget charges per live slot at the configured windows (see
+    /// [`live_slot_bytes`]).
     pub connection_bytes: u64,
-    /// QUIC connections the budget funds.
+    /// Live QUIC connections the budget funds.
     pub funded: usize,
-    /// Funded connections kept for handshakes and draining connections.
+    /// Funded live connections kept for handshakes and dial attempts.
     pub headroom: usize,
     /// Connections the budget admits.
     pub admitted: usize,
@@ -100,8 +123,9 @@ pub struct PeerMemoryBudgetError {
 }
 
 /// Returns the connection cap after the budget: `max_connections`, lowered to
-/// what `budget_bytes` funds at `connection_bytes` each, less `headroom` for
-/// QUIC connections the node holds but hasn't admitted.
+/// the live slots `budget_bytes` funds for connections of `connection_bytes`
+/// (see [`live_slot_bytes`]), less `headroom` for QUIC connections the node
+/// holds but hasn't admitted.
 ///
 /// Fails when the budget admits fewer than [`min_budgeted_connections`] for
 /// `bootstrap_peer_count`, or fewer than `max_connections` when that is
@@ -114,6 +138,7 @@ pub fn budgeted_max_connections(
     headroom: usize,
 ) -> Result<usize, PeerMemoryBudgetError> {
     let max_connections = max_connections.max(1);
+    let connection_bytes = live_slot_bytes(connection_bytes);
     let funded = max_connections_for_budget(budget_bytes, connection_bytes);
     let admitted = funded.saturating_sub(headroom);
     let required = max_connections.min(min_budgeted_connections(bootstrap_peer_count));
@@ -151,9 +176,12 @@ mod tests {
             DEFAULT_ZAKURA_MAX_CONNECTIONS,
             DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
         );
-        // Every QUIC connection the transport may hold fits the budget.
+        // Every live QUIC connection the transport may hold, with its two
+        // closing slots, fits the budget.
         // Widening usize to u64 is lossless on supported targets.
         let held = DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES;
+        let connection_bytes = live_slot_bytes(connection_bytes);
+        assert_eq!(connection_bytes, 80 * MIB + 128 * 1024);
         let committed = held as u64 * connection_bytes;
         assert!(committed <= DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
         assert!(committed + connection_bytes > DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
@@ -249,7 +277,7 @@ mod tests {
 
         // 50 funded connections less 32 of headroom leave 18, below Mainnet's 19.
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: 50 * 80 * MIB,
+            peer_memory_budget_bytes: 50 * live_slot_bytes(80 * MIB),
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections().unwrap_err();
@@ -266,12 +294,12 @@ mod tests {
         let config = ZakuraConfig {
             max_connections: 2,
             max_pending_handshakes: 2,
-            peer_memory_budget_bytes: 4 * 80 * MIB,
+            peer_memory_budget_bytes: 4 * live_slot_bytes(80 * MIB),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(), Ok(2));
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: 4 * 80 * MIB - 1,
+            peer_memory_budget_bytes: 4 * live_slot_bytes(80 * MIB) - 1,
             ..config
         };
         assert_eq!(config.budgeted_max_connections().unwrap_err().required, 2);

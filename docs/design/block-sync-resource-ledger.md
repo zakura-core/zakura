@@ -21,10 +21,11 @@ it is sized to the throughput target, not below it.
 
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
 connection; the node admits at most `zakura.max_connections` = 70 of them. The transport holds
-at most 102 QUIC connections, admitted or not, until each drains (zakura-quic ADM-12): the most
-that `zakura.peer_memory_budget_bytes` = 8 GiB funds, with 32 of them headroom for handshakes
-and closing connections (CTRL-26). The QUIC rows count all 102; the application rows count the
-70 admitted peers.
+at most 102 live QUIC connections, admitted or not (zakura-quic ADM-12): the most that
+`zakura.peer_memory_budget_bytes` = 8 GiB funds, with 32 of them headroom for handshakes
+(CTRL-26). Closed connections release their stream buffers and drain in a separate allowance of
+204 at 64 KiB each (ADM-13). The QUIC rows count all 102 live connections; the application rows
+count the 70 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |

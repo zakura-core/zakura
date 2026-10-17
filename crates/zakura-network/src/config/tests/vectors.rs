@@ -874,19 +874,35 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 24159191040
+        peer_memory_budget_bytes = 24196939776
         "#,
     )
     .unwrap();
-    // 22.5 GiB funds 288 connections: 256 admitted and 32 of headroom.
+    // 288 live slots of 80 MiB, each with two 64 KiB closing slots: 256
+    // admitted and 32 of headroom.
     assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
 
     // The transport holds the admitted connections and the headroom, half of
-    // it kept for dials (zakura-quic ADM-12).
+    // it kept for dials (zakura-quic ADM-12), and two closing connections per
+    // live slot (ADM-13).
     let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
-    assert_eq!((bind.max_connections, bind.dial_reserve), (288, 16));
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (288, 16, 576)
+    );
     let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
-    assert_eq!((bind.max_connections, bind.dial_reserve), (102, 16));
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (102, 16, 204)
+    );
 
     // A 1 GiB receive window leaves the default budget room for 7 QUIC
     // connections, less than its headroom alone.

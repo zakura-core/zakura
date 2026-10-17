@@ -3135,11 +3135,13 @@ impl HeaderSyncReactor {
     }
 
     fn prune_vct_supplier_history(&mut self) {
+        // Every `Status` reaches this, so build the peer set only for a repair.
+        let Some(task) = self.vct_repair.current_mut() else {
+            return;
+        };
         let connected_sources: HashSet<_> =
             self.peer_state.keys().map(source_id_from_peer).collect();
-        if let Some(task) = self.vct_repair.current_mut() {
-            task.retain_connected_sources(&connected_sources);
-        }
+        task.retain_connected_sources(&connected_sources);
     }
 
     fn try_assign_vct_repair(&mut self) {

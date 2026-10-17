@@ -50,6 +50,13 @@ const VCT_LOCAL_OPERATION_FATAL_AFTER: std::time::Duration =
 /// The reactor emits the first row immediately, then samples while nothing changes. The bound
 /// keeps a long stalled repair from dominating the header-sync JSONL trace.
 const VCT_REPAIR_STALL_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The first wait after an ordinary round ends `HistoryPruned`. Each repeat
+/// before a success doubles it, up to [`PRUNED_BACKOFF_MAX`].
+const PRUNED_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The longest wait after repeated `HistoryPruned` rounds with one peer.
+const PRUNED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(16 * 60);
 /// Time one repair generation may stay stalled before the reactor reports it at error level.
 const VCT_REPAIR_STALL_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
@@ -208,6 +215,37 @@ struct PeerState {
     status_spent: bool,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
+    /// Set when an ordinary schema 1 round with this peer ended
+    /// `HistoryPruned`, because a pruned publisher lacks the records. Ordinary
+    /// rounds ask for no records until it expires, then probe schema 1 once.
+    /// An admitted schema 1 round clears it.
+    aux_fallback: Option<PrunedBackoff>,
+    /// Set when an ordinary round without records also ended
+    /// `HistoryPruned`. Ordinary discovery with this peer waits until it
+    /// expires or the selected header tip it names moves. An admitted round
+    /// clears it.
+    pruned_pause: Option<(PrunedBackoff, zakura_header_chain::Frontier)>,
+}
+
+/// A wait that doubles each time it is renewed, until a success clears it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrunedBackoff {
+    until: Instant,
+    delay: std::time::Duration,
+}
+
+impl PrunedBackoff {
+    /// The wait from `now` after `previous`: [`PRUNED_BACKOFF_MIN`] at first,
+    /// then twice the previous delay, at most [`PRUNED_BACKOFF_MAX`].
+    fn after(previous: Option<Self>, now: Instant) -> Self {
+        let delay = previous.map_or(PRUNED_BACKOFF_MIN, |previous| {
+            previous.delay.saturating_mul(2).min(PRUNED_BACKOFF_MAX)
+        });
+        Self {
+            until: now + delay,
+            delay,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -231,7 +269,8 @@ struct HeaderSyncReactor {
     /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
     ///
     /// Each entry represents one admitted session that survived
-    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts.
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts,
+    /// or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
@@ -857,6 +896,8 @@ impl HeaderSyncReactor {
                 last_status: None,
                 status_spent: false,
                 unproductive_requests: 0,
+                aux_fallback: None,
+                pruned_pause: None,
             },
         ) {
             previous.session.cancel_token().cancel();
@@ -1002,6 +1043,15 @@ impl HeaderSyncReactor {
         // A status too small for one header can never start a request.
         let eligible = target.is_discovery_eligible(local)
             && self.negotiated_response_limits(&target.status).1 != 0;
+        let pruned = self.pruned_pause_holds(&peer, local.frontiers.header_best);
+        if pruned {
+            // The same attempt would end `HistoryPruned` again, so another
+            // peer's status takes the target.
+            self.peer_work_queue.remove_unstarted(&peer);
+            self.spend_status(&peer);
+            metrics::counter!("sync.header.target.pruned_pause").increment(1);
+            return;
+        }
         if !eligible || covered {
             self.peer_work_queue.remove_unstarted(&peer);
             self.spend_status(&peer);
@@ -1188,22 +1238,72 @@ impl HeaderSyncReactor {
     }
 
     /// The schema for an ordinary round of up to `count` headers after `start`
-    /// from `status`'s sender: `schema` while the round ends at or below the
-    /// sender's work anchor, and no records past it.
+    /// from `peer`, whose status is `status`: `schema` while the round ends at
+    /// or below the peer's work anchor and no `HistoryPruned` fallback holds,
+    /// and no records otherwise.
     ///
     /// A publisher is sure to hold records only through its finalized height,
     /// and a schema 1 page waits for a missing record rather than dropping it,
-    /// so a round past the anchor could stall.
+    /// so a round past the anchor could stall. A pruned publisher lacks them
+    /// below its index height too, which the fallback learns.
     fn ordinary_schema(
+        &self,
+        peer: &ZakuraPeerId,
         schema: AuxSchema,
         status: &Status,
         start: block::Height,
         count: u32,
     ) -> AuxSchema {
-        if start.0.saturating_add(count) <= status.work_anchor_height.0 {
+        let fallback = self
+            .peer_state
+            .get(peer)
+            .and_then(|state| state.aux_fallback)
+            .is_some_and(|fallback| fallback.until > Instant::now());
+        if !fallback && start.0.saturating_add(count) <= status.work_anchor_height.0 {
             schema
         } else {
             AuxSchema::None
+        }
+    }
+
+    /// Whether ordinary discovery with `peer` still waits after a round
+    /// without records ended `HistoryPruned` at the selected header tip
+    /// `tip`.
+    fn pruned_pause_holds(&self, peer: &ZakuraPeerId, tip: zakura_header_chain::Frontier) -> bool {
+        self.peer_state
+            .get(peer)
+            .and_then(|state| state.pruned_pause)
+            .is_some_and(|(pause, paused_at)| pause.until > Instant::now() && paused_at == tip)
+    }
+
+    /// Remember that `peer` ended an ordinary round asking for `schema` with
+    /// `HistoryPruned`. This is legal and never a fault.
+    ///
+    /// After a schema 1 round, the peer's next rounds ask for no records,
+    /// starting at once from the validated tip, and schema 1 is probed again
+    /// after a backoff. After a round without records, ordinary discovery with
+    /// the peer pauses instead, so another peer takes the target.
+    fn note_history_pruned(&mut self, peer: &ZakuraPeerId, schema: AuxSchema) {
+        let now = Instant::now();
+        let tip = self
+            .committed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.frontiers.header_best);
+        let Some(state) = self.peer_state.get_mut(peer) else {
+            return;
+        };
+        match schema {
+            AuxSchema::V1 => {
+                state.aux_fallback = Some(PrunedBackoff::after(state.aux_fallback, now));
+                state.status_spent = false;
+                metrics::counter!("sync.header.target.aux_fallback").increment(1);
+            }
+            AuxSchema::None => {
+                if let Some(tip) = tip {
+                    let previous = state.pruned_pause.map(|(pause, _)| pause);
+                    state.pruned_pause = Some((PrunedBackoff::after(previous, now), tip));
+                }
+            }
         }
     }
 
@@ -1590,10 +1690,21 @@ impl HeaderSyncReactor {
         let Some(active) = self.peer_work_queue.active(&peer) else {
             return;
         };
-        if active.request_id.get() != ended.id
-            || active.owner.session_id() != session_id
-            || active.phase != HeaderTargetPhase::Receiving
+        if active.request_id.get() != ended.id || active.owner.session_id() != session_id {
+            return;
+        }
+        // Remember a pruned publisher even when the round already holds its
+        // pages, so the next round picks its schema from it.
+        if ended.outcome == HeadersOutcomeCode::HistoryPruned
+            && matches!(active.purpose, HeaderTargetPurpose::Normal)
         {
+            let schema = active.tree_aux_schema;
+            self.note_history_pruned(&peer, schema);
+        }
+        let Some(active) = self.peer_work_queue.active(&peer) else {
+            return;
+        };
+        if active.phase != HeaderTargetPhase::Receiving {
             return;
         }
         let is_repair = matches!(
@@ -1699,6 +1810,16 @@ impl HeaderSyncReactor {
                 if let (Some(cursor), Some(state)) = (active.cursor, self.peer_state.get(&peer)) {
                     if state.session.session_id() == owner.session_id() {
                         state.session.accept(active.request_id.get(), &cursor);
+                    }
+                }
+                // An admitted ordinary round ends the peer's `HistoryPruned`
+                // pause, and one with records ends its schema fallback.
+                if let (HeaderTargetPurpose::Normal, Some(state)) =
+                    (active.purpose, self.peer_state.get_mut(&peer))
+                {
+                    state.pruned_pause = None;
+                    if active.tree_aux_schema == AuxSchema::V1 {
+                        state.aux_fallback = None;
                     }
                 }
             }
@@ -2431,8 +2552,13 @@ impl HeaderSyncReactor {
                 zakura_header_chain::Frontier::new(accepted.height, accepted.hash);
             tip == target_tip_hash
                 && locator.entries().contains(&accepted_frontier)
-                && Self::ordinary_schema(schema, &target.status, accepted.height, max_header_count)
-                    == schema
+                && self.ordinary_schema(
+                    &peer,
+                    schema,
+                    &target.status,
+                    accepted.height,
+                    max_header_count,
+                ) == schema
         });
         if session.subscriber().live().is_some() && resumed.is_none() {
             // The next `Open` follows the live subscription's outcome.
@@ -2443,7 +2569,8 @@ impl HeaderSyncReactor {
         let tree_aux_schema = match resumed {
             Some((_, _, _, schema)) => schema,
             None => locator.entries().first().map_or(AuxSchema::None, |start| {
-                Self::ordinary_schema(
+                self.ordinary_schema(
+                    &peer,
                     negotiated_schema,
                     &target.status,
                     start.height,
@@ -4307,13 +4434,7 @@ impl HeaderSyncReactor {
         }
         state.session.cancel_token().cancel();
 
-        let cooldown = self.startup.config.unproductive_peer_cooldown;
-        if !cooldown.is_zero() {
-            let now = Instant::now();
-            let _ = self.prune_unproductive_cooldowns(now);
-            self.unproductive_peer_cooldowns
-                .insert(peer.clone(), now + cooldown);
-        }
+        self.start_readmission_cooldown(peer);
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         self.dispatch_action(HeaderPortOperation::DropPeer {
             peer: peer.clone(),
@@ -4321,6 +4442,17 @@ impl HeaderSyncReactor {
             reason,
         });
         self.handle_peer_disconnected(peer, session_id, reason);
+    }
+
+    /// Refuse `peer` header-sync readmission for the configured cooldown.
+    fn start_readmission_cooldown(&mut self, peer: &ZakuraPeerId) {
+        let cooldown = self.startup.config.unproductive_peer_cooldown;
+        if !cooldown.is_zero() {
+            let now = Instant::now();
+            let _ = self.prune_unproductive_cooldowns(now);
+            self.unproductive_peer_cooldowns
+                .insert(peer.clone(), now + cooldown);
+        }
     }
 
     fn prune_unproductive_cooldowns(&mut self, now: Instant) -> bool {
@@ -4490,7 +4622,9 @@ impl HeaderSyncReactor {
 
     /// Record `peer`'s violation. A fault in `owner`'s work also disconnects
     /// the session that did that work, while it is still current, and its
-    /// subscription never acknowledges the failed cursor.
+    /// subscription never acknowledges the failed cursor. The peer then waits
+    /// out the readmission cooldown, so it cannot reconnect and restage the
+    /// same branch at once.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
@@ -4532,6 +4666,9 @@ impl HeaderSyncReactor {
                 .into(),
             );
         });
+        if faulted.is_some() {
+            self.start_readmission_cooldown(&peer);
+        }
         let _ = self.dispatch_action(HeaderPortOperation::Misbehavior { peer, reason });
     }
 }

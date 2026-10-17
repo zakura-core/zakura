@@ -194,9 +194,10 @@ type FailureFixture = fn(
 ) -> Arc<zakura_header_chain::HeaderChainError>;
 
 /// An invalid header from preparation or admission disconnects the session
-/// that sent it, and its subscription never acknowledges its cursor. A local
-/// or stale failure keeps the connection, and so does a fault in the work of
-/// a session that a replacement superseded.
+/// that sent it and holds back the peer's readmission, and its subscription
+/// never acknowledges its cursor. A local or stale failure keeps the
+/// connection, and so does a fault in the work of a session that a
+/// replacement superseded.
 #[test]
 fn header_peer_faults_disconnect_only_the_sending_session() {
     let cases: [(FailureFixture, bool); 3] = [
@@ -239,13 +240,17 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
             let failure = failure(source, owner);
             if phase == HeaderTargetPhase::Preparing {
                 let failed = HeaderTargetPreparationResult::Failed(failure);
-                reactor.handle_header_target_prepared(peer, source, owner, failed);
+                reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
             } else {
                 let failed = HeaderTargetAdmissionResult::Failed(failure);
-                reactor.handle_header_target_admission_ready(peer, source, owner, failed);
+                reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);
             }
 
             assert_eq!(connection.is_cancelled(), faulted);
+            assert_eq!(
+                reactor.unproductive_peer_cooldowns.contains_key(&peer),
+                faulted
+            );
             if !faulted {
                 assert!(
                     actions.try_recv().is_err(),
@@ -273,8 +278,9 @@ fn header_peer_faults_disconnect_only_the_sending_session() {
     let (_replacement, _outbound, connection, _) =
         connect(&mut reactor, &peer, owner.session_id() + 1);
     let failure = invalid_header_failure(source, owner);
-    reactor.handle_typed_failure(peer, source, Some(owner), &failure);
+    reactor.handle_typed_failure(peer.clone(), source, Some(owner), &failure);
     assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+    assert!(!reactor.unproductive_peer_cooldowns.contains_key(&peer));
     assert!(
         !connection.is_cancelled(),
         "the replacement stays connected"

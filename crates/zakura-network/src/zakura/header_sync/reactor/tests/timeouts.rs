@@ -2442,3 +2442,60 @@ async fn disconnected_preparation_retains_capacity_until_completion() {
     reactor.handle_port_completion(completion);
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
 }
+
+/// Repair ignores a peer's ordinary `HistoryPruned` fallback: each supplier's
+/// repair still asks for schema 1, and `HistoryPruned` rotates the repair to
+/// the next supplier without touching the ordinary fallback.
+#[test]
+fn repair_keeps_schema_one_and_rotates_after_history_pruned() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
+    let fallback = PrunedBackoff::after(None, Instant::now());
+    for peer in &peers {
+        fixture
+            .reactor
+            .peer_state
+            .get_mut(peer)
+            .expect("the supplier is connected")
+            .aux_fallback = Some(fallback);
+    }
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+
+    for peer in &peers {
+        let active = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the next round-robin supplier owns the repair")
+            .clone();
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        assert_eq!(
+            active.tree_aux_schema,
+            AuxSchema::V1,
+            "repair needs every record whatever the ordinary fallback"
+        );
+        fixture.reactor.deliver_outcome(
+            peer.clone(),
+            active.owner.session_id(),
+            HeadersOutcome {
+                subscription_id: active.request_id.get(),
+                initial_target_tip_hash: fixture.target.hash,
+                outcome: HeadersOutcomeCode::HistoryPruned,
+            },
+        );
+        let state = &fixture.reactor.peer_state[peer];
+        assert_eq!(state.aux_fallback, Some(fallback));
+        assert!(state.pruned_pause.is_none());
+        assert_eq!(state.unproductive_requests, 0);
+    }
+    let task = fixture
+        .reactor
+        .vct_repair
+        .current()
+        .expect("the repair requirement remains");
+    assert_eq!(task.tried_sources.len(), 2, "each supplier had its turn");
+}

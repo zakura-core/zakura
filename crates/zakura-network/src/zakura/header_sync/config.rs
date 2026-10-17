@@ -29,7 +29,8 @@ pub struct ZakuraHeaderSyncConfig {
     /// Do not charge a peer that reports the selected tip.
     /// Set this value to `0` to keep all peers.
     pub max_unproductive_header_requests: u32,
-    /// How long the node refuses header-sync readmission to an unproductive peer.
+    /// How long the node refuses header-sync readmission to an unproductive peer,
+    /// or to a peer it disconnected for headers that failed validation.
     ///
     /// Discovery applies dial backoff only after a failed dial.
     /// The cooldown prevents an immediate redial after a successful dial ends in eviction.

@@ -30,11 +30,11 @@ use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
     handle_pipe_exit,
     regulation::{
-        CadenceSendError, CadenceSender, Current, Replacement, SessionKey, SessionTable,
-        WriterFence,
+        CadenceSendError, CadenceSender, Current, ExchangeWriter, Replacement, SessionKey,
+        SessionTable, WriterFence,
     },
     spawn_supervised_pipe,
-    transport::{FrameGuard, GuardedFrameSlot, GuardedReserveError},
+    transport::{GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
     BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
@@ -72,6 +72,66 @@ mod stream_tests {
     }
 }
 
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::zakura::{framed_channel, header_sync::v9, wire_codec::decode_frame};
+    use zakura_chain::block;
+
+    /// A `Close` queued behind an `Open` follows it: retiring the session's
+    /// fence before the `Open`'s first byte skips both, and otherwise both go
+    /// out in order.
+    #[tokio::test]
+    async fn updates_queued_behind_a_skipped_open_are_skipped_too() {
+        let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
+        let target = Frontier::new(block::Height(5), block::Hash([2; 32]));
+        let status = v9::test_support::status::<REGTEST_HEADER_BYTES>(target);
+        for retire in [false, true] {
+            let connection = CancellationToken::new();
+            let close_cause = CloseCause::new();
+            let fence = WriterFence::new(connection.clone(), close_cause.clone());
+            let (send, mut outbound) = framed_channel(8);
+            let subscriber =
+                Subscriber::new(REGTEST_HEADER_BYTES, fence.clone(), &framed_channel(1).1);
+            let session = PeerSession::new(
+                ZakuraPeerId::new(vec![0x71; 32]).expect("the peer ID has 32 bytes"),
+                1,
+                ServicePeerDirection::Outbound,
+                send,
+                CancellationToken::new(),
+                connection.clone(),
+                close_cause,
+                subscriber,
+                Arc::new(StdMutex::new(CadenceSender::new())),
+            );
+            session
+                .try_open(&status, &[genesis], AuxSchema::None, 4)
+                .expect("the Open is queued");
+            assert!(
+                session.try_close().expect("the queue has room"),
+                "the Close is queued"
+            );
+
+            if retire {
+                assert!(fence.retire());
+                drop(session);
+                assert_eq!(outbound.recv().await, None, "both updates are skipped");
+            } else {
+                for operation in [v9::Operation::Open, v9::Operation::Close] {
+                    let frame = outbound.recv().await.expect("the update is written");
+                    let Ok(v9::Message::SubscribeHeaders(update)) =
+                        decode_frame::<v9::RegtestMessage>(&frame)
+                    else {
+                        panic!("the frame is a subscription update");
+                    };
+                    assert_eq!(update.operation, operation);
+                }
+            }
+            assert!(!connection.is_cancelled());
+        }
+    }
+}
+
 /// Cloneable typed sender for one canonical header-sync stream.
 #[derive(Clone, Debug)]
 pub struct PeerSession {
@@ -91,6 +151,9 @@ struct PeerSessionInner {
     /// retiring the session cannot orphan a subscription the peer still
     /// serves.
     subscriber: StdMutex<Subscriber>,
+    /// The writer of the last `Open` this session queued. Each later `Grant`
+    /// and `Close` follows it, so retirement that skips the `Open` skips them.
+    open_writer: StdMutex<Option<ExchangeWriter>>,
     /// The connection's `Status` cadence.
     status: StatusCadence,
 }
@@ -125,6 +188,7 @@ impl PeerSession {
                 connection_cancel_token,
                 close_cause,
                 subscriber: StdMutex::new(subscriber),
+                open_writer: StdMutex::new(None),
                 status,
             }),
         }
@@ -323,6 +387,7 @@ impl PeerSession {
             subscriber.retract(id);
             return Err(OrderedSendError::Closed);
         }
+        *self.open_writer() = Some(writer);
         Ok(HeaderSyncRequestId::new(id).expect("subscription IDs are nonzero"))
     }
 
@@ -330,14 +395,15 @@ impl PeerSession {
     /// headers, and queue it, if one is due. Returns whether it queued one.
     pub(super) fn try_grant(&self, staging: u32) -> Result<bool, OrderedSendError> {
         let slot = self.reserve()?;
+        let Some(writer) = self.open_writer().clone() else {
+            return Ok(false);
+        };
         let mut subscriber = self.subscriber();
         let Some(update) = subscriber.grant_due(staging) else {
             return Ok(false);
         };
-        slot.send(
-            update_frame(subscriber.header_bytes(), update),
-            FrameGuard::new(Arc::new(())),
-        );
+        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
+            .map_err(|_| OrderedSendError::Closed)?;
         Ok(true)
     }
 
@@ -346,15 +412,24 @@ impl PeerSession {
     /// granted credit still arrive until the terminal outcome.
     pub(super) fn try_close(&self) -> Result<bool, OrderedSendError> {
         let slot = self.reserve()?;
+        let Some(writer) = self.open_writer().clone() else {
+            return Ok(false);
+        };
         let mut subscriber = self.subscriber();
         let Ok(update) = subscriber.close() else {
             return Ok(false);
         };
-        slot.send(
-            update_frame(subscriber.header_bytes(), update),
-            FrameGuard::new(Arc::new(())),
-        );
+        slot.send_following(update_frame(subscriber.header_bytes(), update), &writer)
+            .map_err(|_| OrderedSendError::Closed)?;
         Ok(true)
+    }
+
+    /// The writer of the last `Open` this session queued, if any.
+    fn open_writer(&self) -> MutexGuard<'_, Option<ExchangeWriter>> {
+        self.inner
+            .open_writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Record that every page of subscription `id` through `cursor` passed

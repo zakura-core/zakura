@@ -1,4 +1,4 @@
-//! Serving discovery's request rows through [`Serve`](crate::zakura::regulation::Serve).
+//! Serving discovery's request rows through [`Serve`].
 //!
 //! The reader admits each request without waiting and keeps reading. `Serve`
 //! takes response slots, output bytes, and execution before `produce` runs,

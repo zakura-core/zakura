@@ -71,12 +71,10 @@
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.
-//! * `tokio-console`: enable tokio's `console-subscriber` (needs [specific compiler flags])
 //! * A set of features that [skip verbose tracing].
 //!   The default features ignore `debug` and `trace` logs in release builds.
 //!
 //! [skip verbose tracing]: https://docs.rs/tracing/0.1.35/tracing/level_filters/index.html#compile-time-filters
-//! [specific compiler flags]: https://docs.rs/console-subscriber/latest/console_subscriber/#enabling-tokio-instrumentation
 //!
 //! ### Testing
 //!

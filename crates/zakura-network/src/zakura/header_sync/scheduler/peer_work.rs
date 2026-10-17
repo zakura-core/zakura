@@ -450,9 +450,51 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
-    #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
+    }
+
+    /// Whether `peer` holds unstarted or active work.
+    pub(in crate::zakura::header_sync) fn has_work(&self, peer: &ZakuraPeerId) -> bool {
+        self.work_by_peer.contains_key(peer)
+    }
+
+    /// Whether any peer's unstarted or active work pursues `target_tip_hash`.
+    pub(in crate::zakura::header_sync) fn is_target_assigned(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> bool {
+        self.target_owners(target_tip_hash).next().is_some()
+    }
+
+    fn target_owners(
+        &self,
+        target_tip_hash: zakura_chain::block::Hash,
+    ) -> impl Iterator<Item = &ZakuraPeerId> {
+        self.work_by_peer
+            .iter()
+            .filter(move |(_, work)| {
+                let owned_target = match work {
+                    PeerWorkState::AwaitingLocator { target, .. } => {
+                        target.status.selected_tip_hash
+                    }
+                    PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
+                };
+                owned_target == target_tip_hash
+            })
+            .map(|(peer, _)| peer)
+    }
+
+    /// Return every peer's target that still waits for its locator.
+    pub(in crate::zakura::header_sync) fn awaiting_targets(
+        &self,
+    ) -> impl Iterator<Item = (&ZakuraPeerId, &AdvertisedHeaderTarget)> {
+        self.work_by_peer
+            .iter()
+            .filter_map(|(peer, work)| match work {
+                PeerWorkState::AwaitingLocator { target, .. } => Some((peer, target.as_ref())),
+                PeerWorkState::Active(_) => None,
+            })
     }
 
     /// Retire locator work captured from an obsolete committed snapshot.
@@ -580,20 +622,17 @@ impl PeerWorkQueue {
     ///
     /// All peers derive locators from shared local state.
     /// Two peers pursuing one target would download and authenticate overlapping prefixes.
-    /// The reactor retains the alternate peer's status until the owner retires.
+    /// The reactor keeps the alternate peer's status unspent and stages it once the owner
+    /// retires.
     pub(in crate::zakura::header_sync) fn stage_distinct_target(
         &mut self,
         peer: ZakuraPeerId,
         target: AdvertisedHeaderTarget,
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
-        let owned_by_other_peer = self.work_by_peer.iter().any(|(owner, work)| {
-            let owned_target = match work {
-                PeerWorkState::AwaitingLocator { target, .. } => target.status.selected_tip_hash,
-                PeerWorkState::Active(request) => request.target.status.selected_tip_hash,
-            };
-            owner != &peer && owned_target == target.status.selected_tip_hash
-        });
+        let owned_by_other_peer = self
+            .target_owners(target.status.selected_tip_hash)
+            .any(|owner| owner != &peer);
         if owned_by_other_peer {
             self.remove_unstarted(&peer);
             return QueueWorkResult::TargetAlreadyAssigned;

@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use color_eyre::Report;
+use eyre::Report;
 use zakura_chain::amount::{Amount, DeferredPoolBalanceChange};
 use zakura_chain::block::Block;
 use zakura_chain::parameters::NetworkUpgrade::*;

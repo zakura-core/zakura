@@ -20,7 +20,7 @@ use proptest::{
     strategy::{Strategy, ValueTree},
     test_runner::TestRunner,
 };
-use tempfile::NamedTempFile;
+use zakura_chain::common::TempFile;
 
 use zakura_chain::{
     block::{Block, Height},
@@ -98,7 +98,7 @@ pub struct VctFastSyncedNode {
     pub state: FinalizedState,
 
     _chain_tip_sender: ChainTipSender,
-    _frontier_grid: Option<NamedTempFile>,
+    _frontier_grid: Option<TempFile>,
 }
 
 impl VctFastSyncedChain {
@@ -271,11 +271,7 @@ impl VctFastSyncedChain {
         self.build_node(config, None)
     }
 
-    fn build_node(
-        &self,
-        config: Config,
-        frontier_grid: Option<NamedTempFile>,
-    ) -> VctFastSyncedNode {
+    fn build_node(&self, config: Config, frontier_grid: Option<TempFile>) -> VctFastSyncedNode {
         let config = Config {
             historical_frontier_artifact: frontier_grid
                 .as_ref()
@@ -364,7 +360,7 @@ impl VctFastSyncedChain {
     }
 
     /// Writes a sparse grid from the legacy reference, optionally corrupting one Orchard entry.
-    fn write_frontier_grid(&self, corrupt: Option<Height>) -> NamedTempFile {
+    fn write_frontier_grid(&self, corrupt: Option<Height>) -> TempFile {
         let artifact = FrontierArtifact {
             spacing: FRONTIER_GRID_SPACING,
             last_checkpoint: self.handoff,
@@ -401,7 +397,8 @@ impl VctFastSyncedChain {
                 .collect(),
         };
 
-        let file = NamedTempFile::new().expect("a temporary artifact file is created");
+        let file = TempFile::new_in(std::env::temp_dir(), "zakura-frontier-grid-")
+            .expect("a temporary artifact file is created");
         std::fs::write(file.path(), artifact.encode(&self.network))
             .expect("the genesis frontier grid writes");
 

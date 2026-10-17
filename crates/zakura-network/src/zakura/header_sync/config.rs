@@ -6,8 +6,8 @@ use zakura_chain::{block, parameters::Network};
 use super::{wire::*, HeaderSyncStartError};
 use crate::zakura::ServicePeerLimits;
 
-const COMMON_HEADER_BYTES: usize = 1_487;
-const REGTEST_HEADER_BYTES: usize = 177;
+pub(super) const COMMON_HEADER_BYTES: usize = 1_487;
+pub(super) const REGTEST_HEADER_BYTES: usize = 177;
 const LOCAL_MAX_HS_INFLIGHT_PER_PEER: u16 = 1;
 const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_HS_MAX_UNPRODUCTIVE_REQUESTS: u32 = 3;

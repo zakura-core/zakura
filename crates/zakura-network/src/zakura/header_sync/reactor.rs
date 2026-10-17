@@ -739,8 +739,10 @@ fn assemble_port_header_path_page(
     })
 }
 
+/// The delivery to serve under `schema`: a non-rejected one that carries what
+/// the schema needs, preferring an authenticated delivery.
 #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
-fn selected_port_aux_delivery(
+pub(super) fn selected_port_aux_delivery(
     deliveries: &[zakura_header_chain::AuxDelivery],
     schema: AuxSchema,
 ) -> Option<zakura_header_chain::AuxDelivery> {

@@ -7,7 +7,7 @@
 use proptest::prelude::*;
 use zakura_chain::block;
 
-use super::{HeightLe, LeU32, List, Wire, U8};
+use super::{BlockHash, Bool, HeightLe, LeU16, LeU32, LeU64, List, Wire, U8};
 
 /// Valid test values for one wire item.
 pub(crate) trait WireSample: Wire<Value: 'static> {
@@ -59,6 +59,46 @@ impl WireSample for LeU32 {
 
     fn arbitrary() -> BoxedStrategy<u32> {
         any::<u32>().boxed()
+    }
+}
+
+impl WireSample for LeU16 {
+    fn boundary_values() -> Vec<u16> {
+        vec![0, 1, u16::MAX]
+    }
+
+    fn arbitrary() -> BoxedStrategy<u16> {
+        any::<u16>().boxed()
+    }
+}
+
+impl WireSample for LeU64 {
+    fn boundary_values() -> Vec<u64> {
+        vec![0, 1, u64::MAX]
+    }
+
+    fn arbitrary() -> BoxedStrategy<u64> {
+        any::<u64>().boxed()
+    }
+}
+
+impl WireSample for Bool {
+    fn boundary_values() -> Vec<bool> {
+        vec![false, true]
+    }
+
+    fn arbitrary() -> BoxedStrategy<bool> {
+        any::<bool>().boxed()
+    }
+}
+
+impl WireSample for BlockHash {
+    fn boundary_values() -> Vec<block::Hash> {
+        vec![block::Hash([0; 32]), block::Hash([u8::MAX; 32])]
+    }
+
+    fn arbitrary() -> BoxedStrategy<block::Hash> {
+        any::<[u8; 32]>().prop_map(block::Hash).boxed()
     }
 }
 

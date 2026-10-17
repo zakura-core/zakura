@@ -13,10 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use color_eyre::{
-    eyre::{eyre, Context, Report, Result},
-    Help, SectionExt,
-};
+use eyre::{eyre, Context, Report, Result};
 use regex::RegexSet;
 use tracing::instrument;
 
@@ -27,6 +24,7 @@ pub mod to_regex;
 
 pub use self::arguments::Arguments;
 use self::to_regex::{CollectRegexSet, RegexSetExt, ToRegexSet};
+use crate::report::{Section, SectionExt};
 
 /// A super-trait for [`Iterator`] + [`Debug`].
 pub trait IteratorDebug: Iterator + Debug {}

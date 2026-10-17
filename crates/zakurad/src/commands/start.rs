@@ -80,7 +80,7 @@ use std::{
     sync::Arc,
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
     pin, select,
@@ -1428,7 +1428,7 @@ impl StartCmd {
 
 #[cfg(test)]
 mod tests {
-    use color_eyre::eyre::eyre;
+    use eyre::eyre;
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
 
@@ -2150,7 +2150,8 @@ mod zakura_header_sync_driver_tests {
             )
             .await
             .expect("the first durable header driver starts");
-            let mut snapshots = startup.committed_snapshots.clone();
+            // The port's selected-chain watch follows the durable commits.
+            let mut snapshots = startup.header_chain_port.selected_chain();
             let genesis_snapshot = wait_for_header_snapshot(&mut snapshots, block::Height(0)).await;
             let suffix: Vec<_> = blocks[..4]
                 .iter()

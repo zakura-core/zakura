@@ -4,9 +4,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, Frontier, HeaderChainError, HeaderLocator,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion,
-    VctRepairContext,
+    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, EngineSnapshot, Frontier, HeaderChainError,
+    HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId,
+    TargetCompletion, VctRepairContext,
 };
 
 /// A boxed operation returned by [`Port`].
@@ -487,6 +487,16 @@ pub trait Port: Send + Sync + 'static {
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply>;
+
+    /// Watch the selected header chain.
+    ///
+    /// The value is the latest committed engine snapshot, or `None` before the
+    /// first commit. It changes after each committed transition, so a change
+    /// wakes work that follows the selected tip. The default never changes,
+    /// for a port without durable header-chain state.
+    fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
+        tokio::sync::watch::channel(None).1
+    }
 }
 
 impl std::fmt::Debug for dyn Port {

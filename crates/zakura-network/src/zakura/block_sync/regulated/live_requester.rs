@@ -63,14 +63,6 @@ impl Shared {
     }
 }
 
-fn frame_rejection(error: ClaimRefused) -> FrameRejection {
-    match error {
-        ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-        ClaimRefused::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
-        _ => FrameRejection::Unsolicited,
-    }
-}
-
 /// The transport reader's gate. Every response it queues stays charged until
 /// [`LiveRequester::authorize`] takes it, so the queue never holds more than
 /// the live ranges owe.
@@ -79,7 +71,9 @@ impl ResponsePrecheck for Shared {
         if !(3..=5).contains(&tag) {
             return Ok(());
         }
-        self.lock().admit(tag, len).map_err(frame_rejection)
+        self.lock()
+            .admit(tag, len)
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
@@ -211,7 +205,9 @@ impl LiveRequester {
     /// Endings are small and must validate before their reservation is removed.
     pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
         if self.transport_admits && (3..=5).contains(&frame.message_type) {
-            self.shared.lock().take_admitted(frame.payload.len());
+            self.shared
+                .lock()
+                .take_admitted(frame.message_type, frame.payload.len());
         }
         let rule = MessageRule::find(RULES, frame.message_type)
             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
@@ -226,7 +222,7 @@ impl LiveRequester {
             self.shared
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
-                .map_err(|error| SinkReject::protocol(frame_rejection(error)))?;
+                .map_err(|error| SinkReject::protocol(error.frame_rejection()))?;
             let header = block::Header::zcash_deserialize(&frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
             let result = self
@@ -330,7 +326,7 @@ mod tests {
         assert_eq!(reader.check(1, 53), Ok(()));
 
         // The routine takes and claims the body, then the ending.
-        requester.shared.lock().take_admitted(50);
+        requester.shared.lock().take_admitted(3, 50);
         requester.shared.lock().claim_block(hash, 50).unwrap();
         let mut ending = vec![4];
         ending.extend_from_slice(&1u32.to_le_bytes());

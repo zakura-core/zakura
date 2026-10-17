@@ -5,7 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use color_eyre::eyre::{eyre, Context, Result};
+use eyre::{eyre, Context, Result};
 use tower::BoxError;
 
 use zakura_chain::{

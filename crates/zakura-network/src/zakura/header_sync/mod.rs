@@ -16,6 +16,7 @@ mod scheduler;
 mod service;
 #[cfg(test)]
 mod tests;
+mod v9;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
@@ -39,6 +40,8 @@ pub use scheduler::retry::{
 pub(crate) use service::drive_header_sync_actions;
 pub use service::PeerSession;
 pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use v9::replay_header_sync_v9_codec_bytes;
 #[cfg(test)]
 pub(crate) use wire::headers_response_bytes;
 pub(crate) use wire::headers_response_capacity;

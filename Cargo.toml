@@ -68,14 +68,13 @@ byteorder = "1.5"
 bytes = "1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = "4.5"
-color-eyre = { version = "0.6.3", default-features = false }
-console-subscriber = "0.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
 crossbeam-channel = "0.5.14"
 curve25519-dalek = "4.1"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
 equihash = { version = "=3.0.0", package = "zakura-equihash" }
+eyre = { version = "0.6.12", default-features = false, features = ["auto-install"] }
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
@@ -104,7 +103,6 @@ log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17.2", default-features = false }
 once_cell = "1.21"
-owo-colors = "4.2.0"
 pin-project = "1.1.10"
 # Property tests run in-process; subprocess forking and per-case timeouts are unused.
 proptest = { version = "1.6", default-features = false, features = ["std"] }
@@ -156,7 +154,6 @@ tonic-prost = "0.14"
 # `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,
 # pulldown-cmark-to-cmark and unicase; xtask does not need it.
 tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
-tonic-reflection = "0.14"
 tower = "0.5.3"
 tracing = "0.1.41"
 tracing-error = "0.2"
@@ -347,7 +344,6 @@ lto = "off"
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(tokio_unstable)', # Used by tokio-console
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zakura and librustzcash
 ] }
 

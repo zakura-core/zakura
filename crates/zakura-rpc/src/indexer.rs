@@ -31,9 +31,6 @@ pub(crate) fn receipt_session() -> &'static str {
     SESSION.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
 }
 
-pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
-    tonic::include_file_descriptor_set!("indexer_descriptor");
-
 impl BlockHashAndHeight {
     /// Create a new [`BlockHashAndHeight`] from a [`block::Hash`] and [`block::Height`].
     pub fn new(hash: block::Hash, block::Height(height): block::Height) -> Self {

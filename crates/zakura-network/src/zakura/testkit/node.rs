@@ -535,6 +535,7 @@ impl ZakuraTestNodeBuilder {
                 discovery.clone(),
                 header_sync.clone(),
                 block_sync_handle.clone(),
+                ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
             ))
         } else {
             Arc::new(DiscoveryService::new(discovery.clone()))

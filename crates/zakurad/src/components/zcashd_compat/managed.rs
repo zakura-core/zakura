@@ -10,7 +10,7 @@ use std::{
 use color_eyre::eyre::{eyre, Report};
 use reqwest::{blocking::Client, redirect::Policy, Url};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
+use zakura_chain::common::TempFile;
 
 use super::{
     Config, ConfigZcashdBinarySource, ZcashdReleaseManifest, EMBEDDED_ZCASHD_RELEASE_MANIFEST,
@@ -180,7 +180,7 @@ fn install_managed_zcashd_binary(
         return Ok(binary_path);
     }
 
-    let mut download = NamedTempFile::new_in(&cache_dir).map_err(|err| {
+    let mut download = TempFile::new_in(&cache_dir, ".tmp.zcashd.").map_err(|err| {
         eyre!(
             "failed to create a temporary file in managed zcashd cache directory {}: {err}",
             cache_dir.display()
@@ -200,9 +200,8 @@ fn install_managed_zcashd_binary(
     })?;
     download.persist(&binary_path).map_err(|err| {
         eyre!(
-            "failed to persist managed zcashd binary {}: {}",
+            "failed to persist managed zcashd binary {}: {err}",
             binary_path.display(),
-            err.error
         )
     })?;
 

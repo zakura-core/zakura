@@ -158,7 +158,7 @@ pub enum NoteCommitmentTreeError {
 /// nodes. The default tree is the empty tree which has all leaves empty.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(into = "LegacyNoteCommitmentTree")]
-#[serde(from = "LegacyNoteCommitmentTree")]
+#[serde(try_from = "LegacyNoteCommitmentTree")]
 pub struct NoteCommitmentTree {
     /// The tree represented as a [`Frontier`].
     ///

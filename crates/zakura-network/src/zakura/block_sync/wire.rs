@@ -234,13 +234,13 @@ fn decode_block(payload: &[u8]) -> Result<Arc<block::Block>, BlockSyncWireError>
         return Err(WireError::OutOfRange("a Block payload starts with its type").into());
     }
     let mut block_bytes = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    let block = Arc::new(block::Block::zcash_deserialize_from_slice(
-        &mut block_bytes,
-    )?);
+    // The block fills the rest of the payload, because trailing bytes are rejected
+    // below, so its size is known before parsing it.
+    validate_encoded_block_len(block_bytes.len())?;
+    let block = Arc::new(block::Block::zcash_deserialize_bounded(&mut block_bytes)?);
     if !block_bytes.is_empty() {
         return Err(BlockSyncWireError::TrailingBytes);
     }
-    validate_encoded_block_len(payload.len() - BLOCK_SYNC_MESSAGE_TYPE_BYTES)?;
     Ok(block)
 }
 

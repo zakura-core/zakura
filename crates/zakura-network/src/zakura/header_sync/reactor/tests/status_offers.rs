@@ -853,10 +853,10 @@ fn status_floods_start_no_repeated_work() {
     status_flood(16);
 }
 
-/// Every peer a one-byte test identity allows but the honest one, on the
-/// scheduled run.
+/// Every peer a one-byte test identity allows but the honest one, in
+/// full-coverage CI runs.
 #[test]
-#[ignore = "scheduled load run; nightly CI passes --run-ignored"]
+#[ignore = "broad load run; full-coverage CI passes --run-ignored"]
 fn maximum_status_floods_start_no_repeated_work() {
     status_flood(255);
 }

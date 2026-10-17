@@ -110,7 +110,8 @@ version 8 negotiates no header sync stream, and the connection stays usable.
 ## Load and reporting
 
 The publisher load test runs 40 sessions on each pull request and 512, every default session slot,
-in the nightly unit test run, which includes ignored tests. A fifth of the sessions each follow the
+in the full-coverage unit test runs on pushes to main, the merge queue, and the nightly schedule,
+which include ignored tests. A fifth of the sessions each follow the
 tip, read full pages from an empty start, flood one-header grants, never read, or churn. Reads first
 wait on a closed gate, so they stop at the node and peer execution limits of 8 and 2. After every
 scheduler pass the test checks that cursor history stays within the window and output within its

@@ -432,10 +432,10 @@ async fn many_sessions_keep_header_serving_bounded() {
     run_load(40).await;
 }
 
-/// Every default header-sync session slot, 256 inbound and 256 outbound, on
-/// the scheduled run.
+/// Every default header-sync session slot, 256 inbound and 256 outbound, in
+/// full-coverage CI runs.
 #[tokio::test(start_paused = true)]
-#[ignore = "scheduled load run; nightly CI passes --run-ignored"]
+#[ignore = "broad load run; full-coverage CI passes --run-ignored"]
 async fn maximum_sessions_keep_header_serving_bounded() {
     run_load(512).await;
 }

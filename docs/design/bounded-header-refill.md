@@ -162,8 +162,11 @@ it therefore does not invalidate the global pass. This rule does not depend on
 whole-Status equality or an allowlist of ignorable fields.
 
 The root revision changes for session membership, explicit offer deferral,
-committed snapshots (including body-only advancement), and changes to an existing
-locator's effective virtual header claim. The latter uses the same negotiated,
+committed snapshots (including body-only advancement), every terminal subscription
+outcome, a pruned schema 1 round that re-arms its sender's status, and changes to
+an existing locator's effective virtual header claim. Header sync v9 holds an offer
+whose session still has a live subscription until that subscription ends, so the
+terminal outcome is an opportunity. The latter uses the same negotiated,
 fair-share-capped count as ordinary headroom. Changing a limit above that cap,
 nonzero slot counts or other metadata does not change the claim. The queue revision
 changes on insertion, removal, target-hash replacement or an awaiting request
@@ -186,9 +189,7 @@ configured 256 inbound plus 256 outbound slots. It holds duplicate-target or
 zero-headroom offers across 3,000 end-of-event passes, including repeated blocked
 and active-owner Status messages. It asserts zero additional cached-offer peer
 visits after the initial pass. This measures eliminated scheduler work, not
-production throughput or a saturation threshold. Header-sync v9 cadence changes
-can reduce event frequency, but activation must retain these opportunity inputs
-and release notifications when replacing the ordinary request state machine.
+production throughput or a saturation threshold.
 
 The test also clears only the scheduling cache before each pass as a control,
 replaying the previous unconditional scan with identical offers and scheduling

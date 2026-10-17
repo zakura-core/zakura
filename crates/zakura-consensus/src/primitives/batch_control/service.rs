@@ -131,21 +131,6 @@ where
 
         let span = info_span!("batch worker", kind = std::any::type_name::<T>());
 
-        #[cfg(tokio_unstable)]
-        let worker_handle = {
-            let batch_kind = std::any::type_name::<T>();
-
-            // TODO: identify the unique part of the type name generically,
-            //       or make it an argument to this method
-            let batch_kind = batch_kind.trim_start_matches("zakura_consensus::primitives::");
-            let batch_kind = batch_kind.trim_end_matches("::Verifier");
-
-            tokio::task::Builder::new()
-                .name(&format!("{} batch", batch_kind))
-                .spawn(worker.run().instrument(span))
-                .expect("panic on error to match tokio::spawn")
-        };
-        #[cfg(not(tokio_unstable))]
         let worker_handle = tokio::spawn(worker.run().instrument(span));
 
         batch.register_worker(worker_handle);

@@ -452,11 +452,17 @@ impl Shared {
                 if count == 0 && subscription.checked_tip == Some(tip.hash) {
                     continue;
                 }
+                // A page must extend the last header. A check only needs to
+                // reach it, and a tip it already checked descends from it.
+                let locators = match subscription.checked_tip {
+                    Some(checked) if count == 0 => vec![checked, last.hash],
+                    _ => vec![last.hash],
+                };
                 Job {
                     id,
                     initial_target: subscription.fixed.target,
                     lease_target: tip.hash,
-                    locators: vec![last.hash],
+                    locators,
                     parent: Some(last),
                     probe: None,
                     following: true,
@@ -1172,16 +1178,17 @@ fn log_port_failure(id: u64, operation: &'static str, error: &PortError) {
 /// fits the subscription's credit, because a conformant subscriber need not
 /// keep page credit after its target, and the publisher still owes it
 /// `SubscriptionSuperseded` when the chain stops extending that header.
+///
+/// The job's locators are the last header and any tip a check already found
+/// extending it. Hash ancestry never changes, so reaching either one shows the
+/// new tip extends the last header, and the walk stops at the nearer one.
 async fn check_following(port: &dyn Port, owner: LeaseOwner, job: &Job) -> Output {
-    let Some(last) = job.parent else {
-        return Output::Stall(Stall::Local, "check_parent");
-    };
     let reply = acquire(
         port,
         owner,
         job.selected.as_ref(),
         job.lease_target,
-        vec![last.hash],
+        job.locators.clone(),
     )
     .await;
     match reply {

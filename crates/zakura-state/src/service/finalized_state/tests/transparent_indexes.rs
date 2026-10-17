@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam_channel::bounded;
+use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use tempfile::TempDir;
 use tower::{Service, ServiceExt};
 
@@ -1188,7 +1188,7 @@ fn format_checks_never_rebuild_omitted_transparent_indexes() {
     // Reopening runs the startup format check, which includes the indexer spender rebuild when
     // that feature is enabled.
     let state = open(&config, &network);
-    let (_cancel_sender, cancel_receiver) = bounded(1);
+    let (_cancel_sender, cancel_receiver) = cancel_channel();
     assert_eq!(
         DbFormatChange::format_validity_checks_detailed(&state.db, &cancel_receiver)
             .expect("checks are not cancelled"),

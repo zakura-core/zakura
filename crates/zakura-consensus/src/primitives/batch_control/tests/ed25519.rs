@@ -11,8 +11,8 @@ use std::{
 
 use crate::primitives::batch_control::{Batch, BatchControl, RequestWeight};
 use crate::primitives::fallback::Fallback;
-use color_eyre::{eyre::eyre, Report};
 use ed25519_zebra::{batch, Error, Signature, SigningKey, VerificationKeyBytes};
+use eyre::{eyre, Report};
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures::FutureExt;
 use futures_core::Future;

@@ -117,10 +117,7 @@ use std::{
 #[cfg(not(target_os = "windows"))]
 use std::{net::SocketAddr, path::Path};
 
-use color_eyre::{
-    eyre::{eyre, WrapErr},
-    Help,
-};
+use eyre::{eyre, WrapErr};
 use futures::{stream::FuturesUnordered, StreamExt};
 use semver::Version;
 use serde_json::Value;
@@ -1770,7 +1767,7 @@ async fn non_blocking_logger() -> Result<()> {
             assert!(response.status().is_success());
         }
 
-        Ok::<(), color_eyre::Report>(())
+        Ok::<(), eyre::Report>(())
     })
     .await;
 
@@ -4235,7 +4232,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
                     .map_err(|err| eyre!(err))?;
 
                 if peer_info.is_empty() {
-                    return Ok::<(), color_eyre::Report>(());
+                    return Ok::<(), eyre::Report>(());
                 }
 
                 tracing::debug!(?peer_info, "has not yet disconnected from misbehaving peer");

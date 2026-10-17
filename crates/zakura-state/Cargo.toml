@@ -85,7 +85,7 @@ libc = { workspace = true }
 tempfile = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0", features = ["test-support"] }
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 
 once_cell = { workspace = true }
 toml = { workspace = true }

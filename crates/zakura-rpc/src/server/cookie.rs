@@ -1,7 +1,7 @@
 //! Cookie-based authentication for the RPC server.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use color_eyre::Result;
+use eyre::Result;
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 
@@ -58,7 +58,7 @@ pub fn write_to_disk(cookie: &Cookie, dir: &Path, file_name: Option<&str>) -> Re
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
-        return Err(color_eyre::eyre::eyre!(
+        return Err(eyre::eyre!(
             "cookie path {cookie_path:?} is a symlink, refusing to write"
         ));
     }
@@ -95,7 +95,7 @@ fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
         return Ok(());
     }
 
-    Err(color_eyre::eyre::eyre!(
+    Err(eyre::eyre!(
         "failed to create a unique temporary cookie file for {path:?}"
     ))
 }

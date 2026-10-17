@@ -129,7 +129,7 @@ serde_json = { workspace = true }
 criterion = { workspace = true }
 
 # Error Handling & Formatting
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 
 # Make the optional testing dependencies required
 proptest = { workspace = true }

@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::{select, sync::watch, task::JoinHandle, time::sleep};
 use tracing::{Instrument, Span};

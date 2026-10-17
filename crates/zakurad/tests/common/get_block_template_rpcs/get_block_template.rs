@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Context, Result};
+use eyre::{eyre, Context, Result};
 use futures::FutureExt;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};

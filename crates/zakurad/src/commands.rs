@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use color_eyre::eyre::Report;
+use eyre::Report;
 
 use zakura_chain::common::preference_dir;
 

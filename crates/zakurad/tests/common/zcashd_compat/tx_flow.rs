@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use serde::Deserialize;
 use tokio::time::sleep;
 use zakura_chain::{

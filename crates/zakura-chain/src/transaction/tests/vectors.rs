@@ -2,7 +2,7 @@
 
 use arbitrary::v5_transactions;
 use chrono::DateTime;
-use color_eyre::eyre::{Result, WrapErr};
+use eyre::{Result, WrapErr};
 use lazy_static::lazy_static;
 use rand::{seq::IteratorRandom, thread_rng};
 use std::io::ErrorKind;

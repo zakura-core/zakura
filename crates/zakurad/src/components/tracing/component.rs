@@ -5,7 +5,7 @@ use std::{
     io::Write,
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
 use tracing_error::ErrorLayer;

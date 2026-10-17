@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use tokio::time::{self, timeout};
 use tower::{
     util::{BoxCloneService, BoxService},

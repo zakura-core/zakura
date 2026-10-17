@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 
 use zakura_chain::{
     block::{self},

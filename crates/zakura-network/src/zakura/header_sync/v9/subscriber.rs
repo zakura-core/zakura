@@ -286,12 +286,14 @@ impl Subscriber {
     /// A subscriber with no subscription, on a network whose headers take
     /// `header_bytes`, for the session that `fence` guards and `recv` reads.
     /// It attaches its frame header check to `recv`'s transport reader, if
-    /// `recv` has one.
+    /// `recv` has one. That check charges each page the reader queues
+    /// against the unspent credit until [`Self::admit`] takes it, so queued
+    /// pages never exceed what this node authorized.
     pub(crate) fn new(header_bytes: usize, fence: WriterFence, recv: &FramedRecv) -> Self {
         let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         let tools = SharedSubscriptions::new(Subscriptions::new(limits, rows(header_bytes)));
-        let transport_admits = recv.attach_precheck(Arc::new(tools.clone()));
+        let transport_admits = recv.attach_precheck(Arc::new(tools.admitting()));
         Self {
             tools,
             transport_admits,
@@ -309,14 +311,17 @@ impl Subscriber {
 
     /// Check a page or outcome frame header before its payload is decoded.
     ///
-    /// A transport reader already ran this check. In-process channels have
-    /// none, so this runs the same check for them.
+    /// A transport reader already ran this check, so this releases the
+    /// page's charge instead. In-process channels have no reader, so this
+    /// runs the same check for them.
     ///
     /// It also holds a page to the publisher's advertised byte cap. Only a
     /// page can exceed a cap that the `Status` decoder accepted.
     pub(crate) fn admit(&self, frame: &Frame) -> Result<(), SubscriberFault> {
         let len = frame.payload.len();
-        if !self.transport_admits {
+        if self.transport_admits {
+            self.tools.lock().take_admitted(frame.message_type, len);
+        } else {
             self.tools
                 .lock()
                 .precheck(frame.message_type, len)

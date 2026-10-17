@@ -88,6 +88,7 @@
 //! | An idle subscription holds no execution and needs no outcome | `an_idle_subscription_holds_nothing_and_needs_no_outcome` |
 //! | Closure needs no credit and no execution | `close_needs_no_credit_and_no_execution` |
 //! | Retiring a session with a live subscription closes the connection | `retirement_with_a_live_subscription_closes_the_connection` |
+//! | Pages a reader queues never exceed the unspent credit | `queued_pages_never_exceed_the_unspent_credit` |
 
 mod credit;
 mod publisher;

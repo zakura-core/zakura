@@ -5491,22 +5491,29 @@ mod zakura_header_sync_driver_tests {
         let (write_state, read_state, latest_tip, _tip_change) =
             zakura_state::init_test_services(&network).await;
 
+        let barrier_state = write_state.clone();
         let submitted_count = Arc::new(AtomicUsize::new(0));
+        let resolved = Arc::new(AtomicBool::new(false));
         let verifier_submitted_count = submitted_count.clone();
+        let verifier_resolved = resolved.clone();
         let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let write_state = write_state.clone();
+            let mut write_state = write_state.clone();
             let submitted_count = verifier_submitted_count.clone();
+            let resolved = verifier_resolved.clone();
             async move {
                 match request {
                     zakura_consensus::Request::Commit(block) => {
-                        submitted_count.fetch_add(1, Ordering::SeqCst);
+                        // Calling the buffered state enqueues the commit before the count moves.
                         let commit: futures::future::BoxFuture<
                             'static,
                             Result<zakura_state::Response, zakura_state::BoxError>,
-                        > = Box::pin(write_state.oneshot(
+                        > = Box::pin(write_state.ready().await?.call(
                             zakura_state::Request::CommitSemanticallyVerifiedBlock(block.into()),
                         ));
-                        match commit.await? {
+                        submitted_count.fetch_add(1, Ordering::SeqCst);
+                        let response = commit.await;
+                        resolved.store(true, Ordering::SeqCst);
+                        match response? {
                             zakura_state::Response::Committed(hash) => {
                                 Ok::<_, zakura_consensus::BoxError>(hash)
                             }
@@ -5534,6 +5541,7 @@ mod zakura_header_sync_driver_tests {
 
         // The empty state has no parent for this block, so its commit waits in the queue.
         let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES);
+        let block_hash = block.hash();
         action_tx
             .send(BlockSyncAction::SubmitBlock {
                 owner: test_block_work_owner(),
@@ -5550,6 +5558,15 @@ mod zakura_header_sync_driver_tests {
         })
         .await
         .expect("the driver submits the full-verification body before fallback starts");
+        // The state buffer is FIFO, so this answer means state has queued the commit.
+        barrier_state
+            .oneshot(zakura_state::Request::KnownBlock(block_hash))
+            .await
+            .expect("known-block request succeeds");
+        assert!(
+            !resolved.load(Ordering::SeqCst),
+            "the commit must still be waiting for its parent when fallback starts"
+        );
 
         let fallback = tokio::spawn(async move {
             handoff

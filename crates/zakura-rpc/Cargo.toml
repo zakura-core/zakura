@@ -69,7 +69,7 @@ rand_10 = { workspace = true }
 subtle = { workspace = true }
 
 # Error handling
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros"] }
 tower = { workspace = true }

@@ -98,6 +98,9 @@ pub(crate) struct Subscriptions<K, C> {
     /// Keys of the latest terminal outcomes, newest last. The publisher may
     /// still hold their tombstones, so `open` refuses them.
     ended: VecDeque<K>,
+    /// Pages a reader admitted that the handler has not yet taken, one
+    /// object and their payload bytes each.
+    queued: Totals,
 }
 
 impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
@@ -108,6 +111,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
             rules,
             live: HashMap::new(),
             ended: VecDeque::new(),
+            queued: Totals::default(),
         }
     }
 
@@ -282,6 +286,15 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<(), SubscriptionFault> {
+        self.check_header(message_type, payload_len).map(|_ends| ())
+    }
+
+    /// [`Self::precheck`], returning whether the frame is a terminal outcome.
+    fn check_header(
+        &self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<bool, SubscriptionFault> {
         let ends = match MessageRule::find(self.rules, message_type).map(|row| row.role) {
             Some(MessageRole::Response {
                 request,
@@ -300,9 +313,76 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
                 .values()
                 .any(|live| live.credit.check(1, len).is_ok())
         {
-            return Ok(());
+            return Ok(ends);
         }
         Err(SubscriptionFault::OverCredit)
+    }
+
+    /// Check a page or terminal header as [`Self::precheck`] does, and charge
+    /// a page to the queue until [`Self::claim_admitted_page`] spends it.
+    ///
+    /// The queue holds at most the live subscriptions' unspent credit, so a
+    /// reader that admits frames ahead of the handler never buffers more
+    /// pages than this node authorized. A conformant publisher sends at most
+    /// that. A terminal outcome spends no credit and takes no charge.
+    pub(crate) fn admit(
+        &mut self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(), SubscriptionFault> {
+        if self.check_header(message_type, payload_len)? {
+            return Ok(());
+        }
+        let unspent = self.live.values().fold(Totals::default(), |sum, live| {
+            let unspent = live.credit.unspent();
+            Totals {
+                objects: sum.objects.saturating_add(unspent.objects),
+                bytes: sum.bytes.saturating_add(unspent.bytes),
+            }
+        });
+        // Widening usize to u64 is lossless on supported targets.
+        let queued = Totals {
+            objects: self.queued.objects.saturating_add(1),
+            bytes: self.queued.bytes.saturating_add(payload_len as u64),
+        };
+        if queued.objects > unspent.objects || queued.bytes > unspent.bytes {
+            return Err(SubscriptionFault::OverCredit);
+        }
+        self.queued = queued;
+        Ok(())
+    }
+
+    /// [`Self::claim_page`] for a page that [`Self::admit`] charged: spend
+    /// its credit and release its charge together, so a reader never sees
+    /// that credit free in between. A refused claim keeps the charge.
+    pub(crate) fn claim_admitted_page(
+        &mut self,
+        key: &K,
+        objects: u32,
+        payload_len: usize,
+        cursor: C,
+    ) -> Result<(), SubscriptionFault> {
+        self.claim_page(key, objects, payload_len, cursor)?;
+        // Widening usize to u64 is lossless on supported targets.
+        let bytes = payload_len as u64;
+        debug_assert!(
+            self.queued.objects >= 1 && self.queued.bytes >= bytes,
+            "only an admitted page is claimed as one"
+        );
+        self.queued.objects = self.queued.objects.saturating_sub(1);
+        self.queued.bytes = self.queued.bytes.saturating_sub(bytes);
+        Ok(())
+    }
+
+    /// The frame rejection a reader reports for `fault`.
+    fn frame_rejection(&self, fault: SubscriptionFault) -> FrameRejection {
+        match fault {
+            SubscriptionFault::OverCredit => FrameRejection::AboveReservation {
+                // The unspent byte credit is at most the row's window.
+                bytes: u64::from(self.limits.credit.bytes),
+            },
+            _ => FrameRejection::Unsolicited,
+        }
     }
 
     /// Admit a decoded page whose linkage the reactor checked. Spend its exact
@@ -411,12 +491,33 @@ where
         let subscriptions = self.lock();
         subscriptions
             .precheck(message_type, payload_len)
-            .map_err(|fault| match fault {
-                SubscriptionFault::OverCredit => FrameRejection::AboveReservation {
-                    // The largest unspent byte credit is at most the row's.
-                    bytes: u64::from(subscriptions.limits.credit.bytes),
-                },
-                _ => FrameRejection::Unsolicited,
-            })
+            .map_err(|fault| subscriptions.frame_rejection(fault))
+    }
+}
+
+impl<K, C> SharedSubscriptions<K, C> {
+    /// A reader precheck over this table that charges each admitted page.
+    /// The handler spends each charge with
+    /// [`Subscriptions::claim_admitted_page`].
+    pub(crate) fn admitting(&self) -> AdmittingSubscriptions<K, C> {
+        AdmittingSubscriptions(self.clone())
+    }
+}
+
+/// A reader precheck that charges each admitted page until the handler takes
+/// it. See [`Subscriptions::admit`].
+#[derive(Debug)]
+pub(crate) struct AdmittingSubscriptions<K, C>(SharedSubscriptions<K, C>);
+
+impl<K, C> ResponsePrecheck for AdmittingSubscriptions<K, C>
+where
+    K: Eq + Hash + Clone + std::fmt::Debug + Send,
+    C: Clone + Eq + std::fmt::Debug + Send,
+{
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        let mut subscriptions = self.0.lock();
+        subscriptions
+            .admit(message_type, payload_len)
+            .map_err(|fault| subscriptions.frame_rejection(fault))
     }
 }

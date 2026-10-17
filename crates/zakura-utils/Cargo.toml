@@ -29,7 +29,7 @@ default = []
 
 zakura-checkpoints = [
     "clap",
-    "dep:color-eyre",
+    "dep:eyre",
     "dep:hex",
     "itertools",
     "dep:serde_json",
@@ -62,7 +62,7 @@ tokio = ["dep:tokio"]
 zcash_primitives = ["dep:zcash_primitives"]
 
 [dependencies]
-color-eyre = { workspace = true, optional = true }
+eyre = { workspace = true, optional = true }
 
 clap = { workspace = true, features = ["derive"], optional = true }
 hex = { workspace = true, optional = true }

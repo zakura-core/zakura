@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use color_eyre::eyre;
 use eyre::Result;
 use hex::FromHex;
 

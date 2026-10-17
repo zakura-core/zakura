@@ -8,7 +8,7 @@
 //! of the updated cached state, restart zebra without peers, and submit blocks above the
 //! finalized tip height.
 
-use color_eyre::eyre::{Context, Result};
+use eyre::{Context, Result};
 
 use zakura_chain::parameters::Network;
 use zakura_node_services::rpc_client::RpcRequestClient;

@@ -11,7 +11,7 @@ use std::{
 };
 
 use clap::Parser;
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use semver::{BuildMetadata, Version};
 use tokio::sync::watch;
 
@@ -227,6 +227,18 @@ fn report_fatal_error(error: &Report) {
     eprintln!("error: {} fatal error: {error}", env!("CARGO_PKG_NAME"));
 }
 
+/// Installs a panic hook that prints the default panic report, followed by the
+/// diagnostic metadata that bug reports need.
+fn install_panic_hook(metadata_section: String) {
+    let default_hook = std::panic::take_hook();
+
+    #[allow(clippy::print_stderr)]
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        eprintln!("\n{metadata_section}");
+    }));
+}
+
 /// Loads the configuration for `command`, then sets up error reporting, the Rayon
 /// thread pool and tracing. Server commands also get the metrics endpoint.
 ///
@@ -255,12 +267,6 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
     };
 
     let config = command.process_config(config)?;
-
-    let theme = if config.tracing.use_color_stdout_and_stderr() {
-        color_eyre::config::Theme::dark()
-    } else {
-        color_eyre::config::Theme::new()
-    };
 
     // collect the common metadata for the panic report,
     // skipping any env vars that aren't present
@@ -335,13 +341,7 @@ fn start(command: &EntryPoint) -> Result<(Arc<ZakuradConfig>, Tracing), Report> 
         write!(&mut metadata_section, "\n{k}: {v}").expect("unexpected failure writing to string");
     }
 
-    let builder = color_eyre::config::HookBuilder::default()
-        .theme(theme)
-        .panic_section(metadata_section.clone());
-
-    let (panic_hook, eyre_hook) = builder.into_hooks();
-    eyre_hook.install().expect("eyre_hook.install() error");
-    panic_hook.install();
+    install_panic_hook(metadata_section.clone());
 
     // Apply the configured number of threads to the thread pool.
     //

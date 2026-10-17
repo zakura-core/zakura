@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::zakura::{
     framed_channel,
-    regulation::{ServeCapacity, ServeLimits, WriterFence, UNFINISHED_EXCHANGE},
-    CloseCause, Frame, PayloadLen, ZakuraPeerId,
+    regulation::{ResponsePrecheck, ServeCapacity, ServeLimits, WriterFence, UNFINISHED_EXCHANGE},
+    CloseCause, Frame, FrameRejection, PayloadLen, ZakuraPeerId,
 };
 
 mod message_type {
@@ -1422,4 +1422,51 @@ async fn pushed_pages_keep_response_slots_until_transport_completion() {
             .unwrap(),
     );
     assert_eq!(capacity.node_output_held(), 0);
+}
+
+/// A reader that admits pages ahead of the handler queues at most the
+/// unspent credit, in objects and in bytes. Claiming a page turns its charge
+/// into spent credit, and a terminal outcome takes none.
+#[test]
+fn queued_pages_never_exceed_the_unspent_credit() {
+    let mut tool = Subscriptions::<u8, u32>::new(limits(1), RULES);
+    tool.open(1, credit(3, 40), 0)
+        .expect("the first Open is recorded");
+    let reader = SharedSubscriptions::new(tool);
+    let admitting = reader.admitting();
+    let full = Err(FrameRejection::AboveReservation {
+        bytes: u64::from(LIMIT.bytes),
+    });
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+    assert_eq!(
+        admitting.check(message_type::PAGE, 1),
+        full,
+        "the queued bytes already fill the unspent credit"
+    );
+    assert_eq!(admitting.check(message_type::ENDED, 1), Ok(()), "no charge");
+    reader
+        .lock()
+        .claim_admitted_page(&1, 1, 20, 1)
+        .expect("within credit");
+    assert_eq!(
+        admitting.check(message_type::PAGE, 1),
+        full,
+        "the claim spent the credit its charge held"
+    );
+    let mut tool = reader.lock();
+    tool.accept(&1, &1).expect("the page was claimed");
+    tool.grant(&1, credit(1, 20)).expect("within the window");
+    drop(tool);
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+
+    // One object per page: three pages of one byte fill three objects.
+    let mut tool = Subscriptions::<u8, u32>::new(limits(1), RULES);
+    tool.open(1, credit(3, 40), 0)
+        .expect("the first Open is recorded");
+    let admitting = SharedSubscriptions::new(tool).admitting();
+    for _ in 0..3 {
+        assert_eq!(admitting.check(message_type::PAGE, 1), Ok(()));
+    }
+    assert!(admitting.check(message_type::PAGE, 1).is_err());
 }

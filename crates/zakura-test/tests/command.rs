@@ -2,7 +2,7 @@
 
 use std::{process::Command, time::Duration};
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use regex::RegexSet;
 use tempfile::tempdir;
 

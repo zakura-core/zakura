@@ -385,8 +385,10 @@ fn open_refuses_what_the_publisher_would_fault() {
 }
 
 /// The constructor attaches the frame header check to a transport reader,
-/// which refuses an unsolicited page before its payload is read. Without a
-/// reader, `admit` runs the same check before decode.
+/// which refuses an unsolicited page before its payload is read and queues
+/// at most the unspent credit of pages ahead of the reactor. `admit` releases
+/// each page's charge, and without a reader it runs the same check before
+/// decode.
 #[test]
 fn the_frame_header_check_runs_before_decode() {
     let (tree, chain) = chain(2);
@@ -403,17 +405,39 @@ fn the_frame_header_check_runs_before_decode() {
     let (_, recv) = framed_channel(1);
     let recv = recv.with_precheck(slot.clone());
     let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
-    let sub = Sub::new(HB, fence, &recv);
+    let mut sub = Sub::new(HB, fence, &recv);
     let reader = slot.get().expect("the subscriber attaches its check");
+    let len = frame.payload.len();
     assert_eq!(
-        reader.check(frame.message_type, frame.payload.len()),
+        reader.check(frame.message_type, len),
         Err(FrameRejection::Unsolicited)
     );
-    assert_eq!(sub.admit(&frame), Ok(()), "the reader already checked it");
     assert_eq!(
         subscriber().admit(&frame),
         Err(SubscriptionFault::Unknown.into())
     );
+
+    // Two headers of credit: the reader queues two one-header pages and
+    // refuses a third. A taken page keeps its charge until its claim spends
+    // the credit, so the reader never sees that credit free in between, and
+    // only the Grant after acceptance makes room.
+    sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 2)
+        .expect("the first Open is recorded");
+    assert_eq!(reader.check(frame.message_type, len), Ok(()));
+    assert_eq!(reader.check(frame.message_type, len), Ok(()));
+    assert!(reader.check(frame.message_type, len).is_err());
+    assert_eq!(sub.admit(&frame), Ok(()));
+    assert!(
+        reader.check(frame.message_type, len).is_err(),
+        "a taken page holds its charge until its claim"
+    );
+    let (page, _) = decode_page(&frame);
+    let admitted = sub.receive_page(&page, len).expect("the first page");
+    assert!(reader.check(frame.message_type, len).is_err());
+    sub.accept_through(admitted.id, &admitted.cursor, 2)
+        .expect("a received cursor")
+        .expect("one header of room is a prefix of a two-header window");
+    assert_eq!(reader.check(frame.message_type, len), Ok(()));
 }
 
 /// Path pages start at the highest sent locator on the target's chain, carry

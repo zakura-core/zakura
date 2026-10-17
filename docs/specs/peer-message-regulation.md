@@ -236,6 +236,12 @@ resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
 discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
+`Hello`, `GetPeers`, and `GetServices` share one cadence. A capacity of 42 covers the 15-second
+sender interval across a 600-second connection-wide outage, plus the initial message and one more.
+The buffered arrivals after such an outage cannot prove a sender violation, so exhaustion is
+recorded and the message proceeds. The outstanding-request limit, verification slots, and the
+identical-record skip bound the work that the excess messages can cause.
+
 The following limits apply to every discovery message:
 
 ```text
@@ -268,9 +274,9 @@ SERVICE_ENVELOPE_MAX         = 294 bytes
   - protocol overlap
   - record author == authenticated peer
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`
+  - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
 apart. A long-lived shared connection MAY carry periodic `Hello` messages, including an unchanged
@@ -297,9 +303,9 @@ expiry.
   - excluded node IDs are sorted and unique
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+  - on_empty = record and forward (exhaustion is not a violation)
 - **Capacity**
   - one outstanding `GetPeers` per peer stream
   - bounded sampling work and queued response bytes
@@ -351,9 +357,9 @@ stored records attributed to each source peer.
   - service IDs are 1..=32 ASCII bytes and unique
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+  - on_empty = record and forward (exhaustion is not a violation)
 - **Capacity**
   - one outstanding `GetServices` per peer stream
   - bounded summary generation and queued response bytes

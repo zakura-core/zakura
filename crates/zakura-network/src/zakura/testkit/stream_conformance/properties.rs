@@ -25,14 +25,13 @@ use crate::{
     BoxError,
 };
 
-/// Endpoint seeds for one property. Each property uses its own range, and
-/// each layout its own offset, so parallel runs never share an identity. The
-/// offset counts the layout's members, plus five without a request row.
-fn seeds(property: u64, layout: &'static [Stream]) -> u64 {
-    let subscription_only = LayoutPlan::new(layout).requests.is_empty();
+/// Endpoint seeds for one property: its own range, offset by the layout's
+/// member count. Layouts with the same member count share seeds, which is
+/// harmless because each test's endpoints dial each other's loopback addresses
+/// directly.
+fn seeds(property: u64, layout: &[Stream]) -> u64 {
     // Widening usize to u64 is lossless on supported targets.
-    let shape = layout.len() as u64 + if subscription_only { 5 } else { 0 };
-    95_000 + property * 1_000 + shape * 100
+    95_000 + property * 1_000 + layout.len() as u64 * 100
 }
 
 /// Every capability a raw peer offers: the layout's and the siblings'.

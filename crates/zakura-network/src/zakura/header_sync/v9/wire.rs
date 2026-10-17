@@ -483,8 +483,8 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     }
 
     /// Check an update's shape: the rules for its operation, and the credit
-    /// limits that every update shares. The publisher checks an `Open`'s start
-    /// height, which needs its chain.
+    /// limits that every update shares. The publisher takes an `Open`'s start
+    /// height as given.
     fn check_update(update: &SubscribeHeaders) -> Result<(), WireError> {
         check_subscription_id(update.subscription_id)?;
         let added = update.added_credit;

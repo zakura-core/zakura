@@ -390,9 +390,19 @@ pub mod discovery_trace {
     pub const PEER: &str = "peer";
     /// Dial result label.
     pub const RESULT: &str = "result";
+    /// Discovery stream session id field.
+    pub const SESSION_ID: &str = "session_id";
+    /// Frame-header message type field.
+    pub const MESSAGE_TYPE: &str = "message_type";
+    /// Reader stage label.
+    pub const STAGE: &str = "stage";
+    /// Rejection error text.
+    pub const ERROR: &str = "error";
 
     /// A discovery dial worker completed and was classified for backoff.
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
+    /// The discovery reader rejected a peer's frame and closed the connection.
+    pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

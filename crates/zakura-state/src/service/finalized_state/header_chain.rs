@@ -37,7 +37,7 @@ use crate::{
 };
 
 use super::{
-    disk_db::RawVisitError,
+    disk_db::{prefix_end, RawVisitError},
     disk_format::{
         header_chain::{
             EligibilityReasonKind, HeaderAuxDeliveryKey, HeaderChildKey, HeaderDeferredKey,
@@ -5878,26 +5878,29 @@ impl HeaderChainStore {
         hash: block::Hash,
     ) -> Result<Vec<EligibilityReason>, HeaderChainStoreError> {
         let mut reasons = Vec::new();
-        for tag in 0..=4 {
+        let prefixes: [Vec<u8>; 5] = std::array::from_fn(|tag| {
             let mut prefix = Vec::with_capacity(33);
-            prefix.push(tag);
+            prefix.push(u8::try_from(tag).expect("there are five eligibility tags"));
             prefix.extend(hash.0);
-            for (key, value) in self.scan_prefix(HEADER_ELIGIBILITY_ROOT, &prefix)? {
-                if key.len() != 65 {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "invalid eligibility-root key width",
-                    ));
-                }
-                let key = HeaderEligibilityRootKey::try_from_bytes(&key)
-                    .map_err(|_| HeaderChainStoreError::Incoherent("invalid eligibility key"))?;
-                let reason = HeaderEligibilityReasonDisk::decode(&value)?.into_domain();
-                if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
-                    return Err(HeaderChainStoreError::Incoherent(
-                        "eligibility key/value mismatch",
-                    ));
-                }
-                reasons.push(reason);
+            prefix
+        });
+        let cf = self.cf(HEADER_ELIGIBILITY_ROOT)?;
+        // One iterator for the five tag prefixes: creating an iterator costs more than its seeks.
+        for (key, value) in self.db.raw_prefixes_cf(&cf, &prefixes)? {
+            if key.len() != 65 {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "invalid eligibility-root key width",
+                ));
             }
+            let key = HeaderEligibilityRootKey::try_from_bytes(&key)
+                .map_err(|_| HeaderChainStoreError::Incoherent("invalid eligibility key"))?;
+            let reason = HeaderEligibilityReasonDisk::decode(&value)?.into_domain();
+            if reason_kind(&reason) != key.kind || reason_evidence(&reason) != key.evidence {
+                return Err(HeaderChainStoreError::Incoherent(
+                    "eligibility key/value mismatch",
+                ));
+            }
+            reasons.push(reason);
         }
         Ok(reasons)
     }
@@ -6674,18 +6677,6 @@ fn reason_kind(reason: &EligibilityReason) -> EligibilityReasonKind {
         EligibilityReason::ConsensusBodyInvalid { .. } => EligibilityReasonKind::ConsensusBody,
         EligibilityReason::OperatorInvalid { .. } => EligibilityReasonKind::Operator,
     }
-}
-
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    for index in (0..end.len()).rev() {
-        if end[index] != u8::MAX {
-            end[index] = end[index].saturating_add(1);
-            end.truncate(index + 1);
-            return Some(end);
-        }
-    }
-    None
 }
 
 fn reason_evidence(reason: &EligibilityReason) -> EvidenceId {

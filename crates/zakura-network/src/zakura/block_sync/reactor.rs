@@ -44,11 +44,11 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// and per-session limits only lower that). That also caps the refill low-water
 /// target, at this many requests' worth plus one [`NEEDED_BLOCK_REFILL_LIMIT`]
 /// batch. Past the pool's worth, every free entry already has a pending height
-/// to take. The extra batch keeps a full pool from draining pending work to zero
-/// before the next refill query, which would leave replacement requests waiting
-/// for its round trip. Only one refill query runs at a time and each returns at
-/// most one batch, so a bigger reserve can't refill any faster. It only absorbs
-/// a longer burst by queuing more work.
+/// to take. The extra batch lets a full pool start its next refill query while a
+/// batch of work is still pending, rather than only once pending work has run
+/// out and replacement requests are already waiting. Only one refill query runs
+/// at a time and each returns at most one batch, so a bigger reserve can't
+/// refill any faster. It only absorbs a longer burst by queuing more work.
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 const BS_REQUEST_POOL_ENTRIES: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
 
@@ -2315,8 +2315,8 @@ mod refill_target_tests {
         assert_eq!(refill_low_water_target(&enough, &config), default_cap());
     }
 
-    /// With every pool entry outstanding, refill is still due before pending
-    /// work drops below one batch, so replacements never wait on a refill query.
+    /// With every pool entry outstanding, refill becomes due as soon as pending
+    /// work drops below one batch, not only once it has run out.
     #[test]
     fn a_full_request_pool_still_refills_before_pending_work_runs_out() {
         let config = ZakuraBlockSyncConfig::default();

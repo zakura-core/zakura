@@ -8,3 +8,4 @@ mod rpc_metrics;
 mod surface;
 mod tls;
 mod vectors;
+mod wire;

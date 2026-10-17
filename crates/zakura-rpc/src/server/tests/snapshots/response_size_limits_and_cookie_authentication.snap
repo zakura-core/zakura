@@ -1,0 +1,81 @@
+---
+source: crates/zakura-rpc/src/server/tests/wire.rs
+expression: output
+---
+=== small response
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== oversized response
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"rpc.discover","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 115
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 300"}}
+
+=== oversized bitcoind response
+POST content-type=Some("application/json")
+{"method":"rpc.discover","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 113
+
+{"id":1,"result":null,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 300"}}
+
+=== batch under the limit
+POST content-type=Some("application/json")
+[{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1},{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":2}]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 135
+
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"result":{"standard_fee":400,"version":0}}]
+
+=== oversized batch response
+POST content-type=Some("application/json")
+<631 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 131
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32011,"message":"The batch response was too large","data":"Exceeded max limit of 300"}}
+
+=== batch with an oversized entry
+POST content-type=Some("application/json")
+[{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1},{"jsonrpc":"2.0","method":"rpc.discover","params":[],"id":2}]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 184
+
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 300"}}]
+
+=== no credentials
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+<connection closed>
+
+=== wrong password
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+<connection closed>

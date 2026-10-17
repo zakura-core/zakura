@@ -3863,6 +3863,13 @@ fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketA
     direct_addrs
 }
 
+/// Whether a listening node advertises addresses that peers drop. A wildcard
+/// listener without `external_addr` advertises none, and a private or
+/// loopback listener advertises one that peers must not dial.
+fn peers_drop_discovery_record(config: &Config, direct_addrs: &[SocketAddr]) -> bool {
+    config.zakura.listen_addr.is_some() && !discovery::peers_accept_direct_addrs(direct_addrs)
+}
+
 fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
     bootstrap_peers
         .iter()
@@ -4058,9 +4065,18 @@ async fn spawn_zakura_endpoint_inner(
         config.zakura.dev_network.as_deref(),
     );
     let sought_services = sought_services_with_custom(&custom_services);
+    let direct_addrs = discovery_direct_addrs(config, local_node_id);
+    if peers_drop_discovery_record(config, &direct_addrs) {
+        warn!(
+            listen_addr = ?config.zakura.listen_addr,
+            ?direct_addrs,
+            "peers will drop this node's discovery record because it advertises no address they \
+             can dial; set network.external_addr to this node's public address"
+        );
+    }
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
-        discovery_direct_addrs(config, local_node_id),
+        direct_addrs,
         provided_services_with_custom(&custom_services),
         &handshake_config,
         config.zakura.max_connections,
@@ -6591,6 +6607,38 @@ mod tests {
         assert_eq!(
             discovery_direct_addrs(&config, secret_key.public()),
             vec!["203.0.113.42:8234".parse().expect("test address parses")]
+        );
+    }
+
+    #[test]
+    fn a_listener_that_peers_cannot_dial_is_reported() {
+        let local_node_id = NodeSecretKey::generate().public();
+        let mut config = Config::default();
+        config.zakura.bootstrap_peers.clear();
+        let reported = |config: &Config| {
+            peers_drop_discovery_record(config, &discovery_direct_addrs(config, local_node_id))
+        };
+
+        config.zakura.listen_addr = None;
+        config.external_addr = None;
+        assert!(
+            !reported(&config),
+            "a node that does not listen advertises nothing"
+        );
+
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        assert!(
+            reported(&config),
+            "a wildcard listener advertises no address"
+        );
+
+        config.external_addr = Some("93.184.216.34:8233".parse().expect("test address parses"));
+        assert!(!reported(&config));
+
+        config.zakura.listen_addr = Some("10.0.0.5:8234".parse().expect("test address parses"));
+        assert!(
+            reported(&config),
+            "peers drop a record with a private address"
         );
     }
 

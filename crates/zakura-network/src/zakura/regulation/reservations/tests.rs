@@ -4,7 +4,7 @@
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Barrier,
     },
     task::{Context, Wake, Waker},
@@ -59,6 +59,67 @@ fn a_response_claims_its_frames_then_its_ending() {
     );
     assert!(map.is_empty());
     assert_eq!(pool.held(), 0, "the ending frees the pool entry");
+}
+
+/// Counts `zakura.p2p.reservation.refused` increments.
+#[derive(Default)]
+struct RefusedRecorder(Arc<AtomicU64>);
+
+impl metrics::Recorder for RefusedRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == "zakura.p2p.reservation.refused" {
+            metrics::Counter::from_arc(self.0.clone())
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A claim that succeeds leaves the refused counter unchanged.
+#[test]
+fn only_a_refused_claim_counts_as_refused() {
+    let recorder = RefusedRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let pool = pool(4);
+    let mut map = reservations(&pool, &[1]);
+    map.claim_frame(&1, message_type::PART, 65)
+        .expect("the part answers the live reservation");
+    map.claim_end(&1, message_type::DONE, 4)
+        .expect("the ending answers the live reservation");
+    assert_eq!(recorder.0.load(Ordering::Relaxed), 0);
+    assert!(map.claim_end(&1, message_type::DONE, 4).is_err());
+    assert_eq!(recorder.0.load(Ordering::Relaxed), 1);
 }
 
 #[test]

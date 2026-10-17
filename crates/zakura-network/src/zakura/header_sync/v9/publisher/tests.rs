@@ -2110,6 +2110,24 @@ proptest! {
     }
 }
 
+/// The real subscriber, on an in-process session.
+fn real_subscriber() -> super::super::subscriber::Subscriber<HB> {
+    use crate::zakura::{regulation::WriterFence, CloseCause};
+    super::super::subscriber::Subscriber::new(
+        WriterFence::new(CancellationToken::new(), CloseCause::default()),
+        &framed_channel(1).1,
+    )
+}
+
+/// A `Status` for `tip` with the publisher's own page caps.
+fn advertised(tip: Frontier) -> super::super::Status {
+    super::super::Status {
+        max_headers_per_response: limits().max_headers,
+        max_message_bytes: limits().max_bytes,
+        ..super::super::test_support::status::<HB>(tip)
+    }
+}
+
 /// Feed every written frame to the real subscriber, accepting each page as
 /// validated and applying each due `Grant`.
 async fn follow(
@@ -2160,27 +2178,16 @@ async fn follow(
 /// last header ends with `SubscriptionSuperseded`.
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
-    use super::super::{subscriber::Subscriber, test_support, Status};
-    use crate::zakura::{regulation::WriterFence, CloseCause};
-    // The publisher's own page caps, as its `Status` advertises them.
-    let status = |tip: Frontier| Status {
-        max_headers_per_response: limits().max_headers,
-        max_message_bytes: limits().max_bytes,
-        ..test_support::status::<HB>(tip)
-    };
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
-    let mut subscriber = Subscriber::<HB>::new(
-        WriterFence::new(CancellationToken::new(), CloseCause::default()),
-        &framed_channel(1).1,
-    );
+    let mut subscriber = real_subscriber();
     let open = subscriber
         .open(
-            &status(chain[9]),
+            &advertised(chain[9]),
             &[chain[2], port.genesis],
             AuxSchema::None,
             6,
@@ -2212,7 +2219,7 @@ async fn the_subscriber_follows_the_publisher() {
     let tip = port.tip();
     let open = subscriber
         .open(
-            &status(tip),
+            &advertised(tip),
             &[tip, chain[3], port.genesis],
             AuxSchema::None,
             6,
@@ -2231,6 +2238,87 @@ async fn the_subscriber_follows_the_publisher() {
     assert_eq!(
         follow(&mut harness, &mut subscriber, 6).await,
         [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
+/// A pruned publisher sends the schema-1 pages it has records for, then ends
+/// with `HistoryPruned` at the first header without one. The real subscriber
+/// reports only the page it accepted, refuses the late result for the page
+/// still in validation, and its reopen without records reaches the target
+/// from the accepted cursor.
+#[tokio::test(start_paused = true)]
+async fn the_subscriber_reopens_a_pruned_peer_without_records() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    port.store().no_record.insert(chain[3].hash);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+    let mut subscriber = real_subscriber();
+    let (open, _) = subscriber
+        .open(&advertised(chain[5]), &[port.genesis], AuxSchema::V1, 6)
+        .expect("the first Open is recorded");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+
+    harness.drain().await;
+    let mut admitted = Vec::new();
+    let mut ended = None;
+    while let Some(frame) = harness.inbox.pop_front() {
+        subscriber.admit(&frame).expect("the frame header passes");
+        match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames") {
+            Message::Headers(page) => admitted.push(
+                subscriber
+                    .receive_page(&page, frame.payload.len())
+                    .expect("the record prefix passes"),
+            ),
+            Message::HeadersOutcome(outcome) => {
+                ended = Some(
+                    subscriber
+                        .receive_outcome(&outcome)
+                        .expect("HistoryPruned is legal before the target"),
+                );
+            }
+            other => panic!("the publisher wrote {other:?}"),
+        }
+        // Accept the first page before the rest arrive. The second waits for
+        // validation when the outcome lands.
+        if admitted.len() == 1 && ended.is_none() {
+            assert_eq!(
+                subscriber.accept_through(admitted[0].id, &admitted[0].cursor, 6),
+                Ok(None)
+            );
+        }
+    }
+    let heights: Vec<_> = admitted
+        .iter()
+        .map(|page| (page.parent.height, page.cursor.height))
+        .collect();
+    assert_eq!(
+        heights,
+        [(h(0), h(2)), (h(2), h(3))],
+        "pages stop before height 4"
+    );
+    let ended = ended.expect("the path ends with an outcome");
+    assert_eq!(ended.outcome, HeadersOutcomeCode::HistoryPruned);
+    assert_eq!(ended.accepted, admitted[0].cursor);
+    assert!(subscriber
+        .accept_through(admitted[1].id, &admitted[1].cursor, 6)
+        .is_err());
+
+    let start = Frontier::new(ended.accepted.height, ended.accepted.hash);
+    let (open, _) = subscriber
+        .open(
+            &advertised(chain[5]),
+            &[start, port.genesis],
+            AuxSchema::None,
+            6,
+        )
+        .expect("the terminal outcome freed the slot");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+    assert_eq!(
+        pages(&follow(&mut harness, &mut subscriber, 6).await),
+        [(h(2), h(5), false), (h(5), h(6), true)],
+        "the plain reopen reaches the target"
     );
     harness.check_quiet().await;
 }

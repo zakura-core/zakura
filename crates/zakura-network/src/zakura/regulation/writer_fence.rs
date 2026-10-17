@@ -212,11 +212,15 @@ impl ExchangeWriter {
         true
     }
 
-    /// Whether the request's first byte was written and the exchange is still
-    /// owned, so a later frame of the exchange may follow it.
-    fn started(&self) -> bool {
-        let (_state, phase) = self.0.lock();
-        matches!(*phase, Phase::Started | Phase::Ended)
+    /// Whether a later frame of the exchange may follow its request: the
+    /// request's first byte was written, the exchange is still owned, and the
+    /// fence has neither retired nor seen its connection close. The fence's
+    /// lock orders this against retirement.
+    fn may_follow(&self) -> bool {
+        let (state, phase) = self.0.lock();
+        !state.retired
+            && !self.0.fence.0.connection.is_cancelled()
+            && matches!(*phase, Phase::Started | Phase::Ended)
     }
 }
 
@@ -248,13 +252,13 @@ impl FrameWriteClaim for FencedWrite {
 }
 
 /// A transport write claim for a later frame of an exchange, written only
-/// once the exchange's request started.
+/// once the exchange's request started and before the fence retires.
 #[derive(Debug)]
 struct FollowingWrite(ExchangeWriter);
 
 impl FrameWriteClaim for FollowingWrite {
     fn try_start(&self) -> bool {
-        self.0.started()
+        self.0.may_follow()
     }
 
     fn written(&self) {}
@@ -306,7 +310,8 @@ impl FramedSend {
     /// `writer`'s exchange, such as a subscription update after its `Open`.
     ///
     /// The transport writes `frame` only if the request's first byte was
-    /// written first, so retirement that skips the request skips `frame` too.
+    /// written first and the fence has not retired since, so retirement skips
+    /// `frame` whether or not it skipped the request.
     pub(crate) async fn send_following(
         &self,
         frame: Frame,

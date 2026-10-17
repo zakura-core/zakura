@@ -176,7 +176,8 @@ async fn a_fenced_send_writes_only_before_retirement() {
 }
 
 /// A frame queued to follow a request goes out only after the request's
-/// first byte, so retirement that skips the request skips the frame too.
+/// first byte and before retirement, so retirement skips it whether the
+/// request was skipped or already ended.
 #[tokio::test]
 async fn a_following_frame_needs_its_request_started() {
     let frame = || Frame {
@@ -184,26 +185,26 @@ async fn a_following_frame_needs_its_request_started() {
         flags: 0,
         payload: vec![7],
     };
-    for retire_first in [false, true] {
+    // Retire before the request, retire after the request ended, or never.
+    for case in 0..3 {
         let (fence, connection, _) = fence();
         let (send, mut output) = framed_channel(2);
         let mut exchange = fence.open().unwrap();
         let writer = exchange.writer();
         send.send_fenced(frame(), &writer).await.unwrap();
         send.send_following(frame(), &writer).await.unwrap();
-        if retire_first {
+        if case == 0 {
             assert!(fence.retire());
-            drop(send);
-            assert_eq!(output.recv().await, None, "both frames are skipped");
         } else {
             assert_eq!(output.recv().await, Some(frame()));
-            assert_eq!(
-                output.recv().await,
-                Some(frame()),
-                "the follow-up comes next"
-            );
             exchange.end();
+            if case == 1 {
+                assert!(fence.retire(), "an ended exchange leaves it reusable");
+            }
         }
+        drop(send);
+        let follow_up = output.recv().await;
+        assert_eq!(follow_up.is_some(), case == 2, "case {case}");
         assert!(!connection.is_cancelled());
     }
 }

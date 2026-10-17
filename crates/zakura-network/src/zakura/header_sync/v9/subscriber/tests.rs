@@ -644,18 +644,19 @@ fn a_path_to_the_target_height_without_it_faults() {
     }
 }
 
-/// A page must fit the header count and bytes of one `Status` the publisher
-/// advertised. Two `Status` messages that trade one cap for the other do not
-/// combine into a pair neither advertised, and a later `Status` that raises
-/// both lets larger pages through.
+/// A page must fit the header count and bytes of the latest `Status` before
+/// it. A later `Status` that lowers a cap binds the pages after it, even if
+/// an earlier one allowed them, and one that raises both lets larger pages
+/// through.
 #[test]
-fn pages_fit_the_advertised_caps() {
+fn pages_fit_the_latest_advertised_caps() {
     let (tree, chain) = chain(4);
-    let caps = Status {
-        max_headers_per_response: 1,
-        max_message_bytes: page_bytes(2, AuxSchema::None),
+    let advertise = |headers, max_bytes| Status {
+        max_headers_per_response: headers,
+        max_message_bytes: max_bytes,
         ..status(chain[4])
     };
+    let caps = advertise(1, page_bytes(2, AuxSchema::None));
     let mut fixture = Fixture::open_with(tree, &caps, &[chain[0]], AuxSchema::None, 100);
     assert_eq!(
         fixture.page(chain[0], &chain[1..3], false),
@@ -667,62 +668,19 @@ fn pages_fit_the_advertised_caps() {
         Err(SubscriberFault::AboveAdvertised),
         "three headers' bytes where two were advertised"
     );
-    fixture.sub.observe(&Status {
-        max_headers_per_response: 3,
-        max_message_bytes: page_bytes(1, AuxSchema::None),
-        ..status(chain[4])
-    });
+    fixture.sub.observe(&status(chain[4]));
+    fixture
+        .sub
+        .observe(&advertise(3, page_bytes(1, AuxSchema::None)));
     assert_eq!(
         fixture.page(chain[0], &chain[1..3], false),
         Err(SubscriberFault::AboveAdvertised),
-        "each Status allows only one of the page's count and bytes"
+        "the latest Status lowered the byte cap"
     );
     fixture.sub.observe(&status(chain[4]));
     fixture
         .page(chain[0], &chain[1..4], false)
-        .expect("the later Status raised both caps");
-}
-
-/// However many `Status` messages trade one cap for the other, each keeps
-/// its own pair: a page that takes the header count of one and the bytes of
-/// another faults.
-#[test]
-fn trading_caps_stay_paired() {
-    let (tree, chain) = chain(8);
-    let bytes = |count| page_bytes(count, AuxSchema::None);
-    let advertise = |headers, max_bytes| Status {
-        max_headers_per_response: headers,
-        max_message_bytes: max_bytes,
-        ..status(chain[8])
-    };
-    let mut fixture = Fixture::open_with(
-        tree,
-        &advertise(1, bytes(7)),
-        &[chain[0]],
-        AuxSchema::None,
-        100,
-    );
-    // Each pair allows more headers and fewer bytes than the one before, and
-    // none allows four headers with four headers' bytes.
-    for (headers, max_bytes) in [
-        (2, bytes(6)),
-        (3, bytes(5)),
-        (4, bytes(4) - 1),
-        (5, bytes(4) - 2),
-        (6, bytes(4) - 3),
-        (7, bytes(4) - 4),
-    ] {
-        fixture.sub.observe(&advertise(headers, max_bytes));
-    }
-    assert_eq!(fixture.sub.live.as_ref().expect("live").caps.len(), 7);
-    assert_eq!(
-        fixture.page(chain[0], &chain[1..5], false),
-        Err(SubscriberFault::AboveAdvertised)
-    );
-    fixture.sub.observe(&advertise(4, bytes(4)));
-    fixture
-        .page(chain[0], &chain[1..5], false)
-        .expect("a Status allowing both arrived");
+        .expect("the latest Status raised both caps");
 }
 
 /// Each outcome is legal exactly in its window: before the first page, before

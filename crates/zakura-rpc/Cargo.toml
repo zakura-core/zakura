@@ -58,8 +58,6 @@ getset = { workspace = true }
 derive-new = { workspace = true }
 thiserror = { workspace = true }
 lazy_static = { workspace = true }
-strum = { workspace = true }
-strum_macros = { workspace = true }
 
 # RPC endpoint basic auth
 base64 = { workspace = true }
@@ -113,8 +111,6 @@ zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
-# Only used to read the validity dates of the configured RPC TLS certificates.
-der = "0.7.10"
 
 [dev-dependencies]
 

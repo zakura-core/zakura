@@ -6819,6 +6819,285 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     drop(new_inbound_tx);
 }
 
+/// How the first session ends in [`stale_disconnect_keeps_replacement_registry_entry`].
+#[derive(Clone, Copy, Debug)]
+enum FirstSessionEnd {
+    /// The stream closes and reopens on the same connection.
+    StreamReopened,
+    /// The connection closes and the peer returns on a new connection.
+    Reconnected,
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reopened_stream_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::StreamReopened).await;
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reconnected_peer_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::Reconnected).await;
+}
+
+/// A spawned reactor and a service whose lifecycle events the test relays to
+/// it, so the test decides when the reactor handles each one.
+pub(super) struct RelayedBlockSync {
+    handle: BlockSyncHandle,
+    pub(super) service: BlockSyncService,
+    lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    snapshots: watch::Receiver<ServicePeerSnapshot>,
+    _tip: watch::Sender<(block::Height, block::Hash)>,
+    _actions: mpsc::Receiver<BlockSyncAction>,
+}
+
+impl RelayedBlockSync {
+    /// Spawn a reactor and a relayed service, both using `config`.
+    pub(super) fn spawn(config: ZakuraBlockSyncConfig) -> Self {
+        let (tip, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            config.clone(),
+        );
+        let (handle, actions, _reactor_task) =
+            spawn_block_sync_reactor(startup).expect("valid block-sync config");
+        let (lifecycle_tx, lifecycle) = mpsc::unbounded_channel();
+        let service = BlockSyncService::new_with_handle_for_test(
+            config,
+            BlockSyncHandle {
+                lifecycle: lifecycle_tx,
+                ..handle.clone()
+            },
+        );
+        Self {
+            snapshots: handle.subscribe_peer_snapshot(),
+            handle,
+            service,
+            lifecycle,
+            _tip: tip,
+            _actions: actions,
+        }
+    }
+
+    /// The registry the reactor shares with the service's routines.
+    fn registry(&self) -> &PeerRegistry {
+        &self
+            .handle
+            .routine_wiring
+            .as_ref()
+            .expect("a spawned reactor wires peer routines")
+            .registry
+    }
+
+    /// Whether the registry has an entry for `peer`.
+    pub(super) fn has_entry(&self, peer: &ZakuraPeerId) -> bool {
+        self.registry()
+            .candidate_snapshot()
+            .iter()
+            .any(|(candidate, ..)| candidate == peer)
+    }
+
+    /// Open a regulated outbound block-sync stream for `peer` on `conn_id`.
+    /// Dropping the returned inbound sender ends the stream.
+    pub(super) fn add_outbound(
+        &self,
+        conn_id: u64,
+        peer: &ZakuraPeerId,
+    ) -> (FramedSend, FramedRecv) {
+        let (inbound_tx, inbound_rx) = framed_channel(4);
+        let (outbound_tx, outbound_rx) = framed_channel(4);
+        self.service.add_peer(Peer::new_with_conn_id_and_direction(
+            conn_id,
+            peer.clone(),
+            None,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            ServicePeerDirection::Outbound,
+            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+            CancellationToken::new(),
+        ));
+        (inbound_tx, outbound_rx)
+    }
+
+    /// Wait for the next lifecycle event the service queued for the reactor.
+    pub(super) async fn next_event(&mut self) -> BlockSyncEvent {
+        tokio::time::timeout(Duration::from_secs(3), self.lifecycle.recv())
+            .await
+            .expect("lifecycle event arrives")
+            .expect("lifecycle channel stays open")
+    }
+
+    /// Relay `event` to the reactor and return its admitted outbound peer count
+    /// once the reactor has handled it.
+    pub(super) async fn relay(&mut self, event: BlockSyncEvent) -> usize {
+        self.snapshots.borrow_and_update();
+        self.handle
+            .send_control(event)
+            .expect("the reactor is running");
+        // The reactor republishes its peer snapshot for every peer lifecycle
+        // event it handles, except a connect it skips.
+        tokio::time::timeout(Duration::from_secs(3), self.snapshots.changed())
+            .await
+            .expect("the reactor handles the relayed event")
+            .expect("the peer snapshot stays open");
+        self.snapshots.borrow().outbound_peers
+    }
+}
+
+/// Whether `event` is a connect for `peer`.
+fn connects(event: &BlockSyncEvent, peer: &ZakuraPeerId) -> bool {
+    matches!(event, BlockSyncEvent::PeerConnected(session) if session.peer_id() == peer)
+}
+
+/// Whether `event` is a disconnect for `peer`.
+fn disconnects(event: &BlockSyncEvent, peer: &ZakuraPeerId) -> bool {
+    matches!(event, BlockSyncEvent::PeerDisconnected(gone) if gone == peer)
+}
+
+/// Admit a replacement session before the reactor handles the first session's
+/// disconnect. The stale disconnect must leave the replacement's registry entry
+/// in place, so the replacement's `Status` still reaches the registry. The
+/// replacement's own disconnect then removes its handle and entry.
+async fn stale_disconnect_keeps_replacement_registry_entry(end: FirstSessionEnd) {
+    let mut relayed = RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
+    let peer = peer(0x52);
+    let first_conn_id = 1;
+
+    let (first_inbound_tx, _first_outbound_rx) = relayed.add_outbound(first_conn_id, &peer);
+    let connected = relayed.next_event().await;
+    assert!(connects(&connected, &peer));
+    assert_eq!(relayed.relay(connected).await, 1);
+
+    let second_conn_id = match end {
+        FirstSessionEnd::StreamReopened => {
+            drop(first_inbound_tx);
+            first_conn_id
+        }
+        FirstSessionEnd::Reconnected => {
+            relayed.service.remove_peer(&peer, first_conn_id);
+            first_conn_id + 1
+        }
+    };
+    let disconnected = relayed.next_event().await;
+    assert!(disconnects(&disconnected, &peer));
+
+    // The replacement is admitted before the reactor handles that disconnect.
+    let (second_inbound_tx, _second_outbound_rx) = relayed.add_outbound(second_conn_id, &peer);
+    let replacement = relayed.next_event().await;
+    assert!(connects(&replacement, &peer));
+
+    assert_eq!(relayed.relay(disconnected).await, 0);
+    assert_eq!(relayed.relay(replacement).await, 1);
+    assert!(
+        relayed.has_entry(&peer),
+        "a stale disconnect must not remove the replacement's registry entry",
+    );
+
+    second_inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+    await_until(
+        "the replacement's status reaches the registry",
+        Duration::from_secs(3),
+        || relayed.registry().has_received_status(&peer),
+    )
+    .await
+    .expect("the replacement routine publishes its peer's status");
+
+    drop(second_inbound_tx);
+    let gone = relayed.next_event().await;
+    assert!(disconnects(&gone, &peer));
+    assert_eq!(relayed.relay(gone).await, 0);
+    assert!(
+        !relayed.has_entry(&peer),
+        "the replacement's own disconnect removes its registry entry",
+    );
+}
+
+/// A replaced session sends no disconnect of its own. If its replacement ends
+/// before the reactor handles the replacement's connect, the reactor skips that
+/// connect. The replacement's disconnect must still drop the replaced session's
+/// serving handle and the replacement's closed registry entry.
+#[tokio::test]
+async fn disconnect_of_a_skipped_replacement_removes_the_older_handle() {
+    let mut relayed = RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
+    let peer = peer(0x53);
+
+    let _old_stream = relayed.add_outbound(1, &peer);
+    let connected = relayed.next_event().await;
+    assert_eq!(relayed.relay(connected).await, 1);
+
+    let _new_stream = relayed.add_outbound(2, &peer);
+    let BlockSyncEvent::PeerConnected(replacement) = relayed.next_event().await else {
+        panic!("the replacement session connects");
+    };
+    replacement.cancel_token().cancel();
+    let disconnect = relayed.next_event().await;
+    assert!(disconnects(&disconnect, &peer));
+
+    // The reactor skips the cancelled connect without publishing a snapshot.
+    relayed
+        .handle
+        .send_control(BlockSyncEvent::PeerConnected(replacement))
+        .expect("the reactor is running");
+    assert_eq!(
+        relayed.relay(disconnect).await,
+        0,
+        "the replaced session's handle must not outlive its replacement",
+    );
+    assert!(!relayed.has_entry(&peer));
+}
+
+/// The reactor parks a session it has no slot for but leaves the session's
+/// registry entry to the session's teardown, since by then the entry could
+/// belong to a replacement. The rejected session's disconnect removes it.
+#[tokio::test]
+async fn a_rejected_session_leaves_its_registry_entry_to_its_teardown() {
+    let mut config = ZakuraBlockSyncConfig::default();
+    config.peer_limits.max_outbound_peers = 1;
+    let mut relayed = RelayedBlockSync::spawn(config);
+    let (holder, rejected) = (peer(0x54), peer(0x55));
+
+    // The holder's ended session keeps the reactor's only outbound slot until
+    // the reactor handles its disconnect.
+    let (holder_inbound_tx, _holder_outbound_rx) = relayed.add_outbound(1, &holder);
+    let connected = relayed.next_event().await;
+    assert_eq!(relayed.relay(connected).await, 1);
+    drop(holder_inbound_tx);
+    let holder_gone = relayed.next_event().await;
+    assert!(disconnects(&holder_gone, &holder));
+
+    let _stream = relayed.add_outbound(2, &rejected);
+    let connect = relayed.next_event().await;
+    assert!(connects(&connect, &rejected));
+    assert_eq!(relayed.relay(connect).await, 1, "the reactor has no slot");
+    assert!(
+        relayed.has_entry(&rejected),
+        "rejection leaves the registry entry to the session's teardown",
+    );
+
+    let rejected_gone = relayed.next_event().await;
+    assert!(disconnects(&rejected_gone, &rejected));
+    assert_eq!(relayed.relay(holder_gone).await, 0);
+    assert_eq!(relayed.relay(rejected_gone).await, 0);
+    assert!(!relayed.has_entry(&rejected));
+}
+
 #[tokio::test]
 async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let mut config = ZakuraBlockSyncConfig::default();

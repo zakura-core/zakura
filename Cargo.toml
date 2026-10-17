@@ -140,8 +140,6 @@ sha2 = "0.10"
 socket2 = "0.6"
 sinsemilla = { version = "=3.0.0", package = "zakura-sinsemilla" }
 anyhow = "1.0"
-strum = "0.28"
-strum_macros = "0.28"
 subtle = { version = "2.6", default-features = false }
 tempfile = "3.20"
 thiserror = "2.0"

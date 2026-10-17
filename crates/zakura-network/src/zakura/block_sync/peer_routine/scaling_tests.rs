@@ -11,15 +11,25 @@ use crate::zakura::regulation::ReservationPool;
 use zakura_chain::serialization::ZcashDeserializeInto;
 
 /// A routine with `window` single-block requests' worth of work and capacity.
-struct Probe {
-    routine: PeerRoutine,
-    outbound: FramedRecv,
-    blocks: Vec<Arc<block::Block>>,
+pub(super) struct Probe {
+    pub(super) routine: PeerRoutine,
+    pub(super) outbound: FramedRecv,
+    pub(super) blocks: Vec<Arc<block::Block>>,
     _bodies: mpsc::Receiver<SequencedBody>,
     _events: mpsc::Receiver<RoutineToReactor>,
 }
 
+/// [`probe_in`] with a private pool of `window` entries.
 fn probe(window: u32) -> Probe {
+    probe_in(
+        window,
+        ReservationPool::new(usize::try_from(window).unwrap()).unwrap(),
+    )
+}
+
+/// A routine that may open `window` requests at once, without waiting for a
+/// body, for work at heights `1..=window`. Its requests reserve from `pool`.
+pub(super) fn probe_in(window: u32, pool: ReservationPool) -> Probe {
     let config = ZakuraBlockSyncConfig {
         max_inflight_requests: window,
         initial_inflight_requests: window,
@@ -54,7 +64,7 @@ fn probe(window: u32) -> Probe {
         &session,
         &in_recv,
         &config,
-        ReservationPool::new(usize::try_from(window).unwrap()).unwrap(),
+        pool,
         &CancellationToken::new(),
     );
     let mut routine = PeerRoutine::new(
@@ -128,7 +138,11 @@ async fn deliver(routine: &mut PeerRoutine, message: BlockSyncMessage) {
 #[ignore = "manual scaling probe; run in release with --nocapture"]
 #[allow(clippy::print_stderr)] // Report the per-event cost with --nocapture.
 async fn request_bookkeeping_scaling() {
-    for window in [1_000u32, 2_000, 4_000, 8_000, 16_000] {
+    use super::super::regulated::live_requester::SESSION_RESERVATIONS;
+
+    // One session holds at most its pool share, so the largest window is that share.
+    let largest = u32::try_from(SESSION_RESERVATIONS).expect("the session share fits u32");
+    for window in [largest / 8, largest / 4, largest / 2, largest] {
         let Probe {
             mut routine,
             mut outbound,

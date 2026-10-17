@@ -488,3 +488,38 @@ fn ignores_certificates_that_are_not_valid_der() {
 
     assert!(certificate_validity(&certificate, NOT_BEFORE).is_err());
 }
+
+#[test]
+fn rejects_non_der_lengths() {
+    // Both test certificates start with a two-byte long-form length: `30 82 xx xx`.
+    let certificate = certificate(UTC_TIME_CERT).as_ref().to_vec();
+    assert_eq!(certificate[..2], [0x30, 0x82]);
+    let contents = &certificate[4..];
+
+    let with_header = |header: &[u8]| CertificateDer::from([header, contents].concat());
+    let length = u16::try_from(contents.len()).expect("test certificate is under 64 KiB");
+    let [high, low] = length.to_be_bytes();
+
+    assert_eq!(
+        certificate_validity(&with_header(&[0x30, 0x82, high, low]), NOT_BEFORE),
+        Ok(CertificateValidity::Current),
+        "the minimal encoding is accepted",
+    );
+    assert!(
+        certificate_validity(&with_header(&[0x30, 0x83, 0, high, low]), NOT_BEFORE).is_err(),
+        "a length with a leading zero byte is not DER",
+    );
+    assert!(
+        certificate_validity(&with_header(&[0x30, 0x80]), NOT_BEFORE).is_err(),
+        "an indefinite length is not DER",
+    );
+    let [high_past_end, low_past_end] = (length + 1).to_be_bytes();
+    assert!(
+        certificate_validity(
+            &with_header(&[0x30, 0x82, high_past_end, low_past_end]),
+            NOT_BEFORE
+        )
+        .is_err(),
+        "a length past the end of the input is truncated",
+    );
+}

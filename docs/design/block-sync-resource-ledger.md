@@ -79,9 +79,15 @@ needed.
 
 ### Requester bookkeeping
 
-The node-wide request pool holds 32,768 live ranges. Each range keeps at most 128 expected
-hashes, so hashes total at most 128 MiB. Range maps release their excess capacity after a
-peak (`shrink_after_peak`), so a burst does not pin its high-water allocation.
+The node-wide request pool holds 32,768 live ranges. One session holds at most an eighth of
+them, 4,096 (`SESSION_RESERVATIONS`), so two sessions take at most a quarter of the pool. Normal
+sync stays below that: a default Zakura server advertises 2,816 in-flight requests, and the header
+lead keeps missing heights within 4,000. Abandoned exchanges after GC or a reorg, or a larger
+custom advertisement, can briefly reach it, and the session then waits for endings. A session also
+stops issuing while 64 fully received ranges still owe an ending (`MAX_PENDING_ENDINGS`). Each
+range keeps at most 128 expected hashes, so hashes total at most 128 MiB. Range maps release their
+excess capacity after a peak (`shrink_after_peak`), so a burst does not pin its high-water
+allocation.
 
 ### Raw frames
 

@@ -12,8 +12,6 @@ use std::fmt;
 use chrono::{DateTime, Duration, Utc};
 use hex::{FromHex, ToHex};
 
-use strum::{EnumIter, IntoEnumIterator};
-
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -22,10 +20,9 @@ use proptest_derive::Arbitrary;
 /// Network upgrades change the Zcash network protocol or consensus rules. Note that they have no
 /// designated codenames from NU5 onwards.
 ///
-/// Enum variants must be ordered by activation height.
-#[derive(
-    Copy, Clone, EnumIter, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd,
-)]
+/// Enum variants must be ordered by activation height, and listed in the same order in
+/// [`NETWORK_UPGRADES`].
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NetworkUpgrade {
     /// The Zcash protocol for a Genesis block.
@@ -71,6 +68,36 @@ pub enum NetworkUpgrade {
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
 }
+
+/// Every [`NetworkUpgrade`], in activation order.
+const NETWORK_UPGRADES: &[NetworkUpgrade] = &[
+    Genesis,
+    BeforeOverwinter,
+    Overwinter,
+    Sapling,
+    Blossom,
+    Heartwood,
+    Canopy,
+    Nu5,
+    Nu6,
+    Nu6_1,
+    Nu6_2,
+    Nu6_3,
+    Nu7,
+    #[cfg(zcash_unstable = "zfuture")]
+    ZFuture,
+];
+
+// Each variant's discriminant is its declaration position, so this rejects a list with
+// missing, repeated, or reordered variants before the last one.
+const _: () = {
+    let mut position = 0;
+    while position < NETWORK_UPGRADES.len() {
+        // `NetworkUpgrade` is a fieldless enum with fewer than 256 variants.
+        assert!(NETWORK_UPGRADES[position] as usize == position);
+        position += 1;
+    }
+};
 
 impl TryFrom<u32> for NetworkUpgrade {
     type Error = crate::Error;
@@ -625,7 +652,7 @@ impl NetworkUpgrade {
 
     /// Returns an iterator over [`NetworkUpgrade`] variants.
     pub fn iter() -> impl DoubleEndedIterator<Item = NetworkUpgrade> {
-        <Self as IntoEnumIterator>::iter()
+        NETWORK_UPGRADES.iter().copied()
     }
 }
 

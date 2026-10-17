@@ -362,12 +362,13 @@ where
 {
     fn continuation_locator(
         &self,
+        permit: port::LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<zakura_header_chain::HeaderLocator>, PortError>> {
         let read_state = self.read_state.clone();
         Box::pin(async move {
             match tokio::time::timeout(
                 ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
-                read_state.oneshot(zakura_state::ReadRequest::HeaderLocator),
+                read_state.oneshot(zakura_state::ReadRequest::HeaderLocator { permit }),
             )
             .await
             {

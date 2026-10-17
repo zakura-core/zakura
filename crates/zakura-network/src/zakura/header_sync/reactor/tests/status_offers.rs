@@ -896,3 +896,195 @@ fn a_new_tip_during_application_starts_under_the_applied_authority() {
     assert_ne!(current, stale);
     assert_eq!(current.header_generation, applied.header_generation);
 }
+
+#[test]
+fn locator_evictions_bound_retained_operations() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let mut outbounds = Vec::new();
+    for byte in 1..=32_u8 {
+        if byte > 16 {
+            let previous = ZakuraPeerId::new(vec![byte - 1; 32]).unwrap();
+            let mut downgrade = status_for(&snapshot, block::Hash([byte - 1; 32]));
+            downgrade.suffix_cumulative_work = zakura_chain::work::difficulty::U256::zero();
+            reactor.handle_status(previous, 0, downgrade);
+        }
+        let (peer, outbound) = connect(&mut reactor, byte);
+        outbounds.push(outbound);
+        reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([byte; 32])));
+    }
+    assert!(reactor.pending_locator_queries.len() <= MAX_STAGED_TARGETS_V1);
+    assert!(reactor.pending_port_operations.len() <= MAX_STAGED_TARGETS_V1);
+}
+
+// Models a service that has accepted work which outlives the caller's timeout.
+use zakura_node_services::header_chain as port;
+
+#[derive(Default)]
+struct DelayedLocatorPort {
+    accepted: std::sync::Mutex<Vec<port::LocatorReadPermit>>,
+}
+
+impl port::Port for DelayedLocatorPort {
+    fn continuation_locator(
+        &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
+    ) -> port::HeaderChainFuture<
+        '_,
+        Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
+    > {
+        self.accepted.lock().unwrap().push(_permit);
+        Box::pin(std::future::pending())
+    }
+    fn vct_repair_context(
+        &self,
+        _: zakura_header_chain::BodyWorkOwner,
+        _: block::Height,
+    ) -> port::HeaderChainFuture<'_, Result<port::VctRepairContextReply, port::PortError>> {
+        Box::pin(async { Ok(port::VctRepairContextReply::Stale) })
+    }
+    fn acquire_header_path(
+        &self,
+        _: port::AcquirePath,
+    ) -> port::HeaderChainFuture<'_, Result<port::AcquirePathReply, port::PortError>> {
+        Box::pin(async { Ok(port::AcquirePathReply::TargetNotRetained) })
+    }
+    fn read_header_path(
+        &self,
+        _: port::RetainedHeaderPath,
+        _: port::ReadPath,
+    ) -> port::HeaderChainFuture<'_, Result<port::ReadPathReply, port::PortError>> {
+        panic!("the capacity fixture never acquires a path")
+    }
+    fn release_header_path(
+        &self,
+        _: port::RetainedHeaderPath,
+    ) -> port::HeaderChainFuture<'_, Result<(), port::PortError>> {
+        panic!("the capacity fixture never acquires a path")
+    }
+    fn prepare_header_target(
+        &self,
+        _: port::PrepareHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::PrepareHeaderTargetReply> {
+        panic!("the capacity fixture only serves headers")
+    }
+    fn apply_header_target(
+        &self,
+        _: port::PreparedHeaderTarget,
+    ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
+        panic!("the capacity fixture only serves headers")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    let port = Arc::new(DelayedLocatorPort::default());
+    reactor.startup.header_chain_port = port.clone();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let mut outbounds = Vec::new();
+    for byte in 1..=16 {
+        let (peer, outbound) = connect(&mut reactor, byte);
+        outbounds.push(outbound);
+        reactor.handle_status(
+            peer.clone(),
+            0,
+            status_for(&snapshot, block::Hash([byte; 32])),
+        );
+        assert!(reactor
+            .pending_port_operations
+            .next()
+            .now_or_never()
+            .is_none());
+        reactor.handle_peer_disconnected(&peer, 0, "test churn");
+    }
+    assert_eq!(port.accepted.lock().unwrap().len(), 16);
+    assert_eq!(reactor.locator_capacity.available_permits(), 0);
+    let (peer, outbound) = connect(&mut reactor, 17);
+    outbounds.push(outbound);
+    reactor.handle_status(
+        peer.clone(),
+        0,
+        status_for(&snapshot, block::Hash([17; 32])),
+    );
+    assert!(!reactor.peer_state[&peer].status_spent);
+    time::advance(reactor.startup.request_timeout).await;
+    while let Some(Some(completion)) = reactor.pending_port_operations.next().now_or_never() {
+        reactor.handle_port_completion(completion);
+    }
+    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.locator_capacity.available_permits(), 0);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.pending_locator_queries.is_empty());
+    assert!(!reactor.peer_state[&peer].status_spent);
+    // The real service finishes one orphaned read. Its last permit drop wakes
+    // the reactor's capacity branch, with no timer or new wire Status needed.
+    port.accepted.lock().unwrap().pop();
+    let permit = reactor
+        .locator_capacity
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    drop(permit);
+    reactor.locator_capacity_waiting = false;
+    reactor.schedule_cached_statuses();
+    assert_eq!(reactor.pending_locator_queries.len(), 1);
+    assert!(reactor
+        .pending_port_operations
+        .next()
+        .now_or_never()
+        .is_none());
+    assert_eq!(port.accepted.lock().unwrap().len(), 16);
+    assert_eq!(reactor.locator_capacity.available_permits(), 0);
+    // Shutting down the reactor still cannot free capacity owned by the service.
+    let capacity = reactor.locator_capacity.clone();
+    drop(reactor);
+    assert_eq!(capacity.available_permits(), 0);
+    port.accepted.lock().unwrap().clear();
+    assert_eq!(capacity.available_permits(), MAX_STAGED_TARGETS_V1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, block::Hash([1; 32])));
+    let mut outbounds = Vec::new();
+    for session_id in 1..=32 {
+        if session_id % 2 == 0 {
+            reactor.handle_peer_disconnected(&peer, session_id - 1, "test reconnect");
+        }
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+            peer.clone(),
+            session_id,
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().unwrap();
+        outbounds.push(outbound);
+        // A late disconnect for the previous session must not retire the replacement.
+        reactor.handle_peer_disconnected(&peer, session_id - 1, "stale disconnect");
+        reactor.handle_status(
+            peer.clone(),
+            session_id,
+            status_for(&snapshot, block::Hash([2; 32])),
+        );
+        assert_eq!(reactor.pending_locator_queries.len(), 1);
+        assert_eq!(
+            reactor.locator_capacity.available_permits(),
+            MAX_STAGED_TARGETS_V1 - 1
+        );
+    }
+    reactor.handle_peer_disconnected(&peer, 32, "test final disconnect");
+    let completion = reactor.pending_port_operations.next().await.unwrap();
+    reactor.handle_port_completion(completion);
+    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(
+        reactor.locator_capacity.available_permits(),
+        MAX_STAGED_TARGETS_V1
+    );
+    assert_eq!(reactor.peer_work_queue.len(), 0);
+}

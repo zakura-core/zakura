@@ -55,6 +55,7 @@ impl PendingVctLocalPort {
 impl port::Port for PendingVctLocalPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,

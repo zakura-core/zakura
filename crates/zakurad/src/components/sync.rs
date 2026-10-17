@@ -36,6 +36,7 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 
 use crate::{
@@ -1381,7 +1382,7 @@ where
                 tokio::task::yield_now().await;
             }
             let ready_tip_network = self.tip_network.ready().await.ok()?;
-            requests.push(tokio::spawn(ready_tip_network.call(
+            requests.push(spawn_erased(ready_tip_network.call(
                 zn::Request::FindHeaders {
                     known_blocks: block_locator.clone(),
                     stop: None,
@@ -2006,7 +2007,7 @@ where
             }
 
             let ready_tip_network = self.tip_network.ready().await;
-            requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+            requests.push(spawn_erased(ready_tip_network.map_err(|e| eyre!(e))?.call(
                 zn::Request::FindBlocks {
                     known_blocks: block_locator.clone(),
                     stop: None,
@@ -2211,7 +2212,7 @@ where
                 }
 
                 let ready_tip_network = tip_network.ready().await;
-                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+                responses.push(spawn_erased(ready_tip_network.map_err(|e| eyre!(e))?.call(
                     zn::Request::FindBlocks {
                         known_blocks: vec![tip.tip],
                         stop: None,

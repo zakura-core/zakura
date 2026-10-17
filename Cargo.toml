@@ -95,6 +95,7 @@ jsonrpsee = "0.26.1"
 jsonrpsee-proc-macros = "0.26.1"
 jsonrpsee-types = "0.26.1"
 jubjub = { version = "=4.0.0-rc0", package = "zakura-jubjub" }
+async-trait = "0.1.89"
 lazy_static = "1.4"
 libc = "0.2"
 log = "0.4.27"

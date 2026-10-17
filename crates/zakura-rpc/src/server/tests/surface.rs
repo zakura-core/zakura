@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use jsonrpsee::RpcModule;
 use reqwest::Client;
 use tokio::sync::watch;
 use tower::buffer::Buffer;
@@ -15,7 +14,7 @@ use tower::buffer::Buffer;
 use crate::{
     config::rpc::{Config, TlsConfig},
     methods::{RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
-    server::{configure_rpc_methods, primary_rpc_surface, MAX_RPC_BATCH_REQUESTS},
+    server::{enabled_rpc_methods, primary_rpc_surface, MAX_RPC_BATCH_REQUESTS},
 };
 use zakura_chain::{chain_sync_status::MockSyncStatus, chain_tip::NoChainTip, parameters::Network};
 use zakura_network::address_book_peers::MockAddressBookPeers;
@@ -24,17 +23,9 @@ use zakura_test::mock_service::MockService;
 
 use super::super::RpcServer;
 
-/// Builds a module containing every explicitly classified method.
-fn classified_module() -> RpcModule<()> {
-    let mut module = RpcModule::new(());
-
-    for (method_name, _) in RPC_METHOD_ACCESS {
-        module
-            .register_method(method_name, |_params, _context, _extensions| true)
-            .expect("classified method names should be unique and valid");
-    }
-
-    module
+/// Returns every explicitly classified method name.
+fn classified_methods() -> Vec<&'static str> {
+    RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect()
 }
 
 #[test]
@@ -55,11 +46,10 @@ fn access_policy_matches_the_openrpc_method_set() {
 
 #[test]
 fn restricted_surface_contains_only_unauthenticated_methods() {
-    let mut module = classified_module();
-    configure_rpc_methods(&mut module, RpcSurface::Restricted)
-        .expect("the reviewed method classification should be complete");
-
-    let actual: BTreeSet<_> = module.method_names().collect();
+    let actual: BTreeSet<_> = enabled_rpc_methods(&classified_methods(), RpcSurface::Restricted)
+        .expect("the reviewed method classification should be complete")
+        .into_iter()
+        .collect();
     let expected: BTreeSet<_> = RPC_METHOD_ACCESS
         .iter()
         .filter_map(|(name, access)| (*access == RpcAccess::Unauthenticated).then_some(*name))
@@ -76,11 +66,10 @@ fn restricted_surface_contains_only_unauthenticated_methods() {
 
 #[test]
 fn full_surface_retains_admin_and_test_methods() {
-    let mut module = classified_module();
-    configure_rpc_methods(&mut module, RpcSurface::Full)
-        .expect("the reviewed method classification should be complete");
-
-    let actual: BTreeSet<_> = module.method_names().collect();
+    let actual: BTreeSet<_> = enabled_rpc_methods(&classified_methods(), RpcSurface::Full)
+        .expect("the reviewed method classification should be complete")
+        .into_iter()
+        .collect();
 
     assert!(actual.contains("invalidateblock"));
     assert!(actual.contains("reconsiderblock"));
@@ -92,14 +81,10 @@ fn full_surface_retains_admin_and_test_methods() {
 
 #[test]
 fn unclassified_methods_fail_closed() {
-    let mut module = classified_module();
-    module
-        .register_method("new_unreviewed_method", |_params, _context, _extensions| {
-            true
-        })
-        .expect("test method should register");
+    let mut methods = classified_methods();
+    methods.push("new_unreviewed_method");
 
-    let error = configure_rpc_methods(&mut module, RpcSurface::Restricted)
+    let error = enabled_rpc_methods(&methods, RpcSurface::Restricted)
         .expect_err("an unclassified method must prevent server startup");
 
     assert!(error.to_string().contains("new_unreviewed_method"));
@@ -259,7 +244,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     assert_eq!(blocked_batch_item["error"]["code"], -32601);
 
     // Every call in a batch must pass through the per-call middleware, which
-    // rewrites jsonrpsee's invalid-params code to the `zcashd` legacy code.
+    // rewrites the JSON-RPC invalid-params code to the `zcashd` legacy code.
     let invalid_params_batch = client
         .post(format!("http://{restricted_addr}"))
         .header("content-type", "application/json")
@@ -438,7 +423,7 @@ async fn oversized_batches_are_rejected_before_dispatch() {
         client.post(format!("https://localhost:{}/", tls_addr.port())),
     ];
 
-    let limit = usize::try_from(MAX_RPC_BATCH_REQUESTS).expect("the batch limit fits in usize");
+    let limit = MAX_RPC_BATCH_REQUESTS;
     let invalid_entries = vec!["0"; limit].join(",");
     let full_batch = format!("[{invalid_entries}]");
     let oversized_batch =

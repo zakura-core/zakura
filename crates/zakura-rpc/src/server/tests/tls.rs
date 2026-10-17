@@ -1,11 +1,7 @@
 //! Tests for TLS PEM parsing and listener connection lifetimes.
 
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, io::ErrorKind, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
-use jsonrpsee::{
-    server::{stop_channel, Server, ServerConfig, ServerHandle},
-    RpcModule,
-};
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,9 +12,14 @@ use tokio::{
 use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
 
 use super::super::{
-    certificate_validity, parse_tls_cert_chain, parse_tls_private_key, run_tls_listener,
-    serve_tls_connection, CertificateValidity, MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS,
-    TLS_HANDSHAKE_TIMEOUT, TLS_HEADER_READ_TIMEOUT,
+    certificate_validity,
+    http::JsonRpcHttpService,
+    jsonrpc::{Id, MethodResponse, Params},
+    parse_tls_cert_chain, parse_tls_private_key,
+    rpc_service::{RpcMethods, RpcService},
+    run_tls_listener, serve_tls_connection, stop_channel, CertificateValidity, ServerHandle,
+    MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS, TLS_HANDSHAKE_TIMEOUT,
+    TLS_HEADER_READ_TIMEOUT,
 };
 
 // This self-signed localhost certificate and key are exclusively test fixtures.
@@ -27,6 +28,34 @@ const HANDSHAKE_KEY: &str = include_str!("handshake-key.pem");
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the `slow` test method takes to respond.
 const SLOW_METHOD_DELAY: Duration = Duration::from_secs(2);
+
+/// A `ping` method that returns `pong`, and a `slow` method that returns `done` after
+/// [`SLOW_METHOD_DELAY`].
+#[derive(Clone)]
+struct TestMethods;
+
+impl RpcMethods for TestMethods {
+    const METHOD_NAMES: &'static [&'static str] = &["ping", "slow"];
+
+    fn call<'a>(
+        &'a self,
+        method: &str,
+        _params: Params<'a>,
+        id: Id<'a>,
+        max_response_size: usize,
+    ) -> Option<Pin<Box<dyn Future<Output = MethodResponse> + Send + 'a>>> {
+        match method {
+            "ping" => Some(Box::pin(async move {
+                MethodResponse::response(id, &Ok("pong"), max_response_size)
+            })),
+            "slow" => Some(Box::pin(async move {
+                sleep(SLOW_METHOD_DELAY).await;
+                MethodResponse::response(id, &Ok("done"), max_response_size)
+            })),
+            _ => None,
+        }
+    }
+}
 
 struct TestTlsListener {
     address: SocketAddr,
@@ -66,17 +95,15 @@ impl TestTlsListener {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (stop_handle, handle) = stop_channel();
-        let mut methods = RpcModule::new(());
-        methods.register_method("ping", |_, _, _| "pong").unwrap();
-        methods
-            .register_async_method("slow", |_, _, _| async {
-                sleep(SLOW_METHOD_DELAY).await;
-                "done"
-            })
-            .unwrap();
-        let services = Server::builder()
-            .set_config(ServerConfig::builder().http_only().build())
-            .to_service_builder();
+        let service = JsonRpcHttpService::new(
+            RpcService::new(
+                TestMethods,
+                TestMethods::METHOD_NAMES.iter().copied(),
+                usize::MAX,
+            ),
+            1_000,
+            usize::MAX,
+        );
         let task = tokio::spawn(run_tls_listener(
             listener,
             TlsAcceptor::from(Arc::new(config)),
@@ -86,7 +113,7 @@ impl TestTlsListener {
             handshake_timeout,
             max_connections,
             move |stream, _, stop_handle| {
-                let service = services.clone().build(methods.clone(), stop_handle.clone());
+                let service = service.clone();
                 async move {
                     let _ = serve_tls_connection(
                         stream,

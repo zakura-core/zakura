@@ -2,7 +2,7 @@
 
 use crate::config::ZakuradConfig;
 use clap::Parser;
-use color_eyre::eyre::Report;
+use eyre::Report;
 
 /// Generate a default `zakura.toml` configuration
 #[derive(Debug, Default, Parser)]

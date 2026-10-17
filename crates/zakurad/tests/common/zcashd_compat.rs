@@ -7,7 +7,7 @@
 
 use std::{net::SocketAddr, path::Path};
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use zakura_node_services::BoxError;

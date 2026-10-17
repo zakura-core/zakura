@@ -80,7 +80,7 @@ use std::{
     sync::Arc,
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
     pin, select,
@@ -1428,7 +1428,7 @@ impl StartCmd {
 
 #[cfg(test)]
 mod tests {
-    use color_eyre::eyre::eyre;
+    use eyre::eyre;
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
 

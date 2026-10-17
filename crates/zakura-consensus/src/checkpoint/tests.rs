@@ -4,7 +4,7 @@
 
 use std::{cmp::min, time::Duration};
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;

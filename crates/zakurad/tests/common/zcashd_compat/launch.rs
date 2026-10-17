@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use tempfile::TempDir;
 use tokio::time::sleep;
 use zakura_chain::parameters::{Network, NetworkKind};

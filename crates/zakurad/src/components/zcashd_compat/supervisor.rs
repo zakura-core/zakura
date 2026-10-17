@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},

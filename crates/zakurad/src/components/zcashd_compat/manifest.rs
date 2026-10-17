@@ -7,7 +7,7 @@
 
 use std::{collections::HashSet, sync::LazyLock};
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use serde::Deserialize;
 
 /// Embedded manifest schema version.

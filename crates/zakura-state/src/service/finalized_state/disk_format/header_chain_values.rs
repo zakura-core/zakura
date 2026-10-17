@@ -1,7 +1,5 @@
 //! Version-one value codecs for the fork-aware header-chain column families.
 
-#![allow(dead_code)] // The serialized state adapter consumes these codecs in PR-8.
-
 use std::{num::NonZeroU64, sync::Arc};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -19,7 +17,7 @@ use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
     EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
     FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
+    HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
     StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
     UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
@@ -1585,8 +1583,9 @@ pub struct HeaderValidationContextDisk {
 
 impl HeaderValidationContextDisk {
     /// Return the contextual validation fact authenticated by this row.
-    pub fn fact(&self) -> HeaderContextFact {
-        HeaderContextFact {
+    #[cfg(test)]
+    pub fn fact(&self) -> zakura_header_chain::HeaderContextFact {
+        zakura_header_chain::HeaderContextFact {
             frontier: Frontier::new(self.height, self.header.hash()),
             header: self.header.clone(),
         }

@@ -7,6 +7,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use zakura_test::allocations::AllocationStats;
+
 use super::*;
 use crate::zakura::{
     header_sync::{
@@ -83,7 +85,7 @@ async fn a_full_window_of_one_header_pages_fits_the_cursor_ring() {
 /// A subscriber that never acknowledges sends the most `Open` and `Grant`
 /// updates the window allows, each at the minimum, while page output is
 /// blocked. Every update applies, the publisher spends credit only on the
-/// page its transport slot holds, and the updates retain no memory.
+/// page its transport slot holds, and the updates allocate nothing.
 #[tokio::test(start_paused = true)]
 #[allow(clippy::print_stderr)]
 async fn minimum_grant_floods_apply_while_output_is_blocked() {
@@ -114,7 +116,7 @@ async fn minimum_grant_floods_apply_while_output_is_blocked() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(publisher.unacknowledged(open.subscription_id), Some(1));
     let started = std::time::Instant::now();
-    let ((), retained) = zakura_test::allocations::measure(|| {
+    let ((), allocated) = zakura_test::allocations::measure(|| {
         for grant in &grants[1..] {
             let applied = lock(&publisher.shared).apply(grant, limits());
             assert_eq!(applied, Ok(Applied::Live));
@@ -123,9 +125,13 @@ async fn minimum_grant_floods_apply_while_output_is_blocked() {
     let elapsed = started.elapsed();
     tokio::time::sleep(QUIET).await;
     assert_eq!(publisher.unacknowledged(open.subscription_id), Some(1));
-    assert_eq!(retained.retained_bytes, 0, "{retained:?}");
+    assert_eq!(
+        allocated,
+        AllocationStats::default(),
+        "the updates allocate nothing"
+    );
     eprintln!(
-        "grant_flood updates={updates} measured={} elapsed={elapsed:?} ns_per_update={} {retained:?}",
+        "grant_flood updates={updates} measured={} elapsed={elapsed:?} ns_per_update={} {allocated:?}",
         grants.len() - 1,
         elapsed.as_nanos() / u128::try_from(grants.len() - 1).expect("fits u128"),
     );

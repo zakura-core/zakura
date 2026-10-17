@@ -1500,3 +1500,53 @@ async fn a_deferred_pass_drops_its_refill_deadline_when_discovery_pauses() {
     assert!(!reactor.cached_pass_deferred);
     assert!(reactor.next_maintenance_deadline() > Instant::now());
 }
+
+/// The running reactor still reads the committed snapshot that ends a
+/// resource stall after a deferred pass. A stale refill deadline would keep
+/// the biased loop on its maintenance arm and never read the snapshot.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_pass_does_not_starve_the_snapshot_that_ends_a_stall() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let shutdown = startup.shutdown.clone();
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
+    reactor.cached_pass_budget = CachedPassBudget {
+        passes: 0,
+        refilled_at: Instant::now(),
+    };
+    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_pass_deferred);
+    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    time::advance(CACHED_PASS_REFILL * 2).await;
+
+    let task = tokio::spawn(reactor.run());
+    tokio::task::yield_now().await;
+    let mut applied = snapshot;
+    applied.state_version = applied.state_version.checked_next().unwrap();
+    applied.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(applied.frontiers.header_best.height.0 + 1),
+        block::Hash([0x77; 32]),
+    );
+    snapshots_tx.send_replace(Some(applied.clone()));
+    // A spinning reactor never lets paused time advance, so bound the wait by
+    // scheduler turns instead of a timer.
+    let mut read = false;
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+        if handle.tip.borrow().1 == applied.frontiers.header_best.hash {
+            read = true;
+            break;
+        }
+    }
+    assert!(read, "the reactor reads the new snapshot");
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+}

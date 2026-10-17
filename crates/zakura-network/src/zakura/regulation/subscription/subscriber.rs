@@ -319,7 +319,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
     }
 
     /// Check a page or terminal header as [`Self::precheck`] does, and charge
-    /// a page to the queue until [`Self::take_admitted`] releases it.
+    /// a page to the queue until [`Self::claim_admitted_page`] spends it.
     ///
     /// The queue holds at most the live subscriptions' unspent credit, so a
     /// reader that admits frames ahead of the handler never buffers more
@@ -352,27 +352,26 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         Ok(())
     }
 
-    /// Release an admitted `message_type` frame when the handler takes it,
-    /// before its claim. A terminal outcome holds no charge.
-    pub(crate) fn take_admitted(&mut self, message_type: u16, payload_len: usize) {
-        let page = matches!(
-            MessageRule::find(self.rules, message_type).map(|row| row.role),
-            Some(MessageRole::Response {
-                request,
-                ends_exchange: false,
-            }) if request == self.limits.message_type
-        );
-        if !page {
-            return;
-        }
+    /// [`Self::claim_page`] for a page that [`Self::admit`] charged: spend
+    /// its credit and release its charge together, so a reader never sees
+    /// that credit free in between. A refused claim keeps the charge.
+    pub(crate) fn claim_admitted_page(
+        &mut self,
+        key: &K,
+        objects: u32,
+        payload_len: usize,
+        cursor: C,
+    ) -> Result<(), SubscriptionFault> {
+        self.claim_page(key, objects, payload_len, cursor)?;
         // Widening usize to u64 is lossless on supported targets.
         let bytes = payload_len as u64;
         debug_assert!(
             self.queued.objects >= 1 && self.queued.bytes >= bytes,
-            "only an admitted page is taken"
+            "only an admitted page is claimed as one"
         );
         self.queued.objects = self.queued.objects.saturating_sub(1);
         self.queued.bytes = self.queued.bytes.saturating_sub(bytes);
+        Ok(())
     }
 
     /// The frame rejection a reader reports for `fault`.
@@ -498,7 +497,8 @@ where
 
 impl<K, C> SharedSubscriptions<K, C> {
     /// A reader precheck over this table that charges each admitted page.
-    /// The handler releases each one with [`Subscriptions::take_admitted`].
+    /// The handler spends each charge with
+    /// [`Subscriptions::claim_admitted_page`].
     pub(crate) fn admitting(&self) -> AdmittingSubscriptions<K, C> {
         AdmittingSubscriptions(self.clone())
     }

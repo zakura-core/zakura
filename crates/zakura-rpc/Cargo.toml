@@ -94,7 +94,7 @@ bls12_381 = { workspace = true }
 jubjub = { workspace = true }
 
 zcash_address = { workspace = true }
-zcash_primitives = { workspace = true, features = ["transparent-inputs", "non-standard-fees"] }
+zcash_primitives = { workspace = true, features = ["non-standard-fees"] }
 zcash_protocol = { workspace = true }
 zcash_script = { workspace = true }
 zcash_transparent = { workspace = true }

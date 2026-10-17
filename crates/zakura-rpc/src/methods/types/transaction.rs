@@ -31,7 +31,6 @@ use zakura_state::IntoDisk;
 use zcash_primitives::transaction::{
     builder::{cached_orchard_proving_key, BuildConfig, Builder},
     components::orchard::{bundle_version_for_branch, ACTION_SIZE},
-    fees::fixed::FeeRule,
     TxVersion,
 };
 use zcash_protocol::{
@@ -384,7 +383,7 @@ impl TransactionTemplate<NegativeOrZero> {
         let memo = miner_params.memo().unwrap_or(&default_memo);
 
         // Arms halo2's prepared commitment tables on the process-wide proving key
-        // that `Builder::build` below proves a shielded reward output with. The
+        // that `Builder::build_coinbase` below proves a shielded reward output with. The
         // prepared state is cached inside the key's params for the process
         // lifetime and repeat arming is free, so the first shielded coinbase pays
         // it once; without halo2's opt-in `orbits` feature it is a documented
@@ -395,7 +394,7 @@ impl TransactionTemplate<NegativeOrZero> {
             let branch = BranchId::for_height(net, BlockHeight::from(height));
             // Both pools share the circuit at every branch that supports them, so
             // the Orchard-pool mapping covers Ironwood rewards too (this mirrors
-            // the derivation in `Builder::build`).
+            // the derivation in `Builder::build_coinbase`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
                 let prepared = cached_orchard_proving_key(version.circuit_version())
@@ -439,15 +438,8 @@ impl TransactionTemplate<NegativeOrZero> {
             builder.add_transparent_output(&fs_addr, fs_amount)?;
         }
 
-        let build_result = builder.build(
-            &Default::default(),
-            Default::default(),
-            Default::default(),
-            rand_10::rng(),
-            &NoSaplingProver,
-            &NoSaplingProver,
-            &FeeRule::non_standard(Zatoshis::ZERO),
-        )?;
+        let build_result =
+            builder.build_coinbase(rand_10::rng(), &NoSaplingProver, &NoSaplingProver)?;
 
         let tx = build_result.transaction();
         let mut data = vec![];

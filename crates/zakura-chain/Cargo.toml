@@ -77,7 +77,7 @@ halo2 = { workspace = true }
 orchard.workspace = true
 zakura-mmr-tree.workspace = true
 zcash_note_encryption = { workspace = true }
-zcash_primitives = { workspace = true, features = ["transparent-inputs"] }
+zcash_primitives.workspace = true
 sapling-crypto.workspace = true
 zcash_protocol.workspace = true
 zcash_address.workspace = true

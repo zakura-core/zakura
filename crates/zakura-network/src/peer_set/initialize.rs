@@ -147,6 +147,7 @@ async fn batch_misbehavior_reports(
 /// (zakura-network expects to be able to connect to at least one peer.)
 ///
 /// [1]: zakura_chain::chain_tip::NoChainTip
+#[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init<S, C>(
     config: Config,
     inbound_service: S,
@@ -178,6 +179,7 @@ where
 }
 
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
+#[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_with_zakura_header_sync<S, C>(
     config: Config,
     inbound_service: S,

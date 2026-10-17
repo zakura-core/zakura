@@ -57,17 +57,6 @@ pub enum InventoryHash {
 }
 
 impl InventoryHash {
-    /// Creates a new inventory hash from a legacy transaction ID.
-    ///
-    /// # Correctness
-    ///
-    /// This method must only be used for v1-v4 transaction IDs.
-    /// [`transaction::Hash`] does not uniquely identify unmined v5 transactions.
-    #[allow(dead_code)]
-    pub fn from_legacy_tx_id(legacy_tx_id: transaction::Hash) -> InventoryHash {
-        InventoryHash::Tx(legacy_tx_id)
-    }
-
     /// Returns the block hash for this inventory hash,
     /// if this inventory hash is a non-filtered block variant.
     pub fn block_hash(&self) -> Option<block::Hash> {

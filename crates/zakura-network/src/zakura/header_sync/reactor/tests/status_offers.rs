@@ -1144,17 +1144,20 @@ fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
                     // The end-of-event pass also runs on events with no scheduling effect.
                     if unconditional {
                         reactor.last_scheduling_opportunity = None;
+                        reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                     }
                     reactor.schedule_cached_statuses();
                     let (peer, status) = &offers[iteration % offers.len()];
                     reactor.handle_status(peer.clone(), 0, status.clone());
                     if unconditional {
                         reactor.last_scheduling_opportunity = None;
+                        reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                     }
                     reactor.schedule_cached_statuses();
                     reactor.handle_status(owner.clone(), 0, owner_status.clone());
                     if unconditional {
                         reactor.last_scheduling_opportunity = None;
+                        reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                     }
                     reactor.schedule_cached_statuses();
                 }
@@ -1376,4 +1379,66 @@ fn changed_offer_is_considered_immediately_without_global_invalidation() {
         reactor.handle_status(peer.clone(), 0, eligible);
         assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
     }
+}
+
+/// A peer that keeps changing its own unstarted target changes the scheduling
+/// key on every `Status`. Past the burst, it buys one full cached-offer pass
+/// per refill, however fast it sends. A real opportunity that arrives while
+/// the budget is empty still schedules at the refill, with no new status.
+#[tokio::test(start_paused = true)]
+async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
+    const IDLE: u8 = 64;
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = v9::FakePort::new(0);
+    startup.use_direct_port();
+    let (_, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    // The owner's locator read never answers, so the idle peers stay blocked
+    // behind its target.
+    let shared = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, shared));
+    let idle: Vec<_> = (1..=IDLE).map(|byte| connect(&mut reactor, byte)).collect();
+    for (peer, _) in &idle {
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, shared));
+        reactor.schedule_cached_statuses();
+    }
+    let (attacker, _attacker_outbound) = connect(&mut reactor, 0xfe);
+    let peers = reactor.peer_state.len();
+    // Connecting and the first statuses spent part of the burst.
+    time::advance(CACHED_PASS_REFILL * CACHED_PASS_BURST).await;
+    let flips = [block::Hash([0x51; 32]), block::Hash([0x52; 32])];
+    let visits = reactor.cached_offer_visits;
+    for index in 0..1000 {
+        reactor.handle_status(attacker.clone(), 0, status_for(&snapshot, flips[index % 2]));
+        reactor.schedule_cached_statuses();
+    }
+    let flood_visits = reactor.cached_offer_visits - visits;
+    assert_eq!(
+        flood_visits,
+        usize::try_from(CACHED_PASS_BURST).expect("the burst fits usize") * peers,
+        "1000 retargets buy one burst of passes"
+    );
+    assert!(reactor.cached_pass_deferred);
+
+    // The owner leaves while the budget is empty.
+    reactor.handle_peer_disconnected(&owner, 0, "test owner leaves");
+    reactor.schedule_cached_statuses();
+    let has_work = |reactor: &HeaderSyncReactor| {
+        idle.iter()
+            .any(|(peer, _)| reactor.peer_work_queue.has_work(peer))
+    };
+    assert!(!has_work(&reactor), "the pass waits for the refill");
+    let deadline = reactor.next_maintenance_deadline();
+    assert!(deadline <= Instant::now() + CACHED_PASS_REFILL);
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    assert!(
+        has_work(&reactor),
+        "the refilled pass stages the released target"
+    );
 }

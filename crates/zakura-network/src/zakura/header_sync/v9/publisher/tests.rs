@@ -867,25 +867,128 @@ async fn a_locator_at_the_target_sends_no_path_page() {
     harness.check_quiet().await;
 }
 
-/// A schema-1 page stops before a header without a record, and the
-/// subscription waits for it instead of downgrading the page.
+/// On the path to its target, a schema-1 subscription sends the pages that
+/// have records and ends with `HistoryPruned` at the first header without
+/// one, never skipping it to reach records above.
 #[tokio::test(start_paused = true)]
-async fn schema_one_pages_stop_before_a_header_without_a_record() {
+async fn schema_one_path_pages_end_as_history_pruned_at_a_missing_record() {
+    use HeadersOutcomeCode::HistoryPruned;
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+
+    // The first record is missing: no page, and the subscription ends.
+    port.store().no_record.insert(chain[0].hash);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HistoryPruned)]
+    );
+
+    // Records are missing below a height and present above it, as on a
+    // pruned node. The page cannot skip the hole to reach them.
+    port.store().no_record.insert(chain[1].hash);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HistoryPruned)]
+    );
+
+    // A prefix with records goes out, then the hole ends the subscription.
+    port.store().no_record = HashSet::from([chain[2].hash]);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    let received = harness.deliver_all().await;
+    assert_eq!(pages(&received), [(h(0), h(2), false)]);
+    assert_eq!(received.last(), Some(&Received::Ended(HistoryPruned)));
+    harness.check_quiet().await;
+}
+
+/// A complete schema-1 path still reaches its target, and past the target,
+/// whether a page or the `Open` reached it, a missing record waits.
+#[tokio::test(start_paused = true)]
+async fn schema_one_past_the_target_waits_for_a_missing_record() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(4);
-    port.store().no_record.insert(chain[1].hash);
     let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
     harness
         .open(chain[3].hash, vec![port.genesis], credit(), AuxSchema::V1)
         .await;
-    let h = block::Height;
-    assert_eq!(pages(&harness.deliver_all().await), [(h(0), h(1), false)]);
-    // The record arrives with a selected-chain change, and the path resumes.
-    port.store().no_record.clear();
-    port.select(port.tip());
     assert_eq!(
         pages(&harness.deliver_all().await),
-        [(h(1), h(3), false), (h(3), h(4), true)]
+        [(h(0), h(2), false), (h(2), h(4), true)]
+    );
+    let next = port.grow(1);
+    port.store().no_record.insert(next[0].hash);
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    harness.apply(close).await.expect("the Close applies");
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionClosed)]
+    );
+
+    // A target reached at Open waits the same way, and resumes once the
+    // record arrives with a selected-chain change.
+    let tip = port.tip();
+    harness
+        .open(tip.hash, vec![tip], credit(), AuxSchema::V1)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let next = port.grow(1);
+    port.store().no_record.insert(next[0].hash);
+    assert!(harness.deliver_all().await.is_empty());
+    port.store().no_record.clear();
+    port.select(port.tip());
+    assert_eq!(pages(&harness.deliver_all().await), [(h(5), h(6), false)]);
+    harness.check_quiet().await;
+}
+
+/// Missing records change nothing without schema 1, and a capacity refusal
+/// still waits before the publisher looks at any record.
+#[tokio::test(start_paused = true)]
+async fn missing_records_leave_schema_zero_and_capacity_waits_alone() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    port.store()
+        .no_record
+        .extend(chain.iter().map(|frontier| frontier.hash));
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+    harness
+        .open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None)
+        .await;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(0), h(3), true)]);
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    harness.apply(close).await.expect("the Close applies");
+    harness.deliver_all().await;
+
+    let signal = ServingCapacitySignal::default();
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(signal.clone())));
+    let target = *port.grow(2).last().expect("two headers were added");
+    harness
+        .open(target.hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    signal.release();
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::HistoryPruned)]
     );
     harness.check_quiet().await;
 }

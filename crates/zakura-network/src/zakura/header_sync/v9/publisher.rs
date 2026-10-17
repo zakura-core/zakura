@@ -1119,9 +1119,12 @@ fn scope(selected: Option<&EngineSnapshot>, target: block::Hash) -> HeaderWorkAu
 
 /// Build and encode `job`'s page from a state page.
 ///
-/// A schema-1 page stops before the first header without a record. With none
-/// for its first header, the subscription waits, because a page's schema must
-/// match its subscription.
+/// A schema-1 page stops before the first header without a record, because a
+/// page's schema must match its subscription and a page cannot skip a header.
+/// With none for its first header, a subscription on the path to its target
+/// ends with `HistoryPruned`: a pruned node never gains records below its
+/// index height, so waiting would stall the subscriber forever. A following
+/// subscription waits instead, because `HistoryPruned` is past its window.
 fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPage) -> Output {
     let count = page.headers.len();
     // Widening u32 to usize is lossless on supported targets.
@@ -1164,7 +1167,11 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
         });
     }
     let Some(last) = entries.last() else {
-        return Output::Stall(Stall::Local, "aux_unavailable");
+        return if job.following {
+            Output::Stall(Stall::Local, "aux_unavailable")
+        } else {
+            Output::End(HeadersOutcomeCode::HistoryPruned)
+        };
     };
     let sent = u32::try_from(entries.len()).expect("a page holds at most MAX_HS_RANGE headers");
     let Some(height) = page.common_ancestor.height.0.checked_add(sent) else {

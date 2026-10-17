@@ -14,14 +14,27 @@ const TYPED_RESULT_METHODS: &[&str] = &["preciousblock"];
 
 pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError> {
     let source = syn::parse_file(&fs::read_to_string(source)?)?;
+    // The trait is defined inside the `rpc_trait!` macro call, whose body is a plain trait.
     let rpc = source
         .items
         .iter()
         .find_map(|item| match item {
-            syn::Item::Trait(item) if item.ident == "Rpc" => Some(item),
+            syn::Item::Macro(item)
+                if item
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "rpc_trait") =>
+            {
+                Some(item.mac.parse_body::<syn::ItemTrait>())
+            }
             _ => None,
         })
-        .ok_or("RPC methods source must contain the Rpc trait")?;
+        .ok_or("RPC methods source must contain the rpc_trait! macro call")??;
+    if rpc.ident != "RpcServer" {
+        return Err("the rpc_trait! macro call must define the RpcServer trait".into());
+    }
     let mut output = String::from(
         "/// JSON-RPC methods in declaration order.\n\
          pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[\n",
@@ -124,7 +137,9 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
 
     for name in TYPED_RESULT_METHODS {
         if !output.contains(&format!("({name:?}, openrpc::RpcMethod {{")) {
-            return Err(format!("typed-result RPC method {name} is not in the Rpc trait").into());
+            return Err(
+                format!("typed-result RPC method {name} is not in the RpcServer trait").into(),
+            );
         }
     }
 

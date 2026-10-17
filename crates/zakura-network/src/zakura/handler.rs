@@ -4079,8 +4079,9 @@ async fn spawn_zakura_endpoint_inner(
             listen_addr = ?config.zakura.listen_addr,
             external_addr = ?config.external_addr,
             "this node advertises no discovery address that peers can dial, so they will not \
-             learn of it through discovery; set network.external_addr to this node's public IP \
-             address, which peers dial at the network.zakura.listen_addr port"
+             learn of it through discovery; give network.zakura.listen_addr a fixed nonzero \
+             port, and set network.external_addr to this node's public IP address, which peers \
+             dial at that port"
         );
     }
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
@@ -6658,6 +6659,13 @@ mod tests {
 
         config.external_addr = None;
         assert!(reported(&config), "peers must not dial a private address");
+
+        config.zakura.listen_addr = Some("0.0.0.0:0".parse().expect("test address parses"));
+        config.external_addr = Some("93.184.216.34:8233".parse().expect("test address parses"));
+        assert!(
+            reported(&config),
+            "peers dial the external IP at the listen port, so port 0 is unusable"
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
     budgeted_max_connections, PeerMemoryBudgetError, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-    DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES, ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
@@ -322,18 +322,21 @@ pub struct ZakuraConfig {
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
     pub max_connections: usize,
-    /// Bytes of QUIC flow-control credit and queued datagrams that admitted
-    /// native peers together may make this node hold.
+    /// Bytes of QUIC flow-control credit and queued datagrams that native
+    /// connections together may make this node hold.
     ///
-    /// Each connection can hold its `[network.zakura.quic]` receive and send
-    /// windows plus a 16 MiB datagram queue, 80 MiB at the defaults, whether
-    /// or not the node reads (zakura-quic CTRL-26 lists what this leaves
-    /// out). The node admits at most
-    /// this budget divided by that cost, so the default 8 GiB admits 102
-    /// connections and a larger `max_connections` is lowered at startup.
-    /// Startup fails when the budget admits fewer than 16 connections, or
-    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
-    /// peers), or fewer than `max_connections` when that is smaller.
+    /// Each live QUIC connection can hold its `[network.zakura.quic]` receive
+    /// and send windows plus a 16 MiB datagram queue, 80 MiB at the defaults,
+    /// whether or not the node reads. A closed connection releases its stream
+    /// buffers and holds 64 KiB until it drains, and each live slot funds two
+    /// of those (zakura-quic CTRL-26 lists what this leaves out). The
+    /// transport holds at most 102 live connections at the defaults.
+    /// `max_pending_handshakes` of those are headroom for handshakes, so the
+    /// node admits 70 and a larger
+    /// `max_connections` is lowered at startup. Startup fails when the budget
+    /// admits fewer than 16 connections, or twice the discovery headroom plus
+    /// one (19 with Mainnet's 9 bootstrap peers), or fewer than
+    /// `max_connections` when that is smaller.
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
@@ -343,6 +346,10 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Also the QUIC connections that
+    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
+    /// beyond the admitted ones, for handshakes and extra dial attempts.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
@@ -417,6 +424,7 @@ impl ZakuraConfig {
             self.peer_memory_budget_bytes,
             self.quic.connection_memory_bytes(),
             self.bootstrap_peers.len(),
+            self.max_pending_handshakes.max(1),
         )
     }
 
@@ -552,10 +560,21 @@ impl ZakuraLocalLimits {
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
+    ///
+    /// The transport holds the admitted connections plus
+    /// `max_pending_handshakes` more live ones, half of those kept for dials,
+    /// and two closing connections per live slot (see `peer_memory`).
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
+        let max_connections = self
+            .max_connections
+            .saturating_add(self.max_pending_handshakes);
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
+            max_connections,
+            dial_reserve: self.max_pending_handshakes / 2,
+            max_closing_connections: max_connections
+                .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }
     }
 }
@@ -895,12 +914,14 @@ impl ZakuraEndpoint {
         }
     }
 
-    /// Returns whether the local admission semaphore has a free permit, i.e.
-    /// whether this node can accept another inbound/dialed Zakura connection.
-    /// Used by the discovery dialer to avoid starting candidate dials that would
-    /// immediately bounce off the admission cap.
+    /// Returns whether this node can start another dialed Zakura connection:
+    /// the local admission semaphore has a free permit and the transport has a
+    /// free live slot (zakura-quic ADM-12). Used by the discovery dialer to
+    /// avoid starting candidate dials that would immediately bounce off either
+    /// cap. The transport can be full while permits remain, for example with
+    /// handshakes in flight, and a dial loop gated on permits alone would spin.
     pub(crate) fn has_native_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0
+        self.handler.admission.available_permits() > 0 && self.quic.has_dial_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -4368,9 +4389,18 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     );
     let alpns = supported_p2p_v2_alpns();
     let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
-    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
+    let connection = match timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
         .await
-        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
+    {
+        Ok(connection) => connection,
+        // zakura-quic ADM-12: this node's own cap, so discovery doesn't back
+        // off from the peer.
+        Err(zakura_quic::ConnectError::ConnectionLimit) => {
+            return Err(ZakuraHandlerError::ResourceLimit("transport connections"));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let Some(admitted_ip) = admitted_ip {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = admitted_ip.send(connection.admitted_ip());
@@ -7606,6 +7636,50 @@ mod tests {
         .expect("v2_p2p is enabled in test config");
 
         assert!(endpoint.header_sync().is_some());
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// A full transport stops discovery dials even while admission permits
+    /// remain, so the dialer can't spin on `ConnectionLimit` (zakura-quic
+    /// ADM-12).
+    #[tokio::test]
+    async fn a_full_transport_reports_no_dial_capacity() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        // No bootstrap dials, so nothing else takes the admission permit.
+        config.zakura.bootstrap_peers = Vec::new();
+        config.zakura.max_connections = 1;
+        config.zakura.max_pending_handshakes = 1;
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        assert!(endpoint.has_native_admission_capacity());
+
+        // Two dials to a socket that never answers hold both live slots.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let target = NodeAddr::with_addrs(
+            zakura_quic::NodeSecretKey::generate().public(),
+            vec![silent.local_addr()?],
+        );
+        let mut dials = Vec::new();
+        for _ in 0..2 {
+            let (quic, target) = (endpoint.quic.clone(), target.clone());
+            dials.push(tokio::spawn(async move {
+                quic.connect(target, &[P2P_V2_ALPN]).await
+            }));
+        }
+        while endpoint.quic.connection_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(endpoint.handler.admission.available_permits() > 0);
+        assert!(!endpoint.has_native_admission_capacity());
+        for dial in dials {
+            dial.abort();
+        }
         endpoint.shutdown().await;
         Ok(())
     }

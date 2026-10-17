@@ -38,6 +38,10 @@ pub enum ConnectError {
     /// The peer's key isn't the dialed node ID (TLS-7).
     #[error("the peer presented a different identity than the dialed node ID")]
     WrongIdentity,
+    /// This endpoint already holds `max_connections` QUIC connections
+    /// (ADM-12).
+    #[error("endpoint holds its maximum number of QUIC connections")]
+    ConnectionLimit,
     /// The endpoint is shut down or refused the remote address.
     #[error("endpoint can't dial: {0}")]
     Endpoint(#[from] quinn_proto::ConnectError),
@@ -74,10 +78,16 @@ impl ConnectError {
     }
 
     /// Ranks errors so a multi-address dial reports the most informative one.
+    ///
+    /// `ConnectionLimit` outranks the peer's own failures: an address skipped
+    /// for this node's cap was never tried, so the dial must not blame the
+    /// peer (ADM-12). ALPN and identity errors still win, since they hold for
+    /// every address.
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Self::AlpnMismatch => 6,
-            Self::WrongIdentity => 5,
+            Self::AlpnMismatch => 7,
+            Self::WrongIdentity => 6,
+            Self::ConnectionLimit => 5,
             Self::Refused => 4,
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
@@ -174,5 +184,27 @@ pub struct ClosedStream {
 impl ClosedStream {
     pub(crate) fn new() -> Self {
         Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A multi-address dial reports the cap over the peer's own failures, so
+    /// an address this node never tried doesn't blame the peer (ADM-12).
+    #[test]
+    fn the_connection_limit_outranks_the_peers_failures() {
+        let limit = ConnectError::ConnectionLimit.rank();
+        for peer in [
+            ConnectError::Refused,
+            ConnectError::HandshakeTimeout,
+            ConnectError::Transport(ConnectionError::TimedOut),
+        ] {
+            assert!(limit > peer.rank(), "{peer:?}");
+        }
+        for every_address in [ConnectError::AlpnMismatch, ConnectError::WrongIdentity] {
+            assert!(limit < every_address.rank(), "{every_address:?}");
+        }
     }
 }

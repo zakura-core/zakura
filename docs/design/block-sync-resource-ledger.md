@@ -20,8 +20,12 @@ it is sized to the throughput target, not below it.
 ## Node budget
 
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
-connection; the node admits at most `zakura.max_connections` = 102 of them, the most that
-`zakura.peer_memory_budget_bytes` = 8 GiB admits (zakura-quic CTRL-26).
+connection; the node admits at most `zakura.max_connections` = 70 of them. The transport holds
+at most 102 live QUIC connections, admitted or not (zakura-quic ADM-12): the most that
+`zakura.peer_memory_budget_bytes` = 8 GiB funds, with 32 of them headroom for handshakes
+(CTRL-26). Closed connections release their stream buffers and drain in a separate allowance of
+204 at 64 KiB each (ADM-13). The QUIC rows count all 102 live connections; the application rows
+count the 70 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |
@@ -31,18 +35,19 @@ connection; the node admits at most `zakura.max_connections` = 102 of them, the 
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
 | Serving encoded output | 64 MiB | 1.25 GB, 1 response slot per 4 KiB | `regulation/sizing.rs` (`peer_output_bytes`, `node_output_bytes`) |
 | Requester bookkeeping | ≤ live ranges | 32,768 ranges; ≤ 128 MiB of expected hashes | `MAX_BS_INFLIGHT_REQUESTS` request pool in `reactor.rs` |
-| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 2.0 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
+| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 1.4 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
 | Look-ahead backlog (raw) | — | `max_reorder_lookahead_bytes` = 1.5 GiB plus one range | `admission.rs` byte gate, re-checked by the sequencer on every body |
 | Decoded bodies | one transient junk decode before rejection | 401 submissions × measured decoded size | `max_submitted_block_applies`; admission charges `max(4 × wire, measured decoded)` |
 | Control state | bounded maps | 8,192 supplier cooldowns; Status keeps the latest value | `MAX_SUPPLIER_RETRIES` in `peer_registry.rs` |
 
-At defaults, block-sync application memory sums to about 11 GB in the worst case: 0.5 GiB
+At defaults, block-sync application memory sums to about 10 GB in the worst case: 0.5 GiB
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
-for real blocks), 0.13 GiB requester hashes, 2.0 GB of raw frames awaiting their routines and
+for real blocks), 0.13 GiB requester hashes, 1.4 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
 add 3.2 + 3.2 GiB, and the connections' datagram queues up to 1.6 GiB more. They are shared
 with every other service on the connection and stay unchanged: the 8 GiB peer memory budget
-covers all three for admitted connections, and is a transport budget, not a block-sync choice.
+covers all three for every QUIC connection the transport holds, and is a transport budget, not a
+block-sync choice.
 
 ## Serving
 
@@ -112,7 +117,7 @@ range's cap, and the padding survives until consensus checks the auth-data commi
 Stream 6 therefore also declares an inbound queue depth of 8 frames
 (`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). A session holds at most those 8, the one the reader is
 forwarding and the one the routine keeps while it waits for decode capacity. Its raw frames
-therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 2.0 GB across 102
+therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 1.4 GB across 70
 connections. Later frames wait in the 16 MiB QUIC stream receive
 window the transport already budgets. The owed check still disconnects a peer that sends more
 than it was asked for. `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe`

@@ -34,6 +34,7 @@ pub mod sys;
 
 pub use config::{
     connection_memory_bytes, ConfigError, CongestionController, QuicBindConfig, QuicConfig,
+    CLOSING_CONNECTION_MEMORY_BYTES,
 };
 pub use conn::{
     BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,

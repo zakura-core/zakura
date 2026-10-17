@@ -172,16 +172,22 @@ struct Fixture {
 impl Fixture {
     /// Open to `target` with `locators` and `staging` reserved headers.
     fn open(tree: HeaderTree, target: Frontier, locators: &[Frontier], staging: u32) -> Self {
-        Self::open_with(tree, &status(target), locators, staging)
+        Self::open_with(tree, &status(target), locators, AuxSchema::None, staging)
     }
 
-    /// Open to the tip of `status` with `locators` and `staging` reserved
-    /// headers.
-    fn open_with(tree: HeaderTree, status: &Status, locators: &[Frontier], staging: u32) -> Self {
+    /// Open to the tip of `status` under `schema`, with `locators` and
+    /// `staging` reserved headers.
+    fn open_with(
+        tree: HeaderTree,
+        status: &Status,
+        locators: &[Frontier],
+        schema: AuxSchema,
+        staging: u32,
+    ) -> Self {
         let target = Frontier::new(status.selected_tip_height, status.selected_tip_hash);
         let mut sub = subscriber();
         let (open, _) = sub
-            .open(status, locators, AuxSchema::None, staging)
+            .open(status, locators, schema, staging)
             .expect("the first Open is recorded");
         let open = wire(&open);
         Self {
@@ -189,8 +195,25 @@ impl Fixture {
             sub,
             id: open.subscription_id,
             target,
-            schema: AuxSchema::None,
+            schema,
         }
+    }
+
+    /// Reopen to the same target after the terminal outcome, under `schema`.
+    fn reopen(
+        &mut self,
+        locators: &[Frontier],
+        schema: AuxSchema,
+        staging: u32,
+    ) -> SubscribeHeaders {
+        let (open, _) = self
+            .sub
+            .open(&status(self.target), locators, schema, staging)
+            .expect("the terminal outcome freed the slot");
+        let open = wire(&open);
+        self.id = open.subscription_id;
+        self.schema = schema;
+        open
     }
 
     /// Deliver a page of `headers` above `parent`.
@@ -600,7 +623,7 @@ fn pages_fit_the_advertised_caps() {
         max_message_bytes: page_bytes(2, AuxSchema::None),
         ..status(chain[4])
     };
-    let mut fixture = Fixture::open_with(tree, &caps, &[chain[0]], 100);
+    let mut fixture = Fixture::open_with(tree, &caps, &[chain[0]], AuxSchema::None, 100);
     assert_eq!(
         fixture.page(chain[0], &chain[1..3], false),
         Err(SubscriberFault::AboveAdvertised),
@@ -722,6 +745,146 @@ fn outcomes_fault_outside_their_window() {
     assert_eq!(
         subscriber().receive_outcome(&outcome(1, chain[6].hash, SubscriptionSuperseded)),
         Err(SubscriptionFault::Unknown.into())
+    );
+}
+
+/// A pruned publisher sends the schema-1 prefix it has records for, then
+/// ends with `HistoryPruned` before the target. The outcome frees the slot and
+/// the credit and reports the accepted cursor, so a reopen without records
+/// continues from the validated prefix. Each subscription keeps its own
+/// schema, and `HistoryPruned` stays out of window once the target is reached.
+#[test]
+fn history_pruned_before_the_target_reopens_without_records() {
+    let (tree, chain) = chain(6);
+    let mut fixture = Fixture::open_with(tree, &status(chain[6]), &[chain[0]], AuxSchema::V1, 100);
+    let accepted = fixture
+        .page(chain[0], &chain[1..3], false)
+        .expect("records exist this far");
+    fixture.schema = AuxSchema::None;
+    assert_eq!(
+        fixture.page(chain[2], &chain[3..4], false),
+        Err(SubscriberFault::Schema),
+        "a schema-1 subscription takes no plain page"
+    );
+    fixture.schema = AuxSchema::V1;
+    let received = fixture
+        .page(chain[2], &chain[3..4], false)
+        .expect("the last page with records");
+    assert_eq!(
+        fixture
+            .sub
+            .accept_through(fixture.id, &accepted.cursor, 100),
+        Ok(None)
+    );
+    let ended = fixture
+        .outcome(HeadersOutcomeCode::HistoryPruned)
+        .expect("legal before the target");
+    assert_eq!(
+        (ended.pages, ended.reached, ended.accepted),
+        (2, false, accepted.cursor)
+    );
+    assert_ne!(ended.accepted, received.cursor);
+    assert_eq!(
+        fixture.sub.tools.lock().len(),
+        0,
+        "the credit and slot are free"
+    );
+
+    let start = Frontier::new(ended.accepted.height, ended.accepted.hash);
+    let open = fixture.reopen(&[start, chain[0]], AuxSchema::None, 100);
+    assert_eq!(open.tree_aux_schema, AuxSchema::None);
+    assert_eq!(
+        (open.acknowledged.height, open.acknowledged.hash),
+        (start.height, start.hash)
+    );
+    assert_eq!(open.added_credit.objects, 100, "a fresh window");
+    fixture.schema = AuxSchema::V1;
+    assert_eq!(
+        fixture.page(start, &chain[3..5], false),
+        Err(SubscriberFault::Schema),
+        "a plain subscription takes no schema-1 page"
+    );
+    fixture.schema = AuxSchema::None;
+    fixture
+        .page(start, &chain[3..5], false)
+        .expect("the reopen continues from the accepted cursor");
+    fixture
+        .page(chain[4], &chain[5..7], true)
+        .expect("ends at the target");
+    assert_eq!(
+        fixture.outcome(HeadersOutcomeCode::HistoryPruned),
+        Err(SubscriberFault::OutcomeWindow(
+            HeadersOutcomeCode::HistoryPruned
+        ))
+    );
+}
+
+/// A terminal outcome can arrive while pages wait for validation, or while a
+/// validation result is still pending. `Ended::accepted` covers only accepted
+/// pages, never the received cursor, and a result that lands after the
+/// outcome is refused, even once a new subscription is live.
+#[test]
+fn an_outcome_racing_validation_reports_only_accepted_pages() {
+    // A page received and not yet validated.
+    let (tree, chain) = chain(6);
+    let mut fixture = Fixture::open(tree, chain[6], &[chain[0]], 100);
+    let received = fixture
+        .page(chain[0], &chain[1..3], false)
+        .expect("first page");
+    let ended = fixture
+        .outcome(HeadersOutcomeCode::SubscriptionSuperseded)
+        .expect("legal at any time");
+    assert_eq!(ended.pages, 1);
+    assert_eq!(
+        ended.accepted,
+        Cursor {
+            height: chain[0].height,
+            hash: chain[0].hash,
+            headers: 0,
+            bytes: 0
+        },
+        "the start, not the received cursor"
+    );
+    assert_eq!(
+        fixture
+            .sub
+            .accept_through(fixture.id, &received.cursor, 100),
+        Err(SubscribeError::Tools(SubscribeRefused::Unknown))
+    );
+
+    // One page validated, the next one's result still pending.
+    let (tree, chain) = self::chain(6);
+    let mut fixture = Fixture::open(tree, chain[6], &[chain[0]], 100);
+    let validated = fixture
+        .page(chain[0], &chain[1..3], false)
+        .expect("first page");
+    let pending = fixture
+        .page(chain[2], &chain[3..5], false)
+        .expect("second page");
+    assert_eq!(
+        fixture
+            .sub
+            .accept_through(fixture.id, &validated.cursor, 100),
+        Ok(None)
+    );
+    let old = fixture.id;
+    let ended = fixture
+        .outcome(HeadersOutcomeCode::HistoryPruned)
+        .expect("legal before the target");
+    assert_eq!(ended.accepted, validated.cursor);
+
+    // The reactor reopens before the pending result lands.
+    let start = Frontier::new(validated.cursor.height, validated.cursor.hash);
+    let open = fixture.reopen(&[start, chain[0]], AuxSchema::None, 100);
+    assert_eq!(
+        fixture.sub.accept_through(old, &pending.cursor, 100),
+        Err(SubscribeError::Tools(SubscribeRefused::Unknown))
+    );
+    let close = wire(&fixture.sub.close().expect("Close is recorded"));
+    assert_eq!(close.subscription_id, open.subscription_id);
+    assert_eq!(
+        close.acknowledged, open.acknowledged,
+        "the late result moved nothing"
     );
 }
 

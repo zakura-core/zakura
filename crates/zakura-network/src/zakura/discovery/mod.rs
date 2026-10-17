@@ -1,13 +1,20 @@
 //! Native Zakura discovery service and dial supervision.
 
 mod candidate_dialer;
+#[cfg(test)]
+mod conformance_tests;
 mod dialer;
 mod pipe;
 mod protocol;
 mod redial;
+mod requester;
 mod runtime;
 mod service;
+mod serving;
 mod trace;
+pub(crate) mod wire;
+#[cfg(test)]
+mod wire_tests;
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use candidate_dialer::run_native_discovery_dialer;

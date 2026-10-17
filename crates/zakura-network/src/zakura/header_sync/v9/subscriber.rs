@@ -11,9 +11,13 @@
 //!
 //! [`Subscriber::open`], the grants, and [`Subscriber::close`] record each
 //! update in the subscription tools before returning it, so the caller writes
-//! only updates the tools already counted. The session reader checks each
-//! frame header against the same tools, which [`Subscriber::new`] attaches to
-//! it, or through [`Subscriber::admit`] on a channel without a reader check.
+//! only updates the tools already counted. The `Open` goes out with
+//! `FramedSend::send_fenced` and the writer that `open` returns. Each later
+//! `Grant` and `Close` goes out with `FramedSend::send_following` and the same
+//! writer, so an update queued behind an `Open` that the session's retirement
+//! skipped is skipped too. Frame headers are checked against the same tools,
+//! by the transport reader that [`Subscriber::new`] attaches to, or by
+//! [`Subscriber::admit`].
 //!
 //! # Page linkage
 //!
@@ -133,6 +137,10 @@ pub(crate) enum SubscriberFault {
     /// before the subscription reached it.
     #[error("a page continues past the initial target")]
     PastTarget,
+    /// The page ends at the target at another height than its `Status`
+    /// advertised.
+    #[error("the page reaches the target at another height than advertised")]
+    TargetHeight,
     /// The target marker disagrees with whether the page ends at the target.
     #[error("the target marker disagrees with the page's last header")]
     Marker,
@@ -158,6 +166,7 @@ impl SubscriberFault {
             Self::Parent => "parent",
             Self::LowerLocator => "lower_locator",
             Self::PastTarget => "past_target",
+            Self::TargetHeight => "target_height",
             Self::Marker => "marker",
             Self::SecondMarker => "second_marker",
             Self::OutcomeWindow(_) => "outcome_window",
@@ -204,9 +213,6 @@ pub struct Ended {
     pub(crate) accepted: Cursor,
 }
 
-/// Most page cap pairs a subscription keeps apart before it merges them.
-const MAX_PAGE_CAPS: usize = 4;
-
 /// The page caps one `Status` advertises.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct PageCaps {
@@ -244,7 +250,9 @@ struct Live {
     /// The page caps each `Status` advertised since the `Open`, keeping only
     /// pairs that no other covers. A page must fit one of them: it follows
     /// the `Status` that allowed it on the ordered stream, even if a later
-    /// `Status` changed the caps before the page arrived.
+    /// `Status` changed the caps before the page arrived. Kept pairs have
+    /// distinct header counts, and the `Status` decoder bounds those at
+    /// `MAX_HS_RANGE`, so the list stays bounded.
     caps: Vec<PageCaps>,
     /// Sent locators, highest first.
     locators: Vec<Frontier>,
@@ -548,6 +556,9 @@ impl Subscriber {
             if !reaches && height >= live.target_height.0 {
                 return Err(SubscriberFault::PastTarget);
             }
+            if reaches && height != live.target_height.0 {
+                return Err(SubscriberFault::TargetHeight);
+            }
             if page.reaches_initial_target != reaches {
                 return Err(SubscriberFault::Marker);
             }
@@ -739,22 +750,13 @@ impl Subscriber {
 }
 
 impl Live {
-    /// Add one `Status`'s page caps, dropping pairs they cover. Past
-    /// [`MAX_PAGE_CAPS`] pairs, keep the largest count and bytes as one pair,
-    /// which still allows every page that an advertised pair allowed.
+    /// Add one `Status`'s page caps, dropping pairs they cover.
     fn advertise(&mut self, caps: PageCaps) {
         if self.caps.iter().any(|kept| kept.covers(caps)) {
             return;
         }
         self.caps.retain(|kept| !caps.covers(*kept));
         self.caps.push(caps);
-        if self.caps.len() > MAX_PAGE_CAPS {
-            let merged = self.caps.iter().fold(caps, |merged, kept| PageCaps {
-                headers: merged.headers.max(kept.headers),
-                bytes: merged.bytes.max(kept.bytes),
-            });
-            self.caps = vec![merged];
-        }
     }
 
     /// The wire message for `update`. Only an `Open` carries the locators.

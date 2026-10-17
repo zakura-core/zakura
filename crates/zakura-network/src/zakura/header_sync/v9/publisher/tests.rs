@@ -1021,6 +1021,35 @@ async fn outcomes_before_the_first_page_name_their_cause() {
     harness.check_quiet().await;
 }
 
+/// A selection probe that runs into pruned history ends the subscription as
+/// `HistoryPruned` instead of waiting for history that will not return.
+#[tokio::test(start_paused = true)]
+async fn a_selection_probe_through_pruned_history_ends_as_history_pruned() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(5);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // The target, height 2, is from an older Status, and a header between it
+    // and the selected tip is gone.
+    port.store().tree.nodes.remove(&chain[3].hash);
+    harness
+        .open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::HistoryPruned)]
+    );
+    // With a locator at the target, the Open reached it, so `HistoryPruned`
+    // is out of its window and the subscription ends as superseded.
+    harness
+        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
 /// After the first page, lease failures end in the window that is still open:
 /// `HistoryPruned` before the target, `SubscriptionSuperseded` after it.
 #[tokio::test(start_paused = true)]

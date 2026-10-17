@@ -170,6 +170,15 @@ struct Subscription {
     stall: Option<Stall>,
 }
 
+impl Subscription {
+    /// Whether the subscription reached its initial target, for the outcome
+    /// windows. A locator at the target reaches it at `Open`, even before the
+    /// publisher has served anything.
+    fn reached(&self) -> bool {
+        self.position.reached() || self.locators.contains(&self.fixed.target)
+    }
+}
+
 /// The state shared between [`Publisher::apply`] and the publisher task.
 #[derive(Debug)]
 struct Shared {
@@ -345,7 +354,7 @@ impl Shared {
                     is_legal(
                         outcome,
                         self.pages_sent(&id),
-                        subscription.position.reached(),
+                        subscription.reached(),
                         self.publications.is_closing(&id),
                     ),
                     "the publisher queued {outcome:?} outside its window"
@@ -384,11 +393,7 @@ impl Shared {
         }
         let pages_sent = self.pages_sent(&id);
         if let Some(subscription) = self.subscriptions.get_mut(&id) {
-            subscription.end = Some(in_window(
-                outcome,
-                pages_sent,
-                subscription.position.reached(),
-            ));
+            subscription.end = Some(in_window(outcome, pages_sent, subscription.reached()));
         }
     }
 
@@ -1044,15 +1049,23 @@ async fn run_job<const HEADER_BYTES: usize>(
                     return Output::Stall(Stall::Local, "probe_ancestor");
                 }
             }
-            Ok(AcquirePathReply::NoLocatorIntersection) => {
-                // Tell a target this node never retained from one that left
-                // the selected chain.
+            Ok(
+                reply @ (AcquirePathReply::NoLocatorIntersection | AcquirePathReply::HistoryPruned),
+            ) => {
+                // The probe found the target off the selected chain, or
+                // behind pruned history that will not return. Tell a target
+                // this node never retained from either.
+                let found = if matches!(reply, AcquirePathReply::HistoryPruned) {
+                    HeadersOutcomeCode::HistoryPruned
+                } else {
+                    HeadersOutcomeCode::TargetNotSelected
+                };
                 let locators = job.locators.clone();
                 let path = acquire(port, owner, selected, job.lease_target, locators).await;
                 return match path {
                     Ok(AcquirePathReply::Acquired(path)) => {
                         release(port, job.id, *path).await;
-                        Output::End(HeadersOutcomeCode::TargetNotSelected)
+                        Output::End(found)
                     }
                     Ok(AcquirePathReply::TargetNotRetained) => {
                         Output::End(HeadersOutcomeCode::TargetNotRetained)
@@ -1060,12 +1073,11 @@ async fn run_job<const HEADER_BYTES: usize>(
                     Ok(AcquirePathReply::CapacityBusy(signal)) => {
                         Output::Stall(Stall::Capacity(signal), "capacity")
                     }
-                    // The probe already showed the target is off the
-                    // selected chain.
-                    Ok(_) => Output::End(HeadersOutcomeCode::TargetNotSelected),
+                    // The probe already settled the outcome.
+                    Ok(_) => Output::End(found),
                     Err(error) => {
                         log_port_failure(job.id, "target_retained", &error);
-                        Output::End(HeadersOutcomeCode::TargetNotSelected)
+                        Output::End(found)
                     }
                 };
             }

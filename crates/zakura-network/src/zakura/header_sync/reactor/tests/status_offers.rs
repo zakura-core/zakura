@@ -809,15 +809,21 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
     );
 }
 
-/// A full cadence burst of repeated statuses from each of `peers` peers
-/// starts one locator read, and another peer's new target still starts at
-/// once. The port never answers, so each read stays pending, as under a slow
-/// state.
+/// A full cadence burst of statuses from each of `peers` peers starts one
+/// locator read, and another peer's new target still starts at once. The port
+/// never answers, so each read stays pending, as under a slow state.
+///
+/// The peers all advertise one target. Without `retarget`, they repeat their
+/// statuses. With it, one more peer sends the same number of statuses while
+/// flipping its own unstarted target, which changes the scheduling key every
+/// time, so only the cached-pass budget bounds the cost.
 #[allow(clippy::print_stderr)]
-fn status_flood(peers: u8) {
+fn status_flood(peers: u16, retarget: bool) {
     // The `Status` cadence capacity.
     const BURST: usize = 602;
     let mut startup = startup(CancellationToken::new());
+    // Admit the default 256 inbound and 256 outbound sessions in one direction.
+    startup.config.peer_limits.max_inbound_peers = 512;
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
@@ -826,23 +832,50 @@ fn status_flood(peers: u8) {
     startup.use_direct_port();
     let (_, _actions, mut reactor) =
         build_header_sync_reactor(startup).expect("the reactor builds");
-    let flooders: Vec<_> = (0..peers).map(|byte| connect(&mut reactor, byte)).collect();
-    let (honest, _outbound) = connect(&mut reactor, 0xff);
+    let connect_index = |reactor: &mut HeaderSyncReactor, index: u16| {
+        let mut id = vec![0xa5; 32];
+        id[..2].copy_from_slice(&index.to_be_bytes());
+        let peer = ZakuraPeerId::new(id).expect("the test peer ID has the required length");
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().expect("the initial status was sent");
+        (peer, outbound)
+    };
+    let flooders: Vec<_> = (0..peers)
+        .map(|index| connect_index(&mut reactor, index))
+        .collect();
+    let (attacker, _attacker_outbound) = connect_index(&mut reactor, u16::MAX - 1);
+    let (honest, _outbound) = connect_index(&mut reactor, u16::MAX);
     let flooded = block::Hash([0x42; 32]);
+    let flips = [block::Hash([0x51; 32]), block::Hash([0x52; 32])];
+    for (peer, _) in &flooders {
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
+        reactor.schedule_cached_statuses();
+    }
+    let statuses = BURST * flooders.len();
     let started = std::time::Instant::now();
-    for _ in 0..BURST {
-        for (peer, _) in &flooders {
-            reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
-            reactor.schedule_cached_statuses();
-        }
+    for index in 0..statuses {
+        let (peer, target) = if retarget {
+            (&attacker, flips[index % 2])
+        } else {
+            (&flooders[index % flooders.len()].0, flooded)
+        };
+        // The loop scans maintenance deadlines before each event.
+        std::hint::black_box(reactor.next_maintenance_deadline());
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, target));
+        reactor.schedule_cached_statuses();
     }
     let elapsed = started.elapsed();
-    assert_eq!(reactor.pending_port_operations.len(), 1);
+    let reads = 1 + usize::from(retarget);
+    assert_eq!(reactor.pending_port_operations.len(), reads);
     reactor.handle_status(honest, 0, status_for(&snapshot, block::Hash([0x43; 32])));
-    assert_eq!(reactor.pending_port_operations.len(), 2);
-    let statuses = BURST * flooders.len();
+    assert_eq!(reactor.pending_port_operations.len(), reads + 1);
     eprintln!(
-        "status_flood peers={peers} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
+        "status_flood peers={peers} retarget={retarget} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
         elapsed.as_nanos() / u128::try_from(statuses).expect("fits u128"),
     );
 }
@@ -850,15 +883,16 @@ fn status_flood(peers: u8) {
 /// Sixteen flooding peers, on every pull request.
 #[test]
 fn status_floods_start_no_repeated_work() {
-    status_flood(16);
+    status_flood(16, false);
+    status_flood(16, true);
 }
 
-/// Every peer a one-byte test identity allows but the honest one, in
-/// full-coverage CI runs.
+/// The default 512 sessions, in full-coverage CI runs.
 #[test]
 #[ignore = "broad load run; full-coverage CI passes --run-ignored"]
 fn maximum_status_floods_start_no_repeated_work() {
-    status_flood(255);
+    status_flood(510, false);
+    status_flood(510, true);
 }
 
 /// A status for another tip that arrives while a target applies stays

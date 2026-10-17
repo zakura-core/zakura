@@ -1345,14 +1345,17 @@ async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
     assert!(harness.deliver_all().await.is_empty());
     port.grow(2);
     harness.drain().await;
-    // The tip moves past the page, then again during every recheck lease.
+    // The tip moves past the page, then again during each of the recheck's
+    // leases.
     port.grow(1);
-    port.store().move_tip_on_acquire = 100;
+    port.store().move_tip_on_acquire = RECHECK_LEASES;
     let walks = port.store().walks;
     port.gate.add_permits(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
-    assert_eq!(port.store().walks - walks, RECHECK_LEASES);
+    // The recheck's leases, then one check of the newest tip, since no
+    // credit is left for a page.
+    assert_eq!(port.store().walks - walks, RECHECK_LEASES + 1);
     harness.check_quiet().await;
 }
 
@@ -1525,6 +1528,47 @@ async fn a_leaked_lease_capacity_stall_retries_on_a_chain_change() {
     port.grow(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    harness.check_quiet().await;
+}
+
+/// A follower with no room for a page still learns that the selected chain
+/// stopped extending its last header. Growth costs one check per tip.
+#[tokio::test(start_paused = true)]
+async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    let main = port.grow(2);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // The chain grows with no credit left: one check, and nothing sent.
+    let walks = port.store().walks;
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    assert_eq!(port.store().walks - walks, 1);
+    harness.drain().await;
+    assert_eq!(
+        port.store().walks - walks,
+        1,
+        "a checked tip is not checked again"
+    );
+
+    // A higher branch that forks below the last header supersedes it.
+    let side = port.store().tree.extend(main[0], 4);
+    port.select(side[3]);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
     harness.check_quiet().await;
 }
 

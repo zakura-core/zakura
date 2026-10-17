@@ -41,9 +41,14 @@ const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
 /// Each request holds one entry of the routines' shared request pool until its
 /// response ends, and asks for at most `advertised_max_blocks_per_response`
 /// heights, so in-flight heights never exceed this many requests' worth (per-peer
-/// and per-session limits only lower that). That also caps the refill low-water target: once pending plus in-flight work
-/// reaches it, every free pool entry already has a pending height to take, so a
-/// higher target only queues more work without adding throughput.
+/// and per-session limits only lower that). That also caps the refill low-water
+/// target, at this many requests' worth plus one [`NEEDED_BLOCK_REFILL_LIMIT`]
+/// batch. Past the pool's worth, every free entry already has a pending height
+/// to take. The extra batch keeps a full pool from draining pending work to zero
+/// before the next refill query, which would leave replacement requests waiting
+/// for its round trip. Only one refill query runs at a time and each returns at
+/// most one batch, so a bigger reserve can't refill any faster. It only absorbs
+/// a longer burst by queuing more work.
 // `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
 const BS_REQUEST_POOL_ENTRIES: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
 
@@ -2194,8 +2199,8 @@ fn set_block_reactor_active_connection_gauge(active_connections: usize) {
 }
 
 /// Refill low-water target in heights: one full local per-peer window for each
-/// peer that sent a status, never more than the request pool can have in flight
-/// (see [`BS_REQUEST_POOL_ENTRIES`]), and never less than one request.
+/// peer that sent a status, never more than the request pool's worth plus one
+/// refill batch (see [`BS_REQUEST_POOL_ENTRIES`]), and never less than one request.
 fn refill_low_water_target(registry: &PeerRegistry, config: &ZakuraBlockSyncConfig) -> usize {
     let status_peers = registry.peers_with_status().max(1);
     let max_blocks_per_response = usize::try_from(config.advertised_max_blocks_per_response())
@@ -2204,10 +2209,16 @@ fn refill_low_water_target(registry: &PeerRegistry, config: &ZakuraBlockSyncConf
         .expect("u32 max inflight requests fits in usize on supported targets")
         .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER);
 
+    let cap = BS_REQUEST_POOL_ENTRIES
+        .saturating_mul(max_blocks_per_response)
+        .saturating_add(
+            usize::try_from(NEEDED_BLOCK_REFILL_LIMIT).expect("the refill batch fits usize"),
+        );
+
     status_peers
         .saturating_mul(max_inflight_per_peer)
-        .min(BS_REQUEST_POOL_ENTRIES)
         .saturating_mul(max_blocks_per_response)
+        .min(cap)
         .max(max_blocks_per_response)
 }
 
@@ -2253,9 +2264,19 @@ mod refill_target_tests {
         registry
     }
 
-    /// Status-only peers count toward the target but can't push it past the pool.
+    /// One refill batch in heights.
+    fn refill_batch() -> usize {
+        usize::try_from(NEEDED_BLOCK_REFILL_LIMIT).unwrap()
+    }
+
+    /// The default config's cap: a full pool of one-block requests plus one batch.
+    fn default_cap() -> usize {
+        BS_REQUEST_POOL_ENTRIES + refill_batch()
+    }
+
+    /// Status-only peers count toward the target but can't push it past the cap.
     #[test]
-    fn status_only_peers_cannot_grow_the_refill_target_past_the_request_pool() {
+    fn status_only_peers_cannot_grow_the_refill_target_past_the_cap() {
         let config = ZakuraBlockSyncConfig::default();
         // The default inbound limit's worth of peers whose statuses advertise only
         // genesis, so none of them can serve a far-behind node's missing work.
@@ -2263,17 +2284,14 @@ mod refill_target_tests {
         assert_eq!(registry.peers_with_status(), 256);
 
         // Before the cap this was 256 * 32,000 = 8,192,000 queued heights.
-        assert_eq!(
-            refill_low_water_target(&registry, &config),
-            BS_REQUEST_POOL_ENTRIES
-        );
+        assert_eq!(refill_low_water_target(&registry, &config), default_cap());
     }
 
     /// Useful suppliers still grow the target until it covers the whole pool.
     #[test]
-    fn useful_suppliers_still_fill_the_refill_target_up_to_the_request_pool() {
-        // One default supplier keeps its full window, which already sits just
-        // under the pool, and a second one reaches the pool exactly.
+    fn useful_suppliers_still_fill_the_refill_target_up_to_the_cap() {
+        // One default supplier keeps its full window, as on main, and a second
+        // one reaches the cap.
         let config = ZakuraBlockSyncConfig::default();
         let one = registry_with_status_peers(&config, 1, 0, 3_000_000);
         assert_eq!(
@@ -2281,22 +2299,35 @@ mod refill_target_tests {
             usize::try_from(DEFAULT_BS_MAX_INFLIGHT).unwrap()
         );
         let two = registry_with_status_peers(&config, 2, 0, 3_000_000);
-        assert_eq!(
-            refill_low_water_target(&two, &config),
-            BS_REQUEST_POOL_ENTRIES
-        );
+        assert_eq!(refill_low_water_target(&two, &config), default_cap());
 
-        // Small per-peer windows still add up until the pool is covered.
+        // Small per-peer windows still add up until the cap is reached.
         let config = ZakuraBlockSyncConfig {
             max_inflight_requests: 64,
             ..ZakuraBlockSyncConfig::default()
         };
-        let some = registry_with_status_peers(&config, 100, 0, 3_000_000);
-        assert_eq!(refill_low_water_target(&some, &config), 100 * 64);
-        let enough = registry_with_status_peers(&config, 512, 0, 3_000_000);
+        let some = registry_with_status_peers(&config, 512, 0, 3_000_000);
         assert_eq!(
-            refill_low_water_target(&enough, &config),
+            refill_low_water_target(&some, &config),
             BS_REQUEST_POOL_ENTRIES
+        );
+        let enough = registry_with_status_peers(&config, 600, 0, 3_000_000);
+        assert_eq!(refill_low_water_target(&enough, &config), default_cap());
+    }
+
+    /// With every pool entry outstanding, refill is still due before pending
+    /// work drops below one batch, so replacements never wait on a refill query.
+    #[test]
+    fn a_full_request_pool_still_refills_before_pending_work_runs_out() {
+        let config = ZakuraBlockSyncConfig::default();
+        let registry = registry_with_status_peers(&config, 12, 0, 3_000_000);
+        let target = refill_low_water_target(&registry, &config);
+
+        let outstanding = BS_REQUEST_POOL_ENTRIES;
+        let pending = refill_batch() - 1;
+        assert!(
+            outstanding + pending < target,
+            "a full pool with less than a batch pending must still refill"
         );
     }
 }

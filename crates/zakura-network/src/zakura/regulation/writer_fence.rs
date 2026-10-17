@@ -80,6 +80,8 @@ enum Phase {
     Queued,
     Started,
     Ended,
+    /// Ended before the request's first byte was written.
+    Abandoned,
     Dropped,
 }
 
@@ -170,12 +172,19 @@ impl Exchange {
 
     /// End the exchange. Call it only after the ending passed validation.
     /// Later calls change nothing.
+    ///
+    /// An ending that arrives before the request's first byte abandons the
+    /// exchange: the request and every frame queued to follow it are skipped.
     pub(crate) fn end(&mut self) {
         let (mut state, mut phase) = self.0.lock();
-        if *phase == Phase::Started {
-            state.started -= 1;
+        match *phase {
+            Phase::Started => {
+                state.started -= 1;
+                *phase = Phase::Ended;
+            }
+            Phase::Opened | Phase::Queued => *phase = Phase::Abandoned,
+            Phase::Ended | Phase::Abandoned | Phase::Dropped => {}
         }
-        *phase = Phase::Ended;
     }
 }
 

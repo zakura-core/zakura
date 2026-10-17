@@ -1572,6 +1572,48 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
     harness.check_quiet().await;
 }
 
+/// A check without a page needs no output, so it runs and ends the
+/// subscription even while an unread page holds the peer's one response slot.
+#[tokio::test(start_paused = true)]
+async fn a_check_without_a_page_needs_no_output() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let serve = ServeLimits {
+        peer_output_responses: 1,
+        ..serve_limits()
+    };
+    let mut harness = Harness::new(port.clone(), serve);
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 goes out, and nobody reads it.
+    let main = port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    // A higher branch that forks below the last header needs a check.
+    let side = port.store().tree.extend(main[0], 3);
+    port.select(side[2]);
+    tokio::time::sleep(QUIET).await;
+    let page = harness.recv.try_recv().expect("the page waits unread");
+    assert!(matches!(
+        harness.subscriber.receive(&page),
+        Received::Page { .. }
+    ));
+    let outcome = harness
+        .recv
+        .try_recv()
+        .expect("the outcome is already queued behind the page");
+    assert_eq!(
+        harness.subscriber.receive(&outcome),
+        Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)
+    );
+    harness.check_quiet().await;
+}
+
 /// A follower stalled on a capacity refusal still ends as superseded when
 /// the selected tip drops below its last header.
 #[tokio::test(start_paused = true)]

@@ -1,5 +1,6 @@
 mod admission;
 mod aux_fallback;
+mod closing;
 mod completion;
 mod eviction;
 mod peer_faults;

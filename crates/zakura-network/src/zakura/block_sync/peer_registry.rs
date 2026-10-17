@@ -708,8 +708,9 @@ impl PeerRegistry {
     }
 
     /// Mark `generation`'s session closed. The service calls this when it ends
-    /// the session, before it queues the session's disconnect. A newer
-    /// generation is left open.
+    /// the session, before it queues the session's disconnect, or when it
+    /// refuses an admission it already registered. A newer generation is left
+    /// open.
     pub(super) fn close_session(&self, peer: &ZakuraPeerId, generation: u64) {
         if let Some(entry) = self
             .lock()

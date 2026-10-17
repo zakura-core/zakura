@@ -1014,7 +1014,10 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     }
     assert!(reactor.pending_locator_queries.is_empty());
     assert_eq!(reactor.locator_capacity.available_permits(), 0);
+    // A cached offer can become idle without a fresh refusal arming the waiter.
+    reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
+    assert!(reactor.locator_capacity_waiting);
     assert!(reactor.pending_locator_queries.is_empty());
     assert!(!reactor.peer_state[&peer].status_spent);
     // The real service finishes one orphaned read. Its last permit drop wakes
@@ -1087,4 +1090,290 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
         MAX_STAGED_TARGETS_V1
     );
     assert_eq!(reactor.peer_work_queue.len(), 0);
+}
+
+#[test]
+fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
+    for peers in [16_u16, 64, 256, 512] {
+        for no_headroom in [false, true] {
+            let (mut reactor, mut actions, snapshot) = offers_reactor();
+            let (owner, owner_outbound) = connect(&mut reactor, 0);
+            seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+            let owner_status = applying_target_status(&reactor, &owner);
+            if no_headroom {
+                reactor
+                    .peer_work_queue
+                    .set_capacity_for_test(&owner, 4000, 0);
+            }
+            let mut outbounds = vec![owner_outbound];
+            let mut offers = Vec::new();
+            for index in 1..peers {
+                let mut id = vec![0; 32];
+                id[..2].copy_from_slice(&index.to_le_bytes());
+                let peer = ZakuraPeerId::new(id).unwrap();
+                let (send, mut outbound) = framed_channel(8);
+                let direction = if index < 256 {
+                    ServicePeerDirection::Inbound
+                } else {
+                    ServicePeerDirection::Outbound
+                };
+                reactor.handle_peer_connected(PeerSession::from_parts_with_direction(
+                    peer.clone(),
+                    direction,
+                    send,
+                    CancellationToken::new(),
+                ));
+                outbound.try_recv().unwrap();
+                outbounds.push(outbound);
+                let status = if no_headroom {
+                    let mut target = [0; 32];
+                    target[..2].copy_from_slice(&index.to_le_bytes());
+                    status_for(&snapshot, block::Hash(target))
+                } else {
+                    owner_status.clone()
+                };
+                reactor.handle_status(peer.clone(), 0, status.clone());
+                offers.push((peer, status));
+            }
+            reactor.schedule_cached_statuses();
+            // Clearing only the cache reproduces the prior unconditional pass and
+            // provides a deterministic control using the same scheduling code.
+            for unconditional in [false, true] {
+                let visits = reactor.cached_offer_visits;
+                for iteration in 0..1000 {
+                    // The end-of-event pass also runs on events with no scheduling effect.
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                    let (peer, status) = &offers[iteration % offers.len()];
+                    reactor.handle_status(peer.clone(), 0, status.clone());
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                    reactor.handle_status(owner.clone(), 0, owner_status.clone());
+                    if unconditional {
+                        reactor.last_scheduling_opportunity = None;
+                    }
+                    reactor.schedule_cached_statuses();
+                }
+                assert_eq!(
+                    reactor.cached_offer_visits - visits,
+                    if unconditional {
+                        usize::from(peers) * 3000
+                    } else {
+                        0
+                    },
+                    "peers={peers}, no_headroom={no_headroom}, unconditional={unconditional}"
+                );
+                assert!(actions.try_recv().is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn final_header_lease_drop_wakes_blocked_offers_without_queue_mutation() {
+    for during_scan in [false, true] {
+        let (mut reactor, mut actions, snapshot) = offers_reactor();
+        let (owner, _owner_outbound) = connect(&mut reactor, 1);
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&owner, 4000, 0);
+        let leases = reactor.peer_work_queue.retain_header_capacity(&owner);
+        reactor.peer_work_queue.remove(&owner);
+        let (alternate, _alternate_outbound) = connect(&mut reactor, 2);
+        let status = status_for(&snapshot, block::Hash([2; 32]));
+        reactor.handle_status(alternate.clone(), 0, status.clone());
+        reactor.schedule_cached_statuses();
+        let visits = reactor.cached_offer_visits;
+        let revision = reactor.peer_work_queue.scheduling_revision();
+        let mut releases = reactor.peer_work_queue.capacity_releases();
+        let final_leases = leases.clone();
+        drop(leases);
+        assert!(!releases.has_changed().unwrap());
+        reactor.schedule_cached_statuses();
+        assert_eq!(reactor.cached_offer_visits, visits);
+        if during_scan {
+            reactor.release_after_cached_offer_scan = Some(final_leases);
+            reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+            reactor.schedule_cached_statuses();
+            assert!(actions.try_recv().is_err());
+        } else {
+            drop(final_leases);
+        }
+        time::timeout(std::time::Duration::from_secs(1), releases.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reactor.peer_work_queue.scheduling_revision(), revision);
+        reactor.schedule_cached_statuses();
+        expect_locator_query(&mut actions, &alternate, status.selected_tip_hash);
+    }
+}
+
+fn assert_status_metadata_churn_is_local(no_headroom: bool, awaiting_owner: bool) {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (owner, outbound) = connect(&mut reactor, 0);
+    let owner_status = if awaiting_owner {
+        let mut status = status_for(&snapshot, block::Hash([0x80; 32]));
+        status.max_headers_per_response = 4000;
+        reactor.handle_status(owner.clone(), 0, status.clone());
+        status
+    } else {
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+        applying_target_status(&reactor, &owner)
+    };
+    if no_headroom {
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&owner, 4000, 0);
+    }
+    let mut outbounds = vec![outbound];
+    let mut blocked = None;
+    for byte in 1..=64 {
+        let (peer, outbound) = connect(&mut reactor, byte);
+        outbounds.push(outbound);
+        let status = if no_headroom {
+            status_for(&snapshot, block::Hash([byte; 32]))
+        } else {
+            owner_status.clone()
+        };
+        reactor.handle_status(peer.clone(), 0, status.clone());
+        blocked = Some((peer, status));
+    }
+    reactor.schedule_cached_statuses();
+    let visits = reactor.cached_offer_visits;
+    let (peer, mut status) = if awaiting_owner {
+        (owner, owner_status)
+    } else {
+        blocked.unwrap()
+    };
+    for height in 1..=64 {
+        status.oldest_retained_height = block::Height(height);
+        reactor.handle_status(peer.clone(), 0, status.clone());
+        reactor.schedule_cached_statuses();
+    }
+    assert_eq!(reactor.cached_offer_visits - visits, 0);
+    // Neither nonzero slot-count changes nor limits above the effective virtual
+    // claim change other peers' headroom. Priority is retained for later eviction,
+    // but changing it does not itself release ownership or capacity.
+    for value in 1..=64 {
+        status.max_subscriptions = value + 1;
+        status.max_message_bytes = 2_000_000 + u32::from(value);
+        status.suffix_cumulative_work = zakura_chain::work::difficulty::U256::from(value % 2);
+        if awaiting_owner {
+            status.max_headers_per_response = 4000 - u32::from(value);
+        }
+        reactor.handle_status(peer.clone(), 0, status.clone());
+        reactor.schedule_cached_statuses();
+    }
+    assert_eq!(reactor.cached_offer_visits - visits, 0);
+    assert_eq!(
+        reactor.peer_state[&peer].last_status.as_ref(),
+        Some(&status)
+    );
+    if awaiting_owner {
+        assert_eq!(
+            &reactor
+                .peer_work_queue
+                .awaiting_target(&peer)
+                .unwrap()
+                .status,
+            &status
+        );
+    }
+}
+
+#[test]
+fn blocked_duplicate_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(false, false);
+}
+
+#[test]
+fn blocked_headroom_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(true, false);
+}
+
+#[test]
+fn awaiting_locator_status_metadata_churn_is_local() {
+    assert_status_metadata_churn_is_local(false, true);
+}
+
+#[test]
+fn pending_locator_claim_shrink_wakes_cached_offer_without_changing_target() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (budget_owner, _budget_outbound) = connect(&mut reactor, 1);
+    seed_applying_request(&mut reactor, &snapshot, budget_owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&budget_owner, 3998, 0);
+    let (owner, _outbound) = connect(&mut reactor, 2);
+    let mut status = status_for(&snapshot, block::Hash([2; 32]));
+    status.max_headers_per_response = 2;
+    reactor.handle_status(owner.clone(), 0, status.clone());
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 3);
+    reactor.handle_status(
+        alternate.clone(),
+        0,
+        status_for(&snapshot, block::Hash([3; 32])),
+    );
+    reactor.schedule_cached_statuses();
+    let visits = reactor.cached_offer_visits;
+    assert!(!reactor.peer_work_queue.has_work(&alternate));
+    status.max_headers_per_response = 1;
+    reactor.handle_status(owner, 0, status);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_offer_visits > visits);
+    assert!(reactor
+        .peer_work_queue
+        .awaiting_target(&alternate)
+        .is_some());
+    assert_eq!(reactor.pending_locator_queries.len(), 2);
+}
+
+#[test]
+fn awaiting_owner_retarget_wakes_old_target_alternate() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.startup.port_dispatch = PortDispatch::Direct;
+    let (owner, _outbound) = connect(&mut reactor, 1);
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 2);
+    let status = status_for(&snapshot, block::Hash([1; 32]));
+    reactor.handle_status(owner.clone(), 0, status.clone());
+    reactor.handle_status(alternate.clone(), 0, status);
+    reactor.schedule_cached_statuses();
+    assert!(!reactor.peer_work_queue.has_work(&alternate));
+    reactor.handle_status(owner, 0, status_for(&snapshot, block::Hash([3; 32])));
+    reactor.schedule_cached_statuses();
+    assert!(reactor
+        .peer_work_queue
+        .awaiting_target(&alternate)
+        .is_some());
+    assert_eq!(reactor.pending_locator_queries.len(), 2);
+}
+
+#[test]
+fn changed_offer_is_considered_immediately_without_global_invalidation() {
+    for field in 0..3 {
+        let (mut reactor, _actions, snapshot) = offers_reactor();
+        reactor.startup.port_dispatch = PortDispatch::Direct;
+        let (peer, _outbound) = connect(&mut reactor, 1);
+        let eligible = status_for(&snapshot, block::Hash([1; 32]));
+        let mut ineligible = eligible.clone();
+        match field {
+            0 => ineligible.max_headers_per_response = 0,
+            1 => ineligible.max_message_bytes = 0,
+            _ => ineligible.selected_tip_height = snapshot.frontiers.finalized.height,
+        }
+        reactor.handle_status(peer.clone(), 0, ineligible);
+        reactor.schedule_cached_statuses();
+        assert!(!reactor.peer_work_queue.has_work(&peer));
+        // Admission of this peer does not depend on running the cached-offer pass.
+        reactor.handle_status(peer.clone(), 0, eligible);
+        assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
+    }
 }

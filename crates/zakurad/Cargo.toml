@@ -236,7 +236,6 @@ hex.workspace = true
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-jsonrpsee-types = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }

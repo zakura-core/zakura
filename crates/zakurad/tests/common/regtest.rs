@@ -17,7 +17,7 @@ use zakura_chain::{
     transaction::{LockTime, Transaction},
     transparent::{self, Address, Input, OutPoint, Output, Script},
 };
-use zakura_node_services::rpc_client::RpcRequestClient;
+use zakura_node_services::rpc_client::{RpcError, RpcRequestClient};
 use zakura_rpc::{
     client::{
         BlockProposalResponse, BlockTemplateResponse, BlockTemplateTimeSource,
@@ -577,12 +577,10 @@ impl MiningRpcMethods for RpcRequestClient {
                 Ok(Some(Arc::new(block)))
             }
             Err(err)
-                if err
-                    .downcast_ref::<jsonrpsee_types::ErrorObject>()
-                    .is_some_and(|err| {
-                        let error: i32 = server::error::LegacyCode::InvalidParameter.into();
-                        err.code() == error
-                    }) =>
+                if err.downcast_ref::<RpcError>().is_some_and(|err| {
+                    let error: i32 = server::error::LegacyCode::InvalidParameter.into();
+                    err.code == error
+                }) =>
             {
                 Ok(None)
             }

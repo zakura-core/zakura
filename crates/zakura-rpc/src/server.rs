@@ -61,6 +61,7 @@ use crate::{
 pub mod cookie;
 pub mod error;
 pub mod http_request_compatibility;
+pub mod jsonrpc;
 pub mod rpc_batch;
 pub mod rpc_call_compatibility;
 pub mod rpc_logger;

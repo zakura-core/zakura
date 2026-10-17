@@ -26,7 +26,6 @@ color-eyre = []
 
 rpc-client = [
     "color-eyre",
-    "jsonrpsee-types",
     "reqwest",
     "dep:rustls",
     "dep:webpki-roots",
@@ -42,7 +41,6 @@ tower = { workspace = true }
 # Optional dependencies
 
 # Tool and test feature rpc-client
-jsonrpsee-types = { workspace = true, optional = true }
 # Security: avoid default dependency on openssl
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
@@ -58,7 +56,6 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "s
 webpki-roots = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonrpsee-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

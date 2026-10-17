@@ -12,10 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::server::jsonrpc::RpcResult as Result;
 use futures::FutureExt;
 use hex::FromHex;
 use insta::Settings;
-use jsonrpsee::core::RpcResult as Result;
 use tower::{buffer::Buffer, Service};
 
 use zakura_chain::{

@@ -133,20 +133,72 @@ impl RpcRequestClient {
     fn json_result_from_response_text<T: serde::de::DeserializeOwned>(
         response_text: &str,
     ) -> std::result::Result<T, BoxError> {
-        let output: jsonrpsee_types::Response<serde_json::Value> =
+        let mut response: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(response_text)?;
-        match output.payload {
-            jsonrpsee_types::ResponsePayload::Success(success) => {
-                Ok(serde_json::from_value(success.into_owned())?)
-            }
-            jsonrpsee_types::ResponsePayload::Error(failure) => Err(failure.to_string().into()),
+
+        if let Some(error) = response.remove("error").filter(|error| !error.is_null()) {
+            return Err(Box::new(serde_json::from_value::<RpcError>(error)?));
         }
+
+        let result = response
+            .remove("result")
+            .ok_or("JSON-RPC response has neither a result nor an error")?;
+
+        Ok(serde_json::from_value(result)?)
     }
 }
+
+/// An error object from a JSON-RPC response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct RpcError {
+    /// The error code.
+    pub code: i32,
+    /// The error message.
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_results_and_errors() {
+        let result: u32 = RpcRequestClient::json_result_from_response_text(
+            r#"{"jsonrpc":"2.0","id":1,"result":7}"#,
+        )
+        .expect("the response has a result");
+        assert_eq!(result, 7);
+
+        let result: Option<u32> = RpcRequestClient::json_result_from_response_text(
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+        )
+        .expect("a null result is a result");
+        assert_eq!(result, None);
+
+        let error = RpcRequestClient::json_result_from_response_text::<u32>(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-8,"message":"Block not found"}}"#,
+        )
+        .expect_err("the response has an error");
+        assert_eq!(
+            error.downcast_ref::<RpcError>(),
+            Some(&RpcError {
+                code: -8,
+                message: "Block not found".to_string(),
+            })
+        );
+        assert_eq!(error.to_string(), "-8: Block not found");
+
+        RpcRequestClient::json_result_from_response_text::<u32>(r#"{"jsonrpc":"2.0","id":1}"#)
+            .expect_err("the response has no result");
+    }
     use std::sync::{Arc, Mutex};
 
     /// Proves that `RpcRequestClient` times out instead of hanging indefinitely

@@ -6,6 +6,7 @@ use std::future::Future;
 
 use std::pin::Pin;
 
+use super::jsonrpc::ErrorObject;
 use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
@@ -13,7 +14,6 @@ use jsonrpsee::{
     core::BoxError,
     server::{HttpBody, HttpRequest, HttpResponse},
 };
-use jsonrpsee_types::ErrorObject;
 use serde::{Deserialize, Serialize};
 use tower::Service;
 
@@ -227,7 +227,7 @@ where
     fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
         // Check if the request is authenticated
         if !self.check_credentials(request.headers_mut()) {
-            let error = ErrorObject::borrowed(401, "unauthenticated method", None);
+            let error = ErrorObject::new(401, "unauthenticated method");
             // TODO: Error object is not being returned to the user but an empty response.
             return future::err(BoxError::from(error)).boxed();
         }

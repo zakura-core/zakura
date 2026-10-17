@@ -43,9 +43,8 @@ use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFuture
 use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
-use jsonrpsee::core::{async_trait, RpcResult as Result};
+use jsonrpsee::core::async_trait;
 use jsonrpsee_proc_macros::rpc;
-use jsonrpsee_types::{ErrorCode, ErrorObject};
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -101,6 +100,7 @@ use crate::{
     server::{
         self,
         error::{MapError, OkOrError},
+        jsonrpc::{ErrorCode, ErrorObject, RpcResult as Result},
     },
 };
 
@@ -1603,10 +1603,9 @@ where
         }
 
         if state.saturated {
-            return Err(ErrorObject::owned(
+            return Err(ErrorObject::new(
                 0,
                 "template rejection limit reached; wait for a new tip",
-                None::<()>,
             ));
         }
 
@@ -1708,7 +1707,7 @@ where
                 Ok(None)
             }
             Ok(Ok(zakura_state::ReadResponse::Tip(_))) | Ok(Err(_)) | Err(_) => {
-                Err(ErrorObject::owned(0, error, None::<()>))
+                Err(ErrorObject::new(0, error))
             }
             Ok(Ok(_)) => unreachable!("unmatched response to a tip request"),
         }
@@ -1892,10 +1891,9 @@ where
         });
 
         let block_verifier_router_response = lifecycle.await.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
+            ErrorObject::new(
+                ErrorCode::InternalError,
                 format!("mined block lifecycle task failed: {error}"),
-                None::<()>,
             )
         })?;
 
@@ -3227,10 +3225,9 @@ where
                 subtrees,
             })
         } else {
-            Err(ErrorObject::owned(
-                server::error::LegacyCode::Misc.into(),
+            Err(ErrorObject::new(
+                server::error::LegacyCode::Misc,
                 format!("invalid pool name, must be one of: {POOL_LIST:?}").as_str(),
-                None::<()>,
             ))
         }
     }
@@ -3351,24 +3348,21 @@ where
         if self.network.is_regtest() {
             match unix::raise_interrupt() {
                 Ok(_) => Ok("Zakura server stopping".to_string()),
-                Err(error) => Err(ErrorObject::owned(
-                    ErrorCode::InternalError.code(),
+                Err(error) => Err(ErrorObject::new(
+                    ErrorCode::InternalError,
                     format!("Failed to shut down: {error}").as_str(),
-                    None::<()>,
                 )),
             }
         } else {
-            Err(ErrorObject::borrowed(
-                ErrorCode::MethodNotFound.code(),
+            Err(ErrorObject::new(
+                ErrorCode::MethodNotFound,
                 "stop is only available on regtest networks",
-                None,
             ))
         }
         #[cfg(target_os = "windows")]
-        Err(ErrorObject::borrowed(
-            ErrorCode::MethodNotFound.code(),
+        Err(ErrorObject::new(
+            ErrorCode::MethodNotFound,
             "stop is not available in windows targets",
-            None,
         ))
     }
 
@@ -3390,10 +3384,9 @@ where
 
         match response {
             zakura_state::ReadResponse::BlockHash(Some(hash)) => Ok(GetBlockHashResponse(hash)),
-            zakura_state::ReadResponse::BlockHash(None) => Err(ErrorObject::borrowed(
-                server::error::LegacyCode::InvalidParameter.into(),
+            zakura_state::ReadResponse::BlockHash(None) => Err(ErrorObject::new(
+                server::error::LegacyCode::InvalidParameter,
                 "Block not found",
-                None,
             )),
             _ => unreachable!("unmatched response to a block request"),
         }
@@ -3617,7 +3610,7 @@ where
 
                     let _ = wait_for_new_tip.await;
 
-                    Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
+                    Ok::<_, ErrorObject>(precomputed_coinbase)
                 };
 
                 // Wait for the template's time range to expire. On testnet, minimum difficulty
@@ -3804,11 +3797,7 @@ where
             }
         }
 
-        Err(ErrorObject::owned(
-            0,
-            "template parent changed; retry",
-            None::<()>,
-        ))
+        Err(ErrorObject::new(0, "template parent changed; retry"))
     }
 
     async fn submit_block(
@@ -4076,10 +4065,9 @@ where
             )
             .await
             .map_err(|_| {
-                ErrorObject::owned(
-                    server::error::LegacyCode::Misc.into(),
+                ErrorObject::new(
+                    server::error::LegacyCode::Misc,
                     "timed out waiting for parent block information",
-                    None::<()>,
                 )
             })??
             else {
@@ -4250,10 +4238,9 @@ where
             Ok(zakura_state::Response::Precious) => Ok(()),
             Ok(_) => unreachable!("unmatched response to a precious block request"),
             Err(error) => match error.downcast_ref::<zakura_state::PreciousError>() {
-                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::owned(
-                    server::error::LegacyCode::InvalidAddressOrKey.into(),
+                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::new(
+                    server::error::LegacyCode::InvalidAddressOrKey,
                     "Block not found",
-                    None::<()>,
                 )),
                 _ => Err(error).map_misc_error(),
             },
@@ -4265,10 +4252,9 @@ where
         let network = self.network.clone();
 
         if !network.disable_pow() {
-            return Err(ErrorObject::borrowed(
+            return Err(ErrorObject::new(
                 0,
                 "generate is only supported on networks where PoW is disabled",
-                None,
             ));
         }
 
@@ -4282,11 +4268,7 @@ where
             let block_template = rpc.get_block_template(None).await.map_misc_error()?;
 
             let GetBlockTemplateResponse::TemplateMode(block_template) = block_template else {
-                return Err(ErrorObject::borrowed(
-                    0,
-                    "error generating block template",
-                    None,
-                ));
+                return Err(ErrorObject::new(0, "error generating block template"));
             };
 
             let proposal_block = proposal_block_from_template(
@@ -4306,10 +4288,9 @@ where
             match r {
                 SubmitBlockResponse::Accepted => { /* pass */ }
                 SubmitBlockResponse::ErrorResponse(response) => {
-                    return Err(ErrorObject::owned(
-                        server::error::LegacyCode::Misc.into(),
+                    return Err(ErrorObject::new(
+                        server::error::LegacyCode::Misc,
                         format!("block was rejected: {response:?}"),
-                        None::<()>,
                     ));
                 }
             }
@@ -4332,19 +4313,17 @@ where
                     if self.address_book.clone().add_peer(addr) {
                         Ok(())
                     } else {
-                        return Err(ErrorObject::owned(
-                            server::error::LegacyCode::ClientNodeAlreadyAdded.into(),
+                        return Err(ErrorObject::new(
+                            server::error::LegacyCode::ClientNodeAlreadyAdded,
                             format!("peer address was already present in the address book: {addr}"),
-                            None::<()>,
                         ));
                     }
                 }
             }
         } else {
-            return Err(ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
+            return Err(ErrorObject::new(
+                ErrorCode::InvalidParams,
                 "addnode command is only supported on regtest",
-                None::<()>,
             ));
         }
     }
@@ -6037,10 +6016,9 @@ fn build_height_range(
     };
 
     if start > end {
-        return Err(ErrorObject::owned(
-            ErrorCode::InvalidParams.code(),
+        return Err(ErrorObject::new(
+            ErrorCode::InvalidParams,
             format!("start {start:?} must be less than or equal to end {end:?}"),
-            None::<()>,
         ));
     }
 
@@ -6056,18 +6034,13 @@ fn build_height_range(
 // TODO: also use this function in `get_block` and `z_get_treestate`
 pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> {
     if index >= 0 {
-        let height = index.try_into().map_err(|_| {
-            ErrorObject::borrowed(
-                ErrorCode::InvalidParams.code(),
-                "Index conversion failed",
-                None,
-            )
-        })?;
+        let height = index
+            .try_into()
+            .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams, "Index conversion failed"))?;
         if height > tip_height.0 {
-            return Err(ErrorObject::borrowed(
-                ErrorCode::InvalidParams.code(),
+            return Err(ErrorObject::new(
+                ErrorCode::InvalidParams,
                 "Provided index is greater than the current tip",
-                None,
             ));
         }
         Ok(Height(height))
@@ -6075,42 +6048,31 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
         // `index + 1` can't overflow, because `index` is always negative here.
         let height = i32::try_from(tip_height.0)
             .map_err(|_| {
-                ErrorObject::borrowed(
-                    ErrorCode::InvalidParams.code(),
-                    "Tip height conversion failed",
-                    None,
-                )
+                ErrorObject::new(ErrorCode::InvalidParams, "Tip height conversion failed")
             })?
             .checked_add(index + 1);
 
         let sanitized_height = match height {
             None => {
-                return Err(ErrorObject::borrowed(
-                    ErrorCode::InvalidParams.code(),
+                return Err(ErrorObject::new(
+                    ErrorCode::InvalidParams,
                     "Provided index is not valid",
-                    None,
                 ));
             }
             Some(h) => {
                 if h < 0 {
-                    return Err(ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
+                    return Err(ErrorObject::new(
+                        ErrorCode::InvalidParams,
                         "Provided negative index ends up with a negative height",
-                        None,
                     ));
                 }
                 let h: u32 = h.try_into().map_err(|_| {
-                    ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
-                        "Height conversion failed",
-                        None,
-                    )
+                    ErrorObject::new(ErrorCode::InvalidParams, "Height conversion failed")
                 })?;
                 if h > tip_height.0 {
-                    return Err(ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
+                    return Err(ErrorObject::new(
+                        ErrorCode::InvalidParams,
                         "Provided index is greater than the current tip",
-                        None,
                     ));
                 }
 

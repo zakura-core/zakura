@@ -3752,7 +3752,6 @@ dependencies = [
  "idna_adapter",
  "indexmap",
  "insta",
- "jsonrpsee-types",
  "lazy_static",
  "libc",
  "log",
@@ -4116,7 +4115,6 @@ dependencies = [
 name = "zakura-node-services"
 version = "5.0.0-rc1"
 dependencies = [
- "jsonrpsee-types",
  "reqwest",
  "rustls",
  "serde",

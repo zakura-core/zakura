@@ -6,9 +6,9 @@ use std::{
     sync::Arc,
 };
 
+use crate::server::jsonrpc::{ErrorCode, ErrorObject};
 use futures::{join, FutureExt, TryFutureExt};
 use hex::{FromHex, ToHex};
-use jsonrpsee_types::{ErrorCode, ErrorObject};
 use proptest::{collection::vec, prelude::*};
 use thiserror::Error;
 use tokio::sync::oneshot;

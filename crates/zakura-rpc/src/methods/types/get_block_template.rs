@@ -20,10 +20,10 @@ use std::{
     time::Duration,
 };
 
+use crate::server::jsonrpc::RpcResult;
+use crate::server::jsonrpc::{ErrorCode, ErrorObject};
 use derive_new::new;
 use getset::{CopyGetters, Getters};
-use jsonrpsee::core::RpcResult;
-use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
@@ -899,10 +899,9 @@ where
         )
         .await
         .map_err(|_| {
-            ErrorObject::owned(
-                LegacyCode::Misc.into(),
+            ErrorObject::new(
+                LegacyCode::Misc,
                 "timed out waiting for mining template construction capacity",
-                None::<()>,
             )
         })?
         .map_misc_error()?;
@@ -1019,22 +1018,20 @@ pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcR
             mode: GetBlockTemplateRequestMode::Proposal,
             data: None,
             ..
-        } => Err(ErrorObject::borrowed(
-            ErrorCode::InvalidParams.code(),
+        } => Err(ErrorObject::new(
+            ErrorCode::InvalidParams,
             "\"data\" parameter must be \
                 provided in \"proposal\" mode",
-            None,
         )),
 
         GetBlockTemplateParameters {
             mode: GetBlockTemplateRequestMode::Template,
             data: Some(_),
             ..
-        } => Err(ErrorObject::borrowed(
-            ErrorCode::InvalidParams.code(),
+        } => Err(ErrorObject::new(
+            ErrorCode::InvalidParams,
             "\"data\" parameter must be \
                 omitted in \"template\" mode",
-            None,
         )),
     }
 }
@@ -1082,7 +1079,7 @@ where
     let block_verifier_router_response = block_verifier_router
         .ready()
         .await
-        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
+        .map_err(|error| ErrorObject::new(0, error.to_string()))?
         .call(zakura_consensus::Request::Prepare {
             block: block.clone(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
@@ -1147,15 +1144,14 @@ where
              Hint: check your network connection, clock, and time zone settings."
         );
 
-        return Err(ErrorObject::owned(
-            NOT_SYNCED_ERROR_CODE.code(),
+        return Err(ErrorObject::new(
+            NOT_SYNCED_ERROR_CODE,
             format!(
                 "Zakura has not synced to the chain tip, \
                  estimated distance: {estimated_distance_to_chain_tip:?}, \
                  local tip: {local_tip_height:?}. \
                  Hint: check your network connection, clock, and time zone settings."
             ),
-            None::<()>,
         ));
     }
 
@@ -1183,7 +1179,7 @@ where
     let response = state
         .oneshot(request.clone())
         .await
-        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+        .map_err(|error| ErrorObject::new(0, error.to_string()))?;
 
     let chain_info = match response {
         zakura_state::ReadResponse::ChainInfo(chain_info) => chain_info,
@@ -1213,7 +1209,7 @@ where
     let response = mempool
         .oneshot(mempool::Request::FullTransactions)
         .await
-        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+        .map_err(|error| ErrorObject::new(0, error.to_string()))?;
 
     // TODO: Order transactions in block templates based on their dependencies
 

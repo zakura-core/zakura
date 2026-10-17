@@ -140,9 +140,8 @@ impl ZcashdRpcClient {
     /// Sends a call and attempts to deserialize the `result` field.
     ///
     /// zcashd returns JSON-RPC 1.0-style responses where both `result` and
-    /// `error` are always present and the unused one is `null`, so this parses
-    /// the fields manually instead of using `jsonrpsee_types::Response`
-    /// (which rejects `"error": null`).
+    /// `error` are always present and the unused one is `null`, so this
+    /// accepts `"error": null`, and returns a missing `result` as `null`.
     pub async fn json_result_from_call<T: DeserializeOwned>(
         &self,
         method: impl AsRef<str>,

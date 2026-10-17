@@ -66,6 +66,8 @@ pub(super) struct Requester {
     next: HashMap<Hash, Height>,
     // Abandoned work and fully received ranges still waiting for an ending.
     retiring: BTreeSet<(Instant, Height)>,
+    // Ranges in `ranges` whose every body arrived.
+    pending_endings: usize,
     read_paused: Duration,
     capacity: usize,
 }
@@ -81,6 +83,7 @@ impl Requester {
             ranges: BTreeMap::new(),
             next: HashMap::new(),
             retiring: BTreeSet::new(),
+            pending_endings: 0,
             read_paused: Duration::ZERO,
             capacity,
         }
@@ -114,6 +117,11 @@ impl Requester {
 
     pub(super) fn at_capacity(&self) -> bool {
         self.len() >= self.capacity
+    }
+
+    /// Live ranges whose every body arrived but whose ending has not.
+    pub(super) fn pending_endings(&self) -> usize {
+        self.pending_endings
     }
 
     /// Old abandoned work must not pin a height forever while other work advances.
@@ -272,6 +280,7 @@ impl Requester {
             // deadline, or start one when the last block is claimed.
             let at = *pending.retirement_started_at.get_or_insert(now);
             self.retiring.insert((at, start));
+            self.pending_endings += 1;
         }
         Ok((height, claimed))
     }
@@ -301,6 +310,11 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
+            } else {
+                self.pending_endings = self
+                    .pending_endings
+                    .checked_sub(1)
+                    .expect("claiming a range's last body counted it as owing an ending");
             }
             // A complete range already left `next` when its last block was
             // claimed, so shrink on every removal, not only an unfinished one.

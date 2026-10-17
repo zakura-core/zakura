@@ -788,8 +788,9 @@ impl BlockSyncReactor {
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
             // Reject: cancel the session (which also cancels the already-spawned
-            // pipe-routine, whose `Drop` returns any taken work) and drop the
-            // routine's registry entry so a parked peer leaves no stale facts.
+            // pipe-routine, whose `Drop` returns any taken work). Its teardown
+            // closes the registry entry and queues the disconnect that removes
+            // it. Removing it here could remove a newer session's entry.
             metrics::counter!("sync.block.peer.parked").increment(1);
             tracing::info!(
                 ?peer,
@@ -799,7 +800,6 @@ impl BlockSyncReactor {
             );
             self.state.parked_peers.insert(peer.clone());
             session.cancel_token().cancel();
-            self.registry.remove(&peer);
             self.publish_peer_snapshot();
             self.publish_candidate_state();
             return;
@@ -828,7 +828,8 @@ impl BlockSyncReactor {
         // The pipe-routine cancels on the session token (transport disconnect);
         // its `Drop` guard returns its unreceived outstanding heights to
         // `work.pending` and releases their budget. The reactor only drops its
-        // thin serving handle and the registry entry.
+        // thin serving handle and the closed registry entry. A replacement
+        // admitted before this event keeps its entry.
         if self.state.peers.remove(&peer).is_some() {
             set_block_reactor_active_connection_gauge(self.state.peers.len());
             self.trace_peer_disconnected(
@@ -837,7 +838,7 @@ impl BlockSyncReactor {
                 self.state.peers.len(),
             );
         }
-        self.registry.remove(&peer);
+        self.registry.remove_closed_session(&peer);
         self.state.parked_peers.remove(&peer);
         self.flush_status_refresh();
         self.publish_peer_snapshot();

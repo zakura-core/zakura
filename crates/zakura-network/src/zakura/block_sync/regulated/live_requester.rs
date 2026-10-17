@@ -21,9 +21,42 @@ use crate::zakura::{
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
 };
 
-/// Leave at least half the node pool for other sessions, including draining ones.
+/// Live GetBlocks exchanges one session may hold from the node pool: an eighth
+/// of the pool, so the share follows the pool size.
+///
+/// Two sessions hold at most a quarter of the pool, so peers that grow large
+/// windows and then stop answering cannot starve every other session. Normal
+/// sync stays below it: a default Zakura server advertises 2,816 in-flight
+/// requests (`serving_max_inflight_requests`), and the integrated header lead
+/// keeps distinct missing heights within 4,000
+/// (`INTEGRATED_HEADER_BODY_WINDOW_V1`). Exchanges abandoned after GC or a
+/// reorg, or a larger custom advertisement, can briefly reach it, and the
+/// session then waits for endings before it requests more.
 // The protocol ceiling fits usize on supported targets.
-pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 2;
+pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 8;
+
+/// Fully received ranges one session may hold while their endings are owed.
+///
+/// A peer that sends every body but withholds the ending still looks
+/// productive, so without this bound it could keep taking work until its
+/// unended exchanges fill [`SESSION_RESERVATIONS`]. An honest server queues
+/// each ending right after its body. Its ready-order output interleaves at most
+/// one body per running read-and-encode job (`PEER_EXECUTION`, 12 per peer),
+/// and one stream keeps frames in that order. So an honest session stays well
+/// below this bound, while a withholding one holds at most this many pool
+/// entries beyond the requests its window already has in flight.
+pub(crate) const MAX_PENDING_ENDINGS: usize = 64;
+
+/// One consistent read of a session's requester limits.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct RequesterOccupancy {
+    /// Whether the session holds its whole [`SESSION_RESERVATIONS`] share.
+    pub(crate) at_capacity: bool,
+    /// Live exchanges, including abandoned ones still awaiting an ending.
+    pub(crate) len: usize,
+    /// Fully received ranges still owing an ending.
+    pub(crate) pending_endings: usize,
+}
 
 /// The precheck may outlive the routine. Its sender retains session capacity
 /// until the authorization maps and transport reader have both been dropped.
@@ -116,12 +149,14 @@ impl LiveRequester {
         self.shared.lock().unreceived_expected(limit)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.shared.lock().len()
-    }
-
-    pub(crate) fn at_capacity(&self) -> bool {
-        self.shared.lock().at_capacity()
+    /// The share, live exchange count and owed endings, read under one lock.
+    pub(crate) fn occupancy(&self) -> RequesterOccupancy {
+        let requester = self.shared.lock();
+        RequesterOccupancy {
+            at_capacity: requester.at_capacity(),
+            len: requester.len(),
+            pending_endings: requester.pending_endings(),
+        }
     }
 
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {

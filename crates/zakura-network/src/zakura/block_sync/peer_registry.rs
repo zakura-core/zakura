@@ -14,8 +14,9 @@
 //! per-peer facts and writes them all (generation-gated): servable/caps/
 //! `received_status` (when it decodes a `Status` frame in its own task),
 //! `outstanding` (on issue/finish/timeout/disconnect — per *request*, never per
-//! *body*), slot diagnostics, and download-side misbehavior. The **reactor** owns
-//! entry insert/remove (admission/teardown), serving-side misbehavior, and
+//! *body*), slot diagnostics, and download-side misbehavior. The **service** inserts
+//! an entry at admission and closes its generation when the session ends. The
+//! **reactor** removes closed entries and owns serving-side misbehavior and
 //! floor-watchdog hard excludes. Misbehavior is observed and traced, and only a
 //! proven tampered body disconnects (see `BlockSyncMisbehavior::proves_tampered_body`),
 //! so the registry keeps no per-peer misbehavior state.
@@ -69,6 +70,10 @@ pub(super) struct Entry {
     /// admission and cleared when that connection closes, so a routine
     /// draining down on a dead connection cannot record a new park.
     pub(super) conn_id: Option<ZakuraConnId>,
+    /// Whether the service has ended the current generation's session. The
+    /// reactor removes only a closed entry, so a disconnect it handles late
+    /// cannot remove a replacement admitted in the meantime.
+    pub(super) session_closed: bool,
 }
 
 impl Entry {
@@ -90,6 +95,7 @@ impl Entry {
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
             conn_id: None,
+            session_closed: false,
         }
     }
 }
@@ -701,12 +707,44 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
-    pub(super) fn remove(&self, peer: &ZakuraPeerId) {
+    /// Mark `generation`'s session closed. The service calls this when it ends
+    /// the session, before it queues the session's disconnect, or when it
+    /// refuses an admission it already registered. A newer generation is left
+    /// open.
+    pub(super) fn close_session(&self, peer: &ZakuraPeerId, generation: u64) {
+        if let Some(entry) = self
+            .lock()
+            .get_mut(peer)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.session_closed = true;
+        }
+    }
+
+    /// Remove a peer's entry if its session is closed (see
+    /// [`close_session`](Self::close_session)). An entry admitted after that
+    /// close belongs to a live replacement and stays.
+    pub(super) fn remove_closed_session(&self, peer: &ZakuraPeerId) {
         // Drop the removed entry after releasing the lock.
-        let removed = self.lock().remove(peer);
+        let removed = {
+            let mut peers = self.lock();
+            if peers.get(peer).is_some_and(|entry| entry.session_closed) {
+                peers.remove(peer)
+            } else {
+                None
+            }
+        };
         if removed.is_some() {
             // A routine may have deferred the floor to the removed peer.
+            self.floor_ranking_changed.notify_waiters();
+        }
+    }
+
+    /// Remove a peer's entry whether or not its session is closed.
+    #[cfg(test)]
+    pub(super) fn remove(&self, peer: &ZakuraPeerId) {
+        let removed = self.lock().remove(peer);
+        if removed.is_some() {
             self.floor_ranking_changed.notify_waiters();
         }
     }

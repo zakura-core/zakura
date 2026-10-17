@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-14. Version 0.7.
+Status: draft for review, 2026-10-17. Version 0.8.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -16,6 +16,8 @@ explains it. Version 0.6 moves the crate from the noq fork to upstream
 `quinn-proto` with a Zakura-owned driver and drops Iroh compatibility; §17d
 lists each change. Version 0.5 was the draft in #1296. This version doesn't
 include it. Version 0.7 removes qlog output (CTRL-25); §17e explains it.
+Version 0.8 adds CTRL-26, which ties the connection count to a memory budget;
+§17f explains it.
 
 ## 0. Conventions
 
@@ -472,9 +474,35 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (256), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (102), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
+`peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
+
+- **CTRL-26.** One connection can make the node hold
+  `receive_window_bytes + send_window_bytes` plus its 16 MiB datagram queue
+  (DRV-3) in transport buffers, 80 MiB at the defaults, whether or not the
+  application reads. Per-stream receive windows sit inside the connection
+  window and add nothing. `zakura_quic::connection_memory_bytes` is the only
+  implementation of this formula. The node admits at most
+  `[network.zakura] peer_memory_budget_bytes` divided by this cost
+  connections. Startup lowers a larger `max_connections` to that count with
+  a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
+  admits fewer than 16 connections or twice the discovery headroom plus one
+  (19 with Mainnet's 9 bootstrap peers), so discovery keeps a dial slot with
+  every bootstrap peer connected. A smaller `max_connections` lowers that
+  floor to match. The budget never shrinks the windows, so it costs no
+  per-connection throughput.
+
+  The budget counts flow-control credit and queued datagrams, not resident
+  memory, and only for admitted connections. An inbound connection takes its
+  slot when TLS finishes, before its control handshake, and a dial takes one
+  before its first attempt. The slot frees when the connection's serving task
+  ends. These still hold buffers outside the budget: handshakes not yet
+  admitted (at most `max_pending_handshakes`), extra address attempts of one
+  dial, closed connections until `quinn-proto` reports them drained (three
+  PTOs), reassembly bookkeeping and allocator overhead, and our writes still
+  waiting for send credit.
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -680,7 +708,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     send errors.
   - `quinn-proto` 0.11 exposes neither the unread bytes in its receive
     buffers nor a runtime per-stream receive window. The receive windows bound
-    both: a peer holds at most `receive_window` of unread data per connection.
+    both: a peer holds at most `receive_window` of unread data per connection,
+    and CTRL-26 bounds the sum across admitted connections.
 
 ## 13. Compatibility
 
@@ -990,3 +1019,12 @@ Deleted:
 Changed:
 
 - **DEP-3.** No longer allows the `quinn-proto` `qlog` feature.
+
+## 17f. Changes in version 0.8
+
+Added:
+
+- **CTRL-26.** No setting tied the connection count to the transport memory
+  that peers can fill, so 256 connections could hold 20 GiB at the defaults
+  (V12 F-69). `peer_memory_budget_bytes` now caps the count, and the default
+  `max_connections` drops from 256 to the 102 that the default budget admits.

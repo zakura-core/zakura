@@ -44,6 +44,12 @@ connection at 500 ms round-trip time, and a test checks each default against its
 local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
 today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
+Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
+peer can fill. The node bounds that credit by admitting fewer peers, not by shrinking windows:
+`peer_memory_budget_bytes` (8 GiB) divided by one connection's windows and datagram queue
+(80 MiB) caps the connection count at 102. CTRL-26 in the zakura-quic spec lists the buffers
+the budget leaves out.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a

@@ -18,8 +18,9 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -844,6 +845,56 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
+}
+
+#[test]
+fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
+    let _init_guard = zakura_test::init();
+
+    // A config generated before the budget existed keeps loading. The endpoint
+    // lowers its cap to what the default budget admits.
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.zakura.max_connections, 256);
+    assert_eq!(
+        config.zakura.budgeted_max_connections(),
+        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    );
+    assert_eq!(
+        ZakuraLocalLimits::from_config(&config).max_connections,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS
+    );
+
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        peer_memory_budget_bytes = 21474836480
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+
+    // A 1 GiB receive window leaves the default budget room for 7 peers, below
+    // Mainnet's floor of 19.
+    let error = toml::from_str::<Config>(
+        r#"
+        [zakura.quic]
+        receive_window_bytes = 1073741824
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("[network.zakura] peer_memory_budget_bytes"),
+        "{error}"
+    );
+    assert!(error.contains("receive_window_bytes"), "{error}");
 }
 
 #[test]

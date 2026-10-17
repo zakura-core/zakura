@@ -92,7 +92,7 @@ async fn minimum_grant_floods_apply_while_output_is_blocked() {
     let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
         .expect("the test budgets are valid");
     // A one-frame transport queue that nobody reads.
-    let (publisher, _recv, _cancel, _task) = session(&port, &capacity, &peer(7), 1, 1, limits());
+    let (publisher, _recv, _cancel, _task) = session(&port, &capacity, &peer(7), 1, 1);
     let mut subscriber = Subscriber::new();
     let p = p::<HB>();
     let first = Credit {
@@ -275,7 +275,7 @@ async fn run_load(peers: usize) {
         identity[..8].copy_from_slice(&u64::try_from(index).expect("fits u64").to_le_bytes());
         let peer = ZakuraPeerId::new(identity).expect("a 32-byte peer ID is valid");
         let (publisher, recv, cancel, _task) =
-            session(&port, &capacity, &peer, id, QUEUE, production_pages());
+            session_advertising(&port, &capacity, &peer, id, QUEUE, production_pages());
         let role = ROLES[index % ROLES.len()];
         let (locator, credit) = match role {
             Role::Follower => (tip, WINDOW),

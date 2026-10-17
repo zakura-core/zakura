@@ -24,7 +24,7 @@ proptest = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true }
 

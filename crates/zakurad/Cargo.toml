@@ -243,7 +243,7 @@ insta = { workspace = true, features = ["json"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 
-tokio = { workspace = true, features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

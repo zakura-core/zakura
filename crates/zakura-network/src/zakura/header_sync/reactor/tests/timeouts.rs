@@ -2452,12 +2452,13 @@ fn repair_keeps_schema_one_and_rotates_after_history_pruned() {
     let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
     let fallback = PrunedBackoff::after(None, Instant::now());
     for peer in &peers {
-        fixture
-            .reactor
-            .peer_state
-            .get_mut(peer)
-            .expect("the supplier is connected")
-            .aux_fallback = Some(fallback);
+        fixture.reactor.pruned_peers.insert(
+            peer.clone(),
+            PrunedPeer {
+                aux_fallback: Some(fallback),
+                pruned_pause: None,
+            },
+        );
     }
     fixture.schedule();
     fixture.advertise(&peers, 7);
@@ -2487,10 +2488,10 @@ fn repair_keeps_schema_one_and_rotates_after_history_pruned() {
                 outcome: HeadersOutcomeCode::HistoryPruned,
             },
         );
-        let state = &fixture.reactor.peer_state[peer];
-        assert_eq!(state.aux_fallback, Some(fallback));
-        assert!(state.pruned_pause.is_none());
-        assert_eq!(state.unproductive_requests, 0);
+        let pruned = fixture.reactor.pruned_peers[peer];
+        assert_eq!(pruned.aux_fallback, Some(fallback));
+        assert!(pruned.pruned_pause.is_none());
+        assert_eq!(fixture.reactor.peer_state[peer].unproductive_requests, 0);
     }
     let task = fixture
         .reactor

@@ -145,3 +145,37 @@ fn an_idle_subscription_closes_when_no_round_can_continue_it() {
     assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
     assert!(reactor.close_deadlines.contains_key(&peer));
 }
+
+/// A `Close` that the session's full queue refuses starts no deadline,
+/// because the publisher has nothing to answer. The next maintenance pass
+/// after the queue drains sends it and starts the deadline.
+#[test]
+fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
+    let (mut reactor, mut actions, snapshot) = fallback_reactor();
+    let peer = ZakuraPeerId::new(vec![0x71; 32]).expect("the peer ID has 32 bytes");
+    let (send, mut outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts(
+        peer.clone(),
+        send.clone(),
+        CancellationToken::new(),
+    ));
+    let target = block::Hash([0x53; 32]);
+    reactor.handle_status(peer.clone(), 0, pruned_status(&snapshot, target));
+    answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    let filler = Frame {
+        message_type: 1,
+        flags: 0,
+        payload: Vec::new(),
+    };
+    while send.try_send(filler.clone()).is_ok() {}
+
+    reactor.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
+    assert!(reactor.close_deadlines.is_empty(), "nothing was queued");
+    assert!(reactor.pending_closes.contains_key(&peer));
+
+    while outbound.try_recv().is_ok() {}
+    reactor.refresh_statuses();
+    assert_eq!(next_update(&mut outbound).operation, v9::Operation::Close);
+    assert!(reactor.close_deadlines.contains_key(&peer));
+    assert!(reactor.pending_closes.is_empty());
+}

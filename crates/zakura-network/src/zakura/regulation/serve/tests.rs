@@ -691,6 +691,42 @@ async fn output_bytes_return_only_when_the_last_frame_is_written() {
     }
 }
 
+/// `responses_written` resolves once the last frame is written, and once a
+/// cancelled session drops its requests.
+#[tokio::test]
+async fn responses_written_waits_for_the_last_frame_or_cancellation() {
+    for order in ORDERS {
+        let capacity = capacity(LIMITS);
+        let mut session = session_in(order, &capacity, 1, 4);
+        let written = session.serve.responses_written();
+        let unwritten = || futures::FutureExt::now_or_never(written.wait()).is_none();
+        assert!(!unwritten(), "an idle session has nothing to write");
+        session
+            .serve
+            .admit(Job {
+                parts: 1,
+                part_len: 8,
+                ..job()
+            })
+            .unwrap();
+        settle().await;
+        assert!(unwritten());
+        next(&mut session.output).await;
+        assert!(unwritten(), "the ending is unwritten");
+        next(&mut session.output).await;
+        assert!(!unwritten());
+
+        let gate = Arc::new(Semaphore::new(0));
+        session.serve.admit(gated(&gate)).unwrap();
+        settle().await;
+        assert!(unwritten());
+        session.cancel.cancel();
+        gate.add_permits(1);
+        settle().await;
+        assert!(!unwritten(), "a cancelled session drops its requests");
+    }
+}
+
 /// Tiny responses must stop on bookkeeping capacity before encoded bytes fill.
 #[tokio::test]
 async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
@@ -954,6 +990,7 @@ fn sink_and_core(
             _peer: grant(),
             _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer_budgets: capacity(LIMITS).peer(&peer(1)),
+            _unwritten: None,
         }),
         Commitment(Some(commitments.clone()), None),
     );

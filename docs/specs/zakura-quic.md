@@ -488,7 +488,7 @@ These keys stay in `[network.zakura]` and keep their meaning:
   `[network.zakura] peer_memory_budget_bytes` divided by this cost
   connections. Startup lowers a larger `max_connections` to that count with
   a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
-  admits fewer than 8 connections, or fewer than `max_connections` when that
+  admits fewer than 16 connections, or fewer than `max_connections` when that
   is smaller. The budget never shrinks the windows, so it costs no
   per-connection throughput. Each connection holds its slot of the cap from
   before its control handshake until it closes.

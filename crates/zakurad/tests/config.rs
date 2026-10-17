@@ -605,6 +605,19 @@ fn config_generated_file_roundtrip() {
 }
 
 #[test]
+fn config_rejects_sections_written_as_arrays() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "rpc = []\n").expect("write config");
+    let error = ZakuradConfig::load(Some(path))
+        .expect_err("reject a section written as an array")
+        .to_string();
+    assert!(error.contains("rpc"), "{error}");
+    assert!(error.contains("sequence"), "{error}");
+}
+
+#[test]
 fn config_invalid_values_report_the_field_path() {
     let env = EnvGuard::new();
     env.set_var("ZAKURA_RPC__LISTEN_ADDR", "invalid-address");

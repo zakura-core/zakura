@@ -171,6 +171,7 @@ async fn header_credit_sets_throughput_at_the_target_round_trip() {
                 .min()
                 .unwrap_or(start + rtt * 1_000);
             tokio::select! {
+                biased;
                 frame = harness.recv.recv() => {
                     let frame = frame.expect("the session is open");
                     frames.push_back((tokio::time::Instant::now() + one_way, frame));

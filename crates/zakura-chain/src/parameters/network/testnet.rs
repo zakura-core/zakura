@@ -709,7 +709,7 @@ impl<'de> serde::Deserialize<'de> for ConfiguredCheckpoints {
                 self,
                 seq: A,
             ) -> Result<Self::Value, A::Error> {
-                Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
                     .map(ConfiguredCheckpoints::HeightsAndHashes)
             }
         }

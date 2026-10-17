@@ -41,6 +41,7 @@
 //! | Only an ending releases a started exchange | `only_endings_release_started_exchanges` |
 //! | Every writer of an old or closed fence stays fenced | `exchange_histories_keep_old_writers_fenced` |
 //! | A following frame is written only after its request started | `a_following_frame_needs_its_request_started` |
+//! | Retirement during a following frame's write closes the connection | `retirement_during_a_following_write_closes_the_connection` |
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -72,6 +73,8 @@ struct Fence {
 struct FenceState {
     retired: bool,
     started: usize,
+    /// Following frames claimed and not yet written.
+    following: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -130,13 +133,13 @@ impl WriterFence {
     }
 
     /// Fence every unstarted write. Close the connection if an exchange
-    /// started and has no ending.
+    /// started and has no ending, or a following frame is being written.
     ///
     /// Returns whether the connection can host a replacement session.
     pub(crate) fn retire(&self) -> bool {
         let mut state = self.lock();
         state.retired = true;
-        if state.started != 0 {
+        if state.started != 0 || state.following != 0 {
             self.close_unfinished();
         }
         !self.0.connection.is_cancelled()
@@ -215,11 +218,31 @@ impl ExchangeWriter {
         true
     }
 
-    /// Whether the request's first byte was written and the exchange is still
-    /// owned, so a later frame of the exchange may follow it.
-    fn started(&self) -> bool {
-        let (_state, phase) = self.0.lock();
-        matches!(*phase, Phase::Started | Phase::Ended)
+    /// Claim a later frame's write, if the request's first byte was written,
+    /// the exchange is still owned, and the fence has neither retired nor
+    /// seen its connection close. The claim holds the fence until
+    /// [`Self::follow_written`], so retirement during the write closes the
+    /// connection rather than let the frame reach a replacement session.
+    fn try_follow(&self) -> bool {
+        let (mut state, phase) = self.0.lock();
+        if state.retired
+            || self.0.fence.0.connection.is_cancelled()
+            || !matches!(*phase, Phase::Started | Phase::Ended)
+        {
+            return false;
+        }
+        state.following = state
+            .following
+            .checked_add(1)
+            .expect("each following write holds a distinct queued frame");
+        true
+    }
+
+    /// Release the claim of a following frame whose write finished.
+    fn follow_written(&self) {
+        let mut state = self.0.fence.lock();
+        debug_assert!(state.following > 0, "a written frame was claimed");
+        state.following = state.following.saturating_sub(1);
     }
 }
 
@@ -250,17 +273,19 @@ impl FrameWriteClaim for FencedWrite {
     fn written(&self) {}
 }
 
-/// A transport write claim for a later frame of an exchange, written only
-/// once the exchange's request started.
+/// A transport write claim for a later frame of an exchange. See
+/// [`ExchangeWriter::try_follow`].
 #[derive(Debug)]
 struct FollowingWrite(ExchangeWriter);
 
 impl FrameWriteClaim for FollowingWrite {
     fn try_start(&self) -> bool {
-        self.0.started()
+        self.0.try_follow()
     }
 
-    fn written(&self) {}
+    fn written(&self) {
+        self.0.follow_written();
+    }
 }
 
 /// Why a fenced request was not queued.
@@ -299,7 +324,8 @@ impl FramedSend {
     /// `writer`'s exchange, such as a subscription update after its `Open`.
     ///
     /// The transport writes `frame` only if the request's first byte was
-    /// written first, so retirement that skips the request skips `frame` too.
+    /// written first and the fence has not retired since, so retirement skips
+    /// `frame` whether or not it skipped the request.
     pub(crate) async fn send_following(
         &self,
         frame: Frame,

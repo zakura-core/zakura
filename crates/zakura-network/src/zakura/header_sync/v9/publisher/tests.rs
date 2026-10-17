@@ -867,25 +867,128 @@ async fn a_locator_at_the_target_sends_no_path_page() {
     harness.check_quiet().await;
 }
 
-/// A schema-1 page stops before a header without a record, and the
-/// subscription waits for it instead of downgrading the page.
+/// On the path to its target, a schema-1 subscription sends the pages that
+/// have records and ends with `HistoryPruned` at the first header without
+/// one, never skipping it to reach records above.
 #[tokio::test(start_paused = true)]
-async fn schema_one_pages_stop_before_a_header_without_a_record() {
+async fn schema_one_path_pages_end_as_history_pruned_at_a_missing_record() {
+    use HeadersOutcomeCode::HistoryPruned;
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+
+    // The first record is missing: no page, and the subscription ends.
+    port.store().no_record.insert(chain[0].hash);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HistoryPruned)]
+    );
+
+    // Records are missing below a height and present above it, as on a
+    // pruned node. The page cannot skip the hole to reach them.
+    port.store().no_record.insert(chain[1].hash);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HistoryPruned)]
+    );
+
+    // A prefix with records goes out, then the hole ends the subscription.
+    port.store().no_record = HashSet::from([chain[2].hash]);
+    harness
+        .open(chain[5].hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    let received = harness.deliver_all().await;
+    assert_eq!(pages(&received), [(h(0), h(2), false)]);
+    assert_eq!(received.last(), Some(&Received::Ended(HistoryPruned)));
+    harness.check_quiet().await;
+}
+
+/// A complete schema-1 path still reaches its target, and past the target,
+/// whether a page or the `Open` reached it, a missing record waits.
+#[tokio::test(start_paused = true)]
+async fn schema_one_past_the_target_waits_for_a_missing_record() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(4);
-    port.store().no_record.insert(chain[1].hash);
     let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
     harness
         .open(chain[3].hash, vec![port.genesis], credit(), AuxSchema::V1)
         .await;
-    let h = block::Height;
-    assert_eq!(pages(&harness.deliver_all().await), [(h(0), h(1), false)]);
-    // The record arrives with a selected-chain change, and the path resumes.
-    port.store().no_record.clear();
-    port.select(port.tip());
     assert_eq!(
         pages(&harness.deliver_all().await),
-        [(h(1), h(3), false), (h(3), h(4), true)]
+        [(h(0), h(2), false), (h(2), h(4), true)]
+    );
+    let next = port.grow(1);
+    port.store().no_record.insert(next[0].hash);
+    assert!(harness.deliver_all().await.is_empty());
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    harness.apply(close).await.expect("the Close applies");
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionClosed)]
+    );
+
+    // A target reached at Open waits the same way, and resumes once the
+    // record arrives with a selected-chain change.
+    let tip = port.tip();
+    harness
+        .open(tip.hash, vec![tip], credit(), AuxSchema::V1)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let next = port.grow(1);
+    port.store().no_record.insert(next[0].hash);
+    assert!(harness.deliver_all().await.is_empty());
+    port.store().no_record.clear();
+    port.select(port.tip());
+    assert_eq!(pages(&harness.deliver_all().await), [(h(5), h(6), false)]);
+    harness.check_quiet().await;
+}
+
+/// Missing records change nothing without schema 1, and a capacity refusal
+/// still waits before the publisher looks at any record.
+#[tokio::test(start_paused = true)]
+async fn missing_records_leave_schema_zero_and_capacity_waits_alone() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    port.store()
+        .no_record
+        .extend(chain.iter().map(|frontier| frontier.hash));
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+    harness
+        .open(chain[2].hash, vec![port.genesis], credit(), AuxSchema::None)
+        .await;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(0), h(3), true)]);
+    let close = harness
+        .subscriber
+        .close()
+        .expect("the subscription is live");
+    harness.apply(close).await.expect("the Close applies");
+    harness.deliver_all().await;
+
+    let signal = ServingCapacitySignal::default();
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(signal.clone())));
+    let target = *port.grow(2).last().expect("two headers were added");
+    harness
+        .open(target.hash, vec![port.genesis], credit(), AuxSchema::V1)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    signal.release();
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::HistoryPruned)]
     );
     harness.check_quiet().await;
 }
@@ -1188,6 +1291,59 @@ async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
     assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
+/// While one subscription's terminal outcome waits for a full queue, the
+/// other subscription's page keeps moving, so its finished job gives its
+/// execution slot back.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_wait_keeps_the_other_page_moving() {
+    let port = FakePort::new(0);
+    let chain = port.grow(2);
+    let serve = ServeLimits {
+        node_execution: 1,
+        ..serve_limits()
+    };
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
+        .expect("the test budgets are valid");
+    // A frame nobody reads fills the one-slot queue.
+    let (send, _recv) = framed_channel(1);
+    send.try_send(Frame {
+        message_type: 1,
+        flags: 0,
+        payload: Vec::new(),
+    })
+    .expect("the queue has room");
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        CancellationToken::new(),
+    );
+    // The first subscription's page waits in its read, holding the slot.
+    let mut first = Subscriber::new();
+    let open = first.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(capacity.node_execution_held(), 1);
+    // The margin admits a second subscription, whose Close leaves a
+    // terminal outcome waiting for the full queue.
+    let mut second = Subscriber::new();
+    second.next_id = 2;
+    let open = second.open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the margin admits it");
+    let close = second.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    // The first page's read finishes, and its job gives the slot back.
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(capacity.node_execution_held(), 0);
+}
+
 /// A following page that leaves the selected chain while in progress is read
 /// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.
@@ -1242,14 +1398,17 @@ async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
     assert!(harness.deliver_all().await.is_empty());
     port.grow(2);
     harness.drain().await;
-    // The tip moves past the page, then again during every recheck lease.
+    // The tip moves past the page, then again during each of the recheck's
+    // leases.
     port.grow(1);
-    port.store().move_tip_on_acquire = 100;
+    port.store().move_tip_on_acquire = RECHECK_LEASES;
     let walks = port.store().walks;
     port.gate.add_permits(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
-    assert_eq!(port.store().walks - walks, RECHECK_LEASES);
+    // The recheck's leases, then one check of the newest tip, since no
+    // credit is left for a page.
+    assert_eq!(port.store().walks - walks, RECHECK_LEASES + 1);
     harness.check_quiet().await;
 }
 
@@ -1373,10 +1532,11 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.check_quiet().await;
 }
 
-/// A local stall from a job that read an older selected chain is not
-/// recorded, because the change that would clear it already passed.
+/// A stall from a job that read an older selected chain is not recorded,
+/// local or for capacity, because the change that would clear it already
+/// passed.
 #[tokio::test(start_paused = true)]
-async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
+async fn a_stall_from_an_older_selected_chain_retries_at_once() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1398,6 +1558,20 @@ async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
     port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // The same race with a capacity refusal whose signal never fires.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.grow(1);
+    harness.drain().await;
+    port.grow(1);
+    harness.drain().await;
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(
+            ServingCapacitySignal::default(),
+        )));
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    assert_eq!(pages(&harness.deliver_all().await), [(h(5), h(7), false)]);
     harness.check_quiet().await;
 }
 
@@ -1422,6 +1596,89 @@ async fn a_leaked_lease_capacity_stall_retries_on_a_chain_change() {
     port.grow(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+    harness.check_quiet().await;
+}
+
+/// A follower with no room for a page still learns that the selected chain
+/// stopped extending its last header. Growth costs one check per tip.
+#[tokio::test(start_paused = true)]
+async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    let main = port.grow(2);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // The chain grows with no credit left: one check, and nothing sent.
+    let walks = port.store().walks;
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    assert_eq!(port.store().walks - walks, 1);
+    harness.drain().await;
+    assert_eq!(
+        port.store().walks - walks,
+        1,
+        "a checked tip is not checked again"
+    );
+
+    // A higher branch that forks below the last header supersedes it.
+    let side = port.store().tree.extend(main[0], 4);
+    port.select(side[3]);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
+/// A check without a page needs no output, so it runs and ends the
+/// subscription even while an unread page holds the peer's one response slot.
+#[tokio::test(start_paused = true)]
+async fn a_check_without_a_page_needs_no_output() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let serve = ServeLimits {
+        peer_output_responses: 1,
+        ..serve_limits()
+    };
+    let mut harness = Harness::new(port.clone(), serve);
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 goes out, and nobody reads it.
+    let main = port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    // A higher branch that forks below the last header needs a check.
+    let side = port.store().tree.extend(main[0], 3);
+    port.select(side[2]);
+    tokio::time::sleep(QUIET).await;
+    let page = harness.recv.try_recv().expect("the page waits unread");
+    assert!(matches!(
+        harness.subscriber.receive(&page),
+        Received::Page { .. }
+    ));
+    let outcome = harness
+        .recv
+        .try_recv()
+        .expect("the outcome is already queued behind the page");
+    assert_eq!(
+        harness.subscriber.receive(&outcome),
+        Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)
+    );
     harness.check_quiet().await;
 }
 
@@ -1963,6 +2220,25 @@ proptest! {
     }
 }
 
+/// The real subscriber, on an in-process session.
+fn real_subscriber() -> super::super::subscriber::Subscriber {
+    use crate::zakura::{regulation::WriterFence, CloseCause};
+    super::super::subscriber::Subscriber::new(
+        HB,
+        WriterFence::new(CancellationToken::new(), CloseCause::default()),
+        &framed_channel(1).1,
+    )
+}
+
+/// A `Status` for `tip` with the publisher's own page caps.
+fn advertised(tip: Frontier) -> super::super::Status {
+    super::super::Status {
+        max_headers_per_response: limits().max_headers,
+        max_message_bytes: limits().max_bytes,
+        ..super::super::test_support::status::<HB>(tip)
+    }
+}
+
 /// Feed every written frame to the real subscriber, accepting each page as
 /// validated and applying each due `Grant`.
 async fn follow(
@@ -2013,28 +2289,16 @@ async fn follow(
 /// last header ends with `SubscriptionSuperseded`.
 #[tokio::test(start_paused = true)]
 async fn the_subscriber_follows_the_publisher() {
-    use super::super::{subscriber::Subscriber, test_support, Status};
-    use crate::zakura::{regulation::WriterFence, CloseCause};
-    // The publisher's own page caps, as its `Status` advertises them.
-    let status = |tip: Frontier| Status {
-        max_headers_per_response: limits().max_headers,
-        max_message_bytes: limits().max_bytes,
-        ..test_support::status::<HB>(tip)
-    };
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(10);
     let mut harness = Harness::new(port.clone(), serve_limits());
     let h = block::Height;
 
     // Six headers of staging: three-header pages, granted three at a time.
-    let mut subscriber = Subscriber::new(
-        HB,
-        WriterFence::new(CancellationToken::new(), CloseCause::default()),
-        &framed_channel(1).1,
-    );
+    let mut subscriber = real_subscriber();
     let open = subscriber
         .open(
-            &status(chain[9]),
+            &advertised(chain[9]),
             &[chain[2], port.genesis],
             AuxSchema::None,
             6,
@@ -2066,7 +2330,7 @@ async fn the_subscriber_follows_the_publisher() {
     let tip = port.tip();
     let open = subscriber
         .open(
-            &status(tip),
+            &advertised(tip),
             &[tip, chain[3], port.genesis],
             AuxSchema::None,
             6,
@@ -2085,6 +2349,87 @@ async fn the_subscriber_follows_the_publisher() {
     assert_eq!(
         follow(&mut harness, &mut subscriber, 6).await,
         [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
+/// A pruned publisher sends the schema-1 pages it has records for, then ends
+/// with `HistoryPruned` at the first header without one. The real subscriber
+/// reports only the page it accepted, refuses the late result for the page
+/// still in validation, and its reopen without records reaches the target
+/// from the accepted cursor.
+#[tokio::test(start_paused = true)]
+async fn the_subscriber_reopens_a_pruned_peer_without_records() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(6);
+    port.store().no_record.insert(chain[3].hash);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    let h = block::Height;
+    let mut subscriber = real_subscriber();
+    let (open, _) = subscriber
+        .open(&advertised(chain[5]), &[port.genesis], AuxSchema::V1, 6)
+        .expect("the first Open is recorded");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+
+    harness.drain().await;
+    let mut admitted = Vec::new();
+    let mut ended = None;
+    while let Some(frame) = harness.inbox.pop_front() {
+        subscriber.admit(&frame).expect("the frame header passes");
+        match decode_frame::<RegtestMessage>(&frame).expect("the publisher writes valid frames") {
+            Message::Headers(page) => admitted.push(
+                subscriber
+                    .receive_page(&page, frame.payload.len())
+                    .expect("the record prefix passes"),
+            ),
+            Message::HeadersOutcome(outcome) => {
+                ended = Some(
+                    subscriber
+                        .receive_outcome(&outcome)
+                        .expect("HistoryPruned is legal before the target"),
+                );
+            }
+            other => panic!("the publisher wrote {other:?}"),
+        }
+        // Accept the first page before the rest arrive. The second waits for
+        // validation when the outcome lands.
+        if admitted.len() == 1 && ended.is_none() {
+            assert_eq!(
+                subscriber.accept_through(admitted[0].id, &admitted[0].cursor, 6),
+                Ok(None)
+            );
+        }
+    }
+    let heights: Vec<_> = admitted
+        .iter()
+        .map(|page| (page.parent.height, page.cursor.height))
+        .collect();
+    assert_eq!(
+        heights,
+        [(h(0), h(2)), (h(2), h(3))],
+        "pages stop before height 4"
+    );
+    let ended = ended.expect("the path ends with an outcome");
+    assert_eq!(ended.outcome, HeadersOutcomeCode::HistoryPruned);
+    assert_eq!(ended.accepted, admitted[0].cursor);
+    assert!(subscriber
+        .accept_through(admitted[1].id, &admitted[1].cursor, 6)
+        .is_err());
+
+    let start = Frontier::new(ended.accepted.height, ended.accepted.hash);
+    let (open, _) = subscriber
+        .open(
+            &advertised(chain[5]),
+            &[start, port.genesis],
+            AuxSchema::None,
+            6,
+        )
+        .expect("the terminal outcome freed the slot");
+    assert_eq!(harness.apply(open).await, Ok(Applied::Live));
+    assert_eq!(
+        pages(&follow(&mut harness, &mut subscriber, 6).await),
+        [(h(2), h(5), false), (h(5), h(6), true)],
+        "the plain reopen reaches the target"
     );
     harness.check_quiet().await;
 }

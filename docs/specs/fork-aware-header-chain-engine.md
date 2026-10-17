@@ -497,7 +497,7 @@ tree_aux_roots            absent, or header_count records of the selected schema
 
 Each `body_size_hints` value is the advisory total canonical serialized block size. `0` means unknown; the only other legal values are `1..=2,000,000` (`block::MAX_BLOCK_BYTES`). A decoder rejects larger values. A receiver may use a legal nonzero hint for scheduling or byte-budget estimation, but it may not allocate a block buffer, grant admission credit, or relax an independent frame/body bound solely from the hint.
 
-`tree_aux_schema_mask` uses bit `n - 1` to advertise schema `n`; zero advertises no auxiliary schema. A subscriber opens with `tree_aux_schema = 0` for no records, or one schema advertised in the status snapshot. Every page MUST carry the subscription's schema. A publisher that lacks a record stops the page before that header and waits rather than downgrading the schema. Records are certain only through the publisher's work anchor, so an ordinary subscription asks for schema `1` only while its round ends at or below that anchor. A pruned publisher can lack records below its index height too, and ends such a subscription with `HistoryPruned`. The requester then asks that peer for no records, and probes schema `1` again only after a bounded backoff. Auxiliary repair always asks for schema `1`. Schema `0` has no records. Schema `1` has exactly one 156-byte record per header, encoded in this order:
+`tree_aux_schema_mask` uses bit `n - 1` to advertise schema `n`; zero advertises no auxiliary schema. A subscriber opens with `tree_aux_schema = 0` for no records, or one schema advertised in the status snapshot. Every page MUST carry the subscription's schema. Before the target, a publisher that lacks a record sends the pages it can serve and then ends the subscription with `HistoryPruned`, never skipping the record or downgrading the schema. Records are certain only through the publisher's work anchor, so an ordinary subscription asks for schema `1` only while its round ends at or below that anchor. A pruned publisher can lack records below its index height too. After such a `HistoryPruned`, the requester asks that peer for no records, and probes schema `1` again only after a bounded backoff. Auxiliary repair always asks for schema `1`. Schema `0` has no records. Schema `1` has exactly one 156-byte record per header, encoded in this order:
 
 ```text
 height                    u32
@@ -518,7 +518,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 | ---: | --- | --- |
 | `1` | `TargetNotRetained` | target was absent or evicted before the server acquired its snapshot |
 | `2` | `NoLocatorIntersection` | none of the sent locator hashes is on the target path |
-| `3` | `HistoryPruned` | an intersection may exist below the server’s retained boundary but cannot be served |
+| `3` | `HistoryPruned` | history the path needs is unavailable for the requested schema: headers below the server’s retained boundary, or auxiliary records it cannot produce |
 | `5` | `TargetNotSelected` | the publisher's selected chain left the target between `Status` and `Open` |
 | `6` | `SubscriptionSuperseded` | the publisher's selected chain stopped extending the subscription cursor |
 | `7` | `SubscriptionClosed` | the publisher received `Close` |

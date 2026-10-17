@@ -49,7 +49,6 @@ halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
-lazy_static = { workspace = true }
 metrics = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }

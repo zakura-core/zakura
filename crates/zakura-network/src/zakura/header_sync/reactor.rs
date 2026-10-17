@@ -269,7 +269,8 @@ struct HeaderSyncReactor {
     /// Deadlines until which the reactor refuses header-sync readmission to dropped peers.
     ///
     /// Each entry represents one admitted session that survived
-    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts.
+    /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`] request timeouts,
+    /// or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     peer_work_queue: PeerWorkQueue,
@@ -4430,13 +4431,7 @@ impl HeaderSyncReactor {
         }
         state.session.cancel_token().cancel();
 
-        let cooldown = self.startup.config.unproductive_peer_cooldown;
-        if !cooldown.is_zero() {
-            let now = Instant::now();
-            let _ = self.prune_unproductive_cooldowns(now);
-            self.unproductive_peer_cooldowns
-                .insert(peer.clone(), now + cooldown);
-        }
+        self.start_readmission_cooldown(peer);
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         self.dispatch_action(HeaderPortOperation::DropPeer {
             peer: peer.clone(),
@@ -4444,6 +4439,17 @@ impl HeaderSyncReactor {
             reason,
         });
         self.handle_peer_disconnected(peer, session_id, reason);
+    }
+
+    /// Refuse `peer` header-sync readmission for the configured cooldown.
+    fn start_readmission_cooldown(&mut self, peer: &ZakuraPeerId) {
+        let cooldown = self.startup.config.unproductive_peer_cooldown;
+        if !cooldown.is_zero() {
+            let now = Instant::now();
+            let _ = self.prune_unproductive_cooldowns(now);
+            self.unproductive_peer_cooldowns
+                .insert(peer.clone(), now + cooldown);
+        }
     }
 
     fn prune_unproductive_cooldowns(&mut self, now: Instant) -> bool {
@@ -4613,7 +4619,9 @@ impl HeaderSyncReactor {
 
     /// Record `peer`'s violation. A fault in `owner`'s work also disconnects
     /// the session that did that work, while it is still current, and its
-    /// subscription never acknowledges the failed cursor.
+    /// subscription never acknowledges the failed cursor. The peer then waits
+    /// out the readmission cooldown, so it cannot reconnect and restage the
+    /// same branch at once.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
@@ -4655,6 +4663,9 @@ impl HeaderSyncReactor {
                 .into(),
             );
         });
+        if faulted.is_some() {
+            self.start_readmission_cooldown(&peer);
+        }
         let _ = self.dispatch_action(HeaderPortOperation::Misbehavior { peer, reason });
     }
 }

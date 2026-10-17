@@ -322,11 +322,13 @@ pub struct ZakuraConfig {
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
     pub max_connections: usize,
-    /// Bytes of QUIC buffers all native peers together may make this node hold.
+    /// Bytes of QUIC flow-control credit and queued datagrams that admitted
+    /// native peers together may make this node hold.
     ///
     /// Each connection can hold its `[network.zakura.quic]` receive and send
     /// windows plus a 16 MiB datagram queue, 80 MiB at the defaults, whether
-    /// or not the node reads (zakura-quic CTRL-26). The node admits at most
+    /// or not the node reads (zakura-quic CTRL-26 lists what this leaves
+    /// out). The node admits at most
     /// this budget divided by that cost, so the default 8 GiB admits 102
     /// connections and a larger `max_connections` is lowered at startup.
     /// Startup fails when the budget admits fewer than 16 connections, or fewer

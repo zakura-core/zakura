@@ -1,4 +1,4 @@
-//! The node-wide memory budget for native peers' transport buffers.
+//! The node-wide budget for native peers' transport credit.
 //!
 //! Each native connection can make this node hold
 //! [`zakura_quic::connection_memory_bytes`] in QUIC buffers (zakura-quic
@@ -9,6 +9,11 @@
 //! The budget lowers the connection count, never the windows, so every
 //! connection keeps the throughput that regulation sizing assumes (see
 //! `regulation::sizing`).
+//!
+//! It counts admitted connections only. QUIC handshakes not yet admitted,
+//! extra address attempts of one dial, and closed connections that QUIC is
+//! still draining hold buffers outside it, as do the overheads that
+//! [`zakura_quic::connection_memory_bytes`] lists.
 
 use thiserror::Error;
 

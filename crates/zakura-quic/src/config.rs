@@ -21,12 +21,14 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u32 = 10;
 /// Default pending handshakes above which unvalidated sources get a Retry (CTRL-22).
 pub const DEFAULT_RETRY_THRESHOLD: u32 = 8;
 
-/// Most bytes of transport buffers one connection's peer can make this node
-/// hold, whether or not the application reads (CTRL-26).
+/// Payload bytes one connection's flow-control credit and datagram queue can
+/// make this node hold, whether or not the application reads (CTRL-26).
 ///
 /// That is unread data up to the receive window, our unacknowledged data up to
 /// the send window, and datagrams queued for the connection task. Per-stream
 /// receive windows sit inside the connection window, so they add nothing.
+/// Reassembly bookkeeping, allocator overhead and our writes still waiting for
+/// send credit come on top, so this is not a resident-memory ceiling.
 pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_bytes: u64) -> u64 {
     // Widening u32 to u64 is lossless, and the driver's queue size fits u64 on
     // every supported target. Saturating keeps an unvalidated window from

@@ -490,8 +490,17 @@ These keys stay in `[network.zakura]` and keep their meaning:
   a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
   admits fewer than 16 connections, or fewer than `max_connections` when that
   is smaller. The budget never shrinks the windows, so it costs no
-  per-connection throughput. Each connection holds its slot of the cap from
-  before its control handshake until it closes.
+  per-connection throughput.
+
+  The budget counts flow-control credit and queued datagrams, not resident
+  memory, and only for admitted connections. An inbound connection takes its
+  slot when TLS finishes, before its control handshake, and a dial takes one
+  before its first attempt. The slot frees when the connection's serving task
+  ends. These still hold buffers outside the budget: handshakes not yet
+  admitted (at most `max_pending_handshakes`), extra address attempts of one
+  dial, closed connections until `quinn-proto` reports them drained (three
+  PTOs), reassembly bookkeeping and allocator overhead, and our writes still
+  waiting for send credit.
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -698,7 +707,7 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `quinn-proto` 0.11 exposes neither the unread bytes in its receive
     buffers nor a runtime per-stream receive window. The receive windows bound
     both: a peer holds at most `receive_window` of unread data per connection,
-    and CTRL-26 bounds the sum across connections.
+    and CTRL-26 bounds the sum across admitted connections.
 
 ## 13. Compatibility
 

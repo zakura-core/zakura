@@ -42,7 +42,7 @@ for real blocks), 0.13 GiB requester hashes, 2.0 GB of raw frames awaiting their
 5.6 GB of requested bodies (both derived below). The QUIC windows
 add 3.2 + 3.2 GiB, and the connections' datagram queues up to 1.6 GiB more. They are shared
 with every other service on the connection and stay unchanged: the 8 GiB peer memory budget
-covers all three, and is a transport budget, not a block-sync choice.
+covers all three for admitted connections, and is a transport budget, not a block-sync choice.
 
 ## Serving
 

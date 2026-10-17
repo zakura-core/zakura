@@ -14,6 +14,7 @@
 
 use std::{
     future::Future,
+    pin::Pin,
     sync::{Arc, OnceLock},
 };
 
@@ -305,12 +306,38 @@ compile_error!(
 /// Returns the task's [`JoinHandle`]: services let it drop to detach the task (it
 /// self-reaps; the `PipeTeardown` still runs on every exit), while the
 /// panic-containment test awaits it to observe the contained panic.
+///
+/// The pipe and hooks are boxed so every service spawns the same task type and
+/// shares one copy of tokio's per-task code. Pipes start once per peer stream, so
+/// the extra allocation is negligible.
 pub(crate) fn spawn_supervised_pipe(
     peer_id: ZakuraPeerId,
     cancel: CancellationToken,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
     pipe: impl Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    spawn_boxed_pipe(
+        peer_id,
+        cancel,
+        Box::new(on_teardown),
+        Box::new(on_panic),
+        Box::pin(pipe),
+    )
+}
+
+/// A supervised task boxed so that its spawned task type does not depend on the caller.
+type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A boxed teardown or panic hook for a supervised task.
+type BoxedHook = Box<dyn FnOnce() + Send>;
+
+fn spawn_boxed_pipe(
+    peer_id: ZakuraPeerId,
+    cancel: CancellationToken,
+    on_teardown: BoxedHook,
+    on_panic: BoxedHook,
+    pipe: BoxedTask,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let _teardown = PipeTeardown {
@@ -377,7 +404,27 @@ impl<F: FnOnce(), P: FnOnce()> Drop for PeerTaskTeardown<F, P> {
 /// Returns the task's [`JoinHandle`]: services let it drop to detach the task (it
 /// self-reaps; the `PeerTaskTeardown` still runs on every exit), while the
 /// panic-containment test awaits it to observe the contained panic.
+///
+/// Like [`spawn_supervised_pipe`], the task and hooks are boxed so every caller
+/// shares one task type. Use [`spawn_supervised_peer_task_unboxed`] for tasks
+/// spawned per request rather than per connection or session.
 pub(crate) fn spawn_supervised_peer_task(
+    peer_id: ZakuraPeerId,
+    on_teardown: impl FnOnce() + Send + 'static,
+    on_panic: impl FnOnce() + Send + 'static,
+    task: impl Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    let on_teardown: BoxedHook = Box::new(on_teardown);
+    let on_panic: BoxedHook = Box::new(on_panic);
+    let task: BoxedTask = Box::pin(task);
+    spawn_supervised_peer_task_unboxed(peer_id, on_teardown, on_panic, task)
+}
+
+/// [`spawn_supervised_peer_task`] without boxing, for tasks spawned per request.
+///
+/// Each distinct task type gets its own copy of tokio's per-task code, so use this
+/// only where the extra allocation of the boxed variant would land on a hot path.
+pub(crate) fn spawn_supervised_peer_task_unboxed(
     peer_id: ZakuraPeerId,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
@@ -423,6 +470,32 @@ pub(crate) fn handle_pipe_exit(
         Err(SinkReject::Local(error)) => {
             tracing::debug!(?error, service, "Zakura stream stopped on local error");
         }
+    }
+}
+
+/// Entry points for the supervised-spawn benchmark. Not part of the production API.
+#[cfg(feature = "internal-bench")]
+pub mod supervised_spawn_bench {
+    use std::future::Future;
+
+    use tokio::task::JoinHandle;
+
+    use crate::zakura::ZakuraPeerId;
+
+    /// Spawn `task` through the boxed path used for per-connection peer tasks.
+    pub fn spawn_boxed(
+        peer_id: ZakuraPeerId,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<()> {
+        super::spawn_supervised_peer_task(peer_id, || {}, || {}, task)
+    }
+
+    /// Spawn `task` through the unboxed path used for per-request serving tasks.
+    pub fn spawn_unboxed(
+        peer_id: ZakuraPeerId,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<()> {
+        super::spawn_supervised_peer_task_unboxed(peer_id, || {}, || {}, task)
     }
 }
 

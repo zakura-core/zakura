@@ -112,3 +112,8 @@ harness = false
 name = "address_book"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "supervised_spawn"
+harness = false
+required-features = ["internal-bench"]

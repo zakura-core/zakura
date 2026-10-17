@@ -2718,19 +2718,6 @@ impl HeaderChainRuntime {
         self.apply_combined(request, context, DiskWriteBatch::new(), || {})
     }
 
-    #[cfg(test)]
-    fn apply_with_fault<F>(
-        &self,
-        request: TransitionRequest,
-        context: &TransitionContext<'_>,
-        fault: F,
-    ) -> Result<ApplyResult, HeaderChainStoreError>
-    where
-        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
-    {
-        self.apply_combined_with_fault(request, context, DiskWriteBatch::new(), || {}, fault)
-    }
-
     pub(in crate::service) fn apply_combined<M>(
         &self,
         request: TransitionRequest,
@@ -6579,25 +6566,6 @@ impl HeaderChainStore {
             .single()
             .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))
             .map(Some)
-    }
-
-    fn projection_entries(&self, family: &'static str) -> Result<Vec<Frontier>, StoreError> {
-        let mut projection = Vec::new();
-        for (key, value) in self.scan_raw(family).map_err(store_error)? {
-            if key.len() != 4 || value.len() != 32 {
-                return Err(StoreError::Incoherent("invalid projection row width"));
-            }
-            let height = HeaderHeightKey::from_bytes(&key).0;
-            let hash = block::Hash(
-                value
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Incoherent("invalid projection hash"))?,
-            );
-            projection.push(Frontier::new(height, hash));
-        }
-        projection.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
-        Ok(projection)
     }
 
     fn projection_hash(

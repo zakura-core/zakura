@@ -335,18 +335,6 @@ impl FinalizedState {
         Self::new_with_debug(config, network, false, false)
     }
 
-    /// Opens (or creates) the on-disk finalized state database read-write, for
-    /// offline tooling (e.g. the replay benchmark).
-    ///
-    /// Equivalent to [`FinalizedState::new`] for offline tooling.
-    pub fn new_writable(config: &Config, network: &Network) -> Self {
-        Self::new_with_debug(config, network, false, false).expect(
-            "opening the read-write finalized state database failed; check that the \
-             state cache directory is writable and not locked by another Zakura instance, \
-             and that there is free disk space",
-        )
-    }
-
     /// Returns an on-disk database instance with the supplied production and debug settings.
     /// If there is no existing database, creates a new database on disk.
     ///

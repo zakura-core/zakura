@@ -32,7 +32,6 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
-#[allow(dead_code)]
 pub(crate) mod commitment_roots_db;
 #[allow(dead_code)]
 pub mod highest_completed_checkpoint;

@@ -1065,8 +1065,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `sprout_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_sprout_nullifier(&self, sprout_nullifier: &sprout::Nullifier) -> bool {
         self.best_chain()
             .map(|best_chain| best_chain.sprout_nullifiers.contains_key(sprout_nullifier))
@@ -1074,8 +1073,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `sapling_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_sapling_nullifier(
         &self,
         sapling_nullifier: &zakura_chain::sapling::Nullifier,
@@ -1090,8 +1088,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `orchard_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_orchard_nullifier(
         &self,
         orchard_nullifier: &zakura_chain::orchard::Nullifier,

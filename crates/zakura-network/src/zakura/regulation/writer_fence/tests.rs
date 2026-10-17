@@ -175,6 +175,39 @@ async fn a_fenced_send_writes_only_before_retirement() {
     }
 }
 
+/// A frame queued to follow a request goes out only after the request's
+/// first byte, so retirement that skips the request skips the frame too.
+#[tokio::test]
+async fn a_following_frame_needs_its_request_started() {
+    let frame = || Frame {
+        message_type: 1,
+        flags: 0,
+        payload: vec![7],
+    };
+    for retire_first in [false, true] {
+        let (fence, connection, _) = fence();
+        let (send, mut output) = framed_channel(2);
+        let mut exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        send.send_fenced(frame(), &writer).await.unwrap();
+        send.send_following(frame(), &writer).await.unwrap();
+        if retire_first {
+            assert!(fence.retire());
+            drop(send);
+            assert_eq!(output.recv().await, None, "both frames are skipped");
+        } else {
+            assert_eq!(output.recv().await, Some(frame()));
+            assert_eq!(
+                output.recv().await,
+                Some(frame()),
+                "the follow-up comes next"
+            );
+            exchange.end();
+        }
+        assert!(!connection.is_cancelled());
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ExpectedExchange {
     generation: usize,

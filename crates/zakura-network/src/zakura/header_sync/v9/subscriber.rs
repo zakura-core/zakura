@@ -11,8 +11,13 @@
 //!
 //! [`Subscriber::open`], the grants, and [`Subscriber::close`] record each
 //! update in the subscription tools before returning it, so the caller writes
-//! only updates the tools already counted. The session reader checks each
-//! frame header against the same tools through [`Subscriber::precheck`].
+//! only updates the tools already counted. The `Open` goes out with
+//! `FramedSend::send_fenced` and the writer that `open` returns. Each later
+//! `Grant` and `Close` goes out with `FramedSend::send_following` and the same
+//! writer, so an update queued behind an `Open` that the session's retirement
+//! skipped is skipped too. Frame headers are checked against the same tools,
+//! by the transport reader that [`Subscriber::new`] attaches to, or by
+//! [`Subscriber::admit`].
 //!
 //! # Page linkage
 //!

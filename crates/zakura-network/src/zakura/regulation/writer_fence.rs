@@ -40,6 +40,7 @@
 //! | Dropping a started, unended exchange closes the connection | `owner_drop_fences_unstarted_writes_and_closes_started_exchanges` |
 //! | Only an ending releases a started exchange | `only_endings_release_started_exchanges` |
 //! | Every writer of an old or closed fence stays fenced | `exchange_histories_keep_old_writers_fenced` |
+//! | A following frame is written only after its request started | `a_following_frame_needs_its_request_started` |
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -210,6 +211,13 @@ impl ExchangeWriter {
         *phase = Phase::Started;
         true
     }
+
+    /// Whether the request's first byte was written and the exchange is still
+    /// owned, so a later frame of the exchange may follow it.
+    fn started(&self) -> bool {
+        let (_state, phase) = self.0.lock();
+        matches!(*phase, Phase::Started | Phase::Ended)
+    }
 }
 
 impl Drop for Exchange {
@@ -234,6 +242,19 @@ struct FencedWrite(ExchangeWriter);
 impl FrameWriteClaim for FencedWrite {
     fn try_start(&self) -> bool {
         self.0.try_start(|| true)
+    }
+
+    fn written(&self) {}
+}
+
+/// A transport write claim for a later frame of an exchange, written only
+/// once the exchange's request started.
+#[derive(Debug)]
+struct FollowingWrite(ExchangeWriter);
+
+impl FrameWriteClaim for FollowingWrite {
+    fn try_start(&self) -> bool {
+        self.0.started()
     }
 
     fn written(&self) {}
@@ -275,6 +296,27 @@ impl FramedSend {
             return Err(FencedSendError::Fenced);
         }
         if queued {
+            Ok(())
+        } else {
+            Err(FencedSendError::Closed)
+        }
+    }
+
+    /// Wait for a queue slot, then queue `frame` to follow the request of
+    /// `writer`'s exchange, such as a subscription update after its `Open`.
+    ///
+    /// The transport writes `frame` only if the request's first byte was
+    /// written first, so retirement that skips the request skips `frame` too.
+    pub(crate) async fn send_following(
+        &self,
+        frame: Frame,
+        writer: &ExchangeWriter,
+    ) -> Result<(), FencedSendError> {
+        let slot = self
+            .reserve_guarded()
+            .await
+            .map_err(|_| FencedSendError::Closed)?;
+        if slot.send_request(frame, Arc::new(FollowingWrite(writer.clone()))) {
             Ok(())
         } else {
             Err(FencedSendError::Closed)

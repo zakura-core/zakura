@@ -32,7 +32,9 @@ mod socket;
 mod stream;
 pub mod sys;
 
-pub use config::{ConfigError, CongestionController, QuicBindConfig, QuicConfig};
+pub use config::{
+    connection_memory_bytes, ConfigError, CongestionController, QuicBindConfig, QuicConfig,
+};
 pub use conn::{
     BanCheck, CongestionStats, Conn, ConnLimits, ConnLoad, ConnObserver, ConnSample, ConnStats,
     DriverStats, LOAD_INTERVAL,

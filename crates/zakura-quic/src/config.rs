@@ -10,6 +10,8 @@ use quinn_proto::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::driver::CONNECTION_QUEUE_BYTES;
+
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
@@ -18,6 +20,21 @@ const GIB: u64 = 1024 * MIB;
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u32 = 10;
 /// Default pending handshakes above which unvalidated sources get a Retry (CTRL-22).
 pub const DEFAULT_RETRY_THRESHOLD: u32 = 8;
+
+/// Most bytes of transport buffers one connection's peer can make this node
+/// hold, whether or not the application reads (CTRL-26).
+///
+/// That is unread data up to the receive window, our unacknowledged data up to
+/// the send window, and datagrams queued for the connection task. Per-stream
+/// receive windows sit inside the connection window, so they add nothing.
+pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_bytes: u64) -> u64 {
+    // Widening u32 to u64 is lossless, and the driver's queue size fits u64 on
+    // every supported target. Saturating keeps an unvalidated window from
+    // wrapping to a small cost.
+    (receive_window_bytes as u64)
+        .saturating_add(send_window_bytes)
+        .saturating_add(CONNECTION_QUEUE_BYTES as u64)
+}
 
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,6 +224,11 @@ impl QuicConfig {
         check("dial_stagger_ms", self.dial_stagger_ms, 0, 5000)?;
         check("kernel_drop_poll_secs", self.kernel_drop_poll_secs, 1, 300)?;
         Ok(())
+    }
+
+    /// [`connection_memory_bytes`] for this config's windows (CTRL-26).
+    pub fn connection_memory_bytes(&self) -> u64 {
+        connection_memory_bytes(self.receive_window_bytes, self.send_window_bytes)
     }
 
     /// The connection idle timeout (CTRL-10).
@@ -413,6 +435,18 @@ mod tests {
         assert_eq!(config.handshake_timeout_secs, Some(10));
         assert_eq!(config.retry_threshold, Some(8));
         assert_eq!(config.congestion_controller, CongestionController::Cubic);
+    }
+
+    #[test]
+    fn connection_memory_counts_both_windows_and_the_datagram_queue() {
+        // 32 MiB received, 32 MiB sent and 16 MiB of queued datagrams.
+        assert_eq!(QuicConfig::default().connection_memory_bytes(), 80 * MIB);
+        let config = QuicConfig {
+            receive_window_bytes: 1 << 30,
+            send_window_bytes: GIB,
+            ..QuicConfig::default()
+        };
+        assert_eq!(config.connection_memory_bytes(), 2 * GIB + 16 * MIB);
     }
 
     #[test]

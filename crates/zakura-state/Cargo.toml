@@ -43,7 +43,6 @@ proptest-impl = [
 ]
 
 [dependencies]
-bincode = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }

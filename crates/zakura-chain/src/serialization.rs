@@ -29,6 +29,7 @@ mod write_zcash;
 mod zcash_deserialize;
 mod zcash_serialize;
 
+pub mod bincode_format;
 pub mod display_order;
 pub mod serde_adapters;
 pub mod sha256d;

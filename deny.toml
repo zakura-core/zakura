@@ -11,9 +11,7 @@ version = 2
 yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
-ignore = [
-    "RUSTSEC-2025-0141", # bincode — direct dependency
-]
+ignore = []
 
 # This section is considered when running `cargo deny check licenses`.
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html

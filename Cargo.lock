@@ -206,15 +206,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3870,7 +3861,6 @@ name = "zakura-chain"
 version = "10.0.0-rc1"
 dependencies = [
  "bech32",
- "bincode",
  "bitflags",
  "bitvec",
  "blake2b_simd",
@@ -4436,7 +4426,6 @@ dependencies = [
 name = "zakura-state"
 version = "11.0.0-rc1"
 dependencies = [
- "bincode",
  "chrono",
  "crossbeam-channel",
  "derive-new",

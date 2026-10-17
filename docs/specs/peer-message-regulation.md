@@ -661,6 +661,34 @@ capacity are available. This specification imposes no mandatory push deadline. T
 track progress and select another peer under local policy. Slow progress alone is not a protocol
 violation, and local failover MUST NOT revoke outstanding authorization.
 
+Before the subscription reaches its initial target, a publisher can find history unavailable for the
+requested schema, because it cannot produce the next header the path needs or the auxiliary record
+that header needs under the subscription's `tree_aux_schema`. A pruned publisher, for example,
+cannot derive records below the height where its commitment-tree index starts. The publisher MUST
+then send the path's pages up to the last header it can serve under that schema, as credit allows,
+and end the subscription with `HeadersOutcome(HistoryPruned)`. It MUST NOT wait for a record that
+cannot arrive, and a page MUST NOT skip a missing record to reach records above it. Unlike version
+8, the publisher MUST NOT fall back to schema 0 within a subscription. A capacity wait or a local
+backend error is not `HistoryPruned`. Capacity waits pause under Capacity admission, and a local
+failure returns `LocalFault`.
+
+After the subscription reaches its target, including at `Open`, `HistoryPruned` stays illegal. A
+publisher that cannot yet produce a record for a new header waits, and the subscriber MAY fail over
+under local policy, as for any slow progress. `SubscriptionSuperseded` still reports only a chain
+change.
+
+On `HistoryPruned` for a V1 subscription toward an ordinary discovery target, the subscriber MAY
+open its next subscription to that peer with no auxiliary schema. It SHOULD keep that downgrade for
+the peer across later subscriptions and `Status` updates, and SHOULD retry V1 periodically with
+backoff. If a subscription without auxiliary records also ends with `HistoryPruned`, the subscriber
+SHOULD rotate to another peer or back off. `HistoryPruned` is never a peer fault. VCT repair under
+LC-AUX-07 of the [fork-aware header chain engine specification](fork-aware-header-chain-engine.md)
+always requests V1 and rotates suppliers instead of downgrading.
+
+Headers taken without records do not bypass root authentication. After VCT freezes the frontier, a
+missing root parks block commit until some peer supplies it. Below a pruned publisher's
+commitment-tree index, roots and bodies must come from archive peers, as in version 8.
+
 The handler MUST verify contextual difficulty, time, chain connection, and auxiliary roots. The
 transition planner performs those checks; [`prepare_headers`][prepare-headers] documents the split.
 The handler MUST disconnect the peer when one of those checks fails.
@@ -697,11 +725,11 @@ An outcome outside its window MUST return `Disconnect`. A subscription that reac
 
 `Busy` is not a protocol outcome, and its version 8 byte, 4, MUST NOT be reused. Bytes 1 through 3
 keep their version 8 meanings. Local capacity exhaustion MUST pause response-work admission under
-Capacity admission. A local failure after admission MUST return `LocalFault`.
-`TargetNotSelected` reports
-that the publisher changed its selected chain between `Status` and `Open`. `SubscriptionSuperseded`
-reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
-a peer violation.
+Capacity admission. A local failure after admission MUST return `LocalFault`. `TargetNotSelected`
+reports that the publisher changed its selected chain between `Status` and `Open`.
+`SubscriptionSuperseded` reports that the publisher's selected chain stopped extending the
+subscription cursor. Neither is a peer violation. `HistoryPruned` reports history unavailable for
+the requested schema, as defined under `Headers`.
 
 ### Block sync — stream 6, regulated version 3
 

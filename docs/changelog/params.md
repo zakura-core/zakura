@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `PRUNED_BACKOFF_MIN` / `PRUNED_BACKOFF_MAX` | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | new → `60 s` doubling to `16 min` | [#1474](https://github.com/zakura-core/zakura/pull/1474) | After an ordinary round ends `HistoryPruned`, probe schema 1 records from that peer again, or retry a pruned attempt without records, only after this backoff, so a pruned peer never loops on the same attempt. |
 | Header sync `INBOUND_QUEUE_DEPTH` | `crates/zakura-network/src/zakura/header_sync/v9/wire.rs` | share of the 4,096-frame transport depth → `4` frames | [#1474](https://github.com/zakura-core/zakura/pull/1474) | Pages and control share the queue, which keeps the two slots that regulation needs and holds at most about 8 MiB of pages. |
 | Header sync `NODE_EXECUTION` / `PEER_EXECUTION` | `crates/zakura-network/src/zakura/header_sync/v9.rs` | new → `8` / `2` concurrent page reads | [#1474](https://github.com/zakura-core/zakura/pull/1474) | Each read holds a retained-path lease in state. Two per peer cover a session and a replacement that overlaps it. |
 | `LOCAL_MAX_HS_INFLIGHT_PER_PEER` (`Status.max_inflight_requests`) | `crates/zakura-network/src/zakura/header_sync/config.rs` | `1` request → removed; `Status.max_subscriptions` is always `1` | [#1474](https://github.com/zakura-core/zakura/pull/1474) | Version 9 allows one live or closing subscription per peer, so the protocol fixes the advertisement. |

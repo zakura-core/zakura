@@ -805,7 +805,7 @@ id = "LC-WIRE-14"
 name = "Auxiliary-schema validation"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::TreeAuxRecordV1::validate_for"
-tests = ["PW-06::tree_aux_records_need_their_header_height_and_activation_defaults", "PW-06::fixtures_decode_and_reencode_on_every_network", "PW-06::schema_one_pages_stop_before_a_header_without_a_record", "PW-06::conforms_to_its_rows"]
+tests = ["PW-06::tree_aux_records_need_their_header_height_and_activation_defaults", "PW-06::fixtures_decode_and_reencode_on_every_network", "PW-06::schema_one_path_pages_end_as_history_pruned_at_a_missing_record", "PW-06::schema_one_past_the_target_waits_for_a_missing_record", "PW-06::conforms_to_its_rows"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

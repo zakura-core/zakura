@@ -1066,9 +1066,10 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
         tree_aux_schema_mask: 0,
     };
 
+    // `HistoryPruned` pauses or downgrades the peer instead; the
+    // `aux_fallback` tests cover it.
     for outcome in [
         HeadersOutcomeCode::TargetNotRetained,
-        HeadersOutcomeCode::HistoryPruned,
         HeadersOutcomeCode::TargetNotSelected,
         HeadersOutcomeCode::SubscriptionSuperseded,
         HeadersOutcomeCode::NoLocatorIntersection,

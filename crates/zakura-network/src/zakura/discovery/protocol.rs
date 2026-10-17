@@ -587,39 +587,6 @@ impl BlockSyncServiceSummary {
             max_response_bytes: status.max_response_bytes,
         }
     }
-
-    /// Returns true if this summary can serve every height in `gap`.
-    pub fn covers_gap(&self, gap: &[block::Height]) -> bool {
-        self.gap_coverage(gap) == BlockSyncGapCoverage::Whole
-    }
-
-    /// Returns how much of `gap` this summary can serve.
-    fn gap_coverage(&self, gap: &[block::Height]) -> BlockSyncGapCoverage {
-        if self.free_slots == 0 {
-            return BlockSyncGapCoverage::None;
-        }
-
-        let Some(first) = gap.iter().min().copied() else {
-            return BlockSyncGapCoverage::None;
-        };
-        let Some(last) = gap.iter().max().copied() else {
-            return BlockSyncGapCoverage::None;
-        };
-        if self.servable_low <= first && last <= self.servable_high {
-            BlockSyncGapCoverage::Whole
-        } else if self.servable_low <= first && first <= self.servable_high {
-            BlockSyncGapCoverage::LowPrefix
-        } else {
-            BlockSyncGapCoverage::None
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum BlockSyncGapCoverage {
-    None,
-    LowPrefix,
-    Whole,
 }
 
 /// Native discovery protocol messages.
@@ -910,17 +877,6 @@ impl ZakuraDiscoveryDialCandidate {
     pub fn node_addr(&self) -> NodeAddr {
         NodeAddr::with_addrs(self.node_id, self.direct_addrs.clone())
     }
-}
-
-/// Service-aware peer candidates derived from signed discovery state.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ZakuraServiceCandidates {
-    /// Connected peers whose latest valid `Hello` advertised the requested service.
-    pub connected: Vec<NodeId>,
-    /// Dialable discovered peers whose signed record advertised the requested service.
-    pub discovered: Vec<ZakuraDiscoveryDialCandidate>,
-    /// Whether discovered candidates came from explicit fallback to general peers.
-    pub used_fallback: bool,
 }
 
 /// Header-sync candidate selection hints owned by the header-sync reactor.
@@ -1393,65 +1349,6 @@ impl ZakuraActiveServiceEntry {
     fn is_empty_live_only(&self) -> bool {
         self.record.is_none() && self.live_summaries.is_empty()
     }
-
-    fn live_summary_preference(&self, service: &ZakuraServiceId, now_unix_secs: u64) -> u32 {
-        self.live_summaries
-            .iter()
-            .filter(|summary| {
-                self.summary_advises_service(summary, service)
-                    && summary.expires_at_unix_secs > now_unix_secs
-            })
-            .map(ZakuraCachedLiveServiceSummary::preference_score)
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn fresh_header_sync_summary(&self, now_unix_secs: u64) -> Option<HeaderSyncServiceSummary> {
-        let header_sync_service = ZakuraServiceId::header_sync();
-        self.live_summaries.iter().find_map(|summary| {
-            if !self.summary_advises_service(summary, &header_sync_service)
-                || summary.expires_at_unix_secs <= now_unix_secs
-            {
-                return None;
-            }
-            match summary.summary {
-                ZakuraLiveServiceSummary::HeaderSync(header_sync) => Some(header_sync),
-                ZakuraLiveServiceSummary::BlockSync(_)
-                | ZakuraLiveServiceSummary::Discovery(_)
-                | ZakuraLiveServiceSummary::Unknown => None,
-            }
-        })
-    }
-
-    fn summary_advises_service(
-        &self,
-        summary: &ZakuraCachedLiveServiceSummary,
-        service: &ZakuraServiceId,
-    ) -> bool {
-        if summary.service_id == *service {
-            return true;
-        }
-
-        *service == ZakuraServiceId::header_sync()
-            && summary.service_id == ZakuraServiceId::header_sync_retired()
-            && self.services.contains(service)
-    }
-
-    fn fresh_block_sync_summary(&self, now_unix_secs: u64) -> Option<BlockSyncServiceSummary> {
-        self.live_summaries.iter().find_map(|summary| {
-            if summary.service_id != ZakuraServiceId::block_sync()
-                || summary.expires_at_unix_secs <= now_unix_secs
-            {
-                return None;
-            }
-            match summary.summary {
-                ZakuraLiveServiceSummary::BlockSync(block_sync) => Some(block_sync),
-                ZakuraLiveServiceSummary::HeaderSync(_)
-                | ZakuraLiveServiceSummary::Discovery(_)
-                | ZakuraLiveServiceSummary::Unknown => None,
-            }
-        })
-    }
 }
 
 /// A decoded first-party live service summary cached while its peer remains connected.
@@ -1491,28 +1388,6 @@ impl ZakuraCachedLiveServiceSummary {
             observed_at_unix_secs,
             expires_at_unix_secs,
         })
-    }
-
-    fn preference_score(&self) -> u32 {
-        match self.summary {
-            ZakuraLiveServiceSummary::HeaderSync(summary) => {
-                if !summary.serving_headers {
-                    return 0;
-                }
-                u32::from(summary.inbound_slots_free)
-                    .saturating_add(u32::from(summary.outbound_slots_free))
-            }
-            ZakuraLiveServiceSummary::Discovery(summary) => {
-                u32::from(summary.peer_exchange_slots_free)
-            }
-            ZakuraLiveServiceSummary::BlockSync(summary) => u32::from(summary.free_slots)
-                .saturating_add(
-                    summary
-                        .max_blocks_per_response
-                        .min(MAX_BS_BLOCKS_PER_REQUEST),
-                ),
-            ZakuraLiveServiceSummary::Unknown => 1,
-        }
     }
 }
 
@@ -1630,7 +1505,6 @@ impl ZakuraDiscoveryHandle {
     /// A node can keep its native connections longer than the record TTL. Refreshing lazily before
     /// a discovery exchange prevents a long-running node from sending an expired `Hello` to a new
     /// peer after its startup record has aged out.
-    #[allow(dead_code)]
     pub(crate) async fn current_self_record_for_gossip(
         &self,
     ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
@@ -1706,17 +1580,6 @@ impl ZakuraDiscoveryHandle {
                 .saturating_add(DEFAULT_LIVE_SERVICE_SUMMARY_TTL.as_secs()),
             summaries,
         }
-    }
-
-    /// Admit a typed discovery session if the service-specific cap has room.
-    pub async fn admit_peer(
-        &self,
-        conn_id: ZakuraConnId,
-        peer_id: ZakuraPeerId,
-        direction: ServicePeerDirection,
-    ) -> ServiceAdmissionDecision {
-        self.admit_peer_session(conn_id, 0, peer_id, direction)
-            .await
     }
 
     pub(crate) async fn admit_peer_session(
@@ -1856,30 +1719,6 @@ impl ZakuraDiscoveryHandle {
         excluded
     }
 
-    /// Replaces the local advertised service set and signs a newer self-record.
-    pub async fn update_advertised_services(
-        &self,
-        services: Vec<ZakuraServiceId>,
-    ) -> Result<Arc<ZakuraNodeRecord>, DiscoveryWireError> {
-        let services = advertised_services(services)?;
-        if self.self_record.borrow().body.services == services {
-            return Ok(self.current_self_record());
-        }
-
-        let record = {
-            let mut inner = self.inner.lock().await;
-            inner.local.services = services;
-            let record_ttl = inner.config.record_ttl;
-            Arc::new(inner.local.build_self_record(
-                current_unix_secs(),
-                current_sequence_tick(),
-                record_ttl,
-            )?)
-        };
-        self.self_record_tx.send_replace(record.clone());
-        Ok(record)
-    }
-
     /// Imports a relayed batch of peer-supplied signed records from `source`.
     ///
     /// Verification of every record finishes before any record is imported:
@@ -1950,18 +1789,6 @@ impl ZakuraDiscoveryHandle {
             }
         }
         Ok(outcome)
-    }
-
-    /// Imports one peer-supplied signed record through the discovery book validation path.
-    pub async fn import_peer_record(
-        &self,
-        record: ZakuraNodeRecord,
-        source: Option<NodeId>,
-    ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        let context = inner.validation_context(now);
-        inner.book.import_record(record, source, now, &context)
     }
 
     /// Imports a connected peer's first-party live service summaries.
@@ -2262,323 +2089,6 @@ impl ZakuraDiscoveryHandle {
             inner.config.dial_backoff_base,
             inner.config.dial_backoff_max,
         )
-    }
-
-    /// Returns service-aware candidates, using fallback to general peers only when requested.
-    pub async fn service_candidates(
-        &self,
-        service: &ZakuraServiceId,
-        allow_fallback: bool,
-        in_flight_node_ids: &[NodeId],
-    ) -> ZakuraServiceCandidates {
-        let connected = self.connected.borrow().clone();
-        let connected_node_ids = connected_peer_node_ids(&connected);
-        let (limit, dial_backoff_base, dial_backoff_max, book_limits) = {
-            let inner = self.inner.lock().await;
-            (
-                discovery_dial_slot_limit(
-                    connected.len(),
-                    in_flight_node_ids.len(),
-                    inner.config.max_zakura_connections,
-                    inner.config.discovery_connection_headroom,
-                    inner.config.max_concurrent_discovery_dials,
-                ),
-                inner.config.dial_backoff_base,
-                inner.config.dial_backoff_max,
-                inner.config.book_limits,
-            )
-        };
-
-        let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected_node_ids, now);
-
-        let mut connected_entries: Vec<_> = inner
-            .active_services
-            .iter()
-            .filter(|(node_id, entry)| {
-                connected_node_ids.contains(node_id) && entry.services.contains(service)
-            })
-            .map(|(node_id, entry)| {
-                (
-                    *node_id,
-                    entry.live_summary_preference(service, now),
-                    node_id_sort_key(node_id),
-                )
-            })
-            .collect();
-        connected_entries
-            .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<NodeId> = connected_entries
-            .into_iter()
-            .map(|(node_id, _, _)| node_id)
-            .collect();
-
-        let wanted_services = bounded_services(std::slice::from_ref(service), book_limits);
-        let mut rng = rand::thread_rng();
-        let mut discovered = inner.book.dial_candidates(
-            limit,
-            &wanted_services,
-            &[],
-            DialCandidateExclusions {
-                connected_node_ids: &connected_node_ids,
-                in_flight_node_ids,
-            },
-            now,
-            (dial_backoff_base, dial_backoff_max),
-            &mut rng,
-        );
-        let used_fallback = allow_fallback && connected.is_empty() && discovered.is_empty();
-        if used_fallback {
-            discovered = inner.book.dial_candidates(
-                limit,
-                &[],
-                &[],
-                DialCandidateExclusions {
-                    connected_node_ids: &connected_node_ids,
-                    in_flight_node_ids,
-                },
-                now,
-                (dial_backoff_base, dial_backoff_max),
-                &mut rng,
-            );
-        }
-
-        ZakuraServiceCandidates {
-            connected,
-            discovered,
-            used_fallback,
-        }
-    }
-
-    /// Returns header-sync candidates filtered and ordered by first-party advisory summaries.
-    ///
-    /// The returned peers are still advisory only: header-sync `Status` and header validation remain
-    /// authoritative after admission.
-    pub async fn header_sync_candidates(
-        &self,
-        header_sync: &ZakuraHeaderSyncCandidateState,
-        allow_fallback: bool,
-        in_flight_node_ids: &[NodeId],
-    ) -> ZakuraServiceCandidates {
-        let connected = self.connected.borrow().clone();
-        let connected_node_ids = connected_peer_node_ids(&connected);
-        let (limit, dial_backoff_base, dial_backoff_max, book_limits) = {
-            let inner = self.inner.lock().await;
-            (
-                discovery_dial_slot_limit(
-                    connected.len(),
-                    in_flight_node_ids.len(),
-                    inner.config.max_zakura_connections,
-                    inner.config.discovery_connection_headroom,
-                    inner.config.max_concurrent_discovery_dials,
-                ),
-                inner.config.dial_backoff_base,
-                inner.config.dial_backoff_max,
-                inner.config.book_limits,
-            )
-        };
-
-        let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected_node_ids, now);
-
-        let admitted_node_ids: HashSet<_> = header_sync.admitted_node_ids.iter().copied().collect();
-        let backed_off_node_ids: HashSet<_> =
-            header_sync.backed_off_node_ids.iter().copied().collect();
-        let header_sync_service = ZakuraServiceId::header_sync();
-        let mut connected_entries: Vec<_> = inner
-            .active_services
-            .iter()
-            .filter_map(|(node_id, entry)| {
-                let is_admitted = admitted_node_ids.contains(node_id);
-                if !connected_node_ids.contains(node_id)
-                    || !entry.services.contains(&header_sync_service)
-                    || (backed_off_node_ids.contains(node_id) && !is_admitted)
-                {
-                    return None;
-                }
-
-                let summary = entry.fresh_header_sync_summary(now);
-                if summary.is_some_and(|summary| {
-                    summary.serving_headers && summary.inbound_slots_free == 0 && !is_admitted
-                }) {
-                    return None;
-                }
-
-                Some((
-                    *node_id,
-                    header_sync_candidate_preference(summary, header_sync.target_height),
-                    node_id_sort_key(node_id),
-                ))
-            })
-            .collect();
-        connected_entries
-            .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<NodeId> = connected_entries
-            .into_iter()
-            .map(|(node_id, _, _)| node_id)
-            .collect();
-
-        let wanted_services =
-            bounded_services(std::slice::from_ref(&header_sync_service), book_limits);
-        let mut excluded_node_ids = Vec::with_capacity(
-            in_flight_node_ids
-                .len()
-                .saturating_add(header_sync.backed_off_node_ids.len()),
-        );
-        excluded_node_ids.extend_from_slice(in_flight_node_ids);
-        excluded_node_ids.extend(
-            header_sync
-                .backed_off_node_ids
-                .iter()
-                .copied()
-                .filter(|node_id| !admitted_node_ids.contains(node_id)),
-        );
-        let mut rng = rand::thread_rng();
-        let mut discovered = inner.book.dial_candidates(
-            limit,
-            &wanted_services,
-            &[],
-            DialCandidateExclusions {
-                connected_node_ids: &connected_node_ids,
-                in_flight_node_ids: &excluded_node_ids,
-            },
-            now,
-            (dial_backoff_base, dial_backoff_max),
-            &mut rng,
-        );
-        let used_fallback = allow_fallback && connected.is_empty() && discovered.is_empty();
-        if used_fallback {
-            discovered = inner.book.dial_candidates(
-                limit,
-                &[],
-                &[],
-                DialCandidateExclusions {
-                    connected_node_ids: &connected_node_ids,
-                    in_flight_node_ids: &excluded_node_ids,
-                },
-                now,
-                (dial_backoff_base, dial_backoff_max),
-                &mut rng,
-            );
-        }
-
-        ZakuraServiceCandidates {
-            connected,
-            discovered,
-            used_fallback,
-        }
-    }
-
-    /// Returns block-sync candidates filtered and ordered by first-party advisory summaries.
-    ///
-    /// The returned peers are still advisory only: block-sync `Status`, body hash validation, and
-    /// consensus verification remain authoritative after admission.
-    pub async fn block_sync_candidates(
-        &self,
-        block_sync: &ZakuraBlockSyncCandidateState,
-        allow_fallback: bool,
-        in_flight_node_ids: &[NodeId],
-    ) -> ZakuraServiceCandidates {
-        let connected = self.connected.borrow().clone();
-        let connected_node_ids = connected_peer_node_ids(&connected);
-        let (limit, dial_backoff_base, dial_backoff_max, book_limits) = {
-            let inner = self.inner.lock().await;
-            (
-                discovery_dial_slot_limit(
-                    connected.len(),
-                    in_flight_node_ids.len(),
-                    inner.config.max_zakura_connections,
-                    inner.config.discovery_connection_headroom,
-                    inner.config.max_concurrent_discovery_dials,
-                ),
-                inner.config.dial_backoff_base,
-                inner.config.dial_backoff_max,
-                inner.config.book_limits,
-            )
-        };
-
-        let now = current_unix_secs();
-        let mut inner = self.inner.lock().await;
-        inner.sync_active_services(&connected_node_ids, now);
-
-        let admitted_node_ids: HashSet<_> = block_sync.admitted_node_ids.iter().copied().collect();
-        let block_sync_service = ZakuraServiceId::block_sync();
-        let mut connected_entries: Vec<_> = inner
-            .active_services
-            .iter()
-            .filter_map(|(node_id, entry)| {
-                if !connected_node_ids.contains(node_id)
-                    || !entry.services.contains(&block_sync_service)
-                {
-                    return None;
-                }
-
-                if block_sync.missing_block_bodies.is_empty() {
-                    return Some((
-                        *node_id,
-                        entry.live_summary_preference(&block_sync_service, now),
-                        node_id_sort_key(node_id),
-                    ));
-                }
-
-                let is_admitted = admitted_node_ids.contains(node_id);
-                let summary = entry.fresh_block_sync_summary(now);
-                if summary.is_some_and(|summary| summary.free_slots == 0 && !is_admitted) {
-                    return None;
-                }
-
-                Some((
-                    *node_id,
-                    block_sync_candidate_preference(summary, &block_sync.missing_block_bodies),
-                    node_id_sort_key(node_id),
-                ))
-            })
-            .collect();
-        connected_entries
-            .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<NodeId> = connected_entries
-            .into_iter()
-            .map(|(node_id, _, _)| node_id)
-            .collect();
-
-        let wanted_services =
-            bounded_services(std::slice::from_ref(&block_sync_service), book_limits);
-        let mut rng = rand::thread_rng();
-        let mut discovered = inner.book.dial_candidates(
-            limit,
-            &wanted_services,
-            &[],
-            DialCandidateExclusions {
-                connected_node_ids: &connected_node_ids,
-                in_flight_node_ids,
-            },
-            now,
-            (dial_backoff_base, dial_backoff_max),
-            &mut rng,
-        );
-        let used_fallback = allow_fallback && connected.is_empty() && discovered.is_empty();
-        if used_fallback {
-            discovered = inner.book.dial_candidates(
-                limit,
-                &[],
-                &[],
-                DialCandidateExclusions {
-                    connected_node_ids: &connected_node_ids,
-                    in_flight_node_ids,
-                },
-                now,
-                (dial_backoff_base, dial_backoff_max),
-                &mut rng,
-            );
-        }
-
-        ZakuraServiceCandidates {
-            connected,
-            discovered,
-            used_fallback,
-        }
     }
 
     /// Marks a discovery dial attempt for `node_id`.
@@ -2959,29 +2469,6 @@ impl ZakuraDiscoveryBook {
         self.import_record_inner(record, None, true, false, now, context)
     }
 
-    /// Imports a bounded batch of signed peer records from a single response.
-    pub fn import_records(
-        &mut self,
-        records: impl IntoIterator<Item = ZakuraNodeRecord>,
-        source: Option<NodeId>,
-        now: u64,
-        context: &DiscoveryRecordValidationContext,
-    ) -> ImportBatchOutcome {
-        let mut outcome = ImportBatchOutcome::default();
-        for (index, record) in records.into_iter().enumerate() {
-            if index >= self.limits.max_imported_records_per_response {
-                outcome.dropped_for_limit += 1;
-                continue;
-            }
-            outcome.attempted += 1;
-            match self.import_record(record, source, now, context) {
-                Ok(import_outcome) => outcome.record_success(import_outcome),
-                Err(_) => outcome.rejected += 1,
-            }
-        }
-        outcome
-    }
-
     /// Returns a bounded peer sample from the requester's disclosure window.
     ///
     /// Only confirmed entries (see [`ZakuraDiscoveryEntry::last_confirmed`]) are eligible:
@@ -3284,13 +2771,6 @@ impl ZakuraDiscoveryBook {
         if let Some(candidate) = self.static_candidates.get_mut(node_id) {
             candidate.last_short_lived_exchange = Some(now);
         }
-    }
-
-    /// Returns the advertised services for `node_id`.
-    pub fn services_for(&self, node_id: &NodeId) -> Option<Vec<ZakuraServiceId>> {
-        self.entries
-            .get(node_id)
-            .map(|entry| entry.record.body.services.clone())
     }
 
     fn recent_node_ids(&self, limit: usize) -> Vec<NodeId> {
@@ -3904,50 +3384,6 @@ fn effective_live_summary_expiry(
     // a bounded receipt TTL only inside the accepted skew window; future expiries still honor a
     // peer's intentionally shorter lifetime.
     Some(local_expiry)
-}
-
-fn header_sync_candidate_preference(
-    summary: Option<HeaderSyncServiceSummary>,
-    target_height: block::Height,
-) -> u32 {
-    let Some(summary) = summary else {
-        return 0;
-    };
-    if !summary.serving_headers
-        || summary.inbound_slots_free == 0
-        || summary.best_height < target_height
-    {
-        return 0;
-    }
-
-    let useful_height_delta = summary.best_height.0.saturating_sub(target_height.0);
-    1_000_000u32
-        .saturating_add(u32::from(summary.inbound_slots_free))
-        .saturating_add(u32::from(summary.outbound_slots_free))
-        .saturating_add(useful_height_delta)
-}
-
-fn block_sync_candidate_preference(
-    summary: Option<BlockSyncServiceSummary>,
-    missing_block_bodies: &[block::Height],
-) -> u32 {
-    let Some(summary) = summary else {
-        return 0;
-    };
-
-    let coverage_bonus = match summary.gap_coverage(missing_block_bodies) {
-        BlockSyncGapCoverage::Whole => 1_000_000u32,
-        BlockSyncGapCoverage::LowPrefix => 500_000u32,
-        BlockSyncGapCoverage::None => return 0,
-    };
-
-    coverage_bonus
-        .saturating_add(u32::from(summary.free_slots))
-        .saturating_add(
-            summary
-                .max_blocks_per_response
-                .min(MAX_BS_BLOCKS_PER_REQUEST),
-        )
 }
 
 fn bounded_services(
@@ -4759,20 +4195,6 @@ mod tests {
         runtime_record_with_secret(&secret_key, sequence, service, addr)
     }
 
-    fn runtime_record_with_services(
-        sequence: u64,
-        services: Vec<ZakuraServiceId>,
-        addr: SocketAddr,
-    ) -> ZakuraNodeRecord {
-        let secret_key = secret_key();
-        let mut body = body(&secret_key);
-        body.sequence = sequence;
-        body.direct_addrs = vec![addr];
-        body.services = services;
-        body.expires_at_unix_secs = current_unix_secs() + DEFAULT_DISCOVERY_RECORD_TTL.as_secs();
-        ZakuraNodeRecord::sign(body, &secret_key).expect("runtime test record signs")
-    }
-
     fn runtime_record_with_secret(
         secret_key: &NodeSecretKey,
         sequence: u64,
@@ -4832,6 +4254,19 @@ mod tests {
     ) -> ZakuraDiscoveryHandle {
         ZakuraDiscoveryHandle::new_at(local_config, config, connected, now, wall_clock_sequence)
             .expect("test discovery state constructs")
+    }
+
+    /// Imports one peer record through the relayed-batch path and asserts the book accepted it.
+    async fn import_one_peer_record(
+        handle: &ZakuraDiscoveryHandle,
+        record: ZakuraNodeRecord,
+        source: Option<NodeId>,
+    ) {
+        let outcome = handle
+            .import_peer_records([record], source)
+            .await
+            .expect("authentic test record verifies");
+        assert_eq!(outcome.rejected, 0, "test record imports into the book");
     }
 
     fn discovery_handle_with_connected(
@@ -6633,26 +6068,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_book_import_batch_enforces_per_response_cap() {
-        let mut book = ZakuraDiscoveryBook::new(ZakuraDiscoveryBookLimits {
-            max_imported_records_per_response: 2,
-            ..ZakuraDiscoveryBookLimits::default()
-        });
-        let records = (1u8..=4)
-            .map(|index| {
-                signed_record_with(u64::from(index), service(index as usize), test_addr(index))
-            })
-            .collect::<Vec<_>>();
-
-        let outcome = book.import_records(records, None, NOW, &context());
-
-        assert_eq!(outcome.attempted, 2);
-        assert_eq!(outcome.added, 2);
-        assert_eq!(outcome.dropped_for_limit, 2);
-        assert_eq!(book.discovered_len(), 2);
-    }
-
-    #[test]
     fn discovery_book_total_capacity_and_eviction_order_are_enforced() {
         let mut book = small_book(2);
 
@@ -7218,8 +6633,6 @@ mod tests {
         book.mark_dial_attempt(&node_id, NOW + 1);
         book.mark_dial_failure(&node_id, NOW + 1);
 
-        assert_eq!(book.services_for(&node_id), Some(vec![service(9)]));
-
         let mut persisted = book.persisted_entries();
         persisted.push(ZakuraDiscoveryPersistedEntry {
             record: {
@@ -7287,32 +6700,6 @@ mod tests {
         record.verify(&context()).expect("self-record verifies");
     }
 
-    #[tokio::test]
-    async fn self_record_sequence_increases_when_services_change() {
-        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_at(
-            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
-            ZakuraDiscoveryConfig::default(),
-            connected_rx,
-            NOW,
-        );
-        let initial = handle.current_self_record();
-
-        let updated = handle
-            .update_advertised_services(vec![service(2)])
-            .await
-            .expect("updated self-record signs");
-
-        assert!(updated.body.sequence > initial.body.sequence);
-        assert_eq!(updated.body.services, vec![service(2)]);
-        updated
-            .verify(&DiscoveryRecordValidationContext {
-                current_unix_secs: current_unix_secs(),
-                ..context()
-            })
-            .expect("updated record verifies");
-    }
-
     #[test]
     fn startup_rejects_more_advertised_services_than_a_record_carries() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -7352,28 +6739,6 @@ mod tests {
             handle.current_self_record().body.services.len(),
             MAX_SERVICES_PER_RECORD
         );
-    }
-
-    #[tokio::test]
-    async fn update_rejects_more_advertised_services_than_a_record_carries() {
-        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_at(
-            local_config_with(secret_key(), vec![test_addr(43)], vec![service(1)]),
-            ZakuraDiscoveryConfig::default(),
-            connected_rx,
-            NOW,
-        );
-        let initial = handle.current_self_record();
-
-        let result = handle
-            .update_advertised_services((0..=MAX_SERVICES_PER_RECORD).map(service).collect())
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(DiscoveryWireError::TooManyAdvertisedServices { .. })
-        ));
-        assert_eq!(handle.current_self_record(), initial);
     }
 
     #[tokio::test]
@@ -7526,12 +6891,6 @@ mod tests {
             .import_connected_peer_record(record, node_id)
             .await
             .expect("connected self-record imports");
-
-        assert!(handle
-            .service_candidates(&service(9), false, &[])
-            .await
-            .connected
-            .is_empty());
         assert_eq!(handle.active_services(node_id).await, None);
         assert!(handle.inner.lock().await.active_services.is_empty());
     }
@@ -7754,22 +7113,12 @@ mod tests {
             .import_connected_peer_record(active_record, node_id)
             .await
             .expect("connected self-record imports");
-        handle
-            .import_peer_record(stale_book_record, Some(secret_key().public()))
-            .await
-            .expect("newer third-party record imports into book");
+        import_one_peer_record(&handle, stale_book_record, Some(secret_key().public())).await;
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert_eq!(
             handle.active_services(node_id).await,
             Some(vec![service(1)])
-        );
-        assert_eq!(
-            handle
-                .service_candidates(&service(1), false, &[])
-                .await
-                .connected,
-            vec![node_id]
         );
     }
 
@@ -7877,10 +7226,7 @@ mod tests {
                 .expect("equal-sequence connected self-record refreshes metadata only"),
             ImportOutcome::MetadataUpdated
         );
-        handle
-            .import_peer_record(stored_newer, Some(secret_key().public()))
-            .await
-            .expect("newer third-party record imports into book");
+        import_one_peer_record(&handle, stored_newer, Some(secret_key().public())).await;
         assert_eq!(
             handle
                 .import_connected_peer_record(older_than_stored, node_id)
@@ -7893,18 +7239,6 @@ mod tests {
             handle.active_services(node_id).await,
             Some(vec![service(2)])
         );
-        assert_eq!(
-            handle
-                .service_candidates(&service(2), false, &[])
-                .await
-                .connected,
-            vec![node_id]
-        );
-        assert!(handle
-            .service_candidates(&service(3), false, &[])
-            .await
-            .connected
-            .is_empty());
     }
 
     #[tokio::test]
@@ -7938,18 +7272,6 @@ mod tests {
             handle.active_services(node_id).await,
             Some(vec![service(2)])
         );
-        assert_eq!(
-            handle
-                .service_candidates(&service(2), false, &[])
-                .await
-                .connected,
-            vec![node_id]
-        );
-        assert!(handle
-            .service_candidates(&service(3), false, &[])
-            .await
-            .connected
-            .is_empty());
     }
 
     /// A peer that reset its sequence and dropped its addresses regains its
@@ -8002,442 +7324,6 @@ mod tests {
             Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired))
         ));
         assert_eq!(handle.active_services(node_id).await, None);
-        assert!(handle
-            .service_candidates(&service(1), false, &[])
-            .await
-            .connected
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn service_candidates_require_explicit_general_fallback() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_at(
-            local_config_with(secret_key(), vec![test_addr(49)], vec![service(1)]),
-            ZakuraDiscoveryConfig {
-                max_zakura_connections: 8,
-                discovery_connection_headroom: 1,
-                ..ZakuraDiscoveryConfig::default()
-            },
-            connected_rx,
-            NOW,
-        );
-        let active = runtime_record_with(1, service(1), test_addr(1));
-        let active_id = active.body.node_id;
-        let discovered = runtime_record_with(2, service(1), test_addr(2));
-        let general = runtime_record_with(3, service(3), test_addr(3));
-        handle
-            .import_connected_peer_record(active, active_id)
-            .await
-            .expect("connected self-record imports");
-        handle
-            .import_peer_record(discovered.clone(), Some(discovered.body.node_id))
-            .await
-            .expect("discovered first-party record imports");
-        handle
-            .import_peer_record(general.clone(), Some(general.body.node_id))
-            .await
-            .expect("general first-party record imports");
-        connected_tx.send_replace(vec![peer_id_for(active_id)]);
-
-        let matching = handle.service_candidates(&service(1), true, &[]).await;
-        assert_eq!(matching.connected, vec![active_id]);
-        assert_eq!(matching.discovered, vec![candidate_for(&discovered, false)]);
-        assert!(!matching.used_fallback);
-
-        assert_eq!(
-            handle
-                .service_candidates(&service(2), false, &[])
-                .await
-                .discovered,
-            Vec::<ZakuraDiscoveryDialCandidate>::new()
-        );
-
-        let fallback = handle
-            .service_candidates(&service(2), true, &[discovered.body.node_id])
-            .await;
-        assert!(fallback.connected.is_empty());
-        assert_eq!(fallback.discovered, vec![candidate_for(&general, false)]);
-        assert!(fallback.used_fallback);
-    }
-
-    #[tokio::test]
-    async fn live_first_party_summary_prioritizes_service_candidates_until_stale() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let first = runtime_record_with(1, ZakuraServiceId::header_sync(), test_addr(1));
-        let second = runtime_record_with(2, ZakuraServiceId::header_sync(), test_addr(2));
-        let first_id = first.body.node_id;
-        let second_id = second.body.node_id;
-        connected_tx.send_replace(vec![peer_id_for(first_id), peer_id_for(second_id)]);
-
-        handle
-            .import_connected_peer_record(first, first_id)
-            .await
-            .expect("first connected self-record imports");
-        handle
-            .import_connected_peer_record(second, second_id)
-            .await
-            .expect("second connected self-record imports");
-
-        let initial = handle
-            .service_candidates(&ZakuraServiceId::header_sync(), false, &[])
-            .await
-            .connected;
-        assert_eq!(initial.len(), 2);
-        let preferred_id = initial[1];
-        let mut preferred_summary = header_summary();
-        preferred_summary.inbound_slots_free = 8;
-        preferred_summary.outbound_slots_free = 8;
-
-        handle
-            .import_connected_peer_services_at(
-                first_party_services(
-                    preferred_id,
-                    now + 30,
-                    vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
-                        .expect("test header summary encodes")],
-                ),
-                preferred_id,
-                now,
-            )
-            .await
-            .expect("first-party header summary imports");
-
-        let with_live_summary = handle
-            .service_candidates(&ZakuraServiceId::header_sync(), false, &[])
-            .await
-            .connected;
-        assert_eq!(with_live_summary[0], preferred_id);
-
-        handle
-            .import_connected_peer_services_at(
-                first_party_services(
-                    preferred_id,
-                    now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
-                    vec![ServiceSummaryEnvelope::header_sync(&preferred_summary)
-                        .expect("test header summary encodes")],
-                ),
-                preferred_id,
-                now,
-            )
-            .await
-            .expect("stale first-party header summary is dropped");
-
-        assert_eq!(
-            handle
-                .service_candidates(&ZakuraServiceId::header_sync(), false, &[])
-                .await
-                .connected,
-            initial
-        );
-    }
-
-    #[tokio::test]
-    async fn header_sync_candidates_prefer_useful_first_party_height() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let without_summary = runtime_record_with(1, ZakuraServiceId::header_sync(), test_addr(1));
-        let with_summary = runtime_record_with(2, ZakuraServiceId::header_sync(), test_addr(2));
-        let without_summary_id = without_summary.body.node_id;
-        let with_summary_id = with_summary.body.node_id;
-        connected_tx.send_replace(vec![
-            peer_id_for(without_summary_id),
-            peer_id_for(with_summary_id),
-        ]);
-
-        handle
-            .import_connected_peer_record(without_summary, without_summary_id)
-            .await
-            .expect("connected record imports");
-        handle
-            .import_connected_peer_record(with_summary, with_summary_id)
-            .await
-            .expect("connected record imports");
-
-        let mut summary = header_summary();
-        summary.best_height = block::Height(20);
-        summary.inbound_slots_free = 1;
-        handle
-            .import_connected_peer_services_at(
-                first_party_services(
-                    with_summary_id,
-                    now + 30,
-                    vec![ServiceSummaryEnvelope::header_sync(&summary)
-                        .expect("test header summary encodes")],
-                ),
-                with_summary_id,
-                now,
-            )
-            .await
-            .expect("first-party header summary imports");
-
-        let candidates = handle
-            .header_sync_candidates(
-                &ZakuraHeaderSyncCandidateState {
-                    target_height: block::Height(10),
-                    ..ZakuraHeaderSyncCandidateState::default()
-                },
-                false,
-                &[],
-            )
-            .await;
-
-        assert_eq!(candidates.connected[0], with_summary_id);
-        assert!(candidates.connected.contains(&without_summary_id));
-    }
-
-    #[tokio::test]
-    async fn retired_header_summary_scores_only_dual_stack_header_sync_candidates() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let v1_only = runtime_record_with(1, ZakuraServiceId::header_sync_retired(), test_addr(1));
-        let dual_stack = runtime_record_with_services(
-            2,
-            vec![
-                ZakuraServiceId::header_sync_retired(),
-                ZakuraServiceId::header_sync(),
-            ],
-            test_addr(2),
-        );
-        let current_only = runtime_record_with(3, ZakuraServiceId::header_sync(), test_addr(3));
-        let v1_only_id = v1_only.body.node_id;
-        let dual_stack_id = dual_stack.body.node_id;
-        let current_only_id = current_only.body.node_id;
-        connected_tx.send_replace(vec![
-            peer_id_for(v1_only_id),
-            peer_id_for(dual_stack_id),
-            peer_id_for(current_only_id),
-        ]);
-
-        for record in [v1_only, dual_stack, current_only] {
-            let node_id = record.body.node_id;
-            handle
-                .import_connected_peer_record(record, node_id)
-                .await
-                .expect("connected record imports");
-        }
-
-        let mut summary = header_summary();
-        summary.best_height = block::Height(20);
-        summary.inbound_slots_free = 8;
-        for node_id in [v1_only_id, dual_stack_id] {
-            handle
-                .import_connected_peer_services_at(
-                    first_party_services(
-                        node_id,
-                        now + 30,
-                        vec![retired_header_sync_envelope(&summary)],
-                    ),
-                    node_id,
-                    now,
-                )
-                .await
-                .expect("retired first-party header summary imports");
-        }
-
-        let generic = handle
-            .service_candidates(&ZakuraServiceId::header_sync(), false, &[])
-            .await;
-        assert_eq!(generic.connected[0], dual_stack_id);
-        assert!(generic.connected.contains(&current_only_id));
-        assert!(!generic.connected.contains(&v1_only_id));
-
-        let candidates = handle
-            .header_sync_candidates(
-                &ZakuraHeaderSyncCandidateState {
-                    target_height: block::Height(10),
-                    ..ZakuraHeaderSyncCandidateState::default()
-                },
-                false,
-                &[],
-            )
-            .await;
-
-        assert_eq!(candidates.connected[0], dual_stack_id);
-        assert!(candidates.connected.contains(&current_only_id));
-        assert!(!candidates.connected.contains(&v1_only_id));
-    }
-
-    #[tokio::test]
-    async fn header_sync_candidates_skip_full_inbound_unless_already_admitted() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let full = runtime_record_with(1, ZakuraServiceId::header_sync(), test_addr(1));
-        let open = runtime_record_with(2, ZakuraServiceId::header_sync(), test_addr(2));
-        let full_id = full.body.node_id;
-        let open_id = open.body.node_id;
-        connected_tx.send_replace(vec![peer_id_for(full_id), peer_id_for(open_id)]);
-
-        handle
-            .import_connected_peer_record(full, full_id)
-            .await
-            .expect("connected record imports");
-        handle
-            .import_connected_peer_record(open, open_id)
-            .await
-            .expect("connected record imports");
-
-        let mut full_summary = header_summary();
-        full_summary.best_height = block::Height(20);
-        full_summary.inbound_slots_free = 0;
-        let mut open_summary = full_summary;
-        open_summary.inbound_slots_free = 2;
-        for (node_id, summary) in [(full_id, full_summary), (open_id, open_summary)] {
-            handle
-                .import_connected_peer_services_at(
-                    first_party_services(
-                        node_id,
-                        now + 30,
-                        vec![ServiceSummaryEnvelope::header_sync(&summary)
-                            .expect("test header summary encodes")],
-                    ),
-                    node_id,
-                    now,
-                )
-                .await
-                .expect("first-party header summary imports");
-        }
-
-        let candidates = handle
-            .header_sync_candidates(
-                &ZakuraHeaderSyncCandidateState {
-                    target_height: block::Height(10),
-                    ..ZakuraHeaderSyncCandidateState::default()
-                },
-                false,
-                &[],
-            )
-            .await;
-        assert_eq!(candidates.connected, vec![open_id]);
-
-        let candidates = handle
-            .header_sync_candidates(
-                &ZakuraHeaderSyncCandidateState {
-                    target_height: block::Height(10),
-                    admitted_node_ids: vec![full_id],
-                    ..ZakuraHeaderSyncCandidateState::default()
-                },
-                false,
-                &[],
-            )
-            .await;
-        assert!(candidates.connected.contains(&full_id));
-        assert!(candidates.connected.contains(&open_id));
-    }
-
-    #[tokio::test]
-    async fn block_sync_service_candidates_prefer_covering_free_slot_summary() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let no_summary = runtime_record_with(1, ZakuraServiceId::block_sync(), test_addr(1));
-        let covering = runtime_record_with(2, ZakuraServiceId::block_sync(), test_addr(2));
-        let prefix = runtime_record_with(3, ZakuraServiceId::block_sync(), test_addr(3));
-        let full = runtime_record_with(4, ZakuraServiceId::block_sync(), test_addr(4));
-        let not_block_sync = runtime_record_with(5, ZakuraServiceId::header_sync(), test_addr(5));
-        let no_summary_id = no_summary.body.node_id;
-        let covering_id = covering.body.node_id;
-        let prefix_id = prefix.body.node_id;
-        let full_id = full.body.node_id;
-        let not_block_sync_id = not_block_sync.body.node_id;
-        connected_tx.send_replace(vec![
-            peer_id_for(no_summary_id),
-            peer_id_for(covering_id),
-            peer_id_for(prefix_id),
-            peer_id_for(full_id),
-            peer_id_for(not_block_sync_id),
-        ]);
-
-        for record in [no_summary, covering, prefix, full, not_block_sync] {
-            let node_id = record.body.node_id;
-            handle
-                .import_connected_peer_record(record, node_id)
-                .await
-                .expect("connected record imports");
-        }
-
-        let mut covering_summary = block_sync_summary();
-        covering_summary.servable_low = block::Height(10);
-        covering_summary.servable_high = block::Height(20);
-        covering_summary.free_slots = 2;
-        let mut prefix_summary = covering_summary;
-        prefix_summary.servable_high = block::Height(12);
-        prefix_summary.free_slots = 4;
-        let mut full_summary = covering_summary;
-        full_summary.free_slots = 0;
-        for (node_id, summary) in [
-            (covering_id, covering_summary),
-            (prefix_id, prefix_summary),
-            (full_id, full_summary),
-        ] {
-            handle
-                .import_connected_peer_services_at(
-                    first_party_services(
-                        node_id,
-                        now + 30,
-                        vec![ServiceSummaryEnvelope::block_sync(&summary)
-                            .expect("test block summary encodes")],
-                    ),
-                    node_id,
-                    now,
-                )
-                .await
-                .expect("first-party block summary imports");
-        }
-
-        let generic = handle
-            .service_candidates(&ZakuraServiceId::block_sync(), false, &[])
-            .await;
-        assert!(generic.connected.contains(&covering_id));
-        assert!(generic.connected.contains(&prefix_id));
-        assert!(generic.connected.contains(&full_id));
-        assert!(generic.connected.contains(&no_summary_id));
-        assert!(!generic.connected.contains(&not_block_sync_id));
-
-        let candidates = handle
-            .block_sync_candidates(
-                &ZakuraBlockSyncCandidateState {
-                    missing_block_bodies: vec![block::Height(10), block::Height(20)],
-                    ..ZakuraBlockSyncCandidateState::default()
-                },
-                false,
-                &[],
-            )
-            .await;
-
-        assert_eq!(candidates.connected[0], covering_id);
-        let prefix_position = candidates
-            .connected
-            .iter()
-            .position(|node_id| node_id == &prefix_id)
-            .expect("prefix-covering peer remains a candidate");
-        let no_summary_position = candidates
-            .connected
-            .iter()
-            .position(|node_id| node_id == &no_summary_id)
-            .expect("no-summary peer remains a candidate");
-        assert!(prefix_position < no_summary_position);
-        assert!(candidates.connected.contains(&no_summary_id));
-        assert!(!candidates.connected.contains(&full_id));
-        assert!(!candidates.connected.contains(&not_block_sync_id));
-
-        let candidates = handle
-            .block_sync_candidates(
-                &ZakuraBlockSyncCandidateState {
-                    missing_block_bodies: vec![block::Height(10), block::Height(20)],
-                    admitted_node_ids: vec![full_id],
-                },
-                false,
-                &[],
-            )
-            .await;
-
-        assert!(candidates.connected.contains(&full_id));
     }
 
     #[tokio::test]
@@ -8498,87 +7384,6 @@ mod tests {
 
         assert_eq!(handle.live_service_summaries_at(node_id, now).await, None);
         assert_eq!(handle.active_services(node_id).await, None);
-    }
-
-    #[tokio::test]
-    async fn block_sync_summary_mismatch_changes_selection_without_punitive_state() {
-        let (connected_tx, connected_rx) = watch::channel(Vec::new());
-        let handle = discovery_handle_with_connected(connected_rx);
-        let now = current_unix_secs();
-        let peer = runtime_record_with(1, ZakuraServiceId::block_sync(), test_addr(1));
-        let covering_peer = runtime_record_with(2, ZakuraServiceId::block_sync(), test_addr(2));
-        let peer_id = peer.body.node_id;
-        let covering_peer_id = covering_peer.body.node_id;
-        connected_tx.send_replace(vec![peer_id_for(peer_id), peer_id_for(covering_peer_id)]);
-        for record in [peer, covering_peer] {
-            let node_id = record.body.node_id;
-            handle
-                .import_connected_peer_record(record, node_id)
-                .await
-                .expect("connected record imports");
-        }
-
-        let mut summary = block_sync_summary();
-        summary.servable_low = block::Height(10);
-        summary.servable_high = block::Height(20);
-        summary.free_slots = 3;
-        let mut covering_summary = summary;
-        covering_summary.free_slots = 1;
-        for (node_id, summary) in [(peer_id, summary), (covering_peer_id, covering_summary)] {
-            handle
-                .import_connected_peer_services_at(
-                    first_party_services(
-                        node_id,
-                        now + 30,
-                        vec![ServiceSummaryEnvelope::block_sync(&summary)
-                            .expect("test block summary encodes")],
-                    ),
-                    node_id,
-                    now,
-                )
-                .await
-                .expect("first-party block summary imports");
-        }
-
-        let state = ZakuraBlockSyncCandidateState {
-            missing_block_bodies: vec![block::Height(10), block::Height(20)],
-            ..ZakuraBlockSyncCandidateState::default()
-        };
-        assert_eq!(
-            handle
-                .block_sync_candidates(&state, false, &[])
-                .await
-                .connected
-                .first(),
-            Some(&peer_id)
-        );
-
-        summary.servable_high = block::Height(11);
-        handle
-            .import_connected_peer_services_at(
-                first_party_services(
-                    peer_id,
-                    now + 31,
-                    vec![ServiceSummaryEnvelope::block_sync(&summary)
-                        .expect("test block summary encodes")],
-                ),
-                peer_id,
-                now + 1,
-            )
-            .await
-            .expect("corrected first-party block summary imports");
-
-        let candidates = handle.block_sync_candidates(&state, false, &[]).await;
-        assert_eq!(candidates.connected.first(), Some(&covering_peer_id));
-        assert!(candidates.connected.contains(&peer_id));
-        let cached = handle
-            .live_service_summaries_at(peer_id, now + 1)
-            .await
-            .expect("live summary remains cached");
-        assert_eq!(
-            cached[0].summary,
-            ZakuraLiveServiceSummary::BlockSync(summary)
-        );
     }
 
     #[tokio::test]
@@ -8671,12 +7476,6 @@ mod tests {
             handle.active_services(record_backed_node_id).await,
             Some(vec![service.clone()])
         );
-        let fresh_candidates = handle
-            .service_candidates(&service, false, &[])
-            .await
-            .connected;
-        assert!(fresh_candidates.contains(&live_only_node_id));
-        assert!(fresh_candidates.contains(&record_backed_node_id));
 
         for node_id in [live_only_node_id, record_backed_node_id] {
             handle
@@ -8702,12 +7501,6 @@ mod tests {
             handle.active_services(record_backed_node_id).await,
             Some(vec![service.clone()])
         );
-        let stale_candidates = handle
-            .service_candidates(&service, false, &[])
-            .await
-            .connected;
-        assert!(!stale_candidates.contains(&live_only_node_id));
-        assert!(stale_candidates.contains(&record_backed_node_id));
     }
 
     #[tokio::test]
@@ -9359,10 +8152,7 @@ mod tests {
         let other = runtime_record_with(3, ZakuraServiceId::legacy_gossip(), test_addr(3));
         for record in [matching.clone(), excluded, other] {
             let author = record.body.node_id;
-            handle
-                .import_peer_record(record, Some(author))
-                .await
-                .expect("first-party record imports");
+            import_one_peer_record(&handle, record, Some(author)).await;
         }
 
         let sample = handle
@@ -9410,10 +8200,7 @@ mod tests {
         // Once its owner confirms it first-party, the record is one this node vouches for and
         // the filtered query reveals nothing the unfiltered query does not already return.
         let author = custom_record.body.node_id;
-        handle
-            .import_peer_record(custom_record.clone(), Some(author))
-            .await
-            .expect("first-party record imports");
+        import_one_peer_record(&handle, custom_record.clone(), Some(author)).await;
         assert_eq!(
             handle
                 .sample_peers(requester, 10, std::slice::from_ref(&custom_service), &[])
@@ -9440,7 +8227,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer(2, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(2, 0, peer.clone(), ServicePeerDirection::Inbound)
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -9448,7 +8235,7 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer(1, peer.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(1, 0, peer.clone(), ServicePeerDirection::Inbound)
                 .await,
             ServiceAdmissionDecision::RejectNotUseful
         );
@@ -9530,10 +8317,7 @@ mod tests {
         let connected = runtime_record_with(2, service(1), test_addr(2));
         let connected_id = connected.body.node_id;
         let candidate_id = candidate.body.node_id;
-        handle
-            .import_peer_record(candidate.clone(), Some(candidate_id))
-            .await
-            .expect("candidate first-party record imports");
+        import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
             .import_connected_peer_record(connected, connected_id)
             .await
@@ -9556,10 +8340,7 @@ mod tests {
         let connected = runtime_record_with(2, service(1), test_addr(2));
         let connected_id = connected.body.node_id;
         let candidate_id = candidate.body.node_id;
-        handle
-            .import_peer_record(candidate.clone(), Some(candidate_id))
-            .await
-            .expect("candidate first-party record imports");
+        import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
             .import_connected_peer_record(connected, connected_id)
             .await
@@ -9578,10 +8359,7 @@ mod tests {
         let handle = discovery_handle_with_connected(connected_rx);
         let candidate = runtime_record_with(1, service(1), test_addr(1));
         let candidate_id = candidate.body.node_id;
-        handle
-            .import_peer_record(candidate, Some(secret_key().public()))
-            .await
-            .expect("candidate imports");
+        import_one_peer_record(&handle, candidate, Some(secret_key().public())).await;
 
         assert!(handle
             .dial_candidates(&[service(1)], &[candidate_id])
@@ -9600,10 +8378,7 @@ mod tests {
         let neither = runtime_record_with(3, service(3), test_addr(3));
 
         for record in [&matching_a, &matching_b, &neither] {
-            handle
-                .import_peer_record(record.clone(), Some(record.body.node_id))
-                .await
-                .expect("candidate record imports");
+            import_one_peer_record(&handle, record.clone(), Some(record.body.node_id)).await;
         }
 
         assert!(handle

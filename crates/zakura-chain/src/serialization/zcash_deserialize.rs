@@ -26,6 +26,13 @@ pub trait ZcashDeserialize: Sized {
     /// This function has a `zcash_` prefix to alert the reader that the
     /// serialization in use is consensus-critical serialization, rather than
     /// some other kind of serialization.
+    ///
+    /// The input length is unknown, so collection counts are only checked against
+    /// protocol limits.
+    ///
+    /// Do not override this method; implement [`Self::zcash_deserialize_from`].
+    /// Values nested inside other types are decoded with `zcash_deserialize_from`
+    /// through [`ZcashReader::read_value`], so an override here would be skipped.
     fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
         Self::zcash_deserialize_from(&mut ZcashReader::from_stream(reader))
     }
@@ -38,16 +45,16 @@ pub trait ZcashDeserialize: Sized {
 
     /// Decode one value while keeping track of how many input bytes remain.
     ///
+    /// This is the one decoder every type implements; [`Self::zcash_deserialize`]
+    /// and [`Self::zcash_deserialize_from_slice`] call it for stream and slice input.
+    ///
     /// Implementations must use the reader's `read_value`, `read_external_count`,
     /// and `read_bytes` methods for nested data, so those decoders keep the same
-    /// remaining byte count and check counts before allocating. The default rejects
-    /// types that only implement the older streaming method.
+    /// remaining byte count and check counts before allocating. Fixed-size fields
+    /// can be read through the reader's [`io::Read`] implementation.
     fn zcash_deserialize_from<R: io::Read>(
-        _reader: &mut ZcashReader<R>,
-    ) -> Result<Self, SerializationError> {
-        // Implementers must override this method (or `zcash_deserialize` for stream-only types).
-        Err(SerializationError::Parse("type has no bounded decoder"))
-    }
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError>;
 }
 
 /// Deserialize a `Vec`, where the number of items is set by a CompactSize

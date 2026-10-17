@@ -1085,7 +1085,6 @@ impl WorkQueue {
     }
 
     /// The "work added" notifier (per-peer routines wake source).
-    #[allow(dead_code)]
     pub(super) fn subscribe_available(&self) -> &Notify {
         &self.available
     }

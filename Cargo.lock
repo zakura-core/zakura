@@ -3639,7 +3639,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "toml",
  "tower",
@@ -4289,7 +4288,6 @@ dependencies = [
  "indexmap",
  "insta",
  "itertools 0.14.0",
- "lazy_static",
  "libc",
  "metrics",
  "once_cell",
@@ -4334,7 +4332,6 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "tempfile",
- "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -4381,7 +4378,6 @@ dependencies = [
  "tracing-subscriber",
  "zakura-chain",
  "zakura-node-services",
- "zakura-primitives",
  "zakura-state",
 ]
 

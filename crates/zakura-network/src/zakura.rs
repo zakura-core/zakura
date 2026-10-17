@@ -127,10 +127,6 @@ pub enum ServiceAdmissionDecision {
     RejectFull,
     /// The peer is not useful for this service right now.
     RejectNotUseful,
-    /// The peer is still in a local retry backoff window.
-    RejectBackoff,
-    /// The peer does not support this service.
-    RejectUnsupported,
 }
 
 /// Direction of the underlying Zakura connection.

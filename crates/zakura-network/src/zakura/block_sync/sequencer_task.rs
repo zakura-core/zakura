@@ -1306,6 +1306,7 @@ mod tests {
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
+    use super::super::tests::genesis_frontiers;
     use super::*;
 
     #[test]
@@ -1461,11 +1462,7 @@ mod tests {
     }
 
     fn retention_test_task(limit: u64) -> SequencerTask {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
@@ -1615,11 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_version_refresh_does_not_retire_body_authority() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let scope = super::test_work_scope();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -1661,11 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_target_scope_advance_preserves_downloaded_bodies() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let old_scope = super::test_work_scope();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1717,11 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_invalid_reselection_resets_block_pipeline() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
         let work = Arc::new(WorkQueue::new(block::Height(0)));
         work.extend(
@@ -1783,11 +1768,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_retry_completion_releases_only_exact_infrastructure() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -1878,11 +1859,7 @@ mod tests {
 
     #[tokio::test]
     async fn consensus_invalid_evidence_waits_for_action_capacity() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -1995,11 +1972,7 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_evidence_waits_for_action_capacity() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2108,11 +2081,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_action_receiver_retains_exact_required_evidence() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, actions_rx) = mpsc::channel(1);
@@ -2183,11 +2152,7 @@ mod tests {
         ];
         for (index, kind) in kinds.into_iter().enumerate() {
             for attribution_matches in [true, false] {
-                let frontiers = BlockSyncFrontiers {
-                    finalized_height: block::Height(0),
-                    verified_block_tip: block::Height(0),
-                    verified_block_hash: block::Hash([0; 32]),
-                };
+                let frontiers = genesis_frontiers();
                 let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2287,11 +2252,7 @@ mod tests {
     /// The height is still reset so another supplier can serve it.
     #[tokio::test]
     async fn tampered_body_misbehavior_waits_for_a_busy_driver() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2398,11 +2359,7 @@ mod tests {
     // Attribute it only to the authenticated supplier.
     async fn body_invalid_after_header_extension_reaches_header_dag() {
         for attribution_matches in [true, false] {
-            let frontiers = BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(0),
-                verified_block_hash: block::Hash([0; 32]),
-            };
+            let frontiers = genesis_frontiers();
             let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2514,11 +2471,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submission_retries_after_action_channel_capacity_returns() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2595,11 +2548,7 @@ mod tests {
 
     #[test]
     fn handoff_publishes_applying_decoded_bytes_before_submission() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2646,11 +2595,7 @@ mod tests {
 
     #[test]
     fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =

@@ -700,21 +700,6 @@ impl ZakuraEndpoint {
         events.lock().await.take()
     }
 
-    /// Cancels and waits for endpoint-owned sync/background tasks.
-    ///
-    /// Used by dual-stack fallback before legacy ChainSync starts, so already-started
-    /// Zakura block applies have finished before legacy can submit commits through
-    /// the same verifier and state pipeline.
-    pub async fn shutdown_sync_tasks(&self) {
-        if let Some(tasks) = &self.header_sync_tasks {
-            tasks.shutdown.cancel();
-            let mut tasks = tasks.tasks.lock().await;
-            for task in tasks.drain(..) {
-                let _ = task.await;
-            }
-        }
-    }
-
     /// The endpoint-wide background-task shutdown token, cancelled by
     /// [`ZakuraEndpoint::shutdown`].
     ///
@@ -911,34 +896,6 @@ impl ZakuraEndpoint {
             header_sync_tasks: None,
             header_sync_fatal_events: None,
             header_sync_actions: None,
-            block_sync_actions: None,
-            upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
-        }
-    }
-
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    #[allow(dead_code)]
-    pub(crate) fn from_parts_with_header_sync(
-        quic: QuicEndpoint,
-        supervisor: ZakuraSupervisorHandle,
-        handler: ZakuraProtocolHandler,
-        header_sync: super::HeaderSyncHandle,
-        shutdown: CancellationToken,
-        tasks: Vec<JoinHandle<()>>,
-        actions: Option<mpsc::Receiver<HeaderSyncAction>>,
-    ) -> Self {
-        Self {
-            quic,
-            supervisor,
-            handler,
-            header_sync: Some(header_sync),
-            block_sync: None,
-            header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
-                shutdown,
-                tasks: Mutex::new(tasks),
-            })),
-            header_sync_fatal_events: None,
-            header_sync_actions: actions.map(|actions| Arc::new(Mutex::new(Some(actions)))),
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }

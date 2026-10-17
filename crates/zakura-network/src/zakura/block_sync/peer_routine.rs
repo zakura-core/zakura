@@ -2640,10 +2640,10 @@ mod tests {
     use super::super::sequencer_task::initial_view;
     use super::super::source::EmptyBlockRangeSource;
     use super::super::state::{ByteBudget, ThroughputMeter};
+    use super::super::tests::genesis_frontiers;
     use super::super::work_queue::WorkQueue;
     use super::super::{
-        BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
-        ZakuraBlockSyncConfig,
+        BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig,
     };
     use super::PeerRoutine;
     use super::RoutineToReactor;
@@ -2725,11 +2725,7 @@ mod tests {
         let work = Arc::new(WorkQueue::new(block::Height(0)));
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) =
             test_authorization(&session, &in_recv, &config, pool, connection);
         let routine = PeerRoutine::new(
@@ -3288,11 +3284,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3398,11 +3390,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -3546,11 +3534,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3813,11 +3797,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -4003,11 +3983,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -4327,11 +4303,7 @@ mod tests {
             }
         }
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause.clone());
         let (requester, serving) = test_authorization(
             &session,
@@ -4599,11 +4571,7 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
         let (reactor_input, mut reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause);
         let (requester, serving) = test_authorization(
             &session,

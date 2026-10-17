@@ -6,7 +6,8 @@
 //! response above the reserved size are protocol violations, because only the
 //! response itself or the session's end removes a reservation.
 //!
-//! Each reservation owns its query's [`Exchange`]. Retiring the session's
+//! Each reservation owns its query's
+//! [`Exchange`](crate::zakura::regulation::Exchange). Retiring the session's
 //! [`WriterFence`] skips a query that was never written, and closes the
 //! connection if a written query is still unanswered: no receiver remains for
 //! its answer.

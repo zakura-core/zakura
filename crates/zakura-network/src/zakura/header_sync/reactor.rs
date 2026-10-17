@@ -1415,6 +1415,7 @@ impl HeaderSyncReactor {
             AuxSchema::V1 => {
                 pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
                 state.status_spent = false;
+                self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
                 metrics::counter!("sync.header.target.aux_fallback").increment(1);
             }
             AuxSchema::None => {
@@ -1811,6 +1812,9 @@ impl HeaderSyncReactor {
     /// arrives. An outcome for work that already holds its pages, or for a
     /// subscription this node closed, changes nothing.
     fn handle_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, ended: Ended) {
+        // A terminal outcome lets the session open again, which an offer held
+        // by `Self::subscription_ready` waits for.
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         // The session holds one live or closing subscription, so this is the
         // outcome of any `Close` this node sent it.
         if self

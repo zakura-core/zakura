@@ -256,7 +256,9 @@ struct Load {
 /// node and peer execution limits. After the gate opens, every reading
 /// session must finish within a bound on scheduler passes, so a wait on a
 /// timer fails instead of advancing the paused clock. Cursor history,
-/// execution, and output stay within their bounds after every pass.
+/// execution, and output stay within their bounds after every pass. Pages
+/// carry Regtest headers, so output bytes stay far below production limits
+/// and this checks counts and slots, not byte budgets.
 #[allow(clippy::print_stderr)]
 async fn run_load(peers: usize) {
     const TIP: u32 = 2 * DEFAULT_HS_RANGE;

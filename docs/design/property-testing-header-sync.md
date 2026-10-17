@@ -117,6 +117,8 @@ wait on a closed gate, so they stop at the node and peer execution limits of 8 a
 scheduler pass the test checks that cursor history stays within the window and output within its
 bound. Every reading session must then finish. A non-reading session queues pages in every
 transport slot but the one kept for control, and its next page waits without spending credit.
+The pages carry Regtest headers, about 181 KB for 1,000 headers against roughly 1.7 MB on Mainnet
+with records, so the test checks counts and slots, not output bytes near production limits.
 
 Each of these tests runs on a paused clock in one thread. A progress bound counts scheduler passes,
 at most one million, so a wait on a timer fails instead of advancing time. The port and transport

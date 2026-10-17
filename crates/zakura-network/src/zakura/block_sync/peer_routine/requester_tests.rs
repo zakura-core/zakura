@@ -543,7 +543,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         next_sent(&mut outbound).await;
         deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
-        assert!(!routine.requester.at_capacity());
+        assert!(!routine.requester.occupancy().at_capacity);
         peers.push((routine, outbound, connection));
     }
     assert!(
@@ -1085,7 +1085,10 @@ async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
         requested.len() < usize::try_from(BULK_WORK).unwrap(),
         "the bound, not the queue, stopped the peer",
     );
-    assert_eq!(routine.requester.pending_endings(), requested.len());
+    assert_eq!(
+        routine.requester.occupancy().pending_endings,
+        requested.len()
+    );
     assert_eq!(pool.held(), requested.len());
     assert!(routine.window.outstanding.is_empty());
     assert!(routine.work.pending_contains(block::Height(BULK_WORK)));
@@ -1130,7 +1133,7 @@ async fn a_late_ending_below_the_bound_lets_the_peer_take_work_again() {
         .await;
         routine.try_fill().await;
         requested = requested_heights(&mut outbound);
-        let pending = routine.requester.pending_endings();
+        let pending = routine.requester.occupancy().pending_endings;
         if pending >= MAX_PENDING_ENDINGS {
             assert!(requested.is_empty(), "gated with {pending} endings owed");
         } else {
@@ -1172,7 +1175,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
         for height in &batch {
             let index = usize::try_from(height.0 - 1).unwrap();
             deliver(&mut routine, BlockSyncMessage::Block(blocks[index].clone())).await;
-            most_pending = most_pending.max(routine.requester.pending_endings());
+            most_pending = most_pending.max(routine.requester.occupancy().pending_endings);
             routine.try_fill().await;
             let new = requested_heights(&mut outbound);
             requested += new.len();
@@ -1195,7 +1198,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
     }
     assert_eq!(requested, usize::try_from(BULK_WORK).unwrap());
     assert_eq!(most_pending, INTERLEAVED);
-    assert_eq!(routine.requester.pending_endings(), 0);
+    assert_eq!(routine.requester.occupancy().pending_endings, 0);
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
 }
@@ -1273,7 +1276,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
     ranking.as_mut().enable();
     unended.sort();
     let mut endings = unended.into_iter();
-    while fast.requester.pending_endings() > MAX_PENDING_ENDINGS {
+    while fast.requester.occupancy().pending_endings > MAX_PENDING_ENDINGS {
         let start_height = endings.next().unwrap();
         deliver(
             &mut fast,
@@ -1324,7 +1327,10 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
         }
         probe.routine.try_fill().await;
         assert!(requested_heights(&mut probe.outbound).is_empty());
-        assert_eq!(probe.routine.requester.len(), SESSION_RESERVATIONS);
+        assert_eq!(
+            probe.routine.requester.occupancy().len,
+            SESSION_RESERVATIONS
+        );
         sessions.push(probe);
     }
     // The protocol ceiling fits usize on supported targets.
@@ -1379,7 +1385,7 @@ async fn fast_peer_holding_one_exchange() -> (
         .window
         .bbr_rtprop_ms(time::Instant::now().into_std())
         .is_some());
-    assert_eq!(fast.requester.len(), 1);
+    assert_eq!(fast.requester.occupancy().len, 1);
     let floor = fast
         .work
         .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))

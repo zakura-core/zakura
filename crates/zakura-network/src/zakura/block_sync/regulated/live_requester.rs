@@ -47,6 +47,17 @@ pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize
 /// entries beyond the requests its window already has in flight.
 pub(crate) const MAX_PENDING_ENDINGS: usize = 64;
 
+/// One consistent read of a session's requester limits.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct RequesterOccupancy {
+    /// Whether the session holds its whole [`SESSION_RESERVATIONS`] share.
+    pub(crate) at_capacity: bool,
+    /// Live exchanges, including abandoned ones still awaiting an ending.
+    pub(crate) len: usize,
+    /// Fully received ranges still owing an ending.
+    pub(crate) pending_endings: usize,
+}
+
 /// The precheck may outlive the routine. Its sender retains session capacity
 /// until the authorization maps and transport reader have both been dropped.
 #[derive(Debug)]
@@ -138,18 +149,14 @@ impl LiveRequester {
         self.shared.lock().unreceived_expected(limit)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.shared.lock().len()
-    }
-
-    pub(crate) fn at_capacity(&self) -> bool {
-        self.shared.lock().at_capacity()
-    }
-
-    /// Live ranges whose every body arrived but whose ending has not.
-    /// New requests wait while this is at [`MAX_PENDING_ENDINGS`].
-    pub(crate) fn pending_endings(&self) -> usize {
-        self.shared.lock().pending_endings()
+    /// The share, live exchange count and owed endings, read under one lock.
+    pub(crate) fn occupancy(&self) -> RequesterOccupancy {
+        let requester = self.shared.lock();
+        RequesterOccupancy {
+            at_capacity: requester.at_capacity(),
+            len: requester.len(),
+            pending_endings: requester.pending_endings(),
+        }
     }
 
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {

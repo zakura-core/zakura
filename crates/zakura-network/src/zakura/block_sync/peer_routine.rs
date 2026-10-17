@@ -2493,15 +2493,13 @@ impl PeerRoutine {
 
     /// Why the live requester refuses another request, whatever the window allows.
     fn requester_stop(&self) -> Option<FillStop> {
+        let occupancy = self.requester.occupancy();
         // Count unanswered exchanges, including scheduler-abandoned work.
         // The peer's u32 advertised limit fits usize on supported targets.
-        if self.requester.at_capacity()
-            || self.requester.len() >= self.window.max_inflight_requests as usize
-        {
+        if occupancy.at_capacity || occupancy.len >= self.window.max_inflight_requests as usize {
             return Some(FillStop::CwndSaturated);
         }
-        if self.requester.pending_endings() >= super::regulated::live_requester::MAX_PENDING_ENDINGS
-        {
+        if occupancy.pending_endings >= super::regulated::live_requester::MAX_PENDING_ENDINGS {
             return Some(FillStop::PendingEndings);
         }
         None

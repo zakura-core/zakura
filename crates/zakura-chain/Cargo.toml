@@ -100,7 +100,6 @@ serde = { workspace = true, features = ["serde_derive", "rc"] }
 futures = { workspace = true }
 itertools = { workspace = true }
 rayon = { workspace = true }
-strum = { workspace = true, features = ["derive"] }
 
 # ZF deps
 ed25519-zebra = { workspace = true }

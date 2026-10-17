@@ -1291,6 +1291,59 @@ async fn a_page_job_panic_ends_a_terminal_wait_on_a_full_queue() {
     assert!(ended.is_err_and(|error| error.is_panic()));
 }
 
+/// While one subscription's terminal outcome waits for a full queue, the
+/// other subscription's page keeps moving, so its finished job gives its
+/// execution slot back.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_wait_keeps_the_other_page_moving() {
+    let port = FakePort::new(0);
+    let chain = port.grow(2);
+    let serve = ServeLimits {
+        node_execution: 1,
+        ..serve_limits()
+    };
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve)
+        .expect("the test budgets are valid");
+    // A frame nobody reads fills the one-slot queue.
+    let (send, _recv) = framed_channel(1);
+    send.try_send(Frame {
+        message_type: 1,
+        flags: 0,
+        payload: Vec::new(),
+    })
+    .expect("the queue has room");
+    let (publisher, _task) = Publisher::spawn::<HB>(
+        port.clone(),
+        capacity.push(&peer(7)),
+        send,
+        LeaseOwner {
+            peer: SourceId::from_digest(peer(7).digest()),
+            session_id: 1,
+        },
+        limits(),
+        CancellationToken::new(),
+    );
+    // The first subscription's page waits in its read, holding the slot.
+    let mut first = Subscriber::new();
+    let open = first.open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(capacity.node_execution_held(), 1);
+    // The margin admits a second subscription, whose Close leaves a
+    // terminal outcome waiting for the full queue.
+    let mut second = Subscriber::new();
+    second.next_id = 2;
+    let open = second.open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the margin admits it");
+    let close = second.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    // The first page's read finishes, and its job gives the slot back.
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(capacity.node_execution_held(), 0);
+}
+
 /// A following page that leaves the selected chain while in progress is read
 /// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.

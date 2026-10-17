@@ -771,21 +771,49 @@ async fn publish<const HEADER_BYTES: usize>(
     let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
     loop {
         let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
+        // Another subscription's page that finished while a terminal outcome
+        // waited for the queue.
+        let mut finished = None;
         for (id, frame, terminal) in ended {
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
             if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
-            // A full queue must not keep a cancelled session's task alive or
-            // hide a page job's panic.
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-                sent = terminal.send(&send, frame) => if !sent {
-                    return;
-                },
+            if finished
+                .as_ref()
+                .is_some_and(|(working, _, _)| *working == id)
+            {
+                finished = None;
+            }
+            let terminal = terminal.send(&send, frame);
+            tokio::pin!(terminal);
+            // A full queue must not keep a cancelled session's task alive,
+            // hide a page job's panic, or leave another subscription's
+            // finished job holding its execution slots.
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
+                    progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
+                        if work.is_some() =>
+                    {
+                        let (id, seen, _) = work.take().expect("the page in progress just finished");
+                        finished = Some((id, seen, progress));
+                    }
+                    sent = &mut terminal => {
+                        if !sent {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((id, seen, progress)) = finished {
+            if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                return;
             }
         }
         if work.is_none() {
@@ -819,19 +847,8 @@ async fn publish<const HEADER_BYTES: usize>(
                 if work.is_some() =>
             {
                 let (id, seen, _) = work.take().expect("the page in progress just finished");
-                match progress {
-                    // A page whose subscription closed meanwhile spends
-                    // nothing and drops its slot.
-                    Progress::Page(page, slot) => {
-                        if lock(&task.shared).commit(id, &page) {
-                            slot.send(page.frame);
-                        }
-                    }
-                    Progress::Other(output) => {
-                        let moved = selected.borrow().as_ref() != seen.as_ref();
-                        lock(&task.shared).finish(id, output, moved);
-                    }
-                    Progress::Closed => return,
+                if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                    return;
                 }
             }
             () = task.wake.notified() => {}
@@ -844,6 +861,33 @@ async fn publish<const HEADER_BYTES: usize>(
             }
             () = any_released(capacity) => lock(&task.shared).clear_stalls(false),
         }
+    }
+}
+
+/// Apply a finished page or job to subscription `id`, whose job read the
+/// selected chain `seen`. Returns false when the stream closed.
+fn settle(
+    shared: &Mutex<Shared>,
+    selected: &watch::Receiver<Option<EngineSnapshot>>,
+    id: u64,
+    seen: Option<&EngineSnapshot>,
+    progress: Progress<'_>,
+) -> bool {
+    match progress {
+        // A page whose subscription closed meanwhile spends nothing and drops
+        // its slot.
+        Progress::Page(page, slot) => {
+            if lock(shared).commit(id, &page) {
+                slot.send(page.frame);
+            }
+            true
+        }
+        Progress::Other(output) => {
+            let moved = selected.borrow().as_ref() != seen;
+            lock(shared).finish(id, output, moved);
+            true
+        }
+        Progress::Closed => false,
     }
 }
 

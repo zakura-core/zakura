@@ -47,7 +47,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "s
 webpki-roots = { version = "1", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
 
 [dev-dependencies]
 

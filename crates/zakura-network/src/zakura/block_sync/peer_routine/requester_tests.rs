@@ -1402,8 +1402,9 @@ async fn fast_peer_holding_one_exchange() -> (
 /// A status that lowers the advertised in-flight limit to what a fast peer
 /// already holds stops its requester, so a slower peer takes the floor at
 /// once instead of deferring until the next slot heartbeat. The status here
-/// is rate-limited, which still applies the new limit.
-#[tokio::test]
+/// is rate-limited, which still applies the new limit. Time is paused so the
+/// status always falls inside the rate window, however slow the runner.
+#[tokio::test(start_paused = true)]
 async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     let (mut fast, mut slow, mut slow_outbound, floor, _keep) =
         fast_peer_holding_one_exchange().await;

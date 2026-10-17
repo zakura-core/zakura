@@ -172,6 +172,15 @@ struct Subscription {
     stall: Option<Stall>,
 }
 
+impl Subscription {
+    /// Whether the subscription reached its initial target, for the outcome
+    /// windows. A locator at the target reaches it at `Open`, even before the
+    /// publisher has served anything.
+    fn reached(&self) -> bool {
+        self.position.reached() || self.locators.contains(&self.fixed.target)
+    }
+}
+
 /// The state shared between [`Publisher::apply`] and the publisher task.
 #[derive(Debug)]
 struct Shared {
@@ -347,7 +356,7 @@ impl Shared {
                     is_legal(
                         outcome,
                         self.pages_sent(&id),
-                        subscription.position.reached(),
+                        subscription.reached(),
                         self.publications.is_closing(&id),
                     ),
                     "the publisher queued {outcome:?} outside its window"
@@ -386,11 +395,7 @@ impl Shared {
         }
         let pages_sent = self.pages_sent(&id);
         if let Some(subscription) = self.subscriptions.get_mut(&id) {
-            subscription.end = Some(in_window(
-                outcome,
-                pages_sent,
-                subscription.position.reached(),
-            ));
+            subscription.end = Some(in_window(outcome, pages_sent, subscription.reached()));
         }
     }
 
@@ -779,26 +784,20 @@ async fn publish<const HEADER_BYTES: usize>(
     let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
     loop {
         let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
-        // Another subscription's page that finished while a terminal outcome
-        // waited for the queue.
-        let mut finished = None;
         for (id, frame, terminal) in ended {
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
             if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
-            if finished
-                .as_ref()
-                .is_some_and(|(working, _, _)| *working == id)
-            {
-                finished = None;
-            }
             let terminal = terminal.send(&send, frame);
             tokio::pin!(terminal);
             // A full queue must not keep a cancelled session's task alive,
-            // hide a page job's panic, or leave another subscription's
-            // finished job holding its execution slots.
+            // hide a page job's panic, or stop another subscription's page.
+            // That page settles at once: its job gives its execution slots
+            // back, and a page that holds the queue slot this terminal waits
+            // for is queued instead of kept. A page whose subscription ends
+            // later in this batch fails its commit and is dropped.
             loop {
                 tokio::select! {
                     biased;
@@ -808,7 +807,9 @@ async fn publish<const HEADER_BYTES: usize>(
                         if work.is_some() =>
                     {
                         let (id, seen, _) = work.take().expect("the page in progress just finished");
-                        finished = Some((id, seen, progress));
+                        if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                            return;
+                        }
                     }
                     sent = &mut terminal => {
                         if !sent {
@@ -817,11 +818,6 @@ async fn publish<const HEADER_BYTES: usize>(
                         break;
                     }
                 }
-            }
-        }
-        if let Some((id, seen, progress)) = finished {
-            if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
-                return;
             }
         }
         if work.is_none() {
@@ -1057,15 +1053,23 @@ async fn run_job<const HEADER_BYTES: usize>(
                     return Output::Stall(Stall::Local, "probe_ancestor");
                 }
             }
-            Ok(AcquirePathReply::NoLocatorIntersection) => {
-                // Tell a target this node never retained from one that left
-                // the selected chain.
+            Ok(
+                reply @ (AcquirePathReply::NoLocatorIntersection | AcquirePathReply::HistoryPruned),
+            ) => {
+                // The probe found the target off the selected chain, or
+                // behind pruned history that will not return. Tell a target
+                // this node never retained from either.
+                let found = if matches!(reply, AcquirePathReply::HistoryPruned) {
+                    HeadersOutcomeCode::HistoryPruned
+                } else {
+                    HeadersOutcomeCode::TargetNotSelected
+                };
                 let locators = job.locators.clone();
                 let path = acquire(port, owner, selected, job.lease_target, locators).await;
                 return match path {
                     Ok(AcquirePathReply::Acquired(path)) => {
                         release(port, job.id, *path).await;
-                        Output::End(HeadersOutcomeCode::TargetNotSelected)
+                        Output::End(found)
                     }
                     Ok(AcquirePathReply::TargetNotRetained) => {
                         Output::End(HeadersOutcomeCode::TargetNotRetained)
@@ -1073,12 +1077,11 @@ async fn run_job<const HEADER_BYTES: usize>(
                     Ok(AcquirePathReply::CapacityBusy(signal)) => {
                         Output::Stall(Stall::Capacity(signal), "capacity")
                     }
-                    // The probe already showed the target is off the
-                    // selected chain.
-                    Ok(_) => Output::End(HeadersOutcomeCode::TargetNotSelected),
+                    // The probe already settled the outcome.
+                    Ok(_) => Output::End(found),
                     Err(error) => {
                         log_port_failure(job.id, "target_retained", &error);
-                        Output::End(HeadersOutcomeCode::TargetNotSelected)
+                        Output::End(found)
                     }
                 };
             }

@@ -417,14 +417,26 @@ fn the_frame_header_check_runs_before_decode() {
         Err(SubscriptionFault::Unknown.into())
     );
 
-    // Two headers of credit: the reader queues two one-header pages, refuses
-    // a third, and takes another once the reactor takes one.
+    // Two headers of credit: the reader queues two one-header pages and
+    // refuses a third. A taken page keeps its charge until its claim spends
+    // the credit, so the reader never sees that credit free in between, and
+    // only the Grant after acceptance makes room.
     sub.open(&status(chain[2]), &[chain[0]], AuxSchema::None, 2)
         .expect("the first Open is recorded");
     assert_eq!(reader.check(frame.message_type, len), Ok(()));
     assert_eq!(reader.check(frame.message_type, len), Ok(()));
     assert!(reader.check(frame.message_type, len).is_err());
     assert_eq!(sub.admit(&frame), Ok(()));
+    assert!(
+        reader.check(frame.message_type, len).is_err(),
+        "a taken page holds its charge until its claim"
+    );
+    let (page, _) = decode_page(&frame);
+    let admitted = sub.receive_page(&page, len).expect("the first page");
+    assert!(reader.check(frame.message_type, len).is_err());
+    sub.accept_through(admitted.id, &admitted.cursor, 2)
+        .expect("a received cursor")
+        .expect("one header of room is a prefix of a two-header window");
     assert_eq!(reader.check(frame.message_type, len), Ok(()));
 }
 

@@ -1425,8 +1425,8 @@ async fn pushed_pages_keep_response_slots_until_transport_completion() {
 }
 
 /// A reader that admits pages ahead of the handler queues at most the
-/// unspent credit, in objects and in bytes. Taking a page releases its
-/// charge, and a terminal outcome takes none.
+/// unspent credit, in objects and in bytes. Claiming a page turns its charge
+/// into spent credit, and a terminal outcome takes none.
 #[test]
 fn queued_pages_never_exceed_the_unspent_credit() {
     let mut tool = Subscriptions::<u8, u32>::new(limits(1), RULES);
@@ -1434,28 +1434,30 @@ fn queued_pages_never_exceed_the_unspent_credit() {
         .expect("the first Open is recorded");
     let reader = SharedSubscriptions::new(tool);
     let admitting = reader.admitting();
+    let full = Err(FrameRejection::AboveReservation {
+        bytes: u64::from(LIMIT.bytes),
+    });
     assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
     assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
     assert_eq!(
         admitting.check(message_type::PAGE, 1),
-        Err(FrameRejection::AboveReservation {
-            bytes: u64::from(LIMIT.bytes)
-        }),
+        full,
         "the queued bytes already fill the unspent credit"
     );
     assert_eq!(admitting.check(message_type::ENDED, 1), Ok(()), "no charge");
-    let mut tool = reader.lock();
-    tool.take_admitted(message_type::PAGE, 20);
-    tool.claim_page(&1, 1, 20, 1).expect("within credit");
-    drop(tool);
+    reader
+        .lock()
+        .claim_admitted_page(&1, 1, 20, 1)
+        .expect("within credit");
     assert_eq!(
         admitting.check(message_type::PAGE, 1),
-        Err(FrameRejection::AboveReservation {
-            bytes: u64::from(LIMIT.bytes)
-        }),
-        "the claimed page spent the credit its charge held"
+        full,
+        "the claim spent the credit its charge held"
     );
-    reader.lock().take_admitted(message_type::PAGE, 20);
+    let mut tool = reader.lock();
+    tool.accept(&1, &1).expect("the page was claimed");
+    tool.grant(&1, credit(1, 20)).expect("within the window");
+    drop(tool);
     assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
 
     // One object per page: three pages of one byte fill three objects.

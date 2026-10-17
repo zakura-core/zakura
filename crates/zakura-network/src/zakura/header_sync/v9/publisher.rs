@@ -771,21 +771,49 @@ async fn publish<const HEADER_BYTES: usize>(
     let mut work: Option<(u64, Option<EngineSnapshot>, Work<'_>)> = None;
     loop {
         let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
+        // Another subscription's page that finished while a terminal outcome
+        // waited for the queue.
+        let mut finished = None;
         for (id, frame, terminal) in ended {
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
             if work.as_ref().is_some_and(|(working, _, _)| *working == id) {
                 work = None;
             }
-            // A full queue must not keep a cancelled session's task alive or
-            // hide a page job's panic.
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-                sent = terminal.send(&send, frame) => if !sent {
-                    return;
-                },
+            if finished
+                .as_ref()
+                .is_some_and(|(working, _, _)| *working == id)
+            {
+                finished = None;
+            }
+            let terminal = terminal.send(&send, frame);
+            tokio::pin!(terminal);
+            // A full queue must not keep a cancelled session's task alive,
+            // hide a page job's panic, or leave another subscription's
+            // finished job holding its execution slots.
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
+                    progress = async { work.as_mut().expect("guarded by is_some").2.as_mut().await },
+                        if work.is_some() =>
+                    {
+                        let (id, seen, _) = work.take().expect("the page in progress just finished");
+                        finished = Some((id, seen, progress));
+                    }
+                    sent = &mut terminal => {
+                        if !sent {
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((id, seen, progress)) = finished {
+            if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                return;
             }
         }
         if work.is_none() {
@@ -819,19 +847,8 @@ async fn publish<const HEADER_BYTES: usize>(
                 if work.is_some() =>
             {
                 let (id, seen, _) = work.take().expect("the page in progress just finished");
-                match progress {
-                    // A page whose subscription closed meanwhile spends
-                    // nothing and drops its slot.
-                    Progress::Page(page, slot) => {
-                        if lock(&task.shared).commit(id, &page) {
-                            slot.send(page.frame);
-                        }
-                    }
-                    Progress::Other(output) => {
-                        let moved = selected.borrow().as_ref() != seen.as_ref();
-                        lock(&task.shared).finish(id, output, moved);
-                    }
-                    Progress::Closed => return,
+                if !settle(&task.shared, &selected, id, seen.as_ref(), progress) {
+                    return;
                 }
             }
             () = task.wake.notified() => {}
@@ -844,6 +861,33 @@ async fn publish<const HEADER_BYTES: usize>(
             }
             () = any_released(capacity) => lock(&task.shared).clear_stalls(false),
         }
+    }
+}
+
+/// Apply a finished page or job to subscription `id`, whose job read the
+/// selected chain `seen`. Returns false when the stream closed.
+fn settle(
+    shared: &Mutex<Shared>,
+    selected: &watch::Receiver<Option<EngineSnapshot>>,
+    id: u64,
+    seen: Option<&EngineSnapshot>,
+    progress: Progress<'_>,
+) -> bool {
+    match progress {
+        // A page whose subscription closed meanwhile spends nothing and drops
+        // its slot.
+        Progress::Page(page, slot) => {
+            if lock(shared).commit(id, &page) {
+                slot.send(page.frame);
+            }
+            true
+        }
+        Progress::Other(output) => {
+            let moved = selected.borrow().as_ref() != seen;
+            lock(shared).finish(id, output, moved);
+            true
+        }
+        Progress::Closed => false,
     }
 }
 
@@ -964,7 +1008,7 @@ async fn still_selected(
         }
         let contains = match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
             Ok(AcquirePathReply::Acquired(path)) => {
-                release(port, *path).await;
+                release(port, id, *path).await;
                 true
             }
             Ok(_) => false,
@@ -998,7 +1042,7 @@ async fn run_job<const HEADER_BYTES: usize>(
         match acquire(port, owner, selected, tip.hash, vec![job.initial_target]).await {
             Ok(AcquirePathReply::Acquired(path)) => {
                 let selected = path.common_ancestor.hash == job.initial_target;
-                release(port, *path).await;
+                release(port, job.id, *path).await;
                 if !selected {
                     return Output::Stall(Stall::Local, "probe_ancestor");
                 }
@@ -1010,7 +1054,7 @@ async fn run_job<const HEADER_BYTES: usize>(
                 let path = acquire(port, owner, selected, job.lease_target, locators).await;
                 return match path {
                     Ok(AcquirePathReply::Acquired(path)) => {
-                        release(port, *path).await;
+                        release(port, job.id, *path).await;
                         Output::End(HeadersOutcomeCode::TargetNotSelected)
                     }
                     Ok(AcquirePathReply::TargetNotRetained) => {
@@ -1072,14 +1116,14 @@ async fn run_job<const HEADER_BYTES: usize>(
         };
         if job.parent.is_none() && path.common_ancestor == path.target {
             let target = path.target;
-            release(port, path).await;
+            release(port, job.id, path).await;
             return Output::ReachedAtOpen(target);
         }
         if job
             .parent
             .is_some_and(|parent| parent != path.common_ancestor)
         {
-            release(port, path).await;
+            release(port, job.id, path).await;
             return Output::Stall(Stall::Local, "lease_parent");
         }
         let read = ReadPath {
@@ -1091,9 +1135,9 @@ async fn run_job<const HEADER_BYTES: usize>(
             Ok(ReadPathReply::Page(page)) => return page_output::<HEADER_BYTES>(job, *page),
             // The lease expired or state evicted it. Acquire it again from
             // the last header sent.
-            Ok(ReadPathReply::Unavailable) => release(port, path).await,
+            Ok(ReadPathReply::Unavailable) => release(port, job.id, path).await,
             Err(error) => {
-                release(port, path).await;
+                release(port, job.id, path).await;
                 return port_failure(job.id, "read", &error);
             }
         }
@@ -1138,7 +1182,7 @@ async fn check_following(port: &dyn Port, owner: LeaseOwner, job: &Job) -> Outpu
     .await;
     match reply {
         Ok(AcquirePathReply::Acquired(path)) => {
-            release(port, *path).await;
+            release(port, job.id, *path).await;
             Output::Extends(job.lease_target)
         }
         Ok(AcquirePathReply::NoLocatorIntersection) => {
@@ -1174,10 +1218,11 @@ async fn acquire(
     .await
 }
 
-/// Release `path`. A failed release leaves the lease to its idle deadline.
-async fn release(port: &dyn Port, path: RetainedHeaderPath) {
+/// Release `path`, which subscription `id` leased. A failed release leaves
+/// the lease to its idle deadline.
+async fn release(port: &dyn Port, id: u64, path: RetainedHeaderPath) {
     if let Err(error) = port.release_header_path(path).await {
-        tracing::debug!(?error, "failed to release a header sync v9 serving lease");
+        log_port_failure(id, "release", &error);
     }
 }
 

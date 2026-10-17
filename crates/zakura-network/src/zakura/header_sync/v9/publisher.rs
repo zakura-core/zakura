@@ -496,9 +496,9 @@ impl Shared {
 
     /// Record a finished job's result for its subscription.
     ///
-    /// A local stall waits for the next selected-chain change, so it is not
-    /// recorded when the chain `moved` since the job read it: that change
-    /// already passed.
+    /// A stall waits for the next selected-chain change, among other wakes,
+    /// so it is not recorded when the chain `moved` since the job read it:
+    /// that change already passed, and the next pass retries at once.
     fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
@@ -520,7 +520,7 @@ impl Shared {
             Output::Stall(stall, reason) => {
                 metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
-                if moved && matches!(stall, Stall::Local) {
+                if moved {
                     return;
                 }
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {

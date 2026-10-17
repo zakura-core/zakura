@@ -1479,10 +1479,11 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.check_quiet().await;
 }
 
-/// A local stall from a job that read an older selected chain is not
-/// recorded, because the change that would clear it already passed.
+/// A stall from a job that read an older selected chain is not recorded,
+/// local or for capacity, because the change that would clear it already
+/// passed.
 #[tokio::test(start_paused = true)]
-async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
+async fn a_stall_from_an_older_selected_chain_retries_at_once() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1504,6 +1505,20 @@ async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
     port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // The same race with a capacity refusal whose signal never fires.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.grow(1);
+    harness.drain().await;
+    port.grow(1);
+    harness.drain().await;
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(
+            ServingCapacitySignal::default(),
+        )));
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    assert_eq!(pages(&harness.deliver_all().await), [(h(5), h(7), false)]);
     harness.check_quiet().await;
 }
 

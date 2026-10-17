@@ -945,65 +945,24 @@ fn indexed_database_upgrades_in_place_before_index_updates_stop() {
     assert!(state.db.skips_transparent_indexes());
 }
 
-/// Skipping a release can reuse a cache only through explicitly reusable major upgrades.
+/// Startup refuses to guess the format of a database that holds blocks but has no version file.
 #[test]
-fn cache_reuse_requires_every_intermediate_major_upgrade() {
-    use crate::service::finalized_state::disk_db::DiskDb;
-
+fn database_with_blocks_and_no_version_file_is_refused() {
     let _init_guard = zakura_test::init();
     let chain = test_chain();
     let dir = TempDir::new().expect("temp dir");
     let config = config_at(dir.path(), NodeConfig::PrunedFullVerification);
-    let current = state_database_format_version_in_code();
-    let previous = semver::Version::new(28, 2, 0);
-    let current_path = config.db_path(STATE_DATABASE_KIND, current.major, &chain.network);
-    let previous_path = config.db_path(STATE_DATABASE_KIND, previous.major, &chain.network);
-    {
+    let version_path = {
         let mut state = open(&config, &chain.network);
         commit_checkpoint(&mut state, &chain.blocks[..3]);
-        crate::write_database_format_version_to_disk(
-            &config,
-            STATE_DATABASE_KIND,
-            current.major,
-            &previous,
-            &chain.network,
-        )
-        .expect("fixture version is written");
-    }
-    std::fs::create_dir_all(
-        previous_path
-            .parent()
-            .expect("version directory has a parent"),
-    )
-    .expect("older version parent exists");
-    std::fs::rename(&current_path, &previous_path)
-        .expect("fixture moves to the older version directory");
-    assert_eq!(
-        DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[30],
-            &current,
-            &config,
-            STATE_DATABASE_KIND,
-            &chain.network
-        ),
-        None,
-        "an unsupported intermediate major upgrade prevents reuse"
-    );
-    assert!(previous_path.exists());
-    assert!(!current_path.exists());
-    assert_eq!(
-        DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[29, 30],
-            &current,
-            &config,
-            STATE_DATABASE_KIND,
-            &chain.network
-        ),
-        Some(previous),
-        "all intermediate upgrades explicitly permit cache reuse"
-    );
-    assert!(!previous_path.exists());
-    assert!(current_path.exists());
+        state.db.path().join("version")
+    };
+    std::fs::remove_file(&version_path).expect("the fixture removes the version file");
+
+    assert!(matches!(
+        FinalizedState::new(&config, &chain.network),
+        Err(StateInitError::DatabaseFormatVersion { path, .. }) if path == version_path
+    ));
 }
 
 /// Offline rollback reverses the canonical UTXO set of a database without transparent indexes,

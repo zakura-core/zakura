@@ -9,15 +9,16 @@
 //! [`crate::constants::state_database_format_version_in_code()`] must be incremented
 //! each time the database format (column, serialization, etc) changes.
 
-use std::{path::Path, sync::Arc};
+use std::{cmp::Ordering, path::Path, sync::Arc};
 
 use crossbeam_channel::bounded;
 use semver::Version;
 
-use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
+use zakura_chain::{common::atomic_write, diagnostic::task::WaitForPanics, parameters::Network};
 
 use crate::{
-    config::database_format_version_on_disk,
+    config::{adopt_previous_major_database, database_format_version_at_path, find_database},
+    constants::{DATABASE_FORMAT_VERSION_FILE_NAME, MIN_UPGRADABLE_DATABASE_FORMAT_VERSION},
     service::finalized_state::{
         disk_db::DiskDb,
         disk_format::{
@@ -25,10 +26,8 @@ use crate::{
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
     },
-    write_database_format_version_to_disk, BoxError, Config, StateInitError,
+    BoxError, Config, StateInitError,
 };
-
-use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
@@ -36,6 +35,7 @@ pub mod chain;
 pub(crate) mod commitment_roots_db;
 #[allow(dead_code)]
 pub mod highest_completed_checkpoint;
+mod manifest;
 pub mod metrics;
 
 /// Minimum number of transactions in a block before the per-transaction batch
@@ -143,36 +143,47 @@ impl ZakuraDb {
             return Err(StateInitError::ReadOnlyEphemeralConflict);
         }
 
-        // A read-only secondary instance must never modify the primary's cache directory, so it
-        // skips the post-major-upgrade DB reuse (which can create directories and rename the
-        // on-disk database) and reads the on-disk format version directly. The cache directory is
-        // checked for readability first, so a missing or unreadable directory returns a typed
-        // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
-        let version_path =
-            config.version_file_path(&db_kind, format_version_in_code.major, network);
-        let read_disk_version = || {
-            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
-                .map_err(|source| StateInitError::DatabaseFormatVersion {
-                    path: version_path.clone(),
-                    source,
-                })
-        };
-        let disk_version = if read_only {
+        // Every open finds the database the same way. A read-only secondary must never modify the
+        // primary's cache directory, so it opens a previous-major database where it is, and the
+        // next read-write open moves it. The cache directory is checked for readability first, so
+        // a missing or unreadable directory returns a typed `ReadOnlyCacheDirUnreadable` error.
+        let db_kind = db_kind.as_ref();
+        let major_version = format_version_in_code.major;
+        let path = if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
 
-            read_disk_version()?
+            find_database(config, db_kind, major_version, network).ok_or_else(|| {
+                StateInitError::ReadOnlyDatabaseNotFound {
+                    path: config.db_path(db_kind, major_version, network),
+                }
+            })?
         } else {
-            match DiskDb::try_reusing_previous_db_after_major_upgrade(
-                &restorable_db_versions(),
-                format_version_in_code,
-                config,
-                &db_kind,
-                network,
-            ) {
-                Some(version) => Some(version),
-                None => read_disk_version()?,
-            }
+            adopt_previous_major_database(config, db_kind, major_version, network)?;
+
+            // An ephemeral config returns a new temporary path on each call, so this is the only
+            // call.
+            config.db_path(db_kind, major_version, network)
         };
+
+        let disk_version = database_format_version_at_path(&path).map_err(|source| {
+            StateInitError::DatabaseFormatVersion {
+                path: path.join(DATABASE_FORMAT_VERSION_FILE_NAME),
+                source,
+            }
+        })?;
+
+        if let Some(disk_version) = &disk_version {
+            if disk_version.cmp_precedence(&MIN_UPGRADABLE_DATABASE_FORMAT_VERSION)
+                == Ordering::Less
+            {
+                return Err(StateInitError::DatabaseTooOld {
+                    path,
+                    disk_version: disk_version.clone(),
+                    min_upgradable_version: MIN_UPGRADABLE_DATABASE_FORMAT_VERSION,
+                });
+            }
+        }
+
         let disk_version_before_open = disk_version.clone();
 
         // Log any format changes before opening the database, in case opening fails.
@@ -183,8 +194,7 @@ impl ZakuraDb {
         //
         // The read-write path is unaffected: creating a new database is the correct behavior there.
         if read_only && format_change.is_newly_created() {
-            let db_path = config.db_path(&db_kind, format_version_in_code.major, network);
-            return Err(StateInitError::ReadOnlyDatabaseNotFound { path: db_path });
+            return Err(StateInitError::ReadOnlyDatabaseNotFound { path });
         }
 
         // Format upgrades try to write to the database, so we always skip them
@@ -195,11 +205,10 @@ impl ZakuraDb {
 
         // Open the low-level database and do initial checks.
         //
-        // After the database directory is created, a newly created database temporarily
-        // changes to the default database version. Then we set the correct version in the
-        // upgrade thread. We need to do the version change in this order, because the version
-        // file can only be changed while we hold the RocksDB database lock.
-        let disk_db = DiskDb::new(
+        // A newly created database has no version file until the startup format change marks it.
+        // The version file can only be changed while we hold the RocksDB database lock.
+        let disk_db = DiskDb::new_at_path(
+            path,
             config,
             db_kind,
             format_version_in_code,
@@ -208,12 +217,41 @@ impl ZakuraDb {
             read_only,
         )?;
 
+        // Dropping the database runs the shutdown format check. Skip it until startup accepts the
+        // database, so a refused database is never decoded.
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
-            debug_skip_format_upgrades,
+            debug_skip_format_upgrades: true,
             format_change_handle: None,
             db: disk_db,
         };
+
+        // Without a version file, the database is only safe to mark as new while it holds no
+        // blocks.
+        if format_change.is_newly_created() && db.finalized_tip_height().is_some() {
+            return Err(StateInitError::DatabaseFormatVersion {
+                path: db.path().join(DATABASE_FORMAT_VERSION_FILE_NAME),
+                source: "the version file is missing, but the database holds blocks".into(),
+            });
+        }
+
+        // A newer format change can make the database unreadable for older code. Refuse it before
+        // any reader decodes it, in every open mode.
+        let min_reader_version =
+            db.min_reader_version()
+                .map_err(|source| StateInitError::DatabaseFormatVersion {
+                    path: db.path().to_owned(),
+                    source,
+                })?;
+        if let Some(min_reader_version) = min_reader_version {
+            if format_version_in_code.cmp_precedence(&min_reader_version) == Ordering::Less {
+                return Err(StateInitError::DatabaseTooNew {
+                    path: db.path().to_owned(),
+                    min_reader_version,
+                    running_version: format_version_in_code.clone(),
+                });
+            }
+        }
 
         // Reject stale address-query state before any upgrade can modify it. This also
         // applies to read-only and offline utility opens, which skip format upgrades.
@@ -245,6 +283,7 @@ impl ZakuraDb {
             });
         }
 
+        db.debug_skip_format_upgrades = debug_skip_format_upgrades;
         db.run_startup_format_change(format_change)?;
 
         Ok(db)
@@ -271,12 +310,12 @@ impl ZakuraDb {
                 source: Box::new(source),
             })?;
 
-        let format_change_handle = DbFormatChange::spawn_periodic_format_checks(
-            self.clone(),
-            initial_finalized_tip_height,
-        );
-
-        self.format_change_handle = Some(format_change_handle);
+        if self.config.debug_validity_check_interval.is_some() {
+            self.format_change_handle = Some(DbFormatChange::spawn_periodic_format_checks(
+                self.clone(),
+                initial_finalized_tip_height,
+            ));
+        }
 
         Ok(())
     }
@@ -308,21 +347,9 @@ impl ZakuraDb {
         self.db.format_version_in_code()
     }
 
-    /// Returns the fixed major version for this database.
-    pub fn major_version(&self) -> u64 {
-        self.db.major_version()
-    }
-
-    /// Returns the format version of this database on disk.
-    ///
-    /// See `database_format_version_on_disk()` for details.
+    /// Returns the format version in this database's version file.
     pub fn format_version_on_disk(&self) -> Result<Option<Version>, BoxError> {
-        database_format_version_on_disk(
-            self.config(),
-            self.db_kind(),
-            self.major_version(),
-            &self.network(),
-        )
+        database_format_version_at_path(self.path())
     }
 
     /// Updates the format of this database on disk to the suppled version.
@@ -332,13 +359,14 @@ impl ZakuraDb {
         &self,
         new_version: &Version,
     ) -> Result<(), BoxError> {
-        write_database_format_version_to_disk(
-            self.config(),
-            self.db_kind(),
-            self.major_version(),
-            new_version,
-            &self.network(),
-        )
+        // Write the version file atomically so the cache is not corrupted if Zakura shuts down or
+        // crashes.
+        atomic_write(
+            self.path().join(DATABASE_FORMAT_VERSION_FILE_NAME),
+            new_version.to_string().as_bytes(),
+        )??;
+
+        Ok(())
     }
 
     /// Returns the configured network for this database.
@@ -420,13 +448,9 @@ impl ZakuraDb {
             // which would then make unrelated PRs fail when Zebra starts up.
 
             // If the upgrade has completed, or we've done a downgrade, check the state is valid.
-            let disk_version = database_format_version_on_disk(
-                &self.config,
-                self.db_kind(),
-                self.major_version(),
-                &self.network(),
-            )
-            .expect("unexpected invalid or unreadable database version file");
+            let disk_version = self
+                .format_version_on_disk()
+                .expect("unexpected invalid or unreadable database version file");
 
             if let Some(disk_version) = disk_version {
                 // We need to keep the cancel handle until the format check has finished,
@@ -672,5 +696,231 @@ mod tests {
         let (_cache, config) = persistent_config();
         seed_db(&config, &regtest, old, true);
         assert!(open(&config, &regtest, false).is_ok());
+    }
+
+    fn current_path(config: &Config, network: &Network) -> std::path::PathBuf {
+        config.db_path(
+            STATE_DATABASE_KIND,
+            state_database_format_version_in_code().major,
+            network,
+        )
+    }
+
+    /// Moves the current-major database to the `major_version` directory, as an older release
+    /// left it.
+    fn move_to_major(config: &Config, network: &Network, major_version: u64) -> std::path::PathBuf {
+        let path = config.db_path(STATE_DATABASE_KIND, major_version, network);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("database paths have a major version parent"),
+        )
+        .expect("the older major directory is created");
+        std::fs::rename(current_path(config, network), &path)
+            .expect("the fixture moves to the older major directory");
+        path
+    }
+
+    /// The minimum reader version that this code records: its format without build metadata.
+    fn running_min_reader_version() -> Version {
+        Version {
+            build: semver::BuildMetadata::EMPTY,
+            ..state_database_format_version_in_code()
+        }
+    }
+
+    /// Records `version` as the minimum reader version, as a newer release would.
+    fn set_min_reader_version(config: &Config, network: &Network, version: &Version) {
+        let db = ZakuraDb::new(
+            config,
+            STATE_DATABASE_KIND,
+            &state_database_format_version_in_code(),
+            network,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .expect("fixture database opens");
+        let mut batch = DiskWriteBatch::new();
+        batch.update_min_reader_version(&db, version);
+        db.write_batch(batch)
+            .expect("minimum reader version write succeeds");
+    }
+
+    /// Read-only tools find a previous-major database where it is, without moving it. The next
+    /// read-write open moves and upgrades it.
+    #[test]
+    fn read_only_open_finds_previous_major_database_without_moving_it() {
+        let network = Network::Mainnet;
+        let previous = Version::new(29, 1, 0);
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &network, previous.clone(), false);
+        let previous_path = move_to_major(&config, &network, previous.major);
+
+        let db = open(&config, &network, true).expect("read-only open finds the database");
+        assert_eq!(db.path(), previous_path);
+        assert_eq!(
+            db.format_version_on_disk()
+                .expect("the version file is readable"),
+            Some(previous.clone())
+        );
+        drop(db);
+        assert_eq!(
+            crate::state_database_format_version_on_disk(&config, &network)
+                .expect("the version file is readable"),
+            Some(previous),
+            "code that reads the version without opening RocksDB finds the same database"
+        );
+        assert!(previous_path.exists());
+        assert!(!current_path(&config, &network).exists());
+
+        let db = open(&config, &network, false).expect("read-write open moves the database");
+        assert_eq!(db.path(), current_path(&config, &network));
+        assert!(!previous_path.exists());
+        assert_eq!(
+            db.format_version_on_disk()
+                .expect("the version file is readable"),
+            Some(state_database_format_version_in_code())
+        );
+        assert_eq!(
+            db.min_reader_version().expect("the manifest is readable"),
+            Some(running_min_reader_version())
+        );
+    }
+
+    /// Startup moves the newest database at or above the upgrade floor, even when a release
+    /// skipped a major directory, and ignores databases below the floor.
+    #[test]
+    fn read_write_open_searches_older_majors_down_to_the_upgrade_floor() {
+        let network = Network::Mainnet;
+
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &network, Version::new(28, 1, 5), false);
+        let floor_path = move_to_major(&config, &network, 28);
+        let db = open(&config, &network, false).expect("startup moves the floor-major database");
+        assert_eq!(db.path(), current_path(&config, &network));
+        assert!(!floor_path.exists());
+
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &network, Version::new(28, 0, 0), false);
+        let below_floor_path = move_to_major(&config, &network, 27);
+        let db = open(&config, &network, false).expect("startup creates a new database");
+        assert_eq!(db.path(), current_path(&config, &network));
+        assert!(below_floor_path.exists());
+    }
+
+    /// A running older node keeps its database: startup refuses to move a database that another
+    /// RocksDB instance has open, instead of starting with an empty database.
+    ///
+    /// Only Linux has file locks that conflict with RocksDB's lock inside the same process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_write_open_refuses_to_move_a_database_in_use() {
+        let network = Network::Mainnet;
+        let (_cache, config) = persistent_config();
+        seed_db(&config, &network, Version::new(29, 1, 0), false);
+        let previous_path = move_to_major(&config, &network, 29);
+
+        let column_families = rocksdb::DB::list_cf(&rocksdb::Options::default(), &previous_path)
+            .expect("the fixture is a database");
+        let older_node = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            &previous_path,
+            column_families,
+        )
+        .expect("the older node opens its database");
+
+        assert!(matches!(
+            open(&config, &network, false),
+            Err(StateInitError::PreviousDatabaseInUse { .. })
+        ));
+        assert!(previous_path.exists());
+        assert!(!current_path(&config, &network).exists());
+
+        drop(older_node);
+        let db = open(&config, &network, false).expect("the move succeeds after the node stops");
+        assert_eq!(db.path(), current_path(&config, &network));
+    }
+
+    /// Startup refuses a database older than the upgrade floor in every open mode.
+    #[test]
+    fn databases_below_the_upgrade_floor_are_refused() {
+        let network = Network::Mainnet;
+
+        for read_only in [false, true] {
+            let (_cache, config) = persistent_config();
+            seed_db(&config, &network, Version::new(27, 3, 0), false);
+
+            assert!(
+                matches!(
+                    open(&config, &network, read_only),
+                    Err(StateInitError::DatabaseTooOld { .. })
+                ),
+                "read_only = {read_only} startup must refuse a database below the floor"
+            );
+        }
+    }
+
+    /// The minimum reader version decides whether older code may open a newer database. Allowed
+    /// code leaves the newer version on disk, so the newer release never repeats an upgrade.
+    #[test]
+    fn min_reader_version_decides_whether_older_code_opens_a_newer_database() {
+        let network = Network::Mainnet;
+        let running = state_database_format_version_in_code();
+        let newer = Version::new(running.major, running.minor + 5, 0);
+
+        let (_cache, config) = persistent_config();
+        drop(open(&config, &network, false).expect("a new database is created"));
+        crate::write_state_database_format_version_to_disk(&config, &newer, &network)
+            .expect("the newer version is written");
+
+        let db =
+            open(&config, &network, false).expect("the minimum reader version allows this code");
+        assert_eq!(
+            db.format_version_on_disk()
+                .expect("the version file is readable"),
+            Some(newer.clone())
+        );
+        drop(db);
+
+        set_min_reader_version(&config, &network, &newer);
+        for read_only in [false, true] {
+            assert!(
+                matches!(
+                    open(&config, &network, read_only),
+                    Err(StateInitError::DatabaseTooNew { .. })
+                ),
+                "read_only = {read_only} startup must refuse a database that needs newer code"
+            );
+        }
+    }
+
+    /// A database that older code created or upgraded has no minimum reader version. Read-write
+    /// startup records one, so later format changes can raise it.
+    #[test]
+    fn startup_records_a_missing_min_reader_version() {
+        let network = Network::Mainnet;
+
+        // The first database is current, and the second one needs an upgrade.
+        for disk_version in [running_min_reader_version(), Version::new(29, 1, 0)] {
+            let (_cache, config) = persistent_config();
+            seed_db(&config, &network, disk_version.clone(), false);
+
+            let db = open(&config, &network, true).expect("read-only open succeeds");
+            assert_eq!(
+                db.min_reader_version().expect("the manifest is readable"),
+                None,
+                "read-only opens never write"
+            );
+            drop(db);
+
+            let db = open(&config, &network, false).expect("read-write open succeeds");
+            assert_eq!(
+                db.min_reader_version().expect("the manifest is readable"),
+                Some(running_min_reader_version()),
+                "disk version {disk_version}"
+            );
+        }
     }
 }

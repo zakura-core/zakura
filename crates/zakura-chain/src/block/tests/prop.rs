@@ -1,6 +1,6 @@
 //! Randomised property tests for Zcash blocks.
 
-use std::{env, io::ErrorKind, sync::Arc};
+use std::{env, sync::Arc};
 
 use proptest::{prelude::*, test_runner::Config};
 
@@ -143,17 +143,15 @@ proptest! {
                 .expect("vec serialization is infallible");
             prop_assert_eq![bytes, bytes2, "bytes must be equal if structs are equal"];
         } else {
-            let serialization_err = bytes.zcash_deserialize_into::<Block>()
+            let serialization_err = Block::zcash_deserialize_bounded(&mut bytes.as_slice())
                 .expect_err("blocks larger than the maximum size should fail");
-            match serialization_err {
-                SerializationError::Io(io_err) => {
-                    prop_assert_eq![io_err.kind(), ErrorKind::UnexpectedEof];
-                }
-                _ => {
-                    prop_assert!(false,
-                                 "blocks larger than the maximum size should fail with an io::Error");
-                }
-            }
+            prop_assert!(
+                matches!(
+                    serialization_err,
+                    SerializationError::Parse("block is larger than MAX_BLOCK_BYTES")
+                ),
+                "blocks larger than the maximum size should fail before parsing"
+            );
         }
     }
 

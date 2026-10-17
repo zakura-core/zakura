@@ -23,6 +23,17 @@ use crate::{
 /// transaction in the chain is approximately 1.5 kB smaller.)
 pub const MAX_BLOCK_BYTES: u64 = 2_000_000;
 
+/// Rejects an encoding longer than [`MAX_BLOCK_BYTES`] before any of it is parsed.
+pub(crate) fn check_max_block_bytes(
+    encoded_len: usize,
+    error: &'static str,
+) -> Result<(), SerializationError> {
+    if u64::try_from(encoded_len).unwrap_or(u64::MAX) > MAX_BLOCK_BYTES {
+        return Err(SerializationError::Parse(error));
+    }
+    Ok(())
+}
+
 /// Checks if a block header version is valid.
 ///
 /// Zebra could encounter a [`Header`] with an invalid version when serializing a block header constructed
@@ -150,21 +161,36 @@ impl ZcashSerialize for Block {
     }
 }
 
+impl Block {
+    /// Decode a block from untrusted bytes, such as a peer message or an RPC request.
+    ///
+    /// # Consensus
+    ///
+    /// > The size of a block MUST be less than or equal to 2000000 bytes.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#blockheader>
+    ///
+    /// The block parser does not enforce this rule. This method does, by rejecting `bytes`
+    /// longer than [`MAX_BLOCK_BYTES`] before parsing anything, so `bytes` must hold the
+    /// block's encoding and nothing after it. Like
+    /// [`ZcashDeserialize::zcash_deserialize_from_slice`], it leaves `bytes` pointing to
+    /// any unread bytes.
+    pub fn zcash_deserialize_bounded(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
+        check_max_block_bytes(bytes.len(), "block is larger than MAX_BLOCK_BYTES")?;
+        Self::zcash_deserialize_from_slice(bytes)
+    }
+}
+
 impl ZcashDeserialize for Block {
+    /// Decode a block without checking the block size limit.
+    ///
+    /// Use [`Block::zcash_deserialize_bounded`] for untrusted input.
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
-        // # Consensus
-        //
-        // > The size of a block MUST be less than or equal to 2000000 bytes.
-        //
-        // https://zips.z.cash/protocol/protocol.pdf#blockheader
-        //
-        // If the limit is reached, we'll get an UnexpectedEof error
-        let limited_reader = &mut reader.with_limit(MAX_BLOCK_BYTES);
         Ok(Block {
-            header: limited_reader.read_value()?,
-            transactions: limited_reader.read_value()?,
+            header: reader.read_value()?,
+            transactions: reader.read_value()?,
         })
     }
 }

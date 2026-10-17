@@ -233,6 +233,61 @@ fn reject_message_extra_data_round_trip() {
     assert_eq!(v, v_parsed);
 }
 
+/// Block and transaction messages over `MAX_BLOCK_BYTES` fit in a protocol message,
+/// but are rejected before their bodies are parsed.
+#[test]
+fn oversized_block_and_tx_messages_are_rejected() {
+    use tokio_util::codec::{FramedRead, FramedWrite};
+
+    let _init_guard = zakura_test::init();
+
+    let max = usize::try_from(zakura_chain::block::MAX_BLOCK_BYTES).unwrap();
+    let body = vec![0; max + 1];
+    assert!(body.len() <= MAX_PROTOCOL_MESSAGE_LEN);
+
+    let codec = Codec::builder()
+        .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+        .finish();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        assert!(matches!(
+            codec.read_block(&mut body.as_slice()),
+            Err(Error::Parse("block is larger than MAX_BLOCK_BYTES"))
+        ));
+        assert!(matches!(
+            codec.read_tx(&mut body.as_slice()),
+            Err(Error::Parse("transaction is larger than MAX_BLOCK_BYTES"))
+        ));
+    });
+
+    // A real block one transaction over the limit is rejected end to end.
+    let block = zakura_chain::block::tests::generate::oversized_multi_transaction_block();
+    let msg_bytes = zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut bytes = Vec::new();
+        FramedWrite::new(
+            &mut bytes,
+            Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish(),
+        )
+        .send(Message::Block(block.into()))
+        .await
+        .expect("an oversized block still fits in a protocol message");
+        bytes
+    });
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut fr = FramedRead::new(
+            Cursor::new(&msg_bytes),
+            Codec::builder()
+                .with_max_body_len(MAX_PROTOCOL_MESSAGE_LEN)
+                .finish(),
+        );
+        assert!(matches!(
+            fr.next().await.expect("a message is available"),
+            Err(Error::Parse("block is larger than MAX_BLOCK_BYTES"))
+        ));
+    });
+}
+
 #[test]
 fn max_msg_size_round_trip() {
     use zakura_chain::serialization::ZcashDeserializeInto;

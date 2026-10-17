@@ -132,15 +132,15 @@ impl BlockSyncMessage {
                 let block_start = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
                 let mut block_bytes = &bytes[block_start..];
-                let block = Arc::new(block::Block::zcash_deserialize_from_slice(
-                    &mut block_bytes,
-                )?);
+                // The block fills the rest of the payload, because trailing bytes are
+                // rejected below, so its size is known before parsing it.
+                validate_encoded_block_len(block_bytes.len())?;
+                let block = Arc::new(block::Block::zcash_deserialize_bounded(&mut block_bytes)?);
                 let block_end = bytes.len() - block_bytes.len();
                 reader.set_position(
                     u64::try_from(block_end)
                         .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?,
                 );
-                validate_encoded_block_len(block_end.saturating_sub(block_start))?;
                 Self::Block(block)
             }
             MSG_BS_BLOCKS_DONE => {

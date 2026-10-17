@@ -40,7 +40,7 @@ use zakura_chain::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
         Network,
     },
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::DateTime32,
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
@@ -1059,7 +1059,7 @@ where
 {
     check_synced_to_tip(net, latest_chain_tip, sync_status)?;
 
-    let block: Block = match block_proposal_bytes.zcash_deserialize_into() {
+    let block = match Block::zcash_deserialize_bounded(&mut block_proposal_bytes.as_slice()) {
         Ok(block) => block,
         Err(parse_error) => {
             tracing::info!(

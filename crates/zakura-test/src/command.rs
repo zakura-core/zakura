@@ -798,7 +798,7 @@ impl<T> TestChild<T> {
             }
         }
 
-        let timeout = humantime::format_duration(timeout).to_string();
+        let timeout = format!("{timeout:?}");
         let mut error = eyre!("command did not exit within the {timeout} command timeout");
 
         if let Err(kill_err) = self.kill(true) {
@@ -1045,7 +1045,7 @@ impl<T> TestChild<T> {
 
         let timeout = self
             .timeout
-            .map(|timeout| humantime::format_duration(timeout).to_string())
+            .map(|timeout| format!("{timeout:?}"))
             .unwrap_or_else(|| "unlimited".to_string());
 
         let report = eyre!(

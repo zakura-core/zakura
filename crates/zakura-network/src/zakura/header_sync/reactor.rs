@@ -1282,6 +1282,10 @@ impl HeaderSyncReactor {
 
     /// Stage idle unspent offers only after an eligibility input changes.
     fn schedule_cached_statuses(&mut self) {
+        // Only a pass refused by the budget below waits for its refill. Every
+        // other return either has nothing to do or waits for its own wakeup, so
+        // a stale refill deadline would spin the loop.
+        self.cached_pass_deferred = false;
         let opportunity = self.scheduling_opportunity();
         if self.last_scheduling_opportunity == Some(opportunity) {
             return;
@@ -1305,7 +1309,6 @@ impl HeaderSyncReactor {
             self.cached_pass_deferred = true;
             return;
         }
-        self.cached_pass_deferred = false;
         #[cfg(test)]
         {
             self.cached_offer_visits += self.peer_state.len();

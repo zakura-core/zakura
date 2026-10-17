@@ -1476,3 +1476,27 @@ async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
         "the refilled pass stages the released target"
     );
 }
+
+/// A pass the budget deferred, followed by a return for another reason, drops
+/// its refill deadline. Otherwise the deadline would sit in the past and the
+/// reactor loop would wake at once on every iteration.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_pass_drops_its_refill_deadline_when_discovery_pauses() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.cached_pass_budget = CachedPassBudget {
+        passes: 0,
+        refilled_at: Instant::now(),
+    };
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
+    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_pass_deferred);
+
+    // A resource stall pauses discovery before the refill.
+    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    time::advance(CACHED_PASS_REFILL * 2).await;
+    reactor.schedule_cached_statuses();
+    assert!(!reactor.cached_pass_deferred);
+    assert!(reactor.next_maintenance_deadline() > Instant::now());
+}

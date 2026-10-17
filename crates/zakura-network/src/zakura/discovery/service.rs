@@ -46,6 +46,10 @@ const _: () = assert!(SEND_INTERVAL.as_secs() <= DEFAULT_LIVE_SERVICE_SUMMARY_TT
 
 /// Maximum time discovery waits for first-party exchange responses before releasing the session.
 const DISCOVERY_INITIAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long closing a discovery-only connection waits for this node's
+/// admitted answers. Each answer is small and needs only free output, so a
+/// peer that reads its stream gets them well within this.
+const DISCOVERY_ANSWER_WRITE_DEADLINE: Duration = Duration::from_secs(2);
 
 const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_DISCOVERY,
@@ -547,6 +551,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
         WriterFence::new(connection_cancel.clone(), close_cause.clone()),
@@ -651,6 +656,15 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                     .is_current_session(&peer_id, conn_id, session_id)
                     .await;
             if closes_discovery_only_connection {
+                // Closing drops every unwritten answer, and the peer's
+                // exchange would end without it.
+                let cancel = source.session.cancel_token();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    () = answers.wait() => {}
+                    () = tokio::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE) => {}
+                }
                 handle.mark_short_lived_exchange(&peer_node_id).await;
                 // A retired session is never charged, so a timed-out
                 // exchange that closes its connection settles here.
@@ -1178,7 +1192,16 @@ mod tests {
                 DiscoveryMessage::Peers { .. } | DiscoveryMessage::Services(_) => {}
             }
         }
+        answer_discovery_exchange(peer_send, peer_secret, handshake).await
+    }
 
+    /// Send the peer's `Hello`, `Peers` and `Services`, which complete the
+    /// local side's exchange.
+    async fn answer_discovery_exchange(
+        peer_send: &FramedSend,
+        peer_secret: &NodeSecretKey,
+        handshake: &ZakuraHandshakeConfig,
+    ) -> Result<(), crate::BoxError> {
         peer_send
             .send(discovery_frame(DiscoveryMessage::Hello {
                 record: signed_discovery_record(peer_secret, handshake)?,
@@ -1562,6 +1585,114 @@ mod tests {
             .await
             .is_empty());
 
+        Ok(())
+    }
+
+    /// A discovery-only peer that asked for services and completed the local
+    /// exchange, while the local stream holds `capacity` unread frames.
+    /// Returns the connection's token and the peer's halves of the stream.
+    async fn discovery_only_peer_awaiting_services(
+        seed: u8,
+        capacity: usize,
+    ) -> Result<(CancellationToken, FramedSend, FramedRecv), crate::BoxError> {
+        let (connected_tx, connected_rx) = watch::channel(Vec::new());
+        let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        let handle = ZakuraDiscoveryHandle::new(
+            ZakuraDiscoveryLocalConfig {
+                secret_key: NodeSecretKey::from_bytes(&[seed; 32]),
+                direct_addrs: Vec::new(),
+                services: vec![ZakuraServiceId::discovery()],
+                zakura_protocol_min: handshake.zakura_protocol_min,
+                zakura_protocol_max: handshake.zakura_protocol_max,
+                network_id: handshake.network_id,
+                chain_id: handshake.chain_id,
+                last_authored_sequence: None,
+            },
+            ZakuraDiscoveryConfig::default(),
+            connected_rx,
+        )?;
+        let service = DiscoveryService::new(handle.clone());
+        let peer_secret = NodeSecretKey::from_bytes(&[seed + 1; 32]);
+        let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
+        connected_tx.send_replace(vec![peer_id.clone()]);
+
+        let connection_cancel = CancellationToken::new();
+        let (peer_send, service_recv) = framed_channel(16);
+        let (service_send, peer_recv) = framed_channel(capacity);
+        let local_output = service_send.clone();
+        let streams = HashMap::from([(ZAKURA_STREAM_DISCOVERY, (service_recv, service_send))]);
+        service.add_peer(Peer::new(
+            peer_id,
+            None,
+            ZAKURA_CAP_DISCOVERY,
+            streams,
+            connection_cancel.clone(),
+        ));
+        wait_for_discovery_inbound_peers(&handle, 1).await;
+        // The local Hello, GetPeers and GetServices fill the stream, so the
+        // answer below cannot be written until the peer reads.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while local_output.capacity() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the local exchange fills the stream");
+        peer_send
+            .send(discovery_frame(DiscoveryMessage::GetServices(
+                GetServices {
+                    wanted_services: Vec::new(),
+                },
+            ))?)
+            .await?;
+        answer_discovery_exchange(&peer_send, &peer_secret, &handshake).await?;
+        Ok((connection_cancel, peer_send, peer_recv))
+    }
+
+    /// A completed exchange closes its discovery-only connection only after
+    /// the peer's admitted `Services` answer is written.
+    #[tokio::test]
+    async fn discovery_only_close_waits_for_an_unwritten_answer() -> Result<(), crate::BoxError> {
+        let (connection_cancel, _peer_send, mut peer_recv) =
+            discovery_only_peer_awaiting_services(44, 3).await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), connection_cancel.cancelled())
+                .await
+                .is_err(),
+            "the connection stays open while the Services answer is unwritten"
+        );
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), peer_recv.recv())
+                .await?
+                .expect("the local side writes its answer before closing");
+            if matches!(
+                decode_frame::<DiscoveryMessage>(&frame)?,
+                DiscoveryMessage::Services(_)
+            ) {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), connection_cancel.cancelled())
+            .await
+            .expect("the written answer lets the connection close");
+        Ok(())
+    }
+
+    /// A peer that never reads cannot hold a discovery-only connection open
+    /// past the answer deadline.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_only_close_waits_at_most_the_answer_deadline() -> Result<(), crate::BoxError>
+    {
+        let (connection_cancel, _peer_send, _peer_recv) =
+            discovery_only_peer_awaiting_services(46, 3).await?;
+        let waiting = tokio::time::Instant::now();
+        tokio::time::timeout(
+            DISCOVERY_ANSWER_WRITE_DEADLINE + Duration::from_secs(1),
+            connection_cancel.cancelled(),
+        )
+        .await
+        .expect("the deadline closes the connection");
+        assert!(waiting.elapsed() >= DISCOVERY_ANSWER_WRITE_DEADLINE - Duration::from_millis(100));
         Ok(())
     }
 

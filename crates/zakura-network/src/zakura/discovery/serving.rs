@@ -21,8 +21,8 @@ use super::{
 };
 use crate::zakura::{
     regulation::{
-        Produce, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd, ServeLimits,
-        SinkProgress, WorkLease,
+        Produce, Responded, ResponseCap, ResponseSink, ResponsesWritten, Serve, ServeCapacity,
+        ServeEnd, ServeLimits, SinkProgress, WorkLease,
     },
     BlockSyncHandle, CloseCause, FramedSend, HeaderSyncHandle, MessageRole, MessageRule,
     ZakuraPeerId, DEFAULT_ZAKURA_MAX_CONNECTIONS,
@@ -125,6 +125,29 @@ impl ServingCapacity {
                 connection,
                 close_cause,
             ),
+        }
+    }
+}
+
+impl Serving {
+    /// Waits until this session has written every answer it admitted.
+    pub(super) fn answers_written(&self) -> AnswersWritten {
+        AnswersWritten([
+            self.get_peers.responses_written(),
+            self.get_services.responses_written(),
+        ])
+    }
+}
+
+/// Waits until one session has written every admitted `Peers` and `Services`.
+#[derive(Clone, Debug)]
+pub(super) struct AnswersWritten([ResponsesWritten; 2]);
+
+impl AnswersWritten {
+    /// Resolves once both rows have written every admitted answer.
+    pub(super) async fn wait(&self) {
+        for row in &self.0 {
+            row.wait().await;
         }
     }
 }

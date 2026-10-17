@@ -155,6 +155,76 @@ fn merkle_crh_words(layer: u8, left: pallas::Base, right: pallas::Base) -> [u16;
     words
 }
 
+/// Small subtrees use scalar hashing to avoid batch allocation overhead.
+const MIN_BATCH_LEAVES: usize = 8;
+/// Keep multiple subtrees available to Rayon while reaching the library's
+/// affine batch evaluator with 32 pairs at the first level.
+const PARALLEL_BATCH_LEAVES: usize = 64;
+
+/// Reduces a perfect Orchard subtree, batching independent hashes per level.
+fn batched_subtree_root(leaves: &[Node], append_leaves: usize) -> Node {
+    let workers = rayon::current_num_threads();
+    // Small segments cannot fill the pool with 64-leaf tasks. Preserve scalar
+    // parallelism until there is work for at least three quarters of the pool.
+    // This decision is made separately on either side of a tracked boundary.
+    let parallel_minimum = PARALLEL_BATCH_LEAVES.saturating_mul(workers - workers / 4);
+    let batch_limit = if workers == 1 {
+        usize::MAX
+    } else if append_leaves >= parallel_minimum {
+        PARALLEL_BATCH_LEAVES
+    } else {
+        1
+    };
+    subtree_root_with_batch_limit(leaves, batch_limit)
+}
+
+fn subtree_root_with_batch_limit(leaves: &[Node], batch_limit: usize) -> Node {
+    use sinsemilla::weighted::BatchHashWorkspace;
+
+    debug_assert!(leaves.len().is_power_of_two());
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+
+    if leaves.len() < MIN_BATCH_LEAVES || leaves.len() > batch_limit {
+        let (left, right) = leaves.split_at(leaves.len() / 2);
+        let (left, right) = rayon::join(
+            || subtree_root_with_batch_limit(left, batch_limit),
+            || subtree_root_with_batch_limit(right, batch_limit),
+        );
+        let level = u8::try_from((leaves.len() / 2).ilog2())
+            .expect("a subtree level is bounded by the Orchard tree depth");
+        return Node::combine(level.into(), &left, &right);
+    }
+
+    // Reuse the scalar path's word packing and weighted domain. Nodes remain
+    // field elements, and each workspace/buffer retains its allocations.
+    let mut nodes = leaves.to_vec();
+    let mut parents = Vec::with_capacity(nodes.len() / 2);
+    let mut messages = Vec::with_capacity(nodes.len() / 2);
+    let mut workspace = BatchHashWorkspace::default();
+    let mut level = 0u8;
+    while nodes.len() > 1 {
+        let layer = MERKLE_DEPTH - 1 - level;
+        messages.clear();
+        messages.extend(
+            nodes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| merkle_crh_words(layer, pair[0].0, pair[1].0)),
+        );
+        let hashes =
+            ORCHARD_MERKLE_CRH_DOMAIN.hash_words_batch_with_workspace(&messages, &mut workspace);
+        parents.clear();
+        parents.extend(hashes.iter().copied().map(Node));
+        std::mem::swap(&mut nodes, &mut parents);
+        level += 1;
+    }
+
+    nodes[0]
+}
+
 lazy_static! {
     /// List of "empty" Orchard note commitment nodes, one for each layer.
     ///
@@ -520,7 +590,7 @@ impl NoteCommitmentTree {
         &mut self,
         note_commitments: &[NoteCommitmentUpdate],
     ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
-        use crate::parallel::batch_frontier::append_batch_with_subtree;
+        use crate::parallel::batch_frontier::append_batch_with_subtree_using;
 
         if note_commitments.is_empty() {
             return Ok(None);
@@ -532,8 +602,9 @@ impl NoteCommitmentTree {
             .map(|commitment_x| (*commitment_x).into())
             .collect();
 
-        let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
-            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+        let (frontier, completed) =
+            append_batch_with_subtree_using(self.inner.clone(), nodes, batched_subtree_root)
+                .map_err(|_| NoteCommitmentTreeError::FullTree)?;
 
         self.inner = frontier;
         *self
@@ -1071,6 +1142,113 @@ mod tests {
         }
 
         Ok(completed_subtree)
+    }
+
+    lazy_static! {
+        static ref BATCH_TEST_POOLS: Vec<rayon::ThreadPool> = [1, 2, 8]
+            .into_iter()
+            .map(|workers| rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test worker counts are nonzero"))
+            .collect();
+    }
+
+    /// Constructs a valid frontier shape at large positions without hashing
+    /// billions of leaves. Both implementations start with identical parts.
+    fn tree_at_size(size: u64) -> NoteCommitmentTree {
+        if size == 0 {
+            return NoteCommitmentTree::default();
+        }
+        let position = size - 1;
+        let ommers = (0..position.count_ones())
+            .map(|index| node(u64::from(index) + 2))
+            .collect();
+        let frontier = Frontier::from_parts(Position::from(position), node(1), ommers)
+            .expect("one ommer per set bit makes a valid frontier");
+        NoteCommitmentTree::from_frontier(frontier)
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_at_perfect_subtree_boundaries() {
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let prefixes = [
+            0,
+            1,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            subtree_size - 65,
+            subtree_size - 64,
+            subtree_size - 1,
+            subtree_size,
+            subtree_size + 1,
+        ];
+        let counts = [0, 1, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 257, 385, 436];
+        for pool in BATCH_TEST_POOLS.iter() {
+            pool.install(|| {
+                for prefix in prefixes {
+                    for count in counts {
+                        let mut sequential = tree_at_size(prefix);
+                        let mut batched = sequential.clone();
+                        let commitments: Vec<_> = (0..count)
+                            .map(|value| note_commitment(1_000 + value))
+                            .collect();
+                        let _ = sequential.root();
+                        let _ = batched.root();
+                        let expected = sequential_append_batch(&mut sequential, &commitments)
+                            .expect("small batches cross at most one tracked subtree");
+                        assert_eq!(batched.append_batch(&commitments), Ok(expected));
+                        batched.assert_frontier_eq(&sequential);
+                        assert_eq!(batched.root(), sequential.root());
+                    }
+                }
+            });
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(300))]
+        #[test]
+        fn batched_subtrees_match_sequential_with_full_width_fields(
+            size in proptest::sample::select(vec![
+                0u64, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 10_000,
+                (1u64 << TRACKED_SUBTREE_HEIGHT) - 1,
+                1u64 << TRACKED_SUBTREE_HEIGHT,
+                (1u64 << MERKLE_DEPTH) - 1_024,
+                (1u64 << MERKLE_DEPTH) - 1,
+                1u64 << MERKLE_DEPTH,
+            ]),
+            limbs in proptest::collection::vec(
+                proptest::prelude::any::<[u64; 4]>(), 0..600,
+            ),
+        ) {
+            let commitments: Vec<_> = limbs.into_iter()
+                .map(pallas::Base::from_raw).collect();
+            let original = tree_at_size(size);
+            let _ = original.root();
+            for pool in BATCH_TEST_POOLS.iter() {
+                let mut batched = original.clone();
+                let actual = pool.install(|| batched.append_batch(&commitments));
+                let count = u64::try_from(commitments.len())
+                    .expect("bounded test batch length fits in u64");
+                if size + count > (1u64 << MERKLE_DEPTH) {
+                    proptest::prop_assert_eq!(actual, Err(NoteCommitmentTreeError::FullTree));
+                    batched.assert_frontier_eq(&original);
+                    proptest::prop_assert_eq!(batched.root(), original.root());
+                } else {
+                    let mut sequential = original.clone();
+                    let expected = sequential_append_batch(&mut sequential, &commitments)
+                        .expect("bounded test batches fit and cross at most one subtree");
+                    proptest::prop_assert_eq!(actual, Ok(expected));
+                    batched.assert_frontier_eq(&sequential);
+                    proptest::prop_assert_eq!(batched.root(), sequential.root());
+                }
+            }
+        }
     }
 
     #[test]

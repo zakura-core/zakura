@@ -137,6 +137,9 @@ FROM deps AS release
 ARG SHORT_SHA
 ARG FEATURES
 ENV FEATURES=${FEATURES},portable
+# Compress debug sections with zlib, roughly 275 MB -> 110 MB on disk.
+# Not zstd: std's backtrace symbolizer only reads zlib, and file:line would be lost.
+ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
 
 # Set the working directory for the build.
 ARG HOME

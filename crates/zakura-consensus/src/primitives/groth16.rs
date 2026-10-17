@@ -4,7 +4,7 @@ use std::fmt;
 
 use bellman::{
     gadgets::multipack,
-    groth16::{batch, PreparedVerifyingKey, VerifyingKey},
+    groth16::{batch, PreparedVerifyingKey},
     VerificationError,
 };
 use bls12_381::Bls12;
@@ -64,10 +64,6 @@ impl Item {
         self.0.verify_single(pvk)
     }
 }
-
-/// The type of a raw verifying key.
-/// This is the key used to verify batches.
-pub type BatchVerifyingKey = VerifyingKey<Bls12>;
 
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.

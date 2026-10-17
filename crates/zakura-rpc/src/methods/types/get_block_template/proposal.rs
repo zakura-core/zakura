@@ -122,17 +122,6 @@ impl BlockTemplateTimeSource {
         }
     }
 
-    /// Returns true if this time source uses `max_time` in any way, including clamping.
-    pub fn uses_max_time(&self) -> bool {
-        use BlockTemplateTimeSource::*;
-
-        match self {
-            CurTime | MinTime => false,
-            MaxTime | Clamped(_) | ClampedNow => true,
-            Raw(_) | RawNow => false,
-        }
-    }
-
     /// Returns an iterator of time sources that are valid according to the consensus rules.
     pub fn valid_sources() -> impl IntoIterator<Item = BlockTemplateTimeSource> {
         use BlockTemplateTimeSource::*;

@@ -681,14 +681,6 @@ impl GetBlockTemplateResponse {
             Self::ProposalMode(_) => None,
         }
     }
-
-    /// Returns the inner proposal, if the response is in proposal mode.
-    pub fn try_into_proposal(self) -> Option<BlockProposalResponse> {
-        match self {
-            Self::TemplateMode(_) => None,
-            Self::ProposalMode(proposal) => Some(proposal),
-        }
-    }
 }
 
 /// Miner parameters.

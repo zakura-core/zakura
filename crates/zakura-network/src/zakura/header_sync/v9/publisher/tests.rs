@@ -314,6 +314,7 @@ impl FakePort {
 impl Port for FakePort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(std::future::pending())
     }

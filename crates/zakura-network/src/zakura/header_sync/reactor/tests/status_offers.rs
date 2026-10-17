@@ -895,6 +895,8 @@ fn a_new_tip_during_application_starts_under_the_applied_authority() {
     let current = expect_locator_query(&mut actions, &peer, next_tip);
     assert_ne!(current, stale);
     assert_eq!(current.header_generation, applied.header_generation);
+}
+
 #[test]
 fn locator_evictions_bound_retained_operations() {
     let (mut reactor, _actions, snapshot) = offers_reactor();
@@ -905,15 +907,11 @@ fn locator_evictions_bound_retained_operations() {
             let previous = ZakuraPeerId::new(vec![byte - 1; 32]).unwrap();
             let mut downgrade = status_for(&snapshot, block::Hash([byte - 1; 32]));
             downgrade.suffix_cumulative_work = zakura_chain::work::difficulty::U256::zero();
-            reactor.handle_wire_message(previous, 0, HeaderSyncMessage::Status(downgrade));
+            reactor.handle_status(previous, 0, downgrade);
         }
         let (peer, outbound) = connect(&mut reactor, byte);
         outbounds.push(outbound);
-        reactor.handle_wire_message(
-            peer,
-            0,
-            HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([byte; 32]))),
-        );
+        reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([byte; 32])));
     }
     assert!(reactor.pending_locator_queries.len() <= MAX_STAGED_TARGETS_V1);
     assert!(reactor.pending_port_operations.len() <= MAX_STAGED_TARGETS_V1);
@@ -988,10 +986,10 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     for byte in 1..=16 {
         let (peer, outbound) = connect(&mut reactor, byte);
         outbounds.push(outbound);
-        reactor.handle_wire_message(
+        reactor.handle_status(
             peer.clone(),
             0,
-            HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([byte; 32]))),
+            status_for(&snapshot, block::Hash([byte; 32])),
         );
         assert!(reactor
             .pending_port_operations
@@ -1004,10 +1002,10 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     assert_eq!(reactor.locator_capacity.available_permits(), 0);
     let (peer, outbound) = connect(&mut reactor, 17);
     outbounds.push(outbound);
-    reactor.handle_wire_message(
+    reactor.handle_status(
         peer.clone(),
         0,
-        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([17; 32]))),
+        status_for(&snapshot, block::Hash([17; 32])),
     );
     assert!(!reactor.peer_state[&peer].status_spent);
     time::advance(reactor.startup.request_timeout).await;
@@ -1052,11 +1050,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
     let (mut reactor, _actions, snapshot) = offers_reactor();
     reactor.startup.port_dispatch = PortDispatch::Direct;
     let (peer, _outbound) = connect(&mut reactor, 1);
-    reactor.handle_wire_message(
-        peer.clone(),
-        0,
-        HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([1; 32]))),
-    );
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, block::Hash([1; 32])));
     let mut outbounds = Vec::new();
     for session_id in 1..=32 {
         if session_id % 2 == 0 {
@@ -1073,10 +1067,10 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
         outbounds.push(outbound);
         // A late disconnect for the previous session must not retire the replacement.
         reactor.handle_peer_disconnected(&peer, session_id - 1, "stale disconnect");
-        reactor.handle_wire_message(
+        reactor.handle_status(
             peer.clone(),
             session_id,
-            HeaderSyncMessage::Status(status_for(&snapshot, block::Hash([2; 32]))),
+            status_for(&snapshot, block::Hash([2; 32])),
         );
         assert_eq!(reactor.pending_locator_queries.len(), 1);
         assert_eq!(

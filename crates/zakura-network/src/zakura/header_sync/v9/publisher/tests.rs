@@ -1347,6 +1347,56 @@ async fn a_terminal_wait_keeps_the_other_page_moving() {
     assert_eq!(capacity.node_execution_held(), 0);
 }
 
+/// A page that holds the queue's only slot when it finishes during another
+/// subscription's terminal wait is queued at once, so neither frame waits on
+/// the other.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_wait_queues_a_page_that_holds_the_queue_slot() {
+    let port = FakePort::new(0);
+    let chain = port.grow(3);
+    let capacity = ServeCapacity::new("header_sync_v9", &SUBSCRIBE_HEADERS, serve_limits())
+        .expect("the test budgets are valid");
+    let (publisher, mut recv, _cancel, _task) = session(&port, &capacity, &peer(7), 1, 1);
+    // Two subscriptions reach their target at Open; the margin admits the
+    // second.
+    let mut first = Subscriber::new();
+    let open = first.open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the Open applies");
+    let mut second = Subscriber::new();
+    second.next_id = 2;
+    let open = second.open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None);
+    publisher.apply(&open).await.expect("the margin admits it");
+    tokio::time::sleep(QUIET).await;
+    // The first subscription's page waits in its read. The chain grows, so
+    // after the read the page reserves the only queue slot and then waits in
+    // its recheck lease.
+    port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    port.grow(1);
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.gate.add_permits(1);
+    tokio::time::sleep(QUIET).await;
+    // The second subscription's terminal outcome waits for that slot, and
+    // then the recheck confirms the page.
+    let close = second.close().expect("the subscription is live");
+    publisher.apply(&close).await.expect("the Close applies");
+    tokio::time::sleep(QUIET).await;
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    let page = tokio::time::timeout(QUIET, recv.recv())
+        .await
+        .expect("the page is queued")
+        .expect("the session is open");
+    assert!(matches!(first.receive(&page), Received::Page { .. }));
+    let outcome = tokio::time::timeout(QUIET, recv.recv())
+        .await
+        .expect("the outcome follows")
+        .expect("the session is open");
+    assert_eq!(
+        second.receive(&outcome),
+        Received::Ended(HeadersOutcomeCode::SubscriptionClosed)
+    );
+}
+
 /// A following page that leaves the selected chain while in progress is read
 /// again toward the new tip, and the lease that rechecks it waits for and
 /// holds an execution slot, as the page's read did.

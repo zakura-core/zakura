@@ -1050,6 +1050,13 @@ impl HeaderSyncReactor {
         let eligible = target.is_discovery_eligible(local)
             && self.negotiated_response_limits(&target.status).1 != 0;
         let pruned = self.pruned_pause_holds(&peer, local.frontiers.header_best);
+        if pruned || !eligible || covered {
+            // No round can follow, so an idle subscription kept for the next
+            // round only holds the session's connection hostage.
+            if self.peer_work_queue.active(&peer).is_none() {
+                self.close_subscription(&peer);
+            }
+        }
         if pruned {
             // The same attempt would end `HistoryPruned` again, so another
             // peer's status takes the target.
@@ -4546,6 +4553,12 @@ impl HeaderSyncReactor {
 
     /// Close `active`'s subscription, unless a `Grant` can continue it toward
     /// its target after a committed prefix.
+    ///
+    /// A subscription kept for the next round still holds its `Open`'s
+    /// started exchange, so retiring the session while it is open closes the
+    /// connection, as during a round. The next round resumes it, or the peer's
+    /// next status that cannot closes it; see
+    /// [`Self::consider_advertised_header_target`].
     fn cancel_active_request(&mut self, active: &ActiveHeaderRequest) {
         let Some(state) = self.peer_state.get(&active.peer) else {
             return;

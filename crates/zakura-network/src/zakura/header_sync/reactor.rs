@@ -181,6 +181,7 @@ fn build_header_sync_reactor(
         serving: v9::serving_capacity(),
         page_limits,
     };
+    let header_bytes = header_sync_header_bytes_for_network(&startup.network);
     let mut reactor = HeaderSyncReactor {
         startup,
         events: events_rx,
@@ -201,6 +202,7 @@ fn build_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        header_bytes,
         page_limits,
         committed_snapshot,
         vct_repair_status,
@@ -314,6 +316,11 @@ struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    /// One header's wire size on this network, fixed for the reactor's life.
+    ///
+    /// Checking a configured testnet for Regtest builds its parameters, and
+    /// every headroom check needs this, so it is computed once.
+    header_bytes: usize,
     /// The serving limits this node advertises in its `Status`.
     page_limits: PageLimits,
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
@@ -1447,7 +1454,7 @@ impl HeaderSyncReactor {
             AuxSchema::None
         };
         let byte_limited_count = v9::page_capacity(
-            header_sync_header_bytes_for_network(&self.startup.network),
+            self.header_bytes,
             tree_aux_schema,
             usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                 .unwrap_or(usize::MAX),
@@ -3182,7 +3189,7 @@ impl HeaderSyncReactor {
                 .and_then(|distance| distance.checked_add(1))
                 .unwrap_or(0);
             let message_capacity = v9::page_capacity(
-                header_sync_header_bytes_for_network(&self.startup.network),
+                self.header_bytes,
                 AuxSchema::V1,
                 usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                     .unwrap_or(usize::MAX),

@@ -98,6 +98,8 @@ struct Store {
     continuations: HashMap<SourceId, (block::Hash, Frontier)>,
     /// Leases that walked the ancestry instead of reusing a continuation.
     walks: usize,
+    /// Parent steps those walks took.
+    walk_steps: usize,
     /// The next release fails and leaves its lease held.
     leak_release: bool,
     /// The selected tip grows by one header after each of this many leases.
@@ -140,6 +142,7 @@ impl Store {
                 self.walks += 1;
                 let mut current = target;
                 while !request.locator_hashes.contains(&current.hash) {
+                    self.walk_steps += 1;
                     current = match self.tree.parent(current) {
                         Some(parent) => parent,
                         None if current.height == block::Height(0) => {
@@ -1620,7 +1623,7 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
 
     // The chain grows with no credit left: one check, and nothing sent.
     let walks = port.store().walks;
-    port.grow(1);
+    port.grow(3);
     assert!(harness.deliver_all().await.is_empty());
     assert_eq!(port.store().walks - walks, 1);
     harness.drain().await;
@@ -1629,6 +1632,12 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
         1,
         "a checked tip is not checked again"
     );
+    // The next check stops at the tip it already checked instead of walking
+    // back to the last header.
+    let steps = port.store().walk_steps;
+    port.grow(1);
+    assert!(harness.deliver_all().await.is_empty());
+    assert_eq!(port.store().walk_steps - steps, 1);
 
     // A higher branch that forks below the last header supersedes it.
     let side = port.store().tree.extend(main[0], 4);

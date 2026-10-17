@@ -1479,10 +1479,11 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.check_quiet().await;
 }
 
-/// A local stall from a job that read an older selected chain is not
-/// recorded, because the change that would clear it already passed.
+/// A stall from a job that read an older selected chain is not recorded,
+/// local or for capacity, because the change that would clear it already
+/// passed.
 #[tokio::test(start_paused = true)]
-async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
+async fn a_stall_from_an_older_selected_chain_retries_at_once() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1504,6 +1505,20 @@ async fn a_local_stall_from_an_older_selected_chain_retries_at_once() {
     port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // The same race with a capacity refusal whose signal never fires.
+    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.grow(1);
+    harness.drain().await;
+    port.grow(1);
+    harness.drain().await;
+    port.store()
+        .acquire_script
+        .push_back(Ok(AcquirePathReply::CapacityBusy(
+            ServingCapacitySignal::default(),
+        )));
+    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    assert_eq!(pages(&harness.deliver_all().await), [(h(5), h(7), false)]);
     harness.check_quiet().await;
 }
 
@@ -1568,6 +1583,48 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
+/// A check without a page needs no output, so it runs and ends the
+/// subscription even while an unread page holds the peer's one response slot.
+#[tokio::test(start_paused = true)]
+async fn a_check_without_a_page_needs_no_output() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let serve = ServeLimits {
+        peer_output_responses: 1,
+        ..serve_limits()
+    };
+    let mut harness = Harness::new(port.clone(), serve);
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    // The page for heights 4 and 5 goes out, and nobody reads it.
+    let main = port.grow(2);
+    tokio::time::sleep(QUIET).await;
+    // A higher branch that forks below the last header needs a check.
+    let side = port.store().tree.extend(main[0], 3);
+    port.select(side[2]);
+    tokio::time::sleep(QUIET).await;
+    let page = harness.recv.try_recv().expect("the page waits unread");
+    assert!(matches!(
+        harness.subscriber.receive(&page),
+        Received::Page { .. }
+    ));
+    let outcome = harness
+        .recv
+        .try_recv()
+        .expect("the outcome is already queued behind the page");
+    assert_eq!(
+        harness.subscriber.receive(&outcome),
+        Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)
     );
     harness.check_quiet().await;
 }

@@ -58,8 +58,8 @@ use crate::zakura::{
         wire::{AuxSchema, HeaderEntry, MAX_HS_RANGE},
     },
     regulation::{
-        Applied, Publications, Push, PushPermit, PushSend, SubscriptionFault, SubscriptionLimits,
-        TerminalPermit, Totals,
+        Applied, ExecutionSlots, Publications, Push, PushPermit, PushSend, SubscriptionFault,
+        SubscriptionLimits, TerminalPermit, Totals,
     },
     wire_codec::encode_frame,
     Frame, FramedSend,
@@ -496,9 +496,9 @@ impl Shared {
 
     /// Record a finished job's result for its subscription.
     ///
-    /// A local stall waits for the next selected-chain change, so it is not
-    /// recorded when the chain `moved` since the job read it: that change
-    /// already passed.
+    /// A stall waits for the next selected-chain change, among other wakes,
+    /// so it is not recorded when the chain `moved` since the job read it:
+    /// that change already passed, and the next pass retries at once.
     fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
@@ -520,7 +520,7 @@ impl Shared {
             Output::Stall(stall, reason) => {
                 metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
-                if moved && matches!(stall, Stall::Local) {
+                if moved {
                     return;
                 }
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
@@ -741,6 +741,14 @@ struct Task {
 /// A page in progress: its permit wait, its job, and its transport slot.
 type Work<'a> = Pin<Box<dyn Future<Output = Progress<'a>> + Send + 'a>>;
 
+/// The budgets a job holds while it runs.
+enum Admission {
+    /// A page's output and execution slots.
+    Page(PushPermit),
+    /// A check's execution slots. It writes nothing.
+    Check(ExecutionSlots),
+}
+
 /// How a page in progress finished.
 enum Progress<'a> {
     Page(Page, PushSend<'a>),
@@ -849,7 +857,8 @@ async fn any_released(signals: Vec<ServingCapacitySignal>) {
 }
 
 /// Start one page: wait for its budgets, run its job holding them, then
-/// reserve its transport slot.
+/// reserve its transport slot. A check without a page writes nothing, so it
+/// waits for execution slots alone.
 ///
 /// The job keeps its permit until the state read finishes, even if the
 /// session ends first. A following page whose selected tip moved meanwhile is
@@ -868,8 +877,13 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let id = job.id;
     let leased_tip = job.following.then_some(job.lease_target);
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
+    let check = job.count == 0;
     Box::pin(async move {
-        let permit = push.acquire(bytes).await;
+        let permit = if check {
+            Admission::Check(push.execution().await)
+        } else {
+            Admission::Page(push.acquire(bytes).await)
+        };
         let running = tokio::spawn(async move {
             let job = AssertUnwindSafe(run_job::<HEADER_BYTES>(&*port, owner, &job));
             match job.catch_unwind().await {
@@ -883,15 +897,16 @@ fn start_page<'a, const HEADER_BYTES: usize>(
                 }
             }
         });
-        let (output, permit): (Output, PushPermit) = match running.await {
+        let (output, permit): (Output, Admission) = match running.await {
             Ok(Some(done)) => done,
             // The publisher task re-raises the job's panic.
             Ok(None) => return Progress::Other(Output::Stall(Stall::Local, "job_panicked")),
             // The runtime is shutting down.
             Err(_) => return Progress::Closed,
         };
-        let Output::Page(page) = output else {
-            return Progress::Other(output);
+        let (page, permit) = match (output, permit) {
+            (Output::Page(page), Admission::Page(permit)) => (page, permit),
+            (output, _) => return Progress::Other(output),
         };
         let Ok(slot) = permit.reserve_send(send).await else {
             return Progress::Closed;

@@ -106,6 +106,10 @@ pub(crate) enum SubscribeError {
     /// The session's fence retired, or its connection closed.
     #[error("the session's writers are fenced")]
     Fenced,
+    /// A sent locator is the `Status` target at another height than the
+    /// `Status` advertised.
+    #[error("a locator is the target at another height than advertised")]
+    TargetHeight,
 }
 
 /// A page or outcome that breaks a subscriber rule. Each case is a protocol
@@ -414,6 +418,14 @@ impl Subscriber {
         if window.objects == 0 {
             return Err(SubscribeError::NoStaging);
         }
+        let target = status.selected_tip_hash;
+        let target_locator = locators
+            .iter()
+            .find(|locator| locator.hash == target)
+            .copied();
+        if target_locator.is_some_and(|locator| locator.height != status.selected_tip_height) {
+            return Err(SubscribeError::TargetHeight);
+        }
         let id = self.next_id;
         let start = Cursor {
             height: start.height,
@@ -425,11 +437,6 @@ impl Subscriber {
         let writer = exchange.writer();
         let update = self.tools.lock().open_fenced(id, window, start, exchange)?;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        let target = status.selected_tip_hash;
-        let target_locator = locators
-            .iter()
-            .find(|locator| locator.hash == target)
-            .copied();
         let live = Live {
             id,
             target,

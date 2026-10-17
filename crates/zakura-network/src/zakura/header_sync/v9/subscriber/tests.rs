@@ -322,8 +322,9 @@ fn open_records_its_reservation_first() {
     assert_ne!(next.subscription_id, open.subscription_id, "a new ID");
 }
 
-/// Local refusals: bad locators, an unadvertised schema, and no staging
-/// budget. None records anything.
+/// Local refusals: bad locators, an unadvertised schema, no staging budget,
+/// and a locator that puts the target at another height than the `Status`.
+/// None records anything.
 #[test]
 fn open_refuses_what_the_publisher_would_fault() {
     let (_tree, chain) = chain(20);
@@ -356,6 +357,16 @@ fn open_refuses_what_the_publisher_would_fault() {
     assert_eq!(
         sub.open(&target, &[chain[1]], AuxSchema::None, 0).err(),
         Some(SubscribeError::NoStaging)
+    );
+    let misplaced = Status {
+        selected_tip_height: block::Height(19),
+        ..status(chain[20])
+    };
+    assert_eq!(
+        sub.open(&misplaced, &[chain[20], chain[1]], AuxSchema::None, 10)
+            .err(),
+        Some(SubscribeError::TargetHeight),
+        "our locator puts the target at 20"
     );
     assert_eq!(sub.live(), None);
     assert_eq!(sub.tools.lock().len(), 0);

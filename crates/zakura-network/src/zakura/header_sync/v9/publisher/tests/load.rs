@@ -160,16 +160,16 @@ async fn header_credit_sets_throughput_at_the_target_round_trip() {
         let mut updates = VecDeque::from([(start + one_way, open)]);
         let mut frames: VecDeque<(tokio::time::Instant, Frame)> = VecDeque::new();
         let mut received = 0;
+        // Five round trips at the credit ceiling; a stall fails at a hundred.
+        let deadline = start + rtt * 100;
         while received < HEADERS {
+            let now = tokio::time::Instant::now();
+            assert!(now < deadline, "the subscription stopped making progress");
             let due = [
                 updates.front().map(|(at, _)| *at),
                 frames.front().map(|(at, _)| *at),
             ];
-            let next = due
-                .into_iter()
-                .flatten()
-                .min()
-                .unwrap_or(start + rtt * 1_000);
+            let next = due.into_iter().flatten().min().unwrap_or(deadline);
             tokio::select! {
                 biased;
                 frame = harness.recv.recv() => {

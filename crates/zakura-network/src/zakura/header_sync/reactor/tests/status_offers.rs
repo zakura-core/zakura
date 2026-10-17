@@ -860,3 +860,39 @@ fn status_floods_start_no_repeated_work() {
 fn maximum_status_floods_start_no_repeated_work() {
     status_flood(255);
 }
+
+/// A status for another tip that arrives while a target applies stays
+/// unspent. If the reactor stages it before it sees the applied snapshot, the
+/// snapshot retires that attempt and stages the tip again under the new header
+/// authority, with no further status from the peer.
+#[test]
+fn a_new_tip_during_application_starts_under_the_applied_authority() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let (peer, _outbound) = connect(&mut reactor, 0x71);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 0);
+    let next_tip = block::Hash([0x43; 32]);
+    reactor.handle_status(peer.clone(), 0, status_for(&snapshot, next_tip));
+    reactor.schedule_cached_statuses();
+    assert!(
+        actions.try_recv().is_err(),
+        "the applying target holds the peer"
+    );
+
+    // The target applies, and the reactor schedules before the new snapshot.
+    reactor.handle_header_target_admission_ready(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetAdmissionResult::Applied,
+    );
+    reactor.schedule_cached_statuses();
+    let stale = expect_locator_query(&mut actions, &peer, next_tip);
+
+    let mut applied = snapshot;
+    applied.state_version = applied.state_version.checked_next().unwrap();
+    applied.header_generation = applied.header_generation.checked_next().unwrap();
+    reactor.observe_latest_committed_snapshot(applied.clone());
+    let current = expect_locator_query(&mut actions, &peer, next_tip);
+    assert_ne!(current, stale);
+    assert_eq!(current.header_generation, applied.header_generation);
+}

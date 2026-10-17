@@ -197,6 +197,38 @@ fn history_pruned_downgrades_the_peer_across_rounds_and_status_refreshes() {
     assert_unpunished(&reactor, &mut actions, &peer);
 }
 
+/// The fallback belongs to the peer, not its session. It holds across a
+/// disconnect and reconnect, so session churn cannot reset the backoff.
+#[test]
+fn the_fallback_outlives_a_reconnect() {
+    let (mut reactor, mut actions, snapshot) = fallback_reactor();
+    let (peer, mut outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x53; 32]);
+    let status = pruned_status(&snapshot, target);
+    refresh(&mut reactor, &peer, &status);
+    let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    assert_eq!(open.tree_aux_schema, AuxSchema::V1);
+    reactor.deliver_outcome(
+        peer.clone(),
+        0,
+        HeadersOutcome {
+            subscription_id: open.subscription_id,
+            initial_target_tip_hash: target,
+            outcome: HeadersOutcomeCode::HistoryPruned,
+        },
+    );
+    reactor.handle_peer_disconnected(&peer, 0, "test");
+
+    let (peer, mut outbound) = connect(&mut reactor, 0x71);
+    refresh(&mut reactor, &peer, &status);
+    let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+    assert_eq!(
+        open.tree_aux_schema,
+        AuxSchema::None,
+        "a new session keeps the peer's fallback"
+    );
+}
+
 /// Schema 1 returns only after the backoff, which doubles after each failed
 /// probe up to its cap, and a failed probe never retries schema 1 at once.
 #[tokio::test(start_paused = true)]
@@ -222,7 +254,7 @@ async fn schema_one_is_probed_again_after_a_bounded_backoff() {
             &open,
             HeadersOutcomeCode::HistoryPruned,
         );
-        let fallback = reactor.peer_state[&peer]
+        let fallback = reactor.pruned_peers[&peer]
             .aux_fallback
             .expect("a failed probe renews the fallback");
         delays.push(fallback.delay);
@@ -368,7 +400,10 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
             accepted: open.acknowledged,
         },
     );
-    assert!(reactor.peer_state[&peer].aux_fallback.is_none());
+    assert!(reactor
+        .pruned_peers
+        .get(&peer)
+        .is_none_or(|pruned| pruned.aux_fallback.is_none()));
     assert!(reactor.peer_work_queue.active(&peer).is_some());
 
     end(
@@ -383,7 +418,10 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
         &open,
         HeadersOutcomeCode::HistoryPruned,
     );
-    assert!(reactor.peer_state[&peer].aux_fallback.is_none());
+    assert!(reactor
+        .pruned_peers
+        .get(&peer)
+        .is_none_or(|pruned| pruned.aux_fallback.is_none()));
     refresh(&mut reactor, &peer, &status);
     let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
     assert_eq!(open.tree_aux_schema, AuxSchema::V1);
@@ -702,7 +740,7 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
     );
     let fallen_back = peers.clone();
     for peer in &fallen_back {
-        assert!(reactor.peer_state[peer].aux_fallback.is_some());
+        assert!(reactor.pruned_peers[peer].aux_fallback.is_some());
     }
 
     // Root repair still asks a fallen-back peer for schema 1.
@@ -774,7 +812,10 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
         chain[15],
     );
     assert_eq!(rounds, [(prober.clone(), AuxSchema::V1, true)]);
-    assert!(reactor.peer_state[&prober].aux_fallback.is_none());
+    assert!(reactor
+        .pruned_peers
+        .get(&prober)
+        .is_none_or(|pruned| pruned.aux_fallback.is_none()));
     for peer in &peers {
         assert_unpunished(&reactor, &mut actions, peer);
     }

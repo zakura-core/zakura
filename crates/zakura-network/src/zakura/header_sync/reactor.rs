@@ -190,6 +190,7 @@ fn build_header_sync_reactor(
         request_deadlines: HashMap::new(),
         close_deadlines: HashMap::new(),
         pending_closes: HashMap::new(),
+        pruned_peers: HashMap::new(),
         completed_targets: CompletedHeaderTargets::default(),
         ordinary_resource_stall: None,
         vct_repair: RepairRequirementSlot::default(),
@@ -220,6 +221,11 @@ struct PeerState {
     status_spent: bool,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
+}
+
+/// What `HistoryPruned` taught the reactor about one peer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PrunedPeer {
     /// Set when an ordinary schema 1 round with this peer ended
     /// `HistoryPruned`, because a pruned publisher lacks the records. Ordinary
     /// rounds ask for no records until it expires, then probe schema 1 once.
@@ -230,6 +236,19 @@ struct PeerState {
     /// expires or the selected header tip it names moves. An admitted round
     /// clears it.
     pruned_pause: Option<(PrunedBackoff, zakura_header_chain::Frontier)>,
+}
+
+impl PrunedPeer {
+    /// Whether either wait still matters at `now`. An expired fallback stays
+    /// for one more maximum backoff, so a failed probe soon after still
+    /// doubles its delay.
+    fn relevant(&self, now: Instant) -> bool {
+        self.aux_fallback
+            .is_some_and(|fallback| fallback.until + PRUNED_BACKOFF_MAX > now)
+            || self
+                .pruned_pause
+                .is_some_and(|(pause, _)| pause.until > now)
+    }
 }
 
 /// A wait that doubles each time it is renewed, until a success clears it.
@@ -285,6 +304,10 @@ struct HeaderSyncReactor {
     /// Sessions whose `Close` a full queue refused, by session ID. Each
     /// maintenance pass tries again until the `Close` is queued.
     pending_closes: HashMap<ZakuraPeerId, u64>,
+    /// What `HistoryPruned` taught the reactor about each peer. It outlives
+    /// the peer's sessions, so reconnecting cannot reset its backoff, and
+    /// maintenance drops entries once they no longer matter.
+    pruned_peers: HashMap<ZakuraPeerId, PrunedPeer>,
     completed_targets: CompletedHeaderTargets,
     /// State version of the latest ordinary admission refused by a committed resource stall.
     ordinary_resource_stall: Option<zakura_header_chain::StateVersion>,
@@ -909,8 +932,6 @@ impl HeaderSyncReactor {
                 last_status: None,
                 status_spent: false,
                 unproductive_requests: 0,
-                aux_fallback: None,
-                pruned_pause: None,
             },
         ) {
             previous.session.cancel_token().cancel();
@@ -1274,9 +1295,9 @@ impl HeaderSyncReactor {
         count: u32,
     ) -> AuxSchema {
         let fallback = self
-            .peer_state
+            .pruned_peers
             .get(peer)
-            .and_then(|state| state.aux_fallback)
+            .and_then(|pruned| pruned.aux_fallback)
             .is_some_and(|fallback| fallback.until > Instant::now());
         if !fallback && start.0.saturating_add(count) <= status.work_anchor_height.0 {
             schema
@@ -1289,9 +1310,9 @@ impl HeaderSyncReactor {
     /// without records ended `HistoryPruned` at the selected header tip
     /// `tip`.
     fn pruned_pause_holds(&self, peer: &ZakuraPeerId, tip: zakura_header_chain::Frontier) -> bool {
-        self.peer_state
+        self.pruned_peers
             .get(peer)
-            .and_then(|state| state.pruned_pause)
+            .and_then(|pruned| pruned.pruned_pause)
             .is_some_and(|(pause, paused_at)| pause.until > Instant::now() && paused_at == tip)
     }
 
@@ -1311,16 +1332,17 @@ impl HeaderSyncReactor {
         let Some(state) = self.peer_state.get_mut(peer) else {
             return;
         };
+        let pruned = self.pruned_peers.entry(peer.clone()).or_default();
         match schema {
             AuxSchema::V1 => {
-                state.aux_fallback = Some(PrunedBackoff::after(state.aux_fallback, now));
+                pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
                 state.status_spent = false;
                 metrics::counter!("sync.header.target.aux_fallback").increment(1);
             }
             AuxSchema::None => {
                 if let Some(tip) = tip {
-                    let previous = state.pruned_pause.map(|(pause, _)| pause);
-                    state.pruned_pause = Some((PrunedBackoff::after(previous, now), tip));
+                    let previous = pruned.pruned_pause.map(|(pause, _)| pause);
+                    pruned.pruned_pause = Some((PrunedBackoff::after(previous, now), tip));
                 }
             }
         }
@@ -1840,12 +1862,15 @@ impl HeaderSyncReactor {
                 }
                 // An admitted ordinary round ends the peer's `HistoryPruned`
                 // pause, and one with records ends its schema fallback.
-                if let (HeaderTargetPurpose::Normal, Some(state)) =
-                    (active.purpose, self.peer_state.get_mut(&peer))
+                if let (HeaderTargetPurpose::Normal, Some(pruned)) =
+                    (active.purpose, self.pruned_peers.get_mut(&peer))
                 {
-                    state.pruned_pause = None;
+                    pruned.pruned_pause = None;
                     if active.tree_aux_schema == AuxSchema::V1 {
-                        state.aux_fallback = None;
+                        pruned.aux_fallback = None;
+                    }
+                    if *pruned == PrunedPeer::default() {
+                        self.pruned_peers.remove(&peer);
                     }
                 }
             }
@@ -3405,6 +3430,7 @@ impl HeaderSyncReactor {
         }
         self.refresh_vct_repair_stall(now);
         self.retire_timed_out_requests(now);
+        self.pruned_peers.retain(|_, pruned| pruned.relevant(now));
         self.retry_pending_closes();
         self.retire_unanswered_closes(now);
         if self.prune_unproductive_cooldowns(now) {

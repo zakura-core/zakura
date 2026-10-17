@@ -258,8 +258,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         }
         if !closing_seen && task.conn.is_closed() {
             closing_seen = true;
-            task.release_streams();
-            if !task.slot.begin_closing() {
+            if !task.enter_closing(&mut datagrams) {
                 // ADM-13: the closing allowance is full, so drop the state
                 // now. Dropping the task reports the connection drained.
                 metrics::counter!("zakura.quic.connections.closing_full").increment(1);
@@ -637,6 +636,25 @@ impl ConnTask {
                 observer(&sample);
             }
         }
+    }
+
+    /// Releases a closed connection's payload and moves its slot to the
+    /// closing allowance (ADM-13). Returns `false` when the allowance is full,
+    /// and the caller then drops the connection's state at once.
+    fn enter_closing(
+        &mut self,
+        datagrams: &mut mpsc::UnboundedReceiver<(ConnectionEvent, usize)>,
+    ) -> bool {
+        self.release_streams();
+        let slot = self.slot.clone();
+        // The backlog was queued under the live limit. A closed connection
+        // only answers with CONNECTION_CLOSE, so dropping it loses nothing.
+        // An endpoint send racing the switch adds at most one datagram.
+        slot.begin_closing(|| {
+            while let Ok((_, bytes)) = datagrams.try_recv() {
+                self.refund_datagram(bytes);
+            }
+        })
     }
 
     /// Frees the stream payload quinn-proto still holds for a closed
@@ -1361,6 +1379,57 @@ mod tests {
         }
         task.drain_datagrams(&mut rx).await;
         assert!(tx.is_closed());
+        assert_eq!(task.shared.queued_datagram_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            task.shared.socket_queued_bytes.load(Ordering::Relaxed),
+            other_connection_bytes
+        );
+    }
+
+    /// ADM-13: entering the closing allowance drops and refunds the datagrams
+    /// queued under the live limit, so the closed connection holds no more
+    /// than its closing charge.
+    #[tokio::test]
+    async fn entering_closing_drops_the_live_datagram_backlog() {
+        let (_client, mut task) = client_task();
+        let mut server = server_endpoint();
+        let remote = "127.0.0.1:54321".parse().unwrap();
+        let mut packet = Vec::new();
+        let transmit = task.conn.poll_transmit(now(), 1, &mut packet).unwrap();
+        let data = bytes::BytesMut::from(&packet[..transmit.size]);
+        let mut response = Vec::new();
+        let Some(quinn_proto::DatagramEvent::NewConnection(incoming)) =
+            server.handle(now(), remote, None, None, data.clone(), &mut response)
+        else {
+            panic!("client Initial must create an incoming connection")
+        };
+        let _connection = server.accept(incoming, now(), &mut response, None).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let other_connection_bytes = 73;
+        task.shared
+            .socket_queued_bytes
+            .store(other_connection_bytes, Ordering::Relaxed);
+        // More than the closing limit, queued while the connection was live.
+        let charged = super::super::CLOSING_QUEUE_BYTES;
+        for _ in 0..3 {
+            let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, event)) =
+                server.handle(now(), remote, None, None, data.clone(), &mut response)
+            else {
+                panic!("duplicate Initial must route to the accepted connection")
+            };
+            task.shared
+                .queued_datagram_bytes
+                .fetch_add(charged, Ordering::Relaxed);
+            task.shared
+                .socket_queued_bytes
+                .fetch_add(charged, Ordering::Relaxed);
+            tx.send((event, charged)).unwrap();
+        }
+
+        task.close(VarInt::from_u32(0), Bytes::from_static(b"test"));
+        assert!(task.enter_closing(&mut rx));
+        assert!(task.slot.is_closing());
+        assert!(rx.try_recv().is_err());
         assert_eq!(task.shared.queued_datagram_bytes.load(Ordering::Relaxed), 0);
         assert_eq!(
             task.shared.socket_queued_bytes.load(Ordering::Relaxed),

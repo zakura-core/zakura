@@ -49,7 +49,7 @@ peer can fill. The node bounds that credit by holding fewer connections, not by 
 `peer_memory_budget_bytes` (8 GiB) divided by one connection's windows and datagram queue
 (80 MiB) caps the transport at 102 live QUIC connections. A closed connection releases its stream
 buffers and waits out its drain in a separate, cheap allowance, so a peer that gets rejected and
-reconnects can't pile up buffers or block inbound peers. The node keeps `max_pending_handshakes`
+reconnects can't pile up buffers, and its closed connections take no slot from inbound peers. The node keeps `max_pending_handshakes`
 (32) of the live slots for handshakes and admits 70 peers. CTRL-26, ADM-12 and ADM-13 in the
 zakura-quic spec give the rules and the overheads the budget leaves out.
 

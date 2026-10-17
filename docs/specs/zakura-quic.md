@@ -452,19 +452,24 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     bounded by the open streams.
   - The endpoint queues at most 64 KiB of datagrams for a closed connection
     (`CLOSING_QUEUE_BYTES`) instead of DRV-3's 16 MiB. A closed connection
-    only answers with CONNECTION_CLOSE. `CLOSING_CONNECTION_MEMORY_BYTES` is
-    that queue: what a closed connection can make the node hold beyond its
-    bookkeeping.
+    only answers with CONNECTION_CLOSE. When the slot moves, the endpoint
+    switches to that limit first, then the task drops and refunds the
+    datagrams queued while the connection was live, and only then does the
+    live slot free. An endpoint send racing the switch can add one datagram.
+    `CLOSING_CONNECTION_MEMORY_BYTES` is that queue: what a closed connection
+    can make the node hold beyond its bookkeeping.
   - If `max_closing_connections` are already held, the task MUST drop the
     connection's state at once instead of draining it. A late packet for it
     gets at most a stateless reset. Admission never counts closed
-    connections, so draining can't refuse an inbound peer.
+    connections, so draining can't refuse an inbound peer. Handshakes still
+    count as live, and ADM-3's per-IP and pending-handshake rules bound
+    those.
 
   Zakura sets `max_closing_connections` to twice ADM-12's
   `max_connections`, 204 at the defaults. A peer that completes handshakes and
   gets rejected over and over can fill that allowance. Later closes then skip
-  their drain, but live connections, inbound admission and dials are
-  unaffected. This replaces a table in which each closed connection kept its
+  their drain, but the closed connections take no live slot, so admission
+  and dials are unaffected by them. This replaces a table in which each closed connection kept its
   stream buffers, up to 80 MiB, for up to three PTOs.
 
 ## 8. Dialing
@@ -905,6 +910,7 @@ this release tolerates, and keep each hard change explicit.
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; `ConnectionLimit` outranks the peer's failures | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
+| Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
 | Behind a relay that makes three PTOs last seconds, a draining connection leaves the live count so a new inbound peer connects, and with the allowance full it drops its state at once | ADM-13 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |

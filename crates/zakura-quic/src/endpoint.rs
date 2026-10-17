@@ -918,7 +918,11 @@ impl ConnectionSlot {
     /// when the closing allowance is full: the caller then drops the
     /// connection's state at once instead of draining it (ADM-13). Only the
     /// connection task calls this, once.
-    pub(crate) fn begin_closing(&self) -> bool {
+    ///
+    /// `shrink` runs after the endpoint switches to the closing queue limit
+    /// and before the live slot frees, so the caller can drop the datagrams
+    /// queued under the live limit before the cheaper charge applies.
+    pub(crate) fn begin_closing(&self, shrink: impl FnOnce()) -> bool {
         if self.is_closing() {
             return true;
         }
@@ -926,6 +930,7 @@ impl ConnectionSlot {
             return false;
         }
         self.closing.store(true, Ordering::Release);
+        shrink();
         self.counts.live.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         metrics::gauge!("zakura.quic.connections.closing").increment(1.0);

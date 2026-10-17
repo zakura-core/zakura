@@ -32,6 +32,7 @@ mod address_transfers;
 mod backup;
 mod chain;
 mod created_utxos;
+mod shared_map;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -43,6 +44,7 @@ pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
+pub(crate) use shared_map::SharedMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextualMetrics {

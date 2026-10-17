@@ -3111,7 +3111,7 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeaderLocator => {
+            ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let locator = reader
                     .map(|reader| reader.committed_selected_locator())

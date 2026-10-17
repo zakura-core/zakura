@@ -428,6 +428,28 @@ pub enum ApplyHeaderTargetOutcome {
     ResourceStalled(CommittedStallReceipt),
 }
 
+/// Capacity owned by one locator read through its last non-cancellable operation.
+///
+/// Clones share one permit. Adapters must move a clone into accepted work before
+/// awaiting it, so dropping a timed-out caller cannot release that work's capacity.
+#[derive(Clone, Debug)]
+pub struct LocatorReadPermit(Arc<tokio::sync::OwnedSemaphorePermit>);
+
+impl LocatorReadPermit {
+    /// Wrap a permit acquired by the locator scheduler.
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(Arc::new(permit))
+    }
+}
+
+impl PartialEq for LocatorReadPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LocatorReadPermit {}
+
 /// Header-chain operations that header-sync policy requires.
 ///
 /// Each operation returns one typed future for its request and reply.
@@ -435,8 +457,12 @@ pub enum ApplyHeaderTargetOutcome {
 /// An implementation translates its backing service protocol into this contract.
 pub trait Port: Send + Sync + 'static {
     /// Return a coherent locator for the current selected path.
+    ///
+    /// Retain `permit` in any accepted work that can outlive this future. A timeout
+    /// or cancellation must not release capacity while that work still executes.
     fn continuation_locator(
         &self,
+        permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>>;
 
     /// Resolve selected-path context for the auxiliary repair at `height`.
@@ -512,6 +538,7 @@ pub struct UnavailablePort;
 impl Port for UnavailablePort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(async { Err(PortError::Unavailable { source: None }) })
     }
@@ -580,6 +607,7 @@ pub struct InertHeaderChainPort;
 impl Port for InertHeaderChainPort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(std::future::pending())
     }

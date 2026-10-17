@@ -1073,14 +1073,12 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .complete(terminal);
                         completed
                     }
-                    _ = transfer_handoff.wait_for_legacy_yield(),
-                        if class == BlockApplyClass::Checkpoint =>
-                    {
-                        // The checkpoint verifier owns transactional range commits after it
-                        // accepts a request. A partial range cannot commit until another request
-                        // supplies every missing body. Legacy fallback uses the same verifier, so
-                        // it can complete the range after this driver transfers completion
-                        // responsibility.
+                    _ = transfer_handoff.wait_for_legacy_yield() => {
+                        // An accepted apply can wait for a body only fallback can supply. The
+                        // checkpoint verifier holds a partial range until every missing body
+                        // arrives, and state queues a full commit until its parent commits.
+                        // Legacy fallback uses the same verifier and state, so it can complete
+                        // that work after this driver transfers completion responsibility.
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
@@ -1093,9 +1091,12 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .take()
                             .expect("accepted operation has one terminal result")
                             .complete(super::BlockApplyTerminal::TransferredToLegacy);
-                        metrics::counter!(
-                            "sync.zakura.apply.checkpoint_transferred_to_legacy"
-                        )
+                        metrics::counter!(match class {
+                            BlockApplyClass::Checkpoint => {
+                                "sync.zakura.apply.checkpoint_transferred_to_legacy"
+                            }
+                            BlockApplyClass::Full => "sync.zakura.apply.full_transferred_to_legacy",
+                        })
                         .increment(1);
                         BlockApplyCompletion { class, result }
                     }

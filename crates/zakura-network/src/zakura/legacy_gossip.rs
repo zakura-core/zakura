@@ -1866,7 +1866,8 @@ impl LegacyRequestAdapter {
     }
 
     /// Request inventory, preferring the Zakura peer that advertised it when known.
-    pub async fn request_from_source(
+    #[cfg(test)]
+    async fn request_from_source(
         &self,
         request: Request,
         source: Option<PeerSource>,

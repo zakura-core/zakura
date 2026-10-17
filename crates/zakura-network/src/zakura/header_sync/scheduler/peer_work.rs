@@ -317,25 +317,6 @@ pub enum HeaderTargetPurpose {
     },
 }
 
-impl HeaderTargetPurpose {
-    /// Return the target purpose's exact response-count requirement, when fixed.
-    ///
-    /// Selected auxiliary repairs can cover a negotiated range, so they have no fixed count.
-    pub const fn exact_header_count(&self) -> Option<usize> {
-        None
-    }
-
-    /// Return the selected target fixed by an auxiliary repair.
-    pub fn selected_repair_target(&self) -> Option<Frontier> {
-        match self {
-            Self::Normal => None,
-            Self::SelectedAuxiliaryRepair {
-                selected_target, ..
-            } => Some(*selected_target),
-        }
-    }
-}
-
 /// Reactor-owned phase that permits each target preparation and state submission once.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeaderTargetPhase {
@@ -1577,19 +1558,5 @@ mod tests {
 
         assert!(queue.remove(&peer(1)).is_some());
         assert_eq!(queue.repair_episode(owner), None);
-    }
-
-    #[test]
-    fn selected_auxiliary_repair_keeps_its_selected_target() {
-        let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
-        let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
-            selected_target,
-            repair_generation: 7,
-        };
-
-        assert_eq!(purpose.exact_header_count(), None);
-        assert_eq!(purpose.selected_repair_target(), Some(selected_target));
-        assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
-        assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

@@ -4,7 +4,7 @@
 //! from connect to disconnect. This module owns the shared abstraction — the
 //! per-stage control flow ([`Flow`]), the per-peer context ([`PipeCx`]), the
 //! checked-documentation DAG ([`PipeShape`]), the generic inbound runner
-//! ([`Pipe`]/[`PipeSink`]), and the panic-containment launcher
+//! ([`Pipe`]), and the panic-containment launcher
 //! ([`spawn_supervised_pipe`]). Services depend on this vocabulary but never
 //! re-implement it.
 //!
@@ -20,7 +20,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{Frame, FramedRecv, SinkReject};
+use super::{Frame, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
 use crate::zakura::ZakuraPeerId;
 
@@ -238,51 +238,6 @@ impl<S, Env> Pipe<S, Env> {
     }
 }
 
-/// The generic inbound runner for a per-peer pipe.
-///
-/// `PipeSink::run` is the single inbound loop: `recv → guard.admit → entry →
-/// map Flow`. block_sync drives its stream-6 inbound path through it directly;
-/// header_sync and discovery fork their own loops (command draining / async
-/// handler handoff) that are genuinely different shapes.
-#[allow(dead_code)]
-pub(crate) struct PipeSink<S, Env> {
-    pipe: Pipe<S, Env>,
-    recv: FramedRecv,
-    cancel: CancellationToken,
-}
-
-#[allow(dead_code)]
-impl<S, Env> PipeSink<S, Env>
-where
-    S: Send + 'static,
-    Env: Send + Sync + 'static,
-{
-    /// Build the inbound runner around a pipe and its receive half.
-    pub(crate) fn new(pipe: Pipe<S, Env>, recv: FramedRecv, cancel: CancellationToken) -> Self {
-        Self { pipe, recv, cancel }
-    }
-
-    /// Run the inbound loop until the stream closes or the peer is cancelled.
-    ///
-    /// `Throttle` continues the loop, `Reject` returns `Err(SinkReject)`, and
-    /// stream end or cancellation returns `Ok(())`.
-    pub(crate) async fn run(mut self) -> Result<(), SinkReject> {
-        loop {
-            let frame = tokio::select! {
-                () = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv() => frame,
-            };
-            let Some(frame) = frame else {
-                return Ok(());
-            };
-            match self.pipe.run_one(frame) {
-                Flow::Continue(()) | Flow::Done => continue,
-                Flow::Reject(reject) => return Err(reject),
-            }
-        }
-    }
-}
-
 /// Cleanup that runs when a supervised pipe task ends, on every exit path.
 ///
 /// Living in `Drop`, the teardown runs whether the pipe future returns normally,
@@ -477,7 +432,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::zakura::transport::framed_channel;
     use crate::zakura::transport::guard::ByteBudget;
 
     const SHAPE: PipeShape = PipeShape {
@@ -600,29 +554,6 @@ mod tests {
 
         assert!(cancel.is_cancelled());
         assert_eq!(cause.get_or("fallback"), "service_protocol_reject");
-    }
-
-    #[tokio::test]
-    async fn pipe_sink_run_returns_ok_on_stream_end() {
-        let (send, recv) = framed_channel(4);
-        let cancel = CancellationToken::new();
-        let pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
-        let sink = PipeSink::new(pipe, recv, cancel);
-        // One admitted frame, then close the stream by dropping the sender.
-        send.send(frame(1)).await.expect("channel has capacity");
-        drop(send);
-        assert!(sink.run().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn pipe_sink_run_returns_err_on_reject() {
-        let (send, recv) = framed_channel(4);
-        let cancel = CancellationToken::new();
-        let pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
-        let sink = PipeSink::new(pipe, recv, cancel);
-        // A disallowed type rejects the peer.
-        send.send(frame(2)).await.expect("channel has capacity");
-        assert!(sink.run().await.is_err());
     }
 
     #[tokio::test]

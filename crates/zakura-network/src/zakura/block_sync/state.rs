@@ -309,12 +309,6 @@ impl BlockSyncHandle {
             .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
     }
 
-    /// Subscribe to the reactor's current local serving status.
-    /// Peer delivery is tracked separately and can lag while outbound queues are full.
-    pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
-        self.status.clone()
-    }
-
     /// Return the reactor's current local serving status, independent of peer delivery.
     pub fn local_status(&self) -> BlockSyncStatus {
         *self.status.borrow()

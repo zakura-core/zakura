@@ -60,13 +60,11 @@ impl<R: Read> ZcashReader<R> {
     }
 
     /// Decode one value, letting its decoder see how many bytes remain.
+    ///
+    /// The value decodes on this same reader, so nested decoders are not
+    /// instantiated again for a reader type wrapping this one.
     pub fn read_value<T: ZcashDeserialize>(&mut self) -> Result<T, SerializationError> {
-        if self.remaining.is_some() {
-            T::zcash_deserialize_from(self)
-        } else {
-            // Read through `self`, not `self.inner`, so an active limit still applies.
-            T::zcash_deserialize(self)
-        }
+        T::zcash_deserialize_from(self)
     }
 
     /// Give a nested decoder permission to read at most `limit` bytes.

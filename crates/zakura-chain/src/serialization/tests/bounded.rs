@@ -224,28 +224,36 @@ fn bounded_blocks_match_streaming_fixtures_and_preserve_trailing_input() {
 }
 
 #[test]
-fn external_streaming_implementations_remain_usable_but_do_not_claim_bounds() {
+fn external_decoders_work_for_stream_and_slice_input() {
     #[derive(Debug)]
-    struct StreamingByte(u8);
+    struct ExternalByte(u8);
 
-    impl ZcashDeserialize for StreamingByte {
-        fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    impl ZcashDeserialize for ExternalByte {
+        fn zcash_deserialize_from<R: Read>(
+            reader: &mut ZcashReader<R>,
+        ) -> Result<Self, SerializationError> {
             let mut byte = [0];
             reader.read_exact(&mut byte)?;
             Ok(Self(byte[0]))
         }
     }
 
-    impl TrustedPreallocate for StreamingByte {
+    impl TrustedPreallocate for ExternalByte {
         fn max_allocation() -> u64 {
             10
         }
+
+        fn min_serialized_size() -> u64 {
+            1
+        }
     }
 
-    let streamed = Vec::<StreamingByte>::zcash_deserialize(&[1, 7][..]).unwrap();
+    let streamed = Vec::<ExternalByte>::zcash_deserialize(&[1, 7][..]).unwrap();
     assert_eq!(streamed[0].0, 7);
-    assert!(StreamingByte::zcash_deserialize_from_slice(&mut &[7][..]).is_err());
-    assert!(Vec::<StreamingByte>::zcash_deserialize_from_slice(&mut &[1, 7][..]).is_err());
+    let sliced = Vec::<ExternalByte>::zcash_deserialize_from_slice(&mut &[1, 7][..]).unwrap();
+    assert_eq!(sliced[0].0, 7);
+    // Slice input knows its length, so a count the bytes cannot hold is rejected.
+    assert!(Vec::<ExternalByte>::zcash_deserialize_from_slice(&mut &[2, 7][..]).is_err());
 }
 
 #[test]

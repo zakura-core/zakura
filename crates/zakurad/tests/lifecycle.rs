@@ -819,11 +819,7 @@ fn occupied_p2p_listener_exits_with_failure() {
         .lines()
         .find(|line| line.contains("panicked at"))
         .expect("the default panic hook prints a panic header");
-    for patterns in [
-        failure_messages::ZAKURA_FAILURE_MESSAGES,
-        #[cfg(feature = "zakura-checkpoints")]
-        failure_messages::ZAKURA_CHECKPOINTS_FAILURE_MESSAGES,
-    ] {
+    let assert_panic_detected = |patterns: &[&str]| {
         let failures = regex::RegexSet::new(patterns).expect("failure patterns are valid regexes");
         let ignores = regex::RegexSet::empty();
         assert!(
@@ -849,7 +845,10 @@ fn occupied_p2p_listener_exits_with_failure() {
             .is_ok(),
             "normal startup output must not be treated as a panic",
         );
-    }
+    };
+    assert_panic_detected(failure_messages::ZAKURA_FAILURE_MESSAGES);
+    #[cfg(feature = "zakura-checkpoints")]
+    assert_panic_detected(failure_messages::ZAKURA_CHECKPOINTS_FAILURE_MESSAGES);
 }
 
 /// A panic during startup, after logging has started, reports the panic and still writes

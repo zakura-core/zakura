@@ -17,6 +17,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use zakura_chain::parameters::NetworkKind;
+use zakura_node_services::task::spawn_erased;
 
 use super::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path, Config};
 
@@ -417,7 +418,7 @@ fn spawn_log_task<T>(stream: T, stream_name: &'static str) -> JoinHandle<()>
 where
     T: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_erased(async move {
         let mut reader = BufReader::new(stream).lines();
 
         while let Ok(Some(line)) = reader.next_line().await {

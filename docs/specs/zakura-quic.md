@@ -488,8 +488,10 @@ These keys stay in `[network.zakura]` and keep their meaning:
   `[network.zakura] peer_memory_budget_bytes` divided by this cost
   connections. Startup lowers a larger `max_connections` to that count with
   a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
-  admits fewer than 16 connections, or fewer than `max_connections` when that
-  is smaller. The budget never shrinks the windows, so it costs no
+  admits fewer than 16 connections or twice the discovery headroom plus one
+  (19 with Mainnet's 9 bootstrap peers), so discovery keeps a dial slot with
+  every bootstrap peer connected. A smaller `max_connections` lowers that
+  floor to match. The budget never shrinks the windows, so it costs no
   per-connection throughput.
 
   The budget counts flow-control credit and queued datagrams, not resident

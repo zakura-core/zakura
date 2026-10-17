@@ -3414,7 +3414,7 @@ fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
         .collect()
 }
 
-fn discovery_dial_slot_limit(
+pub(crate) fn discovery_dial_slot_limit(
     connected_count: usize,
     in_flight_count: usize,
     max_connections: usize,

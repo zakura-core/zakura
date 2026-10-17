@@ -17,19 +17,34 @@
 
 use thiserror::Error;
 
-use super::{DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW};
+use super::{
+    discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_RECEIVE_WINDOW,
+    DEFAULT_ZAKURA_SEND_WINDOW,
+};
 
-/// Default bytes of QUIC buffers all native peers together may make this node
-/// hold: 8 GiB.
+/// Default budget for admitted native connections' flow-control credit and
+/// queued datagrams: 8 GiB. CTRL-26 in the zakura-quic spec lists what it
+/// leaves out.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Fewest connections a peer memory budget must admit, so a node that lowers
-/// its budget or raises its windows still dials discovered peers.
-///
-/// Discovery keeps one slot per bootstrap peer out of its dials, 9 on
-/// Mainnet, so a smaller floor could leave it no dial slots at all. A smaller
-/// `max_connections` lowers this floor to match.
+/// Fewest connections a peer memory budget must admit, whatever the bootstrap
+/// list (see [`min_budgeted_connections`]).
 pub const MIN_ZAKURA_BUDGETED_CONNECTIONS: usize = 16;
+
+/// Returns the fewest connections a budget must admit with
+/// `bootstrap_peer_count` configured bootstrap peers, so discovery can still
+/// dial a discovered peer while every bootstrap peer is connected.
+///
+/// Discovery keeps its headroom, one slot per bootstrap peer and at least 4,
+/// out of its dials, and also counts each connected peer against the rest. So
+/// it needs twice the headroom plus one: 19 on Mainnet. The result is never
+/// below [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
+pub fn min_budgeted_connections(bootstrap_peer_count: usize) -> usize {
+    effective_discovery_connection_headroom(bootstrap_peer_count)
+        .saturating_mul(2)
+        .saturating_add(1)
+        .max(MIN_ZAKURA_BUDGETED_CONNECTIONS)
+}
 
 /// Connections the default budget admits at the default windows: 102.
 pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = max_connections_for_budget(
@@ -54,7 +69,7 @@ pub const fn max_connections_for_budget(budget_bytes: u64, connection_bytes: u64
 }
 
 /// `[network.zakura] peer_memory_budget_bytes` admits fewer connections than
-/// [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
+/// [`min_budgeted_connections`] requires.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 #[error(
     "invalid [network.zakura] peer_memory_budget_bytes: {budget_bytes} bytes admits \
@@ -77,16 +92,18 @@ pub struct PeerMemoryBudgetError {
 /// Returns the connection cap after the budget: `max_connections`, lowered to
 /// what `budget_bytes` admits at `connection_bytes` each.
 ///
-/// Fails when the budget admits fewer than [`MIN_ZAKURA_BUDGETED_CONNECTIONS`],
-/// or fewer than `max_connections` when that is smaller.
+/// Fails when the budget admits fewer than [`min_budgeted_connections`] for
+/// `bootstrap_peer_count`, or fewer than `max_connections` when that is
+/// smaller.
 pub fn budgeted_max_connections(
     max_connections: usize,
     budget_bytes: u64,
     connection_bytes: u64,
+    bootstrap_peer_count: usize,
 ) -> Result<usize, PeerMemoryBudgetError> {
     let max_connections = max_connections.max(1);
     let admitted = max_connections_for_budget(budget_bytes, connection_bytes);
-    let required = max_connections.min(MIN_ZAKURA_BUDGETED_CONNECTIONS);
+    let required = max_connections.min(min_budgeted_connections(bootstrap_peer_count));
     if admitted < required {
         return Err(PeerMemoryBudgetError {
             budget_bytes,
@@ -104,8 +121,8 @@ mod tests {
 
     use super::*;
     use crate::zakura::{
-        discovery::effective_discovery_connection_headroom, ZakuraConfig,
-        DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        discovery::discovery_dial_slot_limit, ZakuraConfig, DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS,
     };
 
     const MIB: u64 = 1024 * 1024;
@@ -160,10 +177,30 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_leaves_discovery_dial_slots_on_mainnet() {
-        let headroom =
-            effective_discovery_connection_headroom(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS.len());
-        assert!(MIN_ZAKURA_BUDGETED_CONNECTIONS > headroom);
+    fn the_floor_leaves_a_discovery_dial_slot_with_every_bootstrap_peer_connected() {
+        assert_eq!(
+            min_budgeted_connections(DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS.len()),
+            19
+        );
+        for bootstrap_peers in [0, 3, 9, 20, 100] {
+            let floor = min_budgeted_connections(bootstrap_peers);
+            let headroom = effective_discovery_connection_headroom(bootstrap_peers);
+            let slots = |max_connections| {
+                discovery_dial_slot_limit(bootstrap_peers, 0, max_connections, headroom, 4)
+            };
+            assert!(slots(floor) >= 1, "{bootstrap_peers} bootstrap peers");
+            if floor > MIN_ZAKURA_BUDGETED_CONNECTIONS {
+                assert_eq!(slots(floor - 1), 0, "{bootstrap_peers} bootstrap peers");
+            }
+        }
+
+        // A custom list of 16 bootstrap peers needs 33 connections.
+        let config = ZakuraConfig {
+            bootstrap_peers: vec![String::new(); 16],
+            peer_memory_budget_bytes: 32 * 80 * MIB,
+            ..ZakuraConfig::default()
+        };
+        assert_eq!(config.budgeted_max_connections().unwrap_err().required, 33);
     }
 
     #[test]
@@ -178,13 +215,13 @@ mod tests {
         let error = config.budgeted_max_connections().unwrap_err();
         // 8 GiB / (1024 + 32 + 16) MiB.
         assert_eq!(error.admitted, 7);
-        assert_eq!(error.required, MIN_ZAKURA_BUDGETED_CONNECTIONS);
+        assert_eq!(error.required, 19);
         assert!(error
             .to_string()
             .contains("[network.zakura] peer_memory_budget_bytes"));
         assert!(error.to_string().contains("receive_window_bytes"));
 
-        // 8 GiB / (512 + 32 + 16) MiB leaves room for 14, below the floor.
+        // 8 GiB / (512 + 32 + 16) MiB leaves room for 14, below Mainnet's 19.
         let config = ZakuraConfig {
             quic: QuicConfig {
                 receive_window_bytes: 512 << 20,

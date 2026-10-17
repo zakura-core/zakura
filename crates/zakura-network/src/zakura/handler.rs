@@ -331,8 +331,9 @@ pub struct ZakuraConfig {
     /// out). The node admits at most
     /// this budget divided by that cost, so the default 8 GiB admits 102
     /// connections and a larger `max_connections` is lowered at startup.
-    /// Startup fails when the budget admits fewer than 16 connections, or fewer
-    /// than `max_connections` when that is smaller.
+    /// Startup fails when the budget admits fewer than 16 connections, or
+    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
+    /// peers), or fewer than `max_connections` when that is smaller.
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
@@ -415,6 +416,7 @@ impl ZakuraConfig {
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.quic.connection_memory_bytes(),
+            self.bootstrap_peers.len(),
         )
     }
 

@@ -1158,10 +1158,9 @@ mod requester_session_tests {
         assert!(fence.open().is_none());
     }
 
-    /// Ending a session queues its disconnect in the same step that removes its
-    /// record. A teardown worker that stalls after that step cannot let a
-    /// replacement's connect reach the reactor first, which would make the
-    /// reactor drop the replacement's handle on the late disconnect.
+    /// `finish_session` itself queues the disconnect, so a teardown worker that
+    /// stalls after it returns cannot let a replacement's connect reach the
+    /// reactor first.
     #[tokio::test]
     async fn a_finished_session_queues_its_disconnect_before_a_replacement_connects() {
         let (service, mut events) =

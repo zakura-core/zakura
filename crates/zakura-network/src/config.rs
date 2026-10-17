@@ -1399,21 +1399,11 @@ impl<'de> Deserialize<'de> for Config {
             ));
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
-        let budgeted_max_connections = zakura
+        // The endpoint lowers a larger `max_connections` when it starts, after
+        // tracing is up, so its warning reaches the log.
+        zakura
             .budgeted_max_connections()
             .map_err(de::Error::custom)?;
-        if budgeted_max_connections < zakura.max_connections {
-            warn!(
-                max_connections = zakura.max_connections,
-                budgeted_max_connections,
-                peer_memory_budget_bytes = zakura.peer_memory_budget_bytes,
-                connection_memory_bytes = zakura.quic.connection_memory_bytes(),
-                "lowering [network.zakura] max_connections to what \
-                 peer_memory_budget_bytes admits at the configured QUIC windows; \
-                 raise the budget or lower max_connections to silence this"
-            );
-            zakura.max_connections = budgeted_max_connections;
-        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),

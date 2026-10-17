@@ -86,7 +86,6 @@ sinsemilla = { workspace = true }
 
 # Time
 chrono = { workspace = true, features = ["serde"] }
-humantime = { workspace = true }
 
 # Error Handling & Formatting
 thiserror = { workspace = true }

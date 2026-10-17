@@ -84,7 +84,6 @@ halo2 = { version = "=3.0.0", package = "zakura-halo2-proofs" }
 hex = "0.4.3"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-humantime = "2.2"
 hyper = "1.6"
 hyper-util = "0.1.11"
 # Select the unicode-rs IDNA backend. The 1.2.x line selects ICU4X instead.

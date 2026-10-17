@@ -30,7 +30,6 @@ futures = { workspace = true }
 
 eyre = { workspace = true }
 
-humantime = { workspace = true }
 thiserror = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

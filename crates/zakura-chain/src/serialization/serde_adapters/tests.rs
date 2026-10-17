@@ -61,7 +61,7 @@ struct OptionalDuration {
 #[test]
 fn duration_strings_and_binary_formats_are_unchanged() {
     let value = HumanDuration(Duration::new(15, 123));
-    let string = humantime::format_duration(value.0).to_string();
+    let string = "15s 123ns".to_string();
     assert_eq!(
         serde_json::to_string(&value).unwrap(),
         serde_json::to_string(&string).unwrap()
@@ -109,7 +109,7 @@ fn optional_durations_preserve_some_none_and_missing_fields() {
     );
     for duration in [None, Some(Duration::new(15, 123))] {
         let value = OptionalDuration { duration };
-        let old_format = duration.map(|value| humantime::format_duration(value).to_string());
+        let old_format = duration.map(|_| "15s 123ns".to_string());
         let encoded = bincode::serialize(&old_format).unwrap();
         assert_eq!(bincode::serialize(&value).unwrap(), encoded);
         assert_eq!(

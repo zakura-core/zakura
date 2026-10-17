@@ -24,7 +24,7 @@ pub(crate) use candidate_dialer::{
 pub(crate) use dialer::{parse_bootstrap_peer, spawn_native_bootstrap_dialer};
 pub use protocol::*;
 pub(crate) use redial::{native_dial_supervised, RedialPolicy};
-pub(crate) use runtime::{
-    build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
-};
+#[cfg(test)]
+pub(crate) use runtime::effective_discovery_connection_headroom;
+pub(crate) use runtime::{build_discovery_handle, default_advertised_services};
 pub use service::{DiscoveryPeerSession, DiscoveryService};

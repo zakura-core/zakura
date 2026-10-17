@@ -5,7 +5,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
     time::{Duration, Instant},
@@ -200,7 +200,11 @@ impl QuicEndpoint {
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
-            connections: ConnectionSlots::new(bind.max_connections, bind.dial_reserve),
+            connections: ConnectionSlots::new(
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_closing_connections,
+            ),
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
@@ -307,10 +311,22 @@ impl QuicEndpoint {
             .collect()
     }
 
-    /// QUIC connections the endpoint holds across its sockets, counting
-    /// handshakes and closed connections not yet drained (ADM-12).
+    /// Live QUIC connections the endpoint holds across its sockets:
+    /// handshakes, dial attempts and established connections (ADM-12).
     pub fn connection_count(&self) -> usize {
-        self.inner.shared.connections.held()
+        self.inner.shared.connections.live()
+    }
+
+    /// Closed connections the endpoint keeps until they drain (ADM-13).
+    pub fn closing_connection_count(&self) -> usize {
+        self.inner.shared.connections.closing()
+    }
+
+    /// Whether a dial would get a live connection slot right now (ADM-12).
+    /// Callers that dial in a loop check this first, so a full table doesn't
+    /// make them spin on `ConnectionLimit`.
+    pub fn has_dial_capacity(&self) -> bool {
+        self.inner.shared.connections.can_dial()
     }
 
     /// Network changes the endpoint has passed to its connections (SOCK-12).
@@ -803,77 +819,133 @@ impl Drop for PendingGuard {
     }
 }
 
-/// QUIC connections held across every socket of one endpoint (ADM-12).
+/// QUIC connections held across every socket of one endpoint: live ones
+/// (ADM-12) and closed ones still draining (ADM-13).
 pub(crate) struct ConnectionSlots {
-    held: Arc<AtomicUsize>,
+    counts: Arc<SlotCounts>,
     max: usize,
     max_inbound: usize,
+    max_closing: usize,
+}
+
+#[derive(Default)]
+struct SlotCounts {
+    live: AtomicUsize,
+    closing: AtomicUsize,
 }
 
 impl ConnectionSlots {
-    /// Allows `max` connections, of which inbound attempts may take all but
-    /// `dial_reserve`.
-    fn new(max: usize, dial_reserve: usize) -> Self {
+    /// Allows `max` live connections, of which inbound attempts may take all
+    /// but `dial_reserve`, and `max_closing` closed ones.
+    pub(crate) fn new(max: usize, dial_reserve: usize, max_closing: usize) -> Self {
         Self {
-            held: Arc::new(AtomicUsize::new(0)),
+            counts: Arc::default(),
             max,
             max_inbound: max.saturating_sub(dial_reserve),
+            max_closing,
         }
     }
 
-    /// Slots held right now, dial attempts in flight included.
-    pub(crate) fn held(&self) -> usize {
-        self.held.load(Ordering::Acquire)
+    /// Live connections held right now, dial attempts in flight included.
+    pub(crate) fn live(&self) -> usize {
+        self.counts.live.load(Ordering::Acquire)
     }
 
-    /// Claims a slot for an inbound attempt, or `None` when only the dial
-    /// reserve is left.
-    pub(crate) fn claim_inbound(&self) -> Option<ConnectionSlot> {
+    /// Closed connections held right now.
+    pub(crate) fn closing(&self) -> usize {
+        self.counts.closing.load(Ordering::Acquire)
+    }
+
+    /// Whether a dial attempt would get a slot right now.
+    pub(crate) fn can_dial(&self) -> bool {
+        self.live() < self.max
+    }
+
+    /// Claims a live slot for an inbound attempt, or `None` when only the dial
+    /// reserve is left. Closed connections don't count (ADM-13).
+    pub(crate) fn claim_inbound(&self) -> Option<Arc<ConnectionSlot>> {
         self.claim(self.max_inbound)
     }
 
-    /// Claims a slot for one dial attempt, or `None` at the cap.
-    pub(crate) fn claim_dial(&self) -> Option<ConnectionSlot> {
+    /// Claims a live slot for one dial attempt, or `None` at the cap.
+    pub(crate) fn claim_dial(&self) -> Option<Arc<ConnectionSlot>> {
         self.claim(self.max)
     }
 
-    /// Claims a slot while fewer than `limit` are held. Endpoint tasks on
-    /// different sockets claim concurrently, so the check and the increment
-    /// are one atomic step.
-    fn claim(&self, limit: usize) -> Option<ConnectionSlot> {
-        // A plain CAS loop: `fetch_update` is deprecated on newer toolchains
-        // and `try_update` doesn't exist on older ones.
-        let mut held = self.held.load(Ordering::Acquire);
-        loop {
-            if held >= limit {
-                return None;
-            }
-            match self.held.compare_exchange_weak(
-                held,
-                held + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => held = current,
-            }
+    /// Claims a live slot while fewer than `limit` are held.
+    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
+        if !try_increment(&self.counts.live, limit) {
+            return None;
         }
         metrics::gauge!("zakura.quic.connections.held").increment(1.0);
-        Some(ConnectionSlot {
-            held: self.held.clone(),
-        })
+        Some(Arc::new(ConnectionSlot {
+            counts: self.counts.clone(),
+            max_closing: self.max_closing,
+            closing: AtomicBool::new(false),
+        }))
     }
 }
 
-/// One connection's slot, released on drop. The connection table entry holds
-/// it until `quinn-proto` reports the connection drained (ADM-11).
+/// Adds one to `count` unless it already holds `limit`. Endpoint tasks on
+/// different sockets claim concurrently, so the check and the increment are
+/// one atomic step. A plain CAS loop: `fetch_update` is deprecated on newer
+/// toolchains and `try_update` doesn't exist on older ones.
+fn try_increment(count: &AtomicUsize, limit: usize) -> bool {
+    let mut held = count.load(Ordering::Acquire);
+    loop {
+        if held >= limit {
+            return false;
+        }
+        match count.compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => held = current,
+        }
+    }
+}
+
+/// One connection's slot, shared by its table entry and its connection task.
+/// It counts as live until the connection closes, then as closing, and frees
+/// when the last holder drops it: the table entry leaves only once
+/// `quinn-proto` reports the connection drained (ADM-11).
 pub(crate) struct ConnectionSlot {
-    held: Arc<AtomicUsize>,
+    counts: Arc<SlotCounts>,
+    max_closing: usize,
+    closing: AtomicBool,
+}
+
+impl ConnectionSlot {
+    /// Moves the slot from live to closing. Returns `false`, leaving it live,
+    /// when the closing allowance is full: the caller then drops the
+    /// connection's state at once instead of draining it (ADM-13). Only the
+    /// connection task calls this, once.
+    pub(crate) fn begin_closing(&self) -> bool {
+        if self.is_closing() {
+            return true;
+        }
+        if !try_increment(&self.counts.closing, self.max_closing) {
+            return false;
+        }
+        self.closing.store(true, Ordering::Release);
+        self.counts.live.fetch_sub(1, Ordering::AcqRel);
+        metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        metrics::gauge!("zakura.quic.connections.closing").increment(1.0);
+        true
+    }
+
+    /// Whether the connection has closed and moved to the closing allowance.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.held.fetch_sub(1, Ordering::AcqRel);
-        metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        if self.is_closing() {
+            self.counts.closing.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.closing").decrement(1.0);
+        } else {
+            self.counts.live.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        }
     }
 }

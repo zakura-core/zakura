@@ -10,7 +10,7 @@ use quinn_proto::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::driver::CONNECTION_QUEUE_BYTES;
+use crate::driver::{CLOSING_QUEUE_BYTES, CONNECTION_QUEUE_BYTES};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -37,6 +37,12 @@ pub const fn connection_memory_bytes(receive_window_bytes: u32, send_window_byte
         .saturating_add(send_window_bytes)
         .saturating_add(CONNECTION_QUEUE_BYTES as u64)
 }
+
+/// Payload bytes one closed connection can make this node hold while it
+/// drains: its datagram queue, since the driver releases its stream buffers at
+/// close (ADM-13). Connection and stream bookkeeping come on top.
+// Widening usize to u64 is lossless on supported targets.
+pub const CLOSING_CONNECTION_MEMORY_BYTES: u64 = CLOSING_QUEUE_BYTES as u64;
 
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -354,12 +360,15 @@ pub struct QuicBindConfig {
     pub addrs: Vec<SocketAddr>,
     /// Concurrent bidirectional streams per connection (WIRE-8).
     pub max_bidi_streams: u32,
-    /// QUIC connections the endpoint holds across all its sockets, from
-    /// accept or connect until drained (ADM-12).
+    /// Live QUIC connections the endpoint holds across all its sockets:
+    /// handshakes, dial attempts and established connections (ADM-12).
     pub max_connections: usize,
     /// Slots of `max_connections` that only dials may take, so inbound
     /// attempts can't block this node's own dials (ADM-12).
     pub dial_reserve: usize,
+    /// Closed connections the endpoint keeps, with their stream buffers
+    /// released, until `quinn-proto` drains them (ADM-13).
+    pub max_closing_connections: usize,
 }
 
 #[cfg(test)]

@@ -22,7 +22,6 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
 };
 
 use bytes::Bytes;
@@ -46,14 +45,9 @@ pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
 /// datagrams also bounds memory when a peer sends 64 KiB datagrams.
 pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
-/// The longest a closed connection stays in the connection table, holding
-/// its buffers and its ADM-12 slot (ADM-11).
-///
-/// quinn-proto waits three PTOs, and the PTO adds the peer's advertised
-/// `max_ack_delay` (up to 16 s), so a peer could otherwise hold the slot for
-/// most of a minute. Leaving early is safe: a late packet for the dropped
-/// connection gets at most a stateless reset.
-pub(crate) const MAX_DRAIN: Duration = Duration::from_secs(3);
+/// Datagram bytes the endpoint queues for a closed connection (ADM-13). A
+/// closed connection only answers with CONNECTION_CLOSE, so it needs little.
+pub(crate) const CLOSING_QUEUE_BYTES: usize = 64 * 1024;
 
 /// The datagram bytes one socket may queue across all its connections
 /// (SPEC §6a), so many lagging connection tasks can't add up to

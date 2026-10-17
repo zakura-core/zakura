@@ -24,7 +24,8 @@ use tokio::{
 use super::{
     connection::CurrentLimits,
     connection::{self, now, ConnTaskParams},
-    ConnRef, ConnShared, Connecting, CONNECTION_QUEUE_BYTES, SOCKET_QUEUE_BYTES,
+    ConnRef, ConnShared, Connecting, CLOSING_QUEUE_BYTES, CONNECTION_QUEUE_BYTES,
+    SOCKET_QUEUE_BYTES,
 };
 use crate::{
     congestion::CongestionProbe,
@@ -53,7 +54,7 @@ pub(crate) enum EndpointCmd {
         config: quinn_proto::ClientConfig,
         remote: SocketAddr,
         probe: Arc<CongestionProbe>,
-        slot: ConnectionSlot,
+        slot: Arc<ConnectionSlot>,
         reply: oneshot::Sender<Result<Connecting, quinn_proto::ConnectError>>,
     },
     Serve {
@@ -70,8 +71,8 @@ struct ConnEntry {
     datagrams: mpsc::UnboundedSender<(ConnectionEvent, usize)>,
     control: mpsc::UnboundedSender<ConnectionEvent>,
     shared: Arc<ConnShared>,
-    /// Released when the entry leaves the table (ADM-12).
-    _slot: ConnectionSlot,
+    /// Released when the entry leaves the table (ADM-12, ADM-13).
+    slot: Arc<ConnectionSlot>,
 }
 
 struct Serving {
@@ -273,7 +274,7 @@ impl EndpointTask {
         conn: quinn_proto::Connection,
         probe: Arc<CongestionProbe>,
         admitted: SocketAddr,
-        slot: ConnectionSlot,
+        slot: Arc<ConnectionSlot>,
     ) -> Connecting {
         let (cmds_tx, cmds) = mpsc::unbounded_channel();
         let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
@@ -286,7 +287,7 @@ impl EndpointTask {
                 datagrams: datagrams_tx,
                 control: control_tx,
                 shared: shared.clone(),
-                _slot: slot,
+                slot: slot.clone(),
             },
         );
         let config = &self.shared.config;
@@ -311,6 +312,7 @@ impl EndpointTask {
             admitted: canonical_addr(admitted),
             handshake: handshake_tx,
             limits,
+            slot,
         }));
         Connecting {
             conn: ConnRef {
@@ -412,7 +414,12 @@ impl EndpointTask {
                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                     if let Some(entry) = self.conns.get(&handle) {
                         let queued = &entry.shared.queued_datagram_bytes;
-                        if queued.load(Ordering::Relaxed) + bytes > CONNECTION_QUEUE_BYTES
+                        let limit = if entry.slot.is_closing() {
+                            CLOSING_QUEUE_BYTES
+                        } else {
+                            CONNECTION_QUEUE_BYTES
+                        };
+                        if queued.load(Ordering::Relaxed) + bytes > limit
                             || self.queued_total.load(Ordering::Relaxed) + bytes
                                 > SOCKET_QUEUE_BYTES
                         {
@@ -470,8 +477,8 @@ impl EndpointTask {
         self.response_buf.clear();
         match decision {
             Admit::Accept => {
-                // ADM-12: the slot lasts until the connection drains, so a
-                // peer that churns connections can't outrun the cap.
+                // ADM-12: a live slot. Closed connections draining hold their
+                // own allowance, so they don't count here (ADM-13).
                 let Some(slot) = self.shared.connections.claim_inbound() else {
                     metrics::counter!("zakura.quic.incoming.refused").increment(1);
                     tracing::trace!(target: "zakura_quic", remote = %info.remote, "connection cap full");

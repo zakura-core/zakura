@@ -3731,14 +3731,12 @@ fn validate_discovery_direct_addrs(
 }
 
 fn has_discovery_dialable_direct_addrs(record: &ZakuraNodeRecord) -> bool {
-    peers_accept_direct_addrs(&record.body.direct_addrs)
-}
-
-/// Whether a peer that did not configure this node as a bootstrap peer
-/// imports a record advertising `addrs`. It drops a record with no address,
-/// or with any address it must not dial.
-pub(crate) fn peers_accept_direct_addrs(addrs: &[SocketAddr]) -> bool {
-    !addrs.is_empty() && addrs.iter().all(is_discovery_dialable_addr)
+    !record.body.direct_addrs.is_empty()
+        && record
+            .body
+            .direct_addrs
+            .iter()
+            .all(is_discovery_dialable_addr)
 }
 
 fn has_discovery_usable_direct_addrs(entry: &ZakuraDiscoveryEntry) -> bool {

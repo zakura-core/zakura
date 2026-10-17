@@ -140,4 +140,7 @@ These figures come from a release build on an Apple M3 Ultra. Rates on the pause
 `Status` floods start no repeated work. A 602-message burst of repeated statuses from each of 16
 peers starts one locator read and costs 7.3 µs per status. From each of 255 peers it costs 40 µs per
 status. About 30 µs of that is the pass over cached statuses that the reactor runs after every
-event, so the cost of each status grows with the number of connected peers.
+event, so the cost of each status grows with the number of connected peers. The 602-message burst
+is the cadence capacity, not a ceiling. Cadence exhaustion records and forwards, so one peer can
+keep sending. At 40 µs per status with 255 peers connected, about 25,000 statuses per second
+saturate the reactor. Sizing that as a denial-of-service bound is follow-up work.

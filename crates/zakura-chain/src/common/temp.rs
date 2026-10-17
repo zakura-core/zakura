@@ -131,7 +131,10 @@ impl TempDir {
     /// Creates a new temporary directory in `dir`, with a name starting with `prefix`.
     pub fn new_in(dir: impl AsRef<Path>, prefix: impl AsRef<OsStr>) -> io::Result<Self> {
         let (path, ()) = create_unique(dir.as_ref(), prefix.as_ref(), |path| {
-            let mut builder = fs::DirBuilder::new();
+            let builder = fs::DirBuilder::new();
+
+            #[cfg(unix)]
+            let mut builder = builder;
 
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

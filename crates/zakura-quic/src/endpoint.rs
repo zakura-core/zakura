@@ -841,11 +841,23 @@ impl ConnectionSlots {
     /// different sockets claim concurrently, so the check and the increment
     /// are one atomic step.
     fn claim(&self, limit: usize) -> Option<ConnectionSlot> {
-        self.held
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                (held < limit).then_some(held + 1)
-            })
-            .ok()?;
+        // A plain CAS loop: `fetch_update` is deprecated on newer toolchains
+        // and `try_update` doesn't exist on older ones.
+        let mut held = self.held.load(Ordering::Acquire);
+        loop {
+            if held >= limit {
+                return None;
+            }
+            match self.held.compare_exchange_weak(
+                held,
+                held + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => held = current,
+            }
+        }
         metrics::gauge!("zakura.quic.connections.held").increment(1.0);
         Some(ConnectionSlot {
             held: self.held.clone(),

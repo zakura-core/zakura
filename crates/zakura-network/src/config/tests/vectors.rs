@@ -7,7 +7,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
-        Network, NetworkUpgrade,
+        Network, NetworkKind, NetworkUpgrade,
     },
 };
 
@@ -1287,6 +1287,30 @@ fn regtest_missing_mandatory_checkpoints_returns_config_error() {
         default_config.network.checkpoint_list().max_height(),
         zakura_chain::block::Height(0)
     );
+}
+
+#[test]
+fn regtest_form_keys_are_only_accepted_directly_inside_network() {
+    let config: Config =
+        toml::from_str("network = { params = { checkpoints = false }, regtest = true }")
+            .expect("the Regtest form accepts `regtest` next to `params`");
+    assert_eq!(config.network.kind(), NetworkKind::Regtest);
+
+    for (config, field) in [
+        ("network = { params = { params = {} } }", "params"),
+        ("network = { params = { regtest = true } }", "regtest"),
+        (
+            "network = { network_name = 'ConfiguredTestnet', regtest = true }",
+            "regtest",
+        ),
+        ("network = 'Regtest'\n[testnet_parameters.params]", "params"),
+    ] {
+        let error = toml::from_str::<Config>(config).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{config:?} must reject `{field}`: {error}"
+        );
+    }
 }
 
 #[test]

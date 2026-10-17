@@ -50,6 +50,62 @@ struct SchedulingOpportunity {
     resource_stalled: bool,
 }
 
+/// Full cached-offer passes the reactor may run back to back.
+///
+/// A pass clones and sorts every idle offer. One peer whose statuses keep
+/// changing its own unstarted target changes the scheduling key on every
+/// message, so without a budget it could buy one such pass per message.
+/// Past the burst, passes refill one per [`CACHED_PASS_REFILL`].
+const CACHED_PASS_BURST: u32 = 32;
+
+/// The interval that refills one full cached-offer pass.
+const CACHED_PASS_REFILL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A token bucket of full cached-offer passes; see [`CACHED_PASS_BURST`].
+#[derive(Clone, Copy, Debug)]
+struct CachedPassBudget {
+    passes: u32,
+    refilled_at: Instant,
+}
+
+impl CachedPassBudget {
+    /// A full bucket at `now`.
+    fn new(now: Instant) -> Self {
+        Self {
+            passes: CACHED_PASS_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Refill for the time since the last refill, then take one pass if any
+    /// is left.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let refills = elapsed.as_nanos() / CACHED_PASS_REFILL.as_nanos();
+        if refills > 0 {
+            // At most the burst refills count, which fits u32.
+            let refills = u32::try_from(refills.min(u128::from(CACHED_PASS_BURST)))
+                .expect("the burst fits u32");
+            self.passes = self.passes.saturating_add(refills).min(CACHED_PASS_BURST);
+            self.refilled_at = if self.passes == CACHED_PASS_BURST {
+                now
+            } else {
+                self.refilled_at + CACHED_PASS_REFILL * refills
+            };
+        }
+        let Some(passes) = self.passes.checked_sub(1) else {
+            return false;
+        };
+        self.passes = passes;
+        true
+    }
+
+    /// When the next pass refills.
+    fn next_refill(&self) -> Instant {
+        self.refilled_at + CACHED_PASS_REFILL
+    }
+}
+
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Hard deadline for one VCT repair prepare or apply operation.
@@ -181,6 +237,7 @@ fn build_header_sync_reactor(
         serving: v9::serving_capacity(),
         page_limits,
     };
+    let header_bytes = header_sync_header_bytes_for_network(&startup.network);
     let mut reactor = HeaderSyncReactor {
         startup,
         events: events_rx,
@@ -194,6 +251,8 @@ fn build_header_sync_reactor(
         locator_capacity_waiting: false,
         scheduling_revision: 0,
         last_scheduling_opportunity: None,
+        cached_pass_budget: CachedPassBudget::new(Instant::now()),
+        cached_pass_deferred: false,
         #[cfg(test)]
         cached_offer_visits: 0,
         #[cfg(test)]
@@ -201,6 +260,7 @@ fn build_header_sync_reactor(
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        header_bytes,
         page_limits,
         committed_snapshot,
         vct_repair_status,
@@ -307,6 +367,9 @@ struct HeaderSyncReactor {
     locator_capacity_waiting: bool,
     scheduling_revision: u64,
     last_scheduling_opportunity: Option<SchedulingOpportunity>,
+    cached_pass_budget: CachedPassBudget,
+    /// A changed key whose pass waits for [`Self::cached_pass_budget`] to refill.
+    cached_pass_deferred: bool,
     #[cfg(test)]
     cached_offer_visits: usize,
     #[cfg(test)]
@@ -314,6 +377,11 @@ struct HeaderSyncReactor {
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    /// One header's wire size on this network, fixed for the reactor's life.
+    ///
+    /// Checking a configured testnet for Regtest builds its parameters, and
+    /// every headroom check needs this, so it is computed once.
+    header_bytes: usize,
     /// The serving limits this node advertises in its `Status`.
     page_limits: PageLimits,
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
@@ -1232,6 +1300,12 @@ impl HeaderSyncReactor {
             self.locator_capacity_waiting = true;
             return;
         }
+        if !self.cached_pass_budget.try_take(Instant::now()) {
+            // The key stays uncached, so the pass after the refill scans.
+            self.cached_pass_deferred = true;
+            return;
+        }
+        self.cached_pass_deferred = false;
         #[cfg(test)]
         {
             self.cached_offer_visits += self.peer_state.len();
@@ -1447,7 +1521,7 @@ impl HeaderSyncReactor {
             AuxSchema::None
         };
         let byte_limited_count = v9::page_capacity(
-            header_sync_header_bytes_for_network(&self.startup.network),
+            self.header_bytes,
             tree_aux_schema,
             usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                 .unwrap_or(usize::MAX),
@@ -3128,11 +3202,13 @@ impl HeaderSyncReactor {
     }
 
     fn prune_vct_supplier_history(&mut self) {
+        // Every `Status` reaches this, so build the peer set only for a repair.
+        let Some(task) = self.vct_repair.current_mut() else {
+            return;
+        };
         let connected_sources: HashSet<_> =
             self.peer_state.keys().map(source_id_from_peer).collect();
-        if let Some(task) = self.vct_repair.current_mut() {
-            task.retain_connected_sources(&connected_sources);
-        }
+        task.retain_connected_sources(&connected_sources);
     }
 
     fn try_assign_vct_repair(&mut self) {
@@ -3182,7 +3258,7 @@ impl HeaderSyncReactor {
                 .and_then(|distance| distance.checked_add(1))
                 .unwrap_or(0);
             let message_capacity = v9::page_capacity(
-                header_sync_header_bytes_for_network(&self.startup.network),
+                self.header_bytes,
                 AuxSchema::V1,
                 usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                     .unwrap_or(usize::MAX),
@@ -3566,6 +3642,10 @@ impl HeaderSyncReactor {
                     .and_then(RepairRequirement::next_deadline),
             )
             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
+            .chain(
+                self.cached_pass_deferred
+                    .then(|| self.cached_pass_budget.next_refill()),
+            )
             .chain(
                 self.vct_local_operation
                     .as_ref()

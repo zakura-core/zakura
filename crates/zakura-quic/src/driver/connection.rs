@@ -15,7 +15,7 @@ use quinn_proto::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{ConnCmd, ConnShared, Handshake, ReadReply, READ_BATCH_BYTES};
+use super::{ConnCmd, ConnShared, Handshake, ReadReply, MAX_DRAIN, READ_BATCH_BYTES};
 use crate::{
     congestion::CongestionProbe,
     conn::{
@@ -228,6 +228,8 @@ pub(crate) async fn run(params: ConnTaskParams) {
     sampler.tick().await;
     let mut publish = Box::pin(tokio::time::sleep(Duration::ZERO));
     let mut publish_deadline: Option<Instant> = None;
+    let mut drain = Box::pin(tokio::time::sleep(Duration::ZERO));
+    let mut draining = false;
     if *closing.borrow() {
         task.close(
             VarInt::from_u32(0),
@@ -239,6 +241,12 @@ pub(crate) async fn run(params: ConnTaskParams) {
         task.drive();
         if task.conn.is_drained() {
             break;
+        }
+        if !draining && task.conn.is_closed() {
+            draining = true;
+            drain
+                .as_mut()
+                .reset(tokio::time::Instant::from_std(now() + MAX_DRAIN));
         }
         match task.publish_load() {
             Some(deadline) if publish_deadline != Some(deadline) => {
@@ -296,6 +304,8 @@ pub(crate) async fn run(params: ConnTaskParams) {
                     task.close(VarInt::from_u32(0), Bytes::from_static(reason));
                 }
             },
+            // ADM-11: dropping the task reports the connection drained.
+            () = &mut drain, if draining => break,
             Ok(()) = closing.changed() => {
                 if *closing.borrow() {
                     task.close(VarInt::from_u32(0), Bytes::from_static(b"endpoint shutdown"));

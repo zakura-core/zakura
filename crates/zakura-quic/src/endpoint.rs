@@ -5,7 +5,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
     time::{Duration, Instant},
@@ -129,6 +129,7 @@ pub(crate) struct Shared {
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
+    pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
@@ -199,6 +200,7 @@ impl QuicEndpoint {
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
+            connections: ConnectionSlots::new(bind.max_connections, bind.dial_reserve),
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
@@ -303,6 +305,12 @@ impl QuicEndpoint {
                 }
             })
             .collect()
+    }
+
+    /// QUIC connections the endpoint holds across its sockets, counting
+    /// handshakes and closed connections not yet drained (ADM-12).
+    pub fn connection_count(&self) -> usize {
+        self.inner.shared.connections.held()
     }
 
     /// Network changes the endpoint has passed to its connections (SOCK-12).
@@ -444,6 +452,13 @@ impl QuicEndpoint {
         target: SocketAddr,
         deadline: Option<Duration>,
     ) -> Result<(ConnRef, Handshake), ConnectError> {
+        // ADM-12: claimed here, so a dial at the cap sends no packet.
+        let slot = self
+            .inner
+            .shared
+            .connections
+            .claim_dial()
+            .ok_or(ConnectError::ConnectionLimit)?;
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
         client.transport_config(
@@ -458,6 +473,7 @@ impl QuicEndpoint {
                 config: client,
                 remote: target,
                 probe,
+                slot,
                 reply,
             })
             .map_err(|_| ConnectError::Endpoint(quinn_proto::ConnectError::EndpointStopping))?;
@@ -784,5 +800,68 @@ impl Drop for PendingGuard {
                 counts.by_ip.remove(&self.ip);
             }
         }
+    }
+}
+
+/// QUIC connections held across every socket of one endpoint (ADM-12).
+pub(crate) struct ConnectionSlots {
+    held: Arc<AtomicUsize>,
+    max: usize,
+    max_inbound: usize,
+}
+
+impl ConnectionSlots {
+    /// Allows `max` connections, of which inbound attempts may take all but
+    /// `dial_reserve`.
+    fn new(max: usize, dial_reserve: usize) -> Self {
+        Self {
+            held: Arc::new(AtomicUsize::new(0)),
+            max,
+            max_inbound: max.saturating_sub(dial_reserve),
+        }
+    }
+
+    /// Slots held right now, dial attempts in flight included.
+    pub(crate) fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// Claims a slot for an inbound attempt, or `None` when only the dial
+    /// reserve is left.
+    pub(crate) fn claim_inbound(&self) -> Option<ConnectionSlot> {
+        self.claim(self.max_inbound)
+    }
+
+    /// Claims a slot for one dial attempt, or `None` at the cap.
+    pub(crate) fn claim_dial(&self) -> Option<ConnectionSlot> {
+        self.claim(self.max)
+    }
+
+    /// Claims a slot while fewer than `limit` are held. Endpoint tasks on
+    /// different sockets claim concurrently, so the check and the increment
+    /// are one atomic step.
+    fn claim(&self, limit: usize) -> Option<ConnectionSlot> {
+        self.held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < limit).then_some(held + 1)
+            })
+            .ok()?;
+        metrics::gauge!("zakura.quic.connections.held").increment(1.0);
+        Some(ConnectionSlot {
+            held: self.held.clone(),
+        })
+    }
+}
+
+/// One connection's slot, released on drop. The connection table entry holds
+/// it until `quinn-proto` reports the connection drained (ADM-11).
+pub(crate) struct ConnectionSlot {
+    held: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.held.fetch_sub(1, Ordering::AcqRel);
+        metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
     }
 }

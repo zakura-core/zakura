@@ -38,6 +38,10 @@ pub enum ConnectError {
     /// The peer's key isn't the dialed node ID (TLS-7).
     #[error("the peer presented a different identity than the dialed node ID")]
     WrongIdentity,
+    /// This endpoint already holds `max_connections` QUIC connections
+    /// (ADM-12).
+    #[error("endpoint holds its maximum number of QUIC connections")]
+    ConnectionLimit,
     /// The endpoint is shut down or refused the remote address.
     #[error("endpoint can't dial: {0}")]
     Endpoint(#[from] quinn_proto::ConnectError),
@@ -81,7 +85,7 @@ impl ConnectError {
             Self::Refused => 4,
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
-            Self::Endpoint(_) | Self::Tls(_) => 1,
+            Self::Endpoint(_) | Self::Tls(_) | Self::ConnectionLimit => 1,
             Self::SelfDial | Self::NoUsableAddress => 0,
         }
     }

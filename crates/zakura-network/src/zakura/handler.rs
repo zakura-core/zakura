@@ -322,18 +322,20 @@ pub struct ZakuraConfig {
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
     pub max_connections: usize,
-    /// Bytes of QUIC flow-control credit and queued datagrams that admitted
-    /// native peers together may make this node hold.
+    /// Bytes of QUIC flow-control credit and queued datagrams that native
+    /// connections together may make this node hold.
     ///
-    /// Each connection can hold its `[network.zakura.quic]` receive and send
-    /// windows plus a 16 MiB datagram queue, 80 MiB at the defaults, whether
-    /// or not the node reads (zakura-quic CTRL-26 lists what this leaves
-    /// out). The node admits at most
-    /// this budget divided by that cost, so the default 8 GiB admits 102
-    /// connections and a larger `max_connections` is lowered at startup.
-    /// Startup fails when the budget admits fewer than 16 connections, or
-    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
-    /// peers), or fewer than `max_connections` when that is smaller.
+    /// Each QUIC connection can hold its `[network.zakura.quic]` receive and
+    /// send windows plus a 16 MiB datagram queue, 80 MiB at the defaults,
+    /// whether or not the node reads, until it drains after close
+    /// (zakura-quic CTRL-26 lists what this leaves out). The transport holds
+    /// at most this budget divided by that cost, 102 at the defaults.
+    /// `max_pending_handshakes` of those are headroom for handshakes and
+    /// closing connections, so the node admits 70 and a larger
+    /// `max_connections` is lowered at startup. Startup fails when the budget
+    /// admits fewer than 16 connections, or twice the discovery headroom plus
+    /// one (19 with Mainnet's 9 bootstrap peers), or fewer than
+    /// `max_connections` when that is smaller.
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
@@ -343,6 +345,10 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Also the QUIC connections that
+    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
+    /// beyond the admitted ones, for handshakes and closing connections.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
@@ -417,6 +423,7 @@ impl ZakuraConfig {
             self.peer_memory_budget_bytes,
             self.quic.connection_memory_bytes(),
             self.bootstrap_peers.len(),
+            self.max_pending_handshakes.max(1),
         )
     }
 
@@ -552,10 +559,18 @@ impl ZakuraLocalLimits {
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
+    ///
+    /// The transport holds the admitted connections plus
+    /// `max_pending_handshakes` more, half of them kept for dials (see
+    /// `peer_memory`).
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
+            max_connections: self
+                .max_connections
+                .saturating_add(self.max_pending_handshakes),
+            dial_reserve: self.max_pending_handshakes / 2,
         }
     }
 }
@@ -4368,9 +4383,18 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     );
     let alpns = supported_p2p_v2_alpns();
     let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
-    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
+    let connection = match timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
         .await
-        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
+    {
+        Ok(connection) => connection,
+        // zakura-quic ADM-12: this node's own cap, so discovery doesn't back
+        // off from the peer.
+        Err(zakura_quic::ConnectError::ConnectionLimit) => {
+            return Err(ZakuraHandlerError::ResourceLimit("transport connections"));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let Some(admitted_ip) = admitted_ip {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = admitted_ip.send(connection.admitted_ip());

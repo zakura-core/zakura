@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-17. Version 0.8.
+Status: draft for review, 2026-10-17. Version 0.9.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -17,7 +17,9 @@ explains it. Version 0.6 moves the crate from the noq fork to upstream
 lists each change. Version 0.5 was the draft in #1296. This version doesn't
 include it. Version 0.7 removes qlog output (CTRL-25); §17e explains it.
 Version 0.8 adds CTRL-26, which ties the connection count to a memory budget;
-§17f explains it.
+§17f explains it. Version 0.9 adds ADM-12, a transport cap on QUIC
+connections that lasts until they drain, bounds draining in ADM-11 and makes
+CTRL-26 fund every QUIC connection; §17g lists each change.
 
 ## 0. Conventions
 
@@ -358,7 +360,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   connections, and counts
   `pending_total` with the control handshakes holding `max_pending_handshakes`
   permits. The endpoint applies rules 3 and 5 after the acceptor returns
-  `Accept`. Rules 3 and 4 both refuse, so their order doesn't change the result.
+  `Accept`, then its connection cap (ADM-12). Rules 3 and 4 both refuse, so
+  their order doesn't change the result.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
   ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
   rule 1 never fires.
@@ -407,7 +410,39 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-11.** The endpoint task MUST remove a connection from its table only
   when `quinn-proto` reports the connection drained, and MUST NOT pass
   `quinn-proto` an event for a connection it already removed. A connection
-  task that exits without a drained event reports one when it drops.
+  task that exits without a drained event reports one when it drops. A
+  connection task MUST exit at most 3 s (`MAX_DRAIN`) after its connection
+  closes, drained or not. `quinn-proto` drains after three PTOs, and the PTO
+  adds the peer's advertised `max_ack_delay` (up to 2^14 ms), so a peer could
+  otherwise keep a closed connection, its stream buffers and its ADM-12 slot
+  for most of a minute. A late packet for a connection dropped early gets at
+  most a stateless reset.
+- **ADM-12.** The endpoint MUST hold at most `QuicBindConfig::max_connections`
+  QUIC connections across all its sockets. A connection counts from `accept`
+  or `connect` until it leaves the table (ADM-11), so handshakes, dial
+  attempts and closed connections still draining all count. Each address
+  attempt of a dial (DIAL-3) counts on its own.
+  - An attempt the acceptor and rules 3 and 5 accept MUST be refused while
+    `max_connections - dial_reserve` connections are held. Refusing creates
+    no connection state (SEC-3). Inbound attempts therefore never take the
+    last `dial_reserve` slots, and peers that churn inbound connections
+    can't stop this node's dials.
+  - A dial attempt MUST fail with `ConnectFailed(ConnectionLimit)` before
+    sending a packet while `max_connections` are held. `zakura-network`
+    treats that as its own resource limit, not the peer's fault.
+
+  Zakura sets `max_connections` to its admitted cap plus
+  `max_pending_handshakes`, and `dial_reserve` to half of
+  `max_pending_handshakes`: 102 and 16 at the defaults (CTRL-26).
+
+  Slots of closed connections stay busy until they drain, at most 3 s. A peer
+  that completes handshakes and gets rejected over and over can keep the
+  inbound slots that admitted connections leave free busy, at least 16 at
+  the defaults, and other inbound attempts are refused while it does. That
+  takes about 5 completed handshakes per second for every 16 slots.
+  Admitted connections and this node's dials keep working. Without the cap,
+  the same churn grew the table without bound, at up to 80 MiB of buffers
+  per closed connection.
 
 ## 8. Dialing
 
@@ -474,35 +509,34 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (102), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (70), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
 `peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
 
-- **CTRL-26.** One connection can make the node hold
+- **CTRL-26.** One QUIC connection can make the node hold
   `receive_window_bytes + send_window_bytes` plus its 16 MiB datagram queue
   (DRV-3) in transport buffers, 80 MiB at the defaults, whether or not the
-  application reads. Per-stream receive windows sit inside the connection
-  window and add nothing. `zakura_quic::connection_memory_bytes` is the only
-  implementation of this formula. The node admits at most
-  `[network.zakura] peer_memory_budget_bytes` divided by this cost
-  connections. Startup lowers a larger `max_connections` to that count with
-  a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
-  admits fewer than 16 connections or twice the discovery headroom plus one
-  (19 with Mainnet's 9 bootstrap peers), so discovery keeps a dial slot with
-  every bootstrap peer connected. A smaller `max_connections` lowers that
-  floor to match. The budget never shrinks the windows, so it costs no
-  per-connection throughput.
+  application reads, until it leaves the connection table (ADM-11).
+  Per-stream receive windows sit inside the connection window and add
+  nothing. `zakura_quic::connection_memory_bytes` is the only implementation
+  of this formula. `[network.zakura] peer_memory_budget_bytes` divided by
+  this cost is the number of QUIC connections the budget funds, 102 at the
+  defaults. `max_pending_handshakes` of them are headroom for handshakes not
+  yet admitted, extra address attempts of one dial and closed connections
+  still draining, and the node admits the rest, 70 at the defaults. ADM-12
+  holds the transport to the admitted cap plus that headroom, so every QUIC
+  connection the node holds is funded. Startup lowers a larger
+  `max_connections` to the admitted count with a warning. It fails, naming
+  `peer_memory_budget_bytes`, when the budget admits fewer than 16
+  connections or twice the discovery headroom plus one (19 with Mainnet's 9
+  bootstrap peers), so discovery keeps a dial slot with every bootstrap peer
+  connected. A smaller `max_connections` lowers that floor to match. The
+  budget never shrinks the windows, so it costs no per-connection throughput.
 
   The budget counts flow-control credit and queued datagrams, not resident
-  memory, and only for admitted connections. An inbound connection takes its
-  slot when TLS finishes, before its control handshake, and a dial takes one
-  before its first attempt. The slot frees when the connection's serving task
-  ends. These still hold buffers outside the budget: handshakes not yet
-  admitted (at most `max_pending_handshakes`), extra address attempts of one
-  dial, closed connections until `quinn-proto` reports them drained (three
-  PTOs), reassembly bookkeeping and allocator overhead, and our writes still
-  waiting for send credit.
+  memory. Reassembly bookkeeping and allocator overhead come on top, as do
+  our writes still waiting for send credit (DRV-4).
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -568,6 +602,7 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
 | `zakura.quic.connections` | gauge | Open connections |
+| `zakura.quic.connections.held` | gauge | ADM-12 slots held: handshakes, open connections and closed connections not yet drained |
 | `zakura.quic.dial.attempts` / `.alpn_mismatch` | counter | DIAL-3, DIAL-5 |
 | `zakura.quic.paths.closed_banned` | counter | PATH-3 closes |
 | `zakura.quic.packets.lost` | counter | Sum of `PathStats::lost_packets` deltas |
@@ -631,7 +666,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-1.** Identity: `NodeId`, `NodeSecretKey` and `NodeAddr { id, direct: Vec<SocketAddr> }`.
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
-  - `local_id()`, `local_addrs()`, `socket_stats()`, `network_changes()` and `config()`;
+  - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
+    (ADM-12), `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
   - `connect(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`, which
     offers `alpns` in order; an empty list fails with
@@ -667,7 +703,7 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   `FrameStats`.
 - **API-6.** Errors: `ConnectError` has the variants `SelfDial`,
   `NoUsableAddress`, `AlpnMismatch`, `HandshakeTimeout`, `Refused`, `WrongIdentity`,
-  `Endpoint(quinn_proto::ConnectError)`, `Tls` and
+  `ConnectionLimit` (ADM-12), `Endpoint(quinn_proto::ConnectError)`, `Tls` and
   `Transport(quinn_proto::ConnectionError)`.
   `Endpoint` covers local endpoint failures such as a stopping endpoint; `Tls`
   covers other TLS alerts. `BindError` and `ConfigError` name the failing key
@@ -835,6 +871,9 @@ this release tolerates, and keep each hard change explicit.
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
+| Peers that fill a stream, get rejected and reconnect never push the held count past the inbound cap, and every slot frees once they stop | ADM-12 |
+| Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit` | ADM-12 |
+| Behind a relay that makes three PTOs outlast the bound, a closed connection frees its slot within `MAX_DRAIN` | ADM-11, ADM-12 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
 | Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-24 |
@@ -1028,3 +1067,29 @@ Added:
   that peers can fill, so 256 connections could hold 20 GiB at the defaults
   (V12 F-69). `peer_memory_budget_bytes` now caps the count, and the default
   `max_connections` drops from 256 to the 102 that the default budget admits.
+
+## 17g. Changes in version 0.9
+
+Added:
+
+- **ADM-12.** The connection table had no cap. Closed connections stayed in
+  it, holding their stream buffers, until `quinn-proto` drained them, and
+  handshakes and extra dial attempts sat outside Zakura's admission cap. A
+  peer could fill a stream, fail the control handshake, free its admission
+  slot and reconnect while the old buffers drained. In a test, 12 peers
+  doing that left 66 QUIC connections in the table. The endpoint now caps
+  the table across sockets, keeps a dial reserve inbound attempts can't
+  take, and fails a dial at the cap with the new `ConnectError` variant
+  `ConnectionLimit`. `QuicBindConfig` gains `max_connections` and
+  `dial_reserve`, and `QuicEndpoint` gains `connection_count()`.
+
+Changed:
+
+- **ADM-11.** A connection task exits at most 3 s after its connection
+  closes, so a peer's `max_ack_delay` or inflated RTT can't stretch the time
+  a closed connection holds its slot and buffers.
+- **ADM-3.** The endpoint applies ADM-12 after rules 3 and 5.
+- **CTRL-26.** The budget now funds every QUIC connection the transport may
+  hold, not only admitted ones: the admitted cap plus `max_pending_handshakes`
+  of headroom. The default `max_connections` drops from 102 to 70, and the
+  exclusion list keeps only resident-memory overheads and pending writes.

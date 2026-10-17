@@ -354,6 +354,12 @@ pub struct QuicBindConfig {
     pub addrs: Vec<SocketAddr>,
     /// Concurrent bidirectional streams per connection (WIRE-8).
     pub max_bidi_streams: u32,
+    /// QUIC connections the endpoint holds across all its sockets, from
+    /// accept or connect until drained (ADM-12).
+    pub max_connections: usize,
+    /// Slots of `max_connections` that only dials may take, so inbound
+    /// attempts can't block this node's own dials (ADM-12).
+    pub dial_reserve: usize,
 }
 
 #[cfg(test)]

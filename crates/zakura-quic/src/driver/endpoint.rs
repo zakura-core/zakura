@@ -28,7 +28,10 @@ use super::{
 };
 use crate::{
     congestion::CongestionProbe,
-    endpoint::{decide, inbound_handshake, Acceptor, Admit, IncomingInfo, Shared, SocketSlot},
+    endpoint::{
+        decide, inbound_handshake, Acceptor, Admit, ConnectionSlot, IncomingInfo, Shared,
+        SocketSlot,
+    },
     socket::{bind_udp, SocketCell, UdpIo, RECV_BUFFER_BYTES},
     sys::canonical_addr,
 };
@@ -50,6 +53,7 @@ pub(crate) enum EndpointCmd {
         config: quinn_proto::ClientConfig,
         remote: SocketAddr,
         probe: Arc<CongestionProbe>,
+        slot: ConnectionSlot,
         reply: oneshot::Sender<Result<Connecting, quinn_proto::ConnectError>>,
     },
     Serve {
@@ -66,6 +70,8 @@ struct ConnEntry {
     datagrams: mpsc::UnboundedSender<(ConnectionEvent, usize)>,
     control: mpsc::UnboundedSender<ConnectionEvent>,
     shared: Arc<ConnShared>,
+    /// Released when the entry leaves the table (ADM-12).
+    _slot: ConnectionSlot,
 }
 
 struct Serving {
@@ -224,6 +230,7 @@ impl EndpointTask {
                 config,
                 remote,
                 probe,
+                slot,
                 reply,
             } => {
                 if self.close_deadline.is_some() {
@@ -233,7 +240,7 @@ impl EndpointTask {
                 let result = self
                     .endpoint
                     .connect(now(), config, remote, crate::tls::UNSENT_SERVER_NAME)
-                    .map(|(handle, conn)| self.spawn_connection(handle, conn, probe, remote));
+                    .map(|(handle, conn)| self.spawn_connection(handle, conn, probe, remote, slot));
                 let _ = reply.send(result);
             }
             EndpointCmd::Serve { server, acceptor } => {
@@ -266,6 +273,7 @@ impl EndpointTask {
         conn: quinn_proto::Connection,
         probe: Arc<CongestionProbe>,
         admitted: SocketAddr,
+        slot: ConnectionSlot,
     ) -> Connecting {
         let (cmds_tx, cmds) = mpsc::unbounded_channel();
         let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
@@ -278,6 +286,7 @@ impl EndpointTask {
                 datagrams: datagrams_tx,
                 control: control_tx,
                 shared: shared.clone(),
+                _slot: slot,
             },
         );
         let config = &self.shared.config;
@@ -461,6 +470,15 @@ impl EndpointTask {
         self.response_buf.clear();
         match decision {
             Admit::Accept => {
+                // ADM-12: the slot lasts until the connection drains, so a
+                // peer that churns connections can't outrun the cap.
+                let Some(slot) = self.shared.connections.claim_inbound() else {
+                    metrics::counter!("zakura.quic.incoming.refused").increment(1);
+                    tracing::trace!(target: "zakura_quic", remote = %info.remote, "connection cap full");
+                    let transmit = self.endpoint.refuse(incoming, &mut self.response_buf);
+                    self.send_response(&transmit, io);
+                    return;
+                };
                 // ADM-7: count the handshake from Accept until it finishes.
                 let pending = self.shared.pending.enter(remote.ip());
                 let probe = Arc::new(CongestionProbe::default());
@@ -474,7 +492,8 @@ impl EndpointTask {
                 ) {
                     Ok((handle, conn)) => {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
-                        let connecting = self.spawn_connection(handle, conn, probe, raw_remote);
+                        let connecting =
+                            self.spawn_connection(handle, conn, probe, raw_remote, slot);
                         self.tasks.spawn(inbound_handshake(
                             connecting,
                             self.shared.config.handshake_timeout(),

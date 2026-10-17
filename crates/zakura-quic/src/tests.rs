@@ -3,7 +3,10 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -76,6 +79,8 @@ fn loopback() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
     }
 }
 
@@ -83,6 +88,8 @@ fn wildcard() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
     }
 }
 
@@ -1967,6 +1974,204 @@ async fn a_header_read_takes_only_the_header_from_quinn() {
             "{delivered}"
         );
         assert!(recv.read_chunk(usize::MAX).await.unwrap().is_some());
+    })
+    .await
+    .unwrap();
+}
+
+/// Takes the first stream's data and then rejects the connection, the way
+/// Zakura closes a peer that fails its control handshake.
+struct ChurnAcceptor;
+
+impl Acceptor for ChurnAcceptor {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(50), conn.accept_bi()).await;
+            conn.close(VarInt::from_u32(0), b"control handshake");
+        })
+    }
+}
+
+/// ADM-12: peers that fill a stream, get rejected and reconnect at once never
+/// make the endpoint hold more connections than its cap, closed connections
+/// still draining included, and every slot comes back once they stop.
+#[tokio::test]
+async fn churned_connections_never_exceed_the_cap() {
+    const CAP: usize = 6;
+    const RESERVE: usize = 2;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: CAP,
+            dial_reserve: RESERVE,
+            ..loopback()
+        };
+        let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+        server.serve(ChurnAcceptor).unwrap();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let (server, stop, peak) = (server.clone(), stop.clone(), peak.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peak.fetch_max(server.connection_count(), Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let refused = Arc::new(AtomicUsize::new(0));
+        let mut churners = Vec::new();
+        for _ in 0..12 {
+            let (addr, refused) = (addr.clone(), refused.clone());
+            churners.push(tokio::spawn(async move {
+                let client = client();
+                for _ in 0..8 {
+                    match client.connect(addr.clone(), &[ALPN]).await {
+                        Ok(conn) => {
+                            if let Ok((mut send, _recv)) = conn.open_bi().await {
+                                let _ = send.write_all(&[7; 256 * 1024]).await;
+                            }
+                            conn.closed().await;
+                        }
+                        Err(ConnectError::Refused) => {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }));
+        }
+        for churner in churners {
+            churner.await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        // Inbound attempts stop short of the dial reserve.
+        assert_eq!(peak.load(Ordering::Relaxed), CAP - RESERVE);
+        assert!(refused.load(Ordering::Relaxed) > 0);
+        tokio::time::timeout(crate::driver::MAX_DRAIN + Duration::from_secs(2), async {
+            while server.connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every slot frees once its connection drains");
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: inbound connections can't take the dial reserve, and a dial at the
+/// cap fails locally.
+#[tokio::test]
+async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 2,
+            dial_reserve: 1,
+            ..loopback()
+        };
+        let mut node = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let first = client();
+        let _held = first.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 1);
+
+        let second = client();
+        assert!(matches!(
+            second.connect(node.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+
+        let peer = server();
+        let _dialed = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 2);
+        assert!(matches!(
+            node.endpoint.connect(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+/// A UDP relay that delays every datagram by `delay` in each direction.
+struct DelayRelay {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelayRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts a relay to `server` that adds `delay` each way.
+async fn delay_relay(server: SocketAddr, delay: Duration) -> DelayRelay {
+    let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let (mut up, mut down) = (vec![0; 65_536], vec![0; 65_536]);
+        loop {
+            let (data, to, socket) = tokio::select! {
+                Ok((len, from)) = front.recv_from(&mut up) => {
+                    client = Some(from);
+                    (up[..len].to_vec(), server, back.clone())
+                }
+                Ok((len, _)) = back.recv_from(&mut down) => {
+                    let Some(client) = client else { continue };
+                    (down[..len].to_vec(), client, front.clone())
+                }
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = socket.send_to(&data, to).await;
+            });
+        }
+    });
+    DelayRelay { addr, task }
+}
+
+/// ADM-11, ADM-12: a closed connection frees its slot within `MAX_DRAIN`
+/// even when three of its PTOs last longer, as when a peer inflates its RTT
+/// or advertises a large `max_ack_delay`.
+#[tokio::test]
+async fn a_closed_connection_frees_its_slot_within_the_drain_bound() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let relay = delay_relay(server.endpoint.local_addrs()[0], Duration::from_millis(750)).await;
+        let client = client();
+        let via_relay = NodeAddr::with_addrs(server.endpoint.local_id(), vec![relay.addr]);
+        let _conn = client.connect(via_relay, &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        let rtt = inbound.stats().await.unwrap().connection.path.rtt;
+        let bound = crate::driver::MAX_DRAIN + Duration::from_secs(1);
+        // quinn-proto alone would hold the connection for longer than the test waits.
+        assert!(rtt * 3 > bound, "{rtt:?}");
+
+        assert_eq!(server.endpoint.connection_count(), 1);
+        inbound.close(VarInt::from_u32(0), b"done");
+        tokio::time::timeout(bound, async {
+            while server.endpoint.connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the slot frees within the drain bound");
     })
     .await
     .unwrap();

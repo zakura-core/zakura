@@ -827,18 +827,6 @@ impl AddressBook {
         }
     }
 
-    /// Returns true if the given [`PeerSocketAddr`] is pending a reconnection
-    /// attempt.
-    pub fn pending_reconnection_addr(&mut self, addr: PeerSocketAddr) -> bool {
-        let meta_addr = self.get(addr);
-
-        let _guard = self.span.enter();
-        match meta_addr {
-            None => false,
-            Some(peer) => peer.last_connection_state == PeerAddrState::AttemptPending,
-        }
-    }
-
     /// Return an iterator over all peers.
     ///
     /// Returns peers in reconnection attempt order, including recently connected peers.

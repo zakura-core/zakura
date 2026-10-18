@@ -1568,11 +1568,6 @@ async fn test_populated_state_responds_correctly(
         let height = block.coinbase_height().unwrap();
         let hash = block.hash();
 
-        transcript.push((
-            Request::Depth(block.hash()),
-            Ok(Response::Depth(Some(LAST_BLOCK_HEIGHT - height.0))),
-        ));
-
         // these requests don't have any arguments, so we just do them once
         if ind == LAST_BLOCK_HEIGHT as usize {
             transcript.push((Request::Tip, Ok(Response::Tip(Some((height, hash))))));
@@ -1590,18 +1585,6 @@ async fn test_populated_state_responds_correctly(
                 Request::BlockLocator,
                 Ok(Response::BlockLocator(locator_hashes)),
             ));
-        }
-
-        // Spec: transactions in the genesis block are ignored.
-        if height.0 != 0 {
-            for transaction in &block.transactions {
-                let transaction_hash = transaction.hash();
-
-                transcript.push((
-                    Request::Transaction(transaction_hash),
-                    Ok(Response::Transaction(Some(transaction.clone()))),
-                ));
-            }
         }
 
         transcript.push((
@@ -1737,13 +1720,8 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
     let iter = vec![
         // No checks for SemanticallyVerifiedBlock or CommitCheckpointVerifiedBlock because empty state
         // precondition doesn't matter to them
-        (Request::Depth(block.hash()), Ok(Response::Depth(None))),
         (Request::Tip, Ok(Response::Tip(None))),
         (Request::BlockLocator, Ok(Response::BlockLocator(vec![]))),
-        (
-            Request::Transaction(transaction::Hash([0; 32])),
-            Ok(Response::Transaction(None)),
-        ),
         (
             Request::Block(block.hash().into()),
             Ok(Response::Block(None)),

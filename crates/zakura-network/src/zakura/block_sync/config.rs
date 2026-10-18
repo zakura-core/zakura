@@ -64,6 +64,26 @@ pub const DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES: u64 = 1536 * 1024 * 1024;
 /// maximum checkpoint gap plus the boundary block in flight.
 pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
     zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
+/// Decoded-byte cap on the block-sync submission window above the last checkpoint.
+///
+/// Above the verifier's last checkpoint, blocks are not fixed history, so the
+/// count-only window could hold `submitted_apply_limit` worst-case decoded
+/// blocks. There the sequencer stops keeping decoded copies and stops
+/// submitting once the window's decoded heap would exceed this cap. Later
+/// bodies stay raw and decode at submit as earlier submissions finish. When
+/// none of the window's bodies is submitted, the next one is always allowed,
+/// so a single oversized block still progresses. Checkpoint heights are exempt
+/// because a whole checkpoint range must be co-resident (see
+/// [`MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES`]).
+///
+/// The cap gates new submissions and is not a hard ceiling. Submissions
+/// detached by a failure or reset stay charged but never block the next body,
+/// so after repeated resets the window can exceed the cap within the count
+/// limit.
+///
+/// 512 MiB is about 1.5x the 354 MiB decoded-window peak measured while
+/// syncing the Mainnet sandblasting range.
+pub const BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 /// The byte size of one full worst-case checkpoint range held in flight.
 ///
 /// The checkpoint verifier resolves a block's commit only once the entire

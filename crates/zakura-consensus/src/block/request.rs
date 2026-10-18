@@ -58,14 +58,6 @@ impl Request {
         }
     }
 
-    /// Returns the prepared candidate source.
-    pub fn prepared_candidate_source(&self) -> Option<PreparedCandidateSource> {
-        match self {
-            Request::Prepare { source, .. } => Some(*source),
-            _ => None,
-        }
-    }
-
     /// Returns the state admission notification for a mined commit.
     pub fn admission(&self) -> Option<BlockAdmission> {
         match self {

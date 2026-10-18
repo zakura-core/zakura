@@ -3,9 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam_channel::TryRecvError;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator as _};
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NonNegative},
     block::{Block, Height},
@@ -59,7 +59,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         initial_finalized_tip_height: Option<zakura_chain::block::Height>,
         db: &crate::ZakuraDb,
-        cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
+        cancel_receiver: &super::CancelReceiver,
     ) -> Result<(), super::FormatChangeError> {
         let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
             return Ok(());
@@ -258,7 +258,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         db: &crate::ZakuraDb,
-        cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
+        cancel_receiver: &super::CancelReceiver,
     ) -> Result<Result<(), String>, super::FormatChangeError> {
         let network = db.network();
 

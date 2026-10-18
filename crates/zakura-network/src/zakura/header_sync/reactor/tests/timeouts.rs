@@ -55,6 +55,7 @@ impl PendingVctLocalPort {
 impl port::Port for PendingVctLocalPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
@@ -142,6 +143,13 @@ impl port::Port for PendingVctLocalPort {
                 ))
             }
         })
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
     }
 }
 

@@ -68,7 +68,6 @@ bytes = "1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = "4.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
-crossbeam-channel = "0.5.14"
 curve25519-dalek = "4.1"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
@@ -153,12 +152,7 @@ tonic-prost-build = { version = "0.14", default-features = false, features = ["t
 tower = "0.5.3"
 tracing = "0.1.41"
 tracing-error = "0.2"
-tracing-journald = "0.3"
 tracing-subscriber = "0.3.19"
-tracing-opentelemetry = "0.33"
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
 zcash_note_encryption = { version = "=4.0.0-rc0", package = "zakura-note-encryption" }
 zcash_script = "0.6"
@@ -306,6 +300,12 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
+[profile.test]
+# Match CI, where the toolchain action sets CARGO_PROFILE_DEV_DEBUG=0. Full
+# debuginfo slows each test build by about 25%. Panic messages still name the
+# panicking file and line. `cargo build` keeps full debuginfo for debugging.
+debug = 0
+
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment
 # (security_requirements.md SR-1); do not set "abort". Enforced by a
@@ -323,6 +323,13 @@ panic = "unwind"
 #     - add "-flto=thin" to all C/C++ code builds
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
 lto = "thin"
+
+# Each codegen unit gets its own copy of the generic code and drop glue it uses,
+# and thin LTO does not merge those copies. 4 units instead of the default 16
+# shrinks zakurad's .text by about 5% while still using 4 cores per crate, the
+# size of the standard CI runners.
+codegen-units = 4
+
 # Enable line numbers in stack traces. Note that we re-disable it for dependencies below.
 debug = "line-tables-only"
 

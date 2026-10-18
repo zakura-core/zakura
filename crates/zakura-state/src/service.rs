@@ -43,6 +43,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::{
@@ -654,7 +655,7 @@ impl StateService {
 
         // Spawn a background task to periodically export RocksDB metrics to Prometheus
         let db_for_metrics = read_service.db.clone();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
@@ -2192,11 +2193,9 @@ impl Service<Request> for StateService {
 
             // Runs concurrently using the ReadStateService
             Request::Tip
-            | Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator
-            | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
@@ -3111,7 +3110,7 @@ impl Service<ReadRequest> for ReadStateService {
                 .collect(),
             )),
 
-            ReadRequest::HeaderLocator => {
+            ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let locator = reader
                     .map(|reader| reader.committed_selected_locator())
@@ -3181,6 +3180,16 @@ impl Service<ReadRequest> for ReadStateService {
                     .transpose()?
                     .unwrap_or(false);
                 Ok(ReadResponse::RetainedHeaderPathReleased(released))
+            }
+
+            ReadRequest::SelectedChainMembership { hash } => {
+                let membership = match state.header_chain_reader_receiver.borrow().clone() {
+                    Some(reader) => reader.selected_chain_membership(hash)?,
+                    None => {
+                        zakura_node_services::header_chain::SelectedChainMembership::NotRetained
+                    }
+                };
+                Ok(ReadResponse::SelectedChainMembership(membership))
             }
 
             ReadRequest::BlockRoots {

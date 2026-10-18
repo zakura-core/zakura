@@ -2236,7 +2236,11 @@ mod zakura_header_sync_driver_tests {
             );
             let locator = startup
                 .header_chain_port
-                .continuation_locator()
+                .continuation_locator(zakura_node_services::header_chain::LocatorReadPermit::new(
+                    Arc::new(tokio::sync::Semaphore::new(1))
+                        .try_acquire_owned()
+                        .unwrap(),
+                ))
                 .await
                 .expect("the restarted continuation locator query succeeds")
                 .expect("the restarted state has a selected-path locator");

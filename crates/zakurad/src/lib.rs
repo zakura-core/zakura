@@ -67,7 +67,6 @@
 //!
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
-//! * `journald`: send tracing spans and events to `systemd-journald`.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.

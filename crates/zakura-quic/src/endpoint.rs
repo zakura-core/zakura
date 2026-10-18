@@ -688,17 +688,27 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
     Admit::Accept
 }
 
+/// Counts a handshake result, and records its duration when it completed.
 fn record_handshake<T>(result: &Result<T, ConnectError>, started: Instant) {
+    let Some(counter) = handshake_counter(result) else {
+        return;
+    };
+    metrics::counter!(counter).increment(1);
+    if result.is_ok() {
+        metrics::histogram!("zakura.quic.handshake.duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+    }
+}
+
+/// The handshake counter a dial or accept result belongs to, or `None` when
+/// no handshake happened: `ConnectionLimit` is this node's own cap refusing
+/// the attempt before any packet (ADM-12), so it isn't a failed handshake.
+fn handshake_counter<T>(result: &Result<T, ConnectError>) -> Option<&'static str> {
     match result {
-        Ok(_) => {
-            metrics::counter!("zakura.quic.handshake.completed").increment(1);
-            metrics::histogram!("zakura.quic.handshake.duration_seconds")
-                .record(started.elapsed().as_secs_f64());
-        }
-        Err(ConnectError::HandshakeTimeout) => {
-            metrics::counter!("zakura.quic.handshake.timed_out").increment(1);
-        }
-        Err(_) => metrics::counter!("zakura.quic.handshake.failed").increment(1),
+        Ok(_) => Some("zakura.quic.handshake.completed"),
+        Err(ConnectError::HandshakeTimeout) => Some("zakura.quic.handshake.timed_out"),
+        Err(ConnectError::ConnectionLimit) => None,
+        Err(_) => Some("zakura.quic.handshake.failed"),
     }
 }
 
@@ -952,5 +962,27 @@ impl Drop for ConnectionSlot {
             self.counts.live.fetch_sub(1, Ordering::AcqRel);
             metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dial refused at this node's own cap never reached the peer, so it
+    /// isn't counted as a failed handshake (ADM-12).
+    #[test]
+    fn a_local_cap_refusal_is_not_a_handshake_result() {
+        let counter = |result: Result<(), ConnectError>| handshake_counter(&result);
+        assert_eq!(counter(Err(ConnectError::ConnectionLimit)), None);
+        assert_eq!(counter(Ok(())), Some("zakura.quic.handshake.completed"));
+        assert_eq!(
+            counter(Err(ConnectError::HandshakeTimeout)),
+            Some("zakura.quic.handshake.timed_out")
+        );
+        assert_eq!(
+            counter(Err(ConnectError::Refused)),
+            Some("zakura.quic.handshake.failed")
+        );
     }
 }

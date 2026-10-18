@@ -62,6 +62,8 @@ pub(crate) fn validate_header_version(version: u32) -> Result<(), &'static str> 
 }
 
 impl ZcashSerialize for Header {
+    crate::serialization::compile_serialize_entry_points_here!();
+
     #[allow(clippy::unwrap_in_result)]
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         validate_header_version(self.version).map_err(io::Error::other)?;
@@ -84,6 +86,8 @@ impl ZcashSerialize for Header {
 }
 
 impl ZcashDeserialize for Header {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
@@ -140,6 +144,8 @@ impl ZcashDeserialize for CountedHeader {
 }
 
 impl ZcashSerialize for Block {
+    crate::serialization::compile_serialize_entry_points_here!();
+
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // All block structs are validated when they are parsed.
         // So we don't need to check MAX_BLOCK_BYTES here, until
@@ -151,6 +157,8 @@ impl ZcashSerialize for Block {
 }
 
 impl ZcashDeserialize for Block {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {

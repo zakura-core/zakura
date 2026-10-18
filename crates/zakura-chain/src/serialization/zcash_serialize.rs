@@ -38,21 +38,54 @@ pub trait ZcashSerialize: Sized {
     /// encoder is compiled once per writer type rather than once per nesting depth.
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error>;
 
+    /// Append `self` to the end of `out`.
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        self.zcash_serialize(out)
+    }
+
     /// Helper function to construct a vec to serialize the current struct into
     fn zcash_serialize_to_vec(&self) -> Result<Vec<u8>, io::Error> {
         let mut data = Vec::new();
-        self.zcash_serialize(&mut data)?;
+        self.zcash_serialize_into_vec(&mut data)?;
         Ok(data)
     }
 
     /// Get the size of `self` by using a fake writer.
     fn zcash_serialized_size(&self) -> usize {
-        let mut writer = FakeWriter(0);
-        self.zcash_serialize(&mut writer)
-            .expect("writer should never fail");
-        writer.0
+        serialized_size_with_fake_writer(self)
     }
 }
+
+/// The number of bytes `value` serializes to, counted without allocating.
+pub(crate) fn serialized_size_with_fake_writer<T: ZcashSerialize>(value: &T) -> usize {
+    let mut writer = FakeWriter(0);
+    value
+        .zcash_serialize(&mut writer)
+        .expect("writer should never fail");
+    writer.0
+}
+
+/// Compiles a type's `Vec` and size encoders once, in this crate.
+///
+/// The provided `ZcashSerialize` methods are generic over `Self`, so every crate
+/// that calls them compiles its own copy of the type's whole encoder. Expanding
+/// this macro inside a type's `ZcashSerialize` impl overrides them with
+/// non-generic methods that other crates call instead. Use it for types with
+/// large encoders that other crates serialize, such as blocks and transactions.
+macro_rules! compile_serialize_entry_points_here {
+    () => {
+        #[inline(never)]
+        fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), std::io::Error> {
+            self.zcash_serialize(out)
+        }
+
+        #[inline(never)]
+        fn zcash_serialized_size(&self) -> usize {
+            $crate::serialization::serialized_size_with_fake_writer(self)
+        }
+    };
+}
+pub(crate) use compile_serialize_entry_points_here;
 
 impl ZcashSerialize for u8 {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {

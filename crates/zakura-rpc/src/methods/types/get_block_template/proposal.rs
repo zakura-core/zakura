@@ -7,7 +7,7 @@ use std::{num::ParseIntError, str::FromStr, sync::Arc};
 use zakura_chain::{
     block::{self, Block, Height},
     parameters::{Network, NetworkUpgrade},
-    serialization::{BytesInDisplayOrder, DateTime32, SerializationError, ZcashDeserializeInto},
+    serialization::{BytesInDisplayOrder, DateTime32, SerializationError, ZcashDeserialize},
     work::equihash::Solution,
 };
 use zakura_node_services::BoxError;
@@ -204,10 +204,14 @@ pub fn proposal_block_from_template(
         .time_from_template(template)
         .into();
 
-    let mut transactions = vec![coinbase_txn.data.as_ref().zcash_deserialize_into()?];
+    let mut transactions = vec![ZcashDeserialize::zcash_deserialize_from_slice(
+        &mut coinbase_txn.data.as_ref(),
+    )?];
 
     for tx_template in tx_templates {
-        transactions.push(tx_template.data.as_ref().zcash_deserialize_into()?);
+        transactions.push(ZcashDeserialize::zcash_deserialize_from_slice(
+            &mut tx_template.data.as_ref(),
+        )?);
     }
 
     let commitment_bytes = match NetworkUpgrade::current(net, height) {

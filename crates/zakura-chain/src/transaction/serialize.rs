@@ -595,6 +595,8 @@ impl<T: reddsa::SigType> ZcashDeserialize for reddsa::Signature<T> {
 }
 
 impl ZcashSerialize for Transaction {
+    crate::serialization::compile_serialize_entry_points_here!();
+
     #[allow(clippy::unwrap_in_result)]
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // Post-Sapling, transaction size is limited to MAX_BLOCK_BYTES.
@@ -883,6 +885,8 @@ impl ZcashSerialize for Transaction {
 }
 
 impl ZcashDeserialize for Transaction {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     #[allow(clippy::unwrap_in_result)]
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
@@ -1252,6 +1256,10 @@ where
     ) -> Result<Self, SerializationError> {
         Ok(Arc::new(reader.read_value::<T>()?))
     }
+
+    fn zcash_deserialize_from_slice(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
+        T::zcash_deserialize_from_slice(bytes).map(Arc::new)
+    }
 }
 
 impl<T> ZcashSerialize for Arc<T>
@@ -1260,6 +1268,14 @@ where
 {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         T::zcash_serialize(self, writer)
+    }
+
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        T::zcash_serialize_into_vec(self, out)
+    }
+
+    fn zcash_serialized_size(&self) -> usize {
+        T::zcash_serialized_size(self)
     }
 }
 

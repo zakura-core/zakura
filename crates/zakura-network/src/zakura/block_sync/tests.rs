@@ -4942,6 +4942,129 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
+/// Build a sequencer with a decoded-byte cap, buffer Mainnet blocks 1 to 3
+/// charged `wire_bytes` each, and drain them into `applying`.
+fn capped_sequencer_with_blocks_1_to_3(
+    max_checkpoint_height: u32,
+    max_decoded_bytes: u64,
+    wire_bytes: u64,
+) -> (Sequencer, Vec<Arc<block::Block>>) {
+    let mut seq = test_sequencer(0, 8)
+        .with_decoded_window_cap(block::Height(max_checkpoint_height), max_decoded_bytes);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        seq.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            block.hash(),
+            block.header.previous_block_hash,
+            body,
+            wire_bytes,
+            peer(0),
+        );
+    }
+    seq.drain_ready_into_applying();
+    (seq, blocks)
+}
+
+/// Submit every currently submittable height and return the dispatch items.
+fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
+    seq.submittable_heights()
+        .into_iter()
+        .map(|height| seq.prepare_submit(height).expect("height is applying"))
+        .collect()
+}
+
+/// Retire a submission the way a committed apply completion does.
+fn finish_committed(seq: &mut Sequencer, item: &SubmitItem) {
+    seq.remove_applying(item.height);
+    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+}
+
+#[test]
+fn sequencer_decoded_cap_holds_above_last_checkpoint() {
+    // Height 1 drains decoded; heights 2 and 3 arrived out of order and stay
+    // raw, so each is charged its wire bytes times the decode factor.
+    let wire_bytes = 1_000;
+    let raw_estimate = wire_bytes * DESERIALIZED_MEM_FACTOR;
+    let decoded_1 = mainnet_blocks_1_to_3()[0].attributed_memory_size_bytes();
+    let cap = decoded_1 + raw_estimate;
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(0, cap, wire_bytes);
+    assert_eq!(seq.decoded_applying_count(), 1);
+
+    // The count window has room for all three, but the cap fits only two.
+    let items = submit_all(&mut seq);
+    assert_eq!(
+        items.iter().map(|item| item.height).collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert_eq!(seq.decoded_applying_count(), 2);
+    assert!(seq.submittable_heights().is_empty());
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        seq.applying_decoded_attributed_memory_bytes_scanned()
+    );
+
+    // Height 3 waits raw until the earlier submissions release their charge.
+    for item in &items {
+        finish_committed(&mut seq, item);
+    }
+    assert_eq!(seq.decoded_applying_count(), 0);
+    assert_eq!(seq.submittable_heights(), vec![block::Height(3)]);
+}
+
+#[test]
+fn sequencer_checkpoint_heights_ignore_decoded_cap() {
+    // At or below the last checkpoint only the count window applies, even with
+    // a cap smaller than one block, because checkpoint ranges must be
+    // co-resident.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(3, 1, 1_000);
+    assert_eq!(seq.decoded_applying_count(), 1);
+    assert_eq!(
+        submit_all(&mut seq)
+            .iter()
+            .map(|item| item.height)
+            .collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+
+    // A window straddling the last checkpoint submits the checkpoint heights,
+    // then caps the first height above it.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(2, 1, 1_000);
+    assert_eq!(
+        submit_all(&mut seq)
+            .iter()
+            .map(|item| item.height)
+            .collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert!(seq.submittable_heights().is_empty());
+}
+
+#[test]
+fn sequencer_decoded_cap_still_submits_one_oversized_body() {
+    // Every block exceeds a one-byte cap above the checkpoint.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(0, 1, 1_000);
+    // Draining does not keep a decoded copy past the cap.
+    assert_eq!(seq.decoded_applying_count(), 0);
+
+    // With nothing in flight, one body is always submittable, one at a time.
+    for height in 1..=3 {
+        let items = submit_all(&mut seq);
+        assert_eq!(
+            items.iter().map(|item| item.height).collect::<Vec<_>>(),
+            vec![block::Height(height)]
+        );
+        assert!(seq.submittable_heights().is_empty());
+        finish_committed(&mut seq, &items[0]);
+    }
+    assert_eq!(seq.applying_len(), 0);
+}
+
 #[test]
 fn sequencer_applying_counters_match_scan_across_transitions() {
     // Assert the O(1) applying and in-flight-submission counters never drift
@@ -5242,6 +5365,139 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     })
     .await
     .expect("stale completions settle with a refilled checkpoint submission window");
+
+    task.abort();
+}
+
+/// Wait up to `timeout` for the next `SubmitBlock`, skipping other actions.
+async fn next_submission(
+    actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
+    timeout: Duration,
+) -> Option<(BlockApplyToken, Arc<block::Block>)> {
+    time::timeout(timeout, async {
+        loop {
+            let action = actions_rx
+                .recv()
+                .await
+                .expect("sequencer action channel remains live");
+            if let BlockSyncAction::SubmitBlock { token, block, .. } = action {
+                return (token, block);
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+#[tokio::test]
+async fn decoded_cap_resubmits_after_last_in_flight_submission_retires() {
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    let blocks = fake_sequential_blocks(2);
+    let frontiers = genesis_frontiers();
+    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (body_tx, body_rx) = mpsc::channel(2);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (actions_tx, mut actions_rx) = mpsc::channel(8);
+    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+    // Both blocks exceed a one-byte cap above the checkpoint, so only one is
+    // submitted at a time.
+    let task = SequencerTask::new(
+        Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+            .with_decoded_window_cap(block::Height(0), 1),
+        ByteBudget::new(1),
+        Arc::new(WorkQueue::new(block::Height(0))),
+        Arc::new(PeerRegistry::new()),
+        actions_tx,
+        ThroughputMeter::new(Instant::now()),
+        frontiers,
+        Some(test_work_scope()),
+        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+        body_rx,
+        control_rx,
+        body_input_bytes.clone(),
+        body_input_decoded_attributed_memory_bytes.clone(),
+        view_tx,
+        CHANNEL_TIMEOUT,
+        ZakuraTrace::noop(),
+    );
+    let task = tokio::spawn(task.run());
+
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        body_tx
+            .send(SequencedBody::new_queued(
+                test_work_owner(),
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                height,
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                u64::from(block_size(block)),
+                peer(1),
+                Instant::now(),
+                body_input_bytes.clone(),
+                body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("sequencer body channel remains live");
+    }
+
+    let (token_1, block_1) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
+        .await
+        .expect("height 1 is submitted");
+    assert_eq!(block_1.coinbase_height(), Some(block::Height(1)));
+    assert!(
+        next_submission(&mut actions_rx, MISSING_SUBMISSION_TIMEOUT)
+            .await
+            .is_none(),
+        "the cap holds height 2 back while height 1 is in flight",
+    );
+
+    // A frontier advance detaches height 1 while the driver still holds it, so
+    // height 2 stays capped. A later unverified completion for the detached
+    // submission retires the only in-flight charge, and the window must refill.
+    control_tx
+        .send(SequencerControlInput::FrontierAdvance {
+            frontiers: BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: block_1.hash(),
+            },
+            release_applied: true,
+        })
+        .expect("frontier advance queues");
+    assert!(
+        next_submission(&mut actions_rx, MISSING_SUBMISSION_TIMEOUT)
+            .await
+            .is_none(),
+        "the detached submission still holds the cap",
+    );
+    control_tx
+        .send(SequencerControlInput::ApplyFinished {
+            owner: Box::new(test_work_owner()),
+            source: zakura_header_chain::SourceId::from_digest([1; 32]),
+            token: token_1,
+            height: block::Height(1),
+            hash: block_1.hash(),
+            outcome: test_block_apply_outcome(BlockApplyResult::Unavailable),
+            eligible_sources: BTreeSet::new(),
+            persisted_availability: None,
+            semantic_completion: Some((
+                test_work_owner(),
+                zakura_header_chain::StateVersion::default(),
+            )),
+        })
+        .expect("height 1 completion queues");
+    let (_, block_2) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
+        .await
+        .expect("height 2 is submitted once the window drains");
+    assert_eq!(block_2.coinbase_height(), Some(block::Height(2)));
 
     task.abort();
 }

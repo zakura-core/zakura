@@ -761,7 +761,14 @@ impl SequencerTask {
                 outcome.verification(),
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
-            return (false, released && verified && semantic_completion.is_some());
+            // The decoded-byte cap can hold back current work while only
+            // detached submissions are in flight, so retiring the last one must
+            // resubmit even when it did not verify.
+            let window_drained = self.sequencer.in_flight_submission_count() == 0;
+            return (
+                false,
+                released && semantic_completion.is_some() && (verified || window_drained),
+            );
         };
         if applying_owner != owner
             || applying_source != source

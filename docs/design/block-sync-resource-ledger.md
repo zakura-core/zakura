@@ -167,6 +167,12 @@ built, proof-of-work-paid chain at `r` ≈ 26 raises the window term to about 21
 then charges the measured size and stops requesting ahead. The check costs one txid pass per
 body, about 11% of decode time on real blocks, on the per-peer routine tasks.
 
+Above the last checkpoint the sequencer also caps the window's decoded heap at
+`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB). Past the cap, bodies stay raw until
+earlier submissions finish, so the window term there is 512 MiB plus about one block of
+estimate error. That rules out the 21 GB case, because below the last checkpoint the window
+holds fixed Mainnet blocks of about 7 MB decoded at most, about 2.8 GB in total.
+
 The Merkle check departs from the Block section's SHOULD to reuse downstream validation
 rather than add a duplicate ingress check. The downstream check runs only after the junk body
 is decoded into the pipeline, and its misbehavior report does not disconnect. Common

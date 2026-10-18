@@ -194,10 +194,6 @@ fn build_header_sync_reactor(
         locator_capacity_waiting: false,
         scheduling_revision: 0,
         last_scheduling_opportunity: None,
-        #[cfg(test)]
-        cached_offer_visits: 0,
-        #[cfg(test)]
-        release_after_cached_offer_scan: None,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -307,10 +303,6 @@ struct HeaderSyncReactor {
     locator_capacity_waiting: bool,
     scheduling_revision: u64,
     last_scheduling_opportunity: Option<SchedulingOpportunity>,
-    #[cfg(test)]
-    cached_offer_visits: usize,
-    #[cfg(test)]
-    release_after_cached_offer_scan: Option<Vec<super::scheduler::peer_work::HeaderCapacityLease>>,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -1232,10 +1224,14 @@ impl HeaderSyncReactor {
             self.locator_capacity_waiting = true;
             return;
         }
-        #[cfg(test)]
-        {
-            self.cached_offer_visits += self.peer_state.len();
-        }
+        let peers = self.peer_state.len();
+        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+            row.insert(
+                hs_trace::EVENT.into(),
+                hs_trace::HEADER_CACHED_OFFER_PASS.into(),
+            );
+            row.insert(hs_trace::PEERS_CONSIDERED.into(), peers.into());
+        });
         let mut offers: Vec<_> = self
             .peer_state
             .iter()
@@ -1275,8 +1271,6 @@ impl HeaderSyncReactor {
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
-        #[cfg(test)]
-        drop(self.release_after_cached_offer_scan.take());
         // Retain the pre-pass key: an external lease can drop while we scan.
         // Recording a fresh key here would swallow that release's wakeup.
         self.last_scheduling_opportunity = Some(opportunity);

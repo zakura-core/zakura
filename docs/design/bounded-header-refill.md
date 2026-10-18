@@ -186,21 +186,23 @@ notifications or other independent per-peer reactor work.
 
 The deterministic work test uses 16, 64, 256 and 512 admitted peers, covering the
 configured 256 inbound plus 256 outbound slots. It holds duplicate-target or
-zero-headroom offers across 3,000 end-of-event passes, including repeated blocked
+zero-headroom offers across 300 end-of-event passes, including repeated blocked
 and active-owner Status messages. It asserts zero additional cached-offer peer
 visits after the initial pass. This measures eliminated scheduler work, not
 production throughput or a saturation threshold.
 
 The test also clears only the scheduling cache before each pass as a control,
 replaying the previous unconditional scan with identical offers and scheduling
-logic. Expected additional peer visits over 3,000 passes are:
+logic. Each full pass writes a `header_cached_offer_pass` trace row with the peers
+it walked, and the test counts visits from those rows. Expected additional peer
+visits over 300 passes are:
 
 | Admitted peers | Unconditional control | Opportunity tracking |
 | --- | ---: | ---: |
-| 16 | 48,000 | 0 |
-| 64 | 192,000 | 0 |
-| 256 | 768,000 | 0 |
-| 512 | 1,536,000 | 0 |
+| 16 | 4,800 | 0 |
+| 64 | 19,200 | 0 |
+| 256 | 76,800 | 0 |
+| 512 | 153,600 | 0 |
 
 Both the duplicate-target and zero-headroom workloads assert these counts.
 

@@ -571,8 +571,11 @@ These keys stay in `[network.zakura]` and keep their meaning:
   connections or twice the discovery headroom plus one (19 with Mainnet's 9
   bootstrap peers), so discovery keeps a dial slot when only the bootstrap
   peers are connected. Inbound and other connections still share that slot,
-  as at any cap. A smaller `max_connections` lowers that floor to match. The
-  budget never shrinks the windows, so it costs no per-connection throughput.
+  as at any cap. A smaller `max_connections` lowers that floor to match.
+  Config load can't see the node key yet, so it counts one bootstrap identity
+  fewer in case one is this node's own, and the endpoint applies the exact
+  floor. The budget never shrinks the windows, so it costs no per-connection
+  throughput.
 
   The budget counts flow-control credit and queued datagrams, not resident
   memory. Connection and stream bookkeeping, reassembly bookkeeping and

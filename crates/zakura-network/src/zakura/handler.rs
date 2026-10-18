@@ -420,9 +420,10 @@ impl ZakuraConfig {
     /// [`budgeted_max_connections`]), or an error naming the keys when the
     /// budget admits too few connections.
     ///
-    /// The floor counts distinct bootstrap identities, as discovery does. It
-    /// can't leave out this node's own entry before the node key is loaded;
-    /// [`Self::budgeted_max_connections_for_node`] can.
+    /// The floor counts distinct bootstrap identities, as discovery does.
+    /// Without the node key it can't tell whether one of them is this node, so
+    /// it counts one fewer: it never refuses a config that
+    /// [`Self::budgeted_max_connections_for_node`] accepts.
     pub fn budgeted_max_connections(&self) -> Result<usize, PeerMemoryBudgetError> {
         self.budgeted_max_connections_excluding(None)
     }
@@ -444,7 +445,13 @@ impl ZakuraConfig {
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.quic.connection_memory_bytes(),
-            remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id),
+            match local_node_id {
+                Some(local_node_id) => {
+                    remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
+                }
+                // One entry may be this node's own.
+                None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
+            },
             self.max_pending_handshakes.max(1),
         )
     }

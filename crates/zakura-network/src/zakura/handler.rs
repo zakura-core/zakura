@@ -4146,6 +4146,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync.clone(),
         block_sync.clone(),
         trace.clone(),
+        limits.max_connections,
     ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let service_demand = header_sync_driver_startup

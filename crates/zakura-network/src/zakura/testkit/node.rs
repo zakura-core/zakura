@@ -553,6 +553,7 @@ impl ZakuraTestNodeBuilder {
                 header_sync.clone(),
                 block_sync_handle.clone(),
                 ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
+                self.limits.max_connections,
             ))
         } else {
             Arc::new(DiscoveryService::new(discovery.clone()))

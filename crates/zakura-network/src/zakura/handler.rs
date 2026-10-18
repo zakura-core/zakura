@@ -43,8 +43,8 @@ use zakura_quic::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::peer_memory::{
-    budgeted_max_connections, PeerMemoryBudgetError, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
-    DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    budgeted_max_connections, max_connections_for_budget, PeerMemoryBudgetError,
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
 };
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
@@ -509,12 +509,16 @@ impl ZakuraLocalLimits {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         Self {
             quic: config.zakura.quic.clone(),
-            // Endpoint startup refuses a budget below its floor, so this only
-            // lowers the cap; it never raises it past `max_connections`.
+            // The floor only decides whether endpoint startup refuses the
+            // config, so the cap is the budget's count either way.
             max_connections: config
                 .zakura
-                .budgeted_max_connections()
-                .unwrap_or(config.zakura.max_connections.max(1)),
+                .max_connections
+                .max(1)
+                .min(max_connections_for_budget(
+                    config.zakura.peer_memory_budget_bytes,
+                    config.zakura.quic.connection_memory_bytes(),
+                )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),

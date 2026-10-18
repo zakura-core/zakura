@@ -126,6 +126,7 @@ mod tests {
         discovery::discovery_dial_slot_limit, ZakuraConfig, DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_MAX_CONNECTIONS,
     };
+    use crate::{zakura::ZakuraLocalLimits, Config};
 
     const MIB: u64 = 1024 * 1024;
 
@@ -228,6 +229,29 @@ mod tests {
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(), Ok(30));
+    }
+
+    #[test]
+    fn local_limits_keep_the_budget_when_only_the_node_floor_passes() {
+        // Nine identities including this node's own, and a budget for 18
+        // connections: the node-specific floor (17) passes, the generic one
+        // (19) doesn't, and the limits must still stop at 18.
+        let node_ids: Vec<NodeId> = (1..=9)
+            .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let mut config = Config::default();
+        config.zakura.bootstrap_peers = node_ids
+            .iter()
+            .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+            .collect();
+        config.zakura.max_connections = 256;
+        config.zakura.peer_memory_budget_bytes = 18 * 80 * MIB;
+        assert!(config.zakura.budgeted_max_connections().is_err());
+        assert_eq!(
+            config.zakura.budgeted_max_connections_for_node(node_ids[0]),
+            Ok(18)
+        );
+        assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
     }
 
     #[test]

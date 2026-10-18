@@ -3884,6 +3884,13 @@ fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketA
     direct_addrs
 }
 
+/// Whether a listening node's signed discovery record carries no address.
+/// The record keeps only addresses that peers may dial, so peers drop a record
+/// left with none. A wildcard listener without `external_addr` advertises none.
+fn advertises_no_discovery_address(config: &Config, advertised: &[SocketAddr]) -> bool {
+    config.zakura.listen_addr.is_some() && advertised.is_empty()
+}
+
 /// Counts the distinct parseable bootstrap identities other than `local_node_id`.
 fn remote_bootstrap_peer_count(
     bootstrap_peers: &[String],
@@ -4107,6 +4114,16 @@ async fn spawn_zakura_endpoint_inner(
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
         supervisor.subscribe(),
     )?;
+    if advertises_no_discovery_address(config, &discovery.current_self_record().body.direct_addrs) {
+        warn!(
+            listen_addr = ?config.zakura.listen_addr,
+            external_addr = ?config.external_addr,
+            "this node advertises no discovery address that peers can dial, so they will not \
+             learn of it through discovery; give network.zakura.listen_addr a fixed nonzero \
+             port, and set network.external_addr to this node's public IP address, which peers \
+             dial at that port"
+        );
+    }
     let anchor = config.zakura.header_sync.anchor(&config.network)?;
     let frontiers = header_sync_driver_startup.as_ref().map_or(
         FullStateFrontiers {
@@ -6630,6 +6647,63 @@ mod tests {
         assert_eq!(
             discovery_direct_addrs(&config, secret_key.public()),
             vec!["203.0.113.42:8234".parse().expect("test address parses")]
+        );
+    }
+
+    #[test]
+    fn a_listener_that_peers_cannot_dial_is_reported() {
+        let secret_key = NodeSecretKey::generate();
+        let local_node_id = secret_key.public();
+        let mut config = Config::default();
+        config.zakura.bootstrap_peers.clear();
+        let reported = |config: &Config| {
+            let (_connected_tx, connected) = watch::channel(Vec::new());
+            let discovery = discovery::build_discovery_handle(
+                secret_key.clone(),
+                discovery_direct_addrs(config, local_node_id),
+                Vec::new(),
+                &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
+                config.zakura.max_connections,
+                0,
+                connected,
+            )
+            .expect("the test self-record builds");
+            advertises_no_discovery_address(
+                config,
+                &discovery.current_self_record().body.direct_addrs,
+            )
+        };
+
+        config.zakura.listen_addr = None;
+        config.external_addr = None;
+        assert!(
+            !reported(&config),
+            "a node that does not listen advertises nothing"
+        );
+
+        config.zakura.listen_addr = Some("0.0.0.0:8234".parse().expect("test address parses"));
+        assert!(
+            reported(&config),
+            "a wildcard listener advertises no address"
+        );
+
+        config.external_addr = Some("93.184.216.34:8233".parse().expect("test address parses"));
+        assert!(!reported(&config));
+
+        config.zakura.listen_addr = Some("10.0.0.5:8234".parse().expect("test address parses"));
+        assert!(
+            !reported(&config),
+            "the record drops the private address and keeps the public one"
+        );
+
+        config.external_addr = None;
+        assert!(reported(&config), "peers must not dial a private address");
+
+        config.zakura.listen_addr = Some("0.0.0.0:0".parse().expect("test address parses"));
+        config.external_addr = Some("93.184.216.34:8233".parse().expect("test address parses"));
+        assert!(
+            reported(&config),
+            "peers dial the external IP at the listen port, so port 0 is unusable"
         );
     }
 

@@ -594,7 +594,7 @@ impl<K: Eq + Hash> Reservations<K> {
         let reservation = self
             .live
             .get_mut(key)
-            .ok_or(refused(ClaimRefused::Unsolicited { message_type }))?;
+            .ok_or_else(|| refused(ClaimRefused::Unsolicited { message_type }))?;
         if request != reservation.request {
             return Err(refused(ClaimRefused::WrongRequest { message_type }));
         }

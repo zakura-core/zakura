@@ -16,7 +16,6 @@ use futures::{
 };
 use tokio::sync::oneshot;
 use tower::{
-    buffer::Buffer,
     timeout::{error::Elapsed, Timeout},
     Service, ServiceExt,
 };
@@ -155,7 +154,7 @@ pub(crate) type TestStateService =
 impl
     Verifier<
         TestStateService,
-        Buffer<
+        tower::buffer::Buffer<
             mempool::Request,
             futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
         >,

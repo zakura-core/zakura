@@ -34,7 +34,7 @@ pub type HttpResponse<B = HttpBody> = hyper::Response<B>;
 ///
 /// [`HttpRequestMiddleware`](super::http_request_compatibility::HttpRequestMiddleware) applies a
 /// smaller limit first.
-const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
+pub(super) const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
 
 /// The maximum number of requests a server handles at the same time.
 const MAX_CONCURRENT_REQUESTS: usize = 100;
@@ -169,7 +169,7 @@ fn is_json(content_type: Option<&header::HeaderValue>) -> bool {
 }
 
 /// Why a request body couldn't be read.
-enum ReadBodyError {
+pub(super) enum ReadBodyError {
     /// The body is longer than the limit.
     TooLarge,
     /// The body doesn't start with `{` or `[`, or is empty.
@@ -183,7 +183,7 @@ enum ReadBodyError {
 /// Returns the body without its leading whitespace, and whether it is a single request, which
 /// starts with `{`, rather than a batch, which starts with `[`. The first non-whitespace byte
 /// must be in the first 128 bytes of the first chunk of the body.
-async fn read_body<B>(
+pub(super) async fn read_body<B>(
     headers: &header::HeaderMap,
     body: B,
     max_body_size: u32,

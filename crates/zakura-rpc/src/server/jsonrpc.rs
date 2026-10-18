@@ -903,6 +903,55 @@ macro_rules! rpc_trait {
                 }
             }
         }
+
+        /// Methods that decode their parameters exactly like the [`RpcMethods`] implementation
+        /// for this trait does, then return `null` without running the method.
+        ///
+        /// Fuzz targets use it to reach parameter decoding without a node.
+        ///
+        /// [`RpcMethods`]: $crate::server::rpc_service::RpcMethods
+        #[cfg(feature = "fuzz-impl")]
+        #[derive(Clone, Copy, Debug)]
+        pub struct DecodeParamsOnly;
+
+        #[cfg(feature = "fuzz-impl")]
+        impl $crate::server::rpc_service::RpcMethods for DecodeParamsOnly {
+            const METHOD_NAMES: &'static [&'static str] = &[$($name),*];
+
+            fn call<'a>(
+                &'a self,
+                method: &str,
+                params: $crate::server::jsonrpc::Params<'a>,
+                id: $crate::server::jsonrpc::Id<'a>,
+                max_response_size: usize,
+            ) -> Option<
+                std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = $crate::server::jsonrpc::MethodResponse>
+                            + Send
+                            + 'a,
+                    >,
+                >,
+            > {
+                match method {
+                    $(
+                        $name => Some(Box::pin(async move {
+                            let result = $crate::server::jsonrpc::rpc_trait!(
+                                @decode params; $($arg: $ty),*
+                            )
+                            .map(|_| ());
+
+                            $crate::server::jsonrpc::MethodResponse::response(
+                                id,
+                                &result,
+                                max_response_size,
+                            )
+                        })),
+                    )*
+                    _ => None,
+                }
+            }
+        }
     };
 
     (@call $call:expr, async) => { $call.await };

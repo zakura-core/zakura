@@ -33,6 +33,10 @@ indexer = ["zakura-state/indexer"]
 internal-miner = []
 
 # Test-only features
+
+# Exposes `server::fuzz`, the entry points of the fuzz targets in `qa/fuzz/rpc`
+fuzz-impl = []
+
 proptest-impl = [
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",

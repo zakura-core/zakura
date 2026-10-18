@@ -459,8 +459,10 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     (`CLOSING_QUEUE_BYTES`) instead of DRV-3's 16 MiB. A closed connection
     only answers with CONNECTION_CLOSE. When the slot moves, the endpoint
     switches to that limit first, then the task drops and refunds the
-    datagrams queued while the connection was live, and only then does the
-    live slot free. An endpoint send racing the switch can add one datagram.
+    datagrams already queued at the switch, and only then does the live slot
+    free. Datagrams that arrive later sit under the closing limit and are
+    handled as usual, so concurrent arrivals can't extend that work. An
+    endpoint send racing the switch can add one datagram.
     `CLOSING_CONNECTION_MEMORY_BYTES` is that queue: what a closed connection
     can make the node hold beyond its bookkeeping.
   - If `max_closing_connections` are already held, the task MUST drop the

@@ -649,9 +649,15 @@ impl ConnTask {
         let slot = self.slot.clone();
         // The backlog was queued under the live limit. A closed connection
         // only answers with CONNECTION_CLOSE, so dropping it loses nothing.
-        // An endpoint send racing the switch adds at most one datagram.
+        // Drop only what was queued at the switch: refunds reopen room, so a
+        // loop until empty could run as long as the peer keeps sending.
+        // Later datagrams sit under the closing limit, and the run loop
+        // handles them as usual.
         slot.begin_closing(|| {
-            while let Ok((_, bytes)) = datagrams.try_recv() {
+            for _ in 0..datagrams.len() {
+                let Ok((_, bytes)) = datagrams.try_recv() else {
+                    break;
+                };
                 self.refund_datagram(bytes);
             }
         })

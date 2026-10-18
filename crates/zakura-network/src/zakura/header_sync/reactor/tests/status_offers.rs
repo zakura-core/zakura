@@ -1585,3 +1585,22 @@ async fn a_deferred_pass_does_not_starve_the_snapshot_that_ends_a_stall() {
     task.await
         .expect("the reactor stops through normal shutdown");
 }
+
+/// A pass that runs longer than a refill interval doesn't pay for the next
+/// one. The next retargeting `Status` waits a full interval after the pass
+/// ends, however slow the pass was.
+#[tokio::test(start_paused = true)]
+async fn a_slow_pass_earns_no_refill_while_it_runs() {
+    let start = Instant::now();
+    let mut budget = CachedPassBudget {
+        passes: 1,
+        refilled_at: start,
+    };
+    assert!(budget.try_take(start));
+    // The pass takes five refill intervals.
+    let end = start + CACHED_PASS_REFILL * 5;
+    budget.finish_pass(end);
+    assert!(!budget.try_take(end), "the scan time refilled nothing");
+    assert_eq!(budget.next_refill(), end + CACHED_PASS_REFILL);
+    assert!(budget.try_take(end + CACHED_PASS_REFILL));
+}

@@ -223,7 +223,11 @@ insertion. Each change would buy a full pass, which clones and sorts every idle
 offer.
 
 So full passes draw from a token bucket of 32 that refills one pass per
-millisecond (`CACHED_PASS_BURST`, `CACHED_PASS_REFILL`). A changed key whose
+millisecond (`CACHED_PASS_BURST`, `CACHED_PASS_REFILL`). The refill clock
+restarts when a pass ends, so time spent scanning earns no refill. Otherwise a
+pass that took a whole interval would pay for the next one, and passes could run
+back to back. Past the burst, a pass of cost P takes at most P / (P + 1 ms) of
+the reactor. A changed key whose
 pass finds the bucket empty stays uncached, and the refill joins the
 maintenance deadlines. The deferred opportunity is therefore scheduled at the
 refill without a new `Status`. The sender's own offer is still considered

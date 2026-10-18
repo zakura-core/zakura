@@ -101,6 +101,15 @@ impl CachedPassBudget {
         true
     }
 
+    /// Restart the refill clock when a pass ends at `now`.
+    ///
+    /// Time spent scanning earns no refill. Otherwise a pass that takes a whole
+    /// refill interval would pay for the next one, and passes could run back to
+    /// back.
+    fn finish_pass(&mut self, now: Instant) {
+        self.refilled_at = self.refilled_at.max(now);
+    }
+
     /// When the next pass refills.
     fn next_refill(&self) -> Instant {
         self.refilled_at + CACHED_PASS_REFILL
@@ -1349,6 +1358,7 @@ impl HeaderSyncReactor {
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
+        self.cached_pass_budget.finish_pass(Instant::now());
         // Retain the pre-pass key: an external lease can drop while we scan.
         // Recording a fresh key here would swallow that release's wakeup.
         self.last_scheduling_opportunity = Some(opportunity);

@@ -150,17 +150,17 @@ time. The time per status includes the reactor loop's scan for its next deadline
 | 256 | 54 µs | 0.85 µs | 43 µs | 1.1 µs |
 | 512 | 106 µs | 1.7 µs | 104 µs | 2.1 µs |
 
-Before, nearly all of the time went to the pass over cached statuses that the reactor ran after
-every event. That pass now runs only when something that can make a held-back offer eligible
-changes, and at most 32 times back to back, then once per millisecond. The before column already
-computes the header size once. Without that, every headroom check on this Regtest fixture rebuilt
-the Regtest parameters, and the same runs cost 9.4, 50 and 115 µs per repeated status. Mainnet never
-paid that rebuild.
+Before, nearly all of the time went to the pass over cached statuses that the reactor ran after every
+event. That pass now runs only when something that can make a held-back offer eligible changes, and at
+most 32 times back to back, then once per millisecond of time spent outside a pass. The before column
+already computes the header size once. Without that, every headroom check on this Regtest fixture
+rebuilt the Regtest parameters, and the same runs cost 9.4, 50 and 115 µs per repeated status. Mainnet
+never paid that rebuild.
 
 Cadence exhaustion still records and forwards, so one peer can keep sending. The 2.1 µs is an average
 over a tight flood, not a per-message cap. Each of the first 32 changed keys, and one per millisecond
-after that, still pays a full pass of about 100 µs at 512 sessions, so full passes take at most about
-10% of the reactor. At the 2.1 µs average, it takes about 475,000 statuses per second, roughly 57 MB/s
-from one peer, to saturate the reactor with 512 sessions. An honest event behind a full event queue of
-128 waits about 0.27 ms instead of about 13 ms. What still grows with peers is the deadline scan, at
-about 3 ns per session.
+after each pass ends, still pays a full pass of about 100 µs at 512 sessions, so full passes take at
+most about 9% of the reactor. At the 2.1 µs average, it takes about 475,000 statuses per second,
+roughly 57 MB/s from one peer, to saturate the reactor with 512 sessions. An honest event behind a
+full event queue of 128 waits about 0.27 ms instead of about 13 ms. What still grows with peers is the
+deadline scan, at about 3 ns per session.

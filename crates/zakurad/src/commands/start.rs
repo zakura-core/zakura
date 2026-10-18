@@ -2669,10 +2669,11 @@ mod zakura_header_sync_driver_tests {
                 None,
                 block_sync,
                 latest_chain_tip,
-                read_state,
+                // Boxed so tests that pass different mock services share one compiled driver.
+                tower::util::BoxCloneService::new(read_state),
                 self.header_chain_write,
                 self.body_evidence_authority,
-                block_verifier,
+                tower::util::BoxCloneService::new(block_verifier),
                 self.max_checkpoint_height,
                 self.checkpoint_apply_limit,
                 self.full_apply_limit,

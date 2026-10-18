@@ -1851,10 +1851,11 @@ mod tests {
             None,
             block_sync,
             zakura_chain::chain_tip::NoChainTip,
-            read_state,
+            // Boxed so tests that pass different mock services share one compiled driver.
+            tower::util::BoxCloneService::new(read_state),
             None,
             None,
-            block_verifier,
+            tower::util::BoxCloneService::new(block_verifier),
             block::Height::MAX,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,

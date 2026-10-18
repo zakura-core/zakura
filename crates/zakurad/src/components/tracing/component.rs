@@ -37,9 +37,6 @@ use super::non_blocking::{non_blocking, WorkerGuard};
 // paste -d "\0" logo.utf8 heart.utf8 > zakura.utf8
 static ZAKURA_ART: [u8; include_bytes!("zakura.utf8").len()] = *include_bytes!("zakura.utf8");
 
-#[cfg(all(test, feature = "opentelemetry"))]
-mod tests;
-
 /// Returns a tracing setup error, with the prefix `zakurad` has always printed for it.
 fn io_error(error: std::io::Error) -> Report {
     eyre!("I/O operation failed: {error}")
@@ -48,12 +45,8 @@ fn io_error(error: std::io::Error) -> Report {
 /// A type-erased boxed writer that can be sent between threads safely.
 pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
-/// The global `tracing` subscriber's log writer and OpenTelemetry exporter.
+/// The global `tracing` subscriber's log writer.
 pub struct Tracing {
-    /// The OpenTelemetry tracer provider, if enabled.
-    #[cfg(feature = "opentelemetry")]
-    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-
     /// Drop guard for worker thread of non-blocking logger,
     /// responsible for flushing any remaining logs when the program terminates.
     //
@@ -177,44 +170,6 @@ impl Tracing {
         #[cfg(feature = "journald")]
         let subscriber = subscriber.with(journaldlayer);
 
-        // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
-        #[cfg(feature = "opentelemetry")]
-        let (otel_layer, otel_provider, otel_resolved_config) = {
-            // Check standard OTEL_* env vars as fallback (lower precedence than config/ZAKURA_*)
-            let endpoint = config
-                .opentelemetry_endpoint
-                .clone()
-                .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
-            let service_name = config
-                .opentelemetry_service_name
-                .clone()
-                .or_else(|| std::env::var("OTEL_SERVICE_NAME").ok());
-            let sample_percent = config.opentelemetry_sample_percent.or_else(|| {
-                std::env::var("OTEL_TRACES_SAMPLER_ARG")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            });
-
-            // Keep only non-endpoint values for status logging. URLs can contain credentials.
-            let resolved_config = (
-                service_name.clone().unwrap_or_else(|| "zakura".to_string()),
-                sample_percent.unwrap_or(100),
-            );
-
-            match super::otel::layer(endpoint.as_deref(), service_name.as_deref(), sample_percent) {
-                Ok((layer, provider)) => (layer, provider, resolved_config),
-                Err(e) => {
-                    tracing::warn!(
-                        ?e,
-                        "failed to initialize OpenTelemetry, traces will not be exported"
-                    );
-                    (None, None, resolved_config)
-                }
-            }
-        };
-        #[cfg(feature = "opentelemetry")]
-        let subscriber = subscriber.with(otel_layer);
-
         // Initialise the global tracing subscriber
         subscriber.init();
 
@@ -237,29 +192,7 @@ impl Tracing {
             }
         }
 
-        // Log OpenTelemetry status
-        #[cfg(feature = "opentelemetry")]
-        if otel_provider.is_some() {
-            let (ref service_name, sample_percent) = otel_resolved_config;
-            info!(
-                %service_name,
-                sample_percent,
-                "installed OpenTelemetry tracing layer",
-            );
-        }
-
-        // Warning if OpenTelemetry is configured but feature not compiled
-        #[cfg(not(feature = "opentelemetry"))]
-        if config.opentelemetry_endpoint.is_some() {
-            warn!(
-                "unable to activate OpenTelemetry tracing: \
-                 enable the 'opentelemetry' feature when compiling zakurad",
-            );
-        }
-
         Ok(Self {
-            #[cfg(feature = "opentelemetry")]
-            otel_provider,
             _guard: Some(worker_guard),
         })
     }
@@ -267,16 +200,8 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     ///
-    /// Shuts down the OpenTelemetry exporter first, so its errors are logged. Calling this
-    /// more than once, or dropping `Tracing` afterwards, does nothing more.
+    /// Calling this more than once, or dropping `Tracing` afterwards, does nothing more.
     pub fn shutdown(&mut self) {
-        #[cfg(feature = "opentelemetry")]
-        if let Some(provider) = self.otel_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                tracing::warn!(?e, "OpenTelemetry shutdown error");
-            }
-        }
-
         self._guard.take();
     }
 }

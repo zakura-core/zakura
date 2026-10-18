@@ -934,36 +934,6 @@ fn log_file_is_flushed_on_shutdown() {
     );
 }
 
-/// A configured OpenTelemetry exporter with no collector doesn't stop the node from
-/// shutting down cleanly, and its endpoint is not logged.
-#[cfg(all(unix, feature = "opentelemetry"))]
-#[test]
-fn opentelemetry_exporter_shuts_down_with_the_node() {
-    let scratch = Scratch::new();
-    let (listener, addr) = occupied_port();
-    // Leave nothing listening on the collector port.
-    drop(listener);
-    let endpoint = format!("http://user:{SYNTHETIC_CREDENTIAL}@{addr}");
-    let config = scratch.write_config("zakura.toml", &{
-        let mut config = scratch.regtest_config();
-        config.tracing.opentelemetry_endpoint = Some(endpoint);
-        config
-    });
-
-    let mut node = scratch.spawn(&mut scratch.command([
-        OsStr::new("-c"),
-        config.as_os_str(),
-        OsStr::new("start"),
-    ]));
-    node.wait_for_stdout(STARTED);
-    node.signal("TERM");
-    let run = node.wait();
-
-    run.assert_stopped_cleanly()
-        .assert_stdout_contains("installed OpenTelemetry tracing layer")
-        .assert_no_output_contains(SYNTHETIC_CREDENTIAL);
-}
-
 // Utility commands
 
 /// Utility commands don't start the node or the metrics endpoint, even when verbose.

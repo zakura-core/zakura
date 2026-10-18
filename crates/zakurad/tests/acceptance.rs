@@ -153,7 +153,7 @@ use zakura_rpc::{
 use zakura_state::state_database_format_version_in_code;
 use zakura_test::{
     args,
-    command::{to_regex::CollectRegexSet, ContextFrom, NO_MATCHES_REGEX_ITER},
+    command::{to_regex::CollectRegexSet, ContextFrom},
     net::random_known_port,
     prelude::*,
 };
@@ -207,72 +207,8 @@ fn generate_no_args() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "opentelemetry")]
 #[test]
-fn opentelemetry_endpoint_does_not_panic_on_startup() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let mut config = default_test_config(&Mainnet);
-    config.tracing.opentelemetry_endpoint = Some("http://127.0.0.1:1".to_owned());
-    let testdir = testdir()?.with_config(&mut config)?;
-
-    // A fresh process exercises tracing startup before a TLS provider or Tokio runtime exists.
-    let child = (&testdir).spawn_child(args!["generate", "-o", "generated.toml"])?;
-    child
-        .wait_with_output_or_timeout(Duration::from_secs(30))?
-        .assert_success()?;
-    let generated = fs::read_to_string(testdir.path().join("generated.toml"))?;
-    assert!(generated.starts_with("# Default configuration for zakurad"));
-
-    Ok(())
-}
-
-// Synthetic values cover every URL component that could contain credentials.
-const OTEL_TEST_ENDPOINT: &str =
-    "http://otel-sentinel-user-1273c:otel-sentinel-password-1273c@otel-sentinel-host-1273c.invalid/otel-sentinel-path-1273c?token=otel-sentinel-token-1273c#otel-sentinel-fragment-1273c";
-const OTEL_TEST_PRIVATE_VALUES: [&str; 6] = [
-    "otel-sentinel-user-1273c",
-    "otel-sentinel-password-1273c",
-    "otel-sentinel-host-1273c.invalid",
-    "otel-sentinel-path-1273c",
-    "otel-sentinel-token-1273c",
-    "otel-sentinel-fragment-1273c",
-];
-
-#[test]
-fn opentelemetry_status_does_not_log_endpoint() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    let mut config = default_test_config(&Mainnet);
-    config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
-    config.tracing.opentelemetry_sample_percent = Some(0);
-    let testdir = testdir()?.with_config(&mut config)?;
-    // Utility commands use their own filter. Verbose output includes the INFO status.
-    let output = (&testdir)
-        .spawn_child(args!["-v", "generate", "-o", "generated.toml"])?
-        .wait_with_output_or_timeout(Duration::from_secs(30))?
-        .assert_success()?;
-
-    #[cfg(feature = "opentelemetry")]
-    output.stdout_line_contains("installed OpenTelemetry tracing layer")?;
-    #[cfg(not(feature = "opentelemetry"))]
-    output.stdout_line_contains("unable to activate OpenTelemetry tracing")?;
-
-    for stream in [&output.output.stdout, &output.output.stderr] {
-        let text = String::from_utf8_lossy(stream);
-        for private_value in OTEL_TEST_PRIVATE_VALUES {
-            assert!(
-                !text.contains(private_value),
-                "endpoint value appeared in logs"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[test]
-fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
+fn start_logs_node_configuration_summary() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     let mut config = default_test_config(&Mainnet);
@@ -280,8 +216,6 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     config.network.initial_testnet_peers.clear();
     config.network.cache_dir = false.into();
     config.network.peerset_initial_target_size = 25;
-    config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
-    config.tracing.opentelemetry_sample_percent = Some(0);
     config.tracing.filter = Some("info".to_owned());
     // Keep exact field assertions stable even when FORCE_USE_COLOR is set for tests.
     config.tracing.use_color = false;
@@ -289,18 +223,7 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     let testdir = testdir()?.with_config(&mut config)?;
     let mut child = testdir
         .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY)
-        .with_failure_regex_iter(
-            OTEL_TEST_PRIVATE_VALUES
-                .iter()
-                .map(|value| regex::escape(value)),
-            NO_MATCHES_REGEX_ITER.iter().copied(),
-        );
-
-    #[cfg(feature = "opentelemetry")]
-    child.expect_stdout_line_matches("installed OpenTelemetry tracing layer")?;
-    #[cfg(not(feature = "opentelemetry"))]
-    child.expect_stdout_line_matches("unable to activate OpenTelemetry tracing")?;
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
     let summary = child.expect_stdout_line_matches("loaded node configuration")?;
     for diagnostic in [
@@ -311,9 +234,6 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     ] {
         assert!(summary.contains(diagnostic));
     }
-    // This event follows configuration logging, so the negative assertions cover that path.
-    child.expect_stdout_line_matches("initialized rayon thread pool")?;
-    // Check unread stdout and stderr too, including any output queued before the kill.
     child.kill_and_consume_output(false)?;
 
     Ok(())

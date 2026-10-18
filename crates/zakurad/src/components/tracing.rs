@@ -11,9 +11,6 @@ use serde::{Deserialize, Serialize};
 mod component;
 mod non_blocking;
 
-#[cfg(feature = "opentelemetry")]
-mod otel;
-
 pub use component::Tracing;
 
 /// Tracing configuration section: outer config after cross-field defaults are applied.
@@ -142,41 +139,22 @@ pub struct InnerConfig {
     /// Install Zebra using `cargo install --features=journald` to enable this config.
     pub use_journald: bool,
 
-    /// OpenTelemetry OTLP endpoint URL for distributed tracing.
+    /// Legacy OpenTelemetry endpoint, accepted for configuration compatibility.
     ///
-    /// Build `zakurad` with `--features opentelemetry` to enable this config. It is not
-    /// included in release binaries by default.
-    ///
-    /// When `None` (default), OpenTelemetry is completely disabled with zero runtime overhead.
-    /// When set, traces are exported via OTLP HTTP protocol.
-    /// The URL must use HTTP or HTTPS. Its path is extended with `/v1/traces`
-    /// unless it already ends with that suffix, ignoring trailing slashes.
-    /// Query parameters are preserved, and fragments are discarded.
-    ///
-    /// Example: `"http://localhost:4318"`
-    ///
-    /// Can also be set via `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (lower precedence).
+    /// Ignored because OpenTelemetry trace export has been removed.
+    #[serde(skip_serializing)]
     pub opentelemetry_endpoint: Option<String>,
 
-    /// Service name reported to OpenTelemetry collector.
+    /// Legacy OpenTelemetry service name, accepted for configuration compatibility.
     ///
-    /// Defaults to `"zakura"` if not specified.
-    ///
-    /// Can also be set via `OTEL_SERVICE_NAME` environment variable.
+    /// Ignored because OpenTelemetry trace export has been removed.
+    #[serde(skip_serializing)]
     pub opentelemetry_service_name: Option<String>,
 
-    /// Trace sampling percentage between 0 and 100.
+    /// Legacy OpenTelemetry sampling percentage, accepted for configuration compatibility.
     ///
-    /// Controls what percentage of traces are exported:
-    /// - `100` = 100% (all traces, default)
-    /// - `10` = 10% (recommended for high-traffic production)
-    /// - `0` = 0% (effectively disabled)
-    ///
-    /// Lower values reduce network/collector overhead for busy nodes.
-    ///
-    /// Note: This differs from the standard `OTEL_TRACES_SAMPLER_ARG` which uses
-    /// a ratio (0.0-1.0). Zebra uses percentage (0-100) for consistency with
-    /// other integer-based configuration options.
+    /// Ignored because OpenTelemetry trace export has been removed.
+    #[serde(skip_serializing)]
     pub opentelemetry_sample_percent: Option<u8>,
 }
 

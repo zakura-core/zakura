@@ -45,6 +45,7 @@ use zakura_node_services::mempool::{
     CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
     Request, Response,
 };
+use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
 
@@ -477,7 +478,7 @@ fn start_peer_cooldown(
             .clone()
             .oneshot(zn::Request::DisconnectPeer(peer))
             .boxed();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
             if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!("could not disconnect a peer after repeated transaction failures");

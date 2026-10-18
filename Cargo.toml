@@ -68,7 +68,6 @@ bytes = "1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = "4.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
-crossbeam-channel = "0.5.14"
 curve25519-dalek = "4.1"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
@@ -324,6 +323,13 @@ panic = "unwind"
 #     - add "-flto=thin" to all C/C++ code builds
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
 lto = "thin"
+
+# Each codegen unit gets its own copy of the generic code and drop glue it uses,
+# and thin LTO does not merge those copies. 4 units instead of the default 16
+# shrinks zakurad's .text by about 5% while still using 4 cores per crate, the
+# size of the standard CI runners.
+codegen-units = 4
+
 # Enable line numbers in stack traces. Note that we re-disable it for dependencies below.
 debug = "line-tables-only"
 

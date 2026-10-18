@@ -144,7 +144,8 @@ pub struct InnerConfig {
 
     /// OpenTelemetry OTLP endpoint URL for distributed tracing.
     ///
-    /// Install Zebra using `cargo install --features=opentelemetry` to enable this config.
+    /// Build `zakurad` with `--features opentelemetry` to enable this config. It is not
+    /// included in release binaries by default.
     ///
     /// When `None` (default), OpenTelemetry is completely disabled with zero runtime overhead.
     /// When set, traces are exported via OTLP HTTP protocol.

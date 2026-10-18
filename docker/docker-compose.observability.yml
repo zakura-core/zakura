@@ -16,8 +16,8 @@ services:
       dockerfile: docker/Dockerfile
       target: runtime
       args:
-        # OpenTelemetry tracing is included transitively in default-release-binaries.
-        FEATURES: "default-release-binaries"
+        # OpenTelemetry tracing is opt-in, so this stack enables it explicitly.
+        FEATURES: "default-release-binaries,opentelemetry"
     volumes:
       - zakura-cache:/home/zebra/.cache/zakura
     tty: true

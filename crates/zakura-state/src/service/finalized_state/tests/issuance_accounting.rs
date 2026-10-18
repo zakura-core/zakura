@@ -891,7 +891,8 @@ fn deficit_validation_accepts_block_info_rows_with_appended_fields() {
         .zs_insert(&START, &RawBytes::from_bytes(bytes));
     state.db.write_batch(batch).unwrap();
 
-    let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+    let (_cancel_sender, cancel_receiver) =
+        crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     assert_eq!(
         nsm_value_balance_pool::Upgrade
             .validate(&state.db, &cancel_receiver)

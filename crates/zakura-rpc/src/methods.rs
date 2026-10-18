@@ -81,6 +81,7 @@ use zakura_consensus::{
 };
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zakura_node_services::mempool::{self, CreatedOrSpent, MempoolService};
+use zakura_node_services::task::spawn_erased;
 use zakura_state::{
     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
     State as StateService, TransactionLocation,
@@ -1429,7 +1430,7 @@ where
         };
 
         // run the process queue
-        let rpc_tx_queue_task_handle = tokio::spawn(
+        let rpc_tx_queue_task_handle = spawn_erased(
             runner
                 .run(mempool, read_state, latest_chain_tip, network)
                 .in_current_span(),

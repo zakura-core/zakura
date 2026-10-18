@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::PollSemaphore;
 use tower::Service;
 use tracing::{info_span, Instrument};
+use zakura_node_services::task::spawn_erased;
 
 use super::RequestWeight;
 
@@ -131,7 +132,7 @@ where
 
         let span = info_span!("batch worker", kind = std::any::type_name::<T>());
 
-        let worker_handle = tokio::spawn(worker.run().instrument(span));
+        let worker_handle = spawn_erased(worker.run().instrument(span));
 
         batch.register_worker(worker_handle);
 

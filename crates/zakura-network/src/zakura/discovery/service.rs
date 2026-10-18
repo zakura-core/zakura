@@ -18,6 +18,7 @@ use std::{
 
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
 
 use crate::zakura::{
@@ -489,7 +490,7 @@ impl Service for DiscoveryService {
             .remove(&(peer.clone(), conn_id));
         let handle = self.handle.clone();
         let peer = peer.clone();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             handle.remove_peer(&peer, conn_id).await;
         });
     }

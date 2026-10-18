@@ -123,3 +123,26 @@ Attribute each missing interval to one stage before changing another limit:
 
 If durable header transitions become the bottleneck, optimize or overlap bounded preparation/admission before expanding lookahead.
 Do not assume that arbitrarily early headers are free because they also exist on disk.
+
+## Locator operation ownership
+
+Ordinary target slots and locator reads have separate lifetimes. Each reactor has
+16 locator permits, using `MAX_STAGED_TARGETS_V1`. Dispatch acquires a permit
+before creating a locator future. Eviction, disconnect, session replacement and
+header authority changes can retire a target without releasing its read's permit.
+A repeated offer from the same peer coalesces with its existing query.
+
+The port contract transfers a clone of that permit into the state read request.
+The blocking state closure owns it through completion or unwinding. Reactor and
+adapter timeouts drop their callers, but cannot release the clone held by accepted
+state work. Thus the sum of pending locator operations and orphaned accepted reads
+is at most 16 within a reactor's capacity domain, even under identity churn.
+Shutdown drops unaccepted futures; accepted closures retain their permits until
+exit. This is a per-reactor bound, not a process-wide bound across independently
+constructed reactors.
+
+At exhaustion, useful offers remain unspent. The reactor waits on the semaphore
+and immediately schedules cached offers when the last owner releases a permit.
+A permanently stuck accepted operation permanently occupies its permit; a timeout
+cannot safely manufacture replacement capacity. Read failures still consume their
+ordinary attempt, as required by the status-offer policy.

@@ -14,6 +14,7 @@ use tokio::{
     time::{self, Instant},
 };
 use zakura_chain::block;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
 
 use super::{
@@ -92,7 +93,7 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
-    Ok((handle, actions, tokio::spawn(reactor.run())))
+    Ok((handle, actions, spawn_erased(reactor.run())))
 }
 
 fn build_header_sync_reactor(
@@ -178,6 +179,10 @@ fn build_header_sync_reactor(
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
         pending_locator_queries: HashSet::new(),
+        locator_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            zakura_header_chain::MAX_STAGED_TARGETS_V1,
+        )),
+        locator_capacity_waiting: false,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -282,6 +287,9 @@ struct HeaderSyncReactor {
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
     /// Peers with one direct continuation-locator read currently in flight.
     pending_locator_queries: HashSet<ZakuraPeerId>,
+    // Unlike queue ownership, this capacity survives eviction and caller timeouts.
+    locator_capacity: std::sync::Arc<tokio::sync::Semaphore>,
+    locator_capacity_waiting: bool,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -723,6 +731,7 @@ impl HeaderSyncReactor {
             }
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
+            let locator_capacity = self.locator_capacity.clone();
             tokio::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
@@ -737,6 +746,10 @@ impl HeaderSyncReactor {
                         self.handle_port_completion(completion);
                     }
                 }
+                permit = locator_capacity.acquire_owned(), if self.locator_capacity_waiting => {
+                    drop(permit.expect("the locator semaphore is never closed"));
+                    self.locator_capacity_waiting = false;
+                },
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
@@ -1163,6 +1176,12 @@ impl HeaderSyncReactor {
         if self.ordinary_discovery_paused()
             || self.peer_work_queue.len() >= zakura_header_chain::MAX_STAGED_TARGETS_V1
         {
+            return;
+        }
+        if self.locator_capacity.available_permits() == 0 {
+            // Cached offers can become idle without a fresh dispatch refusal.
+            // Arm the wakeup even when we skip their scan at exhausted capacity.
+            self.locator_capacity_waiting = true;
             return;
         }
         let mut offers: Vec<_> = self
@@ -3930,11 +3949,20 @@ impl HeaderSyncReactor {
             );
             return false;
         }
-        if let HeaderPortOperation::QueryHeaderLocator { peer, .. } = &action {
-            if !self.pending_locator_queries.insert(peer.clone()) {
+        let locator_permit = if let HeaderPortOperation::QueryHeaderLocator { peer, .. } = &action {
+            if self.pending_locator_queries.contains(peer) {
                 return true;
             }
-        }
+            let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
+                self.locator_capacity_waiting = true;
+                self.defer_ordinary_target(peer);
+                return true;
+            };
+            self.pending_locator_queries.insert(peer.clone());
+            Some(port::LocatorReadPermit::new(permit))
+        } else {
+            None
+        };
         let capacity = match &action {
             HeaderPortOperation::PrepareHeaderTarget { peer, .. }
             | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
@@ -3972,7 +4000,12 @@ impl HeaderSyncReactor {
                 } => Box::pin(async move {
                     let locator = match tokio::time::timeout(
                         request_timeout,
-                        header_chain.continuation_locator(),
+                        header_chain.continuation_locator(
+                            locator_permit
+                                .as_ref()
+                                .expect("locator dispatch acquired capacity")
+                                .clone(),
+                        ),
                     )
                     .await
                     {
@@ -3986,6 +4019,7 @@ impl HeaderSyncReactor {
                             None
                         }
                     };
+                    drop(locator_permit);
                     Box::new(move |reactor: &mut HeaderSyncReactor| {
                         reactor.finish_header_locator_query(peer, scope, locator);
                     }) as HeaderSyncPortCompletion

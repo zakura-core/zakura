@@ -8,6 +8,7 @@ use crate::zakura::{
 };
 use rand::{rngs::OsRng, RngCore};
 use std::num::NonZeroU64;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
 
 mod trace;
@@ -225,7 +226,7 @@ pub fn spawn_block_sync_reactor(
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
-    tokio::spawn(sequencer_task.run());
+    spawn_erased(sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace
     // and written by the routines (servable/caps/outstanding) and the reactor
@@ -315,7 +316,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_control: sequencer_control_tx,
         sequencer_view: sequencer_view_rx,
     };
-    let task = tokio::spawn(reactor.run());
+    let task = spawn_erased(reactor.run());
 
     Ok((handle, actions_rx, task))
 }

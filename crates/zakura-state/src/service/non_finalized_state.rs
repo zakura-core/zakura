@@ -19,6 +19,7 @@ use zakura_chain::{
     sprout::{self},
     transparent,
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::{MAX_INVALIDATED_BLOCKS, MAX_NON_FINALIZED_CHAIN_FORKS},
@@ -244,7 +245,7 @@ impl NonFinalizedState {
         let (non_finalized_state, sender, receiver) = with_watch_channel(non_finalized_state);
 
         if !skip_backup_task {
-            tokio::spawn(backup::run_backup_task(receiver.clone(), backup_dir_path));
+            spawn_erased(backup::run_backup_task(receiver.clone(), backup_dir_path));
         }
 
         if !non_finalized_state.is_chain_set_empty() {

@@ -52,7 +52,6 @@ itertools = { workspace = true }
 metrics = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
-crossbeam-channel = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
 

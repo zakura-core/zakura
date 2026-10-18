@@ -127,6 +127,10 @@ zakura:
 
 *Note: Zakura uses percentage (0-100) for consistency with other config options, unlike the standard OpenTelemetry ratio (0.0-1.0).
 
+The `OTEL_*` variables only take effect when `zakurad` is built with the `opentelemetry`
+feature. It is not in `default-release-binaries`. This stack's compose file enables it. For
+another build, use `cargo build --release -p zakura --features opentelemetry`.
+
 ## Directory Structure
 
 ```text

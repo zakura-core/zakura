@@ -106,7 +106,7 @@ jobs:
           # `cargo xtask check-rpc-artifacts` below regenerates the gRPC code.
           protoc: 'true'
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --features default-release-binaries,opentelemetry
+        run: cargo clippy --workspace --all-targets --features default-release-binaries
       - name: Check locked all-feature build
         if: ${{ !cancelled() }}
         run: cargo check --locked --all-features --all-targets

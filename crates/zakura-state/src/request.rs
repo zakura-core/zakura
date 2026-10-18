@@ -1879,6 +1879,15 @@ pub enum ReadRequest {
         scope: zakura_header_chain::HeaderWorkAuthority,
     },
 
+    /// Report whether the committed selected header chain contains `hash`, without an ancestry
+    /// walk or a retained-path lease.
+    ///
+    /// Returns [`ReadResponse::SelectedChainMembership`].
+    SelectedChainMembership {
+        /// Header hash to look up.
+        hash: block::Hash,
+    },
+
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
     /// with the per-block commitment roots for the requested heights, in ascending height
     /// order. May return fewer than `count` roots if the node does not hold the whole range.
@@ -2162,6 +2171,7 @@ impl ReadRequest {
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
+            ReadRequest::SelectedChainMembership { .. } => "selected_chain_membership",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BlockSizesByHash { .. } => "block_sizes_by_hash",
             ReadRequest::BestHeaderTip => "best_header_tip",

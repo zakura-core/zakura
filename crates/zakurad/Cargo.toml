@@ -64,7 +64,6 @@ pre-release-replacements = [
 features = [
     "default-release-binaries",
     "journald",
-    "opentelemetry",
     "prometheus",
     "indexer",
 ]
@@ -107,9 +106,6 @@ internal-miner = [
 
 # Tracing and monitoring
 journald = ["tracing-journald"]
-# Opt in explicitly: no committed deployment exports traces, and the exporter stack adds
-# six crates to the binary.
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -206,11 +202,6 @@ hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }
 
-# prod feature opentelemetry
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 

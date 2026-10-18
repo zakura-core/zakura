@@ -68,10 +68,6 @@
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
 //! * `journald`: send tracing spans and events to `systemd-journald`.
-//! * `opentelemetry`: export tracing spans to an OpenTelemetry collector over OTLP HTTP.
-//!   Disabled by default, including in release binaries. Build with
-//!   `cargo build --release -p zakura --features opentelemetry`, then set
-//!   `tracing.opentelemetry_endpoint` or `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.

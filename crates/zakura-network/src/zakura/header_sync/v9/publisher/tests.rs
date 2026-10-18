@@ -89,10 +89,17 @@ fn snapshot(tip: Frontier, generation: u64, genesis: Frontier) -> EngineSnapshot
 /// Like state, it holds one lease per peer, refuses a second for capacity
 /// until the first ends, and keeps a peer's continuation after each partial
 /// read, which a later lease toward the same target from the last header
-/// read reuses without walking the ancestry.
+/// read reuses without walking the ancestry. It indexes the selected chain by
+/// height, as state's selected projection and finalized index do, so a
+/// membership query walks nothing and outlives a header removed from the tree.
 #[derive(Default)]
 struct Store {
     tree: HeaderTree,
+    /// The selected chain, indexed by height.
+    selected: Vec<Frontier>,
+    /// Membership queries answered.
+    memberships: usize,
+    membership_script: VecDeque<Result<SelectedChainMembership, PortError>>,
     next_lease: u64,
     /// Each live lease's peer and the signal its end releases.
     leases: HashMap<u64, (SourceId, ServingCapacitySignal)>,
@@ -104,8 +111,9 @@ struct Store {
     walk_steps: usize,
     /// The next release fails and leaves its lease held.
     leak_release: bool,
-    /// The selected tip grows by one header after each of this many leases.
-    move_tip_on_acquire: usize,
+    /// The selected tip grows by one header after each of this many page
+    /// reads.
+    move_tip_on_read: usize,
     acquire_script: VecDeque<Result<AcquirePathReply, PortError>>,
     read_script: VecDeque<Result<ReadPathReply, PortError>>,
     /// Headers without a schema-1 record.
@@ -182,6 +190,41 @@ impl Store {
         Some(peer)
     }
 
+    /// Index the chain ending at `tip` as selected, walking down only to where
+    /// it meets the chain indexed before.
+    fn select(&mut self, tip: Frontier) {
+        // Widening u32 to usize is lossless on supported targets.
+        let index = |frontier: Frontier| frontier.height.0 as usize;
+        let mut added = Vec::new();
+        let mut current = Some(tip);
+        while let Some(frontier) = current {
+            if self.selected.get(index(frontier)) == Some(&frontier) {
+                break;
+            }
+            added.push(frontier);
+            current = self.tree.parent(frontier);
+        }
+        self.selected
+            .truncate(added.last().map_or(index(tip) + 1, |&lowest| index(lowest)));
+        self.selected.extend(added.into_iter().rev());
+    }
+
+    /// Whether the selected chain contains `hash`, as state answers it.
+    fn membership(&mut self, hash: block::Hash) -> Result<SelectedChainMembership, PortError> {
+        self.memberships += 1;
+        if let Some(reply) = self.membership_script.pop_front() {
+            return reply;
+        }
+        if let Some(&found) = self.selected.iter().find(|frontier| frontier.hash == hash) {
+            return Ok(SelectedChainMembership::Selected(found));
+        }
+        Ok(if self.tree.nodes.contains_key(&hash) {
+            SelectedChainMembership::NotSelected
+        } else {
+            SelectedChainMembership::NotRetained
+        })
+    }
+
     /// Read one page and consume the lease, as state does.
     fn read(
         &mut self,
@@ -255,6 +298,8 @@ pub(crate) struct FakePort {
     gate: Semaphore,
     /// Every lease acquisition waits for a permit here.
     acquire_gate: Semaphore,
+    /// Every membership query waits for a permit here.
+    membership_gate: Semaphore,
     /// Reads panic, standing in for a local bug.
     panic_reads: std::sync::atomic::AtomicBool,
 }
@@ -263,8 +308,9 @@ impl FakePort {
     /// A store holding the Regtest genesis header, selected, with `gate`
     /// read permits.
     pub(crate) fn new(gate: usize) -> Arc<Self> {
-        let store = Store::default();
+        let mut store = Store::default();
         let genesis = store.tree.genesis;
+        store.select(genesis);
         Arc::new(Self {
             key: AdapterKey::new(),
             store: Mutex::new(store),
@@ -272,6 +318,7 @@ impl FakePort {
             selected: watch::channel(Some(snapshot(genesis, 1, genesis))).0,
             gate: Semaphore::new(gate),
             acquire_gate: Semaphore::new(Semaphore::MAX_PERMITS),
+            membership_gate: Semaphore::new(Semaphore::MAX_PERMITS),
             panic_reads: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -293,6 +340,7 @@ impl FakePort {
 
     /// Select the chain ending at `tip`.
     fn select(&self, tip: Frontier) {
+        self.store().select(tip);
         self.selected.send_modify(|selected| {
             let generation = selected
                 .as_ref()
@@ -337,19 +385,7 @@ impl Port for FakePort {
                 .acquire()
                 .await
                 .expect("the gate never closes");
-            let (reply, moves) = {
-                let mut store = self.store();
-                let reply = store.acquire(&self.key, request);
-                let moves = store.move_tip_on_acquire.checked_sub(1);
-                if let Some(left) = moves {
-                    store.move_tip_on_acquire = left;
-                }
-                (reply, moves.is_some())
-            };
-            if moves {
-                self.grow(1);
-            }
-            reply
+            self.store().acquire(&self.key, request)
         })
     }
 
@@ -369,9 +405,20 @@ impl Port for FakePort {
                 !self.panic_reads.load(std::sync::atomic::Ordering::Relaxed),
                 "the test asked this read to panic"
             );
-            let mut store = self.store();
-            store.reads_running -= 1;
-            store.read(&path, &request)
+            let (reply, moves) = {
+                let mut store = self.store();
+                store.reads_running -= 1;
+                let reply = store.read(&path, &request);
+                let moves = store.move_tip_on_read.checked_sub(1);
+                if let Some(left) = moves {
+                    store.move_tip_on_read = left;
+                }
+                (reply, moves.is_some())
+            };
+            if moves {
+                self.grow(1);
+            }
+            reply
         })
     }
 
@@ -405,6 +452,20 @@ impl Port for FakePort {
 
     fn selected_chain(&self) -> watch::Receiver<Option<EngineSnapshot>> {
         self.selected.subscribe()
+    }
+
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(async move {
+            let _permit = self
+                .membership_gate
+                .acquire()
+                .await
+                .expect("the gate never closes");
+            self.store().membership(hash)
+        })
     }
 }
 
@@ -1047,10 +1108,12 @@ async fn outcomes_before_the_first_page_name_their_cause() {
     harness.check_quiet().await;
 }
 
-/// A selection probe that runs into pruned history ends the subscription as
-/// `HistoryPruned` instead of waiting for history that will not return.
+/// A selection probe asks state whether the target is selected and walks
+/// nothing, so history gone between the target and the selected tip does not
+/// end the path. The first following lease then runs into that gap, past the
+/// `HistoryPruned` window, and the subscription ends as superseded.
 #[tokio::test(start_paused = true)]
-async fn a_selection_probe_through_pruned_history_ends_as_history_pruned() {
+async fn a_selection_probe_walks_no_history() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
     let chain = port.grow(5);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1060,12 +1123,15 @@ async fn a_selection_probe_through_pruned_history_ends_as_history_pruned() {
     harness
         .open(chain[1].hash, vec![port.genesis], credit(), AuxSchema::None)
         .await;
+    let received = harness.deliver_all().await;
+    let h = block::Height;
+    assert_eq!(pages(&received[..1]), [(h(0), h(2), true)]);
     assert_eq!(
-        harness.deliver_all().await,
-        [Received::Ended(HeadersOutcomeCode::HistoryPruned)]
+        received[1..],
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
     );
-    // With a locator at the target, the Open reached it, so `HistoryPruned`
-    // is out of its window and the subscription ends as superseded.
+    // With a locator at the target, the Open reached it, and the same gap
+    // ends it as superseded too.
     harness
         .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
         .await;
@@ -1453,7 +1519,7 @@ async fn a_terminal_wait_queues_a_page_that_holds_the_queue_slot() {
 }
 
 /// A following page that leaves the selected chain while in progress is read
-/// again toward the new tip, and the lease that rechecks it waits for and
+/// again toward the new tip, and the query that rechecks it waits for and
 /// holds an execution slot, as the page's read did.
 #[tokio::test(start_paused = true)]
 async fn a_following_page_recheck_holds_an_execution_slot() {
@@ -1472,13 +1538,13 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     harness.drain().await;
     let side = port.store().tree.extend(chain[2], 3);
     port.select(side[2]);
-    // The read finishes, and the recheck's lease blocks in state.
-    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    // The read finishes, and the recheck's query blocks in state.
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
     port.gate.add_permits(1);
     tokio::time::sleep(QUIET).await;
     assert_eq!(port.store().reads_running, 0);
     assert_eq!(harness.capacity.node_execution_held(), 1);
-    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
     // The page for heights 4 and 5 left the selected chain, so it is read
     // again toward the new tip.
     let received = harness.deliver_all().await;
@@ -1488,10 +1554,10 @@ async fn a_following_page_recheck_holds_an_execution_slot() {
     harness.check_quiet().await;
 }
 
-/// A recheck whose tip keeps moving stops after a bounded number of leases
-/// and sends the page it last confirmed.
+/// A recheck takes one membership query and no lease, so it walks nothing,
+/// and neither does the check of the newest tip once no credit is left.
 #[tokio::test(start_paused = true)]
-async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
+async fn a_following_page_recheck_takes_one_query_and_no_walk() {
     let port = FakePort::new(0);
     let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1506,17 +1572,63 @@ async fn a_following_page_recheck_stops_while_the_tip_keeps_moving() {
     assert!(harness.deliver_all().await.is_empty());
     port.grow(2);
     harness.drain().await;
-    // The tip moves past the page, then again during each of the recheck's
-    // leases.
+    // The tip moves past the page.
     port.grow(1);
-    port.store().move_tip_on_acquire = RECHECK_LEASES;
-    let walks = port.store().walks;
+    let (walks, memberships) = {
+        let store = port.store();
+        (store.walks, store.memberships)
+    };
     port.gate.add_permits(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
-    // The recheck's leases, then one check of the newest tip, since no
+    // The recheck's query, then one check of the newest tip, since no
     // credit is left for a page.
-    assert_eq!(port.store().walks - walks, RECHECK_LEASES + 1);
+    assert_eq!(port.store().walks - walks, 0);
+    assert_eq!(port.store().memberships - memberships, 2);
+    harness.check_quiet().await;
+}
+
+/// A follower that lags a selected tip moving after every page walks the
+/// ancestry once per run toward a pinned tip, not once per tip change, because
+/// each later page of a run reuses state's continuation and the rechecks ask
+/// state without a lease.
+#[tokio::test(start_paused = true)]
+async fn a_lagging_follower_walks_once_per_pinned_run() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    harness
+        .open(chain[2].hash, vec![chain[2]], credit(), AuxSchema::None)
+        .await;
+    assert!(harness.deliver_all().await.is_empty());
+    let (walks, steps) = {
+        let store = port.store();
+        (store.walks, store.walk_steps)
+    };
+    // The follower lags twelve headers behind, and this node commits a
+    // header after each of the next four page reads.
+    port.store().move_tip_on_read = 4;
+    port.grow(12);
+    let received = pages(&harness.deliver_all().await);
+    let h = block::Height;
+    assert_eq!(
+        received,
+        [
+            (h(3), h(6), false),
+            (h(6), h(9), false),
+            (h(9), h(12), false),
+            (h(12), h(15), false),
+            (h(15), h(18), false),
+            (h(18), h(19), false),
+        ]
+    );
+    assert_eq!(port.tip().height, h(19));
+    // One run toward height 15, then one toward 19.
+    let walked = {
+        let store = port.store();
+        (store.walks - walks, store.walk_steps - steps)
+    };
+    assert_eq!(walked, (2, 16));
     harness.check_quiet().await;
 }
 
@@ -1581,10 +1693,10 @@ async fn a_following_page_recheck_reads_the_tip_after_admission() {
     harness.check_quiet().await;
 }
 
-/// A recheck whose lease outlasts another tip change judges the page again
-/// against the newer tip.
+/// A recheck whose query waits through another tip change judges the page
+/// against the chain state holds when the query runs.
 #[tokio::test(start_paused = true)]
-async fn a_following_page_recheck_repeats_when_the_tip_moves_during_its_lease() {
+async fn a_following_page_recheck_judges_the_chain_its_query_reads() {
     let port = FakePort::new(0);
     let chain = port.grow(3);
     let mut harness = Harness::new(port.clone(), serve_limits());
@@ -1595,17 +1707,17 @@ async fn a_following_page_recheck_repeats_when_the_tip_moves_during_its_lease() 
     // The page for heights 4 and 5 waits in its read.
     let main = port.grow(2);
     harness.drain().await;
-    // The chain grows past the page, and the recheck's lease toward that tip
-    // blocks in state.
+    // The chain grows past the page, and the recheck's query blocks in
+    // state.
     let grown = port.store().tree.extend(main[1], 1);
     port.select(grown[0]);
-    port.acquire_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
     port.gate.add_permits(1);
     tokio::time::sleep(QUIET).await;
-    // While that lease waits, the chain reorgs away from the page.
+    // While that query waits, the chain reorgs away from the page.
     let side = port.store().tree.extend(chain[2], 4);
     port.select(side[3]);
-    port.acquire_gate.add_permits(Semaphore::MAX_PERMITS);
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
     let h = block::Height;
     assert_eq!(
         pages(&harness.deliver_all().await),
@@ -1630,10 +1742,10 @@ async fn a_following_page_recheck_that_cannot_run_drops_the_page() {
     harness.drain().await;
     let grown = port.store().tree.extend(main[1], 1);
     port.select(grown[0]);
-    // State refuses the recheck's lease.
+    // State fails the recheck's query.
     port.store()
-        .acquire_script
-        .push_back(Ok(AcquirePathReply::Busy));
+        .membership_script
+        .push_back(Err(PortError::Unavailable { source: None }));
     port.gate.add_permits(1);
     let h = block::Height;
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(6), false)]);
@@ -1708,7 +1820,8 @@ async fn a_leaked_lease_capacity_stall_retries_on_a_chain_change() {
 }
 
 /// A follower with no room for a page still learns that the selected chain
-/// stopped extending its last header. Growth costs one check per tip.
+/// stopped extending its last header. Growth costs one membership query per
+/// tip and no walk.
 #[tokio::test(start_paused = true)]
 async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
     let port = FakePort::new(Semaphore::MAX_PERMITS);
@@ -1727,26 +1840,69 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
     assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
 
     // The chain grows with no credit left: one check, and nothing sent.
-    let walks = port.store().walks;
+    let (walks, memberships) = {
+        let store = port.store();
+        (store.walks, store.memberships)
+    };
     port.grow(3);
     assert!(harness.deliver_all().await.is_empty());
-    assert_eq!(port.store().walks - walks, 1);
+    assert_eq!(port.store().memberships - memberships, 1);
     harness.drain().await;
     assert_eq!(
-        port.store().walks - walks,
+        port.store().memberships - memberships,
         1,
         "a checked tip is not checked again"
     );
-    // The next check stops at the tip it already checked instead of walking
-    // back to the last header.
-    let steps = port.store().walk_steps;
     port.grow(1);
     assert!(harness.deliver_all().await.is_empty());
-    assert_eq!(port.store().walk_steps - steps, 1);
+    assert_eq!(port.store().memberships - memberships, 2);
+    assert_eq!(port.store().walks - walks, 0, "a check walks nothing");
 
     // A higher branch that forks below the last header supersedes it.
     let side = port.store().tree.extend(main[0], 4);
     port.select(side[3]);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
+/// A check that state confirmed on a chain the selection left before the
+/// result settled runs again, so a selection that returns to a tip off the
+/// last header's chain still supersedes the follower.
+#[tokio::test(start_paused = true)]
+async fn a_check_confirmed_on_a_chain_since_left_runs_again() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    let main = port.grow(2);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // A higher branch that forks below the last header needs a check, and
+    // its membership query waits in state.
+    let side = port.store().tree.extend(main[0], 3);
+    let above = port.store().tree.extend(main[1], 3);
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.select(side[2]);
+    harness.drain().await;
+    // The selection moves to a chain through the last header, where the
+    // query answers, then back to the side branch before the result settles.
+    port.select(above[2]);
+    port.select(side[2]);
+    port.store()
+        .membership_script
+        .push_back(Ok(SelectedChainMembership::Selected(main[1])));
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
     assert_eq!(
         harness.deliver_all().await,
         [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]

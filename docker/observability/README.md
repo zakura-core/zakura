@@ -1,6 +1,6 @@
 # Zakura Observability Stack
 
-Metrics, distributed tracing, and alerting for Zakura nodes.
+Metrics and alerting for Zakura nodes.
 
 ## Quick Start
 
@@ -16,10 +16,9 @@ docker compose -f docker/docker-compose.observability.yml logs -f zakura
 
 | Component | Port | URL | Purpose |
 |-----------|------|-----|---------|
-| **Zakura** | 9999, 8232 | - | Zcash node with metrics and tracing |
+| **Zakura** | 9999, 8232 | - | Zcash node with metrics |
 | **Prometheus** | 9094 | <http://localhost:9094> | Metrics collection and storage |
 | **Grafana** | 3000 | <http://localhost:3000> | Dashboards and visualization |
-| **Jaeger** | 16686 | <http://localhost:16686> | Distributed tracing UI |
 | **AlertManager** | 9093 | <http://localhost:9093> | Alert routing |
 
 Default Grafana credentials: `admin` / `admin` (you'll be prompted to change on first login)
@@ -27,29 +26,26 @@ Default Grafana credentials: `admin` / `admin` (you'll be prompted to change on 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Zakura Node                                  │
-│  ┌─────────────────┐              ┌─────────────────────────────┐  │
-│  │ Metrics         │              │ Tracing (OpenTelemetry)     │  │
-│  │ :9999/metrics   │              │ OTLP HTTP → Jaeger          │  │
-│  └────────┬────────┘              └──────────────┬──────────────┘  │
-└───────────│──────────────────────────────────────│──────────────────┘
-            │                                      │
-            ▼                                      ▼
-┌───────────────────┐                  ┌───────────────────────────┐
-│   Prometheus      │                  │        Jaeger             │
-│   :9094           │                  │   :16686 (UI)             │
-│                   │◄─────────────────│   :8889 (spanmetrics)     │
-│   Scrapes metrics │  Span metrics    │   :4318 (OTLP HTTP)       │
-└─────────┬─────────┘                  └───────────────────────────┘
-          │                                        │
-          ▼                                        │
-┌───────────────────┐                              │
-│     Grafana       │◄─────────────────────────────┘
-│     :3000         │      Trace queries
+┌───────────────────┐
+│   Zakura Node     │
+│   :9999/metrics   │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│   Prometheus      │
+│   :9094           │
+│                   │
+│   Scrapes metrics │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│     Grafana       │
+│     :3000         │
 │                   │
 │  Dashboards for   │
-│  metrics + traces │
+│  metrics          │
 └─────────┬─────────┘
           │
           ▼
@@ -74,17 +70,6 @@ Quantitative data about Zakura's behavior over time:
 
 See [grafana/README.md](grafana/README.md) for dashboard details.
 
-### Tracing (Jaeger)
-
-Request-level visibility into Zakura's internal operations:
-
-- **Distributed traces**: Follow a request through all components
-- **Latency breakdown**: See where time is spent in each operation
-- **Error analysis**: Identify failure points and error propagation
-- **Service Performance Monitoring (SPM)**: RED metrics for RPC endpoints
-
-See [jaeger/README.md](jaeger/README.md) for tracing details.
-
 ### Alerts (AlertManager)
 
 Automated notifications for operational issues:
@@ -104,32 +89,6 @@ Zakura accepts these environment variables for observability:
 |----------|---------|-------------|
 | `ZAKURA_METRICS__ENDPOINT_ADDR` | - | Prometheus metrics endpoint (e.g., `0.0.0.0:9999`) |
 | `ZAKURA_RPC__LISTEN_ADDR` | - | RPC endpoint for JSON-RPC requests |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | - | Jaeger OTLP endpoint (e.g., `http://jaeger:4318`) |
-| `OTEL_SERVICE_NAME` | `zakura` | Service name in traces |
-| `OTEL_TRACES_SAMPLER_ARG` | `100` | Sampling percentage (0-100)* |
-
-### Trace Sampling
-
-During high-volume operations (initial sync), reduce sampling to avoid overwhelming the collector:
-
-```yaml
-# docker-compose.observability.yml
-zakura:
-  environment:
-    - OTEL_TRACES_SAMPLER_ARG=10  # 10% sampling during sync
-```text
-
-| Scenario | Percentage | Notes |
-|----------|------------|-------|
-| Initial sync | 1-10 | High volume, sample sparingly |
-| Steady state | 10-50 | Normal operation |
-| Debugging | 100 | Full traces for investigation |
-
-*Note: Zakura uses percentage (0-100) for consistency with other config options, unlike the standard OpenTelemetry ratio (0.0-1.0).
-
-The `OTEL_*` variables only take effect when `zakurad` is built with the `opentelemetry`
-feature. It is not in `default-release-binaries`. This stack's compose file enables it. For
-another build, use `cargo build --release -p zakura --features opentelemetry`.
 
 ## Directory Structure
 
@@ -146,9 +105,6 @@ observability/
 │   └── provisioning/
 │       ├── dashboards/
 │       └── datasources/
-├── jaeger/
-│   ├── README.md                # Tracing documentation
-│   └── config.yaml              # Jaeger v2 configuration
 └── prometheus/
     ├── prometheus.yaml          # Scrape configuration
     └── rules/                   # Recording and alert rules
@@ -169,19 +125,6 @@ curl -s http://localhost:9999/metrics | grep zcash
 curl -s 'http://localhost:9094/api/v1/query?query=zcash_state_tip_height'
 ```text
 
-### Find slow operations in Jaeger
-
-1. Open <http://localhost:16686>
-2. Select service: `zakura`
-3. Set "Min Duration" to filter slow traces
-4. Click "Find Traces"
-
-### Check spanmetrics for RPC performance
-
-```bash
-curl -s http://localhost:8889/metrics | grep rpc_request
-```text
-
 ## Troubleshooting
 
 ### No metrics in Grafana
@@ -190,23 +133,7 @@ curl -s http://localhost:8889/metrics | grep rpc_request
 2. Check Prometheus targets: <http://localhost:9094/targets>
 3. Verify job name matches dashboard queries (default: `zakura`)
 
-### No traces in Jaeger
-
-1. Verify OTLP endpoint is set: `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318`
-2. Check Jaeger is healthy: <http://localhost:16686>
-3. Check Jaeger logs: `docker compose logs jaeger`
-
-### High memory usage in Jaeger
-
-Reduce trace sampling during sync:
-
-```yaml
-environment:
-  - OTEL_TRACES_SAMPLER_ARG=10  # Sample only 10%
-```text
-
 ## Related Documentation
 
 - [Grafana Dashboards](grafana/README.md) - Dashboard usage and configuration
-- [Jaeger Tracing](jaeger/README.md) - Distributed tracing guide
 - [Metrics Quick Start](../../docs/metrics-visualization-quickstart.md) - Adding new metrics

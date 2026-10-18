@@ -218,6 +218,17 @@ pub enum AcquirePathReply {
     CapacityBusy(ServingCapacitySignal),
 }
 
+/// Where a header hash sits relative to the selected header chain.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SelectedChainMembership {
+    /// The selected chain contains the header at this frontier.
+    Selected(Frontier),
+    /// The adapter retains the header off the selected chain.
+    NotSelected,
+    /// The adapter retains no header with this hash.
+    NotRetained,
+}
+
 /// A bounded read from an already acquired retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadPath {
@@ -523,6 +534,16 @@ pub trait Port: Send + Sync + 'static {
     fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
         tokio::sync::watch::channel(None).1
     }
+
+    /// Report whether the selected chain contains the header `hash`.
+    ///
+    /// The answer comes from the latest committed selected chain, which is at
+    /// least as new as the latest value of [`Self::selected_chain`]. It costs
+    /// no ancestry walk and no retained-path lease.
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
 }
 
 impl std::fmt::Debug for dyn Port {
@@ -597,6 +618,13 @@ impl Port for UnavailablePort {
             )))
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(async { Ok(SelectedChainMembership::NotRetained) })
+    }
 }
 
 /// Inert port used by state-machine tests that drive completions explicitly.
@@ -653,6 +681,13 @@ impl Port for InertHeaderChainPort {
         &self,
         _target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
+        Box::pin(std::future::pending())
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         Box::pin(std::future::pending())
     }
 }

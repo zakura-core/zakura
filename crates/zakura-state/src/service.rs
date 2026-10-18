@@ -3182,6 +3182,16 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::RetainedHeaderPathReleased(released))
             }
 
+            ReadRequest::SelectedChainMembership { hash } => {
+                let membership = match state.header_chain_reader_receiver.borrow().clone() {
+                    Some(reader) => reader.selected_chain_membership(hash)?,
+                    None => {
+                        zakura_node_services::header_chain::SelectedChainMembership::NotRetained
+                    }
+                };
+                Ok(ReadResponse::SelectedChainMembership(membership))
+            }
+
             ReadRequest::BlockRoots {
                 start_height,
                 count,

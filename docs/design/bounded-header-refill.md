@@ -146,3 +146,70 @@ and immediately schedules cached offers when the last owner releases a permit.
 A permanently stuck accepted operation permanently occupies its permit; a timeout
 cannot safely manufacture replacement capacity. Read failures still consume their
 ordinary attempt, as required by the status-offer policy.
+
+## Cached-offer scheduling opportunities
+
+The end-of-event pass first compares five constant-size inputs: the root policy
+revision, queue ownership revision, claimed header count, available locator permits,
+and committed resource-stall state. Unchanged inputs skip peer traversal, offer
+clones, sorting and duplicate/headroom checks. The existing deterministic priority
+order and immediate end-of-event scheduling remain unchanged.
+
+Every Status is saved and considered synchronously for its sender, including a
+fresh attempt or changes to target, eligibility and priority. A still-blocked
+sender's changed offer does not itself create an opportunity for another peer;
+it therefore does not invalidate the global pass. This rule does not depend on
+whole-Status equality or an allowlist of ignorable fields.
+
+The root revision changes for session membership, explicit offer deferral,
+committed snapshots (including body-only advancement), every terminal subscription
+outcome, a pruned schema 1 round that re-arms its sender's status, and changes to
+an existing locator's effective virtual header claim. Header sync v9 holds an offer
+whose session still has a live subscription until that subscription ends, so the
+terminal outcome is an opportunity. The latter uses the same negotiated,
+fair-share-capped count as ordinary headroom. Changing a limit above that cap,
+nonzero slot counts or other metadata does not change the claim. The queue revision
+changes on insertion, removal, target-hash replacement or an awaiting request
+becoming active. Updated metadata and priority are still retained, but do not
+invalidate other peers' offers by themselves. No-op removals do not change it.
+
+Capacity counters are read directly because the last RAII lease can be dropped
+outside a queue mutation. A watch notification wakes the reactor on final
+header-capacity release; locator permits use their semaphore wakeup.
+
+The cached key is captured **before** scanning. A release during the scan must
+remain visible to the next pass; caching the post-scan counters could swallow that
+wakeup. A pass that changes its own queue can cause one further scan, after which
+unchanged blocked offers are quiescent again. Real shared opportunity changes
+retain the existing bounded sorting cost. This does not optimize serving
+notifications or other independent per-peer reactor work.
+
+The deterministic work test uses 16, 64, 256 and 512 admitted peers, covering the
+configured 256 inbound plus 256 outbound slots. It holds duplicate-target or
+zero-headroom offers across 300 end-of-event passes, including repeated blocked
+and active-owner Status messages. It asserts zero additional cached-offer peer
+visits after the initial pass. This measures eliminated scheduler work, not
+production throughput or a saturation threshold.
+
+The test also clears only the scheduling cache before each pass as a control,
+replaying the previous unconditional scan with identical offers and scheduling
+logic. Each full pass writes a `header_cached_offer_pass` trace row with the peers
+it walked, and the test counts visits from those rows. Expected additional peer
+visits over 300 passes are:
+
+| Admitted peers | Unconditional control | Opportunity tracking |
+| --- | ---: | ---: |
+| 16 | 4,800 | 0 |
+| 64 | 19,200 | 0 |
+| 256 | 76,800 | 0 |
+| 512 | 153,600 | 0 |
+
+Both the duplicate-target and zero-headroom workloads assert these counts.
+
+Additional metadata-churn regressions hold 65 peers across 64 Status updates.
+Changing only `oldest_retained_height` previously caused 4,160 extra peer visits
+for each of duplicate blocking, zero headroom and an awaiting-locator owner.
+Each now asserts zero extra visits, and also checks changed nonzero slot counts,
+priority and limits that leave the effective claim unchanged. Separate tests
+check that reducing a pending claim wakes an alternate, retargeting releases the
+old target, and a newly eligible Status starts its sender immediately.

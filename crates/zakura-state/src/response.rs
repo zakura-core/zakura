@@ -559,6 +559,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
     RetainedHeaderPathReleased(bool),
 
+    /// Response to [`ReadRequest::SelectedChainMembership`].
+    SelectedChainMembership(zakura_node_services::header_chain::SelectedChainMembership),
+
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
 
@@ -789,6 +792,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)
+            | ReadResponse::SelectedChainMembership(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::Blocks(_)

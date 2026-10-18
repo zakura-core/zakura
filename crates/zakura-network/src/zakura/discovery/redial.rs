@@ -6,8 +6,7 @@ use tokio::time::Instant;
 use zakura_quic::NodeAddr;
 
 use crate::zakura::{
-    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZAKURA_ALPN_MISMATCH_BACKOFF,
+    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// A connection that served at least this long is treated as healthy, so the
@@ -98,9 +97,11 @@ enum DialResult {
     /// The peer speaks another ALPN; wait at least
     /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
     AlpnMismatch,
-    /// This node hit one of its own limits before reaching the peer. Retry
-    /// after the initial backoff without counting an attempt or growing the
-    /// backoff, so a full node doesn't give up on the peer.
+    /// This node hit one of its own limits before sending the peer anything
+    /// (`ZakuraHandlerError::is_pre_dial_limit`). Retry after the initial
+    /// backoff without counting an attempt or growing the backoff, so a full
+    /// node doesn't give up on the peer. A limit hit after the handshake
+    /// counts as a failure, so it can't redial the peer forever.
     LocalLimit,
 }
 
@@ -143,8 +144,8 @@ pub(crate) async fn native_dial_supervised(
                     );
                     DialResult::AlpnMismatch
                 }
-                Err(ZakuraHandlerError::ResourceLimit(limit)) => {
-                    tracing::debug!(limit, "Zakura native dial hit a local limit; will retry");
+                Err(error) if error.is_pre_dial_limit() => {
+                    tracing::debug!(?error, "Zakura native dial hit a local limit; will retry");
                     DialResult::LocalLimit
                 }
                 Err(error) => {

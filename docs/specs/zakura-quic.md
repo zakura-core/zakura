@@ -433,9 +433,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     slot. `zakura-network` treats `ConnectionLimit` as its own resource limit,
     not the peer's fault. Its discovery dialer starts a dial only while both
     the admission semaphore and the transport have room, and waits one tick
-    after a dial hits a local limit. Its supervised redials retry a local
-    limit after the initial backoff without counting an attempt or growing
-    the backoff. Without these, a full transport with free admission permits
+    after a dial hits a local limit. Its supervised redials retry a limit hit
+    before any packet was sent (admission or this cap) after the initial
+    backoff, without counting an attempt or growing the backoff. A limit hit
+    after the QUIC handshake, such as the pending control handshakes, counts
+    as a failed attempt, so it can't make a bounded redial handshake with the
+    peer forever. Without these, a full transport with free admission permits
     made the dialer spin.
 
   Zakura sets `max_connections` to its admitted cap plus

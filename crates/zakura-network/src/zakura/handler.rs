@@ -4381,7 +4381,7 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
+        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -4397,7 +4397,9 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
         // zakura-quic ADM-12: this node's own cap, so discovery doesn't back
         // off from the peer.
         Err(zakura_quic::ConnectError::ConnectionLimit) => {
-            return Err(ZakuraHandlerError::ResourceLimit("transport connections"));
+            return Err(ZakuraHandlerError::ResourceLimit(
+                TRANSPORT_CONNECTIONS_LIMIT,
+            ));
         }
         Err(error) => return Err(error.into()),
     };
@@ -6305,7 +6307,26 @@ pub enum ZakuraHandlerError {
     Io(#[from] std::io::Error),
 }
 
+/// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
+/// semaphore is full, before it sends any packet.
+const ADMISSION_LIMIT: &str = "admission";
+/// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
+/// holds its maximum of live connections, before it sends any packet
+/// (zakura-quic ADM-12).
+const TRANSPORT_CONNECTIONS_LIMIT: &str = "transport connections";
+
 impl ZakuraHandlerError {
+    /// Whether a dial stopped at one of this node's own caps before sending
+    /// any packet, so retrying it costs the peer nothing. A pending-handshake
+    /// limit isn't one: it fires after QUIC and TLS with the peer completed.
+    pub(crate) fn is_pre_dial_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceLimit(limit)
+                if *limit == ADMISSION_LIMIT || *limit == TRANSPORT_CONNECTIONS_LIMIT
+        )
+    }
+
     /// Whether a dial failed because the peer speaks another ALPN (zakura-quic DIAL-5).
     pub(crate) fn is_alpn_mismatch(&self) -> bool {
         matches!(
@@ -7682,6 +7703,17 @@ mod tests {
         }
         endpoint.shutdown().await;
         Ok(())
+    }
+
+    /// Only limits a dial hits before sending a packet are local: the
+    /// pending-handshake limit follows a completed QUIC handshake with the
+    /// peer, so redials must count it.
+    #[test]
+    fn only_limits_before_the_first_packet_are_pre_dial() {
+        assert!(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT).is_pre_dial_limit());
+        assert!(ZakuraHandlerError::ResourceLimit(TRANSPORT_CONNECTIONS_LIMIT).is_pre_dial_limit());
+        assert!(!ZakuraHandlerError::ResourceLimit("pending handshake").is_pre_dial_limit());
+        assert!(!ZakuraHandlerError::Timeout("native dial").is_pre_dial_limit());
     }
 
     #[tokio::test]

@@ -302,10 +302,10 @@ incremental = false
 codegen-units = 16
 
 [profile.test]
-# Tests only need line numbers for backtraces. Full debuginfo makes the test
-# binaries about 2.5 times larger and slows each test build by about 10%.
-# `cargo build` keeps full debuginfo for debugger sessions.
-debug = "line-tables-only"
+# Match CI, where the toolchain action sets CARGO_PROFILE_DEV_DEBUG=0. Full
+# debuginfo slows each test build by about 25%. Panic messages still name the
+# panicking file and line. `cargo build` keeps full debuginfo for debugging.
+debug = 0
 
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment

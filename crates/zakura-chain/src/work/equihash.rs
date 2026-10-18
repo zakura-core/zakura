@@ -9,8 +9,7 @@ use crate::{
     block::Header,
     parameters::Network,
     serialization::{
-        zcash_serialize_bytes, CompactSizeMessage, SerializationError, ZcashDeserialize,
-        ZcashSerialize,
+        CompactSize64, CompactSizeMessage, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
 };
 
@@ -337,7 +336,16 @@ impl Default for Solution {
 
 impl ZcashSerialize for Solution {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        zcash_serialize_bytes(&self.value().to_vec(), writer)
+        let solution = self.value();
+        CompactSizeMessage::try_from(solution.len())?.zcash_serialize(writer)?;
+        writer.write_all(solution)
+    }
+
+    fn zcash_serialized_size(&self) -> usize {
+        let solution_len = self.value().len();
+        let length_prefix =
+            u64::try_from(solution_len).expect("Equihash solution sizes fit in u64");
+        CompactSize64::encoded_len(length_prefix) + solution_len
     }
 }
 

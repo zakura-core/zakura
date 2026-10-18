@@ -319,7 +319,23 @@ impl ZcashDeserialize for CompactSizeMessage {
     }
 }
 
+impl CompactSize64 {
+    /// The number of bytes the `CompactSize` encoding of `n` takes.
+    pub(crate) const fn encoded_len(n: u64) -> usize {
+        match n {
+            0x00..=0xfc => 1,
+            0x00fd..=0xffff => 3,
+            0x0001_0000..=0xffff_ffff => 5,
+            _ => 9,
+        }
+    }
+}
+
 impl ZcashSerialize for CompactSize64 {
+    fn zcash_serialized_size(&self) -> usize {
+        Self::encoded_len(self.0)
+    }
+
     #[inline]
     fn zcash_serialize<W: std::io::Write + ?Sized>(
         &self,

@@ -66,7 +66,7 @@ bs58 = "0.5"
 byteorder = "1.5"
 bytes = "1.10"
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
-clap = "4.5"
+clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context"] }
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
 curve25519-dalek = "4.1"
 derive-new = "0.7"

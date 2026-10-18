@@ -3921,7 +3921,7 @@ fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraS
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None).await
 }
@@ -3929,7 +3929,7 @@ pub async fn spawn_zakura_endpoint(
 /// Start a Zakura endpoint with an externally driven header-sync reactor.
 pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_with_services(
@@ -3944,13 +3944,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
 /// Start a Zakura endpoint with optional runtime services.
 pub async fn spawn_zakura_endpoint_with_services(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
-        sink_factory,
+        Box::new(sink_factory),
         header_sync_driver_startup,
         custom_services,
         None,
@@ -3960,14 +3960,14 @@ pub async fn spawn_zakura_endpoint_with_services(
 
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: PeerRegistry,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
-        sink_factory,
+        Box::new(sink_factory),
         header_sync_driver_startup,
         custom_services,
         Some(peer_registry),
@@ -3975,9 +3975,11 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     .await
 }
 
+/// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
+/// every caller's factory type.
 async fn spawn_zakura_endpoint_inner(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: Box<dyn FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: Option<PeerRegistry>,

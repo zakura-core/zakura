@@ -1575,7 +1575,7 @@ fn failing_librustzcash_v5_transaction(
         inputs: vec![],
         outputs: vec![],
         sapling_shielded_data: None,
-        orchard_shielded_data: Some(shielded_data),
+        orchard_shielded_data: Some(Box::new(shielded_data)),
     }
 }
 
@@ -1615,7 +1615,7 @@ fn miner_fees_validation_includes_ironwood_balance() {
         }],
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood_shielded_data(1)),
+        ironwood_shielded_data: Some(Box::new(ironwood_shielded_data(1))),
     };
 
     assert_eq!(
@@ -2962,7 +2962,7 @@ mod zip218_shielded_action_limits {
             outputs: Vec::new(),
             lock_time: LockTime::unlocked(),
             expiry_height: Height(100),
-            joinsplit_data,
+            joinsplit_data: joinsplit_data.map(Box::new),
             sapling_shielded_data: None,
         })
     }

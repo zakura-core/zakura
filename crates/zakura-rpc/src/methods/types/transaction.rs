@@ -1474,7 +1474,7 @@ mod tests {
             outputs: Vec::new(),
             sapling_shielded_data: None,
             orchard_shielded_data: None,
-            ironwood_shielded_data: Some(ironwood_shielded_data.clone()),
+            ironwood_shielded_data: Some(Box::new(ironwood_shielded_data.clone())),
         });
 
         let transaction_object = TransactionObject::from_transaction(

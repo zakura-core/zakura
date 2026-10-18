@@ -127,7 +127,7 @@ fn zip317_counts_ironwood_actions() {
         outputs: Vec::new(),
         sapling_shielded_data: None,
         orchard_shielded_data: None,
-        ironwood_shielded_data: Some(ironwood_shielded_data),
+        ironwood_shielded_data: Some(Box::new(ironwood_shielded_data)),
     };
 
     assert_eq!(conventional_actions(&transaction), 3);

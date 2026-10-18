@@ -141,7 +141,7 @@ impl From<block::Hash> for InventoryHash {
 }
 
 impl ZcashSerialize for InventoryHash {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         writer.write_u32::<LittleEndian>(self.code())?;
         match self {
             // Zebra does not supply error codes

@@ -336,7 +336,7 @@ impl Default for Solution {
 }
 
 impl ZcashSerialize for Solution {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         zcash_serialize_bytes(&self.value().to_vec(), writer)
     }
 }

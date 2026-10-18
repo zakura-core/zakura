@@ -63,11 +63,11 @@ pub(crate) fn validate_header_version(version: u32) -> Result<(), &'static str> 
 
 impl ZcashSerialize for Header {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         validate_header_version(self.version).map_err(io::Error::other)?;
 
         writer.write_u32::<LittleEndian>(self.version)?;
-        self.previous_block_hash.zcash_serialize(&mut writer)?;
+        self.previous_block_hash.zcash_serialize(writer)?;
         writer.write_all(&self.merkle_root.0[..])?;
         writer.write_all(&self.commitment_bytes[..])?;
         writer.write_u32::<LittleEndian>(
@@ -78,7 +78,7 @@ impl ZcashSerialize for Header {
         )?;
         writer.write_u32::<LittleEndian>(self.difficulty_threshold.0)?;
         writer.write_all(&self.nonce[..])?;
-        self.solution.zcash_serialize(&mut writer)?;
+        self.solution.zcash_serialize(writer)?;
         Ok(())
     }
 }
@@ -111,13 +111,13 @@ impl ZcashDeserialize for Header {
 
 impl ZcashSerialize for CountedHeader {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.header.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.header.zcash_serialize(writer)?;
 
         // A header-only message has zero transactions in it.
         let transaction_count =
             CompactSizeMessage::try_from(0).expect("0 is below the message size limit");
-        transaction_count.zcash_serialize(&mut writer)?;
+        transaction_count.zcash_serialize(writer)?;
 
         Ok(())
     }
@@ -140,12 +140,12 @@ impl ZcashDeserialize for CountedHeader {
 }
 
 impl ZcashSerialize for Block {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // All block structs are validated when they are parsed.
         // So we don't need to check MAX_BLOCK_BYTES here, until
         // we start generating our own blocks (see #483).
-        self.header.zcash_serialize(&mut writer)?;
-        self.transactions.zcash_serialize(&mut writer)?;
+        self.header.zcash_serialize(writer)?;
+        self.transactions.zcash_serialize(writer)?;
         Ok(())
     }
 }

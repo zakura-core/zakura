@@ -192,7 +192,7 @@ impl std::str::FromStr for Address {
 }
 
 impl ZcashSerialize for Address {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         match self {
             Address::PayToScriptHash {
                 network_kind,

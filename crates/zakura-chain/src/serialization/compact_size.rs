@@ -284,7 +284,10 @@ impl ZcashSerialize for CompactSizeMessage {
     /// If the value exceeds `MAX_PROTOCOL_MESSAGE_LEN`.
     #[inline]
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: std::io::Write>(&self, writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         // # Security
         // Defence-in-depth for memory DoS via preallocation.
         //
@@ -318,7 +321,10 @@ impl ZcashDeserialize for CompactSizeMessage {
 
 impl ZcashSerialize for CompactSize64 {
     #[inline]
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         let n = self.0;
         match n {
             0x00..=0xfc => writer.write_u8(n as u8),

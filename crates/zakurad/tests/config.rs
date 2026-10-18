@@ -128,6 +128,27 @@ fn legacy_progress_bar_is_accepted_without_redirecting_logs() {
 }
 
 #[test]
+fn legacy_opentelemetry_settings_are_accepted_and_not_serialized() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_opentelemetry.toml");
+    fs::write(
+        &config_path,
+        "[tracing]\n\
+         opentelemetry_endpoint = \"http://localhost:4318\"\n\
+         opentelemetry_service_name = \"zakura\"\n\
+         opentelemetry_sample_percent = 10\n",
+    )
+    .expect("write legacy config");
+
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy OpenTelemetry settings remain valid");
+
+    let serialized = toml::to_string(&config).expect("serialize config");
+    assert!(!serialized.contains("opentelemetry"));
+}
+
+#[test]
 fn legacy_progress_bar_preserves_explicit_log_file() {
     let log_file = PathBuf::from("custom-zakura.log");
     let tracing_config = TracingConfig::from(TracingInnerConfig {

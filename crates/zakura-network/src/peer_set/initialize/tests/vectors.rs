@@ -1334,7 +1334,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         config.clone(),
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        success_stay_open_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_stay_open_inbound_handshaker),
         peerset_tx,
         bans,
         vec![IpAddr::V6(zcashd_compat_ip.to_ipv6_mapped())],
@@ -1431,7 +1431,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         config,
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         bans,
         vec![zcashd_compat_ip.into()],
@@ -1511,7 +1511,7 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
         config,
         tcp_listener,
         Duration::from_secs(1),
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         BannedIps::default(),
         vec![zcashd_compat_ip.into()],
@@ -1589,7 +1589,7 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
         config,
         tcp_listener,
         Duration::from_secs(1),
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         BannedIps::default(),
         Vec::new(),
@@ -1642,7 +1642,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         config,
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        unreachable_inbound_handshaker,
+        tower::util::BoxCloneService::new(unreachable_inbound_handshaker),
         peerset_tx,
         bans,
         vec![zcashd_compat_ip.into()],
@@ -2157,9 +2157,10 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
     let inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
+    // Erase the inbound service type so every caller shares one compiled `init`.
     let (_peer_service, address_book, _) = init(
         config,
-        inbound_service,
+        tower::util::BoxCloneSyncService::new(inbound_service),
         NoChainTip,
         "Test user agent".to_string(),
         PeerServices::NODE_NETWORK,
@@ -2226,9 +2227,10 @@ where
         ..default_config
     };
 
+    // Erase the inbound service type so every caller shares one compiled `init`.
     let (_peer_service, address_book, _) = init(
         config,
-        inbound_service,
+        tower::util::BoxCloneSyncService::new(inbound_service),
         NoChainTip,
         "Test user agent".to_string(),
         PeerServices::NODE_NETWORK,
@@ -2494,7 +2496,7 @@ async fn spawn_replenishment_crawler_with(
         demand_tx.clone(),
         demand_rx,
         candidates,
-        outbound_connector,
+        tower::util::BoxCloneService::new(outbound_connector),
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
@@ -2707,7 +2709,7 @@ where
         demand_tx,
         demand_rx,
         candidates,
-        outbound_connector,
+        tower::util::BoxCloneService::new(outbound_connector),
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
@@ -2925,7 +2927,7 @@ where
         config.clone(),
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        listen_handshaker,
+        tower::util::BoxCloneService::new(listen_handshaker),
         peerset_tx,
         bans,
         Vec::new(),

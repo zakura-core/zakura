@@ -8,7 +8,10 @@ use chrono::{TimeZone, Utc};
 use hex::{FromHex, FromHexError};
 
 use crate::{
-    block::{header::ZCASH_BLOCK_VERSION, merkle, Block, CountedHeader, Hash, Header},
+    block::{
+        header::{HEADER_BYTES_BEFORE_SOLUTION, MAX_SERIALIZED_HEADER_BYTES, ZCASH_BLOCK_VERSION},
+        merkle, Block, CountedHeader, Hash, Header,
+    },
     serialization::{
         CompactSizeMessage, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
@@ -62,12 +65,31 @@ pub(crate) fn validate_header_version(version: u32) -> Result<(), &'static str> 
 }
 
 impl ZcashSerialize for Header {
+    #[inline(never)]
+    fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        self.zcash_serialize(out)
+    }
+
+    /// Allocates once, sized for the largest (Mainnet and Testnet) header.
+    /// A Regtest header leaves the rest of that capacity unused.
+    fn zcash_serialize_to_vec(&self) -> Result<Vec<u8>, io::Error> {
+        let mut out = Vec::with_capacity(MAX_SERIALIZED_HEADER_BYTES);
+        self.zcash_serialize_into_vec(&mut out)?;
+        Ok(out)
+    }
+
+    /// Every header field has a fixed size except the Equihash solution, whose
+    /// size depends only on the network, so this needs no encoder pass.
+    fn zcash_serialized_size(&self) -> usize {
+        HEADER_BYTES_BEFORE_SOLUTION + self.solution.zcash_serialized_size()
+    }
+
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         validate_header_version(self.version).map_err(io::Error::other)?;
 
         writer.write_u32::<LittleEndian>(self.version)?;
-        self.previous_block_hash.zcash_serialize(&mut writer)?;
+        self.previous_block_hash.zcash_serialize(writer)?;
         writer.write_all(&self.merkle_root.0[..])?;
         writer.write_all(&self.commitment_bytes[..])?;
         writer.write_u32::<LittleEndian>(
@@ -78,12 +100,14 @@ impl ZcashSerialize for Header {
         )?;
         writer.write_u32::<LittleEndian>(self.difficulty_threshold.0)?;
         writer.write_all(&self.nonce[..])?;
-        self.solution.zcash_serialize(&mut writer)?;
+        self.solution.zcash_serialize(writer)?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for Header {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
@@ -111,13 +135,13 @@ impl ZcashDeserialize for Header {
 
 impl ZcashSerialize for CountedHeader {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.header.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.header.zcash_serialize(writer)?;
 
         // A header-only message has zero transactions in it.
         let transaction_count =
             CompactSizeMessage::try_from(0).expect("0 is below the message size limit");
-        transaction_count.zcash_serialize(&mut writer)?;
+        transaction_count.zcash_serialize(writer)?;
 
         Ok(())
     }
@@ -140,17 +164,21 @@ impl ZcashDeserialize for CountedHeader {
 }
 
 impl ZcashSerialize for Block {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    crate::serialization::compile_serialize_entry_points_here!();
+
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         // All block structs are validated when they are parsed.
         // So we don't need to check MAX_BLOCK_BYTES here, until
         // we start generating our own blocks (see #483).
-        self.header.zcash_serialize(&mut writer)?;
-        self.transactions.zcash_serialize(&mut writer)?;
+        self.header.zcash_serialize(writer)?;
+        self.transactions.zcash_serialize(writer)?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for Block {
+    crate::serialization::compile_deserialize_entry_points_here!();
+
     fn zcash_deserialize_from<R: io::Read>(
         reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {

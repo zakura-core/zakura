@@ -230,7 +230,7 @@ impl LiveRequester {
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
                 .map_err(|error| SinkReject::protocol(error.frame_rejection()))?;
-            let header = block::Header::zcash_deserialize(&frame.payload[1..])
+            let header = block::Header::zcash_deserialize_from_slice(&mut &frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
             let result = self
                 .shared

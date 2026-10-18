@@ -97,6 +97,13 @@ impl port::Port for PanickingPort {
             ))
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
+    }
 }
 
 fn direct_reactor(port: Arc<dyn port::Port>) -> HeaderSyncReactor {
@@ -437,6 +444,13 @@ impl port::Port for StalledLocatorPort {
         _target: port::PreparedHeaderTarget,
     ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
         Box::pin(async { panic!("the stalled-locator fixture never reaches target application") })
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
     }
 }
 

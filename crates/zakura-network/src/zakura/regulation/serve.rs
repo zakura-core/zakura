@@ -403,8 +403,8 @@ impl ServeCapacity {
             cancel,
             tasks: tasks.clone(),
         };
-        tasks.spawn(dispatch.run(queued));
-        tasks.spawn(writer);
+        tasks.spawn_session(dispatch.run(queued));
+        tasks.spawn_session(writer);
         serve
     }
 }
@@ -487,21 +487,36 @@ struct ServingTasks {
 }
 
 impl ServingTasks {
+    /// Spawn a task that runs once per serving session, boxed like other per-session tasks.
+    fn spawn_session(&self, task: impl Future<Output = ()> + Send + 'static) {
+        crate::zakura::transport::spawn_supervised_peer_task(
+            self.peer.clone(),
+            || {},
+            self.on_panic(),
+            task,
+        );
+    }
+
+    /// Spawn a task for one served request.
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
-        let cancel = self.cancel.clone();
-        let connection = self.connection.clone();
-        let close_cause = self.close_cause.clone();
         // Dispatch spawns one task per served request, so keep it unboxed.
         crate::zakura::transport::spawn_supervised_peer_task_unboxed(
             self.peer.clone(),
             || {},
-            move || {
-                close_cause.record("service_panic");
-                cancel.cancel();
-                connection.cancel();
-            },
+            self.on_panic(),
             task,
         );
+    }
+
+    fn on_panic(&self) -> impl FnOnce() + Send + 'static {
+        let cancel = self.cancel.clone();
+        let connection = self.connection.clone();
+        let close_cause = self.close_cause.clone();
+        move || {
+            close_cause.record("service_panic");
+            cancel.cancel();
+            connection.cancel();
+        }
     }
 }
 

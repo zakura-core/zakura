@@ -17,6 +17,12 @@ use tokio::task::JoinHandle;
 /// A spawned future boxed so that its type depends only on its output.
 pub type ErasedFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// Box `future` as an [`ErasedFuture`], for spawners other than [`spawn_erased`]
+/// such as `JoinSet::spawn` or `Handle::spawn`.
+pub fn erased<T>(future: impl Future<Output = T> + Send + 'static) -> ErasedFuture<T> {
+    Box::pin(future)
+}
+
 /// Spawn `future` on the current runtime as an [`ErasedFuture`].
 ///
 /// Behaves like [`tokio::spawn`], including panics when called outside a runtime.
@@ -24,6 +30,5 @@ pub type ErasedFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub fn spawn_erased<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> JoinHandle<T> {
-    let future: ErasedFuture<T> = Box::pin(future);
-    tokio::spawn(future)
+    tokio::spawn(erased(future))
 }

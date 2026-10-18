@@ -465,6 +465,14 @@ where
     ) -> tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>> {
         self.selected_chain.clone()
     }
+
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<port::SelectedChainMembership, PortError>> {
+        let read_state = self.read_state.clone();
+        Box::pin(async move { selected_chain_contains(read_state, hash).await })
+    }
 }
 
 fn header_failure_evidence(
@@ -1290,6 +1298,36 @@ where
     }
 }
 
+/// Ask state whether its selected header chain contains `hash`, within the
+/// driver deadline.
+async fn selected_chain_contains<ReadState>(
+    read_state: ReadState,
+    hash: block::Hash,
+) -> Result<port::SelectedChainMembership, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::SelectedChainMembership { hash }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::SelectedChainMembership(membership))) => Ok(membership),
+        Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => Err(PortError::Unavailable {
+            source: Some(Arc::from(error)),
+        }),
+        Err(_) => Err(PortError::Timeout),
+    }
+}
+
 #[cfg(test)]
 fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
     zakura_header_chain::SourceId::from_digest(peer.digest())
@@ -2093,5 +2131,34 @@ mod tests {
         let sizes = finalized_body_sizes_for_page(read_state, &[]).await;
 
         assert!(sizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_chain_membership_follows_the_state_reply() {
+        let hash = block::Hash([3; 32]);
+        let selected = zakura_header_chain::Frontier::new(block::Height(3), hash);
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::SelectedChainMembership { hash: asked } => {
+                    assert_eq!(asked, hash);
+                    zakura_state::ReadResponse::SelectedChainMembership(
+                        port::SelectedChainMembership::Selected(selected),
+                    )
+                }
+                request => panic!("unexpected membership state request: {request:?}"),
+            })
+        });
+        assert_eq!(
+            selected_chain_contains(read_state, hash).await.unwrap(),
+            port::SelectedChainMembership::Selected(selected)
+        );
+
+        let wrong_reply = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::BestHeaderTip(None))
+        });
+        assert!(matches!(
+            selected_chain_contains(wrong_reply, hash).await,
+            Err(PortError::Unavailable { source: None })
+        ));
     }
 }

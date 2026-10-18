@@ -60,6 +60,8 @@ use crate::{
 
 pub mod cookie;
 pub mod error;
+#[cfg(feature = "fuzz-impl")]
+pub mod fuzz;
 pub mod http;
 pub mod http_request_compatibility;
 pub mod jsonrpc;
@@ -428,7 +430,8 @@ fn stop_channel() -> (StopHandle, ServerHandle) {
 /// this future is aborted.
 ///
 /// Connections are served with HTTP/1 or HTTP/2, and closed if they don't send a request within
-/// [`FIRST_REQUEST_TIMEOUT`].
+/// [`FIRST_REQUEST_TIMEOUT`]. When this future is dropped, open connections finish their
+/// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
 async fn run_listener<S>(listener: TcpListener, service: S)
 where
     S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
@@ -437,6 +440,9 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    // Dropping this future drops `_server_handle`, which tells every connection to shut down.
+    let (stop_handle, _server_handle) = stop_channel();
+
     loop {
         let (socket, remote_addr) = match listener.accept().await {
             Ok(connection) => connection,
@@ -461,15 +467,22 @@ where
             })
         };
 
+        let stopped = stop_handle.clone().shutdown();
         tokio::spawn(async move {
             let builder = auto::Builder::new(TokioExecutor::new());
             let connection = builder.serve_connection_with_upgrades(
                 TokioIo::new(socket),
                 TowerToHyperService::new(service),
             );
+            tokio::pin!(connection, stopped);
 
             let result = tokio::select! {
-                result = connection => result,
+                result = &mut connection => result,
+                () = &mut stopped => {
+                    // The connection must keep being polled until its graceful shutdown finishes.
+                    connection.as_mut().graceful_shutdown();
+                    connection.await
+                }
                 () = no_request_within(&request_received, FIRST_REQUEST_TIMEOUT) => {
                     Err("no request received in time".into())
                 }

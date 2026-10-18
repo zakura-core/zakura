@@ -29,7 +29,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
-use zakura_node_services::header_chain::ServingCapacitySignal;
+use zakura_node_services::header_chain::{SelectedChainMembership, ServingCapacitySignal};
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -1658,6 +1658,59 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         Ok(self.store.snapshot()?.frontiers.header_best)
+    }
+
+    /// Report whether the committed selected chain contains the header `hash`.
+    ///
+    /// At and above the finalized frontier, the retained graph gives the height and the in-memory
+    /// selected projection answers. Below it, the canonical finalized indexes answer, read from a
+    /// RocksDB snapshot captured with the frontier. Neither walks ancestry.
+    pub(crate) fn selected_chain_membership(
+        &self,
+        hash: block::Hash,
+    ) -> Result<SelectedChainMembership, HeaderChainStoreError> {
+        let (finalized, retained, read) = {
+            let _writer = self
+                .store
+                .writer
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let engine = self
+                .transition_engine
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let finalized = engine.snapshot().frontiers.finalized;
+            let retained = engine
+                .graph()
+                .header_node(hash)
+                .map(|node| Frontier::new(node.height, node.hash));
+            if let Some(frontier) = retained.filter(|node| node.height >= finalized.height) {
+                // Widening u32 to usize is lossless on supported targets.
+                let offset = (frontier.height.0 - finalized.height.0) as usize;
+                let projection = engine.selected_projection();
+                if projection.first() != Some(&finalized) {
+                    return Err(StoreError::Incoherent(
+                        "selected projection disagrees with its published bounds",
+                    )
+                    .into());
+                }
+                return Ok(if projection.get(offset) == Some(&frontier) {
+                    SelectedChainMembership::Selected(frontier)
+                } else {
+                    SelectedChainMembership::NotSelected
+                });
+            }
+            (finalized, retained.is_some(), self.store.audit_snapshot()?)
+        };
+        // Finalized rows below the captured frontier never change, so this read needs no lock.
+        Ok(match read.finalized_frontier(hash)? {
+            Some(frontier) if frontier.height < finalized.height => {
+                SelectedChainMembership::Selected(frontier)
+            }
+            // A retained fork below the finalized frontier is never selected.
+            _ if retained => SelectedChainMembership::NotSelected,
+            _ => SelectedChainMembership::NotRetained,
+        })
     }
 
     /// Capture full-state data and the durable selected projection from one transition generation.

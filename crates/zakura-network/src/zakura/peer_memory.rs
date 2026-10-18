@@ -117,7 +117,7 @@ pub fn budgeted_max_connections(
 
 #[cfg(test)]
 mod tests {
-    use zakura_quic::QuicConfig;
+    use zakura_quic::{NodeId, NodeSecretKey, QuicConfig};
 
     use super::*;
     use crate::zakura::{
@@ -195,12 +195,37 @@ mod tests {
         }
 
         // A custom list of 16 bootstrap peers needs 33 connections.
+        let node_ids: Vec<NodeId> = (1..=16)
+            .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
         let config = ZakuraConfig {
-            bootstrap_peers: vec![String::new(); 16],
-            peer_memory_budget_bytes: 32 * 80 * MIB,
+            bootstrap_peers: node_ids
+                .iter()
+                .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+                .collect(),
+            peer_memory_budget_bytes: 30 * 80 * MIB,
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections().unwrap_err().required, 33);
+        // Leaving this node's own entry out lowers the floor to match discovery.
+        assert_eq!(
+            config
+                .budgeted_max_connections_for_node(node_ids[0])
+                .unwrap_err()
+                .required,
+            31
+        );
+
+        // Extra addresses for one identity and unparseable entries don't count.
+        let config = ZakuraConfig {
+            bootstrap_peers: (1..=16)
+                .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
+                .chain(["not a bootstrap peer".to_string()])
+                .collect(),
+            peer_memory_budget_bytes: 30 * 80 * MIB,
+            ..ZakuraConfig::default()
+        };
+        assert_eq!(config.budgeted_max_connections(), Ok(30));
     }
 
     #[test]

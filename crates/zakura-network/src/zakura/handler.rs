@@ -411,12 +411,32 @@ impl ZakuraConfig {
     /// Return the connection cap after the peer memory budget (see
     /// [`budgeted_max_connections`]), or an error naming the keys when the
     /// budget admits too few connections.
+    ///
+    /// The floor counts distinct bootstrap identities, as discovery does. It
+    /// can't leave out this node's own entry before the node key is loaded;
+    /// [`Self::budgeted_max_connections_for_node`] can.
     pub fn budgeted_max_connections(&self) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(None)
+    }
+
+    /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
+    /// of the bootstrap count, exactly as discovery does.
+    pub fn budgeted_max_connections_for_node(
+        &self,
+        local_node_id: NodeId,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(Some(local_node_id))
+    }
+
+    fn budgeted_max_connections_excluding(
+        &self,
+        local_node_id: Option<NodeId>,
+    ) -> Result<usize, PeerMemoryBudgetError> {
         budgeted_max_connections(
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.quic.connection_memory_bytes(),
-            self.bootstrap_peers.len(),
+            remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id),
         )
     }
 
@@ -3864,11 +3884,16 @@ fn discovery_direct_addrs(config: &Config, local_node_id: NodeId) -> Vec<SocketA
     direct_addrs
 }
 
-fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+/// Counts the distinct parseable bootstrap identities other than `local_node_id`.
+fn remote_bootstrap_peer_count(
+    bootstrap_peers: &[String],
+    local_node_id: impl Into<Option<NodeId>>,
+) -> usize {
+    let local_node_id = local_node_id.into();
     bootstrap_peers
         .iter()
         .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
-        .filter(|node_addr| node_addr.id != local_node_id)
+        .filter(|node_addr| Some(node_addr.id) != local_node_id)
         .map(|node_addr| node_addr.id)
         .collect::<HashSet<_>>()
         .len()
@@ -4027,7 +4052,11 @@ async fn spawn_zakura_endpoint_inner(
         .block_sync
         .validate()
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
-    let budgeted_max_connections = config.zakura.budgeted_max_connections()?;
+    let secret_key = zakura_secret_key(config)?;
+    let local_node_id = secret_key.public();
+    let budgeted_max_connections = config
+        .zakura
+        .budgeted_max_connections_for_node(local_node_id)?;
     if budgeted_max_connections < config.zakura.max_connections {
         warn!(
             max_connections = config.zakura.max_connections,
@@ -4041,8 +4070,6 @@ async fn spawn_zakura_endpoint_inner(
     }
     let limits = ZakuraLocalLimits::from_config(config);
     validate_idle_invariant(&limits)?;
-    let secret_key = zakura_secret_key(config)?;
-    let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)

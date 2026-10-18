@@ -79,11 +79,11 @@ impl ConnectError {
 
     /// Ranks errors so a multi-address dial reports the most informative one.
     ///
-    /// `ConnectionLimit` outranks everything: an address skipped for this
-    /// node's cap was never tried, so the dial must not blame the peer
-    /// (ADM-12). That includes ALPN and identity errors, because a signed
-    /// record proves the node key, not that it owns every address it lists:
-    /// a decoy address can answer for another node or cohort.
+    /// `ConnectionLimit` comes only from the slot claim before a dial's first
+    /// attempt (ADM-12), so it never competes with a peer's result. It ranks
+    /// first anyway, so a local cap can never blame the peer: a signed record
+    /// proves the node key, not that it owns every address it lists, and a
+    /// decoy address can answer for another node or cohort.
     pub(crate) fn rank(&self) -> u8 {
         match self {
             Self::ConnectionLimit => 7,

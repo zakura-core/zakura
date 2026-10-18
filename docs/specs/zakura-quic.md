@@ -422,13 +422,14 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     creates no connection state (SEC-3). Inbound attempts therefore never take
     the last `dial_reserve` slots, and peers that churn inbound connections
     can't stop this node's dials.
-  - A dial attempt MUST fail with `ConnectFailed(ConnectionLimit)` before
-    sending a packet while `max_connections` are held. A multi-address dial
-    ranks `ConnectionLimit` above every other result, so an address this node
-    never tried doesn't blame the peer. That includes `AlpnMismatch` and
-    `WrongIdentity`: a signed record proves the node key, not that the node
-    owns every address it lists, so a decoy address can answer for another
-    node or cohort.
+  - A dial MUST claim a live slot for every address it will try (DIAL-3)
+    before its first attempt. When the cap can't fit them all, it fails with
+    `ConnectFailed(ConnectionLimit)` before sending any packet. A dial
+    therefore never mixes this node's limit with the peer's results. Skipping
+    a later address at the cap would either blame the peer for an address it
+    never got to answer, since a signed record proves the node key and not
+    that the node owns every address it lists, or call a dial that contacted
+    the peer a local limit and retry it without backoff.
   - `QuicEndpoint::has_dial_capacity()` reports whether a dial would get a
     slot. `zakura-network` treats `ConnectionLimit` as its own resource limit,
     not the peer's fault. Its discovery dialer starts a dial only while both
@@ -919,7 +920,7 @@ this release tolerates, and keep each hard change explicit.
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
-| Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; `ConnectionLimit` outranks every other dial result | ADM-12 |
+| Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
 | Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |

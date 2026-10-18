@@ -2112,6 +2112,49 @@ async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
     .unwrap();
 }
 
+/// ADM-12: a dial claims a slot for every address before its first attempt,
+/// so with room for fewer it fails before the peer sees anything. A cap hit
+/// partway would mix a local limit with the peer's real results.
+#[tokio::test]
+async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+
+        let one_slot = QuicBindConfig {
+            max_connections: 1,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &one_slot, &test_config()).unwrap();
+        assert!(matches!(
+            client.connect(addr.clone(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(client.connection_count(), 0);
+        // The first address would have answered at once; give it time to show.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        let two_slots = QuicBindConfig {
+            max_connections: 2,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &two_slots, &test_config()).unwrap();
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// A UDP relay that delays every datagram by `delay` in each direction.
 struct DelayRelay {
     addr: SocketAddr,

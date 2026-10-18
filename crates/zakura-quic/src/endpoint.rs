@@ -322,9 +322,10 @@ impl QuicEndpoint {
         self.inner.shared.connections.closing()
     }
 
-    /// Whether a dial would get a live connection slot right now (ADM-12).
+    /// Whether the table has a free live connection slot right now (ADM-12).
     /// Callers that dial in a loop check this first, so a full table doesn't
-    /// make them spin on `ConnectionLimit`.
+    /// make them spin on `ConnectionLimit`. A dial needs one slot per address
+    /// it tries, so a multi-address dial can still fail with that error.
     pub fn has_dial_capacity(&self) -> bool {
         self.inner.shared.connections.can_dial()
     }
@@ -416,13 +417,24 @@ impl QuicEndpoint {
             return Err(ConnectError::NoUsableAddress);
         }
 
+        // ADM-12: claim a live slot for every address before the first
+        // attempt. The dial then fails here, before sending any packet, or
+        // tries every address. A cap hit partway would mix this node's limit
+        // with the peer's real results, and neither could then be trusted.
+        // Partial claims drop on failure.
+        let slots = targets
+            .iter()
+            .map(|_| shared.connections.claim_dial())
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ConnectError::ConnectionLimit)?;
+
         let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();
         let deadline = shared.config.handshake_timeout();
         let mut attempts = FuturesUnordered::new();
-        for (index, (target, socket)) in targets.into_iter().enumerate() {
+        for (index, ((target, socket), slot)) in targets.into_iter().zip(slots).enumerate() {
             let crypto = crypto.clone();
             // Bounded by the 8 addresses discovery admits per record; the cast can't truncate.
             let delay = stagger * index as u32;
@@ -432,7 +444,7 @@ impl QuicEndpoint {
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = self.dial_once(socket, crypto, target, deadline).await;
+                let result = self.dial_once(socket, crypto, target, deadline, slot).await;
                 record_handshake(&result, started);
                 (target, result)
             });
@@ -467,14 +479,8 @@ impl QuicEndpoint {
         crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
         target: SocketAddr,
         deadline: Option<Duration>,
+        slot: Arc<ConnectionSlot>,
     ) -> Result<(ConnRef, Handshake), ConnectError> {
-        // ADM-12: claimed here, so a dial at the cap sends no packet.
-        let slot = self
-            .inner
-            .shared
-            .connections
-            .claim_dial()
-            .ok_or(ConnectError::ConnectionLimit)?;
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
         client.transport_config(
@@ -548,7 +554,13 @@ impl QuicEndpoint {
             .socket_for(target)
             .expect("tests dial an address family the endpoint bound");
         let deadline = self.inner.shared.config.handshake_timeout();
-        self.dial_once(socket, Arc::new(crypto), target, deadline)
+        let slot = self
+            .inner
+            .shared
+            .connections
+            .claim_dial()
+            .ok_or(ConnectError::ConnectionLimit)?;
+        self.dial_once(socket, Arc::new(crypto), target, deadline, slot)
             .await
     }
 

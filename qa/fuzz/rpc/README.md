@@ -1,6 +1,7 @@
 # RPC fuzzing
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member.
+It has no committed `Cargo.lock`: Cargo resolves its dependencies when it builds.
 
 Run a target from this directory with a pinned nightly toolchain. Pass
 `--fuzz-dir .`, because `cargo-fuzz` otherwise looks for `fuzz/` under the

@@ -881,7 +881,7 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
 
     // A 1 GiB receive window leaves the default budget room for 7 peers, below
-    // Mainnet's floor of 19.
+    // the floor.
     let error = toml::from_str::<Config>(
         r#"
         [zakura.quic]

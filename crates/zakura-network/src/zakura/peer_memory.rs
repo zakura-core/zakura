@@ -209,7 +209,14 @@ mod tests {
             peer_memory_budget_bytes: 30 * 80 * MIB,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections().unwrap_err().required, 33);
+        let outsider = NodeSecretKey::from_bytes(&[99; 32]).public();
+        assert_eq!(
+            config
+                .budgeted_max_connections_for_node(outsider)
+                .unwrap_err()
+                .required,
+            33
+        );
         // Leaving this node's own entry out lowers the floor to match discovery.
         assert_eq!(
             config
@@ -218,6 +225,8 @@ mod tests {
                 .required,
             31
         );
+        // Without the node key, config load assumes one entry may be its own.
+        assert_eq!(config.budgeted_max_connections().unwrap_err().required, 31);
 
         // Extra addresses for one identity and unparsable entries don't count.
         let config = ZakuraConfig {
@@ -232,10 +241,10 @@ mod tests {
     }
 
     #[test]
-    fn local_limits_keep_the_budget_when_only_the_node_floor_passes() {
+    fn config_load_and_limits_never_outrun_the_node_floor() {
         // Nine identities including this node's own, and a budget for 18
-        // connections: the node-specific floor (17) passes, the generic one
-        // (19) doesn't, and the limits must still stop at 18.
+        // connections: the endpoint's floor is 17, so config load must accept
+        // it too.
         let node_ids: Vec<NodeId> = (1..=9)
             .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
             .collect();
@@ -246,12 +255,17 @@ mod tests {
             .collect();
         config.zakura.max_connections = 256;
         config.zakura.peer_memory_budget_bytes = 18 * 80 * MIB;
-        assert!(config.zakura.budgeted_max_connections().is_err());
+        assert_eq!(config.zakura.budgeted_max_connections(), Ok(18));
         assert_eq!(
             config.zakura.budgeted_max_connections_for_node(node_ids[0]),
             Ok(18)
         );
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
+
+        // A budget both checks refuse still caps the limits at its own count.
+        config.zakura.peer_memory_budget_bytes = 16 * 80 * MIB;
+        assert!(config.zakura.budgeted_max_connections().is_err());
+        assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 16);
     }
 
     #[test]
@@ -266,13 +280,14 @@ mod tests {
         let error = config.budgeted_max_connections().unwrap_err();
         // 8 GiB / (1024 + 32 + 16) MiB.
         assert_eq!(error.admitted, 7);
-        assert_eq!(error.required, 19);
+        // Mainnet's 9 bootstrap peers, counting one as possibly this node.
+        assert_eq!(error.required, 17);
         assert!(error
             .to_string()
             .contains("[network.zakura] peer_memory_budget_bytes"));
         assert!(error.to_string().contains("receive_window_bytes"));
 
-        // 8 GiB / (512 + 32 + 16) MiB leaves room for 14, below Mainnet's 19.
+        // 8 GiB / (512 + 32 + 16) MiB leaves room for 14, below the floor.
         let config = ZakuraConfig {
             quic: QuicConfig {
                 receive_window_bytes: 512 << 20,

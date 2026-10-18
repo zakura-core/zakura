@@ -141,8 +141,8 @@ fn legacy_opentelemetry_settings_are_accepted_and_not_serialized() {
     )
     .expect("write legacy config");
 
-    let config = ZakuradConfig::load(Some(config_path))
-        .expect("legacy OpenTelemetry settings remain valid");
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy OpenTelemetry settings remain valid");
 
     let serialized = toml::to_string(&config).expect("serialize config");
     assert!(!serialized.contains("opentelemetry"));

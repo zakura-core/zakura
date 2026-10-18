@@ -90,9 +90,6 @@ idna_adapter = "~1.1.0"
 indexmap = "2.8"
 insta = "1.42"
 itertools = "0.14"
-jsonrpsee = "0.26.1"
-jsonrpsee-proc-macros = "0.26.1"
-jsonrpsee-types = "0.26.1"
 jubjub = { version = "=4.0.0-rc0", package = "zakura-jubjub" }
 async-trait = "0.1.89"
 lazy_static = "1.4"
@@ -390,7 +387,7 @@ print_stderr = "warn"
 # Code styles we want to accept
 try_err = "allow"
 
-# Clippy 1.99 reports these in code that `derive-new`, `thiserror`, `jsonrpsee` and `tonic`
+# Clippy 1.99 reports these in code that `derive-new`, `thiserror` and `tonic`
 # generate, which we can't change.
 double_must_use = "allow"
 redundant_field_names = "allow"

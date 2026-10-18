@@ -515,12 +515,11 @@ impl Sequencer {
 
     /// The unsubmitted `applying` heights eligible for verifier submission, in
     /// height order, bounded by the remaining submission window and, above the
-    /// last checkpoint, by the decoded-byte cap.
+    /// last checkpoint, by the projected decoded-byte cap (see
+    /// [`Self::submission_admitted`]).
     ///
-    /// A raw body's decoded size is unknown until `prepare_submit` decodes it,
-    /// so the cap charges it `bytes × DESERIALIZED_MEM_FACTOR`. When nothing is
-    /// in flight, the next body is always eligible, so one oversized body still
-    /// progresses.
+    /// The projection uses estimates for raw bodies, so callers must recheck
+    /// [`Self::submission_fits_decoded_window`] before each `prepare_submit`.
     pub(super) fn submittable_heights(&self) -> Vec<block::Height> {
         let available = self
             .submitted_apply_limit
@@ -537,26 +536,64 @@ impl Sequencer {
             .filter(|(_, applying)| !applying.submitted)
             .take(available)
         {
-            let additional_decoded_bytes = if applying.body.is_decoded() {
-                0
-            } else {
-                applying.bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
-            };
-            if in_flight > 0
-                && !self.decoded_window_admits(
-                    *height,
-                    resident_decoded_bytes,
-                    additional_decoded_bytes,
-                )
-            {
+            if !self.submission_admitted(*height, applying, resident_decoded_bytes, in_flight) {
                 break;
             }
             resident_decoded_bytes =
-                resident_decoded_bytes.saturating_add(additional_decoded_bytes);
+                resident_decoded_bytes.saturating_add(Self::submission_decode_charge(applying));
             in_flight = in_flight.saturating_add(1);
             heights.push(*height);
         }
         heights
+    }
+
+    /// Whether submitting `height` now keeps the measured decoded window within
+    /// its cap. `true` when `height` is not applying, so `prepare_submit`
+    /// decides that case.
+    pub(super) fn submission_fits_decoded_window(&self, height: block::Height) -> bool {
+        self.applying.get(&height).is_none_or(|applying| {
+            self.submission_admitted(
+                height,
+                applying,
+                self.applying_decoded_attributed_memory_bytes(),
+                self.in_flight_submission_count(),
+            )
+        })
+    }
+
+    /// Whether no submission is in flight while unsubmitted work waits, so
+    /// nothing else will wake a capped window.
+    pub(super) fn submission_window_idle_with_pending_work(&self) -> bool {
+        self.in_flight_submission_count() == 0 && self.unsubmitted_applying_count() > 0
+    }
+
+    /// Decoded-cap admission for one submission. A raw body's decoded size is
+    /// unknown until `prepare_submit` decodes it, so it is charged
+    /// `bytes × DESERIALIZED_MEM_FACTOR`. With nothing in flight the body is
+    /// always admitted, so one oversized body still progresses.
+    fn submission_admitted(
+        &self,
+        height: block::Height,
+        applying: &ApplyingBlock,
+        resident_decoded_bytes: u64,
+        in_flight: usize,
+    ) -> bool {
+        in_flight == 0
+            || self.decoded_window_admits(
+                height,
+                resident_decoded_bytes,
+                Self::submission_decode_charge(applying),
+            )
+    }
+
+    /// Decoded bytes that submitting `applying` adds: none when it is already
+    /// decoded, otherwise the raw-body estimate.
+    fn submission_decode_charge(applying: &ApplyingBlock) -> u64 {
+        if applying.body.is_decoded() {
+            0
+        } else {
+            applying.bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
+        }
     }
 
     /// Assign a token to `height`, mark it submitted, and return the dispatch

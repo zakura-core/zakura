@@ -762,12 +762,13 @@ impl SequencerTask {
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
             // The decoded-byte cap can hold back current work while only
-            // detached submissions are in flight, so retiring the last one must
-            // resubmit even when it did not verify.
-            let window_drained = self.sequencer.in_flight_submission_count() == 0;
+            // detached submissions are in flight. Retiring the last one must
+            // wake that work even when this completion is unverified or from a
+            // superseded owner. Nothing else will.
+            let wake_pending = self.sequencer.submission_window_idle_with_pending_work();
             return (
                 false,
-                released && semantic_completion.is_some() && (verified || window_drained),
+                released && (wake_pending || verified && semantic_completion.is_some()),
             );
         };
         if applying_owner != owner
@@ -788,9 +789,14 @@ impl SequencerTask {
         }
         let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
             let _ = self.sequencer.remove_applying(height);
-            self.sequencer
+            let released = self
+                .sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return (false, false);
+            // See the stale-completion branch above.
+            return (
+                false,
+                released && self.sequencer.submission_window_idle_with_pending_work(),
+            );
         };
         let attribution_matches = outcome
             .attributed_source()
@@ -1001,6 +1007,11 @@ impl SequencerTask {
 
         self.submission_retry_at = None;
         for height in submittable_heights {
+            // Each decode replaces an estimate with the measured size, so recheck
+            // the cap before every submission (see `submittable_heights`).
+            if !self.sequencer.submission_fits_decoded_window(height) {
+                break;
+            }
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };

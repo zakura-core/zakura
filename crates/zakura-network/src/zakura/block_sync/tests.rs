@@ -4971,12 +4971,18 @@ fn capped_sequencer_with_blocks_1_to_3(
     (seq, blocks)
 }
 
-/// Submit every currently submittable height and return the dispatch items.
+/// Submit every currently submittable height the way the sequencer task does,
+/// rechecking the measured decoded window before each one, and return the
+/// dispatch items.
 fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
-    seq.submittable_heights()
-        .into_iter()
-        .map(|height| seq.prepare_submit(height).expect("height is applying"))
-        .collect()
+    let mut items = Vec::new();
+    for height in seq.submittable_heights() {
+        if !seq.submission_fits_decoded_window(height) {
+            break;
+        }
+        items.push(seq.prepare_submit(height).expect("height is applying"));
+    }
+    items
 }
 
 /// Retire a submission the way a committed apply completion does.
@@ -5389,117 +5395,255 @@ async fn next_submission(
     .ok()
 }
 
-#[tokio::test]
-async fn decoded_cap_resubmits_after_last_in_flight_submission_retires() {
+/// A running sequencer task whose window is decoded-capped above height 0.
+struct CappedSequencerTask {
+    body_tx: mpsc::Sender<SequencedBody>,
+    control_tx: mpsc::UnboundedSender<SequencerControlInput>,
+    actions_rx: mpsc::Receiver<BlockSyncAction>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CappedSequencerTask {
     const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
     const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 
-    let blocks = fake_sequential_blocks(2);
-    let frontiers = genesis_frontiers();
-    let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let (body_tx, body_rx) = mpsc::channel(2);
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let (actions_tx, mut actions_rx) = mpsc::channel(8);
-    let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-    // Both blocks exceed a one-byte cap above the checkpoint, so only one is
-    // submitted at a time.
-    let task = SequencerTask::new(
-        Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
-            .with_decoded_window_cap(block::Height(0), 1),
-        ByteBudget::new(1),
-        Arc::new(WorkQueue::new(block::Height(0))),
-        Arc::new(PeerRegistry::new()),
-        actions_tx,
-        ThroughputMeter::new(Instant::now()),
-        frontiers,
-        Some(test_work_scope()),
-        crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
-        body_rx,
-        control_rx,
-        body_input_bytes.clone(),
-        body_input_decoded_attributed_memory_bytes.clone(),
-        view_tx,
-        CHANNEL_TIMEOUT,
-        ZakuraTrace::noop(),
-    );
-    let task = tokio::spawn(task.run());
+    /// Spawn a sequencer task at genesis with a `max_decoded_bytes` cap above
+    /// height 0 and a full checkpoint-sized count window.
+    fn spawn(max_decoded_bytes: u64) -> Self {
+        let frontiers = genesis_frontiers();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, actions_rx) = mpsc::channel(8);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+                .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
+            ByteBudget::new(1),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Self::CHANNEL_TIMEOUT,
+            ZakuraTrace::noop(),
+        );
+        Self {
+            body_tx,
+            control_tx,
+            actions_rx,
+            body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
+            task: tokio::spawn(task.run()),
+        }
+    }
 
-    for (index, block) in blocks.iter().enumerate() {
-        let height = block::Height(index as u32 + 1);
-        body_tx
+    /// Queue `block` at `height` for `owner`, charged `wire_bytes`.
+    async fn send_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        self.body_tx
             .send(SequencedBody::new_queued(
-                test_work_owner(),
+                owner,
                 zakura_header_chain::SourceId::from_digest([1; 32]),
-                height,
+                block::Height(height),
                 block.hash(),
                 block.header.previous_block_hash,
                 BufferedBlockBody::from_decoded_block(
                     block.clone(),
                     Some(raw_block_payload(block)),
                 ),
-                u64::from(block_size(block)),
+                wire_bytes,
                 peer(1),
                 Instant::now(),
-                body_input_bytes.clone(),
-                body_input_decoded_attributed_memory_bytes.clone(),
+                self.body_input_bytes.clone(),
+                self.body_input_decoded_attributed_memory_bytes.clone(),
             ))
             .await
             .expect("sequencer body channel remains live");
     }
 
-    let (token_1, block_1) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
-        .await
-        .expect("height 1 is submitted");
-    assert_eq!(block_1.coinbase_height(), Some(block::Height(1)));
-    assert!(
-        next_submission(&mut actions_rx, MISSING_SUBMISSION_TIMEOUT)
+    /// The next submission, failing the test if none arrives.
+    async fn expect_submission(&mut self, height: u32) -> BlockApplyToken {
+        let (token, block) = next_submission(&mut self.actions_rx, Self::CHANNEL_TIMEOUT)
             .await
-            .is_none(),
-        "the cap holds height 2 back while height 1 is in flight",
-    );
+            .unwrap_or_else(|| panic!("height {height} is submitted"));
+        assert_eq!(block.coinbase_height(), Some(block::Height(height)));
+        token
+    }
+
+    /// Fail the test if any submission arrives shortly.
+    async fn expect_no_submission(&mut self, reason: &str) {
+        assert!(
+            next_submission(&mut self.actions_rx, Self::MISSING_SUBMISSION_TIMEOUT)
+                .await
+                .is_none(),
+            "{reason}",
+        );
+    }
+
+    /// Report an apply completion for a submitted block.
+    fn finish(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        token: BlockApplyToken,
+        height: u32,
+        block: &Arc<block::Block>,
+        result: BlockApplyResult,
+        semantic_completion: Option<zakura_header_chain::BodyWorkOwner>,
+    ) {
+        self.control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source: zakura_header_chain::SourceId::from_digest([1; 32]),
+                token,
+                height: block::Height(height),
+                hash: block.hash(),
+                outcome: test_block_apply_outcome(result),
+                eligible_sources: BTreeSet::new(),
+                persisted_availability: None,
+                semantic_completion: semantic_completion
+                    .map(|owner| (owner, zakura_header_chain::StateVersion::default())),
+            })
+            .expect("apply completion queues");
+    }
+}
+
+#[tokio::test]
+async fn decoded_cap_resubmits_after_last_in_flight_submission_retires() {
+    let blocks = fake_sequential_blocks(2);
+    // Both blocks exceed a one-byte cap above the checkpoint, so only one is
+    // submitted at a time.
+    let mut task = CappedSequencerTask::spawn(1);
+    for (index, block) in blocks.iter().enumerate() {
+        task.send_body(
+            test_work_owner(),
+            index as u32 + 1,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_no_submission("the cap holds height 2 back while height 1 is in flight")
+        .await;
 
     // A frontier advance detaches height 1 while the driver still holds it, so
     // height 2 stays capped. A later unverified completion for the detached
     // submission retires the only in-flight charge, and the window must refill.
-    control_tx
+    task.control_tx
         .send(SequencerControlInput::FrontierAdvance {
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height(0),
                 verified_block_tip: block::Height(1),
-                verified_block_hash: block_1.hash(),
+                verified_block_hash: blocks[0].hash(),
             },
             release_applied: true,
         })
         .expect("frontier advance queues");
-    assert!(
-        next_submission(&mut actions_rx, MISSING_SUBMISSION_TIMEOUT)
-            .await
-            .is_none(),
-        "the detached submission still holds the cap",
+    task.expect_no_submission("the detached submission still holds the cap")
+        .await;
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Unavailable,
+        Some(test_work_owner()),
     );
-    control_tx
-        .send(SequencerControlInput::ApplyFinished {
-            owner: Box::new(test_work_owner()),
-            source: zakura_header_chain::SourceId::from_digest([1; 32]),
-            token: token_1,
-            height: block::Height(1),
-            hash: block_1.hash(),
-            outcome: test_block_apply_outcome(BlockApplyResult::Unavailable),
-            eligible_sources: BTreeSet::new(),
-            persisted_availability: None,
-            semantic_completion: Some((
-                test_work_owner(),
-                zakura_header_chain::StateVersion::default(),
-            )),
-        })
-        .expect("height 1 completion queues");
-    let (_, block_2) = next_submission(&mut actions_rx, CHANNEL_TIMEOUT)
-        .await
-        .expect("height 2 is submitted once the window drains");
-    assert_eq!(block_2.coinbase_height(), Some(block::Height(2)));
+    task.expect_submission(2).await;
+    task.task.abort();
+}
 
-    task.abort();
+#[tokio::test]
+async fn decoded_cap_wakes_current_work_after_superseded_epoch_completion() {
+    let blocks = fake_sequential_blocks(2);
+    let mut task = CappedSequencerTask::spawn(1);
+    task.send_body(
+        test_work_owner(),
+        1,
+        &blocks[0],
+        u64::from(block_size(&blocks[0])),
+    )
+    .await;
+    let token_1 = task.expect_submission(1).await;
+
+    // An epoch change detaches height 1 at its old owner. The new epoch's
+    // height 2 then waits behind the detached charge.
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+    let changed_owner =
+        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
+    task.control_tx
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers: BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: blocks[0].hash(),
+            },
+        })
+        .expect("epoch change queues");
+    task.send_body(
+        changed_owner,
+        2,
+        &blocks[1],
+        u64::from(block_size(&blocks[1])),
+    )
+    .await;
+    task.expect_no_submission("the detached old-epoch submission still holds the cap")
+        .await;
+
+    // The old epoch's completion has no semantic owner, but retiring the last
+    // in-flight charge must still wake the current epoch's work.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Committed,
+        None,
+    );
+    task.expect_submission(2).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_rechecks_measured_size_between_batch_submissions() {
+    let blocks = fake_sequential_blocks(3);
+    // Each body claims one wire byte, so the projection charges a raw body only
+    // `DESERIALIZED_MEM_FACTOR` bytes. The cap fits height 1 decoded plus both
+    // raw estimates, but not height 2's real decoded size.
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let mut task = CappedSequencerTask::spawn(decoded_1 + 2 * DESERIALIZED_MEM_FACTOR);
+    // Heights 3 and 2 arrive first and stay raw, so height 1 releases all
+    // three in one batch.
+    for height in [3, 2, 1] {
+        task.send_body(test_work_owner(), height, &blocks[height as usize - 1], 1)
+            .await;
+    }
+    task.expect_submission(1).await;
+    task.expect_submission(2).await;
+    task.expect_no_submission(
+        "height 2's measured decoded size must stop the batch before height 3",
+    )
+    .await;
+    task.task.abort();
 }
 
 #[tokio::test]

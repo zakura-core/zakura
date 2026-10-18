@@ -145,6 +145,12 @@ ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
 ARG HOME
 WORKDIR ${HOME}
 
+# Build RocksDB's rarely run sources for size, as `.cargo/config.toml` does
+# outside Docker. The cargo config is not mounted here because `.cargo` is the
+# CARGO_HOME cache, so the wrapper is selected directly.
+ENV CXX_x86_64_unknown_linux_gnu=${HOME}/scripts/rocksdb/cxx.sh
+ENV CXX_aarch64_unknown_linux_gnu=${HOME}/scripts/rocksdb/cxx.sh
+
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
@@ -166,6 +172,7 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=bind,source=scripts/rocksdb,target=scripts/rocksdb \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \

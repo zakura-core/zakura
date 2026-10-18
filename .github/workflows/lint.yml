@@ -200,7 +200,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh scripts/rocksdb/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
@@ -275,6 +275,10 @@ jobs:
         # grid deliberately is not, so this is what binds it on an ordinary PR. Bootstrap
         # provenance is a release-time policy rather than a PR one, hence the override.
         run: ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=1 ./scripts/check-release-state.sh
+
+      - name: RocksDB hot source list matches librocksdb-sys
+        if: ${{ !cancelled() }}
+        run: python3 scripts/rocksdb/check_hot_sources.py
 
       - name: Ensure no arbitrary or proptest dependency on default build
         if: ${{ !cancelled() }}

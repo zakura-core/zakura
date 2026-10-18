@@ -14,6 +14,9 @@ rustdocflags = [
 
 [env]
 RUST_BACKTRACE="1"
+# Build RocksDB's rarely run sources for size; see scripts/rocksdb/cxx.sh.
+CXX_x86_64_unknown_linux_gnu = { value = "scripts/rocksdb/cxx.sh", relative = true }
+CXX_aarch64_unknown_linux_gnu = { value = "scripts/rocksdb/cxx.sh", relative = true }
 
 [profile.profiling]
 inherits = "release"

@@ -24,3 +24,5 @@
 !docker/entrypoint.sh
 !docker/default-zakura-config.toml
 !docker/ubuntu-package.Dockerfile
+!scripts/rocksdb
+!scripts/rocksdb/**

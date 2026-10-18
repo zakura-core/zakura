@@ -150,6 +150,29 @@ where
 pub(crate) type TestStateService =
     tower::util::BoxCloneService<zs::Request, zs::Response, BoxError>;
 
+/// Boxes a test's state service as a [`TestStateService`], so tests that pass different mock
+/// services share one compiled copy of the verifier they build.
+#[cfg(test)]
+pub(crate) fn boxed_state<S>(state: S) -> TestStateService
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    TestStateService::new(state)
+}
+
+/// Boxes a test's transaction verifier, for the same reason as [`boxed_state`].
+#[cfg(test)]
+pub(crate) fn boxed_transaction_verifier<V>(
+    verifier: V,
+) -> tower::util::BoxCloneService<Request, Response, BoxError>
+where
+    V: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
+    V::Future: Send + 'static,
+{
+    tower::util::BoxCloneService::new(verifier)
+}
+
 #[cfg(test)]
 impl
     Verifier<

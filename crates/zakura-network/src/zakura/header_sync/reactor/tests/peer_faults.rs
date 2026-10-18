@@ -1,5 +1,5 @@
 use super::*;
-use crate::zakura::{CloseCause, FramedRecv};
+use crate::zakura::{CloseCause, FramedRecv, SinkReject};
 
 #[test]
 fn wrong_locator_ancestor_target_and_prepared_header_are_peer_attributable() {
@@ -361,5 +361,109 @@ fn response_exceeding_its_owned_reservation_is_malformed_and_releases_capacity()
     assert_eq!(
         reactor.peer_work_queue.unowned_chunk_capacity(),
         crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1,
+    );
+}
+
+/// Run the session reader on one page from `parent`, then on the inbound
+/// stream's end, for a session subscribed to `target` from `locators`.
+async fn read_page(
+    tree: &v9::test_support::HeaderTree,
+    target: zakura_header_chain::Frontier,
+    locators: &[zakura_header_chain::Frontier],
+    parent: zakura_header_chain::Frontier,
+    headers: &[zakura_header_chain::Frontier],
+    marker: bool,
+) -> Result<(), SinkReject> {
+    use crate::zakura::header_sync::{
+        config::REGTEST_HEADER_BYTES,
+        pipe::run_peer,
+        v9::{LeaseOwner, Publisher},
+    };
+
+    let (handle, _actions, _reactor) = build_header_sync_reactor(startup(CancellationToken::new()))
+        .expect("the session reader fixture starts");
+    let peer = peer();
+    let cancel = CancellationToken::new();
+    let (send, _outbound) = framed_channel(8);
+    let session = PeerSession::from_parts(peer.clone(), send.clone(), cancel.clone());
+    let status = Status {
+        max_headers_per_response: 2,
+        max_message_bytes: 2_000_000,
+        ..v9::test_support::status::<REGTEST_HEADER_BYTES>(target)
+    };
+    let (open, _) = session
+        .subscriber()
+        .open(&status, locators, AuxSchema::None, 100)
+        .expect("the first Open is recorded");
+    let (publisher, publishing) = Publisher::spawn::<REGTEST_HEADER_BYTES>(
+        handle.port.clone(),
+        handle.serving.push(&peer),
+        send,
+        LeaseOwner {
+            peer: zakura_header_chain::SourceId::from_digest(peer.digest()),
+            session_id: session.session_id(),
+        },
+        handle.page_limits,
+        cancel.clone(),
+    );
+    let page = encode_frame(&v9::RegtestMessage::Headers(Headers {
+        subscription_id: open.subscription_id,
+        initial_target_tip_hash: target.hash,
+        common_ancestor_height: parent.height,
+        common_ancestor_hash: parent.hash,
+        reaches_initial_target: marker,
+        tree_aux_schema: AuxSchema::None,
+        entries: headers
+            .iter()
+            .map(|at| HeaderEntry {
+                header: tree.nodes[&at.hash].1.clone(),
+                body_size: 0,
+                tree_aux: None,
+            })
+            .collect(),
+    }))
+    .expect("the page is wire-valid");
+    let (inbound, recv) = framed_channel(1);
+    inbound.try_send(page).expect("the inbound queue has room");
+    drop(inbound);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_peer::<REGTEST_HEADER_BYTES>(handle, session, publisher, publishing, recv, cancel),
+    )
+    .await
+    .expect("the reader ends once the inbound stream ends")
+}
+
+/// The session reader ends the session as a protocol violation when a page
+/// claims a sent locator but its headers do not link, before the reactor or
+/// preparation sees the page. The same subscription admits the linked page.
+#[tokio::test]
+async fn unlinked_page_ends_the_session_in_the_reader() {
+    let mut tree = v9::test_support::HeaderTree::new();
+    let mut chain = vec![tree.genesis];
+    chain.extend(tree.extend(tree.genesis, 7));
+    let (target, locators) = (chain[7], [chain[5], chain[0]]);
+
+    read_page(&tree, target, &locators, chain[5], &chain[6..8], true)
+        .await
+        .expect("the reader admits a linked page and ends with the stream");
+
+    let rejected = read_page(
+        &tree,
+        target,
+        &locators,
+        chain[5],
+        &[chain[2], chain[7]],
+        true,
+    )
+    .await
+    .expect_err("an unlinked page ends the session");
+    let SinkReject::Protocol(error) = rejected else {
+        panic!("an unlinked page is a protocol violation, got {rejected:?}");
+    };
+    assert_eq!(
+        error.to_string(),
+        "the headers do not link from the page parent",
+        "the reader rejects the page for its linkage, not another rule"
     );
 }

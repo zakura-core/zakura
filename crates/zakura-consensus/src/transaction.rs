@@ -16,7 +16,6 @@ use futures::{
 };
 use tokio::sync::oneshot;
 use tower::{
-    buffer::Buffer,
     timeout::{error::Elapsed, Timeout},
     Service, ServiceExt,
 };
@@ -143,24 +142,59 @@ where
     }
 }
 
-impl<ZS>
+/// The state service of verifiers built by [`Verifier::new_for_tests`].
+///
+/// Boxing every test's state service into one type compiles the verifier once for all tests,
+/// instead of once per mock service type.
+#[cfg(test)]
+pub(crate) type TestStateService =
+    tower::util::BoxCloneService<zs::Request, zs::Response, BoxError>;
+
+/// Boxes a test's state service as a [`TestStateService`], so tests that pass different mock
+/// services share one compiled copy of the verifier they build.
+#[cfg(test)]
+pub(crate) fn boxed_state<S>(state: S) -> TestStateService
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    TestStateService::new(state)
+}
+
+/// Boxes a test's transaction verifier, for the same reason as [`boxed_state`].
+#[cfg(test)]
+pub(crate) fn boxed_transaction_verifier<V>(
+    verifier: V,
+) -> tower::util::BoxCloneService<Request, Response, BoxError>
+where
+    V: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
+    V::Future: Send + 'static,
+{
+    tower::util::BoxCloneService::new(verifier)
+}
+
+#[cfg(test)]
+impl
     Verifier<
-        ZS,
-        Buffer<
+        TestStateService,
+        tower::buffer::Buffer<
             mempool::Request,
             futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
         >,
     >
-where
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    ZS::Future: Send + 'static,
 {
     /// Create a new transaction verifier with a closed channel receiver for mempool setup for tests.
-    #[cfg(test)]
-    pub fn new_for_tests(network: &Network, state: ZS) -> Self {
+    pub fn new_for_tests<ZS>(network: &Network, state: ZS) -> Self
+    where
+        ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+            + Send
+            + Clone
+            + 'static,
+        ZS::Future: Send + 'static,
+    {
         Self {
             network: network.clone(),
-            state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
+            state: Timeout::new(TestStateService::new(state), UTXO_LOOKUP_TIMEOUT),
             mempool: None,
             script_verifier: script::Verifier,
             mempool_setup_rx: oneshot::channel().1,

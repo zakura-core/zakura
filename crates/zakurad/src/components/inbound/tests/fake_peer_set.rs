@@ -998,9 +998,9 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     // The poisoned block must not reach the state.
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // The block must also be re-requested, without a download source, so it routes through the
     // peer set rather than back to the peer that just poisoned it. Honest peers' `inv`s for this
@@ -1096,9 +1096,9 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
 
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // TODO: check that the block is not queued in the checkpoint verifier or non-finalized state
 

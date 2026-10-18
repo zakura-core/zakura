@@ -249,11 +249,6 @@ impl HighestCompletedCheckpointTracker {
         self.replace_state(TrackerState::default());
     }
 
-    /// Returns a sender clone that keeps subscriptions open without retaining the tracker.
-    pub(crate) fn keepalive_sender(&self) -> watch::Sender<Option<HighestCompletedCheckpoint>> {
-        self.sender.clone()
-    }
-
     fn replace_state(&mut self, state: TrackerState) {
         let changed = self.state.current != state.current;
         self.state = state;

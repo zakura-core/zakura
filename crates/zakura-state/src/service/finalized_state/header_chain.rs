@@ -29,7 +29,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
-use zakura_node_services::header_chain::ServingCapacitySignal;
+use zakura_node_services::header_chain::{SelectedChainMembership, ServingCapacitySignal};
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -1660,6 +1660,59 @@ impl HeaderChainReader {
         Ok(self.store.snapshot()?.frontiers.header_best)
     }
 
+    /// Report whether the committed selected chain contains the header `hash`.
+    ///
+    /// At and above the finalized frontier, the retained graph gives the height and the in-memory
+    /// selected projection answers. Below it, the canonical finalized indexes answer, read from a
+    /// RocksDB snapshot captured with the frontier. Neither walks ancestry.
+    pub(crate) fn selected_chain_membership(
+        &self,
+        hash: block::Hash,
+    ) -> Result<SelectedChainMembership, HeaderChainStoreError> {
+        let (finalized, retained, read) = {
+            let _writer = self
+                .store
+                .writer
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let engine = self
+                .transition_engine
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let finalized = engine.snapshot().frontiers.finalized;
+            let retained = engine
+                .graph()
+                .header_node(hash)
+                .map(|node| Frontier::new(node.height, node.hash));
+            if let Some(frontier) = retained.filter(|node| node.height >= finalized.height) {
+                // Widening u32 to usize is lossless on supported targets.
+                let offset = (frontier.height.0 - finalized.height.0) as usize;
+                let projection = engine.selected_projection();
+                if projection.first() != Some(&finalized) {
+                    return Err(StoreError::Incoherent(
+                        "selected projection disagrees with its published bounds",
+                    )
+                    .into());
+                }
+                return Ok(if projection.get(offset) == Some(&frontier) {
+                    SelectedChainMembership::Selected(frontier)
+                } else {
+                    SelectedChainMembership::NotSelected
+                });
+            }
+            (finalized, retained.is_some(), self.store.audit_snapshot()?)
+        };
+        // Finalized rows below the captured frontier never change, so this read needs no lock.
+        Ok(match read.finalized_frontier(hash)? {
+            Some(frontier) if frontier.height < finalized.height => {
+                SelectedChainMembership::Selected(frontier)
+            }
+            // A retained fork below the finalized frontier is never selected.
+            _ if retained => SelectedChainMembership::NotSelected,
+            _ => SelectedChainMembership::NotRetained,
+        })
+    }
+
     /// Capture full-state data and the durable selected projection from one transition generation.
     pub(crate) fn with_selected_projection<T>(
         &self,
@@ -2719,19 +2772,6 @@ impl HeaderChainRuntime {
         context: &TransitionContext<'_>,
     ) -> Result<ApplyResult, HeaderChainStoreError> {
         self.apply_combined(request, context, DiskWriteBatch::new(), || {})
-    }
-
-    #[cfg(test)]
-    fn apply_with_fault<F>(
-        &self,
-        request: TransitionRequest,
-        context: &TransitionContext<'_>,
-        fault: F,
-    ) -> Result<ApplyResult, HeaderChainStoreError>
-    where
-        F: FnMut(FaultPoint) -> Result<(), HeaderChainStoreError>,
-    {
-        self.apply_combined_with_fault(request, context, DiskWriteBatch::new(), || {}, fault)
     }
 
     pub(in crate::service) fn apply_combined<M>(
@@ -6582,25 +6622,6 @@ impl HeaderChainStore {
             .single()
             .ok_or(StoreError::Incoherent("invalid deferred-index timestamp"))
             .map(Some)
-    }
-
-    fn projection_entries(&self, family: &'static str) -> Result<Vec<Frontier>, StoreError> {
-        let mut projection = Vec::new();
-        for (key, value) in self.scan_raw(family).map_err(store_error)? {
-            if key.len() != 4 || value.len() != 32 {
-                return Err(StoreError::Incoherent("invalid projection row width"));
-            }
-            let height = HeaderHeightKey::from_bytes(&key).0;
-            let hash = block::Hash(
-                value
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Incoherent("invalid projection hash"))?,
-            );
-            projection.push(Frontier::new(height, hash));
-        }
-        projection.sort_unstable_by_key(|frontier| (frontier.height, frontier.hash.0));
-        Ok(projection)
     }
 
     fn projection_hash(

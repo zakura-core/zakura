@@ -355,7 +355,7 @@ impl<'de> serde::Deserialize<'de> for Flags {
 }
 
 impl ZcashSerialize for Flags {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_u8(self.bits())?;
 
         Ok(())

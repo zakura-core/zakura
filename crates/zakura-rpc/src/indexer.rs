@@ -37,21 +37,6 @@ impl BlockHashAndHeight {
         let hash = hash.bytes_in_display_order().to_vec();
         BlockHashAndHeight { hash, height }
     }
-
-    /// Try to convert a [`BlockHashAndHeight`] into a tuple of a block hash and height.
-    pub fn try_into_hash_and_height(self) -> Option<(block::Hash, block::Height)> {
-        self.hash
-            .try_into()
-            .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
-            .map_err(|bytes: Vec<_>| {
-                tracing::warn!(
-                    "failed to convert BlockHash to Hash, unexpected len: {}",
-                    bytes.len()
-                )
-            })
-            .ok()
-            .zip(self.height.try_into().ok())
-    }
 }
 
 impl BlockAndHash {

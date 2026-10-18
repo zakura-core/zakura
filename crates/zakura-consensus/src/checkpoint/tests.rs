@@ -79,7 +79,7 @@ async fn checkpoint_completion_notifies_handoff_without_another_caller() -> Resu
             &Mainnet,
             Some(initial_tip),
             committed_tip.0,
-            state,
+            crate::transaction::boxed_state(state),
         );
         let response = verifier.call(blocks[1].clone());
         let response = if drop_response {
@@ -157,7 +157,7 @@ async fn checkpoint_handoff_only_notifies_at_configured_boundary() -> Result<(),
             &Mainnet,
             Some(initial_tip),
             boundary,
-            state,
+            crate::transaction::boxed_state(state),
         );
         for block in blocks.iter().skip(1).take_while(|block| {
             block.coinbase_height().expect("the fixtures have heights") <= boundary
@@ -223,7 +223,7 @@ async fn checkpoint_handoff_survives_a_delayed_buffer_worker() -> Result<(), Rep
         BTreeMap::from([(block::Height(0), hash)]),
         &Mainnet,
         None,
-        state,
+        crate::transaction::boxed_state(state),
     )
     .map_err(|error| eyre!(error))?;
     let response = verifier.call(genesis);
@@ -289,7 +289,7 @@ async fn failed_handoff_check_preserves_committed_checkpoint_progress() -> Resul
             BTreeMap::from([(block::Height(0), hash)]),
             &Mainnet,
             None,
-            state,
+            crate::transaction::boxed_state(state),
         )
         .map_err(|error| eyre!(error))?;
         let result = timeout(
@@ -325,9 +325,13 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -418,9 +422,13 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -533,7 +541,11 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
     .map_err(|error| eyre!(error.to_string()))?;
     let network = generated.network;
     let state_service = zakura_state::init_test(&network).await;
-    let mut checkpoint_verifier = CheckpointVerifier::new(&network, None, state_service);
+    let mut checkpoint_verifier = CheckpointVerifier::new(
+        &network,
+        None,
+        crate::transaction::boxed_state(state_service),
+    );
 
     for block in generated.blocks {
         let block = Arc::new(block);
@@ -657,7 +669,7 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
         [(block::Height(0), hash0), (block::Height(1), hash1)],
         &network,
         None,
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )?;
 
     let block0_result = verifier.ready().await?.call(block0);
@@ -717,7 +729,7 @@ async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), 
         [(block::Height(0), hash0), (block::Height(1), block1.hash())],
         &network,
         None,
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )?;
 
     let block0_result = verifier.ready().await?.call(block0);
@@ -821,7 +833,7 @@ async fn continuous_blockchain(
             checkpoint_list,
             &network,
             initial_tip,
-            state_service.clone(),
+            crate::transaction::boxed_state(state_service.clone()),
         )
         .map_err(|e| eyre!(e))?;
 
@@ -985,9 +997,13 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1073,9 +1089,13 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1290,9 +1310,13 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1391,7 +1415,11 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     let state_service = zakura_state::init_test(&Mainnet).await;
     // Use the hard-coded checkpoint list
-    let mut checkpoint_verifier = CheckpointVerifier::new(&Network::Mainnet, None, state_service);
+    let mut checkpoint_verifier = CheckpointVerifier::new(
+        &Network::Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    );
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1492,9 +1520,13 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     // Verify through the first post-genesis checkpoint and wait for commits so
     // the state tip sits at height 3 before the buggy reset path runs.
@@ -1639,9 +1671,13 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
             }
         }
     });
-    let mut verifier =
-        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
-            .map_err(|error| eyre!(error))?;
+    let mut verifier = CheckpointVerifier::from_list(
+        checkpoints,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state),
+    )
+    .map_err(|error| eyre!(error))?;
 
     let side_chain = verifier.call(blocks[4].clone());
     // Model a competing block after basic validation without mining another valid PoW.
@@ -1710,7 +1746,7 @@ async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> R
         checkpoint_list,
         &Mainnet,
         Some(blockchain[3]),
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )
     .map_err(|e| eyre!(e))?;
 
@@ -1817,9 +1853,13 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
             }
         }
     });
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, Some(initial_tip), state_service)
-            .map_err(|error| eyre!(error))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|error| eyre!(error))?;
 
     let ready = checkpoint_verifier
         .ready()
@@ -1909,9 +1949,13 @@ async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Repo
             }
         }
     });
-    let mut verifier =
-        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
-            .map_err(|error| eyre!(error))?;
+    let mut verifier = CheckpointVerifier::from_list(
+        checkpoints,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state),
+    )
+    .map_err(|error| eyre!(error))?;
     let response = verifier.call(block);
     assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
     drop(response);

@@ -141,9 +141,9 @@ impl<P: ZkSnarkProof> fmt::Debug for JoinSplit<P> {
 }
 
 impl<P: ZkSnarkProof> ZcashSerialize for JoinSplit<P> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.vpub_old.zcash_serialize(&mut writer)?;
-        self.vpub_new.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.vpub_old.zcash_serialize(writer)?;
+        self.vpub_new.zcash_serialize(writer)?;
 
         writer.write_32_bytes(&self.anchor.into())?;
         writer.write_32_bytes(&self.nullifiers[0].into())?;
@@ -156,12 +156,12 @@ impl<P: ZkSnarkProof> ZcashSerialize for JoinSplit<P> {
         #[allow(clippy::needless_borrow)]
         writer.write_32_bytes(&(&self.random_seed).into())?;
 
-        self.vmacs[0].zcash_serialize(&mut writer)?;
-        self.vmacs[1].zcash_serialize(&mut writer)?;
-        self.zkproof.zcash_serialize(&mut writer)?;
+        self.vmacs[0].zcash_serialize(writer)?;
+        self.vmacs[1].zcash_serialize(writer)?;
+        self.zkproof.zcash_serialize(writer)?;
 
-        self.enc_ciphertexts[0].zcash_serialize(&mut writer)?;
-        self.enc_ciphertexts[1].zcash_serialize(&mut writer)?;
+        self.enc_ciphertexts[0].zcash_serialize(writer)?;
+        self.enc_ciphertexts[1].zcash_serialize(writer)?;
 
         Ok(())
     }

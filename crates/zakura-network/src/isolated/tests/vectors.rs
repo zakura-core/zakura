@@ -47,7 +47,8 @@ async fn connect_isolated_with_inbound_sends_anonymised_version_message_tcp_net(
         &network,
         outbound_stream,
         "".to_string(),
-        inbound_service,
+        // Boxed so these tests share the connection code other tests compile.
+        tower::util::BoxCloneSyncService::new(inbound_service),
     ));
 
     let (inbound_conn, _) = listener.accept().await.unwrap();
@@ -103,7 +104,8 @@ async fn connect_isolated_with_inbound_sends_anonymised_version_message_mem_net(
         &network,
         outbound_stream,
         "".to_string(),
-        inbound_service,
+        // Boxed so these tests share the connection code other tests compile.
+        tower::util::BoxCloneSyncService::new(inbound_service),
     ));
 
     let mut inbound_stream = Framed::new(

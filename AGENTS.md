@@ -104,6 +104,25 @@ zakurad (CLI orchestration)
 - Respect the workspace lint policy (`[workspace.lints]` in the root `Cargo.toml`) and the crate-level lint attributes at the top of each crate's `lib.rs`.
 - Keep dependencies flowing downward across crates; maintain `zakura-chain` as sync-only.
 
+## Readability
+
+These checks apply to code in every language. Run them against your own diff.
+
+- A reader learns what a function does from its name, signature, and doc comment, without reading its tests.
+- Production code never knows tests exist. It has no branches on fake types, callable identity, or test flags. Tests reach code through the boundaries production uses.
+- Each fact has one authoritative representation. Each trust boundary has one validation point.
+- Dependencies point one way. Each entry point shows the order of its steps.
+- A readability refactor keeps behavior. Timeouts, validation, and error paths stay.
+- When you finish, reread the diff as a reviewer who saw neither the tests nor the conversation. If you had to explain something in chat, make the code say it instead.
+
+Python adds three checks:
+
+- Real logic lives in importable modules, not in YAML or shell heredocs.
+- Each CLI entry point is `main(argv=None)`.
+- Importing a module does no work.
+
+For module decomposition in the core Rust crates, use the `core-rust-readability` skill.
+
 ## Code Patterns
 
 ### Tower Services

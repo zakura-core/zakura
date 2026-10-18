@@ -12,6 +12,7 @@ use tracing::Instrument;
 
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network as zn;
+use zakura_node_services::task::spawn_erased;
 use zakura_rpc::MinedBlockEvent;
 use zakura_state::ChainTipChange;
 
@@ -323,7 +324,7 @@ fn finish_mined_block_broadcast<ZN>(
         "sending committed block broadcast after the mined block broadcast failed",
     );
     chain_state.mark_last_change_hash(hash);
-    tokio::spawn(broadcast_with_timeout(broadcast_network.clone(), request));
+    spawn_erased(broadcast_with_timeout(broadcast_network.clone(), request));
 }
 
 /// Committed mined-block broadcasts, tracked so the committed-tip path does not duplicate them.

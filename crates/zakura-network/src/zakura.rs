@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
 
 use crate::{
@@ -417,7 +418,7 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
-        tokio::spawn(run_legacy_liveness_keeper(
+        spawn_erased(run_legacy_liveness_keeper(
             book_addr,
             address_book_updater,
             dial_lifetime,

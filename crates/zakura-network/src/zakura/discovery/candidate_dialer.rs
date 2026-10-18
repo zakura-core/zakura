@@ -16,6 +16,7 @@ use std::{
 use futures::FutureExt;
 use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
+use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{NodeAddr, NodeId};
 
 use super::dialer::native_discovery_dial;
@@ -87,7 +88,7 @@ pub(crate) fn spawn_native_discovery_dialer(
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_native_discovery_dialer(
+    spawn_erased(run_native_discovery_dialer(
         endpoint,
         discovery,
         limits,
@@ -239,7 +240,7 @@ async fn spawn_discovery_dial_candidates(
 
         discovery.mark_dial_attempt(&node_id).await;
         metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-        workers.spawn({
+        workers.spawn(erased({
             let reserved_ips_on_panic = reserved_ips.clone();
             AssertUnwindSafe(run_discovery_dial_once(
                 endpoint.clone(),
@@ -252,7 +253,7 @@ async fn spawn_discovery_dial_candidates(
             .map(move |result| {
                 recover_discovery_dial_worker_panic(node_id, reserved_ips_on_panic, result)
             })
-        });
+        }));
     }
 }
 
@@ -441,7 +442,7 @@ async fn run_discovery_dial_once(
     }
 
     let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
-    let dial = tokio::spawn({
+    let dial = spawn_erased({
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     });

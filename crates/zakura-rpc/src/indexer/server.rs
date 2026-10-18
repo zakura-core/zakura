@@ -24,6 +24,7 @@ use tonic::transport::{
 use tower::BoxError;
 use zakura_chain::chain_tip::ChainTip;
 use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::ReadState;
 
 use crate::{
@@ -135,7 +136,7 @@ where
     tracing::info!("{OPENED_RPC_ENDPOINT_MSG}{}", listen_addr);
 
     let incoming = limited_tcp_incoming(tcp_listener, MAX_CONNECTIONS);
-    let server_task: JoinHandle<Result<(), BoxError>> = tokio::spawn(async move {
+    let server_task: JoinHandle<Result<(), BoxError>> = spawn_erased(async move {
         server
             .add_service(IndexerServer::new(indexer_service))
             .serve_with_incoming(incoming)

@@ -44,6 +44,7 @@ use zakura_chain::{
 use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool::MempoolService;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
@@ -302,7 +303,7 @@ impl RpcServer {
 
             info!("{opened_endpoint_msg}{local_addr}");
 
-            return Ok(tokio::spawn(async move {
+            return Ok(spawn_erased(async move {
                 run_tls_listener(
                     listener,
                     acceptor,
@@ -347,7 +348,7 @@ impl RpcServer {
 
         info!("{opened_endpoint_msg}{}", server.local_addr()?);
 
-        Ok(tokio::spawn(async move {
+        Ok(spawn_erased(async move {
             server.start(methods).stopped().await;
             Ok(())
         }))

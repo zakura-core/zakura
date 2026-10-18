@@ -58,6 +58,7 @@ mod types;
 mod tests;
 
 pub use zakura_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
+use zakura_node_services::task::spawn_erased;
 
 /// An unverified block, which is in the queue for checkpoint verification.
 #[derive(Debug)]
@@ -1376,7 +1377,7 @@ where
                         if let Some(state) = handoff_state {
                             // Retain the notification even if its response times out. A delayed
                             // buffer worker must still reconcile the already-durable checkpoint.
-                            let handoff = tokio::spawn(async move {
+                            let handoff = spawn_erased(async move {
                                 match state.oneshot(zs::Request::CheckCheckpointHandoff).await {
                                     Ok(zs::Response::CheckpointHandoffChecked) => {
                                         metrics::counter!("checkpoint.handoff.checked").increment(1);

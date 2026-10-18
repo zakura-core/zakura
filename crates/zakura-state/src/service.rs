@@ -43,6 +43,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::{
@@ -654,7 +655,7 @@ impl StateService {
 
         // Spawn a background task to periodically export RocksDB metrics to Prometheus
         let db_for_metrics = read_service.db.clone();
-        tokio::spawn(async move {
+        spawn_erased(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;

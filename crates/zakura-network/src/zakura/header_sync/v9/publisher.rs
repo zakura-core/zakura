@@ -47,6 +47,7 @@ use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, Port, PortError, ReadPath, ReadPathReply, RetainedHeaderPath,
     RetainedHeaderPathPage, ServingCapacitySignal,
 };
+use zakura_node_services::task::spawn_erased;
 
 use super::{
     entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
@@ -228,7 +229,7 @@ impl Publisher {
         let wake = Arc::new(Notify::new());
         // One panic ends the task, so the channel never needs more room.
         let (panics, panicked) = mpsc::channel(1);
-        let task = tokio::spawn(publish::<HEADER_BYTES>(
+        let task = spawn_erased(publish::<HEADER_BYTES>(
             Task {
                 shared: shared.clone(),
                 wake: wake.clone(),

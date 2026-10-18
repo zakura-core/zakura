@@ -14,6 +14,7 @@ use tokio::{
     time::{self, Instant},
 };
 use zakura_chain::block;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
 
 use super::{
@@ -92,7 +93,7 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
-    Ok((handle, actions, tokio::spawn(reactor.run())))
+    Ok((handle, actions, spawn_erased(reactor.run())))
 }
 
 fn build_header_sync_reactor(

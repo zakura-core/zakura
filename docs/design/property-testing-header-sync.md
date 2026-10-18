@@ -139,8 +139,8 @@ These figures come from a release build on an Apple M3 Ultra. Rates on the pause
 | `Status` interval | The specification lets a peer send its new `Status` up to two seconds after the commit. This node's `StatusPublisher` sends it within its one-second floor, which `initial_refresh_and_coalesced_change_deadlines_are_bounded` checks. The subscriber starts the new target as soon as it has both that `Status` and `SubscriptionSuperseded`, in either order, without a timer wait. So recovery takes at most two seconds plus the round trips against any conformant peer, and at most one second plus the round trips against this node. Before this evidence, a `Status` that arrived first was spent while the subscription was still active, and recovery waited for the peer's 30 s refresh. No longer floor is proposed. |
 | Load | 512 sessions finish in 1.4 s and 202 scheduler passes, and 40 in 0.23 s. Running reads reach the node limit of 8, and no peer holds more than its 2 slots. |
 
-`Status` floods start no repeated work, and their cost per message no longer grows with the number of
-peers. Each run sends a 602-message burst of repeated statuses from every peer, or the same number of
+`Status` floods start no repeated work, and the full pass over cached offers no longer runs once per
+message. Each run sends a 602-message burst of repeated statuses from every peer, or the same number of
 statuses from one peer that flips its own unstarted target, which changes the scheduling key every
 time. The time per status includes the reactor loop's scan for its next deadline.
 

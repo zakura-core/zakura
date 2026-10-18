@@ -219,7 +219,7 @@ mod tests {
             31
         );
 
-        // Extra addresses for one identity and unparseable entries don't count.
+        // Extra addresses for one identity and unparsable entries don't count.
         let config = ZakuraConfig {
             bootstrap_peers: (1..=16)
                 .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))

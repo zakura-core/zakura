@@ -143,24 +143,36 @@ where
     }
 }
 
-impl<ZS>
+/// The state service of verifiers built by [`Verifier::new_for_tests`].
+///
+/// Boxing every test's state service into one type compiles the verifier once for all tests,
+/// instead of once per mock service type.
+#[cfg(test)]
+pub(crate) type TestStateService =
+    tower::util::BoxCloneService<zs::Request, zs::Response, BoxError>;
+
+#[cfg(test)]
+impl
     Verifier<
-        ZS,
+        TestStateService,
         Buffer<
             mempool::Request,
             futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
         >,
     >
-where
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    ZS::Future: Send + 'static,
 {
     /// Create a new transaction verifier with a closed channel receiver for mempool setup for tests.
-    #[cfg(test)]
-    pub fn new_for_tests(network: &Network, state: ZS) -> Self {
+    pub fn new_for_tests<ZS>(network: &Network, state: ZS) -> Self
+    where
+        ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+            + Send
+            + Clone
+            + 'static,
+        ZS::Future: Send + 'static,
+    {
         Self {
             network: network.clone(),
-            state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
+            state: Timeout::new(TestStateService::new(state), UTXO_LOOKUP_TIMEOUT),
             mempool: None,
             script_verifier: script::Verifier,
             mempool_setup_rx: oneshot::channel().1,

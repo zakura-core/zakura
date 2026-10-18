@@ -158,7 +158,6 @@ zakura_block_apply_concurrency_limit = 32
 buffer_limit = 128000
 force_use_color = false
 use_color = true
-use_journald = false
 
 [zcashd_compat]
 block_gossip_peer_ips = []

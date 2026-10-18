@@ -157,19 +157,6 @@ impl Tracing {
                 .with(ErrorLayer::default())
         };
 
-        // Add optional layers based on dynamic and compile-time configs
-
-        #[cfg(feature = "journald")]
-        let journaldlayer = if config.use_journald {
-            let layer = tracing_journald::layer().map_err(|e| eyre!("component error: {e}"))?;
-
-            Some(layer)
-        } else {
-            None
-        };
-        #[cfg(feature = "journald")]
-        let subscriber = subscriber.with(journaldlayer);
-
         // Initialise the global tracing subscriber
         subscriber.init();
 
@@ -180,17 +167,6 @@ impl Tracing {
             LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
             "started tracing component",
         );
-
-        if config.use_journald {
-            if cfg!(feature = "journald") {
-                info!("installed journald tracing layer");
-            } else {
-                warn!(
-                    "unable to activate configured journald tracing: \
-                     enable the 'journald' feature when compiling zakurad",
-                );
-            }
-        }
 
         Ok(Self {
             _guard: Some(worker_guard),

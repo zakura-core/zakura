@@ -63,7 +63,6 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "journald",
     "prometheus",
     "indexer",
 ]
@@ -104,8 +103,8 @@ internal-miner = [
     "zakura-rpc/internal-miner",
 ]
 
-# Tracing and monitoring
-journald = ["tracing-journald"]
+# Legacy flag accepted for build compatibility; journald logging is removed.
+journald = []
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -198,9 +197,6 @@ sha2 = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
-
-# prod feature journald
-tracing-journald = { workspace = true, optional = true }
 
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"

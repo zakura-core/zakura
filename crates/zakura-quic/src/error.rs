@@ -79,15 +79,16 @@ impl ConnectError {
 
     /// Ranks errors so a multi-address dial reports the most informative one.
     ///
-    /// `ConnectionLimit` outranks the peer's own failures: an address skipped
-    /// for this node's cap was never tried, so the dial must not blame the
-    /// peer (ADM-12). ALPN and identity errors still win, since they hold for
-    /// every address.
+    /// `ConnectionLimit` outranks everything: an address skipped for this
+    /// node's cap was never tried, so the dial must not blame the peer
+    /// (ADM-12). That includes ALPN and identity errors, because a signed
+    /// record proves the node key, not that it owns every address it lists:
+    /// a decoy address can answer for another node or cohort.
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Self::AlpnMismatch => 7,
-            Self::WrongIdentity => 6,
-            Self::ConnectionLimit => 5,
+            Self::ConnectionLimit => 7,
+            Self::AlpnMismatch => 6,
+            Self::WrongIdentity => 5,
             Self::Refused => 4,
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
@@ -191,20 +192,20 @@ impl ClosedStream {
 mod tests {
     use super::*;
 
-    /// A multi-address dial reports the cap over the peer's own failures, so
-    /// an address this node never tried doesn't blame the peer (ADM-12).
+    /// A multi-address dial reports the cap over every other result, so an
+    /// address this node never tried doesn't blame the peer, even when a
+    /// decoy address answered for another node (ADM-12).
     #[test]
-    fn the_connection_limit_outranks_the_peers_failures() {
+    fn the_connection_limit_outranks_every_other_result() {
         let limit = ConnectError::ConnectionLimit.rank();
-        for peer in [
+        for other in [
+            ConnectError::AlpnMismatch,
+            ConnectError::WrongIdentity,
             ConnectError::Refused,
             ConnectError::HandshakeTimeout,
             ConnectError::Transport(ConnectionError::TimedOut),
         ] {
-            assert!(limit > peer.rank(), "{peer:?}");
-        }
-        for every_address in [ConnectError::AlpnMismatch, ConnectError::WrongIdentity] {
-            assert!(limit < every_address.rank(), "{every_address:?}");
+            assert!(limit > other.rank(), "{other:?}");
         }
     }
 }

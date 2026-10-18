@@ -510,7 +510,9 @@ impl Shared {
     ///
     /// A stall waits for the next selected-chain change, among other wakes,
     /// so it is not recorded when the chain `moved` since the job read it:
-    /// that change already passed, and the next pass retries at once.
+    /// that change already passed, and the next pass retries at once. Nor is
+    /// a check's tip, because state may have answered on a chain the
+    /// selection has since left, even if the tip hash is the same again.
     fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
@@ -520,6 +522,7 @@ impl Shared {
                 }
             }
             Output::End(outcome) => self.queue_end(id, outcome),
+            Output::Extends(_) if moved => {}
             Output::Extends(tip) => {
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
                     subscription.checked_tip = Some(tip);

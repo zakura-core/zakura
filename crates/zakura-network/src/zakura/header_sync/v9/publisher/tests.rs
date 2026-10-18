@@ -1867,6 +1867,48 @@ async fn a_follower_without_page_credit_is_superseded_by_a_higher_reorg() {
     harness.check_quiet().await;
 }
 
+/// A check that state confirmed on a chain the selection left before the
+/// result settled runs again, so a selection that returns to a tip off the
+/// last header's chain still supersedes the follower.
+#[tokio::test(start_paused = true)]
+async fn a_check_confirmed_on_a_chain_since_left_runs_again() {
+    let port = FakePort::new(Semaphore::MAX_PERMITS);
+    let chain = port.grow(3);
+    let mut harness = Harness::new(port.clone(), serve_limits());
+    // Credit for the one page for heights 4 and 5.
+    let one_page = Credit {
+        objects: 2,
+        bytes: credit().bytes,
+    };
+    harness
+        .open(chain[2].hash, vec![chain[2]], one_page, AuxSchema::None)
+        .await;
+    let main = port.grow(2);
+    let h = block::Height;
+    assert_eq!(pages(&harness.deliver_all().await), [(h(3), h(5), false)]);
+
+    // A higher branch that forks below the last header needs a check, and
+    // its membership query waits in state.
+    let side = port.store().tree.extend(main[0], 3);
+    let above = port.store().tree.extend(main[1], 3);
+    port.membership_gate.forget_permits(Semaphore::MAX_PERMITS);
+    port.select(side[2]);
+    harness.drain().await;
+    // The selection moves to a chain through the last header, where the
+    // query answers, then back to the side branch before the result settles.
+    port.select(above[2]);
+    port.select(side[2]);
+    port.store()
+        .membership_script
+        .push_back(Ok(SelectedChainMembership::Selected(main[1])));
+    port.membership_gate.add_permits(Semaphore::MAX_PERMITS);
+    assert_eq!(
+        harness.deliver_all().await,
+        [Received::Ended(HeadersOutcomeCode::SubscriptionSuperseded)]
+    );
+    harness.check_quiet().await;
+}
+
 /// A check without a page needs no output, so it runs and ends the
 /// subscription even while an unread page holds the peer's one response slot.
 #[tokio::test(start_paused = true)]

@@ -583,6 +583,13 @@ fn header_serialized_size_matches_encoding() {
             .zcash_serialize_to_vec()
             .expect("vec serialization is infallible");
         assert_eq!(header.zcash_serialized_size(), encoded.len());
+        assert!(encoded.len() <= crate::block::header::MAX_SERIALIZED_HEADER_BYTES);
+        if matches!(header.solution, Solution::Common(_)) {
+            assert_eq!(
+                encoded.len(),
+                crate::block::header::MAX_SERIALIZED_HEADER_BYTES
+            );
+        }
         assert_eq!(
             header.solution.zcash_serialized_size(),
             encoded.len() - crate::block::header::HEADER_BYTES_BEFORE_SOLUTION,

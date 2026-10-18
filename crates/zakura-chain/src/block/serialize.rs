@@ -9,7 +9,7 @@ use hex::{FromHex, FromHexError};
 
 use crate::{
     block::{
-        header::{HEADER_BYTES_BEFORE_SOLUTION, ZCASH_BLOCK_VERSION},
+        header::{HEADER_BYTES_BEFORE_SOLUTION, MAX_SERIALIZED_HEADER_BYTES, ZCASH_BLOCK_VERSION},
         merkle, Block, CountedHeader, Hash, Header,
     },
     serialization::{
@@ -68,6 +68,14 @@ impl ZcashSerialize for Header {
     #[inline(never)]
     fn zcash_serialize_into_vec(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
         self.zcash_serialize(out)
+    }
+
+    /// Allocates once, sized for the largest (Mainnet and Testnet) header.
+    /// A Regtest header leaves the rest of that capacity unused.
+    fn zcash_serialize_to_vec(&self) -> Result<Vec<u8>, io::Error> {
+        let mut out = Vec::with_capacity(MAX_SERIALIZED_HEADER_BYTES);
+        self.zcash_serialize_into_vec(&mut out)?;
+        Ok(out)
     }
 
     /// Every header field has a fixed size except the Equihash solution, whose

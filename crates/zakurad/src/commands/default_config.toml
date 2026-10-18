@@ -103,11 +103,12 @@ bootstrap_peers = [
     "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
 ]
 listen_addr = "0.0.0.0:8234"
-max_connections = 256
+max_connections = 102
 max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
+peer_memory_budget_bytes = 8589934592
 stream_open_rate_per_second = 32
 
 [network.zakura.quic]

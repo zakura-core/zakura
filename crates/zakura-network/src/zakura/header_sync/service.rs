@@ -5,10 +5,7 @@ use std::{
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 use tokio::sync::mpsc;
-use tokio::{
-    sync::watch,
-    task::{self, JoinHandle},
-};
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased;

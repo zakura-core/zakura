@@ -71,7 +71,7 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -107,6 +107,8 @@ internal-miner = [
 
 # Tracing and monitoring
 journald = ["tracing-journald"]
+# Opt in explicitly: no committed deployment exports traces, and the exporter stack adds
+# six crates to the binary.
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 prometheus = ["metrics-exporter-prometheus"]

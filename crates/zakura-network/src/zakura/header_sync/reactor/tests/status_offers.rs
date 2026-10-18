@@ -1005,6 +1005,12 @@ impl port::Port for DelayedLocatorPort {
     ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
         panic!("the capacity fixture only serves headers")
     }
+    fn selected_chain_contains(
+        &self,
+        _: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        panic!("the capacity fixture never serves a subscription")
+    }
 }
 
 #[tokio::test(start_paused = true)]

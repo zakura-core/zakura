@@ -46,7 +46,8 @@ pub trait RpcMethods: Clone + Send + Sync + 'static {
 /// The innermost service, which calls the enabled methods.
 #[derive(Clone)]
 pub struct RpcService<M> {
-    methods: M,
+    // Middleware clones this service for every call, so the methods are shared.
+    methods: Arc<M>,
     enabled_methods: Arc<HashSet<&'static str>>,
     max_response_body_size: usize,
 }
@@ -60,7 +61,7 @@ impl<M: RpcMethods> RpcService<M> {
         max_response_body_size: usize,
     ) -> Self {
         Self {
-            methods,
+            methods: Arc::new(methods),
             enabled_methods: Arc::new(enabled_methods.into_iter().collect()),
             max_response_body_size,
         }

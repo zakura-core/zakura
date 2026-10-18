@@ -328,6 +328,7 @@ lto = "thin"
 # shrinks zakurad's .text by about 5% while still using 4 cores per crate, the
 # size of the standard CI runners.
 codegen-units = 4
+
 # Enable line numbers in stack traces. Note that we re-disable it for dependencies below.
 debug = "line-tables-only"
 

@@ -239,15 +239,22 @@ impl SessionSlot {
 }
 
 impl DiscoveryService {
-    /// Builds a discovery service driven by `handle`.
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for the default connection cap.
     pub fn new(handle: ZakuraDiscoveryHandle) -> Self {
+        Self::with_max_connections(handle, DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    }
+
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for a node that admits `max_connections`.
+    pub fn with_max_connections(handle: ZakuraDiscoveryHandle, max_connections: usize) -> Self {
         Self {
             handle,
             header_sync: None,
             block_sync: None,
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
-            serving: ServingCapacity::new(DEFAULT_ZAKURA_MAX_CONNECTIONS),
+            serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
             trace: ZakuraTrace::default(),
         }

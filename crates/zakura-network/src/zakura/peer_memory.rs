@@ -32,13 +32,15 @@ pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MIN_ZAKURA_BUDGETED_CONNECTIONS: usize = 16;
 
 /// Returns the fewest connections a budget must admit with
-/// `bootstrap_peer_count` configured bootstrap peers, so discovery can still
-/// dial a discovered peer while every bootstrap peer is connected.
+/// `bootstrap_peer_count` remote bootstrap peers, so a lowered cap doesn't
+/// leave discovery without a dial slot by construction.
 ///
 /// Discovery keeps its headroom, one slot per bootstrap peer and at least 4,
 /// out of its dials, and also counts each connected peer against the rest. So
-/// it needs twice the headroom plus one: 19 on Mainnet. The result is never
-/// below [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
+/// it needs twice the headroom plus one, 19 on Mainnet, to keep one slot with
+/// only the bootstrap peers connected. Inbound and other connections share
+/// that slot, as they share every slot at any cap. The result is never below
+/// [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
 pub fn min_budgeted_connections(bootstrap_peer_count: usize) -> usize {
     effective_discovery_connection_headroom(bootstrap_peer_count)
         .saturating_mul(2)

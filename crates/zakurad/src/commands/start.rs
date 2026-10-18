@@ -94,6 +94,7 @@ use tracing::Instrument;
 use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
+use zakura_node_services::task::spawn_erased;
 use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 use zakura_state::StorageMode;
 
@@ -590,7 +591,7 @@ impl StartCmd {
             shutdown_cleanup_required.cancel();
 
             let shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
+            Some(spawn_erased(async move {
                 shutdown.cancelled().await;
                 endpoint.shutdown().await;
             }))
@@ -623,7 +624,7 @@ impl StartCmd {
                     let (block_sync_fatal_tx, block_sync_fatal_rx) = mpsc::unbounded_channel();
                     block_sync_fatal_events = Some(block_sync_fatal_rx);
                     let block_driver_shutdown = shutdown.clone();
-                    let block_driver_task = tokio::spawn(
+                    let block_driver_task = spawn_erased(
                         supervise_block_sync_driver(
                             drive_block_sync_actions(
                                 block_actions,
@@ -746,7 +747,7 @@ impl StartCmd {
                 .await
                 .expect("server should start")
         } else {
-            tokio::spawn(std::future::pending().in_current_span())
+            spawn_erased(std::future::pending().in_current_span())
         };
         node_tasks.track(&rpc_task_handle);
 
@@ -755,7 +756,7 @@ impl StartCmd {
                 .await
                 .expect("admin server should start")
         } else {
-            tokio::spawn(std::future::pending().in_current_span())
+            spawn_erased(std::future::pending().in_current_span())
         };
         node_tasks.track(&admin_rpc_task_handle);
 
@@ -808,14 +809,14 @@ impl StartCmd {
                 indexer_rpc_task_handle
             } else {
                 warn!("configure an indexer_listen_addr to start the indexer RPC server");
-                tokio::spawn(std::future::pending().in_current_span())
+                spawn_erased(std::future::pending().in_current_span())
             }
         };
         node_tasks.track(&indexer_rpc_task_handle);
 
         // Start concurrent tasks which don't add load to other tasks
         info!("spawning block gossip task");
-        let block_gossip_task_handle = tokio::spawn(
+        let block_gossip_task_handle = spawn_erased(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change.clone(),
@@ -831,7 +832,7 @@ impl StartCmd {
         node_tasks.track(&mempool_queue_checker_task_handle);
 
         info!("spawning mempool transaction gossip task");
-        let tx_gossip_task_handle = tokio::spawn(
+        let tx_gossip_task_handle = spawn_erased(
             mempool::run_mempool_transaction_id_gossip(
                 mempool_transaction_subscriber.subscribe(),
                 peer_set.clone(),
@@ -851,7 +852,7 @@ impl StartCmd {
         info!("spawning progress logging task");
         let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
             health::ChainTipMetrics::channel();
-        let progress_task_handle = tokio::spawn(
+        let progress_task_handle = spawn_erased(
             show_block_chain_progress(
                 config.network.network.clone(),
                 latest_chain_tip.clone(),
@@ -876,7 +877,7 @@ impl StartCmd {
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
-        let end_of_support_task_handle = tokio::spawn(
+        let end_of_support_task_handle = spawn_erased(
             sync::end_of_support::start(config.network.network.clone(), latest_chain_tip.clone())
                 .in_current_span(),
         );
@@ -936,7 +937,7 @@ impl StartCmd {
             // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
             // reactors stay alive as a serving/advertising bridge for zakura-only peers.
             let legacy_fallback = config.network.v2_p2p() && config.network.legacy_p2p();
-            tokio::spawn(
+            spawn_erased(
                 syncer
                     .bootstrap_genesis_then_pause(
                         read_only_state_service.clone(),
@@ -950,7 +951,7 @@ impl StartCmd {
                     .in_current_span(),
             )
         } else {
-            tokio::spawn(syncer.sync().in_current_span())
+            spawn_erased(syncer.sync().in_current_span())
         };
         node_tasks.track(&syncer_task_handle);
 
@@ -962,13 +963,13 @@ impl StartCmd {
             info!("spawning Zcash miner");
             components::miner::spawn_init(&config.metrics, rpc_impl)
         } else {
-            tokio::spawn(std::future::pending().in_current_span())
+            spawn_erased(std::future::pending().in_current_span())
         };
 
         #[cfg(not(feature = "internal-miner"))]
         // Spawn a dummy miner task which doesn't do anything and never finishes.
         let miner_task_handle: tokio::task::JoinHandle<Result<(), Report>> =
-            tokio::spawn(std::future::pending().in_current_span());
+            spawn_erased(std::future::pending().in_current_span());
         node_tasks.track(&miner_task_handle);
 
         info!("spawned initial Zakura tasks");
@@ -976,12 +977,12 @@ impl StartCmd {
         let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
         let mut zcashd_compat_task_handle =
             if let Some(supervisor_config) = zcashd_compat_supervisor_config {
-                tokio::spawn(
+                spawn_erased(
                     zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
                         .in_current_span(),
                 )
             } else {
-                tokio::spawn(std::future::pending().in_current_span())
+                spawn_erased(std::future::pending().in_current_span())
             };
         // The supervisor may own a child after this point, so shutdown must
         // await cleanup. Do not add a yield between the spawn and this marker.

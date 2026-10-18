@@ -30,6 +30,7 @@ use zakura_chain::{
 use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool::MempoolService;
+use zakura_node_services::task::spawn_erased;
 use zakura_rpc::{
     client::{
         BlockTemplateResponse, BlockTemplateTimeSource,
@@ -145,7 +146,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(config.clone(), rpc).in_current_span())
+    spawn_erased(init(config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -189,9 +190,8 @@ where
     // This is particularly important when there are a large number of solver threads.
     let mut abort_handles = Vec::new();
 
-    let template_generator = tokio::task::spawn(
-        generate_block_templates(rpc.clone(), template_sender).in_current_span(),
-    );
+    let template_generator =
+        spawn_erased(generate_block_templates(rpc.clone(), template_sender).in_current_span());
     abort_handles.push(template_generator.abort_handle());
     let template_generator = template_generator.wait_for_panics();
 
@@ -202,7 +202,7 @@ where
             .try_into()
             .expect("just limited to u8::MAX");
 
-        let solver = tokio::task::spawn(
+        let solver = spawn_erased(
             run_mining_solver(solver_id, template_receiver.clone(), rpc.clone()).in_current_span(),
         );
         abort_handles.push(solver.abort_handle());

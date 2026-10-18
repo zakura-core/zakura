@@ -39,13 +39,15 @@ pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MIN_ZAKURA_BUDGETED_CONNECTIONS: usize = 16;
 
 /// Returns the fewest connections a budget must admit with
-/// `bootstrap_peer_count` configured bootstrap peers, so discovery can still
-/// dial a discovered peer while every bootstrap peer is connected.
+/// `bootstrap_peer_count` remote bootstrap peers, so a lowered cap doesn't
+/// leave discovery without a dial slot by construction.
 ///
 /// Discovery keeps its headroom, one slot per bootstrap peer and at least 4,
 /// out of its dials, and also counts each connected peer against the rest. So
-/// it needs twice the headroom plus one: 19 on Mainnet. The result is never
-/// below [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
+/// it needs twice the headroom plus one, 19 on Mainnet, to keep one slot with
+/// only the bootstrap peers connected. Inbound and other connections share
+/// that slot, as they share every slot at any cap. The result is never below
+/// [`MIN_ZAKURA_BUDGETED_CONNECTIONS`].
 pub fn min_budgeted_connections(bootstrap_peer_count: usize) -> usize {
     effective_discovery_connection_headroom(bootstrap_peer_count)
         .saturating_mul(2)
@@ -157,7 +159,7 @@ pub fn budgeted_max_connections(
 
 #[cfg(test)]
 mod tests {
-    use zakura_quic::QuicConfig;
+    use zakura_quic::{NodeId, NodeSecretKey, QuicConfig};
 
     use super::*;
     use crate::zakura::{
@@ -247,12 +249,38 @@ mod tests {
         }
 
         // A custom list of 16 bootstrap peers needs 33 connections.
+        let node_ids: Vec<NodeId> = (1..=16)
+            .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
         let config = ZakuraConfig {
-            bootstrap_peers: vec![String::new(); 16],
-            peer_memory_budget_bytes: (32 + 32) * 80 * MIB,
+            bootstrap_peers: node_ids
+                .iter()
+                .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+                .collect(),
+            // 32 slots of handshake headroom plus 30 admitted.
+            peer_memory_budget_bytes: (32 + 30) * live_slot_bytes(80 * MIB),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections().unwrap_err().required, 33);
+        // Leaving this node's own entry out lowers the floor to match discovery.
+        assert_eq!(
+            config
+                .budgeted_max_connections_for_node(node_ids[0])
+                .unwrap_err()
+                .required,
+            31
+        );
+
+        // Extra addresses for one identity and unparseable entries don't count.
+        let config = ZakuraConfig {
+            bootstrap_peers: (1..=16)
+                .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
+                .chain(["not a bootstrap peer".to_string()])
+                .collect(),
+            peer_memory_budget_bytes: (32 + 30) * live_slot_bytes(80 * MIB),
+            ..ZakuraConfig::default()
+        };
+        assert_eq!(config.budgeted_max_connections(), Ok(30));
     }
 
     #[test]

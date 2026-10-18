@@ -186,7 +186,6 @@ eyre = { workspace = true }
 thiserror = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-crossbeam-channel = { workspace = true }
 tracing-error = { workspace = true }
 tracing = { workspace = true }
 

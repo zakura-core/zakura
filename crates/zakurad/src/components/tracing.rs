@@ -133,10 +133,10 @@ pub struct InnerConfig {
     /// its parent directories.
     pub log_file: Option<PathBuf>,
 
-    /// The use_journald flag sends tracing events to systemd-journald, on Linux
-    /// distributions that use systemd.
+    /// Legacy journald setting, accepted for configuration compatibility.
     ///
-    /// Install Zebra using `cargo install --features=journald` to enable this config.
+    /// Ignored because journald logging has been removed.
+    #[serde(skip_serializing)]
     pub use_journald: bool,
 
     /// Legacy OpenTelemetry endpoint, accepted for configuration compatibility.

@@ -2549,7 +2549,12 @@ impl LegacyGossipSink {
         Inbound: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
         Inbound::Future: Send + 'static,
     {
-        Self::spawn_with_trace(inbound, supervisor, ZakuraTrace::noop())
+        // Boxed so callers with different inbound services share one compiled worker.
+        Self::spawn_with_trace(
+            tower::util::BoxCloneService::new(inbound),
+            supervisor,
+            ZakuraTrace::noop(),
+        )
     }
 
     /// Spawn a bounded inbound worker with a trace emitter.

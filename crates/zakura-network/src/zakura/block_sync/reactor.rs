@@ -171,10 +171,16 @@ pub fn spawn_block_sync_reactor(
     // bodies use a bounded input channel; progress-critical frontier/apply control
     // events use a separate non-blocking channel so body backlog cannot halt
     // budget release and scheduling.
-    let sequencer = Sequencer::new(
+    let mut sequencer = Sequencer::new(
         startup.frontiers.verified_block_tip,
         startup.config.submitted_apply_limit(),
     );
+    if let Some(max_checkpoint_height) = startup.max_checkpoint_height {
+        sequencer = sequencer.with_decoded_window_cap(
+            max_checkpoint_height,
+            BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES,
+        );
+    }
     let committed_throughput = ThroughputMeter::new(Instant::now());
     // Bound the body input channel at the submission window so a slow verifier
     // backpressures body intake without an unbounded block queue. Control events

@@ -625,6 +625,42 @@ fn misplaced_pages_fault() {
     );
 }
 
+/// A page whose headers do not extend the claimed parent, or each other, is a
+/// protocol fault. The claimed ancestor can still be a sent locator; admitting
+/// the page would verify every header before a local batch rejection.
+#[test]
+fn unlinked_headers_fault() {
+    let (mut tree, chain) = chain(8);
+    let fork = tree.extend(chain[1], 2);
+    let locators = [chain[5], chain[0]];
+    let mut fixture = Fixture::open(tree, chain[7], &locators, 100);
+
+    assert_eq!(
+        fixture.page(chain[5], &fork, false),
+        Err(SubscriberFault::Linkage),
+        "headers that extend another parent do not extend the claimed locator"
+    );
+    assert_eq!(
+        fixture.page(chain[5], &[chain[6], chain[2]], false),
+        Err(SubscriberFault::Linkage),
+        "a later header does not extend the header before it"
+    );
+    assert_eq!(
+        fixture.page(chain[5], &[chain[2], chain[7]], true),
+        Err(SubscriberFault::Linkage),
+        "a page that ends at the target with its marker must still link"
+    );
+
+    fixture
+        .page(chain[5], &chain[6..8], true)
+        .expect("a linked page that ends at the target is admitted");
+    assert_eq!(
+        fixture.page(chain[7], &[chain[4]], false),
+        Err(SubscriberFault::Linkage),
+        "a push after the target must extend the cursor"
+    );
+}
+
 /// A path that reaches the target's height without the target never reaches
 /// it: a first page from a sent locator above the target, or a page whose
 /// last header sits at the target's height under another hash.

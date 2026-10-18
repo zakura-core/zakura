@@ -783,7 +783,14 @@ impl SequencerTask {
             let _ = self.sequencer.remove_applying(height);
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return (false, false);
+            // Removing this submitted body can leave the decoded-cap window with
+            // nothing submitted, so wake its pending work (see
+            // `Sequencer::submission_admitted`). With nothing pending, a stale
+            // completion still schedules nothing.
+            return (
+                false,
+                self.sequencer.submission_window_idle_with_pending_work(),
+            );
         };
         let attribution_matches = outcome
             .attributed_source()
@@ -994,6 +1001,11 @@ impl SequencerTask {
 
         self.submission_retry_at = None;
         for height in submittable_heights {
+            // Each decode replaces an estimate with the measured size, so recheck
+            // the cap before every submission (see `submittable_heights`).
+            if !self.sequencer.submission_fits_decoded_window(height) {
+                break;
+            }
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };

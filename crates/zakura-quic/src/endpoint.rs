@@ -421,7 +421,10 @@ impl QuicEndpoint {
         // attempt. The dial then fails here, before sending any packet, or
         // tries every address. A cap hit partway would mix this node's limit
         // with the peer's real results, and neither could then be trusted.
-        // Partial claims drop on failure.
+        // Partial claims drop on failure. A dial tries at most as many
+        // addresses as the table can ever hold, so `ConnectionLimit` always
+        // means the table is busy now, never that the dial can't fit.
+        targets.truncate(shared.connections.max());
         let slots = targets
             .iter()
             .map(|_| shared.connections.claim_dial())
@@ -876,6 +879,12 @@ impl ConnectionSlots {
     /// Closed connections held right now.
     pub(crate) fn closing(&self) -> usize {
         self.counts.closing.load(Ordering::Acquire)
+    }
+
+    /// The most live connections the table ever holds, so the most addresses
+    /// one dial can claim slots for.
+    pub(crate) fn max(&self) -> usize {
+        self.max
     }
 
     /// Whether a dial attempt would get a slot right now.

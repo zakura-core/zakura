@@ -423,8 +423,11 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     the last `dial_reserve` slots, and peers that churn inbound connections
     can't stop this node's dials.
   - A dial MUST claim a live slot for every address it will try (DIAL-3)
-    before its first attempt. When the cap can't fit them all, it fails with
-    `ConnectFailed(ConnectionLimit)` before sending any packet. A dial
+    before its first attempt. It tries at most the first `max_connections`
+    addresses, so an idle endpoint can always fit it. When the cap can't fit
+    them all right now, it fails with `ConnectFailed(ConnectionLimit)` before
+    sending any packet. That error therefore always means the table is busy,
+    and retrying it later can succeed. A dial
     therefore never mixes this node's limit with the peer's results. Skipping
     a later address at the cap would either blame the peer for an address it
     never got to answer, since a signed record proves the node key and not

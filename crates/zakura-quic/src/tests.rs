@@ -2113,11 +2113,12 @@ async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
 }
 
 /// ADM-12: a dial claims a slot for every address before its first attempt,
-/// so with room for fewer it fails before the peer sees anything. A cap hit
-/// partway would mix a local limit with the peer's real results.
+/// so with room for fewer right now it fails before the peer sees anything. A
+/// cap hit partway would mix a local limit with the peer's real results.
 #[tokio::test]
 async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
     tokio::time::timeout(TEST_TIMEOUT, async {
+        let other = server();
         let server = server();
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = NodeAddr::with_addrs(
@@ -2128,27 +2129,55 @@ async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
             ],
         );
 
-        let one_slot = QuicBindConfig {
-            max_connections: 1,
-            ..loopback()
-        };
-        let client =
-            QuicEndpoint::bind(NodeSecretKey::generate(), &one_slot, &test_config()).unwrap();
-        assert!(matches!(
-            client.connect(addr.clone(), &[ALPN]).await,
-            Err(ConnectError::ConnectionLimit)
-        ));
-        assert_eq!(client.connection_count(), 0);
-        // The first address would have answered at once; give it time to show.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(server.seen.lock().unwrap().is_empty());
-
+        // Two slots, one held by a connection to another peer.
         let two_slots = QuicBindConfig {
             max_connections: 2,
             ..loopback()
         };
         let client =
             QuicEndpoint::bind(NodeSecretKey::generate(), &two_slots, &test_config()).unwrap();
+        let held = client.connect(other.addr(), &[ALPN]).await.unwrap();
+        assert!(matches!(
+            client.connect(addr.clone(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(client.connection_count(), 1);
+        // The first address would have answered at once; give it time to show.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        // Once the slot frees, the same dial connects.
+        drop(held);
+        while client.connection_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: a dial tries at most as many addresses as the table can ever
+/// hold, so a record with more addresses than slots still dials instead of
+/// failing with `ConnectionLimit` forever.
+#[tokio::test]
+async fn a_dial_tries_no_more_addresses_than_the_table_holds() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+        let one_slot = QuicBindConfig {
+            max_connections: 1,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &one_slot, &test_config()).unwrap();
         client.connect(addr, &[ALPN]).await.unwrap();
     })
     .await

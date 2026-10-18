@@ -588,8 +588,9 @@ impl ZakuraLocalLimits {
     /// Returns the QUIC bind settings for `addrs` under these limits.
     ///
     /// The transport holds the admitted connections plus
-    /// `max_pending_handshakes` more live ones, half of those kept for dials,
-    /// and two closing connections per live slot (see `peer_memory`).
+    /// `max_pending_handshakes` more live ones, half of those (rounded up, so
+    /// at least one) kept for dials, and two closing connections per live slot
+    /// (see `peer_memory`).
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
         let max_connections = self
             .max_connections
@@ -598,7 +599,7 @@ impl ZakuraLocalLimits {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
             max_connections,
-            dial_reserve: self.max_pending_handshakes / 2,
+            dial_reserve: self.max_pending_handshakes.div_ceil(2),
             max_closing_connections: max_connections
                 .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }

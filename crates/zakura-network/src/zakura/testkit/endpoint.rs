@@ -33,7 +33,7 @@ impl LocalEndpointFactory {
                 max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
                 max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS
                     + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
-                dial_reserve: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES / 2,
+                dial_reserve: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES.div_ceil(2),
                 max_closing_connections: 2
                     * (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES),
             },

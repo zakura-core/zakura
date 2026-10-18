@@ -296,6 +296,23 @@ mod tests {
         assert_eq!(config.budgeted_max_connections(), Ok(30));
     }
 
+    /// A single handshake of headroom still keeps one slot for dials, so
+    /// inbound attempts on several sockets can't take every live slot.
+    #[test]
+    fn the_dial_reserve_is_at_least_one_slot() {
+        for (pending, reserve) in [(1, 1), (2, 1), (3, 2), (32, 16)] {
+            let mut config = Config::default();
+            config.zakura.max_pending_handshakes = pending;
+            let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+            assert_eq!(bind.dial_reserve, reserve, "{pending} pending handshakes");
+        }
+        // Zero is treated as one.
+        let mut config = Config::default();
+        config.zakura.max_pending_handshakes = 0;
+        let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+        assert_eq!(bind.dial_reserve, 1);
+    }
+
     #[test]
     fn local_limits_keep_the_budget_when_only_the_node_floor_passes() {
         // Nine identities including this node's own, and a budget that admits

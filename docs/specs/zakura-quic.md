@@ -443,7 +443,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 
   Zakura sets `max_connections` to its admitted cap plus
   `max_pending_handshakes`, and `dial_reserve` to half of
-  `max_pending_handshakes`: 102 and 16 at the defaults (CTRL-26).
+  `max_pending_handshakes` rounded up, so at least one slot: 102 and 16 at
+  the defaults (CTRL-26).
 - **ADM-13.** When a connection closes, its connection task MUST release the
   stream payload `quinn-proto` still holds, then move its slot from ADM-12's
   live count to `QuicBindConfig::max_closing_connections`.

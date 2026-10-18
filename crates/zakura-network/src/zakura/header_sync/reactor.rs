@@ -1177,6 +1177,12 @@ impl HeaderSyncReactor {
         {
             return;
         }
+        if self.locator_capacity.available_permits() == 0 {
+            // Cached offers can become idle without a fresh dispatch refusal.
+            // Arm the wakeup even when we skip their scan at exhausted capacity.
+            self.locator_capacity_waiting = true;
+            return;
+        }
         let mut offers: Vec<_> = self
             .peer_state
             .iter()

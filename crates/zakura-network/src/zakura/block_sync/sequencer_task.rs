@@ -761,15 +761,7 @@ impl SequencerTask {
                 outcome.verification(),
                 zakura_header_chain::BodyVerificationOutcome::Verified(_)
             );
-            // The decoded-byte cap can hold back current work while only
-            // detached submissions are in flight. Retiring the last one must
-            // wake that work even when this completion is unverified or from a
-            // superseded owner. Nothing else will.
-            let wake_pending = self.sequencer.submission_window_idle_with_pending_work();
-            return (
-                false,
-                released && (wake_pending || verified && semantic_completion.is_some()),
-            );
+            return (false, released && verified && semantic_completion.is_some());
         };
         if applying_owner != owner
             || applying_source != source
@@ -789,13 +781,15 @@ impl SequencerTask {
         }
         let Some((semantic_owner, semantic_state_version)) = semantic_completion else {
             let _ = self.sequencer.remove_applying(height);
-            let released = self
-                .sequencer
+            self.sequencer
                 .finish_submission(owner, source, token, height, hash);
-            // See the stale-completion branch above.
+            // Removing this submitted body can leave the decoded-cap window with
+            // nothing submitted, so wake its pending work (see
+            // `Sequencer::submission_admitted`). With nothing pending, a stale
+            // completion still schedules nothing.
             return (
                 false,
-                released && self.sequencer.submission_window_idle_with_pending_work(),
+                self.sequencer.submission_window_idle_with_pending_work(),
             );
         };
         let attribution_matches = outcome

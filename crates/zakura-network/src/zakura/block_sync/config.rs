@@ -70,9 +70,9 @@ pub const MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES: usize =
 /// count-only window could hold `submitted_apply_limit` worst-case decoded
 /// blocks. There the sequencer stops keeping decoded copies and stops submitting
 /// once the window's decoded heap would exceed this cap. Later bodies stay raw
-/// and decode at submit as earlier submissions finish. When nothing is in
-/// flight one submission is always allowed, so a single oversized block still
-/// progresses. Checkpoint heights are exempt because a whole checkpoint range
+/// and decode at submit as earlier submissions finish. When none of the
+/// window's bodies is submitted, the next one is always allowed, so a single
+/// oversized block still progresses. Checkpoint heights are exempt because a whole checkpoint range
 /// must be co-resident (see [`MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES`]).
 ///
 /// 512 MiB is about 1.5x the 354 MiB decoded-window peak measured while

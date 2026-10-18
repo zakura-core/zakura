@@ -5525,7 +5525,7 @@ impl CappedSequencerTask {
 }
 
 #[tokio::test]
-async fn decoded_cap_resubmits_after_last_in_flight_submission_retires() {
+async fn decoded_cap_wakes_pending_work_after_superseded_owner_completion() {
     let blocks = fake_sequential_blocks(2);
     // Both blocks exceed a one-byte cap above the checkpoint, so only one is
     // submitted at a time.
@@ -5540,38 +5540,25 @@ async fn decoded_cap_resubmits_after_last_in_flight_submission_retires() {
         .await;
     }
     let token_1 = task.expect_submission(1).await;
-    task.expect_no_submission("the cap holds height 2 back while height 1 is in flight")
+    task.expect_no_submission("the cap holds height 2 back while height 1 is submitted")
         .await;
 
-    // A frontier advance detaches height 1 while the driver still holds it, so
-    // height 2 stays capped. A later unverified completion for the detached
-    // submission retires the only in-flight charge, and the window must refill.
-    task.control_tx
-        .send(SequencerControlInput::FrontierAdvance {
-            frontiers: BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(1),
-                verified_block_hash: blocks[0].hash(),
-            },
-            release_applied: true,
-        })
-        .expect("frontier advance queues");
-    task.expect_no_submission("the detached submission still holds the cap")
-        .await;
+    // A completion without a semantic owner removes height 1 from `applying`.
+    // The window then has nothing submitted, so height 2 must be woken.
     task.finish(
         test_work_owner(),
         token_1,
         1,
         &blocks[0],
-        BlockApplyResult::Unavailable,
-        Some(test_work_owner()),
+        BlockApplyResult::Committed,
+        None,
     );
     task.expect_submission(2).await;
     task.task.abort();
 }
 
 #[tokio::test]
-async fn decoded_cap_wakes_current_work_after_superseded_epoch_completion() {
+async fn decoded_cap_detached_submissions_never_block_current_work() {
     let blocks = fake_sequential_blocks(2);
     let mut task = CappedSequencerTask::spawn(1);
     task.send_body(
@@ -5581,10 +5568,10 @@ async fn decoded_cap_wakes_current_work_after_superseded_epoch_completion() {
         u64::from(block_size(&blocks[0])),
     )
     .await;
-    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(1).await;
 
-    // An epoch change detaches height 1 at its old owner. The new epoch's
-    // height 2 then waits behind the detached charge.
+    // An epoch change detaches height 1, which stays charged and never
+    // completes here. The new epoch's height 2 must still be submitted.
     let mut changed_authority = test_work_scope();
     changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
     let changed_owner =
@@ -5606,20 +5593,42 @@ async fn decoded_cap_wakes_current_work_after_superseded_epoch_completion() {
         u64::from(block_size(&blocks[1])),
     )
     .await;
-    task.expect_no_submission("the detached old-epoch submission still holds the cap")
+    task.expect_submission(2).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_resubmits_failed_parent_while_successors_stay_detached() {
+    let blocks = fake_sequential_blocks(3);
+    // Heights 3 and 2 arrive first claiming one wire byte, so height 1 releases
+    // a batch. The cap fits height 1 plus height 2's estimate, so 1 and 2 are
+    // submitted and the measured recheck stops height 3.
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let mut task = CappedSequencerTask::spawn(decoded_1 + DESERIALIZED_MEM_FACTOR);
+    for height in [3, 2, 1] {
+        task.send_body(test_work_owner(), height, &blocks[height as usize - 1], 1)
+            .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+    task.expect_no_submission("the measured recheck holds height 3 back")
         .await;
 
-    // The old epoch's completion has no semantic owner, but retiring the last
-    // in-flight charge must still wake the current epoch's work.
+    // Height 1 times out. Height 2 is detached and keeps its charge, as a
+    // successor waiting in state for its parent would, and never completes.
     task.finish(
         test_work_owner(),
         token_1,
         1,
         &blocks[0],
-        BlockApplyResult::Committed,
-        None,
+        BlockApplyResult::TimedOut,
+        Some(test_work_owner()),
     );
-    task.expect_submission(2).await;
+    // The retried parent's estimate alone exceeds the cap, but the window has
+    // nothing submitted, so it must be admitted.
+    task.send_body(test_work_owner(), 1, &blocks[0], 1_000_000)
+        .await;
+    task.expect_submission(1).await;
     task.task.abort();
 }
 

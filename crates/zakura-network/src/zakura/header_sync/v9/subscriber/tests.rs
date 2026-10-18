@@ -645,6 +645,11 @@ fn unlinked_headers_fault() {
         Err(SubscriberFault::Linkage),
         "a later header does not extend the header before it"
     );
+    assert_eq!(
+        fixture.page(chain[5], &[chain[2], chain[7]], true),
+        Err(SubscriberFault::Linkage),
+        "a page that ends at the target with its marker must still link"
+    );
 
     fixture
         .page(chain[5], &chain[6..8], true)

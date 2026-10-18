@@ -21,14 +21,14 @@
 //!
 //! # Page linkage
 //!
-//! A page's linkage is checked without hashing its headers, except the last
-//! one, whose hash decides the target marker. Before the target, a header's
-//! parent hash equal to the target or to a sent locator shows that the page
-//! passed the target or that the path skipped the highest sent locator on the
-//! target's chain. A path from the highest such locator never contains another
-//! sent locator: a higher one on that path would also be the target or one of
-//! its ancestors. Whether the headers link to each other is contextual
-//! validation's chain-connection check.
+//! The headers must form one chain from the page parent: the first header's
+//! previous hash is that parent, and each later header's previous hash is the
+//! header before it. The last header's hash decides the target marker. Before
+//! the target, a header's parent hash equal to the target or to a sent locator
+//! shows that the page passed the target or that the path skipped the highest
+//! sent locator on the target's chain. A path from the highest sent locator
+//! never contains another sent locator: a higher one on that path would also
+//! be the target or one of its ancestors.
 //!
 //! # Credit
 //!
@@ -133,6 +133,9 @@ pub(crate) enum SubscriberFault {
     /// A later page does not extend the receive cursor.
     #[error("the page does not extend the receive cursor")]
     Parent,
+    /// The headers do not form one chain from the page parent.
+    #[error("the headers do not link from the page parent")]
+    Linkage,
     /// The path to the target passes a higher sent locator than the one the
     /// first page extended.
     #[error("the path passes a higher sent locator")]
@@ -168,6 +171,7 @@ impl SubscriberFault {
             Self::Schema => "schema",
             Self::FirstParent => "first_parent",
             Self::Parent => "parent",
+            Self::Linkage => "linkage",
             Self::LowerLocator => "lower_locator",
             Self::PastTarget => "past_target",
             Self::TargetHeight => "target_height",
@@ -466,7 +470,8 @@ impl Subscriber {
     ///
     /// The first page extends the highest sent locator on the target's chain,
     /// which is the target when a sent locator equals it. Each later page
-    /// extends the receive cursor. The marker is on exactly the page that
+    /// extends the receive cursor. Every header extends the one before it,
+    /// starting from that parent. The marker is on exactly the page that
     /// ends at the target. A page after `Close` within existing credit is
     /// admitted.
     pub(crate) fn receive_page(
@@ -513,10 +518,9 @@ impl Subscriber {
                 return Err(SubscriberFault::Parent);
             }
         }
-        let Some(last) = page.entries.last() else {
+        if page.entries.is_empty() {
             return Err(SubscriptionFault::OverCredit.into());
-        };
-        let last_hash = last.header.hash();
+        }
         // A page beyond u32::MAX headers exceeds any credit.
         let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
         let height = parent
@@ -527,22 +531,34 @@ impl Subscriber {
         if !live.caps.allow(count, payload_len) {
             return Err(SubscriberFault::AboveAdvertised);
         }
+        // Hash each header once. An unlinked page must fault here: preparation
+        // verifies Equihash before the planner notices the break, and that
+        // refusal is local, so the peer would otherwise stay connected.
+        let mut previous_hash = parent.hash;
+        for (index, entry) in page.entries.iter().enumerate() {
+            if entry.header.previous_block_hash != previous_hash {
+                return Err(SubscriberFault::Linkage);
+            }
+            if !live.reached && index > 0 {
+                if previous_hash == live.target {
+                    return Err(SubscriberFault::PastTarget);
+                }
+                if live
+                    .locators
+                    .iter()
+                    .any(|locator| locator.hash == previous_hash)
+                {
+                    return Err(SubscriberFault::LowerLocator);
+                }
+            }
+            previous_hash = entry.header.hash();
+        }
+        let last_hash = previous_hash;
         if live.reached {
             if page.reaches_initial_target {
                 return Err(SubscriberFault::SecondMarker);
             }
         } else {
-            // A header's parent is the previous header, once chain connection
-            // passes. The first header's parent is the page's parent.
-            for entry in &page.entries[1..] {
-                let previous = entry.header.previous_block_hash;
-                if previous == live.target {
-                    return Err(SubscriberFault::PastTarget);
-                }
-                if live.locators.iter().any(|locator| locator.hash == previous) {
-                    return Err(SubscriberFault::LowerLocator);
-                }
-            }
             let reaches = last_hash == live.target;
             if !reaches
                 && live

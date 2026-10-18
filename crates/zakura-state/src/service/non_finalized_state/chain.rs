@@ -1368,7 +1368,6 @@ impl Chain {
     }
 
     /// Returns the non-finalized root block hash and height.
-    #[allow(dead_code)]
     pub fn non_finalized_root(&self) -> (block::Hash, block::Height) {
         (
             self.non_finalized_root_hash(),
@@ -1383,14 +1382,6 @@ impl Chain {
             .next()
             .expect("only called while blocks is populated")
             .hash
-    }
-
-    /// Returns the block hash of the `n`th block from the non-finalized root.
-    ///
-    /// This is the block at `non_finalized_root_height() + n`.
-    #[allow(dead_code)]
-    pub fn non_finalized_nth_hash(&self, n: usize) -> Option<block::Hash> {
-        self.blocks.values().nth(n).map(|block| block.hash)
     }
 
     /// Remove the highest height block of the non-finalized portion of a chain.
@@ -1465,7 +1456,6 @@ impl Chain {
     }
 
     /// Returns the non-finalized length of this chain.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }

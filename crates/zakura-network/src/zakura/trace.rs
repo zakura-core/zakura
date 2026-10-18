@@ -116,6 +116,9 @@ pub(crate) mod header_sync_trace {
     pub(crate) const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
     pub(crate) const HEADER_SNAPSHOT_OBSERVED: &str = "header_snapshot_observed";
     pub(crate) const HEADER_VCT_REPAIR_STATE: &str = "header_vct_repair_state";
+    /// One full pass over cached offers, with the peers it walked in
+    /// `peers_considered`.
+    pub(crate) const HEADER_CACHED_OFFER_PASS: &str = "header_cached_offer_pass";
 }
 
 /// Legacy compatibility request/response events.

@@ -17,6 +17,7 @@ struct PanickingPort {
 impl port::Port for PanickingPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
@@ -95,6 +96,13 @@ impl port::Port for PanickingPort {
                 ),
             ))
         })
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
     }
 }
 
@@ -377,6 +385,7 @@ struct StalledLocatorPort {
 impl port::Port for StalledLocatorPort {
     fn continuation_locator(
         &self,
+        _permit: zakura_node_services::header_chain::LocatorReadPermit,
     ) -> port::HeaderChainFuture<
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
@@ -435,6 +444,13 @@ impl port::Port for StalledLocatorPort {
         _target: port::PreparedHeaderTarget,
     ) -> port::HeaderChainFuture<'_, port::ApplyHeaderTargetReply> {
         Box::pin(async { panic!("the stalled-locator fixture never reaches target application") })
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
     }
 }
 

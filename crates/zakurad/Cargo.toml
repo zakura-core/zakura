@@ -63,15 +63,13 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "journald",
-    "opentelemetry",
     "prometheus",
     "indexer",
 ]
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -105,9 +103,8 @@ internal-miner = [
     "zakura-rpc/internal-miner",
 ]
 
-# Tracing and monitoring
-journald = ["tracing-journald"]
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Legacy flag accepted for build compatibility; journald logging is removed.
+journald = []
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -149,7 +146,7 @@ zakura-checkpoints = [
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0" }
 zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0-rc0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = ["rpc-client"] }
@@ -186,7 +183,6 @@ eyre = { workspace = true }
 thiserror = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-crossbeam-channel = { workspace = true }
 tracing-error = { workspace = true }
 tracing = { workspace = true }
 
@@ -202,14 +198,6 @@ hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
-# prod feature journald
-tracing-journald = { workspace = true, optional = true }
-
-# prod feature opentelemetry
-opentelemetry = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 
@@ -250,7 +238,7 @@ proptest-derive = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
 zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "10.0.0-rc0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0-rc0", features = ["proptest-impl"] }

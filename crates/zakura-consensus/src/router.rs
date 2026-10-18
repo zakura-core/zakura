@@ -32,6 +32,7 @@ use zakura_chain::{
 };
 
 use zakura_node_services::mempool;
+use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 
 use crate::{
@@ -469,7 +470,7 @@ where
     let checkpoint_sync = config.checkpoint_sync;
     let checkpoint_network = network.clone();
 
-    let state_checkpoint_verify_handle = tokio::task::spawn(
+    let state_checkpoint_verify_handle = spawn_erased(
         // TODO: move this into an async function?
         async move {
             tracing::info!("starting state checkpoint validation");

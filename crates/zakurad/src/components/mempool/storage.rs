@@ -207,6 +207,7 @@ pub struct RemovedTransactionIds {
 
 impl RemovedTransactionIds {
     /// Returns the total number of transactions that were removed from the mempool.
+    #[cfg(test)]
     pub fn total_len(&self) -> usize {
         self.mined.len() + self.invalidated.len()
     }
@@ -652,7 +653,7 @@ impl Storage {
     /// Maintains the order in which the other unmined transactions have been inserted into the mempool.
     ///
     /// Does not add or remove from the 'rejected' tracking set.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn remove_exact(&mut self, exact_wtxids: &HashSet<UnminedTxId>) -> usize {
         self.verified
             .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()))
@@ -761,7 +762,6 @@ impl Storage {
     }
 
     /// Clears the whole mempool storage.
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.verified.clear();
         self.tip_rejected_exact.clear();

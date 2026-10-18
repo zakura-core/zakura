@@ -5,12 +5,10 @@ use std::{
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 use tokio::sync::mpsc;
-use tokio::{
-    sync::watch,
-    task::{self, JoinHandle},
-};
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use zakura_header_chain::Frontier;
+use zakura_node_services::task::spawn_erased;
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
@@ -946,7 +944,7 @@ impl Service for HeaderSyncPassthroughService {
             inner: self.inner.clone(),
             cancel_token: peer.cancel_token(),
         };
-        task::spawn(async move {
+        spawn_erased(async move {
             if let Err(error) = Box::new(sink).run(recv).await {
                 tracing::debug!(?error, "header-sync passthrough stopped");
             }

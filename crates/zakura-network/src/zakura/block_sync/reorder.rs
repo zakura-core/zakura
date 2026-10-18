@@ -312,7 +312,6 @@ impl BufferedBlockBody {
     }
 
     /// Whether this body currently holds a decoded block.
-    #[cfg(test)]
     pub(super) fn is_decoded(&self) -> bool {
         !matches!(self, BufferedBlockBody::RawFramePayload(_))
     }

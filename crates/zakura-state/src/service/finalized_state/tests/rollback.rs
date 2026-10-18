@@ -1506,7 +1506,7 @@ fn legacy_block_info_replay_preserves_slow_start_deferred_funding_and_nsm_seed()
             .zs_delete(&Height(h));
     }
     state.db.write_batch(batch).unwrap();
-    let (_tx, rx) = crossbeam_channel::bounded(1);
+    let (_tx, rx) = crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     Upgrade.run(Some(Height(3)), &state.db, &rx).unwrap();
     for (index, expected) in snapshots.into_iter().enumerate() {
         let height = Height(u32::try_from(index + 1).unwrap());

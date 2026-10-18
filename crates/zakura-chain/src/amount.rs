@@ -628,7 +628,10 @@ pub trait Constraint {
 }
 
 impl ZcashSerialize for Amount<NegativeAllowed> {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_i64::<LittleEndian>(self.0)
     }
 }
@@ -643,7 +646,10 @@ impl ZcashDeserialize for Amount<NegativeAllowed> {
 
 impl ZcashSerialize for Amount<NonNegative> {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         let amount = self
             .0
             .try_into()

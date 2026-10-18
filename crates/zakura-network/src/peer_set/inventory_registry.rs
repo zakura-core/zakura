@@ -127,7 +127,6 @@ impl InventoryChange {
     }
 
     /// Returns a new missing inventory change from a single hash.
-    #[allow(dead_code)]
     pub fn new_missing(hash: InventoryHash, peer: PeerSocketAddr) -> Self {
         let bv = AtLeastOne::from_vec(vec![hash]).expect("bounded vec must fit");
         InventoryStatus::Missing((bv, peer))
@@ -233,7 +232,6 @@ impl InventoryRegistry {
     }
 
     /// Returns an iterator over addrs of peers that have recently missed `hash` in their inventory.
-    #[allow(dead_code)]
     pub fn missing_peers(&self, hash: InventoryHash) -> impl Iterator<Item = &PeerSocketAddr> {
         self.status_peers(hash)
             .filter_map(|addr_status| addr_status.missing())

@@ -4731,7 +4731,6 @@ async fn rpc_addnode() {
     )
     .await;
 
-    //let mock_address_book = MockAddressBookPeers::default();
     let mock_address_book =
         zakura_network::address_book_peers::mock::SharedMockAddressBookPeers::default();
 

@@ -228,6 +228,24 @@ fn parse_environment(value: String) -> Value {
     }
 }
 
+impl Value {
+    /// The error a derived struct visitor reports for a non-table value.
+    #[cold]
+    #[inline(never)]
+    fn invalid_type(&self, expected: &dyn de::Expected) -> Error {
+        let unexpected = match self {
+            Self::Nil => de::Unexpected::Unit,
+            Self::Boolean(value) => de::Unexpected::Bool(*value),
+            Self::Integer(value) => de::Unexpected::Signed(*value),
+            Self::Float(value) => de::Unexpected::Float(*value),
+            Self::String(value) => de::Unexpected::Str(value),
+            Self::Array(_) => de::Unexpected::Seq,
+            Self::Table(_) => de::Unexpected::Map,
+        };
+        de::Error::invalid_type(unexpected, expected)
+    }
+}
+
 /// Preserve the former loader's scalar conversions while using Serde's map
 /// and sequence adapters for the configuration structure.
 struct ConfigValue(Value);
@@ -415,13 +433,8 @@ impl<'de> Deserializer<'de> for ConfigValue {
         visitor: V,
     ) -> Result<V::Value, Error> {
         match self.0 {
-            Value::Boolean(value) => visitor.visit_bool(value),
-            Value::Integer(value) => visitor.visit_i64(value),
-            Value::Float(value) => visitor.visit_f64(value),
-            Value::String(value) => visitor.visit_string(value),
-            Value::Nil => visitor.visit_unit(),
-            Value::Array(_) => Err(de::Error::invalid_type(de::Unexpected::Seq, &visitor)),
             Value::Table(values) => visitor.visit_map(ConfigMap::new(values)),
+            value => Err(value.invalid_type(&visitor)),
         }
     }
 
@@ -483,13 +496,15 @@ impl<'de> de::VariantAccess<'de> for ConfigEnum {
 /// Add the field path to deserialization errors without another dependency.
 struct ConfigMap {
     entries: btree_map::IntoIter<String, Value>,
-    next_value: Option<(String, Value)>,
+    key: String,
+    next_value: Option<Value>,
 }
 
 impl ConfigMap {
     fn new(values: BTreeMap<String, Value>) -> Self {
         Self {
             entries: values.into_iter(),
+            key: String::new(),
             next_value: None,
         }
     }
@@ -505,7 +520,8 @@ impl<'de> de::MapAccess<'de> for ConfigMap {
         match self.entries.next() {
             Some((key, value)) => {
                 let result = seed.deserialize(de::value::StrDeserializer::new(&key))?;
-                self.next_value = Some((key, value));
+                self.key = key;
+                self.next_value = Some(value);
                 Ok(Some(result))
             }
             None => Ok(None),
@@ -513,12 +529,12 @@ impl<'de> de::MapAccess<'de> for ConfigMap {
     }
 
     fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let (key, value) = self
+        let value = self
             .next_value
             .take()
             .expect("a value follows a successfully read key");
         seed.deserialize(ConfigValue(value))
-            .map_err(|error| de::Error::custom(format!("{key}: {error}")))
+            .map_err(|error| prefix_error(&self.key, error))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -539,7 +555,7 @@ impl<'de> de::SeqAccess<'de> for ConfigSequence {
             .next()
             .map(|(index, value)| {
                 seed.deserialize(ConfigValue(value))
-                    .map_err(|error| <Error as de::Error>::custom(format!("[{index}]: {error}")))
+                    .map_err(|error| prefix_error(&format_args!("[{index}]"), error))
             })
             .transpose()
     }
@@ -547,4 +563,11 @@ impl<'de> de::SeqAccess<'de> for ConfigSequence {
     fn size_hint(&self) -> Option<usize> {
         Some(self.0.len())
     }
+}
+
+/// Prefix a nested deserialization error with its field path.
+#[cold]
+#[inline(never)]
+fn prefix_error(path: &dyn std::fmt::Display, error: Error) -> Error {
+    de::Error::custom(format!("{path}: {error}"))
 }

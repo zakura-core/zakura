@@ -35,6 +35,7 @@ use zakura_chain::{
     serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
 };
+use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{
     Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, NodeId, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt,
@@ -843,7 +844,7 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        tokio::spawn(native_dial_supervised(endpoint, node_addr, limits, policy))
+        spawn_erased(native_dial_supervised(endpoint, node_addr, limits, policy))
     }
 
     /// Start one maintained native dial for a legacy handoff.
@@ -882,7 +883,7 @@ impl ZakuraEndpoint {
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
-        let dial = tokio::spawn(async move {
+        let dial = spawn_erased(async move {
             let _lifetime_guard = task_lifetime.drop_guard();
             native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
             endpoint
@@ -1804,9 +1805,9 @@ impl Drop for RegisteredPeerCleanupGuard {
         let peer_id = self.peer_id.clone();
         let conn_id = self.conn_id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _task = handle.spawn(async move {
+            let _task = handle.spawn(erased(async move {
                 supervisor.deregister(&peer_id, conn_id).await;
-            });
+            }));
         }
     }
 }
@@ -4019,7 +4020,7 @@ fn sought_services_with_custom(custom_services: &[CustomService]) -> Vec<ZakuraS
 /// Start a Zakura endpoint and router when P2P v2 is enabled.
 pub async fn spawn_zakura_endpoint(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_with_header_sync_driver(config, sink_factory, None).await
 }
@@ -4027,7 +4028,7 @@ pub async fn spawn_zakura_endpoint(
 /// Start a Zakura endpoint with an externally driven header-sync reactor.
 pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_with_services(
@@ -4042,13 +4043,13 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
 /// Start a Zakura endpoint with optional runtime services.
 pub async fn spawn_zakura_endpoint_with_services(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
-        sink_factory,
+        Box::new(sink_factory),
         header_sync_driver_startup,
         custom_services,
         None,
@@ -4058,14 +4059,14 @@ pub async fn spawn_zakura_endpoint_with_services(
 
 pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send + 'static,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: PeerRegistry,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
-        sink_factory,
+        Box::new(sink_factory),
         header_sync_driver_startup,
         custom_services,
         Some(peer_registry),
@@ -4073,9 +4074,11 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     .await
 }
 
+/// Starts the endpoint. `sink_factory` is boxed so this large function is compiled once for
+/// every caller's factory type.
 async fn spawn_zakura_endpoint_inner(
     config: &Config,
-    sink_factory: impl FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service>,
+    sink_factory: Box<dyn FnOnce(ZakuraSupervisorHandle, ZakuraTrace) -> Arc<dyn Service> + Send>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: Option<PeerRegistry>,
@@ -4212,6 +4215,10 @@ async fn spawn_zakura_endpoint_inner(
             .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
+            // With `checkpoint_sync = false` the verifier stops checkpointing
+            // lower than this, so the cap only ever misses heights, never caps
+            // a checkpoint range.
+            startup.max_checkpoint_height = Some(config.network.checkpoint_list().max_height());
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
                 driver_startup.retained_block_height.clone(),
                 config.network.genesis_hash(),
@@ -4317,7 +4324,7 @@ async fn spawn_zakura_endpoint_inner(
         let capability_handler = endpoint.handler.clone();
         let capability_supervisor = endpoint.supervisor.clone();
         let shutdown = endpoint.background_shutdown_token();
-        let task = tokio::spawn(async move {
+        let task = spawn_erased(async move {
             let mut epochs = HeaderCapabilityEpochs::from_initial(&service_demand.borrow());
             loop {
                 let ready_epoch = epochs.observe(&service_demand.borrow());
@@ -4350,7 +4357,7 @@ async fn spawn_zakura_endpoint_inner(
     {
         let shutdown = endpoint.background_shutdown_token();
         let log_endpoint = endpoint.clone();
-        let task = tokio::spawn(async move {
+        let task = spawn_erased(async move {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => {}
@@ -4699,7 +4706,7 @@ async fn persistent_stream_worker_with_policy(
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
-    let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+    let reader = tokio_util::task::AbortOnDropHandle::new(spawn_erased(async move {
         // Session teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();

@@ -556,7 +556,10 @@ impl ZakuraTestNodeBuilder {
                 self.limits.max_connections,
             ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone()))
+            Arc::new(DiscoveryService::with_max_connections(
+                discovery.clone(),
+                self.limits.max_connections,
+            ))
         };
         let registry = service_registry(
             &supervisor,

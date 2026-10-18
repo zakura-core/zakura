@@ -124,6 +124,18 @@ pub struct PeerMemoryBudgetError {
     pub required: usize,
 }
 
+/// Returns how many connections `budget_bytes` admits for connections of
+/// `connection_bytes`: the live slots it funds (see [`live_slot_bytes`]) less
+/// `headroom` for QUIC connections the node holds but hasn't admitted.
+pub fn budget_admitted_connections(
+    budget_bytes: u64,
+    connection_bytes: u64,
+    headroom: usize,
+) -> usize {
+    max_connections_for_budget(budget_bytes, live_slot_bytes(connection_bytes))
+        .saturating_sub(headroom)
+}
+
 /// Returns the connection cap after the budget: `max_connections`, lowered to
 /// the live slots `budget_bytes` funds for connections of `connection_bytes`
 /// (see [`live_slot_bytes`]), less `headroom` for QUIC connections the node
@@ -140,9 +152,9 @@ pub fn budgeted_max_connections(
     headroom: usize,
 ) -> Result<usize, PeerMemoryBudgetError> {
     let max_connections = max_connections.max(1);
+    let admitted = budget_admitted_connections(budget_bytes, connection_bytes, headroom);
     let connection_bytes = live_slot_bytes(connection_bytes);
     let funded = max_connections_for_budget(budget_bytes, connection_bytes);
-    let admitted = funded.saturating_sub(headroom);
     let required = max_connections.min(min_budgeted_connections(bootstrap_peer_count));
     if admitted < required {
         return Err(PeerMemoryBudgetError {
@@ -166,6 +178,7 @@ mod tests {
         discovery::discovery_dial_slot_limit, ZakuraConfig, DEFAULT_MAINNET_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
     };
+    use crate::{zakura::ZakuraLocalLimits, Config};
 
     const MIB: u64 = 1024 * 1024;
 
@@ -281,6 +294,30 @@ mod tests {
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(), Ok(30));
+    }
+
+    #[test]
+    fn local_limits_keep_the_budget_when_only_the_node_floor_passes() {
+        // Nine identities including this node's own, and a budget that admits
+        // 18 after 32 slots of handshake headroom: the node-specific floor
+        // (17) passes, the generic one (19) doesn't, and the limits must still
+        // stop at 18.
+        let node_ids: Vec<NodeId> = (1..=9)
+            .map(|seed| NodeSecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
+        let mut config = Config::default();
+        config.zakura.bootstrap_peers = node_ids
+            .iter()
+            .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
+            .collect();
+        config.zakura.max_connections = 256;
+        config.zakura.peer_memory_budget_bytes = (18 + 32) * live_slot_bytes(80 * MIB);
+        assert!(config.zakura.budgeted_max_connections().is_err());
+        assert_eq!(
+            config.zakura.budgeted_max_connections_for_node(node_ids[0]),
+            Ok(18)
+        );
+        assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
     }
 
     #[test]

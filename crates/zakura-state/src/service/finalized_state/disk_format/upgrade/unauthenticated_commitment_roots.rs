@@ -4,13 +4,13 @@
 //! therefore contain unverified rows above its finalized body tip. This upgrade removes those
 //! rows before the committer or peer-serving code can read them.
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::block::Height;
 
 use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+use super::{CancelFormatChange, CancelReceiver, DiskFormatUpgrade, FormatChangeError};
 
 /// First format where every stored commitment-root row is authenticated before persistence.
 pub(crate) const UPGRADE_VERSION: Version = Version::new(28, 1, 5);
@@ -91,7 +91,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         _initial_finalized_tip_height: Option<Height>,
         state_database: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
         #[cfg(test)]
@@ -105,7 +105,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         state_database: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         let body_tip = state_database.finalized_tip_height();
         let first_unproven = match body_tip {
@@ -129,9 +129,7 @@ impl DiskFormatUpgrade for Upgrade {
     }
 }
 
-fn check_cancelled(
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
+fn check_cancelled(cancel_receiver: &CancelReceiver) -> Result<(), CancelFormatChange> {
     match cancel_receiver.try_recv() {
         Err(TryRecvError::Empty) => Ok(()),
         _ => Err(CancelFormatChange),
@@ -140,6 +138,7 @@ fn check_cancelled(
 
 #[cfg(test)]
 mod tests {
+    use super::super::cancel_channel;
     use super::*;
     use crate::{
         config::database_format_version_on_disk,
@@ -214,7 +213,7 @@ mod tests {
         truncate_to_body_tip(&db).expect("no-tip cutover purges unauthenticated roots");
 
         assert!(!db.has_commitment_root_rows());
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let (_cancel_tx, cancel_rx) = cancel_channel();
         assert!(matches!(
             DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx),
             Ok(Ok(()))
@@ -363,7 +362,7 @@ mod tests {
         db.insert_zakura_header_commitment_roots([roots_at(Height(1)), roots_at(Height(2))])
             .expect("legacy header-ahead roots write");
 
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let (_cancel_tx, cancel_rx) = cancel_channel();
         DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
             .expect("first cutover is not cancelled");
         DiskFormatUpgrade::run(&Upgrade, Some(Height::MIN), &db, &cancel_rx)
@@ -411,7 +410,7 @@ mod tests {
         db.insert_zakura_header_commitment_roots([roots_at(Height(1))])
             .expect("unproven row writes");
 
-        let (_cancel_tx, cancel_rx) = crossbeam_channel::bounded(1);
+        let (_cancel_tx, cancel_rx) = cancel_channel();
         assert!(
             DiskFormatUpgrade::validate(&Upgrade, &db, &cancel_rx)
                 .expect("validation is not cancelled")

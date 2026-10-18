@@ -2,18 +2,21 @@
 
 use std::{
     cmp::Ordering,
-    sync::Arc,
+    sync::{
+        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[cfg(test)]
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::LazyLock,
 };
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use semver::Version;
 use thiserror::Error;
 use tracing::Span;
@@ -68,7 +71,7 @@ pub trait DiskFormatUpgrade {
         &self,
         initial_finalized_tip_height: Option<Height>,
         state_database: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError>;
 
     /// Validates the postconditions that this upgrade establishes.
@@ -78,7 +81,7 @@ pub trait DiskFormatUpgrade {
     fn validate(
         &self,
         _state_database: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         Ok(Ok(()))
     }
@@ -88,7 +91,7 @@ pub trait DiskFormatUpgrade {
         &self,
         _initial_finalized_tip_height: Option<Height>,
         _state_database: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
         _older_disk_version: &Version,
     ) -> Result<(), FormatChangeError> {
         Ok(())
@@ -241,12 +244,43 @@ pub struct DbFormatChangeThreadHandle {
     update_task: Option<Arc<JoinHandle<Result<(), FormatChangeError>>>>,
 
     /// A channel that tells the running format thread to finish early.
-    cancel_handle: Sender<CancelFormatChange>,
+    cancel_handle: SyncSender<CancelFormatChange>,
 }
 
 /// Marker type that is sent to cancel a format upgrade, and returned as an error on cancellation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct CancelFormatChange;
+
+/// Returns a channel that cancels a format change.
+///
+/// Sending a [`CancelFormatChange`], or dropping the sender, cancels the format change.
+pub fn cancel_channel() -> (SyncSender<CancelFormatChange>, CancelReceiver) {
+    let (cancel_handle, receiver) = sync_channel(1);
+    (cancel_handle, CancelReceiver(Mutex::new(receiver)))
+}
+
+/// The receiving end of a [`cancel_channel`].
+///
+/// Parallel format upgrade workers check it concurrently, so the receiver is behind a mutex.
+#[derive(Debug)]
+pub struct CancelReceiver(Mutex<Receiver<CancelFormatChange>>);
+
+impl CancelReceiver {
+    /// Returns the cancel signal without waiting, or why there isn't one.
+    pub fn try_recv(&self) -> Result<CancelFormatChange, TryRecvError> {
+        self.lock().try_recv()
+    }
+
+    /// Waits up to `timeout` for the cancel signal.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<CancelFormatChange, RecvTimeoutError> {
+        self.lock().recv_timeout(timeout)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Receiver<CancelFormatChange>> {
+        // Receiving can't leave the receiver invalid, so a poisoned lock is still usable.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// An error that prevents the coordinator from updating the database format version.
 #[derive(Debug, Error)]
@@ -455,7 +489,7 @@ impl DbFormatChange {
         //
         // Cancel handles must use try_send() to avoid blocking waiting for the format change
         // thread to shut down.
-        let (cancel_handle, cancel_receiver) = bounded(1);
+        let (cancel_handle, cancel_receiver) = cancel_channel();
 
         let span = Span::current();
         let update_task = thread::spawn(move || {
@@ -478,7 +512,7 @@ impl DbFormatChange {
     fn periodic_format_check_loop(
         db: ZakuraDb,
         initial_finalized_tip_height: Option<Height>,
-        cancel_receiver: Receiver<CancelFormatChange>,
+        cancel_receiver: CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         let Some(debug_validity_check_interval) = db.config().debug_validity_check_interval else {
             return Ok(());
@@ -508,7 +542,7 @@ impl DbFormatChange {
         &self,
         db: &ZakuraDb,
         initial_finalized_tip_height: Option<Height>,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         // Mark the database as having finished applying any format upgrades if there are no
         // format upgrades that need to be applied.
@@ -668,7 +702,7 @@ impl DbFormatChange {
         &self,
         db: &ZakuraDb,
         initial_finalized_tip_height: Option<Height>,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         let Upgrade {
             newer_running_version,
@@ -762,7 +796,7 @@ impl DbFormatChange {
     #[allow(clippy::vec_init_then_push)]
     pub fn format_validity_checks_detailed(
         db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         let timer = CodeTimer::start();
         let mut results = Vec::new();
@@ -1032,8 +1066,10 @@ fn database_startup_waits_for_format_upgrade() {
     let db_path = db.path().to_owned();
     drop(db);
 
-    let (entered_tx, entered_rx) = bounded(1);
-    let (release_tx, release_rx) = bounded(1);
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    // The hook must be `Sync`, and a standard library receiver isn't.
+    let release_rx = Mutex::new(release_rx);
     let _hook_guard = register_startup_upgrade_hook(
         db_path,
         Arc::new(move || {
@@ -1041,12 +1077,14 @@ fn database_startup_waits_for_format_upgrade() {
                 .send(())
                 .expect("startup test receiver remains open");
             release_rx
+                .lock()
+                .expect("the startup test hook runs once")
                 .recv()
                 .expect("startup test releases the format upgrade");
         }),
     );
 
-    let (returned_tx, returned_rx) = bounded(1);
+    let (returned_tx, returned_rx) = sync_channel(1);
     let open_thread = thread::spawn(move || {
         let db = ZakuraDb::new(
             &config,

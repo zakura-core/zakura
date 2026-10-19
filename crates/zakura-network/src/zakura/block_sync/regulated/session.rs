@@ -40,12 +40,10 @@ const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_E
 /// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
 /// the response configuration cannot inflate execution concurrency.
 pub(crate) fn serving_limits() -> ServeLimits {
-    let largest = Range {
-        start: Height::MIN,
-        count: MAX_BS_BLOCKS_PER_REQUEST,
-    }
-    .response_cap(MAX_BS_RESPONSE_BYTES)
-    .output_bytes();
+    let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
+        .expect("the protocol's largest range starts at height zero")
+        .response_cap(MAX_BS_RESPONSE_BYTES)
+        .output_bytes();
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
@@ -159,12 +157,12 @@ pub(crate) struct ServingSession {
 }
 
 impl ServingSession {
-    /// Admit without waiting for storage or output capacity. Only malformed,
-    /// overlapping, or excessive commitments are peer faults.
-    pub(crate) fn admit(&mut self, start: Height, count: u32) -> Result<(), SinkReject> {
-        let range = Range::new(start, count).map_err(SinkReject::protocol)?;
+    /// Admit a range that the stream-6 codec already checked, without waiting
+    /// for storage or output capacity. Only overlapping or excessive commitments
+    /// are peer faults here.
+    pub(crate) fn admit(&mut self, range: Range) -> Result<(), SinkReject> {
+        let (start, last) = (range.start(), range.last());
         self.remove_completed();
-        let last = Height(start.0 + count - 1);
         if self
             .ranges
             .range(..=last)

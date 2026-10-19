@@ -1,5 +1,5 @@
 use super::super::regulated::live_requester::MAX_PENDING_ENDINGS;
-use super::super::request::BlockSizeEstimate;
+use super::super::{request::BlockSizeEstimate, MSG_BS_BLOCK};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
 use crate::zakura::{CwndUnit, MAX_BS_BLOCKS_PER_REQUEST};

@@ -886,13 +886,10 @@ pub(super) struct PeerBlockState {
 }
 
 impl PeerBlockState {
-    pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn new(session: BlockSyncPeerSession) -> Self {
         Self {
             direction: session.direction(),
-            status_delivery: super::status::StatusDelivery::new(
-                config.status_refresh_interval,
-                Instant::now(),
-            ),
+            status_delivery: super::status::StatusDelivery::new(Instant::now()),
             session,
         }
     }
@@ -1069,10 +1066,6 @@ impl RateMeter {
 
     pub(super) fn is_ready(&self, now: Instant) -> bool {
         now >= self.next_allowed
-    }
-
-    pub(super) fn mark_taken(&mut self, now: Instant) {
-        self.next_allowed = now + self.interval;
     }
 }
 

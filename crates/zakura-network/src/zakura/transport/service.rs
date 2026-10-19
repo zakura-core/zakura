@@ -570,6 +570,35 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
 
 /// A Zakura service that accepts one-shot request/response streams.
 pub trait RequestResponseService: Service {
+    /// Dispatch admitted work while retaining its receive capacity through completion.
+    /// Services that detach or queue work must move a clone into that work.
+    #[allow(clippy::too_many_arguments)]
+    fn request_frame_with_lease<'a>(
+        &'a self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        request_id: u64,
+        max_frame_bytes: u32,
+        max_message_bytes: u32,
+        frame: Frame,
+        lease: crate::zakura::ReceiveLease,
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
+        Box::pin(async move {
+            let result = self
+                .request_frame(
+                    peer_id,
+                    stream_kind,
+                    request_id,
+                    max_frame_bytes,
+                    max_message_bytes,
+                    frame,
+                )
+                .await;
+            drop(lease);
+            result
+        })
+    }
+
     /// Deliver one request-response request frame to this service.
     ///
     /// `max_frame_bytes` bounds each encoded outbound frame; `max_message_bytes`

@@ -444,6 +444,30 @@ impl ServiceRegistry {
         max_message_bytes: u32,
         frame: Frame,
     ) -> Result<Vec<Frame>, SinkReject> {
+        self.request_with_lease(
+            peer_id,
+            stream_kind,
+            request_id,
+            max_frame_bytes,
+            max_message_bytes,
+            frame,
+            Default::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Dispatch one request-response frame to the service that owns `kind`.
+    pub(crate) async fn request_with_lease(
+        &self,
+        peer_id: ZakuraPeerId,
+        stream_kind: u16,
+        request_id: u64,
+        max_frame_bytes: u32,
+        max_message_bytes: u32,
+        frame: Frame,
+        lease: crate::zakura::ReceiveLease,
+    ) -> Result<Vec<Frame>, SinkReject> {
         let Some(service) = self.service_for_kind(stream_kind) else {
             return Err(SinkReject::protocol(
                 "request stream kind is not registered",
@@ -456,13 +480,14 @@ impl ServiceRegistry {
         };
 
         handler
-            .request_frame(
+            .request_frame_with_lease(
                 peer_id,
                 stream_kind,
                 request_id,
                 max_frame_bytes,
                 max_message_bytes,
                 frame,
+                lease,
             )
             .await
     }

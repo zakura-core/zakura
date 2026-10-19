@@ -523,18 +523,30 @@ impl Acceptor for RawConnection {
 
 async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Connection), BoxError>
 {
+    raw_connection_with_options(93201, false).await
+}
+
+/// Make independently authenticated loopback peers, optionally using production QUIC defaults.
+async fn raw_connection_with_options(
+    seed: u64,
+    defaults: bool,
+) -> Result<(QuicEndpoint, QuicEndpoint, Connection, Connection), BoxError> {
     let local = ZakuraLocalLimits::from_config(&Config::default());
     // The smallest windows the transport accepts (zakura-quic CTRL-5, CTRL-7).
     let factory = || {
-        LocalEndpointFactory::with_limits(&local).quic_config(QuicConfig {
-            stream_receive_window_bytes: 64 * 1024,
-            receive_window_bytes: 128 * 1024,
-            send_window_bytes: 64 * 1024,
-            ..local.quic.clone()
+        LocalEndpointFactory::with_limits(&local).quic_config(if defaults {
+            local.quic.clone()
+        } else {
+            QuicConfig {
+                stream_receive_window_bytes: 64 * 1024,
+                receive_window_bytes: 128 * 1024,
+                send_window_bytes: 64 * 1024,
+                ..local.quic.clone()
+            }
         })
     };
-    let server = factory().endpoint(93201).await?;
-    let client = factory().endpoint(93202).await?;
+    let server = factory().endpoint(seed).await?;
+    let client = factory().endpoint(seed + 1).await?;
     let (accepted, mut connections) = mpsc::channel(1);
     server.serve(RawConnection(accepted))?;
     let connection = timeout(
@@ -1272,6 +1284,7 @@ async fn request_response_tables_reject_the_other_role_before_payloads() -> Resu
             prelude,
             context,
             Arc::new(ServiceRegistry::new(vec![])?),
+            Arc::new(LegacyReceiveCapacity::new()),
         ),
     )
     .await
@@ -1851,6 +1864,143 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
         );
         assert!(fixture.connection.close_reason().is_none());
         fixture.close().await?;
+    }
+    Ok(())
+}
+
+/// Partial payloads on real QUIC streams retain at most eight request slots per identity.
+/// Multiple connections share the same node allowance and overload preserves the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_partial_payloads_share_receive_capacity() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let capacity = Arc::new(LegacyReceiveCapacity::new());
+    let registry = Arc::new(ServiceRegistry::new(vec![])?);
+    let mut connections = Vec::new();
+    let mut tasks = Vec::new();
+    let mut streams = Vec::new();
+    let mut cancellations = Vec::new();
+    const CAP: u32 = 1024 * 1024;
+    for identity in 0..9_u8 {
+        let (server, client, connection, remote) =
+            raw_connection_with_options(94000 + 2 * u64::from(identity), true).await?;
+        let peer = ZakuraPeerId::new(client.local_id().as_bytes().to_vec()).unwrap();
+        for index in 0..9 {
+            let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
+            let payload_len = CAP - 8;
+            let mut header = Vec::new();
+            header.extend_from_slice(&LEGACY_REQUEST_PUSH_TRANSACTION.to_le_bytes());
+            header.extend_from_slice(&0_u16.to_le_bytes());
+            header.extend_from_slice(&payload_len.to_le_bytes());
+            peer_send.write_all(&header).await?;
+            let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+            let mut context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+            context.peer_id = peer.clone();
+            context.inbound_frame_cap = CAP;
+            let cancel = context.connection_token.clone();
+            let worker = AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
+                send,
+                recv,
+                StreamPrelude {
+                    magic: STREAM_PRELUDE_MAGIC,
+                    stream_kind: LEGACY_REQUEST_STREAM_KIND,
+                    stream_version: 1,
+                    request_id: Some(1),
+                    max_frame_bytes: CAP,
+                },
+                context,
+                registry.clone(),
+                capacity.clone(),
+            )));
+            if identity < 8 && index < 8 {
+                // Send actual bytes. Only the final byte is withheld, so QUIC credit has
+                // flowed into the application allocation rather than staying in a window.
+                timeout(
+                    TEST_TIMEOUT,
+                    peer_send.write_all(&vec![0; usize::try_from(payload_len - 1).unwrap()]),
+                )
+                .await??;
+                tasks.push(worker);
+                cancellations.push(cancel);
+                streams.push((peer_send, peer_recv));
+            } else {
+                timeout(TEST_TIMEOUT, worker).await??;
+                assert!(
+                    !cancel.is_cancelled(),
+                    "local overload must not punish this peer"
+                );
+                assert!(timeout(TEST_TIMEOUT, peer_recv.read_exact(&mut [0; 1]))
+                    .await?
+                    .is_err());
+                break;
+            }
+        }
+        connections.push((server, client, connection, remote));
+    }
+    assert_eq!(capacity.node.available(), 0);
+    assert_eq!(capacity.peers.lock().unwrap().len(), 9);
+    // A matched control response still completes while all inbound request slots are held.
+    let (_, _, connection, remote) = &connections[8];
+    let stream = Stream {
+        kind: LEGACY_REQUEST_STREAM_KIND,
+        version: 1,
+        frame_cap: CAP,
+        ..Stream::REQUEST_RESPONSE
+    };
+    let local = ZakuraLocalLimits::from_config(&Config::default());
+    let response = write_outbound_request_frame(
+        connection,
+        local.clamp(&local.initial_limits()),
+        stream,
+        9,
+        LEGACY_REQUEST_PING,
+        0,
+        Vec::new(),
+    );
+    let pong = async {
+        let (mut send, mut recv) = remote.accept_bi().await?;
+        read_stream_prelude(&mut recv, TEST_TIMEOUT).await?;
+        read_frame(
+            &mut recv,
+            CAP,
+            FrameFilter::new(None, InboundReader::Responder)
+                .with_legacy_stream(LEGACY_REQUEST_STREAM_KIND),
+            TEST_TIMEOUT,
+            Some(TEST_TIMEOUT),
+        )
+        .await?;
+        send.write_all(
+            &Frame {
+                message_type: LEGACY_RESPONSE_PONG,
+                flags: 0,
+                payload: 9_u64.to_le_bytes().to_vec(),
+            }
+            .encode(CAP)?,
+        )
+        .await?;
+        send.finish()?;
+        Ok::<_, BoxError>(())
+    };
+    let (response, pong) = tokio::join!(response, pong);
+    pong?;
+    assert!(
+        response.is_ok(),
+        "matched response must progress under request saturation"
+    );
+    for cancel in cancellations {
+        cancel.cancel();
+    }
+    for task in tasks {
+        timeout(TEST_TIMEOUT, task).await??;
+    }
+    assert_eq!(capacity.node.available(), 64);
+    assert!(capacity
+        .reserve(&ZakuraPeerId::new(vec![99; 32]).unwrap())
+        .is_some());
+    drop(streams);
+    for (server, client, connection, _) in connections {
+        connection.close(0_u32.into(), b"done");
+        timeout(TEST_TIMEOUT, client.shutdown()).await?;
+        timeout(TEST_TIMEOUT, server.shutdown()).await?;
     }
     Ok(())
 }

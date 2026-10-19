@@ -1859,7 +1859,7 @@ async fn production_ingress_status_flood_observes_snapshots() -> Result<(), crat
     let node = ZakuraTestNode::builder(86100)
         .limits(limits.clone())
         // Loopback represents independently addressed peers in this load measurement.
-        .max_connections_per_ip(usize::from(limits.max_connections))
+        .max_connections_per_ip(limits.max_connections)
         .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
         .header_sync_driver(
             network.clone(),

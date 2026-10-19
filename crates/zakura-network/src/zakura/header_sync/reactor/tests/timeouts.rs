@@ -720,6 +720,41 @@ async fn vct_apply_completion_wins_at_the_hard_deadline() {
         .expect("the reactor stops through normal shutdown");
 }
 
+/// A newly published snapshot cannot run deadline enforcement ahead of a ready completion.
+#[tokio::test(start_paused = true)]
+async fn ready_vct_completion_precedes_unseen_snapshot_at_deadline() {
+    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    assert!(fixture
+        .reactor
+        .pending_port_operations
+        .next()
+        .now_or_never()
+        .is_none());
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
+    let mut snapshot = fixture.reactor.committed_snapshot.clone().unwrap();
+    let (updates, snapshots) = watch::channel(Some(snapshot.clone()));
+    fixture.reactor.startup.committed_snapshots = Some(snapshots);
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    updates.send(Some(snapshot)).unwrap();
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(
+            fatal_events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ),
+        "the completed operation must be retired before snapshot-triggered maintenance"
+    );
+    assert!(!task.is_finished());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
 #[test]
 fn normal_header_operations_have_no_vct_fatal_deadline() {
     let port = PendingVctLocalPort::pending(true);

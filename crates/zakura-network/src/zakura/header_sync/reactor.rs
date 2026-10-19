@@ -830,6 +830,15 @@ impl HeaderSyncReactor {
             if self.startup.shutdown.is_cancelled() {
                 break HeaderRequestTerminal::Shutdown;
             }
+            // Retire already-ready state operations before any event can enforce
+            // their hard deadlines. Bound this pass to the current operation set.
+            for _ in 0..self.pending_port_operations.len() {
+                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
+                else {
+                    break;
+                };
+                self.handle_port_completion(completion);
+            }
             // Inspect watches on every turn, even when peer queues never become empty.
             if let Some(snapshots) = committed_snapshots.as_mut() {
                 if snapshots.has_changed().unwrap_or(false) {

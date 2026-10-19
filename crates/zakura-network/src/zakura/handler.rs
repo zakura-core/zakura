@@ -12642,4 +12642,62 @@ mod tests {
             Err(FrameRejection::UnknownMessageType)
         );
     }
+    /// Real service work retains receive admission through queueing, cancellation, and timeout.
+    #[tokio::test(start_paused = true)]
+    async fn receive_lease_survives_service_queue_and_timeout() {
+        use crate::zakura::{
+            legacy_gossip::{LegacyGossipSink, LegacyRequestFrame},
+            transport::RequestResponseService,
+        };
+        for phase in 0..3 {
+            let capacity = LegacyReceiveCapacity::with_limits(1, 1);
+            let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let sink = LegacyGossipSink::spawn(
+                tower::service_fn(move |_: crate::Request| {
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<crate::Response, BoxError>>()
+                }),
+                ZakuraSupervisorHandle::new(1),
+            );
+            let lease = ReceiveLease {
+                _permits: Some(Arc::new(capacity.reserve(&test_peer(1)).unwrap())),
+            };
+            let mut response = sink.request_frame_with_lease(
+                test_peer(1),
+                LEGACY_REQUEST_STREAM_KIND,
+                1,
+                1024 * 1024,
+                2 * 1024 * 1024,
+                LegacyRequestFrame::MempoolTransactionIds
+                    .encode_frame()
+                    .unwrap(),
+                lease,
+            );
+            assert!(futures::poll!(response.as_mut()).is_pending());
+            assert_eq!(capacity.node.available(), 0);
+            if phase != 0 {
+                entered.recv().await.unwrap();
+                assert_eq!(capacity.node.available(), 0);
+            }
+            if phase == 2 {
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert!(response.await.is_err());
+            } else {
+                drop(response);
+                assert_eq!(
+                    capacity.node.available(),
+                    0,
+                    "queued/backend work still owns the lease until cancellation is observed"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while capacity.node.available() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(capacity.reserve(&test_peer(1)).is_some());
+        }
+    }
 }

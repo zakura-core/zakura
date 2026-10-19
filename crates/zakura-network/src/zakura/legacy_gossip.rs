@@ -7721,4 +7721,79 @@ mod tests {
         }
         Ok(())
     }
+    /// Decode eight maximum-size serialized blocks under the default frame and response limits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maximum_block_responses_decode_under_default_limits() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        // Expand one output script without changing its CompactSize width unexpectedly.
+        // These are wire-valid blocks. Consensus validity is outside the response decoder.
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        assert_eq!(block.zcash_serialize_to_vec()?.len(), 2_000_000);
+        let blocks: Vec<_> = (0..8_u8)
+            .map(|index| {
+                let mut block = block.clone();
+                Arc::make_mut(&mut block.header).nonce.0[0] = index;
+                Arc::new(block)
+            })
+            .collect();
+        let requested = blocks
+            .iter()
+            .map(|block| block.hash())
+            .collect::<IndexSet<_>>();
+        let server = ZakuraTestNode::builder(95200)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    tower::service_fn(move |request: Request| {
+                        let response = match request {
+                            Request::BlocksByHash(hashes)
+                            | Request::BlocksByHashFrom { hashes, .. } => Response::Blocks(
+                                hashes
+                                    .into_iter()
+                                    .map(|hash| {
+                                        InventoryResponse::Available((
+                                            blocks
+                                                .iter()
+                                                .find(|block| block.hash() == hash)
+                                                .unwrap()
+                                                .clone(),
+                                            None,
+                                        ))
+                                    })
+                                    .collect(),
+                            ),
+                            _ => Response::Nil,
+                        };
+                        std::future::ready(Ok::<_, BoxError>(response))
+                    }),
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let receiver = ZakuraTestNode::builder(95201).spawn().await?;
+        receiver.connect_native(&server, TEST_NET_TIMEOUT).await?;
+        let response = tokio::time::timeout(
+            TEST_NET_TIMEOUT,
+            LegacyRequestAdapter::new(receiver.supervisor())
+                .request_from_source(Request::BlocksByHash(requested), None),
+        )
+        .await??;
+        let Response::Blocks(received) = response else {
+            panic!("block response")
+        };
+        assert_eq!(received.len(), 8);
+        for item in received {
+            let InventoryResponse::Available((block, _)) = item else {
+                panic!("available block")
+            };
+            assert_eq!(block.zcash_serialize_to_vec()?.len(), 2_000_000);
+        }
+        receiver.shutdown().await;
+        server.shutdown().await;
+        Ok(())
+    }
 }

@@ -2313,3 +2313,92 @@ async fn a_full_closing_allowance_drops_state_at_once() {
     .await
     .unwrap();
 }
+
+/// Silent multi-address discovery attempts leave a live slot for an inbound
+/// peer, while maintained dials can still use the transport's dial reserve.
+#[tokio::test]
+async fn discovery_dials_leave_room_for_an_inbound_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 6,
+            dial_reserve: 2,
+            ..loopback()
+        };
+        let mut config = test_config();
+        config.handshake_timeout_secs = Some(10);
+        let mut node = server_with(&config, &bind, &[ALPN], |_| Admit::Accept);
+        let peer = server();
+        let _maintained = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+
+        let silent: Vec<_> = (0..2)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let target = NodeAddr::with_addrs(
+            NodeSecretKey::generate().public(),
+            silent.iter().map(|socket| socket.local_addr().unwrap()),
+        );
+        let quic = node.endpoint.clone();
+        let discovery = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+        while node.endpoint.connection_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!node.endpoint.has_discovery_capacity());
+        assert!(node.endpoint.has_dial_capacity());
+        assert!(matches!(
+            node.endpoint.connect_discovery(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(node.endpoint.connection_count(), 3);
+
+        let inbound = client();
+        let _accepted = inbound.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 4);
+
+        let _reserved = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 5);
+        discovery.abort();
+        let _ = discovery.await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Discovery caps its address list to its own ceiling, and a ceiling with no
+/// room returns a local limit without contacting the peer or panicking.
+#[tokio::test]
+async fn discovery_handles_small_connection_limits() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for (cap, reserve, can_discover) in [(1, 0, false), (2, 1, false), (3, 1, true)] {
+            let bind = QuicBindConfig {
+                max_connections: cap,
+                dial_reserve: reserve,
+                ..loopback()
+            };
+            let node =
+                QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+            let peer = server();
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let target = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                vec![peer.endpoint.local_addrs()[0], silent.local_addr().unwrap()],
+            );
+            assert_eq!(node.has_discovery_capacity(), can_discover);
+            let result = node.connect_discovery(target, &[ALPN]).await;
+            if can_discover {
+                let held = result.unwrap();
+                assert_eq!(node.connection_count(), 1);
+                assert!(!node.has_discovery_capacity());
+                drop(held);
+            } else {
+                assert!(matches!(result, Err(ConnectError::ConnectionLimit)));
+                assert_eq!(node.connection_count(), 0);
+                assert!(peer.seen.lock().unwrap().is_empty());
+                // A discovery ceiling of zero doesn't disable maintained dials.
+                node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}

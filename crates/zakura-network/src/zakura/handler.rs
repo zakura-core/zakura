@@ -949,14 +949,11 @@ impl ZakuraEndpoint {
         }
     }
 
-    /// Returns whether this node can start another dialed Zakura connection:
-    /// the local admission semaphore has a free permit and the transport has a
-    /// free live slot (zakura-quic ADM-12). Used by the discovery dialer to
-    /// avoid starting candidate dials that would immediately bounce off either
-    /// cap. The transport can be full while permits remain, for example with
-    /// handshakes in flight, and a dial loop gated on permits alone would spin.
-    pub(crate) fn has_native_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0 && self.quic.has_dial_capacity()
+    /// Whether discovery has an admission permit and can start an address
+    /// attempt while preserving inbound capacity (zakura-quic ADM-12).
+    /// Multi-address dials still reserve all their slots in the transport.
+    pub(crate) fn has_discovery_admission_capacity(&self) -> bool {
+        self.handler.admission.available_permits() > 0 && self.quic.has_discovery_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -4426,12 +4423,28 @@ fn trace_conn_id(connection: &Connection) -> u64 {
     connection.stable_id() as u64
 }
 
+/// Selects whether a native dial may use the transport's reserved capacity.
+pub(crate) enum NativeDialKind {
+    /// Bootstrap and maintained dials may use every live slot.
+    Maintained,
+    /// Discovery leaves room for an inbound connection and maintained dials.
+    Discovery,
+}
+
+/// Dials and serves a maintained native connection using the full transport cap.
 pub(crate) async fn serve_native_dial_connection(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
-    serve_native_dial_connection_reporting_admitted_ip(endpoint, node_addr, limits, None).await
+    serve_native_dial_connection_reporting_admitted_ip(
+        endpoint,
+        node_addr,
+        limits,
+        None,
+        NativeDialKind::Maintained,
+    )
+    .await
 }
 
 /// Dials `node_addr` and serves the connection, like [`serve_native_dial_connection`].
@@ -4443,6 +4456,7 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
     admitted_ip: Option<oneshot::Sender<IpAddr>>,
+    kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
         .handler
@@ -4457,13 +4471,19 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     );
     let alpns = supported_p2p_v2_alpns();
     let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
-    let connection = match timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
+    let dial = async {
+        match kind {
+            NativeDialKind::Maintained => endpoint.quic.connect(node_addr, &offered).await,
+            NativeDialKind::Discovery => endpoint.quic.connect_discovery(node_addr, &offered).await,
+        }
+    };
+    let connection = match timeout(dial_timeout, dial)
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
     {
         Ok(connection) => connection,
-        // zakura-quic ADM-12: this node's own cap, so discovery doesn't back
-        // off from the peer.
+        // zakura-quic ADM-12: this node's dial ceiling, so discovery doesn't
+        // back off from the peer.
         Err(zakura_quic::ConnectError::ConnectionLimit) => {
             return Err(ZakuraHandlerError::ResourceLimit(
                 TRANSPORT_CONNECTIONS_LIMIT,
@@ -6379,7 +6399,7 @@ pub enum ZakuraHandlerError {
 /// semaphore is full, before it sends any packet.
 const ADMISSION_LIMIT: &str = "admission";
 /// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
-/// holds its maximum of live connections, before it sends any packet
+/// cannot fit the dial under its connection ceiling, before any packet
 /// (zakura-quic ADM-12).
 const TRANSPORT_CONNECTIONS_LIMIT: &str = "transport connections";
 
@@ -7795,34 +7815,34 @@ mod tests {
         let mut config = Config::for_test(P2pStack::Dual);
         // No bootstrap dials, so nothing else takes the admission permit.
         config.zakura.bootstrap_peers = Vec::new();
-        config.zakura.max_connections = 1;
+        config.zakura.max_connections = 2;
         config.zakura.max_pending_handshakes = 1;
         let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
             Arc::new(NoopService) as Arc<dyn Service>
         })
         .await?
         .expect("v2_p2p is enabled in test config");
-        assert!(endpoint.has_native_admission_capacity());
+        assert!(endpoint.has_discovery_admission_capacity());
 
-        // Two dials to a socket that never answers hold both live slots.
+        // Three dials to a socket that never answers hold every live slot.
         let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
         let target = NodeAddr::with_addrs(
             zakura_quic::NodeSecretKey::generate().public(),
             vec![silent.local_addr()?],
         );
         let mut dials = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (quic, target) = (endpoint.quic.clone(), target.clone());
             dials.push(tokio::spawn(async move {
                 quic.connect(target, &[P2P_V2_ALPN]).await
             }));
         }
-        while endpoint.quic.connection_count() < 2 {
+        while endpoint.quic.connection_count() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         assert!(endpoint.handler.admission.available_permits() > 0);
-        assert!(!endpoint.has_native_admission_capacity());
+        assert!(!endpoint.has_discovery_admission_capacity());
         for dial in dials {
             dial.abort();
         }

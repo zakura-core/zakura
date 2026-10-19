@@ -335,6 +335,12 @@ impl QuicEndpoint {
         self.inner.shared.connections.can_dial()
     }
 
+    /// Whether discovery can reserve an address attempt while leaving one
+    /// live slot below the inbound refusal threshold (ADM-12).
+    pub fn has_discovery_capacity(&self) -> bool {
+        self.inner.shared.connections.live() < self.inner.shared.connections.discovery_limit()
+    }
+
     /// Network changes the endpoint has passed to its connections (SOCK-12).
     pub fn network_changes(&self) -> u64 {
         self.inner.shared.network_changes.load(Ordering::Relaxed)
@@ -393,6 +399,32 @@ impl QuicEndpoint {
     /// of a protocol lets a node reach peers on older versions in one
     /// handshake. An empty list fails with [`ConnectError::AlpnMismatch`].
     pub async fn connect(&self, addr: NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.max())
+            .await
+    }
+
+    /// Dials a discovery candidate without taking the dial reserve or the
+    /// last slot available to inbound connections (ADM-12).
+    ///
+    /// Like [`Self::connect`], but reserves all address attempts below this
+    /// lower ceiling before sending any packet. A ceiling of zero disables
+    /// discovery dials and returns [`ConnectError::ConnectionLimit`].
+    pub async fn connect_discovery(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+    ) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.discovery_limit())
+            .await
+    }
+
+    /// Reserves a dial's address attempts together under `limit` before any packet.
+    async fn connect_with_limit(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+        limit: usize,
+    ) -> Result<Conn, ConnectError> {
         let shared = &self.inner.shared;
         if alpns.is_empty() {
             return Err(ConnectError::AlpnMismatch);
@@ -422,18 +454,16 @@ impl QuicEndpoint {
             return Err(ConnectError::NoUsableAddress);
         }
 
-        // ADM-12: claim a live slot for every address before the first
-        // attempt. The dial then fails here, before sending any packet, or
-        // tries every address. A cap hit partway would mix this node's limit
-        // with the peer's real results, and neither could then be trusted.
-        // Partial claims drop on failure. A dial tries at most as many
-        // addresses as the table can ever hold, so `ConnectionLimit` always
-        // means the table is busy now, never that the dial can't fit.
-        targets.truncate(shared.connections.max());
-        let slots = targets
-            .iter()
-            .map(|_| shared.connections.claim_dial())
-            .collect::<Option<Vec<_>>>()
+        // ADM-12: either every address fits before the first packet, or none
+        // is tried. Bound the target set by this dial's ceiling so an idle
+        // endpoint can fit it whenever that ceiling is nonzero.
+        targets.truncate(limit);
+        if targets.is_empty() {
+            return Err(ConnectError::ConnectionLimit);
+        }
+        let slots = shared
+            .connections
+            .claim_dial_slots(targets.len(), limit)
             .ok_or(ConnectError::ConnectionLimit)?;
 
         let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
@@ -474,10 +504,8 @@ impl QuicEndpoint {
                 }
             }
         }
-        let error = best.expect(
-            "at least one attempt ran because targets was non-empty and bind refuses a zero \
-             connection cap, so truncating to it keeps at least one address",
-        );
+        let error =
+            best.expect("at least one attempt ran because the capped targets were non-empty");
         if matches!(error, ConnectError::AlpnMismatch) {
             metrics::counter!("zakura.quic.dial.alpn_mismatch").increment(1);
         }
@@ -895,6 +923,11 @@ impl ConnectionSlots {
         self.max
     }
 
+    /// The discovery ceiling leaves the dial reserve and one inbound slot free.
+    fn discovery_limit(&self) -> usize {
+        self.max_inbound.saturating_sub(1)
+    }
+
     /// Whether a dial attempt would get a slot right now.
     pub(crate) fn can_dial(&self) -> bool {
         self.live() < self.max
@@ -907,35 +940,49 @@ impl ConnectionSlots {
     }
 
     /// Claims a live slot for one dial attempt, or `None` at the cap.
+    #[cfg(test)]
     pub(crate) fn claim_dial(&self) -> Option<Arc<ConnectionSlot>> {
         self.claim(self.max)
     }
 
-    /// Claims a live slot while fewer than `limit` are held.
-    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
-        if !try_increment(&self.counts.live, limit) {
+    /// Reserves every address attempt atomically, or leaves the count unchanged.
+    fn claim_dial_slots(&self, attempts: usize, limit: usize) -> Option<Vec<Arc<ConnectionSlot>>> {
+        if !try_add(&self.counts.live, attempts, limit) {
             return None;
         }
+        Some((0..attempts).map(|_| self.new_slot()).collect())
+    }
+
+    /// Claims a live slot while fewer than `limit` are held.
+    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
+        if !try_add(&self.counts.live, 1, limit) {
+            return None;
+        }
+        Some(self.new_slot())
+    }
+
+    /// Tracks one already reserved live slot until its connection drains.
+    fn new_slot(&self) -> Arc<ConnectionSlot> {
         metrics::gauge!("zakura.quic.connections.held").increment(1.0);
-        Some(Arc::new(ConnectionSlot {
+        Arc::new(ConnectionSlot {
             counts: self.counts.clone(),
             max_closing: self.max_closing,
             closing: AtomicBool::new(false),
-        }))
+        })
     }
 }
 
-/// Adds one to `count` unless it already holds `limit`. Endpoint tasks on
-/// different sockets claim concurrently, so the check and the increment are
-/// one atomic step. A plain CAS loop: `fetch_update` is deprecated on newer
-/// toolchains and `try_update` doesn't exist on older ones.
-fn try_increment(count: &AtomicUsize, limit: usize) -> bool {
+/// Adds `additional` to `count` only if the result fits `limit`. Concurrent
+/// dials and endpoint tasks reserve their slots in one atomic step. A plain
+/// CAS loop: `fetch_update` is deprecated on newer toolchains and `try_update`
+/// doesn't exist on older ones.
+fn try_add(count: &AtomicUsize, additional: usize, limit: usize) -> bool {
     let mut held = count.load(Ordering::Acquire);
     loop {
-        if held >= limit {
+        let Some(next) = held.checked_add(additional).filter(|next| *next <= limit) else {
             return false;
-        }
-        match count.compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire) {
+        };
+        match count.compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return true,
             Err(current) => held = current,
         }
@@ -965,7 +1012,7 @@ impl ConnectionSlot {
         if self.is_closing() {
             return true;
         }
-        if !try_increment(&self.counts.closing, self.max_closing) {
+        if !try_add(&self.counts.closing, 1, self.max_closing) {
             return false;
         }
         self.closing.store(true, Ordering::Release);
@@ -997,6 +1044,59 @@ impl Drop for ConnectionSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent address batches cannot cross the discovery ceiling, and a
+    /// refused batch leaves no partial claim. Inbound and maintained dials
+    /// retain their separate capacity, and dropping every claim refunds it.
+    #[test]
+    fn concurrent_discovery_reservations_preserve_inbound_capacity() {
+        let slots = ConnectionSlots::new(8, 2, 0);
+        let barrier = std::sync::Barrier::new(9);
+        let observed = std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (slots, barrier) = (&slots, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let held = slots.claim_dial_slots(2, slots.discovery_limit());
+                    barrier.wait();
+                    barrier.wait();
+                    drop(held);
+                });
+            }
+            barrier.wait();
+            barrier.wait();
+            let live = slots.live();
+            let overflow_refused = slots.claim_dial_slots(usize::MAX, usize::MAX).is_none();
+            let inbound = [
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+            ];
+            let maintained = slots.claim_dial_slots(2, slots.max());
+            let observed = (
+                live,
+                overflow_refused,
+                inbound.iter().flatten().count(),
+                maintained.as_ref().map_or(0, Vec::len),
+                slots.live(),
+            );
+            drop((inbound, maintained));
+            // Release workers before asserting, so a regression cannot leave
+            // the test blocked at a barrier.
+            barrier.wait();
+            observed
+        });
+        // Two whole batches fit under the ceiling of five. A third
+        // batch must fail without retaining even its first slot.
+        let (discovery_slots, overflow_refused, inbound_slots, maintained_slots, full_count) =
+            observed;
+        assert_eq!(discovery_slots, 4);
+        assert!(overflow_refused);
+        assert_eq!(inbound_slots, 2);
+        assert_eq!(maintained_slots, 2);
+        assert_eq!(full_count, 8);
+        assert_eq!(slots.live(), 0);
+    }
 
     /// A dial refused at this node's own cap never reached the peer, so it
     /// isn't counted as a failed handshake (ADM-12).

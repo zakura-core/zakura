@@ -3552,31 +3552,14 @@ impl Service<ReadRequest> for ReadStateService {
                 else {
                     return Ok(ReadResponse::BlockAuthCommitment(None));
                 };
-                // Finalization can advance between the tip and tree reads. Such a context
-                // cannot authenticate this parent and must remain retryable.
-                if history
-                    .as_ref()
-                    .as_ref()
-                    .is_some_and(|tree| Some(tree.current_height()) != parent_height)
-                {
-                    return Ok(ReadResponse::BlockAuthCommitment(None));
-                }
-                let Some(history_root) = history.hash().or_else(|| {
-                    (NetworkUpgrade::Heartwood.activation_height(&state.network) == Some(height))
-                        .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
-                }) else {
-                    return Ok(ReadResponse::BlockAuthCommitment(None));
-                };
-                let expected: [u8; 32] =
-                    block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-                        &history_root,
-                        &block.auth_data_root(),
-                    )
-                    .into();
-                let delivered: [u8; 32] = *block.header.commitment_bytes;
-                Ok(ReadResponse::BlockAuthCommitment(Some(
-                    expected == delivered,
-                )))
+                Ok(ReadResponse::BlockAuthCommitment(
+                    read::block::auth_commitment_for_parent(
+                        &block,
+                        &state.network,
+                        parent_height.expect("the parent height selected this child"),
+                        &history,
+                    ),
+                ))
             }
 
             ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {

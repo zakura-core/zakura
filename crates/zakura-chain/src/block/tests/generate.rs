@@ -293,3 +293,154 @@ fn single_transaction_block_many_outputs(oversized: bool) -> Block {
 
     block
 }
+
+/// Build a funded NU5 activation block and a signature-substituted delivery with the same header.
+/// The returned prefix is checkpoint-trusted test state, with a mature transparent output.
+pub fn authorization_substitution_fixture() -> (crate::parameters::Network, Vec<Block>, Block, Block)
+{
+    use crate::{
+        amount::{Amount, MAX_MONEY},
+        block::{self, Height},
+        local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
+        parameters::{subsidy::block_subsidy, NetworkUpgrade},
+        transaction::HashType,
+    };
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["fixture".into()],
+        LocalTestnetGenesisOptions {
+            latest_network_upgrade: NetworkUpgrade::Nu5,
+            maturity_padding_blocks: 100,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let height = Height(102);
+    let network = authorization_substitution_network(&generated.blocks);
+    let funded = &generated.blocks[1].transactions[0];
+    let previous = funded.outputs()[0].clone();
+    let mut spend = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: funded.hash(),
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: (previous.value - Amount::try_from(1000).unwrap()).unwrap(),
+            lock_script: previous.lock_script.clone(),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let digest = spend
+        .sighash(
+            NetworkUpgrade::Nu5,
+            HashType::ALL,
+            Arc::new(vec![previous.clone()]),
+            Some((0, previous.lock_script.as_raw_bytes().to_vec())),
+        )
+        .unwrap();
+    let secret = secp256k1::SecretKey::from_secret_bytes(
+        hex::decode(&generated.funded_keys[0].secret_key_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut signature = secp256k1::ecdsa::sign(secp256k1::Message::from_digest(digest.0), &secret)
+        .serialize_der()
+        .to_vec();
+    signature.push(1);
+    let public = hex::decode(&generated.funded_keys[0].public_key_hex).unwrap();
+    let mut script = vec![u8::try_from(signature.len()).unwrap()];
+    script.extend(signature);
+    script.push(u8::try_from(public.len()).unwrap());
+    script.extend(public);
+    let transparent::Input::PrevOut { unlock_script, .. } = &mut spend.inputs_mut()[0] else {
+        unreachable!()
+    };
+    *unlock_script = transparent::Script::new(&script);
+    let mut coinbase = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: Vec::new(),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: block_subsidy(height, &network, Some(MAX_MONEY.try_into().unwrap())).unwrap(),
+            lock_script: transparent::Script::new(&[0]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    coinbase.outputs_mut()[0].value =
+        (coinbase.outputs()[0].value + Amount::try_from(1000).unwrap()).unwrap();
+    let mut honest = generated.blocks.last().unwrap().clone();
+    honest.transactions = vec![Arc::new(coinbase), Arc::new(spend)];
+    let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        &honest.auth_data_root(),
+    );
+    let header = Arc::make_mut(&mut honest.header);
+    header.previous_block_hash = generated.blocks.last().unwrap().hash();
+    header.time = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
+    header.difficulty_threshold = generated.blocks.last().unwrap().header.difficulty_threshold;
+    header.merkle_root = honest.transactions.iter().collect();
+    header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+    let mut bad = honest.clone();
+    let transparent::Input::PrevOut { unlock_script, .. } =
+        &mut Arc::make_mut(&mut bad.transactions[1]).inputs_mut()[0]
+    else {
+        unreachable!()
+    };
+    script[10] ^= 1;
+    *unlock_script = transparent::Script::new(&script);
+    assert_eq!(honest.transactions[1].hash(), bad.transactions[1].hash());
+    assert_eq!(honest.hash(), bad.hash());
+
+    (network, generated.blocks, honest, bad)
+}
+
+/// Restore the authorization fixture's consensus parameters from its checkpoint prefix.
+pub fn authorization_substitution_network(prefix: &[Block]) -> crate::parameters::Network {
+    use crate::{
+        block::Height,
+        parameters::testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters},
+    };
+    Parameters::build()
+        .with_genesis_hash(prefix[0].hash())
+        .unwrap()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
+            prefix
+                .iter()
+                .map(|block| (block.coinbase_height().unwrap(), block.hash()))
+                .collect(),
+        ))
+        .unwrap()
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(102),
+            sapling: Some(102),
+            blossom: Some(102),
+            heartwood: Some(102),
+            canopy: Some(102),
+            nu5: Some(102),
+            ..Default::default()
+        })
+        .unwrap()
+        .clear_funding_streams()
+        .with_slow_start_interval(Height(0))
+        .with_disable_pow(true)
+        .with_unshielded_coinbase_spends(true)
+        .with_target_difficulty_limit(prefix[0].header.difficulty_threshold.to_expanded().unwrap())
+        .unwrap()
+        .to_network()
+        .unwrap()
+}

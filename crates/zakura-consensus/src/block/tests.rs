@@ -3420,141 +3420,21 @@ async fn body_failure_attribution_requires_exact_commitment_evidence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn substituted_transparent_signature_is_replaceable() {
     use zakura_chain::chain_tip::ChainTip;
-    use zakura_chain::{local_genesis::LocalTestnetGenesisOptions, transaction::HashType};
     use zakura_header_chain::BodyVerificationClass;
     let _guard = zakura_test::init();
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        let generated = generate_local_testnet_with_funded_keys(
-            vec!["fixture".into()],
-            LocalTestnetGenesisOptions {
-                latest_network_upgrade: NetworkUpgrade::Nu5,
-                maturity_padding_blocks: 100,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let height = Height(102);
-        let network = Parameters::build()
-            .with_genesis_hash(generated.blocks[0].hash())
-            .unwrap()
-            .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
-                generated.checkpoints.clone(),
-            ))
-            .unwrap()
-            .with_activation_heights(ConfiguredActivationHeights {
-                overwinter: Some(102),
-                sapling: Some(102),
-                blossom: Some(102),
-                heartwood: Some(102),
-                canopy: Some(102),
-                nu5: Some(102),
-                ..Default::default()
-            })
-            .unwrap()
-            .clear_funding_streams()
-            .with_slow_start_interval(Height(0))
-            .with_disable_pow(true)
-            .with_unshielded_coinbase_spends(true)
-            .with_target_difficulty_limit(
-                generated.blocks[0]
-                    .header
-                    .difficulty_threshold
-                    .to_expanded()
-                    .unwrap(),
-            )
-            .unwrap()
-            .to_network()
-            .unwrap();
-        let (state, read, tip, _) = zs::init_test_services(&network).await;
-        for block in &generated.blocks {
+        let (network, prefix, honest, mut bad) =
+            zakura_chain::block::tests::generate::authorization_substitution_fixture();
+        let (state, _read, tip, _) = zs::init_test_services(&network).await;
+        for block in prefix {
             state
                 .clone()
                 .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
-                    Arc::new(block.clone()).into(),
+                    Arc::new(block).into(),
                 ))
                 .await
                 .unwrap();
         }
-        let zs::ReadResponse::ChainInfo(info) =
-            read.oneshot(zs::ReadRequest::ChainInfo).await.unwrap()
-        else {
-            panic!("chain info")
-        };
-        let funded = &generated.blocks[1].transactions[0];
-        let previous = funded.outputs()[0].clone();
-        let mut spend = Transaction::V5 {
-            network_upgrade: NetworkUpgrade::Nu5,
-            lock_time: LockTime::unlocked(),
-            expiry_height: height,
-            inputs: vec![transparent::Input::PrevOut {
-                outpoint: transparent::OutPoint {
-                    hash: funded.hash(),
-                    index: 0,
-                },
-                unlock_script: transparent::Script::new(&[]),
-                sequence: u32::MAX,
-            }],
-            outputs: vec![transparent::Output {
-                value: (previous.value - Amount::try_from(1000).unwrap()).unwrap(),
-                lock_script: previous.lock_script.clone(),
-            }],
-            sapling_shielded_data: None,
-            orchard_shielded_data: None,
-        };
-        let digest = spend
-            .sighash(
-                NetworkUpgrade::Nu5,
-                HashType::ALL,
-                Arc::new(vec![previous.clone()]),
-                Some((0, previous.lock_script.as_raw_bytes().to_vec())),
-            )
-            .unwrap();
-        let secret = secp256k1::SecretKey::from_secret_bytes(
-            hex::decode(&generated.funded_keys[0].secret_key_hex)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
-        let mut signature =
-            secp256k1::ecdsa::sign(secp256k1::Message::from_digest(digest.0), &secret)
-                .serialize_der()
-                .to_vec();
-        signature.push(1);
-        let public = hex::decode(&generated.funded_keys[0].public_key_hex).unwrap();
-        let mut script = vec![u8::try_from(signature.len()).unwrap()];
-        script.extend(signature);
-        script.push(u8::try_from(public.len()).unwrap());
-        script.extend(public);
-        let transparent::Input::PrevOut { unlock_script, .. } = &mut spend.inputs_mut()[0] else {
-            unreachable!()
-        };
-        *unlock_script = transparent::Script::new(&script);
-        let mut coinbase = v5_coinbase_transaction(NetworkUpgrade::Nu5, height, &network);
-        coinbase.outputs_mut()[0].value =
-            (coinbase.outputs()[0].value + Amount::try_from(1000).unwrap()).unwrap();
-        let mut honest = generated.blocks.last().unwrap().clone();
-        honest.transactions = vec![Arc::new(coinbase), Arc::new(spend)];
-        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
-            &honest.auth_data_root(),
-        );
-        let header = Arc::make_mut(&mut honest.header);
-        header.previous_block_hash = info.tip_hash;
-        header.time = info.cur_time.into();
-        header.difficulty_threshold = info.expected_difficulty;
-        header.merkle_root = honest.transactions.iter().collect();
-        header.commitment_bytes = <[u8; 32]>::from(commitment).into();
-        let mut bad = honest.clone();
-        let transparent::Input::PrevOut { unlock_script, .. } =
-            &mut Arc::make_mut(&mut bad.transactions[1]).inputs_mut()[0]
-        else {
-            unreachable!()
-        };
-        script[10] ^= 1;
-        *unlock_script = transparent::Script::new(&script);
-        assert_eq!(honest.transactions[1].hash(), bad.transactions[1].hash());
-        assert_eq!(honest.hash(), bad.hash());
         let transaction = Buffer::new(
             crate::transaction::Verifier::new_for_tests(&network, state.clone())
                 .map_err(|error| -> BoxError { Box::new(error) }),

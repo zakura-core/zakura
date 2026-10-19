@@ -2837,6 +2837,8 @@ mod zakura_header_sync_driver_tests {
         assert!(diagnostic.contains("diagnostic sentinel"), "{diagnostic}");
     }
 
+    include!("start/zakura/body_recovery_tests.rs");
+
     /// The router's new authorization error reaches native sync as replaceable supplier evidence.
     #[tokio::test]
     async fn block_commit_keeps_substituted_authorizations_replaceable() {

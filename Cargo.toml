@@ -119,13 +119,18 @@ ripemd = "0.1"
 ring = "0.17.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.12"
-# `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
-# it, a build that resolves a second bindgen version elsewhere (for example the
-# fresh placeholder project cargo-semver-checks generates) unifies clang-sys
-# into runtime mode while this bindgen never loads the library, and the
-# librocksdb-sys build script panics with "a `libclang` shared library is not
-# loaded on this thread".
-rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
+# Zakura's fork of rocksdb 0.24.0 (https://github.com/zakura-core/rust-rocksdb-wrapper).
+# Its only functional change compiles the bundled RocksDB C++ as a unity build,
+# 16 sources per translation unit, which more than halves the RocksDB compile.
+# The library is still named `rocksdb`, so no code changes are needed.
+#
+# `bindgen-runtime` makes zakura-librocksdb-sys's bindgen load libclang itself.
+# Without it, a build that resolves a second bindgen version elsewhere (for
+# example the fresh placeholder project cargo-semver-checks generates) unifies
+# clang-sys into runtime mode while this bindgen never loads the library, and
+# the build script panics with "a `libclang` shared library is not loaded on
+# this thread".
+rocksdb = { version = "=0.24.0", package = "zakura-rocksdb", default-features = false, features = ["bindgen-runtime"] }
 secp256k1 = "0.33"
 semver = "1.0.26"
 serde = "1.0.219"

@@ -105,7 +105,6 @@ pin-project = "1.1.10"
 proptest = { version = "1.6", default-features = false, features = ["std"] }
 proptest-derive = "0.5"
 prost = "0.14"
-rand = "0.8.5"
 rand_core = "0.6"
 rand_10 = { package = "rand", version = "0.10" }
 rand_chacha_10 = { package = "rand_chacha", version = "0.10" }

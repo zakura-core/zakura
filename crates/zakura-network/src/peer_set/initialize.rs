@@ -22,7 +22,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
     Future, TryFutureExt,
 };
-use rand::seq::SliceRandom;
+use rand_10::seq::SliceRandom;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc},
@@ -760,7 +760,7 @@ async fn limit_initial_peers(
     for better_peers in preferred_peers.values() {
         let mut better_peers = better_peers.clone();
         let (chosen_peers, _unused_peers) = better_peers.partial_shuffle(
-            &mut rand::thread_rng(),
+            &mut rand_10::rng(),
             config.peerset_initial_target_size - initial_peers.len(),
         );
 

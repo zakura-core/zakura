@@ -34,8 +34,9 @@ blake2b_simd = { workspace = true }
 bellman = { workspace = true }
 bls12_381 = { workspace = true }
 halo2 = { workspace = true }
-rand = { workspace = true }
 rand_10 = { workspace = true }
+# ed25519-zebra takes `rand_core` 0.6 RNGs.
+rand_core = { workspace = true, features = ["getrandom"] }
 rayon = { workspace = true }
 
 chrono = { workspace = true }

@@ -6,7 +6,7 @@ use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
@@ -210,7 +210,7 @@ pub fn spawn_block_sync_reactor(
     registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut retry_jitter_seed);
+    rand_10::rng().fill_bytes(&mut retry_jitter_seed);
 
     let sequencer_task = SequencerTask::new(
         sequencer,

@@ -5352,7 +5352,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     };
 
     // Create a usable signing key
-    let signing_key = ed25519::SigningKey::new(rand::thread_rng());
+    let signing_key = ed25519::SigningKey::new(rand_core::OsRng);
     let verification_key = ed25519::VerificationKey::from(&signing_key);
 
     // Populate join split data with the dummy join split.

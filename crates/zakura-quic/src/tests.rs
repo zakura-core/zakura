@@ -2402,3 +2402,71 @@ async fn discovery_handles_small_connection_limits() {
     .await
     .unwrap();
 }
+
+/// Cancelling discovery returns unused reservations and drains started
+/// attempts, both before and after the staggered second attempt starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_discovery_dials_restore_every_slot() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for started in [1, 2] {
+            let bind = QuicBindConfig {
+                max_connections: 5,
+                dial_reserve: 1,
+                max_closing_connections: 5,
+                ..loopback()
+            };
+            let config = QuicConfig {
+                dial_stagger_ms: if started == 1 { 5000 } else { 25 },
+                handshake_timeout_secs: Some(10),
+                ..test_config()
+            };
+            let node = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &config).unwrap();
+            let peer = server();
+            let retained = node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target = NodeAddr::with_addrs(
+                NodeSecretKey::generate().public(),
+                [first.local_addr().unwrap(), second.local_addr().unwrap()],
+            );
+            let quic = node.clone();
+            let dial = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+            let mut packet = [0; 65_536];
+            first.recv_from(&mut packet).await.unwrap();
+            if started == 2 {
+                second.recv_from(&mut packet).await.unwrap();
+            }
+            // Both addresses reserve slots before either sends an Initial.
+            assert_eq!(node.connection_count(), 3);
+            assert!(!node.has_discovery_capacity());
+            dial.abort();
+            assert!(dial.await.unwrap_err().is_cancelled());
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.connection_count() != 1 || node.closing_connection_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled attempts release every slot while the retained peer stays live");
+            assert!(node.has_discovery_capacity());
+            assert!(retained.stats().await.is_some());
+            if started == 1 {
+                assert!(matches!(
+                    second.try_recv_from(&mut packet),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+
+            // This dial needs both refunded slots, even though its first
+            // address answers before the second address needs to finish.
+            let replacement = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                [peer.endpoint.local_addrs()[0], second.local_addr().unwrap()],
+            );
+            let _connected = node.connect_discovery(replacement, &[ALPN]).await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}

@@ -944,6 +944,7 @@ this release tolerates, and keep each hard change explicit.
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
 | Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
+| Cancelling discovery before or after its second address attempt starts returns all slots, sends no packet to an unstarted address, and lets a subsequent whole dial reserve capacity | ADM-12, ADM-13 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
 | Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
 | Behind a relay that makes three PTOs last seconds, a draining connection leaves the live count so a new inbound peer connects, and with the allowance full it drops its state at once | ADM-13 |

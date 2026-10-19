@@ -73,8 +73,8 @@ impl EvictionFixture {
         self.reactor.retire_timed_out_requests(deadline);
     }
 
-    /// Stage one request in the receiving phase, returning its owning scope.
-    fn start_receiving(&mut self, session_id: u64) -> zakura_header_chain::HeaderWorkAuthority {
+    /// Stage one request in the receiving phase.
+    fn start_receiving(&mut self, session_id: u64) {
         seed_applying_request(
             &mut self.reactor,
             &self.snapshot,
@@ -88,13 +88,12 @@ impl EvictionFixture {
             .expect("the seeded request is active");
         active.phase = HeaderTargetPhase::Receiving;
         active.common_ancestor = None;
-        active.owner.header_authority()
     }
 
     /// Answer the active request with one usable header, completing its target.
     fn answer_with_one_header(&mut self, session_id: u64) {
         let anchor = self.snapshot.frontiers.finalized;
-        let scope = self.start_receiving(session_id);
+        self.start_receiving(session_id);
         let active = self
             .reactor
             .peer_work_queue
@@ -105,11 +104,11 @@ impl EvictionFixture {
             .pop()
             .expect("the seeded request stages exactly one entry");
         let response = Headers {
-            request_id: active.request_id.get(),
-            target_tip_hash: active.target.status.selected_tip_hash,
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
             common_ancestor_height: anchor.height,
             common_ancestor_hash: anchor.hash,
-            complete: true,
+            reaches_initial_target: true,
             tree_aux_schema: AuxSchema::None,
             entries: vec![entry],
         };
@@ -118,43 +117,10 @@ impl EvictionFixture {
             .peer_work_queue
             .set_capacity_for_test(&self.peer, 0, 1);
         self.reactor
-            .handle_headers(self.peer.clone(), session_id, scope, response);
+            .deliver_page(self.peer.clone(), session_id, response);
         // The port owns the completed target.
         // Clear the request so the next request can enter staging.
         self.reactor.clear_peer_work_for_test(&self.peer);
-    }
-
-    /// Answer the active request with the "you are already at my selected tip" reply.
-    fn answer_already_at_our_tip(&mut self, session_id: u64) {
-        let scope = self.start_receiving(session_id);
-        let active = self
-            .reactor
-            .peer_work_queue
-            .active_mut(&self.peer)
-            .expect("the receiving request is active");
-        let target = zakura_header_chain::Frontier::new(
-            active.target.status.selected_tip_height,
-            active.target.status.selected_tip_hash,
-        );
-        // The already-known reply names the target as the common ancestor.
-        // The request must include that target in its locator.
-        active.sent_locator = zakura_header_chain::HeaderLocator::for_continuation(target);
-        active.entries.clear();
-        let response = Headers {
-            request_id: active.request_id.get(),
-            target_tip_hash: target.hash,
-            common_ancestor_height: target.height,
-            common_ancestor_hash: target.hash,
-            complete: true,
-            tree_aux_schema: AuxSchema::None,
-            entries: Vec::new(),
-        };
-        let _ = active;
-        self.reactor
-            .peer_work_queue
-            .set_capacity_for_test(&self.peer, 0, 1);
-        self.reactor
-            .handle_headers(self.peer.clone(), session_id, scope, response);
     }
 
     /// Drain and return every action the reactor has emitted so far.
@@ -238,33 +204,6 @@ fn a_productive_response_resets_the_unproductive_counter() {
         "strikes that straddle a productive response must not accumulate across it"
     );
     assert_eq!(fixture.unproductive_requests(), Some(2));
-}
-
-#[test]
-fn a_peer_at_our_tip_is_not_charged_a_strike() {
-    let mut fixture = eviction_fixture(3, 7);
-
-    for _ in 0..4 {
-        fixture.answer_already_at_our_tip(7);
-        assert_eq!(
-            fixture.unproductive_requests(),
-            Some(0),
-            "answering that we already hold the selected tip is a correct answer"
-        );
-    }
-
-    assert!(
-        fixture.is_admitted() && !fixture.cancel.is_cancelled(),
-        "an honest peer at our tip is never evicted, however often it answers"
-    );
-    // Without this, the test would also pass if every reply were rejected as malformed
-    // before reaching the already-known branch — which charges no strike either.
-    let actions = fixture.drain_actions();
-    assert!(
-        actions.is_empty(),
-        "the already-known reply is accepted, so it emits neither a violation nor a drop: \
-         {actions:?}"
-    );
 }
 
 #[test]

@@ -131,6 +131,9 @@ mod tests {
     use super::*;
     use crate::{
         zakura::handler::i_open_collision_winner,
+        zakura::header_sync::v9::{
+            CommonMessage as HeaderSyncMessage, Cursor, FakePort, Operation, SubscribeHeaders,
+        },
         zakura::trace::block_sync_trace as bs_trace,
         zakura::{
             block_sync::{
@@ -138,10 +141,10 @@ mod tests {
                 ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
             },
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
-            BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
-            DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
-            HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
-            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
+            BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus, Credit,
+            DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, GetPeers, HeaderEntry,
+            HeaderSyncAction, Headers, Peer, Service, ServicePeerLimits, Status, Stream,
+            ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
             MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
             ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
             ZAKURA_STREAM_HEADER_SYNC,
@@ -172,8 +175,10 @@ mod tests {
     };
     use zakura_quic::QuicConfig;
 
+    /// Over real QUIC, a peer's Status leads to an Open, and a page that
+    /// reaches the target prepares it once and closes the subscription.
     #[tokio::test]
-    async fn protocol_v8_status_and_correlated_response_cross_real_wire() -> Result<(), BoxError> {
+    async fn protocol_v9_status_and_subscription_cross_real_wire() -> Result<(), BoxError> {
         let anchor = (block::Height(0), mainnet_genesis_hash());
         let block_one = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let target = (block::Height(1), block_one.hash());
@@ -197,38 +202,31 @@ mod tests {
         let header_sync = victim
             .header_sync()
             .expect("the real header service is enabled");
-        let codec = header_sync.codec();
         let hostile =
             HostilePeer::connect_native_with_capabilities(&victim, 71, ZAKURA_CAP_HEADER_SYNC)
                 .await?;
         let hostile_id = hostile.id()?;
 
         assert!(matches!(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                hostile.recv_header_sync_message(&codec)
-            )
-            .await
-            .map_err(|_| -> BoxError { "timed out waiting for initial v8 Status".into() })??,
+            tokio::time::timeout(Duration::from_secs(5), hostile.recv_header_sync_message())
+                .await
+                .map_err(|_| -> BoxError { "timed out waiting for initial Status".into() })??,
             HeaderSyncMessage::Status(_)
         ));
 
         hostile
-            .send_header_sync_message(
-                &codec,
-                &HeaderSyncMessage::Status(Status {
-                    work_anchor_height: anchor.0,
-                    work_anchor_hash: anchor.1,
-                    selected_tip_height: target.0,
-                    selected_tip_hash: target.1,
-                    suffix_cumulative_work: U256::from(1_u8),
-                    oldest_retained_height: anchor.0,
-                    max_headers_per_response: 16,
-                    max_inflight_requests: 1,
-                    max_message_bytes: 1_000_000,
-                    tree_aux_schema_mask: 0,
-                }),
-            )
+            .send_header_sync_message(&HeaderSyncMessage::Status(Status {
+                work_anchor_height: anchor.0,
+                work_anchor_hash: anchor.1,
+                selected_tip_height: target.0,
+                selected_tip_hash: target.1,
+                suffix_cumulative_work: U256::from(1_u8),
+                oldest_retained_height: anchor.0,
+                max_headers_per_response: 16,
+                max_subscriptions: 1,
+                max_message_bytes: 1_000_000,
+                tree_aux_schema_mask: 0,
+            }))
             .await?;
 
         let (session_id, scope) = match tokio::time::timeout(Duration::from_secs(5), actions.recv())
@@ -260,38 +258,32 @@ mod tests {
             })
             .await?;
 
-        let request = match tokio::time::timeout(
-            Duration::from_secs(5),
-            hostile.recv_header_sync_message(&codec),
-        )
-        .await
-        .map_err(|_| -> BoxError { "timed out waiting for v8 GetHeaders".into() })??
-        {
-            HeaderSyncMessage::GetHeaders(request) => request,
-            message => return Err(format!("unexpected header message: {message:?}").into()),
-        };
-        assert_ne!(request.request_id, 0);
-        assert_eq!(request.target_tip_hash, target.1);
-        assert_eq!(request.locator_hashes.first(), Some(&anchor.1));
+        let open =
+            match tokio::time::timeout(Duration::from_secs(5), hostile.recv_header_sync_message())
+                .await
+                .map_err(|_| -> BoxError { "timed out waiting for Open".into() })??
+            {
+                HeaderSyncMessage::SubscribeHeaders(open) => open,
+                message => return Err(format!("unexpected header message: {message:?}").into()),
+            };
+        assert_eq!(open.operation, Operation::Open);
+        assert_eq!(open.initial_target_tip_hash, target.1);
+        assert_eq!(open.locator_hashes.first(), Some(&anchor.1));
 
         hostile
-            .send_header_sync_message(
-                &codec,
-                &HeaderSyncMessage::Headers(Headers {
-                    request_id: request.request_id,
-                    target_tip_hash: target.1,
-                    common_ancestor_height: anchor.0,
-                    common_ancestor_hash: anchor.1,
-                    complete: true,
-                    tree_aux_schema: crate::zakura::AuxSchema::None,
-                    entries: vec![HeaderEntry {
-                        header: block_one.header.clone(),
-                        body_size: u32::try_from(block_one.zcash_serialized_size())
-                            .unwrap_or(u32::MAX),
-                        tree_aux: None,
-                    }],
-                }),
-            )
+            .send_header_sync_message(&HeaderSyncMessage::Headers(Headers {
+                subscription_id: open.subscription_id,
+                initial_target_tip_hash: target.1,
+                common_ancestor_height: anchor.0,
+                common_ancestor_hash: anchor.1,
+                reaches_initial_target: true,
+                tree_aux_schema: crate::zakura::AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: block_one.header.clone(),
+                    body_size: u32::try_from(block_one.zcash_serialized_size()).unwrap_or(u32::MAX),
+                    tree_aux: None,
+                }],
+            }))
             .await?;
 
         match tokio::time::timeout(Duration::from_secs(5), actions.recv())
@@ -322,11 +314,20 @@ mod tests {
             }
             action => return Err(format!("unexpected header action: {action:?}").into()),
         }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), hostile.recv_header_sync_message())
+                .await
+                .map_err(|_| -> BoxError { "timed out waiting for Close".into() })??,
+            HeaderSyncMessage::SubscribeHeaders(SubscribeHeaders {
+                operation: Operation::Close,
+                ..
+            })
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), actions.recv())
                 .await
                 .is_err(),
-            "one correlated response schedules exactly one preparation",
+            "one page that reaches the target schedules exactly one preparation",
         );
         assert!(victim
             .supervisor()
@@ -339,11 +340,195 @@ mod tests {
         Ok(())
     }
 
+    /// Spawn a Regtest node whose header-sync publisher serves `port`, with
+    /// its committed tip at `tip` and every body below it verified.
+    async fn spawn_header_publisher(
+        seed: u64,
+        port: Arc<FakePort>,
+        tip: zakura_header_chain::Frontier,
+    ) -> Result<(ZakuraTestNode, mpsc::Receiver<HeaderSyncAction>), BoxError> {
+        let network = Network::new_regtest(Default::default());
+        let anchor = (block::Height(0), network.genesis_hash());
+        let node = ZakuraTestNode::builder(seed)
+            .header_sync_driver(
+                network,
+                anchor,
+                FullStateFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: tip.height,
+                    verified_block_hash: anchor.1,
+                },
+                Some((tip.height, tip.hash)),
+            )
+            .header_sync_port(port)
+            .spawn()
+            .await?;
+        let actions = node
+            .take_header_sync_actions()
+            .await
+            .expect("the external header driver is enabled");
+        Ok((node, actions))
+    }
+
+    /// Wait for `node`'s next action that is not a status-driven locator
+    /// query for another target. A misbehavior or drop fails the test.
+    async fn next_header_action(
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+    ) -> Result<HeaderSyncAction, BoxError> {
+        let action = tokio::time::timeout(Duration::from_secs(20), actions.recv())
+            .await
+            .map_err(|_| -> BoxError { "timed out waiting for a header action".into() })?
+            .ok_or("header action channel closed")?;
+        if matches!(
+            action,
+            HeaderSyncAction::Misbehavior { .. } | HeaderSyncAction::DropPeer { .. }
+        ) {
+            return Err(format!("conformant sessions faulted: {action:?}").into());
+        }
+        Ok(action)
+    }
+
+    /// Answer `node`'s locator query for `target` with genesis.
+    async fn answer_locator(
+        node: &ZakuraTestNode,
+        actions: &mut mpsc::Receiver<HeaderSyncAction>,
+        target: block::Hash,
+    ) -> Result<(), BoxError> {
+        let genesis = zakura_header_chain::Frontier::new(
+            block::Height(0),
+            Network::new_regtest(Default::default()).genesis_hash(),
+        );
+        loop {
+            if let HeaderSyncAction::QueryHeaderLocator {
+                peer,
+                session_id,
+                target_tip_hash,
+                scope,
+            } = next_header_action(actions).await?
+            {
+                if target_tip_hash != target {
+                    continue;
+                }
+                node.header_sync()
+                    .expect("the header service is enabled")
+                    .send(Event::HeaderLocatorReady {
+                        peer,
+                        session_id,
+                        target_tip_hash,
+                        scope,
+                        locator: Some(zakura_header_chain::HeaderLocator::for_continuation(
+                            genesis,
+                        )),
+                    })
+                    .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    /// Two nodes subscribe to each other on one connection while A's header
+    /// validation stalls.
+    ///
+    /// A never finishes preparing, so it accepts no page and stops granting
+    /// once its staging budget is full. B's publisher must stop at A's credit
+    /// window without a fault. A's session reader must still apply B's
+    /// Grants and Close while A's own work waits: B receives A's whole chain
+    /// across several grants, and A's terminal outcome after B's Close lets
+    /// B open again.
     #[tokio::test]
-    async fn protocol_v8_hostile_frames_disconnect_with_boundary_attribution(
+    async fn header_sync_v9_subscriptions_cross_while_one_side_stalls() -> Result<(), BoxError> {
+        let a_port = FakePort::new(64);
+        let a_tip = *a_port.grow(600).last().expect("A grows a chain");
+        let b_port = FakePort::new(64);
+        let b_tip = *b_port.grow(6_000).last().expect("B grows a chain");
+        let (a, mut a_actions) = spawn_header_publisher(80, a_port, a_tip).await?;
+        let (b, mut b_actions) = spawn_header_publisher(81, b_port, b_tip).await?;
+        a.connect_native(&b, Duration::from_secs(5)).await?;
+        answer_locator(&a, &mut a_actions, b_tip.hash).await?;
+        answer_locator(&b, &mut b_actions, a_tip.hash).await?;
+
+        let HeaderSyncAction::PrepareHeaderTarget {
+            entries,
+            completion,
+            ..
+        } = next_header_action(&mut a_actions).await?
+        else {
+            return Err("A prepares the prefix its staging budget holds".into());
+        };
+        assert_eq!(
+            entries.len(),
+            usize::try_from(crate::zakura::MAX_HS_RANGE)?,
+            "A grants until its staging budget is full, across many grants"
+        );
+        assert!(matches!(
+            completion,
+            zakura_header_chain::TargetCompletion::TargetPrefix { .. }
+        ));
+
+        let HeaderSyncAction::PrepareHeaderTarget {
+            source,
+            owner,
+            target,
+            entries,
+            ..
+        } = next_header_action(&mut b_actions).await?
+        else {
+            return Err("B prepares A's whole chain".into());
+        };
+        assert_eq!(target, a_tip);
+        assert_eq!(entries.len(), 600, "A applied every Grant while stalled");
+
+        // A never answers its preparation. A page beyond A's credit would
+        // close the connection.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for (node, other) in [(&a, &b), (&b, &a)] {
+            assert!(node
+                .supervisor()
+                .registered_ids()
+                .await
+                .contains(&peer_id_of(other).await?));
+        }
+        assert!(
+            a_actions.try_recv().is_err(),
+            "A's stalled work starts nothing new"
+        );
+
+        // B's subscription closed at its target. Only A's terminal outcome
+        // lets B's next status open another.
+        b.header_sync()
+            .expect("the header service is enabled")
+            .send(Event::HeaderTargetPrepared {
+                peer: peer_id_of(&a).await?,
+                source,
+                owner,
+                result: crate::zakura::HeaderTargetPreparationResult::Failed(Arc::new(
+                    zakura_header_chain::HeaderChainError::stale_target(
+                        zakura_header_chain::ErrorSubject::Branch(owner.header_authority().branch),
+                    ),
+                )),
+            })
+            .await?;
+        answer_locator(&b, &mut b_actions, a_tip.hash).await?;
+
+        a.shutdown().await;
+        b.shutdown().await;
+        Ok(())
+    }
+
+    /// The peer ID other nodes see for `node`.
+    async fn peer_id_of(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
+        Ok(ZakuraPeerId::new(
+            node.node_addr().await.id.as_bytes().to_vec(),
+        )?)
+    }
+
+    /// Each hostile header sync frame closes only its sender's connection,
+    /// with the pipe's violation reason in the trace.
+    #[tokio::test]
+    async fn protocol_v9_hostile_frames_disconnect_with_boundary_attribution(
     ) -> Result<(), BoxError> {
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "protocol_v8_hostile_frames_disconnect",
+            "protocol_v9_hostile_frames_disconnect",
             false,
         )?;
         let anchor = (block::Height(0), mainnet_genesis_hash());
@@ -362,10 +547,6 @@ mod tests {
             )
             .spawn()
             .await?;
-        let header_sync = victim
-            .header_sync()
-            .expect("the real header service is enabled");
-        let codec = header_sync.codec();
         let mut actions = victim
             .take_header_sync_actions()
             .await
@@ -374,8 +555,26 @@ mod tests {
             HostilePeer::connect_native_with_capabilities(&victim, 73, ZAKURA_CAP_HEADER_SYNC)
                 .await?;
         let control_id = control.id()?;
+        let valid_status = Status {
+            work_anchor_height: anchor.0,
+            work_anchor_hash: anchor.1,
+            selected_tip_height: anchor.0,
+            selected_tip_hash: anchor.1,
+            suffix_cumulative_work: U256::from(1_u8),
+            oldest_retained_height: anchor.0,
+            max_headers_per_response: 16,
+            max_subscriptions: 1,
+            max_message_bytes: 1_000_000,
+            tree_aux_schema_mask: 0,
+        };
 
-        for (seed, case) in [(74, "unknown"), (75, "unsolicited"), (76, "oversize")] {
+        for (seed, case) in [
+            (74, "unknown"),
+            (75, "unsolicited"),
+            (76, "oversize"),
+            (77, "malformed"),
+            (78, "update"),
+        ] {
             let hostile = HostilePeer::connect_native_with_capabilities(
                 &victim,
                 seed,
@@ -384,6 +583,7 @@ mod tests {
             .await?;
             let hostile_id = hostile.id()?;
             match case {
+                // The frame filter rejects an unknown type before its payload.
                 "unknown" => {
                     hostile
                         .send_raw_frame(
@@ -396,25 +596,63 @@ mod tests {
                         )
                         .await?;
                 }
+                // The subscription precheck rejects a page nobody opened.
                 "unsolicited" => {
+                    let block_one = mainnet_block(&BLOCK_MAINNET_1_BYTES);
                     hostile
-                        .send_header_sync_message(
-                            &codec,
-                            &HeaderSyncMessage::Headers(Headers {
-                                request_id: 999,
-                                target_tip_hash: anchor.1,
-                                common_ancestor_height: anchor.0,
-                                common_ancestor_hash: anchor.1,
-                                complete: true,
-                                tree_aux_schema: crate::zakura::AuxSchema::None,
-                                entries: Vec::new(),
-                            }),
-                        )
+                        .send_header_sync_message(&HeaderSyncMessage::Headers(Headers {
+                            subscription_id: 999,
+                            initial_target_tip_hash: block_one.hash(),
+                            common_ancestor_height: anchor.0,
+                            common_ancestor_hash: anchor.1,
+                            reaches_initial_target: true,
+                            tree_aux_schema: crate::zakura::AuxSchema::None,
+                            entries: vec![HeaderEntry {
+                                header: block_one.header.clone(),
+                                body_size: 0,
+                                tree_aux: None,
+                            }],
+                        }))
                         .await?;
                 }
                 "oversize" => {
                     hostile
                         .oversize_frame_declared_len(ZAKURA_STREAM_HEADER_SYNC)
+                        .await?;
+                }
+                // A Status advertising two subscriptions fails decode.
+                "malformed" => {
+                    let mut frame = crate::zakura::wire_codec::encode_frame(
+                        &HeaderSyncMessage::Status(valid_status.clone()),
+                    )?;
+                    frame.payload[112] = 2;
+                    hostile
+                        .send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, frame)
+                        .await?;
+                }
+                // A Grant for no subscription breaks the publisher's rules.
+                "update" => {
+                    hostile
+                        .send_header_sync_message(&HeaderSyncMessage::SubscribeHeaders(
+                            SubscribeHeaders {
+                                operation: Operation::Grant,
+                                subscription_id: 999,
+                                update_sequence: 1,
+                                initial_target_tip_hash: anchor.1,
+                                acknowledged: Cursor {
+                                    height: anchor.0,
+                                    hash: anchor.1,
+                                    headers: 0,
+                                    bytes: 0,
+                                },
+                                locator_hashes: Vec::new(),
+                                added_credit: Credit {
+                                    objects: 1,
+                                    bytes: 0,
+                                },
+                                tree_aux_schema: crate::zakura::AuxSchema::None,
+                            },
+                        ))
                         .await?;
                 }
                 _ => unreachable!("the hostile matrix cases are fixed"),
@@ -454,22 +692,16 @@ mod tests {
         capture.flush().await;
         let trace = capture.reader()?;
         let header_rows = trace.node("72").table("header_sync");
-        header_rows.assert_row(
-            "header_peer_violation",
-            &[
-                ("boundary", TraceValue::Str("pipe")),
-                ("reason", TraceValue::Str("unknown_message_type")),
-                ("disposition", TraceValue::Str("disconnect")),
-            ],
-        );
-        header_rows.assert_row(
-            "header_peer_violation",
-            &[
-                ("boundary", TraceValue::Str("pipe")),
-                ("reason", TraceValue::Str("unsolicited_response")),
-                ("disposition", TraceValue::Str("disconnect")),
-            ],
-        );
+        for reason in ["malformed_message", "subscription_update"] {
+            header_rows.assert_row(
+                "header_peer_violation",
+                &[
+                    ("boundary", TraceValue::Str("pipe")),
+                    ("reason", TraceValue::Str(reason)),
+                    ("disposition", TraceValue::Str("disconnect")),
+                ],
+            );
+        }
         assert!(capture.finish().await?.is_none());
         Ok(())
     }
@@ -1132,8 +1364,9 @@ mod tests {
             mainnet_block(&BLOCK_MAINNET_2_BYTES),
             mainnet_block(&BLOCK_MAINNET_3_BYTES),
         ];
-        // The first response carries 3 bodies larger than the requester's
-        // stream window. Every later request is for an unavailable height.
+        // The first request asks for 3 bodies. Serving answers with one, which
+        // is larger than the requester's stream window. Every later request is
+        // for an unavailable height.
         let large = mainnet_block(&BLOCK_MAINNET_1046401_BYTES);
         let source = FixtureBlockSource::new(
             (1..=3)
@@ -1154,7 +1387,6 @@ mod tests {
                     Some((block::Height(3), blocks[2].hash())),
                 )
                 .block_sync_config(ZakuraBlockSyncConfig {
-                    max_blocks_per_response: 3,
                     max_response_bytes: RESPONSE_BYTES,
                     ..ZakuraBlockSyncConfig::default()
                 })
@@ -1216,42 +1448,78 @@ mod tests {
         .await
         .map_err(|_| -> BoxError { "serving production did not settle".into() })?;
         assert!(
-            settled <= bound && settled < usize::try_from(REQUESTS)?,
-            "an unread response stops new production: {settled} reads, bound {bound}"
+            settled < usize::try_from(REQUESTS)?,
+            "an unread response stops new production: {settled} reads"
         );
 
-        // Reading releases output, so every request completes in order.
+        // Reading releases output, so every request completes exactly once.
+        // GetBlocks writes responses as they are ready, so empty responses
+        // that finish before the large one are written ahead of it.
+        let mut early = None;
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut bodies = 0;
-            for request in 0..REQUESTS {
-                let (hashes, ending) =
-                    read_getblocks_response(&peer, version, "a bounded response").await?;
-                bodies += hashes.len();
-                let expected = if request == 0 {
+            let mut ended = vec![false; usize::try_from(REQUESTS)?];
+            let mut endings = 0;
+            while endings < REQUESTS {
+                let frame = peer
+                    .recv_ordered_frame_with_version(ZAKURA_STREAM_BLOCK_SYNC, version)
+                    .await?;
+                let request = match BlockSyncMessage::decode_frame(frame)? {
+                    BlockSyncMessage::Status(_) => continue,
+                    BlockSyncMessage::Block(_) => {
+                        early.get_or_insert(endings);
+                        bodies += 1;
+                        continue;
+                    }
                     BlockSyncMessage::BlocksDone {
                         start_height: block::Height(1),
-                        returned: 3,
+                        returned: 1,
+                    } => {
+                        assert_eq!(bodies, 1, "the large response ends after its body");
+                        0
                     }
-                } else {
                     BlockSyncMessage::RangeUnavailable {
-                        start_height: block::Height(request + 3),
+                        start_height,
                         count: 1,
-                    }
+                    } => start_height.0 - 3,
+                    message => return Err(format!("unexpected message {message:?}").into()),
                 };
-                assert_eq!(ending, expected);
+                let request = usize::try_from(request)?;
+                assert!(!std::mem::replace(&mut ended[request], true));
+                endings += 1;
             }
-            assert_eq!(bodies, 3);
+            assert_eq!(bodies, 1, "a three-block request gets a one-block prefix");
             Ok::<_, BoxError>(())
         })
         .await
         .map_err(|_| -> BoxError { "reading did not resume serving".into() })??;
+        // Only responses written ahead of the stalled body released their
+        // output before reading resumed, so the rest stayed within the bound.
+        let early = usize::try_from(early.expect("the large response has bodies"))?;
+        assert!(
+            settled - early <= bound,
+            "an unread response stops new production: {settled} reads, \
+             {early} written before the stall, bound {bound}"
+        );
         assert_eq!(reads.load(Ordering::SeqCst), usize::try_from(REQUESTS)?);
         Ok(())
     }
 
-    /// Serves the same body at every requested height, within the byte budget.
+    /// Serves the same serialized body at every requested height, within the
+    /// byte budget.
     #[derive(Debug)]
-    struct EndlessBlockSource(Arc<block::Block>);
+    struct EndlessBlockSource(Vec<u8>);
+
+    impl EndlessBlockSource {
+        /// Creates a source that serves the serialization of `block`.
+        fn new(block: &block::Block) -> Self {
+            Self(
+                block
+                    .zcash_serialize_to_vec()
+                    .expect("test block serializes"),
+            )
+        }
+    }
 
     impl crate::zakura::BlockRangeSource for EndlessBlockSource {
         fn read(
@@ -1263,7 +1531,7 @@ mod tests {
         > {
             let mut selected = Vec::new();
             if request.lease.try_start() {
-                let size = block_size(&self.0);
+                let size = u32::try_from(self.0.len()).expect("test block size fits u32");
                 let fits = request.max_body_bytes / size.max(1);
                 for offset in 0..request.count.min(fits) {
                     let height = block::Height(request.start_height.0 + offset);
@@ -1315,7 +1583,6 @@ mod tests {
             (&small, 1_u32, 64_u32),
             (&small, 1, 512),
             (&small, 1, u32::MAX),
-            (&small, 16, u32::MAX),
             (&large, 1, 64),
             (&large, 1, 512),
             (&large, 1, u32::MAX),
@@ -1331,11 +1598,7 @@ mod tests {
             let victim = cluster
                 .spawn_node_with_builder(
                     getblocks_victim(limits, None)
-                        .block_sync_config(ZakuraBlockSyncConfig {
-                            max_blocks_per_response: 16,
-                            ..ZakuraBlockSyncConfig::default()
-                        })
-                        .block_range_source(Arc::new(EndlessBlockSource((*body).clone()))),
+                        .block_range_source(Arc::new(EndlessBlockSource::new(body))),
                 )
                 .await?;
             let victim = cluster.node(victim);
@@ -1473,10 +1736,6 @@ mod tests {
         let victim = cluster
             .spawn_node_with_builder(
                 getblocks_victim(limits, Some((block::Height(3), blocks[2].hash())))
-                    .block_sync_config(ZakuraBlockSyncConfig {
-                        max_blocks_per_response: 3,
-                        ..ZakuraBlockSyncConfig::default()
-                    })
                     .block_range_source(Arc::new(FixtureBlockSource::new(served))),
             )
             .await?;
@@ -1516,15 +1775,14 @@ mod tests {
                 &format!("the response after a {burst}-Status burst"),
             )
             .await?;
-            assert_eq!(
-                hashes,
-                blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
-            );
+            // Serving advertises one block per response, so a three-block
+            // request gets a one-block prefix.
+            assert_eq!(hashes, vec![blocks[0].hash()]);
             assert_eq!(
                 ending,
                 BlockSyncMessage::BlocksDone {
                     start_height: block::Height(1),
-                    returned: 3,
+                    returned: 1,
                 }
             );
         }
@@ -1534,16 +1792,25 @@ mod tests {
     /// Serves fixed bodies at fixed heights, without checking that they match.
     #[derive(Debug)]
     struct FixtureBlockSource {
-        blocks: Vec<(block::Height, Arc<block::Block>)>,
+        blocks: Vec<(block::Height, Vec<u8>)>,
         /// Counts the reads that serving starts, after it reserves output capacity.
         reads: Arc<AtomicUsize>,
     }
 
     impl FixtureBlockSource {
-        /// Creates a source for `blocks` with a zero read count.
+        /// Creates a source serving the serialization of `blocks`, with a zero
+        /// read count.
         fn new(blocks: Vec<(block::Height, Arc<block::Block>)>) -> Self {
             Self {
-                blocks,
+                blocks: blocks
+                    .into_iter()
+                    .map(|(height, block)| {
+                        let bytes = block
+                            .zcash_serialize_to_vec()
+                            .expect("test block serializes");
+                        (height, bytes)
+                    })
+                    .collect(),
                 reads: Arc::default(),
             }
         }
@@ -1561,7 +1828,7 @@ mod tests {
             let mut selected = Vec::new();
             let mut remaining = request.max_body_bytes;
             if request.lease.try_start() {
-                for (height, block) in &self.blocks {
+                for (height, bytes) in &self.blocks {
                     let height = *height;
                     if height < request.start_height {
                         continue;
@@ -1569,12 +1836,12 @@ mod tests {
                     if selected.len() >= usize::try_from(request.count).unwrap() {
                         break;
                     }
-                    let size = block_size(block);
-                    let Some(bytes) = remaining.checked_sub(size) else {
+                    let size = u32::try_from(bytes.len()).expect("test block size fits u32");
+                    let Some(left) = remaining.checked_sub(size) else {
                         break;
                     };
-                    remaining = bytes;
-                    selected.push((height, block.clone()));
+                    remaining = left;
+                    selected.push((height, bytes.clone()));
                 }
             }
             Box::pin(async move {
@@ -1677,7 +1944,8 @@ mod tests {
         let served_blocks: Vec<_> = (1..=3)
             .map(|height| (block::Height(height), large.clone()))
             .collect();
-        let served_hashes = vec![large.hash(); served_blocks.len()];
+        // Serving answers the hostile peer's three-block request with one block.
+        let served_hashes = vec![large.hash()];
 
         let limits = ZakuraLocalLimits {
             message_rate_per_second: 64,
@@ -1686,7 +1954,6 @@ mod tests {
         };
 
         let block_sync_config = ZakuraBlockSyncConfig {
-            max_blocks_per_response: 3,
             max_inflight_block_bytes: u64::MAX,
             request_timeout: Duration::from_secs(300),
             peer_limits: ServicePeerLimits {
@@ -1755,10 +2022,12 @@ mod tests {
             .send_ordered_raw_frame_with_version(
                 ZAKURA_STREAM_BLOCK_SYNC,
                 version,
+                // Serve only height 1, so the victim's single request is the
+                // only one interleaved ahead of its unread serving response.
                 BlockSyncMessage::Status(BlockSyncStatus {
                     servable_low: block::Height(1),
-                    servable_high: block::Height(3),
-                    tip_hash: blocks[2].hash(),
+                    servable_high: block::Height(1),
+                    tip_hash: blocks[0].hash(),
                     max_blocks_per_response: 3,
                     max_inflight_requests: 1,
                     max_response_bytes: MAX_BS_RESPONSE_BYTES,
@@ -1792,7 +2061,10 @@ mod tests {
         })??;
 
         assert_eq!(start_height, block::Height(1));
-        assert_eq!(count, 3);
+        assert_eq!(
+            count, 1,
+            "the peer's three-block advertisement still gets one"
+        );
         assert!(
             submitted
                 .lock()
@@ -1810,7 +2082,7 @@ mod tests {
                 version,
                 BlockSyncMessage::GetBlocks {
                     start_height,
-                    count,
+                    count: 3,
                 }
                 .encode_frame()?,
             )
@@ -1890,7 +2162,7 @@ mod tests {
             ending,
             BlockSyncMessage::BlocksDone {
                 start_height,
-                returned: count,
+                returned: 1,
             }
         );
 
@@ -2056,7 +2328,7 @@ mod tests {
         hostile.shutdown().await;
 
         // Header sync supports one version.
-        // Reset the stream for retired version 6.
+        // Reset the stream for retired version 8.
         // Deliver the current version on the same connection.
         let victim = cluster.node(victim_idx);
         let recorder = victim.recorder();
@@ -2067,10 +2339,10 @@ mod tests {
         )
         .await?;
 
-        let retired_header_sync_v6 = b"header-sync-kind-5-version-6".to_vec();
-        let current_header_sync = b"header-sync-kind-5-version-7".to_vec();
+        let retired_header_sync_v8 = b"header-sync-kind-5-version-8".to_vec();
+        let current_header_sync = b"header-sync-kind-5-version-9".to_vec();
         hostile
-            .send_frame_with_version(ZAKURA_STREAM_HEADER_SYNC, 6, retired_header_sync_v6.clone())
+            .send_frame_with_version(ZAKURA_STREAM_HEADER_SYNC, 8, retired_header_sync_v8.clone())
             .await?;
         hostile
             .send_frame(ZAKURA_STREAM_HEADER_SYNC, current_header_sync.clone())
@@ -2087,8 +2359,8 @@ mod tests {
         assert!(
             !delivered
                 .iter()
-                .any(|m| m.frame.payload == retired_header_sync_v6),
-            "retired header-sync v6 frame must be reset before delivery, got {delivered:?}"
+                .any(|m| m.frame.payload == retired_header_sync_v8),
+            "retired header-sync v8 frame must be reset before delivery, got {delivered:?}"
         );
         assert!(
             delivered
@@ -2105,17 +2377,12 @@ mod tests {
 
     /// Builds a discovery `GetPeers` request frame on the native wire.
     fn discovery_get_peers_frame() -> Frame {
-        Frame {
-            message_type: 1,
-            flags: 0,
-            payload: DiscoveryMessage::GetPeers {
-                limit: 8,
-                wanted_services: Vec::new(),
-                exclude_node_ids: Vec::new(),
-            }
-            .encode()
-            .expect("empty GetPeers encodes"),
-        }
+        crate::zakura::wire_codec::encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
+            limit: 8,
+            wanted_services: Vec::new(),
+            exclude_node_ids: Vec::new(),
+        }))
+        .expect("empty GetPeers encodes")
     }
 
     #[tokio::test]
@@ -2210,6 +2477,53 @@ mod tests {
         Ok(())
     }
 
+    /// A peer that offers only header sync version 8 negotiates no header
+    /// sync stream, and its connection stays usable.
+    #[tokio::test]
+    async fn a_version_8_peer_negotiates_no_header_sync_and_keeps_its_connection(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut cluster = ZakuraTestCluster::new();
+        let victim_idx = cluster.spawn_node(10).await?;
+        let victim = cluster.node(victim_idx);
+        let recorder = victim.recorder();
+        // Bit 5 identified header sync version 8.
+        let v8_peer = HostilePeer::connect_native_with_capabilities(
+            victim,
+            11,
+            (1 << 5) | ZAKURA_CAP_LEGACY_GOSSIP,
+        )
+        .await?;
+
+        let header_sync = b"header-sync-version-8".to_vec();
+        v8_peer
+            .send_frame_with_version(ZAKURA_STREAM_HEADER_SYNC, 8, header_sync.clone())
+            .await?;
+        let gossip = b"gossip-after-header-sync-version-8".to_vec();
+        v8_peer
+            .send_frame(ZAKURA_STREAM_GOSSIP, gossip.clone())
+            .await?;
+        await_until(
+            "the version 8 peer's gossip is delivered",
+            Duration::from_secs(5),
+            || recorder.contains_payload(ZAKURA_STREAM_GOSSIP, &gossip),
+        )
+        .await?;
+        assert!(
+            !recorder.contains_payload(ZAKURA_STREAM_HEADER_SYNC, &header_sync),
+            "a version 8 header-sync stream must be refused before delivery"
+        );
+        assert!(victim
+            .supervisor()
+            .registered_ids()
+            .await
+            .contains(&v8_peer.id()?));
+
+        v8_peer.shutdown().await;
+        cluster.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn discovery_stream_requires_negotiated_capability_and_responds() -> Result<(), BoxError>
     {
@@ -2254,9 +2568,7 @@ mod tests {
                 discovery_peer.recv_ordered_frame(ZAKURA_STREAM_DISCOVERY),
             )
             .await??;
-            assert_eq!(frame.message_type, 1);
-            assert_eq!(frame.flags, 0);
-            match DiscoveryMessage::decode(&frame.payload)? {
+            match crate::zakura::wire_codec::decode_frame::<DiscoveryMessage>(&frame)? {
                 DiscoveryMessage::Hello { record } => {
                     assert_eq!(record.body.node_id, victim_node_id);
                     saw_hello = true;
@@ -2266,7 +2578,7 @@ mod tests {
                     saw_peers = true;
                 }
                 // The victim's own discovery source also asks us for peers.
-                DiscoveryMessage::GetPeers { .. } => {}
+                DiscoveryMessage::GetPeers(_) => {}
                 DiscoveryMessage::GetServices(_) => {}
                 other => panic!("unexpected discovery message: {other:?}"),
             }
@@ -2382,10 +2694,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_stream_uses_transport_rate_and_oversize_bounds() -> Result<(), BoxError> {
+    async fn discovery_stream_uses_transport_oversize_bound() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "discovery_stream_uses_transport_rate_and_oversize_bounds",
+            "discovery_stream_uses_transport_oversize_bound",
             false,
         )?;
         let mut limits = ZakuraLocalLimits::from_config(&Config::default());
@@ -2393,42 +2705,12 @@ mod tests {
         limits.max_pending_handshakes = 8;
         limits.max_open_streams = 16;
         limits.max_inbound_queue_depth = 256;
-        limits.message_rate_per_second = 1;
         limits.stream_open_rate_per_second = 64;
         let victim = ZakuraTestNode::builder(29)
             .limits(limits)
             .tracer(capture.tracer_for_node(29))
             .spawn()
             .await?;
-
-        let flooding =
-            HostilePeer::connect_native_with_capabilities(&victim, 30, ZAKURA_CAP_DISCOVERY)
-                .await?;
-        // The transport traces a per-kind rate violation before it disconnects the stream.
-        flooding
-            .flood_stream(ZAKURA_STREAM_DISCOVERY, 'd', 16)
-            .await?;
-        await_until(
-            "discovery throttling traced",
-            Duration::from_secs(5),
-            || {
-                capture.reader().is_ok_and(|reader| {
-                    reader
-                        .node("29")
-                        .table("ratelimit")
-                        .rows()
-                        .iter()
-                        .any(|row| {
-                            row.get("event").and_then(serde_json::Value::as_str)
-                                == Some("message.throttled")
-                                && row.get("stream_kind").and_then(serde_json::Value::as_str)
-                                    == Some("discovery")
-                        })
-                })
-            },
-        )
-        .await?;
-        flooding.shutdown().await;
 
         let oversized =
             HostilePeer::connect_native_with_capabilities(&victim, 31, ZAKURA_CAP_DISCOVERY)

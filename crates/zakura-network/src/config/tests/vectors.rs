@@ -7,7 +7,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
-        Network, NetworkUpgrade,
+        Network, NetworkKind, NetworkUpgrade,
     },
 };
 
@@ -697,7 +697,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura.block_sync]
         replace_legacy_syncer = true
-        max_blocks_per_response = 5
         status_refresh_interval = "12s"
 
         [zakura.quic]
@@ -724,7 +723,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("status_refresh_interval = \"45s\""));
     assert!(serialized.contains("[zakura.block_sync]"));
     assert!(!serialized.contains("replace_legacy_syncer"));
-    assert!(serialized.contains("max_blocks_per_response = 5"));
     assert!(serialized.contains("status_refresh_interval = \"12s\""));
     assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
     assert!(
@@ -1289,6 +1287,30 @@ fn regtest_missing_mandatory_checkpoints_returns_config_error() {
         default_config.network.checkpoint_list().max_height(),
         zakura_chain::block::Height(0)
     );
+}
+
+#[test]
+fn regtest_form_keys_are_only_accepted_directly_inside_network() {
+    let config: Config =
+        toml::from_str("network = { params = { checkpoints = false }, regtest = true }")
+            .expect("the Regtest form accepts `regtest` next to `params`");
+    assert_eq!(config.network.kind(), NetworkKind::Regtest);
+
+    for (config, field) in [
+        ("network = { params = { params = {} } }", "params"),
+        ("network = { params = { regtest = true } }", "regtest"),
+        (
+            "network = { network_name = 'ConfiguredTestnet', regtest = true }",
+            "regtest",
+        ),
+        ("network = 'Regtest'\n[testnet_parameters.params]", "params"),
+    ] {
+        let error = toml::from_str::<Config>(config).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{config:?} must reject `{field}`: {error}"
+        );
+    }
 }
 
 #[test]

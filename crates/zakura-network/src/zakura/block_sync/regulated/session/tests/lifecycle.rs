@@ -38,6 +38,8 @@ fn compact_session_lifecycle_peak() {
             let peer = ZakuraPeerId::new(vec![63; 32]).unwrap();
             let count =
                 super::super::serving_max_inflight_requests(&ZakuraBlockSyncConfig::default()) * 2;
+            // Allocated before measuring, so the check does not count against the session.
+            let mut ended = vec![false; usize::try_from(count).unwrap() + 1];
             let measurement = ProcessMeasurement::start();
             let (fixed, admitted, idle, cancelled, replacement) = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(90), async {
@@ -52,16 +54,30 @@ fn compact_session_lifecycle_peak() {
                     );
                     let fixed = measurement.snapshot();
                     for height in 1..=count {
-                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     let admitted = measurement.snapshot();
                     gate.add_permits(usize::try_from(count).unwrap());
-                    for height in 1..=count {
+                    // Ready order writes each range as its read finishes.
+                    for _ in 0..count {
+                        let super::super::super::wire::Message::End(ending) =
+                            super::super::super::tests::receive(&mut output).await
+                        else {
+                            panic!("every range is unavailable");
+                        };
                         assert!(
-                            matches!(super::super::super::tests::receive(&mut output).await,
-                            super::super::super::wire::Message::End(ending)
-                                if ending == super::super::super::wire::RangeEnding::unavailable(Height(height), 1))
+                            (1..=count).contains(&ending.start.0)
+                                && ending
+                                    == super::super::super::wire::RangeEnding::unavailable(
+                                        ending.start,
+                                        1
+                                    ),
+                            "{ending:?} was not requested"
                         );
+                        let start = usize::try_from(ending.start.0).unwrap();
+                        assert!(!std::mem::replace(&mut ended[start], true));
                     }
                     while serving.capacity.node_execution_held() != 0 {
                         tokio::task::yield_now().await;
@@ -72,7 +88,9 @@ fn compact_session_lifecycle_peak() {
                     let idle = measurement.snapshot();
                     // The first new admission drains every old completion before overlap checks.
                     for height in 1..=count {
-                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     cancel.cancel();
                     drop((session, output, cancel));
@@ -88,7 +106,9 @@ fn compact_session_lifecycle_peak() {
                         Default::default(),
                     );
                     for height in 1..=count {
-                        session.admit(Range::new(Height(height), 1).unwrap()).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     let replacement = measurement.snapshot();
                     cancel.cancel();

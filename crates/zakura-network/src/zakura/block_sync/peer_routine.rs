@@ -129,6 +129,9 @@ enum FillStop {
     /// The probe-first cap: an unproven peer's single cold-start probe is in flight,
     /// so no further request is issued until it serves (or fails) a body.
     InitialBlockProbeRequestCap,
+    /// Too many fully received requests still owe their ending
+    /// (see `MAX_PENDING_ENDINGS`).
+    PendingEndings,
 }
 
 impl FillStop {
@@ -146,6 +149,7 @@ impl FillStop {
             FillStop::SendError => "send_error",
             FillStop::NoBlockProgressRequestCap => "no_block_progress_request_cap",
             FillStop::InitialBlockProbeRequestCap => "initial_block_probe_request_cap",
+            FillStop::PendingEndings => "pending_endings",
         }
     }
 }
@@ -322,6 +326,8 @@ pub(super) struct PeerRoutine {
     /// Clamped limits last published to the registry. Request issuance uses the
     /// latest limits immediately; only publication waits for the meter.
     published_limits: (u32, u32, u32),
+    /// Whether the last slot publication showed a requester that refuses work.
+    published_requester_stopped: bool,
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -438,6 +444,7 @@ impl PeerRoutine {
             inbound_status_meter,
             status_range_bypass_available: false,
             published_limits,
+            published_requester_stopped: false,
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
@@ -644,7 +651,14 @@ impl PeerRoutine {
         }
 
         use super::regulated::live_requester::Authorization;
-        let height = match self.requester.authorize(&frame)? {
+        let was_stopped = self.requester_stop().is_some();
+        let authorization = self.requester.authorize(&frame)?;
+        // A last body or an ending can close or open the requester. Other
+        // routines must re-rank the floor now, not at this window's next change.
+        if self.requester_stop().is_some() != was_stopped {
+            self.publish_slot_diagnostics();
+        }
+        let height = match authorization {
             Authorization::Block(height) => height,
             Authorization::Status(status) => {
                 self.trace_message_received("status");
@@ -814,6 +828,12 @@ impl PeerRoutine {
             self.max_response_bytes,
             self.window.max_inflight_requests,
         ) = limits;
+        // Publish a stop before the rate limiter, so no routine keeps deferring
+        // the floor to this peer. A reopen waits for a rate-limited publication,
+        // so a Status flood cannot toggle the shared ranking on every frame.
+        if self.requester_stop().is_some() && !self.published_requester_stopped {
+            self.publish_slot_diagnostics();
+        }
         let limits_changed = limits != self.published_limits;
         if self.inbound_status_meter.try_take(now) {
             self.status_range_bypass_available = true;
@@ -829,6 +849,9 @@ impl PeerRoutine {
             return;
         }
         self.pending_status = None;
+        if self.requester_stop().is_some() != self.published_requester_stopped {
+            self.publish_slot_diagnostics();
+        }
         // Replies have their own allowance. The reactor also retries any local
         // status that has not entered this peer's outbound queue.
         let send_reply = self.status_reply_meter.try_take(now);
@@ -1002,12 +1025,8 @@ impl PeerRoutine {
                 break FillStop::CwndSaturated;
             }
             self.request_pool_waiting = false;
-            // Count unanswered exchanges, including scheduler-abandoned work.
-            // The peer's u32 advertised limit fits usize on supported targets.
-            if self.requester.at_capacity()
-                || self.requester.len() >= self.window.max_inflight_requests as usize
-            {
-                break FillStop::CwndSaturated;
+            if let Some(stop) = self.requester_stop() {
+                break stop;
             }
             let Some(entry) = self.requester.pool.try_entry() else {
                 self.request_pool_waiting = true;
@@ -2443,17 +2462,39 @@ impl PeerRoutine {
             .remove_outstanding_for_owner(&self.peer, self.generation, owner, [height]);
     }
 
+    /// Why the live requester refuses another request, whatever the window allows.
+    fn requester_stop(&self) -> Option<FillStop> {
+        let occupancy = self.requester.occupancy();
+        // Count unanswered exchanges, including scheduler-abandoned work.
+        // The peer's u32 advertised limit fits usize on supported targets.
+        if occupancy.at_capacity || occupancy.len >= self.window.max_inflight_requests as usize {
+            return Some(FillStop::CwndSaturated);
+        }
+        if occupancy.pending_endings >= super::regulated::live_requester::MAX_PENDING_ENDINGS {
+            return Some(FillStop::PendingEndings);
+        }
+        None
+    }
+
     /// Publish the window diagnostics for the reactor's periodic trace row and
-    /// for other routines' cross-peer floor-bias decisions.
-    fn publish_slot_diagnostics(&self) {
+    /// for other routines' cross-peer floor-bias decisions. A routine whose
+    /// requester refuses new requests publishes no free slots, so no other
+    /// routine defers the floor to it.
+    fn publish_slot_diagnostics(&mut self) {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
+        self.published_requester_stopped = self.requester_stop().is_some();
+        let available_slots = if self.published_requester_stopped {
+            0
+        } else {
+            self.window.available_slots()
+        };
         self.registry.publish_slots(
             &self.peer,
             self.generation,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
-                available_slots: self.window.available_slots(),
+                available_slots,
                 outstanding_requests: self.window.outstanding.len(),
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
@@ -2466,8 +2507,9 @@ impl PeerRoutine {
     // ===================== misbehavior (shared count via registry) ==========
 
     async fn report_misbehavior(&self, reason: BlockSyncMisbehavior) {
-        // Misbehavior is record-only: observe and forward it, but never cancel the
-        // session. Peer scoring no longer drives disconnects.
+        // This path only records misbehavior: observe and forward it, but never
+        // cancel the session. Only a proven tampered body, reported by the
+        // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).
         metrics::counter!("sync.block.peer.violation").increment(1);
         // `Misbehavior` is best-effort: never block the routine. The reactor owns
         // action dispatch so attacker-triggered reports cannot bypass its reserved
@@ -2569,10 +2611,10 @@ mod tests {
     use super::super::sequencer_task::initial_view;
     use super::super::source::EmptyBlockRangeSource;
     use super::super::state::{ByteBudget, ThroughputMeter};
+    use super::super::tests::genesis_frontiers;
     use super::super::work_queue::WorkQueue;
     use super::super::{
-        BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
-        ZakuraBlockSyncConfig,
+        BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig,
     };
     use super::PeerRoutine;
     use super::RoutineToReactor;
@@ -2654,11 +2696,7 @@ mod tests {
         let work = Arc::new(WorkQueue::new(block::Height(0)));
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) =
             test_authorization(&session, &in_recv, &config, pool, connection);
         let routine = PeerRoutine::new(
@@ -3217,11 +3255,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3327,11 +3361,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -3475,11 +3505,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3742,11 +3768,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3932,11 +3954,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -4256,11 +4274,7 @@ mod tests {
             }
         }
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause.clone());
         let (requester, serving) = test_authorization(
             &session,
@@ -4528,11 +4542,7 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
         let (reactor_input, mut reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause);
         let (requester, serving) = test_authorization(
             &session,

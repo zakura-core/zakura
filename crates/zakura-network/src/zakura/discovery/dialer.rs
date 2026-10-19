@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
 
 use super::{native_dial_supervised, RedialPolicy};
@@ -39,7 +40,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     for node_addr in node_addrs {
         let endpoint = endpoint.clone();
         let limits = limits.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(spawn_erased(async move {
             native_dial_supervised(endpoint, node_addr, limits, policy).await
         }));
     }

@@ -139,8 +139,8 @@ sequencer channel and appears in the next resident snapshot.
 window top, so a single multi-block request can never carry both exempt in-window blocks
 and gated above-window blocks — every above-window height must pass the resident check
 in the gated arm. A contiguous run straddling the boundary becomes two requests (the
-above-window half is planned on the next fill iteration with headroom sizing). At the
-production default of one block per response this split never occurs.
+above-window half is planned on the next fill iteration with headroom sizing). Requests
+carry one block, so this split never occurs in practice.
 
 ## The memory budget
 
@@ -203,7 +203,10 @@ not by budget size. Zero config values are rejected.
 Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
 process overhead and bounded transients. At the default 401-block submission window and
 a chain that decodes at about four times its wire size, the decoded contribution is
-approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. The peer
+approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. Above the
+last checkpoint the window is also capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`
+(512 MiB) of decoded blocks: past the cap, bodies stay raw until earlier submissions finish,
+and the next body is always allowed when none of the window's bodies is submitted. The peer
 routine rejects a body whose transactions do not match its header's Merkle root, so the
 decoded window holds the real chain's blocks; a chain that decodes larger is charged its
 measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)
@@ -258,7 +261,7 @@ borrowed a bypass slot.
 | --- | --- | --- |
 | `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
 | `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
-| `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
+| `max_blocks_per_response` | 1 (fixed) | deprecated and ignored; requests always carry one block, and serving answers a larger request with a one-block prefix |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |
 | `max_submitted_block_applies` | 401 | sequencer submit window (floored at one checkpoint range; no ceiling — which is why the exemption span is a constant) |
@@ -270,9 +273,6 @@ borrowed a bypass slot.
   block at about 26×. Admission therefore charges the larger of the factor's estimate and
   the measured decoded heap. The factor remains a floor so the gate never loosens on
   typical blocks. `estimated_resident_pipeline_bytes` is the single calibration point.
-- **Window-boundary split.** With `max_blocks_per_response > 1`, a run straddling the
-  commit window costs one extra request per crossing (the price of the never-span
-  rule). Irrelevant at the default of 1.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its
   count is not); the channel is bounded by the submit window (401 by default), which is
   noise against the 262,144 default cap.

@@ -5,6 +5,10 @@
 //! the database is still reading blocks for that request. These reads move the
 //! reservation into the blocking job, then return it alongside the blocks.
 //!
+//! Blocks are returned as their serialized bytes. Finalized blocks are copied
+//! from their stored bytes without being decoded, so the retained memory equals
+//! the serialized size.
+//!
 //! The generic resource type lets callers supply their own reservations without
 //! making the state service depend on network serving policy.
 
@@ -13,7 +17,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use tower::ServiceExt;
 use tracing::Span;
-use zakura_chain::{block, diagnostic::CodeTimer};
+use zakura_chain::{block, diagnostic::CodeTimer, serialization::ZcashSerialize};
 
 use super::{finalized_state::ZakuraDb, non_finalized_state::Chain, read, ReadStateService};
 use crate::{request::TimedSpan, BoxError, ReadRequest};
@@ -35,9 +39,48 @@ impl BlockRangeSnapshot {
         }
         read::block_and_size(self.chain.clone(), db, height.into())
     }
+
+    /// Returns the serialized block at `height` on this branch, or `None` if it
+    /// is unavailable or longer than `max_bytes`.
+    ///
+    /// Both stores record each block's serialized size, so a block that cannot
+    /// fit is rejected before it is read or serialized. Finalized blocks are
+    /// copied from their stored bytes and are never decoded. Non-finalized
+    /// blocks exist only decoded in memory, so each is serialized once, and
+    /// that serialization is both checked and returned.
+    pub(super) fn serialized_block_within(
+        &self,
+        db: &ZakuraDb,
+        height: block::Height,
+        max_bytes: usize,
+    ) -> Option<Vec<u8>> {
+        if height > self.tip? {
+            return None;
+        }
+        // The in-memory chain only holds heights above the finalized tip, so
+        // this lookup order matches `read::block_and_size`.
+        if let Some(chain) = self.chain.as_ref() {
+            if let Some(contextual) = chain.block(height.into()) {
+                // The chain records each block's serialized size, so a block that
+                // cannot fit is skipped before it is serialized.
+                if chain.block_info(height.into()).is_some_and(|info| {
+                    usize::try_from(info.size()).is_ok_and(|size| size > max_bytes)
+                }) {
+                    return None;
+                }
+                let bytes = contextual
+                    .block
+                    .zcash_serialize_to_vec()
+                    .expect("a committed block serializes because writing to a Vec is infallible");
+                return (bytes.len() <= max_bytes).then_some(bytes);
+            }
+        }
+        db.raw_block_bytes_within(height.into(), max_bytes)
+    }
 }
 
-/// A bounded block prefix together with the caller's resource reservations.
+/// A bounded prefix of serialized blocks together with the caller's resource
+/// reservations.
 ///
 /// The blocking read transfers its resources into this result. Dropping the
 /// async caller cannot release them while that read is running. Dropping an
@@ -45,16 +88,16 @@ impl BlockRangeSnapshot {
 #[derive(Debug)]
 pub struct OwnedBlockRange<R> {
     // Field order keeps resources alive while the retained blocks are dropped.
-    blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    blocks: Vec<(block::Height, Vec<u8>)>,
     resources: R,
 }
 
 impl<R> OwnedBlockRange<R> {
-    /// Transfer the blocks and their resources to the next owner.
+    /// Transfer the serialized blocks and their resources to the next owner.
     ///
     /// The caller must retain the resources for as long as its resource policy
     /// requires, including while it holds or processes the returned blocks.
-    pub fn into_parts(self) -> (Vec<(block::Height, Arc<block::Block>, usize)>, R) {
+    pub fn into_parts(self) -> (Vec<(block::Height, Vec<u8>)>, R) {
         (self.blocks, self.resources)
     }
 }
@@ -102,11 +145,16 @@ impl ReadStateService {
         })
     }
 
-    /// Read a bounded contiguous prefix while the database job owns `resources`.
+    /// Read a bounded contiguous prefix of serialized blocks while the database
+    /// job owns `resources`.
     ///
     /// This uses the same readiness checks, chain snapshot, and missing-block
     /// behavior as [`ReadRequest::BlocksByHeightRange`], with an additional byte
-    /// cap. One blocking job transfers its resources into the returned result.
+    /// cap. Each block's size is checked against the remaining cap before it is
+    /// copied, and the prefix ends at the first block that does not fit. See
+    /// [`BlockRangeSnapshot::serialized_block_within`] for how finalized and
+    /// non-finalized blocks are read. One blocking job transfers its resources
+    /// into the returned result.
     ///
     /// `is_cancelled` is checked before the first lookup and between lookups.
     /// Cancellation stops further lookups and returns the prefix already read.
@@ -132,7 +180,9 @@ impl ReadStateService {
             is_cancelled,
             move || {
                 let snapshot = state.block_range_snapshot()?;
-                Ok(move |height| snapshot.block_and_size(&state.db, height))
+                Ok(move |height, remaining| {
+                    snapshot.serialized_block_within(&state.db, height, remaining)
+                })
             },
         )
         .await
@@ -155,7 +205,7 @@ fn spawn_owned_block_range<R, G>(
 ) -> BoxFuture<'static, Result<OwnedBlockRange<R>, BoxError>>
 where
     R: Send + 'static,
-    G: FnMut(block::Height) -> Option<(Arc<block::Block>, usize)>,
+    G: FnMut(block::Height, usize) -> Option<Vec<u8>>,
 {
     let timed_span = TimedSpan::new(
         CodeTimer::start_desc("blocks_by_height_range"),
@@ -169,13 +219,18 @@ where
             });
         }
         let mut get_block = prepare_read()?;
-        let blocks = collect_bounded_height_range(start, count, max_response_bytes, |height| {
-            if is_cancelled(&resources) {
-                None
-            } else {
-                get_block(height)
-            }
-        });
+        let blocks =
+            collect_bounded_height_range(start, count, max_response_bytes, |height, remaining| {
+                if is_cancelled(&resources) {
+                    return None;
+                }
+                let bytes = get_block(height, remaining)?;
+                let size = bytes.len();
+                Some((bytes, size))
+            })
+            .into_iter()
+            .map(|(height, bytes, _)| (height, bytes))
+            .collect();
         Ok(OwnedBlockRange { blocks, resources })
     })
 }
@@ -183,25 +238,23 @@ where
 /// Read a contiguous prefix without retaining more encoded block bytes than
 /// the caller permits.
 ///
-/// The first block that does not fit can be materialized by the lookup, but is
-/// dropped immediately and never enters the returned response.
+/// Each lookup receives the remaining byte budget and should return `None`,
+/// without materializing the block, when that block does not fit. A lookup
+/// that returns an oversized block anyway still ends the prefix, and that
+/// block never enters the returned response.
 fn collect_bounded_height_range<T>(
     start: block::Height,
     count: u32,
     max_response_bytes: u32,
-    mut get_block: impl FnMut(block::Height) -> Option<(T, usize)>,
+    mut get_block: impl FnMut(block::Height, usize) -> Option<(T, usize)>,
 ) -> Vec<(block::Height, T, usize)> {
-    let mut response_bytes = 0u64;
+    let mut remaining =
+        usize::try_from(max_response_bytes).expect("u32 fits usize on supported targets");
     (0..count)
         .map_while(|offset| {
             let height = start.0.checked_add(offset).map(block::Height)?;
-            let (block, size) = get_block(height)?;
-            let size_u64 = u64::try_from(size).ok()?;
-            let next_response_bytes = response_bytes.checked_add(size_u64)?;
-            if next_response_bytes > u64::from(max_response_bytes) {
-                return None;
-            }
-            response_bytes = next_response_bytes;
+            let (block, size) = get_block(height, remaining)?;
+            remaining = remaining.checked_sub(size)?;
             Some((height, block, size))
         })
         .collect()

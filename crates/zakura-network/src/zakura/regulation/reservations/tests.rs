@@ -4,7 +4,7 @@
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Barrier,
     },
     task::{Context, Wake, Waker},
@@ -59,6 +59,67 @@ fn a_response_claims_its_frames_then_its_ending() {
     );
     assert!(map.is_empty());
     assert_eq!(pool.held(), 0, "the ending frees the pool entry");
+}
+
+/// Counts `zakura.p2p.reservation.refused` increments.
+#[derive(Default)]
+struct RefusedRecorder(Arc<AtomicU64>);
+
+impl metrics::Recorder for RefusedRecorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == "zakura.p2p.reservation.refused" {
+            metrics::Counter::from_arc(self.0.clone())
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A claim that succeeds leaves the refused counter unchanged.
+#[test]
+fn only_a_refused_claim_counts_as_refused() {
+    let recorder = RefusedRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let pool = pool(4);
+    let mut map = reservations(&pool, &[1]);
+    map.claim_frame(&1, message_type::PART, 65)
+        .expect("the part answers the live reservation");
+    map.claim_end(&1, message_type::DONE, 4)
+        .expect("the ending answers the live reservation");
+    assert_eq!(recorder.0.load(Ordering::Relaxed), 0);
+    assert!(map.claim_end(&1, message_type::DONE, 4).is_err());
+    assert_eq!(recorder.0.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -317,10 +378,10 @@ fn queued_frames_never_exceed_what_the_live_reservations_owe() {
 
     // The handler takes and claims key 1's response; key 2's stays queued.
     for (message_type, len) in [(message_type::PART, 65), (message_type::PART, 65)] {
-        map.take_admitted(len);
+        map.take_admitted(message_type, len);
         map.claim_frame(&1, message_type, len).unwrap();
     }
-    map.take_admitted(4);
+    map.take_admitted(message_type::DONE, 4);
     map.claim_end(&1, message_type::DONE, 4).unwrap();
     assert_eq!(map.admit(message_type::DONE, 4), over_owed(3, 134));
 
@@ -336,6 +397,41 @@ fn queued_frames_never_exceed_what_the_live_reservations_owe() {
     let entry = pool.try_entry().unwrap();
     map.reserve(5, message_type::GET, CAP, entry).unwrap();
     assert_eq!(map.admit(message_type::DONE, 4), Ok(()));
+}
+
+/// With a `Get` and a `Ping` live, a second `Pong` cannot queue on the debt
+/// of the `Get`'s response, and the `Get`'s response still queues in full.
+#[test]
+fn one_request_type_never_admits_answers_owed_to_another() {
+    let pool = pool(4);
+    let mut map = reservations(&pool, &[1]);
+    let pong = ResponseCap {
+        frames: 0,
+        bytes: 4,
+    };
+    map.reserve(2, message_type::PING, pong, pool.try_entry().unwrap())
+        .unwrap();
+
+    assert_eq!(map.admit(message_type::PONG, 4), Ok(()));
+    assert_eq!(
+        map.admit(message_type::PONG, 4),
+        Err(ClaimRefused::OverOwed {
+            frames: 1,
+            bytes: 4
+        })
+    );
+    for (message_type, len) in [
+        (message_type::PART, 65),
+        (message_type::PART, 65),
+        (message_type::DONE, 4),
+    ] {
+        assert_eq!(map.admit(message_type, len), Ok(()));
+    }
+
+    // Taking the `Pong` frees only the `Ping`'s debt.
+    map.take_admitted(message_type::PONG, 4);
+    assert_eq!(map.admit(message_type::PONG, 4), Ok(()));
+    assert!(map.admit(message_type::DONE, 4).is_err());
 }
 
 #[test]

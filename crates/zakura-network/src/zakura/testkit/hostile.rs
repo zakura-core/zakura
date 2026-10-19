@@ -1,21 +1,25 @@
 //! Raw peer harness for adversarial Zakura tests.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tokio::sync::Mutex;
 use zakura_quic::{Conn as Connection, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt};
 
 use super::{LocalEndpointFactory, ZakuraTestNode};
+#[cfg(test)]
+use crate::zakura::{
+    header_sync::v9::CommonMessage,
+    wire_codec::{decode_frame, encode_frame},
+};
 use crate::{
     zakura::{
-        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
-        HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
-        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
+        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame, StreamPrelude,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
+        LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
@@ -92,23 +96,21 @@ impl HostilePeer {
         )?)
     }
 
-    /// Encode and send one canonical protocol-v8 header-sync message.
-    pub async fn send_header_sync_message(
+    /// Encode and send one Mainnet header-sync version 9 message.
+    #[cfg(test)]
+    pub(crate) async fn send_header_sync_message(
         &self,
-        codec: &HeaderSyncCodec,
-        message: &HeaderSyncMessage,
+        message: &CommonMessage,
     ) -> Result<(), BoxError> {
-        let frame = codec.encode_frame(message)?;
+        let frame = encode_frame(message)?;
         self.send_raw_frame(ZAKURA_STREAM_HEADER_SYNC, frame).await
     }
 
-    /// Receive and decode one canonical protocol-v8 header-sync message.
-    pub async fn recv_header_sync_message(
-        &self,
-        codec: &HeaderSyncCodec,
-    ) -> Result<HeaderSyncMessage, BoxError> {
+    /// Receive and decode one Mainnet header-sync version 9 message.
+    #[cfg(test)]
+    pub(crate) async fn recv_header_sync_message(&self) -> Result<CommonMessage, BoxError> {
         let frame = self.recv_ordered_frame(ZAKURA_STREAM_HEADER_SYNC).await?;
-        Ok(codec.decode_frame(frame, None)?)
+        Ok(decode_frame(&frame)?)
     }
 
     /// Wait until the victim closes this QUIC connection.
@@ -363,6 +365,29 @@ impl HostilePeer {
         prelude
             .request_id
             .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        self.held_streams.push(send);
+        Ok(())
+    }
+
+    /// Accept the next request stream, send the frames built from its request id
+    /// `gap` apart, and keep the response side open without finishing it.
+    pub async fn trickle_next_request_without_finishing(
+        &mut self,
+        gap: Duration,
+        build_frames: impl FnOnce(u64) -> Vec<Frame>,
+    ) -> Result<(), BoxError> {
+        let (mut send, mut recv) = self.connection.accept_bi().await?;
+        let prelude = Self::read_prelude(&mut recv).await?;
+        let request_id = prelude
+            .request_id
+            .ok_or_else(|| BoxError::from("request stream did not include a request id"))?;
+        for (index, frame) in build_frames(request_id).into_iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(gap).await;
+            }
+            send.write_all(&frame.encode(self.limits.max_frame_bytes)?)
+                .await?;
+        }
         self.held_streams.push(send);
         Ok(())
     }

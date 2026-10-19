@@ -71,15 +71,6 @@ impl PeerStreamSession {
         try_send_frame(&self.send, frame)
     }
 
-    /// Encode and try to queue a frame without awaiting capacity.
-    pub fn try_send_encoded(
-        &self,
-        encode: impl FnOnce() -> Result<Frame, BoxError>,
-    ) -> Result<(), OrderedSendError> {
-        let frame = encode().map_err(OrderedSendError::Encode)?;
-        self.try_send_frame(frame)
-    }
-
     /// Split into fields for service-specific session workers.
     pub fn into_parts(
         self,

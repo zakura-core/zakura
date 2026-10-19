@@ -1,6 +1,8 @@
+use super::super::regulated::live_requester::MAX_PENDING_ENDINGS;
 use super::super::{request::BlockSizeEstimate, MSG_BS_BLOCK};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
+use crate::zakura::{CwndUnit, MAX_BS_BLOCKS_PER_REQUEST};
 use zakura_chain::serialization::ZcashDeserializeInto;
 
 /// The routine, its outbound frames, its pool, its connection and its reports to the reactor.
@@ -183,25 +185,8 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 3;
-    routine.max_blocks_per_response = 3;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [
-            (
-                block::Height(2),
-                block::Hash([2; 32]),
-                BlockSizeEstimate::Confirmed(1000),
-            ),
-            (
-                block::Height(3),
-                block::Hash([3; 32]),
-                BlockSizeEstimate::Confirmed(1000),
-            ),
-        ],
-    );
     routine.try_fill().await;
-    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 3);
+    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 1);
     next_sent(&mut outbound).await;
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let mut payload = vec![MSG_BS_BLOCK];
@@ -239,15 +224,6 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         block::Hash([1; 32]),
         Instant::now()
     ));
-    for byte in [2, 3] {
-        assert!(work.pending_contains(block::Height(u32::from(byte))));
-        assert!(registry.is_body_retry_avoided(
-            &peer,
-            super::super::test_work_scope(),
-            block::Hash([byte; 32]),
-            Instant::now()
-        ));
-    }
     assert!(!registry.is_body_retry_avoided(
         &peer,
         super::super::test_work_scope(),
@@ -258,7 +234,7 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
     assert!(!registry.is_body_retry_avoided(
         &other_peer,
         super::super::test_work_scope(),
-        block::Hash([2; 32]),
+        block::Hash([1; 32]),
         Instant::now()
     ));
 }
@@ -461,46 +437,6 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
 }
 
 #[tokio::test]
-async fn a_partial_ending_requeues_only_the_missing_suffix() {
-    let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
-    let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
-    let (mut routine, mut outbound, pool, connection, _) = requester_routine(first.hash());
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            second.hash(),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    let (sender, mut bodies) = mpsc::channel(2);
-    routine.sequencer_input = sender;
-    routine.try_fill().await;
-    let sent = next_sent(&mut outbound).await;
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(sent).unwrap(),
-        BlockSyncMessage::GetBlocks { count: 2, .. }
-    ));
-    deliver(&mut routine, BlockSyncMessage::Block(first)).await;
-    assert!(bodies.try_recv().is_ok());
-    deliver(
-        &mut routine,
-        BlockSyncMessage::BlocksDone {
-            start_height: block::Height(1),
-            returned: 1,
-        },
-    )
-    .await;
-    assert!(!routine.work.pending_contains(block::Height(1)));
-    assert!(routine.work.pending_contains(block::Height(2)));
-    assert_eq!(pool.held(), 0);
-    drop(routine);
-    assert!(!connection.is_cancelled());
-}
-
-#[tokio::test]
 async fn local_session_share_leaves_entries_for_another_requester() {
     use super::super::regulated::live_requester::SESSION_RESERVATIONS;
 
@@ -607,7 +543,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         next_sent(&mut outbound).await;
         deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
-        assert!(!routine.requester.at_capacity());
+        assert!(!routine.requester.occupancy().at_capacity);
         peers.push((routine, outbound, connection));
     }
     assert!(
@@ -680,71 +616,6 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
         .await
         .unwrap();
     assert_eq!(pool.held(), 0);
-    assert!(!connection.is_cancelled());
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_live_partially_returned_range_waits_without_retry_spin() {
-    let (mut routine, mut outbound, _, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            block::Hash([2; 32]),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    routine.try_fill().await;
-    outbound.recv().await.unwrap();
-    assert_eq!(routine.window.outstanding.len(), 1);
-    let owner = routine.window.outstanding.first().unwrap().request.owner;
-    // A central scheduler may return one height while this request still owns
-    // the rest. Its wire authorization is live and has not begun retirement.
-    let returned = routine.work.revoke_for_owner(owner, [block::Height(1)]);
-    routine.budget.release(returned.released_bytes);
-    assert_eq!(returned.returned_count, 1);
-    assert!(routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
-    assert_eq!(
-        routine
-            .requester
-            .retirement_deadline(routine.config.effective_liveness_timeout()),
-        None
-    );
-    // Keep the connection eligible for another request. Without prior progress,
-    // the initial probe limit masks the retry loop before it touches the queue.
-    routine.window.note_block_progress(
-        time::Instant::now().into_std(),
-        routine.config.effective_liveness_timeout(),
-    );
-    assert_eq!(routine.try_fill().await, None);
-    assert!(routine.work.pending_contains(block::Height(1)));
-    // The request keeps its slot but stops advertising the revoked height.
-    assert!(!routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(1)));
-    assert!(routine
-        .registry
-        .peer_has_outstanding_height(&routine.peer, block::Height(2)));
-    let before = routine.work.taken_items_for_test();
-    let (_input, recv) = crate::zakura::framed_channel(4);
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
-    let mut guard = block_sync_guard();
-    let mut running = Box::pin(routine.run_inner(&mut guard));
-    for _ in 0..100 {
-        assert!(futures::poll!(&mut running).is_pending());
-        // Let zero-duration sleeps actually fire. Pure synchronous polling cannot
-        // distinguish a timer-driven spin from a legitimately parked future.
-        time::advance(Duration::from_millis(1)).await;
-    }
-    drop(running);
-    assert!(routine.work.taken_items_for_test() - before <= 2);
-    assert_eq!(routine.window.outstanding.len(), 1);
     assert!(!connection.is_cancelled());
 }
 
@@ -957,45 +828,6 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
     assert!(connection.is_cancelled());
 }
 
-/// `RangeUnavailable` may name fewer heights than requested. The requester still
-/// returns every unreceived height, because no prefix arrived.
-#[tokio::test]
-async fn a_shortened_unavailable_requeues_the_whole_original_range() {
-    let (mut routine, mut outbound, pool, connection, mut events) =
-        requester_routine(block::Hash([1; 32]));
-    routine.config.max_blocks_per_response = 2;
-    routine.max_blocks_per_response = 2;
-    routine.work.extend(
-        super::super::test_work_scope(),
-        [(
-            block::Height(2),
-            block::Hash([2; 32]),
-            BlockSizeEstimate::Confirmed(1000),
-        )],
-    );
-    routine.try_fill().await;
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
-        BlockSyncMessage::GetBlocks { count: 2, .. }
-    ));
-    while events.try_recv().is_ok() {}
-    deliver(
-        &mut routine,
-        BlockSyncMessage::RangeUnavailable {
-            start_height: block::Height(1),
-            count: 1,
-        },
-    )
-    .await;
-    assert!(routine.work.pending_contains(block::Height(1)));
-    assert!(routine.work.pending_contains(block::Height(2)));
-    assert_eq!(pool.held(), 0);
-    assert!(!std::iter::from_fn(|| events.try_recv().ok())
-        .any(|event| matches!(event, RoutineToReactor::Misbehavior { .. })));
-    drop(routine);
-    assert!(!connection.is_cancelled());
-}
-
 /// A body is refused before it claims anything when no live range expects it,
 /// or when it exceeds the response's advertised body bytes.
 #[tokio::test]
@@ -1091,4 +923,538 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     assert!(matches!(error, SinkReject::Protocol(_)), "{error:?}");
     assert!(error.to_string().contains("coinbase height"));
     assert!(received.try_recv().is_err());
+}
+
+/// Our requester asks for one block per `GetBlocks`, whatever an old config or the
+/// peer advertises, and keeps several of those requests outstanding at once.
+#[tokio::test]
+async fn requests_stay_single_block_for_any_advertisement() {
+    for peer_max_blocks in [2, MAX_BS_BLOCKS_PER_REQUEST] {
+        let (mut routine, mut outbound, _pool, _connection, _) =
+            requester_routine_with_pool(block::Hash([1; 32]), ReservationPool::new(8).unwrap());
+        // An old config may still carry a multi-block value. It is ignored.
+        routine.config.max_blocks_per_response = Some(MAX_BS_BLOCKS_PER_REQUEST);
+        assert_eq!(routine.config.bbr_cwnd_unit, CwndUnit::Bytes);
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            max_blocks_per_response: peer_max_blocks,
+            ..BlockSyncStatus::default()
+        });
+        routine.work.extend(
+            super::super::test_work_scope(),
+            (2..=4).map(|height| {
+                (
+                    block::Height(height),
+                    block::Hash([u8::try_from(height).unwrap(); 32]),
+                    BlockSizeEstimate::Confirmed(1000),
+                )
+            }),
+        );
+        // Lift the cold-start probe limit so the fill is bounded only by the cwnd.
+        routine
+            .window
+            .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
+
+        routine.try_fill().await;
+
+        let mut requested = Vec::new();
+        while let Ok(frame) = outbound.try_recv() {
+            if let BlockSyncMessage::GetBlocks {
+                start_height,
+                count,
+            } = BlockSyncMessage::decode_frame(frame).unwrap()
+            {
+                requested.push((start_height, count));
+            }
+        }
+        requested.sort();
+        assert_eq!(
+            requested,
+            (1..=4)
+                .map(|height| (block::Height(height), 1))
+                .collect::<Vec<_>>(),
+            "peer advertised {peer_max_blocks} blocks per response",
+        );
+        assert_eq!(routine.window.outstanding.len(), 4);
+    }
+}
+
+/// Heights of synthesized work in the pending-ending tests. Well above
+/// [`MAX_PENDING_ENDINGS`] so the bound, not the queue, stops a withholding peer.
+const BULK_WORK: u32 = 2048;
+
+/// A routine whose peer serves `1..=BULK_WORK` and advertises the protocol's
+/// request ceiling, so only local limits bound its work. Also returns the
+/// synthesized blocks, indexed by height minus one, and the sequencer input,
+/// which holds every body without consuming it.
+fn bulk_routine() -> (
+    RequesterRoutine,
+    Vec<Arc<block::Block>>,
+    mpsc::Receiver<SequencedBody>,
+) {
+    let connection = CancellationToken::new();
+    let pool = super::tests::test_request_pool();
+    let (mut routine, outbound, events) =
+        super::tests::status_test_routine_with(pool.clone(), &connection);
+    routine.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
+        ..BlockSyncStatus::default()
+    });
+    let template = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
+    let blocks: Vec<_> = (1..=BULK_WORK)
+        .map(|height| super::super::tests::fake_block_at_height(&template, block::Height(height)))
+        .collect();
+    routine.work.extend(
+        super::super::test_work_scope(),
+        blocks.iter().map(|block| {
+            let size = block.zcash_serialize_to_vec().unwrap().len();
+            (
+                block.coinbase_height().unwrap(),
+                block.hash(),
+                BlockSizeEstimate::Confirmed(u32::try_from(size).unwrap()),
+            )
+        }),
+    );
+    // Every body stays queued, so the input must hold all of them.
+    let (bodies, received) = mpsc::channel(usize::try_from(BULK_WORK).unwrap());
+    routine.sequencer_input = bodies;
+    (
+        (routine, outbound, pool, connection, events),
+        blocks,
+        received,
+    )
+}
+
+/// Drains the routine's outbound frames and returns the heights it requested.
+fn requested_heights(outbound: &mut FramedRecv) -> Vec<block::Height> {
+    let mut heights = Vec::new();
+    while let Ok(frame) = outbound.try_recv() {
+        if let BlockSyncMessage::GetBlocks { start_height, .. } =
+            BlockSyncMessage::decode_frame(frame).unwrap()
+        {
+            heights.push(start_height);
+        }
+    }
+    heights
+}
+
+/// Plays a peer that sends every requested body, lowest request first, and
+/// never an ending. Refills after each body, like the run loop. Stops once the
+/// routine has nothing outstanding, and returns every height it requested.
+async fn withhold_endings(
+    routine: &mut PeerRoutine,
+    outbound: &mut FramedRecv,
+    blocks: &[Arc<block::Block>],
+) -> Vec<block::Height> {
+    let mut requested = Vec::new();
+    let mut unanswered = std::collections::VecDeque::new();
+    let mut unended = 0;
+    loop {
+        routine.try_fill().await;
+        let new = requested_heights(outbound);
+        assert!(
+            new.is_empty() || unended < MAX_PENDING_ENDINGS,
+            "{} new requests went to a peer withholding {unended} endings",
+            new.len(),
+        );
+        requested.extend(&new);
+        unanswered.extend(new);
+        let Some(height) = unanswered.pop_front() else {
+            return requested;
+        };
+        let index = usize::try_from(height.0 - 1).unwrap();
+        deliver(routine, BlockSyncMessage::Block(blocks[index].clone())).await;
+        unended += 1;
+    }
+}
+
+/// A peer that returns every body but withholds every ending stops receiving
+/// requests at [`MAX_PENDING_ENDINGS`], long before it holds its session share.
+/// The missing-ending deadline still retires the gated connection.
+#[tokio::test]
+async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let requested = withhold_endings(&mut routine, &mut outbound, &blocks).await;
+
+    assert!(requested.len() >= MAX_PENDING_ENDINGS);
+    assert!(
+        requested.len() < usize::try_from(BULK_WORK).unwrap(),
+        "the bound, not the queue, stopped the peer",
+    );
+    assert_eq!(
+        routine.requester.occupancy().pending_endings,
+        requested.len()
+    );
+    assert_eq!(pool.held(), requested.len());
+    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.work.pending_contains(block::Height(BULK_WORK)));
+    routine.try_fill().await;
+    assert!(requested_heights(&mut outbound).is_empty());
+
+    // The gate never replaces the missing-ending deadline.
+    let deadline = routine
+        .requester
+        .retirement_deadline(routine.config.effective_liveness_timeout())
+        .expect("the first unended body starts the missing-ending deadline");
+    assert!(routine
+        .check_request_liveness(deadline - Duration::from_nanos(1))
+        .is_ok());
+    assert!(!connection.is_cancelled());
+    assert!(matches!(
+        routine.check_request_liveness(deadline),
+        Err(SinkReject::Local(_))
+    ));
+    assert!(connection.is_cancelled());
+    drop(routine);
+    assert_eq!(pool.held(), 0, "retirement returns every reservation");
+}
+
+/// Endings that arrive late reopen the gate as soon as fewer than
+/// [`MAX_PENDING_ENDINGS`] remain owed.
+#[tokio::test]
+async fn a_late_ending_below_the_bound_lets_the_peer_take_work_again() {
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let mut unended = withhold_endings(&mut routine, &mut outbound, &blocks).await;
+    unended.sort();
+
+    let mut requested = Vec::new();
+    for start_height in unended {
+        deliver(
+            &mut routine,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned: 1,
+            },
+        )
+        .await;
+        routine.try_fill().await;
+        requested = requested_heights(&mut outbound);
+        let pending = routine.requester.occupancy().pending_endings;
+        if pending >= MAX_PENDING_ENDINGS {
+            assert!(requested.is_empty(), "gated with {pending} endings owed");
+        } else {
+            assert_eq!(pending, MAX_PENDING_ENDINGS - 1);
+            break;
+        }
+    }
+    assert!(!requested.is_empty(), "the reopened gate issues new work");
+    assert!(!connection.is_cancelled());
+    assert_eq!(
+        pool.held(),
+        MAX_PENDING_ENDINGS - 1 + requested.len(),
+        "only owed endings and the new requests hold reservations",
+    );
+}
+
+/// An honest peer sends each ending right after its body, but ready-order
+/// serving can interleave several responses. Bodies arriving in batches of
+/// 12 (one per serving job), with their endings in reverse order, never reach
+/// the bound, so the peer takes all the work.
+#[tokio::test]
+async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
+    const INTERLEAVED: usize = 12;
+    let ((mut routine, mut outbound, pool, connection, _events), blocks, _bodies) = bulk_routine();
+    let mut unanswered = std::collections::VecDeque::new();
+    let mut requested = 0;
+    let mut most_pending = 0;
+    loop {
+        routine.try_fill().await;
+        let new = requested_heights(&mut outbound);
+        requested += new.len();
+        unanswered.extend(new);
+        if unanswered.is_empty() {
+            break;
+        }
+        let batch: Vec<_> = unanswered
+            .drain(..INTERLEAVED.min(unanswered.len()))
+            .collect();
+        for height in &batch {
+            let index = usize::try_from(height.0 - 1).unwrap();
+            deliver(&mut routine, BlockSyncMessage::Block(blocks[index].clone())).await;
+            most_pending = most_pending.max(routine.requester.occupancy().pending_endings);
+            routine.try_fill().await;
+            let new = requested_heights(&mut outbound);
+            requested += new.len();
+            unanswered.extend(new);
+        }
+        for start_height in batch.into_iter().rev() {
+            deliver(
+                &mut routine,
+                BlockSyncMessage::BlocksDone {
+                    start_height,
+                    returned: 1,
+                },
+            )
+            .await;
+            routine.try_fill().await;
+            let new = requested_heights(&mut outbound);
+            requested += new.len();
+            unanswered.extend(new);
+        }
+    }
+    assert_eq!(requested, usize::try_from(BULK_WORK).unwrap());
+    assert_eq!(most_pending, INTERLEAVED);
+    assert_eq!(routine.requester.occupancy().pending_endings, 0);
+    assert_eq!(pool.held(), 0);
+    assert!(!connection.is_cancelled());
+}
+
+/// A second peer that shares `fast`'s registry and work, reserves from `pool`
+/// and serves `1..=BULK_WORK`. It has no RTprop, which ranks below any
+/// measured peer, and its download floor sits just below `floor`, so `floor`
+/// is the height its floor arm contests.
+fn slower_floor_peer(
+    fast: &PeerRoutine,
+    pool: ReservationPool,
+    floor: block::Height,
+) -> (PeerRoutine, FramedRecv) {
+    let (mut slow, outbound, _events) =
+        super::tests::status_test_routine_with(pool, &CancellationToken::new());
+    slow.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
+    slow.registry = Arc::clone(&fast.registry);
+    slow.generation = slow
+        .registry
+        .admit_session(
+            &slow.peer,
+            slow.session.direction(),
+            &slow.config,
+            0,
+            Instant::now(),
+        )
+        .generation();
+    slow.work = Arc::clone(&fast.work);
+    let mut view = *slow.sequencer_view.borrow();
+    view.download_floor = block::Height(floor.0 - 1);
+    // Fill only borrows the view, so its sender need not outlive this setup.
+    slow.sequencer_view = watch::channel(view).1;
+    slow.handle_status(BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests: crate::zakura::block_sync::config::MAX_BS_INFLIGHT_REQUESTS,
+        ..BlockSyncStatus::default()
+    });
+    (slow, outbound)
+}
+
+/// A fast peer gated on owed endings publishes no free slots, so a slower peer
+/// takes the floor height instead of deferring it to a peer that cannot
+/// request it. Once the endings arrive, the fast peer is the preferred floor
+/// server again and deferred routines are woken to re-rank.
+#[tokio::test]
+async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
+    let ((mut fast, mut fast_outbound, pool, _fast_connection, _), blocks, _fast_bodies) =
+        bulk_routine();
+    let mut unended = withhold_endings(&mut fast, &mut fast_outbound, &blocks).await;
+    assert!(
+        fast.window.bbr_rtprop_ms(Instant::now()).is_some(),
+        "the fast peer has a measured RTprop"
+    );
+    let registry = Arc::clone(&fast.registry);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .expect("the gated peer left work behind");
+
+    let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
+
+    slow.try_fill().await;
+    assert_eq!(
+        requested_heights(&mut slow_outbound),
+        [floor],
+        "the slower peer takes the floor from the gated one",
+    );
+
+    // Endings down to the bound keep the fast peer gated, and the next one
+    // reopens it. Only that change wakes routines that wait on the ranking.
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    unended.sort();
+    let mut endings = unended.into_iter();
+    while fast.requester.occupancy().pending_endings > MAX_PENDING_ENDINGS {
+        let start_height = endings.next().unwrap();
+        deliver(
+            &mut fast,
+            BlockSyncMessage::BlocksDone {
+                start_height,
+                returned: 1,
+            },
+        )
+        .await;
+    }
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(futures::poll!(ranking.as_mut()).is_pending());
+    deliver(
+        &mut fast,
+        BlockSyncMessage::BlocksDone {
+            start_height: endings.next().unwrap(),
+            returned: 1,
+        },
+    )
+    .await;
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+}
+
+/// Two sessions that open every request their window allows and then withhold
+/// every ending hold at most a quarter of the node pool together, so a third
+/// session can still reserve.
+#[tokio::test]
+async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
+    use super::super::config::MAX_BS_INFLIGHT_REQUESTS;
+    use super::super::regulated::live_requester::SESSION_RESERVATIONS;
+
+    // Wider than the session share used to be, so only the share stops each window.
+    const WINDOW: u32 = MAX_BS_INFLIGHT_REQUESTS / 2 + 64;
+    let pool = super::tests::test_request_pool();
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let mut probe = super::scaling_tests::probe_in(WINDOW, pool.clone());
+        loop {
+            probe.routine.try_fill().await;
+            if requested_heights(&mut probe.outbound).is_empty() {
+                break;
+            }
+        }
+        // Answered bodies leave the window but keep their reservations.
+        for block in probe.blocks.iter().take(MAX_PENDING_ENDINGS) {
+            deliver(&mut probe.routine, BlockSyncMessage::Block(block.clone())).await;
+        }
+        probe.routine.try_fill().await;
+        assert!(requested_heights(&mut probe.outbound).is_empty());
+        assert_eq!(
+            probe.routine.requester.occupancy().len,
+            SESSION_RESERVATIONS
+        );
+        sessions.push(probe);
+    }
+    // The protocol ceiling fits usize on supported targets.
+    let node_pool = MAX_BS_INFLIGHT_REQUESTS as usize;
+    assert!(
+        pool.held() <= node_pool / 4,
+        "two sessions hold {} of {node_pool} entries",
+        pool.held(),
+    );
+
+    let (mut third, mut outbound, ..) =
+        requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
+    third.try_fill().await;
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
+        BlockSyncMessage::GetBlocks { .. }
+    ));
+}
+
+/// A `bulk_routine` status that advertises `max_inflight_requests`.
+fn inflight_limit(max_inflight_requests: u32) -> BlockSyncStatus {
+    BlockSyncStatus {
+        servable_low: block::Height(1),
+        servable_high: block::Height(BULK_WORK),
+        max_blocks_per_response: 1,
+        max_inflight_requests,
+        ..BlockSyncStatus::default()
+    }
+}
+
+/// A measured fast peer that advertises 8 in-flight requests and holds one
+/// exchange whose ending it withholds, and a slower peer from
+/// [`slower_floor_peer`] that defers the returned floor height to it. The last
+/// value keeps the fast peer's channels open.
+async fn fast_peer_holding_one_exchange() -> (
+    PeerRoutine,
+    PeerRoutine,
+    FramedRecv,
+    block::Height,
+    Box<dyn std::any::Any>,
+) {
+    let ((mut fast, mut fast_outbound, pool, connection, events), blocks, bodies) = bulk_routine();
+    fast.handle_status(inflight_limit(8));
+    // The cold-start probe sends one request. Its body arrives, its ending does not.
+    fast.try_fill().await;
+    let [first] = requested_heights(&mut fast_outbound)[..] else {
+        panic!("the cold-start probe sends one request");
+    };
+    let index = usize::try_from(first.0 - 1).unwrap();
+    deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
+    assert!(fast
+        .window
+        .bbr_rtprop_ms(time::Instant::now().into_std())
+        .is_some());
+    assert_eq!(fast.requester.occupancy().len, 1);
+    let floor = fast
+        .work
+        .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
+        .unwrap();
+    let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
+
+    // With room under its limit, the faster peer is the preferred floor server.
+    slow.try_fill().await;
+    assert!(requested_heights(&mut slow_outbound).is_empty());
+    let keep = Box::new((fast_outbound, connection, events, bodies));
+    (fast, slow, slow_outbound, floor, keep)
+}
+
+/// A status that lowers the advertised in-flight limit to what a fast peer
+/// already holds stops its requester, so a slower peer takes the floor at
+/// once instead of deferring until the next slot heartbeat. The status here
+/// is rate-limited, which still applies the new limit. Time is paused so the
+/// status always falls inside the rate window, however slow the runner.
+#[tokio::test(start_paused = true)]
+async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
+    let (mut fast, mut slow, mut slow_outbound, floor, _keep) =
+        fast_peer_holding_one_exchange().await;
+    let registry = Arc::clone(&fast.registry);
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    fast.handle_status(inflight_limit(1));
+    assert!(fast.pending_status.is_some(), "the status was rate-limited");
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    slow.try_fill().await;
+    assert_eq!(
+        requested_heights(&mut slow_outbound),
+        [floor],
+        "the slower peer takes the floor once the fast one refuses work",
+    );
+}
+
+/// A peer that alternates its in-flight limit between 1 and 2 through
+/// rate-limited statuses publishes its stop once. Reopening waits for a status
+/// the rate limiter admits, so the flood wakes routines waiting on the floor
+/// ranking once, not on every frame.
+#[tokio::test(start_paused = true)]
+async fn alternating_rate_limited_limits_publish_the_stop_once() {
+    let (mut fast, slow, _slow_outbound, floor, _keep) = fast_peer_holding_one_exchange().await;
+    let registry = Arc::clone(&fast.registry);
+    let mut notifications = 0;
+    for round in 0..16 {
+        let ranking = registry.subscribe_floor_ranking().notified();
+        tokio::pin!(ranking);
+        ranking.as_mut().enable();
+        fast.handle_status(inflight_limit(if round % 2 == 0 { 1 } else { 2 }));
+        assert!(
+            fast.pending_status.is_some(),
+            "every status is rate-limited"
+        );
+        if futures::poll!(ranking.as_mut()).is_ready() {
+            notifications += 1;
+        }
+    }
+    assert_eq!(notifications, 1, "only the first stop is published");
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+
+    // The next admitted status publishes the reopened requester.
+    let ranking = registry.subscribe_floor_ranking().notified();
+    tokio::pin!(ranking);
+    ranking.as_mut().enable();
+    time::advance(Duration::from_secs(1)).await;
+    fast.flush_pending_status();
+    assert!(fast.pending_status.is_none());
+    assert!(futures::poll!(ranking.as_mut()).is_ready());
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
 }

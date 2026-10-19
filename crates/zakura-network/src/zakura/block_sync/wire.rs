@@ -89,7 +89,7 @@ impl BlockSyncMessage {
         let control = match self {
             Self::Block(block) => {
                 bytes.write_u8(MSG_BS_BLOCK)?;
-                block.zcash_serialize(&mut bytes)?;
+                block.zcash_serialize_into_vec(&mut bytes)?;
                 validate_encoded_block_len(
                     bytes.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
                 )?;

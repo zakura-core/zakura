@@ -236,6 +236,12 @@ resume eligible processing. Local capacity exhaustion is not a peer violation.
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
 discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
+`Hello`, `GetPeers`, and `GetServices` share one cadence. A capacity of 42 covers the 15-second
+sender interval across a 600-second connection-wide outage, plus the initial message and one more.
+The buffered arrivals after such an outage cannot prove a sender violation, so exhaustion is
+recorded and the message proceeds. The outstanding-request limit, verification slots, and the
+identical-record skip bound the work that the excess messages can cause.
+
 The following limits apply to every discovery message:
 
 ```text
@@ -268,9 +274,9 @@ SERVICE_ENVELOPE_MAX         = 294 bytes
   - protocol overlap
   - record author == authenticated peer
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`
+  - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
 apart. A long-lived shared connection MAY carry periodic `Hello` messages, including an unchanged
@@ -297,9 +303,9 @@ expiry.
   - excluded node IDs are sorted and unique
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+  - on_empty = record and forward (exhaustion is not a violation)
 - **Capacity**
   - one outstanding `GetPeers` per peer stream
   - bounded sampling work and queued response bytes
@@ -351,9 +357,9 @@ stored records attributed to each source peer.
   - service IDs are 1..=32 ASCII bytes and unique
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 42
   - refill = 1 message / 7 seconds
-  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+  - on_empty = record and forward (exhaustion is not a violation)
 - **Capacity**
   - one outstanding `GetServices` per peer stream
   - bounded summary generation and queued response bytes
@@ -395,15 +401,30 @@ renew validity. The handler MUST NOT suppress renewal merely because service val
 
 ### Header sync — stream 5, version 9
 
+Header sync version 9 uses capability bit 10. It replaces version 8 without a compatibility path.
+Capability bit 5, which identified version 8, is retired and MUST NOT be reused. A peer that offers
+only version 8 negotiates no header sync stream.
+
+This section defines version 9's encodings and subscription rules. Section 5 of the [fork-aware
+header chain engine specification](fork-aware-header-chain-engine.md) states the header chain rules
+that apply to them.
+
+The header credit, sent-cursor ring, grant minimum, and `Status` interval below have the evidence
+that Parameters to validate requires. The
+[header sync plan](../design/property-testing-header-sync.md#measured-evidence) records it.
+
 Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
 duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
 and 177 bytes on Regtest. For a selected auxiliary schema, let `A` equal 156 bytes for V1 and zero
-otherwise. The following subscription limits apply:
+otherwise. Let `P` equal `HEADERS_RESPONSE_FIXED_BYTES + H + 4`, the smallest legal page on the
+network: 1,573 bytes on Mainnet and Testnet and 263 bytes on Regtest. The following subscription
+limits apply:
 
 ```text
 MAX_HS_PUSH_CREDIT_HEADERS   = 4,000
 MAX_HS_PUSH_CREDIT_BYTES     = 8 MiB
 MAX_HS_SUBSCRIPTIONS         = 1 live or closing subscription per peer
+HS_PUBLISHER_SLOTS           = 2 live or closing subscriptions per peer
 MAX_HS_RANGE                 = 4,000 headers per response
 HEADERS_RESPONSE_FIXED_BYTES = 82 bytes
 HEADERS_OUTCOME_BYTES        = 41 bytes
@@ -418,19 +439,31 @@ height and hash, 32-byte cumulative work, oldest-retained height, maximum header
 maximum subscriptions, maximum message bytes, and the auxiliary-schema mask. Removing the payload
 discriminator makes its encoded size 122 bytes.
 
-A subscription has **reached its initial target** when its receive cursor equals
-`initial_target_tip_hash`. Until then the publisher serves the path to that target. After that the
-publisher pushes direct descendants as its selected chain grows.
+A subscription has **reached its initial target** when the hash of its receive cursor equals
+`initial_target_tip_hash`, or at `Open` when a sent locator equals it. Until then the publisher
+serves the path to that target. A subscription that reaches its target at `Open` has no path to
+serve, so the publisher sends no path page for it. After the subscription reaches its target, the
+publisher pushes descendants of the target as its selected chain grows.
 
 `SubscribeHeaders` replaces `GetHeaders`. A subscription binds its initial pages to one advertised
-target. After those pages reach the target, the subscription authorizes direct descendants of its
-accepted cursor. It allows at most the declared outstanding header and byte credit. Credit is
-renewable, so the publisher can keep the link full without accepting an unbounded push.
+target. After the subscription reaches the target, it authorizes pages that extend the target, each
+extending the one before. It allows at most the declared outstanding header and byte credit. Credit
+is renewable, so the publisher can keep the link full without accepting an unbounded push.
 
 `SubscribeHeaders` encodes an operation byte, a `u64` subscription ID, a `u32` update sequence, a
 32-byte target hash, a `u32` acknowledged height, a 32-byte acknowledged hash, two `u64`
 acknowledged counts, a locator-count byte, up to 13 locator hashes, two `u32` credit grants, and a
-schema byte. Its maximum encoded size is 523 bytes.
+schema byte. Its maximum encoded size is 523 bytes. `Grant` and `Close` carry no locator hashes, so
+they encode to 107 bytes. The operation byte is 0 for `Open`, 1 for `Grant`, and 2 for `Close`.
+
+A subscription **cursor** is the tuple `(height, hash, headers, bytes)`. The start cursor is the
+first locator's height and hash with zero counts. A page's cursor is the height and hash of its last
+header, with the cumulative header and byte credit that the subscription's pages consumed through
+that page. Both sides record each page's cursor when the page spends its credit. The receive
+cursor is the cursor of the last page received, or the start cursor before any page. Each update's
+acknowledged fields carry one cursor in that order. The publisher compares cursors by equality of
+all four fields. It never orders them. Every cursor of one subscription is distinct, because the
+start has zero counts and each page consumes at least one header.
 
 `Headers` retains the version 8 response fields and order. It renames `request_id` to
 `subscription_id` and `complete` to `reaches_initial_target`. The fixed fields occupy 82 bytes.
@@ -452,15 +485,24 @@ target hash, and a one-byte outcome.
   - `tree_aux_schema_mask` contains only known bits
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 602
   - refill = 2 messages/s
-  - on_empty = `Disconnect`
+  - on_empty = record and forward (exhaustion is not a violation)
 
-The sender MUST coalesce changes to at most one `Status` per second. The handler MUST retain
-bounded latest-status state and SHOULD suppress redundant target-selection work. It need not
-maintain a separate relevance snapshot. `work_anchor_height` is the
-height of the sender's finality anchor. `oldest_retained_height` is the lowest height for which
-the sender retains headers.
+`Status` keeps the publication rules of version 8. Each side MUST send its current `Status`
+immediately after the session opens, because `Open` selects its target from a received `Status`.
+Each side MUST send an updated `Status` after any committed transition that changes its selected
+tip, work anchor, retention floor, or advertised serving caps. It MUST refresh at least once per
+configured `status_refresh_interval`, 30 seconds by default, as a liveness signal. It MAY coalesce
+rapid changes, but it MUST send the newest snapshot within two seconds of its commit. It MUST NOT
+send two `Status` messages less than one second apart. Silence or a stale `Status` is grounds for
+local rescheduling, never a protocol violation. The handler MUST retain bounded latest-status state
+and SHOULD suppress redundant target-selection work. It need not maintain a separate relevance
+snapshot. `work_anchor_height` is the height of the sender's finality anchor.
+`oldest_retained_height` is the lowest height for which the sender retains headers.
+
+The receiver capacity allows 600 messages buffered over the maximum ten-minute transport outage,
+plus the initial message and one message of jitter. The refill runs at twice the sender rate.
 
 #### `SubscribeHeaders` — Request, discriminator 2
 
@@ -473,19 +515,24 @@ the sender retains headers.
   - `Grant` and `Close` have `update_sequence > 0` and no locator hashes
   - `added_header_credit <= 4,000`
   - `added_byte_credit <= 8 MiB`
+  - `Grant` has `added_header_credit >= 1` or `added_byte_credit >= P`
   - exact consumption
 - **Reservation**
-  - `Open` requires a free publisher slot and creates bounded send state
-  - `Grant` and `Close` match one live subscription or the terminal tombstone
+  - `Open` takes one of `HS_PUBLISHER_SLOTS` publisher slots and creates bounded send state
+  - `Grant` and `Close` match one live subscription or one terminal tombstone
   - `update_sequence` increases by exactly one
   - `initial_target_tip_hash` and `tree_aux_schema` remain fixed
-  - the acknowledged cursor and counters equal the current acknowledgement or advance to a prefix
-    in the sent-cursor ring (capacity = `HS_SENT_CURSOR_RING`)
+  - on a live match, the acknowledged cursor equals the current acknowledgement or one entry of
+    the sent-cursor ring (capacity = `HS_SENT_CURSOR_RING`)
   - granted minus acknowledged header credit <= 4,000
   - granted minus acknowledged byte credit <= 8 MiB
-  - terminal tombstone capacity = 1
+  - on a tombstone match, granted credit <= consumed credit + the window, in headers and bytes
+  - a tombstone records whether the publisher received `Close` before the end, and then every
+    matching update returns `Disconnect`
+  - terminal tombstones <= `HS_PUBLISHER_SLOTS`
 - **Capacity**
-  - one live or closing subscription per peer
+  - a conformant subscriber holds one live or closing subscription per peer
+  - the publisher admits up to `HS_PUBLISHER_SLOTS` per peer
   - bounded control processing and response production
   - `Close` processing MUST NOT wait for serving worker or output capacity
 
@@ -494,39 +541,70 @@ work before yielding to other runnable work. Grant processing MUST NOT allocate 
 of response jobs. Credit authorizes future responses; it does not allocate executing workers.
 The implementation MUST preserve control progress while response output is blocked.
 
-`Open` MUST carry `1..=13` unique locator hashes. Its acknowledged cursor MUST equal the first
-locator. Its acknowledged header and byte counts MUST equal zero. It MUST add nonzero header and byte
-credit. The byte credit MUST fit the fixed response fields and one entry under the selected schema.
-The subscriber MUST select the target from a received `Status`. It MUST create the local
-subscription reservation before it sends `Open`.
+`Open` MUST carry `1..=13` unique locator hashes. Its acknowledged cursor MUST be the start
+cursor. It MUST add nonzero header and byte credit. The byte credit MUST fit the fixed response
+fields and one entry under the selected schema. The subscriber MUST select the target from a
+received `Status`. It MUST create the local subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
-It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its local
-subscription reservation before it sends `Grant`. Until the subscription reaches its initial
-target, the resulting header and byte credit MUST fit at least one legal nonempty page. A smaller
-grant stalls the subscription: the publisher cannot legally send a page, and the subscriber waits
-for one. After the subscription reaches its target, the publisher may have nothing to send. The
-subscriber does not need to hold credit for a full page in that state. The subscriber SHOULD keep
-header and byte credit for at least one page outstanding on a live subscription.
+It MUST add at least one header of credit or at least `P` bytes of credit. The subscriber MUST add
+the credit to its local subscription reservation before it sends `Grant`. Until the subscription
+reaches its initial target, the resulting header and byte credit MUST fit at least one legal
+nonempty page. A smaller grant stalls the subscription: the publisher cannot legally send a page,
+and the subscriber waits for one. After the subscription reaches its target, the publisher may have
+nothing to send. The subscriber does not need to hold credit for a full page in that state. The
+subscriber SHOULD keep header and byte credit for at least one page outstanding on a live
+subscription.
+
+Every `Open` and `Grant` adds at least one header or `P` bytes, and the window and the tombstone
+bound below keep a subscription's total granted credit within the credit its pages consumed plus
+one window. So the `Open` and `Grant` updates of one subscription number at most:
+
+```text
+4,000 + sent_headers + floor((8 MiB + sent_bytes) / P)
+```
+
+`sent_headers` and `sent_bytes` count the pages the publisher sent on that subscription. Before any
+page, the bound is 9,332 updates on Mainnet and Testnet and 35,895 on Regtest. Each sent header
+raises it by at most three. A conformant subscriber can always meet the minimum. Once it
+accepts every received page and its unspent credit cannot fit a page, its window has room for at
+least one header or at least `P` bytes.
 
 `Close` MUST carry no locator hashes or added credit. The publisher MUST stop producing new pages
 when it receives `Close`. It MUST send `HeadersOutcome(SubscriptionClosed)` after every page already
 queued unless it already queued a terminal outcome. After a `Close` matches a live subscription, a
-further `Grant` on that subscription MUST return `Disconnect`.
+further `Grant` or `Close` on that subscription MUST return `Disconnect`, both before and after the
+subscription ends.
 
-Receiving `Close` or queueing a terminal outcome frees the publisher slot. The publisher MUST
-retain a terminal tombstone until it receives a crossing `Close` or the next `Open`. The tombstone
-prevents a conformant update that crossed the terminal outcome from causing a violation. A
-tombstone match validates only the subscription ID. A crossing `Grant` that matches the tombstone
-MUST return `Drop` and MUST NOT consume the tombstone. A crossing `Close`
-consumes the tombstone. An `Open` that finds no free publisher slot MUST return `Disconnect`,
-because the subscriber knows its own live subscription count.
+A subscription holds a publisher slot from `Open` until its terminal outcome's transport write
+finishes. The slot also reserves that outcome's output, so exhausted data credit and busy output
+cannot prevent closure. A conformant subscriber holds at most `MAX_HS_SUBSCRIPTIONS` slots on the
+publisher's tally when its `Open` arrives. As with `GetBlocks` commitments, the publisher acts only
+above a conservative margin. An `Open` that arrives while one slot is held MUST be admitted and
+served, and the publisher SHOULD count it in `zakura.p2p.subscription.over_limit`. An `Open` that
+arrives while both slots are held MUST return `Disconnect`. Per-peer send state, credit, and
+sent-cursor rings are therefore bounded at `HS_PUBLISHER_SLOTS` subscriptions.
+
+Ending a subscription leaves a terminal tombstone. The publisher MUST retain it until it receives a
+crossing `Close` or the next `Open`. The tombstone prevents a conformant update that crossed the
+terminal outcome from causing a violation. A tombstone match validates the subscription ID and the
+update sequence, which continues from the last update the publisher applied. It does not check the
+acknowledged cursor.
+
+The rules below apply to a tombstone that the publisher's own terminal outcome left, where updates
+can honestly cross that outcome.
+
+The tombstone keeps the subscription's granted and consumed credit. A crossing `Grant` that would
+raise granted credit above consumed credit plus the window, in headers or in bytes, MUST return
+`Disconnect`. A conformant subscriber stays within that bound because it acknowledged only pages
+that the publisher sent before the end. A crossing `Grant` within the bound MUST return `Drop` and
+MUST NOT consume the tombstone. Its credit still counts toward the tombstone's granted credit, so
+later crossing grants cannot reuse the same room. A crossing `Close` MUST return `Drop` and consumes
+the tombstone.
 
 The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
-clears the tombstone and MUST use a different subscription ID. This rule bounds each side to one
-live or closing subscription and prevents terminal reservations from accumulating. The terminal
-outcome consumes no header or byte credit. The publisher MUST reserve bounded terminal-output
-capacity so exhausted data credit cannot prevent closure.
+clears every tombstone and MUST use a different subscription ID. The terminal outcome consumes no
+header or byte credit.
 
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
@@ -534,6 +612,11 @@ bytes sent on the ordered stream as new credit. The sent-cursor ring MUST hold a
 maximum number of unacknowledged pages. Granted minus acknowledged header credit MUST NOT exceed
 4,000, and granted minus acknowledged byte credit MUST NOT exceed 8 MiB. Every page carries at least
 one header, so at most 4,000 pages are unacknowledged and `HS_SENT_CURSOR_RING` always suffices.
+
+On a live match, the publisher compares an update's acknowledged cursor with its current
+acknowledgement first and then with the sent-cursor ring. A ring match acknowledges that page and
+every earlier one. Any other cursor MUST return `Disconnect`, including one that the publisher
+already passed.
 
 #### `Headers` — Response, discriminator 3
 
@@ -554,11 +637,13 @@ one header, so at most 4,000 pages are unacknowledged and `HS_SENT_CURSOR_RING` 
 - **Reservation**
   - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
     requested schema)
-  - the first parent is a sent locator; each later parent equals the reservation receive cursor
+  - the first parent is a sent locator, and it is the initial target when a sent locator equals
+    the target; each later parent equals the hash of the reservation receive cursor
   - consume `header_count` and the encoded payload bytes
   - advance the receive cursor
   - require `reaches_initial_target` exactly when the final header hash equals the initial target
-  - record when the initial target is reached and reject a second such marker
+  - record when the initial target is reached, at `Open` or by a marked page, and reject any later
+    marker
   - remain live
 - **Verify** — [`prepare_headers`][prepare-headers], the context-free header validator, over the
   decoded page. It establishes the supported encoding version, the locally computed hash, the
@@ -571,18 +656,48 @@ one header, so at most 4,000 pages are unacknowledged and `HS_SENT_CURSOR_RING` 
 Page linkage is a reservation rule, not a context-free one. It holds against the sent locator and
 receive cursor in the local reservation, so [`prepare_headers`][prepare-headers] cannot decide it.
 
-The first page MUST extend the locator intersection selected by the publisher. The publisher MUST
-reach the initial target before it pushes a descendant beyond that target. Each later page MUST
-extend the preceding page on the ordered stream. After reaching the initial target, the publisher
-MAY push a new header immediately when its selected chain extends the subscription cursor and credit
-remains. If its selected chain no longer extends that cursor, it MUST stop pushing and MUST queue
-`HeadersOutcome(SubscriptionSuperseded)`. The subscriber MUST acknowledge only a cursor that passes
-contextual difficulty, time, chain-connection, and auxiliary-root validation.
+The first page MUST extend the highest sent locator that is the initial target or one of its
+ancestors. The publisher MUST reach the initial target before it pushes a descendant beyond that
+target. Each later page MUST extend the preceding page on the ordered stream. After reaching the
+initial target, the publisher MAY push a new header immediately when its selected chain extends the
+subscription's last header and credit remains. That header is the last one the publisher sent on the
+subscription, or the initial target before any page. If its selected chain no longer extends that
+header, it MUST stop pushing and MUST queue `HeadersOutcome(SubscriptionSuperseded)`. The subscriber
+MUST acknowledge only a cursor that passes contextual difficulty, time, chain-connection, and
+auxiliary-root validation.
 
 The publisher SHOULD produce an eligible page when credit, chain data, and execution/output
 capacity are available. This specification imposes no mandatory push deadline. The subscriber MAY
 track progress and select another peer under local policy. Slow progress alone is not a protocol
 violation, and local failover MUST NOT revoke outstanding authorization.
+
+Before the subscription reaches its initial target, a publisher can find history unavailable for the
+requested schema, because it cannot produce the next header the path needs or the auxiliary record
+that header needs under the subscription's `tree_aux_schema`. A pruned publisher, for example,
+cannot derive records below the height where its commitment-tree index starts. The publisher MUST
+then send the path's pages up to the last header it can serve under that schema, as credit allows,
+and end the subscription with `HeadersOutcome(HistoryPruned)`. It MUST NOT wait for a record that
+cannot arrive, and a page MUST NOT skip a missing record to reach records above it. Unlike version
+8, the publisher MUST NOT fall back to schema 0 within a subscription. A capacity wait or a local
+backend error is not `HistoryPruned`. Capacity waits pause under Capacity admission, and a local
+failure returns `LocalFault`.
+
+After the subscription reaches its target, including at `Open`, `HistoryPruned` stays illegal. A
+publisher that cannot yet produce a record for a new header waits, and the subscriber MAY fail over
+under local policy, as for any slow progress. `SubscriptionSuperseded` still reports only a chain
+change.
+
+On `HistoryPruned` for a V1 subscription toward an ordinary discovery target, the subscriber MAY
+open its next subscription to that peer with no auxiliary schema. It SHOULD keep that downgrade for
+the peer across later subscriptions and `Status` updates, and SHOULD retry V1 periodically with
+backoff. If a subscription without auxiliary records also ends with `HistoryPruned`, the subscriber
+SHOULD rotate to another peer or back off. `HistoryPruned` is never a peer fault. VCT repair under
+LC-AUX-07 of the [fork-aware header chain engine specification](fork-aware-header-chain-engine.md)
+always requests V1 and rotates suppliers instead of downgrading.
+
+Headers taken without records do not bypass root authentication. After VCT freezes the frontier, a
+missing root parks block commit until some peer supplies it. Below a pruned publisher's
+commitment-tree index, roots and bodies must come from archive peers, as in version 8.
 
 The handler MUST verify contextual difficulty, time, chain connection, and auxiliary roots. The
 transition planner performs those checks; [`prepare_headers`][prepare-headers] documents the split.
@@ -606,23 +721,25 @@ The handler MUST disconnect the peer when one of those checks fails.
 
 Each outcome is legal only in its window:
 
-| Outcome | Legal window |
-| --- | --- |
-| `NoLocatorIntersection` | Before the first page |
-| `TargetNotRetained` | Before the first page |
-| `TargetNotSelected` | Before the first page |
-| `HistoryPruned` | Before the subscription reaches the initial target |
-| `SubscriptionSuperseded` | Any time |
-| `SubscriptionClosed` | After the publisher receives `Close` |
+| Outcome | Byte | Legal window |
+| --- | --- | --- |
+| `NoLocatorIntersection` | 2 | Before the first page |
+| `TargetNotRetained` | 1 | Before the first page |
+| `TargetNotSelected` | 5 | Before the first page |
+| `HistoryPruned` | 3 | Before the subscription reaches the initial target |
+| `SubscriptionSuperseded` | 6 | Any time |
+| `SubscriptionClosed` | 7 | After the publisher receives `Close` |
 
-An outcome outside its window MUST return `Disconnect`.
+An outcome outside its window MUST return `Disconnect`. A subscription that reaches its target at
+`Open` has no window for `HistoryPruned`.
 
-`Busy` is not a protocol outcome. Local capacity exhaustion MUST pause response-work admission
-under Capacity admission. A local failure after admission MUST return `LocalFault`.
-`TargetNotSelected` reports
-that the publisher changed its selected chain between `Status` and `Open`. `SubscriptionSuperseded`
-reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
-a peer violation.
+`Busy` is not a protocol outcome, and its version 8 byte, 4, MUST NOT be reused. Bytes 1 through 3
+keep their version 8 meanings. Local capacity exhaustion MUST pause response-work admission under
+Capacity admission. A local failure after admission MUST return `LocalFault`. `TargetNotSelected`
+reports that the publisher changed its selected chain between `Status` and `Open`.
+`SubscriptionSuperseded` reports that the publisher's selected chain stopped extending the
+subscription cursor. Neither is a peer violation. `HistoryPruned` reports history unavailable for
+the requested schema, as defined under `Headers`.
 
 ### Block sync — stream 6, regulated version 3
 
@@ -664,6 +781,10 @@ The requester sizes outstanding work through its existing per-peer download wind
 ([`DownloadWindow`][bs-window]) and MUST obey the receiver's advertised inflight limit. Receiver
 safety MUST NOT depend on requester adaptation. Continuous serving is legal while resources are
 available. This specification adds no per-peer serving-rate setting or artificial refill delay.
+
+Zakura's requester sends one block per `GetBlocks` and Zakura advertises a block count of 1. It
+still accepts a peer's legal request for more and answers it with the first block and
+`BlocksDone(1)`.
 
 A stream layout that pauses request intake MUST preserve response and control progress in both
 directions. Capacity admission defines that requirement independently of the concrete layout.
@@ -832,8 +953,12 @@ before enforcing those values:
 | --- | --- |
 | Cadence capacities, refill rates, and discovery request intervals | Initial and periodic exchanges, summary renewal before expiry, configurable refreshes, and buffered arrivals after pauses; flood rejection without rejecting conformant bursts |
 | Execution slots, inflight commitments, retained-result and output bounds | CPU, lock, storage, and memory measurements at the maximum admitted peer count; continuous serving and repeated unavailable-range requests |
-| Header credit and cursor-ring size | Open, grant, close, crossing updates, reorganization, credit exhaustion, and control floods while data output is blocked |
+| Header credit, cursor-ring size, and grant minimum | Open, grant, close, crossing updates, reorganization, credit exhaustion, and control floods at the minimum grant while data output is blocked, and throughput at the target round-trip time |
+| Header sync `Status` interval | Reorganization recovery after `SubscriptionSuperseded` at the one-second floor and at any longer candidate |
 | Incomplete-frame retention and transport windows | Partial-frame tests, intentional read pauses, non-reading peers, existing-credit accounting, and independent stream progress |
+
+The [header sync plan](../design/property-testing-header-sync.md#measured-evidence) records the
+measurements for header sync's two rows.
 
 ## Conformance tests
 
@@ -870,9 +995,9 @@ universal panic-recovery suite, and exhaustive model explorer are not prerequisi
 
 Tests MUST state scheduling assumptions and finite progress bounds where they assert progress.
 Optional traces MUST bound their logging and storage costs. Generated tests search for failures;
-they do not prove all executions correct. The [testing design](../design/property-testing.md) and
-[`GetBlocks` checks](../design/property-testing-block-sync-infrastructure.md) describe the initial
-implementation scope.
+they do not prove all executions correct. The [testing design](../design/property-testing.md),
+[`GetBlocks` checks](../design/property-testing-block-sync-infrastructure.md), and
+[header sync checks](../design/property-testing-header-sync.md) describe the implementation scope.
 
 ## Reference implementations
 

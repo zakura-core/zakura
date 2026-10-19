@@ -158,11 +158,6 @@ impl BlockApplyOutcome {
         self.verification.as_ref()
     }
 
-    /// Consume this wrapper and return canonical typed verification evidence.
-    pub fn into_verification(self) -> zakura_header_chain::BodyVerificationOutcome {
-        *self.verification
-    }
-
     pub(crate) fn attributed_source(&self) -> Option<zakura_header_chain::SourceId> {
         match self.verification.as_ref() {
             zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(evidence) => {
@@ -325,6 +320,15 @@ pub enum BlockSyncMisbehavior {
     RangeUnavailable,
     /// A peer sent too many status frames.
     StatusSpam,
+}
+
+impl BlockSyncMisbehavior {
+    /// Whether this violation proves the peer served a tampered body.
+    ///
+    /// See [`zakura_header_chain::BodyCommitmentKind::proves_tampered_body`].
+    pub fn proves_tampered_body(&self) -> bool {
+        matches!(self, Self::BodyPayloadMismatch(mismatch) if mismatch.kind.proves_tampered_body())
+    }
 }
 
 /// The shared routine→reactor channel (per-peer routines inverted data flow).

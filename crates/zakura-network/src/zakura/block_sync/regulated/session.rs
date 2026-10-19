@@ -10,7 +10,9 @@ use super::{
 };
 use crate::zakura::{
     block_sync::{ZakuraBlockSyncConfig, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
-    regulation::{sizing, CompletionId, Completions, Serve, ServeCapacity, ServeLimits},
+    regulation::{
+        sizing, CompletionId, Completions, OutputOrder, Serve, ServeCapacity, ServeLimits,
+    },
     FramedSend, SinkReject, ZakuraPeerId,
 };
 
@@ -30,6 +32,9 @@ const NODE_EXECUTION: usize = 24;
 /// Read-and-encode jobs for one peer: half the node, so a stalled peer cannot
 /// hold every slot. One peer's share still exceeds one connection's throughput.
 const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
+// An honest server interleaves at most one body per running job, so keep the
+// owed-ending gate well above one peer's jobs (see `MAX_PENDING_ENDINGS`).
+const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);
 
 /// The production GetBlocks serving limits. Execution is fixed by
 /// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
@@ -127,7 +132,10 @@ impl Serving {
             .expect("advertised serving limits are within the protocol bounds")
             .with_session(send.clone());
         ServingSession {
-            serve: self.capacity.session(
+            // The requester matches each block to the live range expecting its
+            // hash and each ending by start height, so ranges need no order.
+            serve: self.capacity.session_with_order(
+                OutputOrder::Ready,
                 Arc::new(producer),
                 peer,
                 self.advertised,
@@ -176,6 +184,8 @@ impl ServingSession {
     }
 
     /// Drain under the ending-publication lock before reusing any live range.
+    /// A drained range's ending is already in the session's shared output, so
+    /// a replacement's frames queue after it (see [`OutputOrder::Ready`]).
     fn remove_completed(&mut self) {
         self.completed.drain(|id| {
             let start =

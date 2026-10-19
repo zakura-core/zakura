@@ -60,6 +60,10 @@ pub struct BlockSyncStartup {
     pub state_queries_enabled: bool,
     /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
+    /// The verifier's last checkpoint height. When set, the submission window
+    /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
+    /// decoded blocks. `None` keeps the count-only window.
+    pub max_checkpoint_height: Option<block::Height>,
 }
 
 impl BlockSyncStartup {
@@ -83,6 +87,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -106,6 +111,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -149,6 +155,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 }
@@ -309,12 +316,6 @@ impl BlockSyncHandle {
             .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
     }
 
-    /// Subscribe to the reactor's current local serving status.
-    /// Peer delivery is tracked separately and can lag while outbound queues are full.
-    pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
-        self.status.clone()
-    }
-
     /// Return the reactor's current local serving status, independent of peer delivery.
     pub fn local_status(&self) -> BlockSyncStatus {
         *self.status.borrow()
@@ -468,7 +469,7 @@ impl DownloadWindow {
     /// Record a completed request into the BBR estimators (RTprop / BtlBw / delivered)
     /// and advance the ProbeRtt phase machine. `delivered_bytes` is the request's total
     /// delivered body bytes — under the single-block-per-request invariant
-    /// (`DEFAULT_BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
+    /// (`BS_BLOCKS_PER_RESPONSE = 1`) this is the completing body's
     /// `serialized_bytes`. Call after removing the completed request from `outstanding`,
     /// so the in-flight measure reflects the post-completion queue depth.
     pub(super) fn record_delivery(
@@ -727,8 +728,8 @@ impl DownloadWindow {
     /// ([`record_timeout`](Self::record_timeout)) and the per-request delivery credit
     /// ([`credit_late_delivery`](Self::credit_late_delivery)): the EWMA is a per-request
     /// goodput fraction, so charging one-per-missing-height would near-seal a peer for a
-    /// single protocol-legal short answer once `max_blocks_per_response > 1` (at the shipped
-    /// default of 1 the two denominations coincide). Unlike a timeout this does *not* dip the
+    /// single protocol-legal short answer to a multi-block request (our requests carry one
+    /// block, so the two denominations coincide). Unlike a timeout this does *not* dip the
     /// cwnd — a short response is a goodput, not a latency/congestion, signal — but it must
     /// still count so a peer cannot deliver one body per request to keep its
     /// liveness/no-progress accounting reset while dropping the rest.

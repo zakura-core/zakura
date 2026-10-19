@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use tokio::time::sleep;
 
 use super::{

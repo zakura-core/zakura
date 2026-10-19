@@ -227,7 +227,7 @@ impl PeerRoutine {
     /// a cwnd that keeps ramping up only to be pulled back by the reliability discount
     /// instead of settling near `r = 1.0`. A sample also follows each batch of expired
     /// requests, because those usually return without a trace row of their own.
-    pub(super) fn trace_bbr_sample(&self) {
+    pub(super) fn trace_bbr_sample(&mut self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.peer));
             row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));

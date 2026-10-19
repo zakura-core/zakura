@@ -1,7 +1,6 @@
 //! In-process Zakura node lifecycle.
 
-use abscissa_core::config::Override;
-use color_eyre::Report;
+use eyre::Report;
 use tokio_util::sync::CancellationToken;
 
 use crate::{commands::StartCmd, components::tokio::run_until_shutdown, config::ZakuradConfig};

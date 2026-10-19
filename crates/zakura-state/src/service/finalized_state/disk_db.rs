@@ -160,7 +160,7 @@ pub struct DiskDb {
     /// The temporary workspace RocksDB uses to follow a primary database.
     ///
     /// This must be declared after `db` so the RocksDB handle is dropped before the directory.
-    _secondary_dir: Option<Arc<tempfile::TempDir>>,
+    _secondary_dir: Option<Arc<zakura_chain::common::TempDir>>,
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -1185,10 +1185,11 @@ impl DiskDb {
 
         let secondary_dir = read_only.then(|| {
             Arc::new(
-                tempfile::Builder::new()
-                    .prefix("zebra-secondary-state-")
-                    .tempdir()
-                    .expect("temporary RocksDB secondary directory can be created"),
+                zakura_chain::common::TempDir::new_in(
+                    std::env::temp_dir(),
+                    "zebra-secondary-state-",
+                )
+                .expect("temporary RocksDB secondary directory can be created"),
             )
         });
 
@@ -1266,7 +1267,9 @@ impl DiskDb {
     /// Returns the temporary RocksDB secondary workspace in tests.
     #[cfg(test)]
     pub(crate) fn secondary_path(&self) -> Option<&Path> {
-        self._secondary_dir.as_deref().map(tempfile::TempDir::path)
+        self._secondary_dir
+            .as_deref()
+            .map(zakura_chain::common::TempDir::path)
     }
 
     /// Returns the low-level rocksdb inner database.

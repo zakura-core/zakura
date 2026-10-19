@@ -381,19 +381,10 @@ impl ZakuraRejectReason {
     }
 }
 
-/// Whether a Zakura validation failure is neutral or may indicate abuse.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ZakuraFailureClass {
-    /// A routine mismatch or resource condition that should close neutrally.
-    Neutral,
-    /// A malformed or forged handshake condition that may be punitive if repeated.
-    PotentiallyPunitive,
-}
-
 /// Internal validation failures after the legacy wire reject boundary.
 ///
 /// Unlike [`ZakuraRejectReason`], these variants are not serialized on the wire.
-/// They preserve the failure-policy distinction needed by the control handshake.
+/// They preserve the specific failure detected by the control handshake.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum ZakuraValidationError {
     /// Unsupported control or prelude version.
@@ -442,24 +433,6 @@ pub enum ZakuraValidationError {
 }
 
 impl ZakuraValidationError {
-    /// Returns the failure-policy class for this validation error.
-    pub fn failure_class(self) -> ZakuraFailureClass {
-        match self {
-            Self::MalformedControl
-            | Self::IdentityMismatch
-            | Self::TranscriptMismatch
-            | Self::UpgradeNonceMismatch
-            | Self::ControlNonceMismatch => ZakuraFailureClass::PotentiallyPunitive,
-
-            Self::UnsupportedVersion(_)
-            | Self::IncompatibleZakuraProtocol
-            | Self::WrongNetwork
-            | Self::WrongChain
-            | Self::MissingRequiredCapability
-            | Self::ResourceLimit => ZakuraFailureClass::Neutral,
-        }
-    }
-
     fn from_wire_reject(reason: ZakuraRejectReason) -> Self {
         match reason {
             ZakuraRejectReason::UnsupportedPreludeVersion => Self::UnsupportedVersion("prelude"),
@@ -2159,13 +2132,6 @@ mod tests {
             accept.validate(&local, nonces(), &init),
             Err(ZakuraValidationError::UpgradeNonceMismatch)
         );
-        assert_eq!(
-            accept
-                .validate(&local, nonces(), &init)
-                .unwrap_err()
-                .failure_class(),
-            ZakuraFailureClass::PotentiallyPunitive
-        );
     }
 
     #[test]
@@ -2264,26 +2230,12 @@ mod tests {
             wrong_identity.validate(&expected),
             Err(ZakuraValidationError::IdentityMismatch)
         );
-        assert_eq!(
-            wrong_identity
-                .validate(&expected)
-                .unwrap_err()
-                .failure_class(),
-            ZakuraFailureClass::PotentiallyPunitive
-        );
 
         let mut wrong_transcript = decoded;
         wrong_transcript.legacy_upgrade_transcript = [5; 32];
         assert_eq!(
             wrong_transcript.validate(&expected),
             Err(ZakuraValidationError::TranscriptMismatch)
-        );
-        assert_eq!(
-            wrong_transcript
-                .validate(&expected)
-                .unwrap_err()
-                .failure_class(),
-            ZakuraFailureClass::PotentiallyPunitive
         );
 
         let native = ZakuraControlHello {

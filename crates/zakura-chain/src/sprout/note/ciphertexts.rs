@@ -43,7 +43,7 @@ impl PartialEq for EncryptedNote {
 impl Eq for EncryptedNote {}
 
 impl ZcashSerialize for EncryptedNote {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.0[..])?;
         Ok(())
     }

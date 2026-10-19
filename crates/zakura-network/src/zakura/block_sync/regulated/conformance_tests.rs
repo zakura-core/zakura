@@ -75,6 +75,10 @@ impl StreamConformance for GetBlocksConformance {
     fn page(_: &MessageRule, _: u32, _: u32) -> Message {
         unreachable!("GetBlocks has no subscriptions")
     }
+
+    fn read_page(_: &Message) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 stream_conformance_suite!(stream_six, block_sync_streams(), GetBlocksConformance);

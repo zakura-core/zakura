@@ -16,7 +16,7 @@ const DEFAULT_NETWORK_IDENTITY_DIR: &str = ".zakura";
 /// This cache directory configuration field is optional.
 /// It defaults to being enabled with the default config path,
 /// but also allows a custom path to be set.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(untagged)]
 pub enum CacheDir {
     /// Whether the cache directory is enabled with the default path (`true`),
@@ -25,6 +25,31 @@ pub enum CacheDir {
 
     /// Enable the cache directory and use a custom path.
     CustomPath(PathBuf),
+}
+
+impl<'de> serde::Deserialize<'de> for CacheDir {
+    /// Dispatches on the value's type instead of buffering it like `#[serde(untagged)]`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CacheDirVisitor;
+
+        impl serde::de::Visitor<'_> for CacheDirVisitor {
+            type Value = CacheDir;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or a cache directory path")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, enabled: bool) -> Result<CacheDir, E> {
+                Ok(CacheDir::IsEnabled(enabled))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, path: &str) -> Result<CacheDir, E> {
+                Ok(CacheDir::CustomPath(path.into()))
+            }
+        }
+
+        deserializer.deserialize_any(CacheDirVisitor)
+    }
 }
 
 impl From<bool> for CacheDir {

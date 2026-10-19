@@ -75,6 +75,8 @@ pub const fn max_connections_for_budget(
     let reserved = sockets.saturating_mul(SOCKET_DATAGRAM_QUEUE_BYTES);
     let connections = budget_bytes.saturating_sub(reserved) / connection_bytes;
     // Clamp before narrowing on targets where usize is smaller than u64.
+    // usize is at most 64 bits on every supported target, so widening
+    // usize::MAX to u64 is lossless.
     if connections > usize::MAX as u64 {
         usize::MAX
     } else {

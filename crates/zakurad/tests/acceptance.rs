@@ -1556,10 +1556,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> 
     // Test rpc endpoint response
     assert!(res.status().is_success());
 
-    let body = res.bytes().await;
-    let (body, mut child) = child.kill_on_error(body)?;
-
-    let parsed: Value = serde_json::from_slice(&body)?;
+    let parsed: Value = serde_json::from_slice(res.body())?;
 
     // Check that we have at least 4 characters in the `build` field.
     let build = parsed["result"]["build"].as_str().unwrap();
@@ -2356,8 +2353,7 @@ async fn fully_synced_rpc_z_getsubtreesbyindex_snapshot_test() -> Result<()> {
 
     for i in zcashd_test_vectors {
         let res = client.call("z_getsubtreesbyindex", i.1).await?;
-        let body = res.bytes().await;
-        let parsed: Value = serde_json::from_slice(&body.expect("Response is valid json"))?;
+        let parsed: Value = serde_json::from_slice(res.body())?;
         insta::assert_json_snapshot!(i.0, parsed);
     }
 
@@ -3947,19 +3943,9 @@ async fn generate_with_cookie(
         .trim()
         .split_once(':')
         .ok_or_else(|| eyre!("RPC cookie does not contain basic-auth credentials"))?;
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let response = reqwest::Client::builder()
-        .timeout(EXTENDED_LAUNCH_DELAY)
-        .build()?
-        .post(format!("http://{rpc_address}"))
-        .basic_auth(username, Some(password))
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"jsonrpc":"2.0","method":"generate","params":[{num_blocks}],"id":123}}"#
-        ))
-        .send()
-        .await?
-        .text()
+    let response = RpcRequestClient::new_with_timeout(rpc_address, EXTENDED_LAUNCH_DELAY)
+        .with_basic_auth(username, password)
+        .text_from_call("generate", format!("[{num_blocks}]"))
         .await?;
 
     let mut response: serde_json::Map<String, Value> = serde_json::from_str(&response)?;

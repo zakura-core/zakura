@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 mod cookie;
+mod http_client;
 mod http_request_compatibility;
 mod jsonrpc;
 mod listener;

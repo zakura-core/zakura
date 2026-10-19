@@ -789,7 +789,7 @@ impl BlockSyncReactor {
                 node_id_from_block_peer_id(&peer_id)
             })
             .collect();
-        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.sort_unstable();
         admitted_node_ids.dedup();
 
         let _ = self.candidates.send(ZakuraBlockSyncCandidateState {

@@ -264,6 +264,7 @@ where
         custom_services,
         peer_registry.clone(),
     )
+    .boxed()
     .await?;
     let zakura_startup_shutdown = zakura_endpoint
         .as_ref()
@@ -452,7 +453,10 @@ where
             ?active_initial_peer_count,
             "sending initial request for peers"
         );
-        let _ = candidates.update_initial(active_initial_peer_count).await;
+        let _ = candidates
+            .update_initial(active_initial_peer_count)
+            .boxed()
+            .await;
 
         // Compute remaining connections to open.
         let demand_count = config

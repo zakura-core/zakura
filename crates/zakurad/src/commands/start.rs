@@ -453,6 +453,7 @@ impl StartCmd {
             config.sync.checkpoint_verify_concurrency_limit
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
         )
+        .boxed()
         .await
         .map_err(|error| eyre!("state initialization failed: {error}"))?;
 
@@ -471,6 +472,7 @@ impl StartCmd {
                     read_only_state_service.clone(),
                     latest_chain_tip.clone(),
                 )
+                .boxed()
                 .await
                 .unwrap_or(zakura_network::zakura::BlockSyncFrontiers {
                     finalized_height: block::Height(0),
@@ -519,6 +521,7 @@ impl StartCmd {
                     &config.network.network,
                     &zakura_block_sync_handoff,
                 )
+                .boxed()
                 .await?,
             )
         } else {
@@ -611,6 +614,7 @@ impl StartCmd {
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
             )
+            .boxed()
             .await;
         node_tasks.track(&consensus_task_handles.state_checkpoint_verify_handle);
 
@@ -744,6 +748,7 @@ impl StartCmd {
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())
+                .boxed()
                 .await
                 .expect("server should start")
         } else {
@@ -753,6 +758,7 @@ impl StartCmd {
 
         let admin_rpc_task_handle = if config.rpc.admin_listen_addr.is_some() {
             RpcServer::start_admin(rpc_impl.clone(), config.rpc.clone())
+                .boxed()
                 .await
                 .expect("admin server should start")
         } else {
@@ -803,6 +809,7 @@ impl StartCmd {
                     latest_chain_tip.clone(),
                     mempool_transaction_subscriber.clone(),
                 )
+                .boxed()
                 .await
                 .map_err(|err| eyre!(err))?;
 
@@ -872,6 +879,7 @@ impl StartCmd {
             sync_status.clone(),
             address_book.clone(),
         )
+        .boxed()
         .await;
         node_tasks.track(&health_task_handle);
 

@@ -72,7 +72,7 @@ pub(crate) async fn run() -> Result<()> {
             .await?;
 
         assert!(res.status().is_success());
-        let res_text = res.text().await?;
+        let res_text = String::from_utf8_lossy(res.body());
 
         // Test rpc endpoint response
         assert!(

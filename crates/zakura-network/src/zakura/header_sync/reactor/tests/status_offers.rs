@@ -1734,6 +1734,98 @@ async fn saturated_status_queue_observes_snapshot_and_resumes_discovery() {
     churn.await.unwrap();
 }
 
+/// Queued peer work uses the final snapshot's generation even after its sender closes.
+#[tokio::test(start_paused = true)]
+async fn queued_status_uses_final_closed_snapshot_generation() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let (peer, _outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x78; 32]);
+    while handle
+        .try_send(Event::Status {
+            peer: peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, target),
+        })
+        .is_ok()
+    {}
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    snapshot.header_generation = snapshot.header_generation.checked_next().unwrap();
+    snapshots.send(Some(snapshot.clone())).unwrap();
+    drop(snapshots);
+    let mut running = Box::pin(reactor.run());
+    assert!(futures::poll!(running.as_mut()).is_pending());
+    let scope = expect_locator_query(&mut actions, &peer, target);
+    assert_eq!(scope.header_generation, snapshot.header_generation);
+    shutdown.cancel();
+    running.await;
+}
+
+/// Closed watches deliver their final unseen values before a busy peer queue is drained.
+#[tokio::test(start_paused = true)]
+async fn saturated_status_queue_observes_final_closed_watch_values() {
+    for (close_snapshots, close_repairs) in [(true, false), (false, true), (true, true)] {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+            startup.anchor.0,
+            startup.anchor.1,
+        ));
+        let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        let (repairs, repairs_rx) = watch::channel(Default::default());
+        startup.committed_snapshots = Some(snapshots_rx);
+        startup.vct_root_repairs = Some(repairs_rx);
+        let (handle, mut actions, reactor) = build_header_sync_reactor(startup).unwrap();
+        // Stale-session events keep the queue ready without triggering other state reads.
+        while handle
+            .try_send(Event::Status {
+                peer: peer(),
+                session_id: 0,
+                status: status_for(&snapshot, snapshot.frontiers.header_best.hash),
+            })
+            .is_ok()
+        {}
+        snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x77; 32]));
+        snapshots.send(Some(snapshot.clone())).unwrap();
+        repairs
+            .send(zakura_header_chain::VctRootRepairStatus {
+                state: zakura_header_chain::VctRootRepairState::Unavailable {
+                    height: block::Height(1),
+                },
+                generation: 7,
+            })
+            .unwrap();
+        let _snapshots = (!close_snapshots).then_some(snapshots);
+        let _repairs = (!close_repairs).then_some(repairs);
+        let mut running = Box::pin(reactor.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(
+            handle.tip.borrow().1,
+            snapshot.frontiers.header_best.hash,
+            "the final snapshot is observed with closed watches {close_snapshots}/{close_repairs}"
+        );
+        assert!(
+            matches!(
+                actions.try_recv(),
+                Ok(HeaderPortOperation::QueryVctRepairContext { height, .. })
+                    if height == block::Height(1)
+            ),
+            "the final repair is observed with closed watches {close_snapshots}/{close_repairs}"
+        );
+        shutdown.cancel();
+        running.await;
+    }
+}
+
 /// The flood benchmark also covers the repair state that previously rebuilt the peer set.
 #[tokio::test(start_paused = true)]
 async fn status_flood_during_context_backoff_keeps_supplier_history() {

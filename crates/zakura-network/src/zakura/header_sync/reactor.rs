@@ -840,18 +840,27 @@ impl HeaderSyncReactor {
                 self.handle_port_completion(completion);
             }
             // Inspect watches on every turn, even when peer queues never become empty.
+            // `changed` delivers a final unseen value before reporting channel closure.
             if let Some(snapshots) = committed_snapshots.as_mut() {
-                if snapshots.has_changed().unwrap_or(false) {
-                    let snapshot = snapshots.borrow_and_update().clone();
-                    if let Some(snapshot) = snapshot {
-                        self.observe_latest_committed_snapshot(snapshot);
+                match snapshots.changed().now_or_never() {
+                    Some(Ok(())) => {
+                        let snapshot = snapshots.borrow_and_update().clone();
+                        if let Some(snapshot) = snapshot {
+                            self.observe_latest_committed_snapshot(snapshot);
+                        }
                     }
+                    Some(Err(_)) => committed_snapshots = None,
+                    None => {}
                 }
             }
             if let Some(repairs) = vct_root_repairs.as_mut() {
-                if repairs.has_changed().unwrap_or(false) {
-                    let status = *repairs.borrow_and_update();
-                    self.observe_vct_root_repair(status);
+                match repairs.changed().now_or_never() {
+                    Some(Ok(())) => {
+                        let status = *repairs.borrow_and_update();
+                        self.observe_vct_root_repair(status);
+                    }
+                    Some(Err(_)) => vct_root_repairs = None,
+                    None => {}
                 }
             }
             // One item from each queue per turn prevents either queue monopolizing the loop.

@@ -41,6 +41,16 @@ use crate::zakura::{
     ZakuraPeerId,
 };
 
+/// Inputs that can make a previously blocked ordinary offer eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SchedulingOpportunity {
+    policy_revision: u64,
+    queue_revision: u64,
+    claimed_headers: usize,
+    available_locators: usize,
+    resource_stalled: bool,
+}
+
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Hard deadline for one VCT repair prepare or apply operation.
@@ -183,6 +193,8 @@ fn build_header_sync_reactor(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
+        scheduling_revision: 0,
+        last_scheduling_opportunity: None,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -290,6 +302,8 @@ struct HeaderSyncReactor {
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<tokio::sync::Semaphore>,
     locator_capacity_waiting: bool,
+    scheduling_revision: u64,
+    last_scheduling_opportunity: Option<SchedulingOpportunity>,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -720,6 +734,7 @@ impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
+        let mut capacity_releases = self.peer_work_queue.capacity_releases();
         let terminal_outcome = loop {
             if self
                 .vct_local_operation
@@ -750,6 +765,7 @@ impl HeaderSyncReactor {
                     drop(permit.expect("the locator semaphore is never closed"));
                     self.locator_capacity_waiting = false;
                 },
+                _ = capacity_releases.changed() => {},
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
@@ -939,6 +955,7 @@ impl HeaderSyncReactor {
         // The replaced session's `Close` dies with it.
         self.close_deadlines.remove(&peer);
         self.pending_closes.remove(&peer);
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         if let Some(previous) = self.peer_state.insert(
             peer.clone(),
             PeerState {
@@ -1021,7 +1038,9 @@ impl HeaderSyncReactor {
         if !owns_local_repair_operation {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
-        self.peer_state.remove(peer);
+        if self.peer_state.remove(peer).is_some() {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+        }
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.vct_supplier_order.retain(|queued| queued != peer);
@@ -1062,6 +1081,9 @@ impl HeaderSyncReactor {
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
+        // This offer is considered synchronously. If it remains blocked, changing
+        // its payload cannot make another peer eligible. Shared ownership and
+        // effective locator claims below invalidate the global pass when needed.
         self.consider_advertised_header_target(peer, session_id, status);
     }
 
@@ -1136,12 +1158,20 @@ impl HeaderSyncReactor {
         if !self.subscription_ready(&peer, target_tip_hash) {
             return;
         }
+        let previous_claim = self
+            .peer_work_queue
+            .awaiting_target(&peer)
+            .map(|target| self.pending_locator_header_count(&target.status));
+        let next_claim = self.pending_locator_header_count(&target.status);
         match self.peer_work_queue.stage_distinct_target(
             peer.clone(),
             target,
             PeerWorkPriority::from_work_order(work_order),
         ) {
             QueueWorkResult::NeedsLocator => {
+                if previous_claim.is_some_and(|claimed| claimed != next_claim) {
+                    self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+                }
                 self.spend_status(&peer);
                 if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                     peer: peer.clone(),
@@ -1164,12 +1194,23 @@ impl HeaderSyncReactor {
         }
     }
 
-    /// Stage the unspent statuses of idle peers into free ordinary slots.
-    ///
-    /// The reactor runs this after every event. A slot, headroom, or stall that any path
-    /// releases therefore reaches a waiting peer before the released peer's next status.
-    /// Staging spends a status, so this pass never retries a failed attempt by itself.
+    /// Compare root-owned opportunity state in constant time before inspecting offers.
+    fn scheduling_opportunity(&self) -> SchedulingOpportunity {
+        SchedulingOpportunity {
+            policy_revision: self.scheduling_revision,
+            queue_revision: self.peer_work_queue.scheduling_revision(),
+            claimed_headers: self.peer_work_queue.claimed_header_count(),
+            available_locators: self.locator_capacity.available_permits(),
+            resource_stalled: self.ordinary_discovery_paused(),
+        }
+    }
+
+    /// Stage idle unspent offers only after an eligibility input changes.
     fn schedule_cached_statuses(&mut self) {
+        let opportunity = self.scheduling_opportunity();
+        if self.last_scheduling_opportunity == Some(opportunity) {
+            return;
+        }
         let Some(local) = self.committed_snapshot.as_ref() else {
             return;
         };
@@ -1184,6 +1225,14 @@ impl HeaderSyncReactor {
             self.locator_capacity_waiting = true;
             return;
         }
+        let peers = self.peer_state.len();
+        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+            row.insert(
+                hs_trace::EVENT.into(),
+                hs_trace::HEADER_CACHED_OFFER_PASS.into(),
+            );
+            row.insert(hs_trace::PEERS_CONSIDERED.into(), peers.into());
+        });
         let mut offers: Vec<_> = self
             .peer_state
             .iter()
@@ -1223,6 +1272,9 @@ impl HeaderSyncReactor {
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
+        // Retain the pre-pass key: an external lease can drop while we scan.
+        // Recording a fresh key here would swallow that release's wakeup.
+        self.last_scheduling_opportunity = Some(opportunity);
     }
 
     /// Whether `peer`'s session can start work toward `target`: it holds no
@@ -1255,6 +1307,7 @@ impl HeaderSyncReactor {
 
     /// Return an unstarted ordinary offer to the scheduler when a local blocker defers it.
     fn defer_ordinary_target(&mut self, peer: &ZakuraPeerId) {
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         self.peer_work_queue.remove_unstarted(peer);
         if let Some(state) = self.peer_state.get_mut(peer) {
             state.status_spent = false;
@@ -1285,11 +1338,7 @@ impl HeaderSyncReactor {
             .peer_work_queue
             .awaiting_targets()
             .filter(|(owner, _)| *owner != peer)
-            .map(|(_, target)| {
-                usize::try_from(self.negotiated_response_limits(&target.status).1)
-                    .unwrap_or(usize::MAX)
-                    .min(MAX_HEADER_CHUNK_RESERVATION_V1)
-            })
+            .map(|(_, target)| self.pending_locator_header_count(&target.status))
             .fold(0, usize::saturating_add);
         let claimed = self
             .peer_work_queue
@@ -1361,6 +1410,7 @@ impl HeaderSyncReactor {
             AuxSchema::V1 => {
                 pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
                 state.status_spent = false;
+                self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
                 metrics::counter!("sync.header.target.aux_fallback").increment(1);
             }
             AuxSchema::None => {
@@ -1370,6 +1420,13 @@ impl HeaderSyncReactor {
                 }
             }
         }
+    }
+
+    /// The effective virtual claim used by ordinary headroom and cache invalidation.
+    fn pending_locator_header_count(&self, status: &Status) -> usize {
+        usize::try_from(self.negotiated_response_limits(status).1)
+            .unwrap_or(usize::MAX)
+            .min(MAX_HEADER_CHUNK_RESERVATION_V1)
     }
 
     /// Return the response schema and the most headers that one response from `status`'s
@@ -1750,6 +1807,9 @@ impl HeaderSyncReactor {
     /// arrives. An outcome for work that already holds its pages, or for a
     /// subscription this node closed, changes nothing.
     fn handle_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, ended: Ended) {
+        // A terminal outcome lets the session open again, which an offer held
+        // by `Self::subscription_ready` waits for.
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         // The session holds one live or closing subscription, so this is the
         // outcome of any `Close` this node sent it.
         if self
@@ -2821,6 +2881,7 @@ impl HeaderSyncReactor {
             return;
         }
 
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         let header_authority_changed = self.committed_snapshot.as_ref().is_some_and(|old| {
             old.header_generation != snapshot.header_generation
                 || old.frontiers.finalized != snapshot.frontiers.finalized

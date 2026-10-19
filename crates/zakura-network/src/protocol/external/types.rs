@@ -167,8 +167,8 @@ pub struct Nonce(pub u64);
 
 impl Default for Nonce {
     fn default() -> Self {
-        use rand::{thread_rng, Rng};
-        Self(thread_rng().gen())
+        use rand_10::{rng as thread_rng, RngExt};
+        Self(thread_rng().random())
     }
 }
 

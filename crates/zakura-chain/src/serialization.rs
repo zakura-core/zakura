@@ -50,10 +50,14 @@ pub use error::SerializationError;
 pub use read_zcash::ReadZcashExt;
 pub use reader::{LimitedReader, ZcashReader};
 pub use write_zcash::WriteZcashExt;
+pub(crate) use zcash_deserialize::compile_deserialize_entry_points_here;
 pub use zcash_deserialize::{
     zcash_deserialize_bytes_external_count, zcash_deserialize_external_count,
     zcash_deserialize_string_external_count, TrustedPreallocate, ZcashDeserialize,
     ZcashDeserializeInto,
+};
+pub(crate) use zcash_serialize::{
+    compile_serialize_entry_points_here, serialized_size_with_fake_writer,
 };
 pub use zcash_serialize::{
     zcash_serialize_bytes, zcash_serialize_bytes_external_count, zcash_serialize_empty_list,

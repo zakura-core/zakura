@@ -11,7 +11,7 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use rand::seq::SliceRandom;
+use rand_10::seq::SliceRandom;
 use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zakura_chain::{
@@ -2025,7 +2025,7 @@ impl ZakuraDiscoveryHandle {
         let now = current_unix_secs();
         let inner = self.inner.lock().await;
         let wanted_services = bounded_services(wanted_services, book_limits);
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_10::rng();
         inner.book.dial_candidates(
             limit,
             &wanted_services,
@@ -2068,7 +2068,7 @@ impl ZakuraDiscoveryHandle {
         let connected_node_ids = connected_peer_node_ids(&connected);
         let now = current_unix_secs();
         let inner = self.inner.lock().await;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand_10::rng();
         inner.book.dial_candidates(
             limit,
             &[],
@@ -2539,7 +2539,7 @@ impl ZakuraDiscoveryBook {
             .map(|entry| entry.record.clone())
             .collect();
         // The order would reveal each record's place in the snapshot.
-        records.shuffle(&mut rand::thread_rng());
+        records.shuffle(&mut rand_10::rng());
         records
     }
 
@@ -2596,7 +2596,7 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
-        node_ids.shuffle(&mut rand::thread_rng());
+        node_ids.shuffle(&mut rand_10::rng());
         node_ids
     }
 
@@ -2617,7 +2617,7 @@ impl ZakuraDiscoveryBook {
 
     /// Returns bounded dial candidates for later dial-loop code.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn dial_candidates<R: rand::Rng + ?Sized>(
+    pub(crate) fn dial_candidates<R: rand_10::Rng + ?Sized>(
         &self,
         limit: usize,
         required_services: &[ZakuraServiceId],
@@ -3212,12 +3212,12 @@ type DialCandidateSortKey = (
 /// candidate and fed to a bounded top-k selection instead of a full sort, which keeps expensive
 /// per-book ordering work bounded under the global discovery mutex (finding
 /// `claude-discovery-expensive-work-under-global-mutex`).
-fn dial_candidate_sort_key<R: rand::Rng + ?Sized>(
+fn dial_candidate_sort_key<R: rand_10::Rng + ?Sized>(
     candidate: &DialCandidateRef<'_>,
     rng: &mut R,
 ) -> DialCandidateSortKey {
     let non_static_random_tie = if !candidate.is_static() {
-        rng.gen::<u64>()
+        rand_10::RngExt::random::<u64>(rng)
     } else {
         0
     };
@@ -4015,7 +4015,7 @@ fn reject_trailing(bytes: &[u8], reader: &Cursor<&[u8]>) -> Result<(), Discovery
 mod tests {
     use std::{net::IpAddr, time::Duration};
 
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand_10::{rngs::StdRng, SeedableRng};
     use zakura_quic::NodeSecretKey;
 
     use super::*;

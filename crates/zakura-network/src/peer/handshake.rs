@@ -16,7 +16,7 @@ use std::{
 use chrono::{TimeZone, Utc};
 use futures::{channel::oneshot, future, pin_mut, FutureExt, SinkExt, StreamExt};
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -1220,7 +1220,7 @@ where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut upgrade_nonce);
 
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -1342,7 +1342,7 @@ where
     };
 
     let mut responder_upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut responder_upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut responder_upgrade_nonce);
 
     let accept = P2pV2UpgradeAccept {
         magic: PRELUDE_MAGIC,

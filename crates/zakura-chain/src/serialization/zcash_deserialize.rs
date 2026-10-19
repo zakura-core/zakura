@@ -57,6 +57,25 @@ pub trait ZcashDeserialize: Sized {
     ) -> Result<Self, SerializationError>;
 }
 
+/// Compiles a type's slice decoder once, in this crate.
+///
+/// [`ZcashDeserialize::zcash_deserialize_from_slice`] is generic over `Self`, so
+/// every crate that calls it compiles its own copy of the type's whole decoder.
+/// Expanding this macro inside a type's `ZcashDeserialize` impl overrides it with
+/// a non-generic method that other crates call instead. Use it for types with
+/// large decoders that other crates decode, such as blocks and transactions.
+macro_rules! compile_deserialize_entry_points_here {
+    () => {
+        #[inline(never)]
+        fn zcash_deserialize_from_slice(
+            bytes: &mut &[u8],
+        ) -> Result<Self, $crate::serialization::SerializationError> {
+            Self::zcash_deserialize_from(&mut $crate::serialization::ZcashReader::from_slice(bytes))
+        }
+    };
+}
+pub(crate) use compile_deserialize_entry_points_here;
+
 /// Deserialize a `Vec`, where the number of items is set by a CompactSize
 /// prefix in the data. This is the most common format in Zcash.
 ///

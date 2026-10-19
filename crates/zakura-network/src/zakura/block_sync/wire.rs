@@ -94,7 +94,7 @@ impl BlockSyncMessage {
                 bytes.write_u32::<LittleEndian>(*count)?;
             }
             Self::Block(block) => {
-                block.zcash_serialize(&mut bytes)?;
+                block.zcash_serialize_into_vec(&mut bytes)?;
                 validate_encoded_block_len(
                     bytes.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
                 )?;

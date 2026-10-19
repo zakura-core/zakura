@@ -144,6 +144,13 @@ impl port::Port for PendingVctLocalPort {
             }
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> port::HeaderChainFuture<'_, Result<port::SelectedChainMembership, port::PortError>> {
+        Box::pin(async { Ok(port::SelectedChainMembership::NotRetained) })
+    }
 }
 
 fn seed_vct_active_request(

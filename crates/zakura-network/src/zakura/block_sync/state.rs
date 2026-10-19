@@ -60,6 +60,10 @@ pub struct BlockSyncStartup {
     pub state_queries_enabled: bool,
     /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
+    /// The verifier's last checkpoint height. When set, the submission window
+    /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
+    /// decoded blocks. `None` keeps the count-only window.
+    pub max_checkpoint_height: Option<block::Height>,
 }
 
 impl BlockSyncStartup {
@@ -83,6 +87,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -106,6 +111,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -149,6 +155,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 }

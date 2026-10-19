@@ -1,7 +1,5 @@
 //! Version-one value codecs for the fork-aware header-chain column families.
 
-#![allow(dead_code)] // The serialized state adapter consumes these codecs in PR-8.
-
 use std::{num::NonZeroU64, sync::Arc};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -11,7 +9,7 @@ use zakura_chain::{
     ironwood, orchard,
     parameters::NetworkKind,
     sapling,
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
     work::difficulty::U256,
 };
 use zakura_header_chain::{
@@ -19,7 +17,7 @@ use zakura_header_chain::{
     BodyWorkAuthority, BodyWorkOwner, BranchId, ChainScore, ConsensusInvalidBodyTombstone,
     EligibilityReason, EligibilityState, EngineMetadata, EngineMode, EvidenceId, FinalityEpoch,
     FinalityHistoryCheckpoint, FinalityRecord, FinalitySource, Frontier, FrontierSet,
-    HeaderChainDiskVersion, HeaderContextFact, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
+    HeaderChainDiskVersion, HeaderGeneration, HeaderNode, HeaderSyncWorkOwner,
     HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner, OperatorInvalidationId, SourceId,
     StateVersion, SuffixWork, TransitionDomain, TransitionFingerprint, TreeAuxRecordV1,
     UntrustedAuxDeliveryRow, VerifiedGeneration, WorkCoordinate,
@@ -978,8 +976,7 @@ impl HeaderNodeDisk {
     ) -> Result<(Self, zakura_header_chain::HashedHeader), HeaderChainValueError> {
         let mut decoder = Decoder::new(bytes);
         let header_bytes = decoder.bounded("header", MAX_HEADER_BYTES)?;
-        let header: block::Header = header_bytes
-            .zcash_deserialize_into()
+        let header = block::Header::zcash_deserialize_from_slice(&mut &header_bytes[..])
             .map_err(|_| HeaderChainValueError::Header)?;
         let hash = block::Hash(decoder.array()?);
         let hashed = zakura_header_chain::HashedHeader::new(Arc::new(header));
@@ -1585,8 +1582,9 @@ pub struct HeaderValidationContextDisk {
 
 impl HeaderValidationContextDisk {
     /// Return the contextual validation fact authenticated by this row.
-    pub fn fact(&self) -> HeaderContextFact {
-        HeaderContextFact {
+    #[cfg(test)]
+    pub fn fact(&self) -> zakura_header_chain::HeaderContextFact {
+        zakura_header_chain::HeaderContextFact {
             frontier: Frontier::new(self.height, self.header.hash()),
             header: self.header.clone(),
         }
@@ -1600,7 +1598,11 @@ impl FallibleDiskValue for HeaderValidationContextDisk {
         let mut encoder = Encoder::default();
         let header_start = encoder.0.len();
         encoder.u32(0);
-        if self.header.zcash_serialize(&mut encoder.0).is_err() {
+        if self
+            .header
+            .zcash_serialize_into_vec(&mut encoder.0)
+            .is_err()
+        {
             encoder.0.truncate(header_start);
             return Err(HeaderChainValueError::Header);
         }
@@ -1626,9 +1628,8 @@ impl FallibleDiskValue for HeaderValidationContextDisk {
 
     fn decode(bytes: &[u8]) -> Result<Self, HeaderChainValueError> {
         let mut decoder = Decoder::new(bytes);
-        let header: block::Header = decoder
-            .bounded("context_header", MAX_HEADER_BYTES)?
-            .zcash_deserialize_into()
+        let mut header_bytes = decoder.bounded("context_header", MAX_HEADER_BYTES)?;
+        let header = block::Header::zcash_deserialize_from_slice(&mut header_bytes)
             .map_err(|_| HeaderChainValueError::Header)?;
         let height = block::Height(decoder.u32()?);
         decoder.finish()?;

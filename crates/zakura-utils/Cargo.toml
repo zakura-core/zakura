@@ -67,7 +67,6 @@ eyre = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"], optional = true }
 hex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true, optional = true }
 

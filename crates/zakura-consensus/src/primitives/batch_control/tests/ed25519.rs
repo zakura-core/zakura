@@ -16,7 +16,7 @@ use eyre::{eyre, Report};
 use futures::stream::{FuturesOrdered, StreamExt};
 use futures::FutureExt;
 use futures_core::Future;
-use rand::thread_rng;
+use rand_core::OsRng;
 use tokio::sync::{oneshot::error::RecvError, watch};
 use tower::{Service, ServiceExt};
 
@@ -92,7 +92,7 @@ impl Verifier {
     /// Synchronously process the batch, and send the result using the channel sender.
     /// This function blocks until the batch is completed.
     fn verify(batch: BatchVerifier, tx: Sender) {
-        let result = batch.verify(thread_rng());
+        let result = batch.verify(OsRng);
         let _ = tx.send(Some(result));
     }
 
@@ -111,7 +111,7 @@ impl Verifier {
     /// This function returns a future that becomes ready when the batch is completed.
     async fn flush_spawning(batch: BatchVerifier, tx: Sender) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        let _ = tx.send(spawn_fifo(move || batch.verify(thread_rng())).await.ok());
+        let _ = tx.send(spawn_fifo(move || batch.verify(OsRng)).await.ok());
     }
 }
 
@@ -191,7 +191,7 @@ async fn spawn_fifo<
 // =============== testing code ========
 
 fn signed_item(is_valid: bool) -> Item {
-    let sk = SigningKey::new(thread_rng());
+    let sk = SigningKey::new(OsRng);
     let vk_bytes = VerificationKeyBytes::from(&sk);
     let msg = b"BatchVerifyTest";
     let sig = if is_valid {
@@ -209,7 +209,7 @@ async fn sign_and_verify_after_try_flush(
 ) -> Result<(), BoxError> {
     let mut results = FuturesOrdered::new();
     for _ in 0..n {
-        let sk = SigningKey::new(thread_rng());
+        let sk = SigningKey::new(OsRng);
         let vk_bytes = VerificationKeyBytes::from(&sk);
         let msg = b"BatchVerifyTest";
         let sig = sk.sign(&msg[..]);

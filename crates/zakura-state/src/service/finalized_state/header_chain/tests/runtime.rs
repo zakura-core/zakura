@@ -440,6 +440,116 @@ fn serving_leases_do_not_block_a_better_work_branch() {
 }
 
 #[test]
+fn selected_chain_membership_spans_the_finalized_boundary_and_follows_a_reorg() {
+    use zakura_node_services::header_chain::SelectedChainMembership::{
+        NotRetained, NotSelected, Selected,
+    };
+    // Heights 1 through 3 are finalized, and 4 through 6 are retained above them.
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let membership = |header: &VerifiedHeaderRef| {
+        reader
+            .selected_chain_membership(header.hash)
+            .expect("the membership query reads coherent state")
+    };
+    let selected = |header: &VerifiedHeaderRef| Selected(Frontier::new(header.height, header.hash));
+    for header in std::iter::once(&genesis).chain(&path) {
+        assert_eq!(membership(header), selected(header));
+    }
+    assert_eq!(
+        reader
+            .selected_chain_membership(block::Hash([0xab; 32]))
+            .unwrap(),
+        NotRetained
+    );
+
+    // Finality moves to height 5, so height 4 now answers from the finalized index.
+    finalize_serving_test_path(&runtime, &db, &path[3..5]);
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.finalized,
+        Frontier::new(path[4].height, path[4].hash)
+    );
+    assert!(
+        runtime
+            .transition_engine
+            .lock()
+            .unwrap()
+            .graph()
+            .header_node(path[3].hash)
+            .is_none(),
+        "finality pruned height 4 from the retained graph"
+    );
+    for header in std::iter::once(&genesis).chain(&path) {
+        assert_eq!(membership(header), selected(header));
+    }
+
+    // A two-header branch from height 5 has more work and replaces height 6.
+    let validation = reader.validation_context(path[4].hash).unwrap().unwrap();
+    let rules = HeaderRules::for_validation_lease(&validation).unwrap();
+    let parent = Frontier::new(path[4].height, path[4].hash);
+    let mut branch = Vec::new();
+    let mut previous = path[4].header.clone();
+    for marker in [0xf1, 0xf2] {
+        let mut header = *previous;
+        header.previous_block_hash = previous.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[31] = marker;
+        let header = Arc::new(header);
+        branch.push(header.clone());
+        previous = header;
+    }
+    let snapshot = runtime.publisher().snapshot();
+    let target = previous.hash();
+    assert_eq!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&snapshot, target, 1, 1),
+                        source: SourceId::from_digest([0xee; 32]),
+                        parent_hash: parent.hash,
+                        target_tip_hash: target,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: parent,
+                        },
+                        batch: zakura_header_chain::prepare_headers(
+                            HeaderBatchInput::new(&branch),
+                            parent,
+                            &rules,
+                            &SystemClock,
+                        )
+                        .unwrap(),
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &runtime.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .unwrap(),
+        ApplyResult::Committed
+    );
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.header_best.hash,
+        target
+    );
+    assert_eq!(membership(&path[5]), NotSelected);
+    for header in std::iter::once(&genesis).chain(&path[..5]) {
+        assert_eq!(membership(header), selected(header));
+    }
+    for (header, height) in branch.iter().zip([6, 7]) {
+        assert_eq!(
+            reader.selected_chain_membership(header.hash()).unwrap(),
+            Selected(Frontier::new(block::Height(height), header.hash()))
+        );
+    }
+}
+
+#[test]
 fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();

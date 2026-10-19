@@ -35,6 +35,7 @@ struct HeaderChunkUsage {
 struct HeaderChunkBudgetInner {
     capacity: usize,
     usage: Mutex<HeaderChunkUsage>,
+    released: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,7 @@ impl Default for HeaderChunkBudget {
         Self(Arc::new(HeaderChunkBudgetInner {
             capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
             usage: Mutex::new(HeaderChunkUsage::default()),
+            released: tokio::sync::watch::channel(0).0,
         }))
     }
 }
@@ -132,6 +134,11 @@ impl HeaderChunkBudget {
         debug_assert!(usage.reserved >= count);
         usage.reserved = usage.reserved.saturating_sub(count);
         self.publish(*usage);
+        if count != 0 {
+            self.0
+                .released
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     fn release_owned(&self, count: usize) {
@@ -143,6 +150,11 @@ impl HeaderChunkBudget {
         debug_assert!(usage.owned >= count);
         usage.owned = usage.owned.saturating_sub(count);
         self.publish(*usage);
+        if count != 0 {
+            self.0
+                .released
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     fn publish(&self, usage: HeaderChunkUsage) {
@@ -421,6 +433,7 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
+    scheduling_revision: u64,
     repair_episodes: HashMap<HeaderSyncWorkOwner, zakura_header_chain::AuxiliaryRequirementEpisode>,
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
@@ -428,6 +441,18 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
+    /// Changes to target ownership or awaiting/active state invalidate cached offers.
+    /// The reactor separately tracks effective virtual claims using negotiated limits.
+    pub(in crate::zakura::header_sync) fn scheduling_revision(&self) -> u64 {
+        self.scheduling_revision
+    }
+
+    pub(in crate::zakura::header_sync) fn capacity_releases(
+        &self,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        self.budget.0.released.subscribe()
+    }
+
     pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
     }
@@ -558,6 +583,11 @@ impl PeerWorkQueue {
                 } => {
                     self.request_reservations.remove(&peer);
                     self.staged_capacity.remove(&peer);
+                    // Replacing metadata or priority does not release a target.
+                    // The reactor tracks changes to the negotiated locator claim.
+                    if current.status.selected_tip_hash != target.status.selected_tip_hash {
+                        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+                    }
                     **current = target;
                     *current_priority = priority;
                     QueueWorkResult::NeedsLocator
@@ -586,6 +616,7 @@ impl PeerWorkQueue {
             };
             self.remove_all(&replace);
         }
+        self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
         self.work_by_peer.insert(
             peer,
             PeerWorkState::AwaitingLocator {
@@ -658,6 +689,7 @@ impl PeerWorkQueue {
             request.target.scope,
         ) == Some(&request.target);
         if matches && self.request_reservations.contains_key(&peer) {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
             self.work_by_peer
                 .insert(peer, PeerWorkState::Active(Box::new(request)));
             true
@@ -713,7 +745,11 @@ impl PeerWorkQueue {
     ) -> Option<ActiveHeaderRequest> {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        match self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+        }
+        match removed {
             Some(PeerWorkState::Active(request)) => {
                 self.repair_episodes.remove(&request.owner);
                 Some(*request)
@@ -779,7 +815,11 @@ impl PeerWorkQueue {
     fn remove_all(&mut self, peer: &ZakuraPeerId) {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        if let Some(PeerWorkState::Active(request)) = self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
+        }
+        if let Some(PeerWorkState::Active(request)) = removed {
             self.repair_episodes.remove(&request.owner);
         }
     }

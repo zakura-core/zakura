@@ -91,13 +91,6 @@ impl EvictionList {
         self.unique_entries.len()
     }
 
-    /// Clear the list.
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.unique_entries.clear();
-        self.ordered_entries.clear();
-    }
-
     /// Prune TXIDs that are older than `eviction_time` ago.
     ///
     // This method is public because ZIP-401 states about pruning:

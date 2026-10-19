@@ -8,7 +8,6 @@
 use std::sync::Once;
 
 use once_cell::sync::Lazy;
-use tracing_error::ErrorLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[allow(missing_docs)]
@@ -111,7 +110,6 @@ pub fn init() -> impl Drop {
             .with(filter_layer)
             .with(fmt_layer)
             .with(log_capture::LogCaptureLayer)
-            .with(ErrorLayer::default())
             .try_init()
             .ok();
 

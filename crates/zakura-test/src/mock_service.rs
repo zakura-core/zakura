@@ -62,13 +62,10 @@ use tokio::{
 };
 use tower::{BoxError, Service};
 
-/// The default size of the channel that forwards received requests.
+/// The size of the channel that forwards received requests.
 ///
 /// If requests are received faster than the test code can consume them, some requests may be
 /// ignored.
-///
-/// This value can be configured in the [`MockService`] using
-/// [`MockServiceBuilder::with_proxy_channel_size`].
 const DEFAULT_PROXY_CHANNEL_SIZE: usize = 100;
 
 /// The default timeout before considering a request has not been received.
@@ -102,7 +99,7 @@ type ProxyItem<Request, Response, Error> =
 ///
 /// The type is generic over the request and response types, and also has an extra generic type
 /// parameter that's used as a tag to determine if the internal assertions should panic or return
-/// errors for proptest minimization. See [`AssertionType`] for more information.
+/// errors for proptest minimization: [`PanicAssertion`] or [`PropTestAssertion`].
 ///
 /// The mock service can be cloned, and provides methods for checking the received requests as well
 /// as responding to them individually.
@@ -125,7 +122,6 @@ pub struct MockService<Request, Response, Assertion, Error = BoxError> {
 /// parameters should be reasonable for most cases.
 #[derive(Default)]
 pub struct MockServiceBuilder {
-    proxy_channel_size: Option<usize>,
     max_request_delay: Option<Duration>,
 }
 
@@ -189,31 +185,6 @@ impl MockService<(), (), ()> {
 }
 
 impl MockServiceBuilder {
-    /// Configure the size of the proxy channel used for sending intercepted requests.
-    ///
-    /// This determines the maximum amount of requests that are kept in queue before the oldest
-    /// request is dropped. This means that any tests that receive too many requests might ignore
-    /// some requests if this parameter isn't properly configured.
-    ///
-    /// The default value of 100 should be enough for most cases.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use zakura_test::mock_service::MockService;
-    /// #
-    /// let mock_service = MockService::build()
-    ///     .with_proxy_channel_size(100)
-    ///     .for_prop_tests();
-    /// #
-    /// # // Add types to satisfy the compiler's type inference.
-    /// # let typed_mock_service: MockService<(), (), _> = mock_service;
-    /// ```
-    pub fn with_proxy_channel_size(mut self, size: usize) -> Self {
-        self.proxy_channel_size = Some(size);
-        self
-    }
-
     /// Configure the time to wait for a request before considering no requests will be received.
     ///
     /// This determines the maximum amount of time that the [`MockService`] will wait for a request
@@ -268,10 +239,7 @@ impl MockServiceBuilder {
     pub fn finish<Request, Response, Assertion, Error>(
         self,
     ) -> MockService<Request, Response, Assertion, Error> {
-        let proxy_channel_size = self
-            .proxy_channel_size
-            .unwrap_or(DEFAULT_PROXY_CHANNEL_SIZE);
-        let (sender, receiver) = broadcast::channel(proxy_channel_size);
+        let (sender, receiver) = broadcast::channel(DEFAULT_PROXY_CHANNEL_SIZE);
 
         MockService {
             receiver,
@@ -701,7 +669,7 @@ impl<Request, Response, Assertion, Error> MockService<Request, Response, Asserti
     ///
     /// If too many requests are received and the queue fills up, the oldest requests are dropped
     /// and ignored. This means that calling this may not receive the next request if the queue is
-    /// not dimensioned properly with the [`MockServiceBuilder::with_proxy_channel_size`] method.
+    /// not dimensioned properly (see [`DEFAULT_PROXY_CHANNEL_SIZE`]).
     pub async fn try_next_request(&mut self) -> Option<ResponseSender<Request, Response, Error>> {
         loop {
             match timeout(self.max_request_delay, self.receiver.recv()).await {
@@ -921,84 +889,13 @@ impl<Request, Response, Error> ResponseSender<Request, Response, Error> {
         //       better supported by the compiler
         let _ = self.response_sender.send(Err(error));
     }
-
-    /// Respond to the request by calculating an error from the request.
-    ///
-    /// The `error` must be the `Error` type. This helps avoid type resolution issues in the
-    /// compiler.
-    ///
-    /// This method takes ownership of the [`ResponseSender`] so that only one response can be
-    /// sent.
-    ///
-    /// # Panics
-    ///
-    /// If one of the `respond*` methods isn't called, the [`MockService`] might panic with a
-    /// timeout error.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use zakura_test::mock_service::MockService;
-    /// # use tower::{Service, ServiceExt};
-    /// #
-    /// # #[derive(Debug, PartialEq, Eq)]
-    /// # struct Request;
-    /// # struct Response;
-    /// #
-    /// # let reactor = tokio::runtime::Builder::new_current_thread()
-    /// #     .enable_all()
-    /// #     .build()
-    /// #     .expect("Failed to build Tokio runtime");
-    /// #
-    /// # reactor.block_on(async {
-    /// // Mock a service with a `String` as the service `Error` type.
-    /// let mut mock_service: MockService<Request, Response, _, String> =
-    ///     MockService::build().for_unit_tests();
-    ///
-    /// # let mut service = mock_service.clone();
-    /// # let task = tokio::spawn(async move {
-    /// #     let first_call_result = (&mut service).oneshot(Request).await;
-    /// #     let second_call_result = service.oneshot(Request).await;
-    /// #
-    /// #     (first_call_result, second_call_result)
-    /// # });
-    /// #
-    /// mock_service
-    ///     .expect_request(Request)
-    ///     .await
-    ///     .respond_with_error(|req| format!("Duplicate request: {req:?}"));
-    /// # });
-    /// ```
-    pub fn respond_with_error<F>(self, response_fn: F)
-    where
-        F: FnOnce(&Request) -> Error,
-    {
-        // TODO: impl ResponseResult for BoxError/Error trait when overlapping impls are
-        //       better supported by the compiler
-        let response_result = Err(response_fn(self.request()));
-        let _ = self.response_sender.send(response_result);
-    }
 }
-
-/// A representation of an assertion type.
-///
-/// This trait is used to group the types of assertions that the [`MockService`] can do. There are
-/// currently two types that are used as type-system tags on the [`MockService`]:
-///
-/// - [`PanicAssertion`]
-/// - [`PropTestAssertion`]
-#[allow(dead_code)]
-trait AssertionType {}
 
 /// Represents normal Rust assertions that panic, like [`assert_eq`].
 pub enum PanicAssertion {}
 
 /// Represents [`mod@proptest`] assertions that return errors, like [`prop_assert_eq`].
 pub enum PropTestAssertion {}
-
-impl AssertionType for PanicAssertion {}
-
-impl AssertionType for PropTestAssertion {}
 
 /// A helper trait to improve ergonomics when sending a response.
 ///

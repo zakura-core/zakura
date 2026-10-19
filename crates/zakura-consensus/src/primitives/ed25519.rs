@@ -9,7 +9,7 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
-use rand::thread_rng;
+use rand_core::OsRng;
 
 use super::batch_control::{Batch, BatchControl, RequestWeight};
 use super::fallback::Fallback;
@@ -130,7 +130,7 @@ impl Verifier {
     /// Synchronously process the batch, and send the result using the channel sender.
     /// This function blocks until the batch is completed.
     fn verify(batch: BatchVerifier, tx: Sender) {
-        let result = batch.verify(thread_rng());
+        let result = batch.verify(OsRng);
         let _ = tx.send(Some(result));
     }
 
@@ -150,7 +150,7 @@ impl Verifier {
     async fn flush_spawning(batch: BatchVerifier, tx: Sender) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.verify(thread_rng())).await;
+        let result = spawn_fifo(move || batch.verify(OsRng)).await;
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {

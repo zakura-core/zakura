@@ -203,7 +203,10 @@ not by budget size. Zero config values are rejected.
 Resident memory plateaus near **`effective budget + the bounded decode window`**, plus
 process overhead and bounded transients. At the default 401-block submission window and
 a chain that decodes at about four times its wire size, the decoded contribution is
-approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. The peer
+approximately 401 × `MAX_BLOCK_BYTES` × `DESERIALIZED_MEM_FACTOR` ≈ 3.2 GB. Above the
+last checkpoint the window is also capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`
+(512 MiB) of decoded blocks: past the cap, bodies stay raw until earlier submissions finish,
+and the next body is always allowed when none of the window's bodies is submitted. The peer
 routine rejects a body whose transactions do not match its header's Merkle root, so the
 decoded window holds the real chain's blocks; a chain that decodes larger is charged its
 measured size. The [resource ledger](../../../../../docs/design/block-sync-resource-ledger.md)

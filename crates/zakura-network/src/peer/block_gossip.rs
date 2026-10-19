@@ -264,9 +264,9 @@ impl BlockGossipPeer {
 pub(crate) fn order_peers(
     peers: Vec<BlockGossipPeer>,
     mined: bool,
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand_10::Rng,
 ) -> Vec<BlockGossipPeer> {
-    use rand::seq::SliceRandom;
+    use rand_10::{seq::SliceRandom, RngExt};
     // Snapshot RTT once: heartbeat updates must not change comparisons during sorting.
     let mut peers: Vec<_> = peers
         .into_iter()
@@ -286,7 +286,7 @@ pub(crate) fn order_peers(
     let mut ordered: Vec<_> = peers.into_iter().map(|(_, _, peer)| peer).collect();
     for position in 1..=remaining.len() {
         let index = if mined && position % MINED_RANDOM_INTERVAL == 0 {
-            rng.gen_range(0..remaining.len())
+            rng.random_range(0..remaining.len())
         } else {
             0
         };
@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     use crate::{peer_registry::PeerRegistry, ConnectedPeer, Response};
     use futures::{FutureExt, StreamExt};
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand_10::{rngs::StdRng, SeedableRng};
 
     fn peer() -> (BlockGossipPeer, mpsc::Receiver<ClientRequest>) {
         let (sender, receiver) = mpsc::channel(0);

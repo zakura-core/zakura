@@ -2193,11 +2193,9 @@ impl Service<Request> for StateService {
 
             // Runs concurrently using the ReadStateService
             Request::Tip
-            | Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator
-            | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
@@ -3182,6 +3180,16 @@ impl Service<ReadRequest> for ReadStateService {
                     .transpose()?
                     .unwrap_or(false);
                 Ok(ReadResponse::RetainedHeaderPathReleased(released))
+            }
+
+            ReadRequest::SelectedChainMembership { hash } => {
+                let membership = match state.header_chain_reader_receiver.borrow().clone() {
+                    Some(reader) => reader.selected_chain_membership(hash)?,
+                    None => {
+                        zakura_node_services::header_chain::SelectedChainMembership::NotRetained
+                    }
+                };
+                Ok(ReadResponse::SelectedChainMembership(membership))
             }
 
             ReadRequest::BlockRoots {

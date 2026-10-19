@@ -18,11 +18,14 @@
 //! and no subscription ends because a lease expired. Each page after the first
 //! acquires with the last header sent as its only locator. State's
 //! continuation index answers that without a new ancestry walk only while the
-//! lease target stays the same. That holds on the path to the initial target.
-//! After it, the leases run from the last header sent to the tip of
-//! [`Port::selected_chain`], so each tip change costs one walk, and so does
-//! each lease [`still_selected`] takes. Local failures wait for an update, a
-//! selected-chain change, or a capacity release, never for a timer.
+//! lease target stays the same. On the path, the target is the initial target.
+//! After it, a run of pages pins the tip of [`Port::selected_chain`] it started
+//! toward and keeps leasing toward that tip until it reaches it, so a tip that
+//! moves every page still costs one walk per run, not one per page. Whether
+//! the selected chain still contains a header comes from
+//! [`Port::selected_chain_contains`], which walks nothing and takes no lease.
+//! Local failures wait for an update, a selected-chain change, or a capacity
+//! release, never for a timer.
 
 use std::{
     any::Any,
@@ -45,7 +48,7 @@ use zakura_header_chain::{
 };
 use zakura_node_services::header_chain::{
     AcquirePath, AcquirePathReply, Port, PortError, ReadPath, ReadPathReply, RetainedHeaderPath,
-    RetainedHeaderPathPage, ServingCapacitySignal,
+    RetainedHeaderPathPage, SelectedChainMembership, ServingCapacitySignal,
 };
 use zakura_node_services::task::spawn_erased;
 
@@ -73,10 +76,6 @@ pub(crate) use tests::FakePort;
 
 /// Lease attempts one page makes before it waits for a wake.
 const LEASE_ATTEMPTS: usize = 2;
-
-/// Leases one following page's recheck takes while the selected tip keeps
-/// moving; see [`still_selected`].
-const RECHECK_LEASES: usize = 2;
 
 /// The serving limits this node advertises in its `Status`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -165,6 +164,9 @@ struct Subscription {
     /// The `Open` locators, until the subscription reaches its target.
     locators: Vec<block::Hash>,
     position: Position,
+    /// The selected tip a following run leases toward until a page reaches
+    /// it, while the selected chain still contains it.
+    pin: Option<Frontier>,
     /// A selected tip that a check without page credit found extending the
     /// last header sent; see [`check_following`].
     checked_tip: Option<block::Hash>,
@@ -299,6 +301,7 @@ impl Shared {
                         fixed,
                         locators: update.locator_hashes.clone(),
                         position: Position::Path(None),
+                        pin: None,
                         checked_tip: None,
                         end: None,
                         stall: None,
@@ -458,19 +461,14 @@ impl Shared {
                 if count == 0 && subscription.checked_tip == Some(tip.hash) {
                     continue;
                 }
-                // A page must extend the last header. A check only needs to
-                // reach it, and a tip it already checked descends from it.
-                let locators = match subscription.checked_tip {
-                    Some(checked) if count == 0 => vec![checked, last.hash],
-                    _ => vec![last.hash],
-                };
                 Job {
                     id,
                     initial_target: subscription.fixed.target,
                     lease_target: tip.hash,
-                    locators,
+                    locators: vec![last.hash],
                     parent: Some(last),
-                    probe: None,
+                    probe: false,
+                    pin: subscription.pin.filter(|pin| count > 0 && *pin != tip),
                     following: true,
                     count,
                     schema,
@@ -493,9 +491,10 @@ impl Shared {
                     parent: last,
                     // Before the first page, check that the target is still
                     // selected.
-                    probe: selected
-                        .map(|selected| selected.frontiers.header_best)
-                        .filter(|tip| last.is_none() && tip.hash != target),
+                    probe: last.is_none()
+                        && selected
+                            .is_some_and(|selected| selected.frontiers.header_best.hash != target),
+                    pin: None,
                     following: false,
                     count,
                     schema,
@@ -512,7 +511,9 @@ impl Shared {
     ///
     /// A stall waits for the next selected-chain change, among other wakes,
     /// so it is not recorded when the chain `moved` since the job read it:
-    /// that change already passed, and the next pass retries at once.
+    /// that change already passed, and the next pass retries at once. Nor is
+    /// a check's tip, because state may have answered on a chain the
+    /// selection has since left, even if the tip hash is the same again.
     fn finish(&mut self, id: u64, output: Output, moved: bool) {
         match output {
             Output::ReachedAtOpen(target) => {
@@ -522,6 +523,7 @@ impl Shared {
                 }
             }
             Output::End(outcome) => self.queue_end(id, outcome),
+            Output::Extends(_) if moved => {}
             Output::Extends(tip) => {
                 if let Some(subscription) = self.subscriptions.get_mut(&id) {
                     subscription.checked_tip = Some(tip);
@@ -588,6 +590,7 @@ impl Shared {
         subscription.checked_tip = None;
         subscription.position = if page.reaches_target || subscription.position.reached() {
             subscription.locators = Vec::new();
+            subscription.pin = (page.target != page.last).then_some(page.target);
             Position::Following(page.last)
         } else {
             Position::Path(Some(page.last))
@@ -706,8 +709,12 @@ struct Job {
     /// The header the page must extend, once a page was sent or the target
     /// was reached.
     parent: Option<Frontier>,
-    /// A selected tip to check the initial target against, at the first page.
-    probe: Option<Frontier>,
+    /// Whether to check, at the first page, that the selected chain still
+    /// contains the initial target.
+    probe: bool,
+    /// An older selected tip a following page leases toward instead of
+    /// `lease_target`, if the selected chain still contains it.
+    pin: Option<Frontier>,
     following: bool,
     count: u32,
     schema: AuxSchema,
@@ -720,6 +727,8 @@ struct Job {
 struct Page {
     parent: Frontier,
     last: Frontier,
+    /// The lease target the page lies toward.
+    target: Frontier,
     count: u32,
     reaches_target: bool,
     frame: Frame,
@@ -910,8 +919,8 @@ async fn any_released(signals: Vec<ServingCapacitySignal>) {
 /// waits for execution slots alone.
 ///
 /// The job keeps its permit until the state read finishes, even if the
-/// session ends first. A following page whose selected tip moved meanwhile is
-/// checked by [`still_selected`] before it is sent.
+/// session ends first. A following page whose selected chain moved meanwhile
+/// is checked by [`still_selected`] before it is sent.
 fn start_page<'a, const HEADER_BYTES: usize>(
     task: &Task,
     job: Job,
@@ -924,7 +933,8 @@ fn start_page<'a, const HEADER_BYTES: usize>(
     let panics = task.panics.clone();
     let owner = task.owner;
     let id = job.id;
-    let leased_tip = job.following.then_some(job.lease_target);
+    let following = job.following;
+    let seen = job.selected.clone();
     let bytes = page_bytes(job.count, job.schema, HEADER_BYTES);
     let check = job.count == 0;
     Box::pin(async move {
@@ -962,75 +972,52 @@ fn start_page<'a, const HEADER_BYTES: usize>(
         let Ok(slot) = permit.reserve_send(send).await else {
             return Progress::Closed;
         };
-        if let Some(leased_tip) = leased_tip {
-            let last = page.last;
-            if !still_selected(&*check_port, &push, owner, id, &selected, leased_tip, last).await {
-                return Progress::Other(Output::Retry("left_selected_chain"));
-            }
+        if following && !still_selected(&*check_port, &push, id, &selected, seen, &page).await {
+            return Progress::Other(Output::Retry("left_selected_chain"));
         }
         Progress::Page(page, slot)
     })
 }
 
-/// Whether the latest selected chain still contains `last`, the last header
-/// of a following page leased toward `leased_tip`.
+/// Whether the latest selected chain still contains the last header of a
+/// following `page`, whose job read the selected chain `seen`.
 ///
-/// It checks only when the selected tip moved, and only a lease that confirms
-/// the page keeps it. Anything else drops the page, and the next pass leases
-/// again from the last header sent, where the usual stall and outcome rules
-/// apply. The lease is state work, so it waits for execution slots through
-/// `push` as the page's read did.
+/// It asks state only when the selected chain moved since `seen` and its tip
+/// is neither the page's lease target nor its last header. Only a reply that
+/// confirms the page keeps it. Anything else drops the page, and the next pass
+/// leases again from the last header sent, where the usual stall and outcome
+/// rules apply. The query is state work, so it waits for execution slots
+/// through `push` as the page's read did.
 ///
-/// The chain can move during that wait or the lease, so a lease whose tip is
-/// no longer selected is taken again toward the newer tip, at most
-/// [`RECHECK_LEASES`] times. After that the last verdict stands, judged
-/// against a tip at most one lease old, and the slots go back to other work.
-/// A reorganization can overtake any page after it is written anyway, and the
-/// next lease ends that subscription as superseded.
+/// One query is enough: state answers from its latest committed chain, which
+/// is at least as new as the watch. A reorganization can still overtake any
+/// page after it is written, and the next page ends that subscription as
+/// superseded.
 async fn still_selected(
     port: &dyn Port,
     push: &Push,
-    owner: LeaseOwner,
     id: u64,
     selected: &watch::Receiver<Option<EngineSnapshot>>,
-    leased_tip: block::Hash,
-    last: Frontier,
+    seen: Option<EngineSnapshot>,
+    page: &Page,
 ) -> bool {
-    let mut execution = None;
-    let mut leases = 0;
-    loop {
-        let Some(latest) = selected.borrow().clone() else {
-            return true;
-        };
-        let tip = latest.frontiers.header_best;
-        if tip.hash == leased_tip || tip == last {
-            return true;
-        }
-        if tip.height <= last.height {
-            return false;
-        }
-        if execution.is_none() {
-            execution = Some(push.execution().await);
-            continue;
-        }
-        let contains = match acquire(port, owner, Some(&latest), tip.hash, vec![last.hash]).await {
-            Ok(AcquirePathReply::Acquired(path)) => {
-                release(port, id, *path).await;
-                true
-            }
-            Ok(_) => false,
-            Err(error) => {
-                log_port_failure(id, "recheck", &error);
-                false
-            }
-        };
-        leases += 1;
-        let current = selected
-            .borrow()
-            .as_ref()
-            .map(|selected| selected.frontiers.header_best);
-        if current == Some(tip) || leases >= RECHECK_LEASES {
-            return contains;
+    let Some(latest) = selected.borrow().clone() else {
+        return true;
+    };
+    let tip = latest.frontiers.header_best;
+    if seen.as_ref() == Some(&latest) || tip == page.target || tip == page.last {
+        return true;
+    }
+    if tip.height <= page.last.height {
+        return false;
+    }
+    let _execution = push.execution().await;
+    match port.selected_chain_contains(page.last.hash).await {
+        Ok(SelectedChainMembership::Selected(found)) => found == page.last,
+        Ok(_) => false,
+        Err(error) => {
+            log_port_failure(id, "recheck", &error);
+            false
         }
     }
 }
@@ -1042,67 +1029,33 @@ async fn run_job<const HEADER_BYTES: usize>(
     job: &Job,
 ) -> Output {
     if job.count == 0 {
-        return check_following(port, owner, job).await;
+        return check_following(port, job).await;
     }
-    if let Some(tip) = job.probe {
-        let selected = job.selected.as_ref();
-        match acquire(port, owner, selected, tip.hash, vec![job.initial_target]).await {
-            Ok(AcquirePathReply::Acquired(path)) => {
-                let selected = path.common_ancestor.hash == job.initial_target;
-                release(port, job.id, *path).await;
-                if !selected {
-                    return Output::Stall(Stall::Local, "probe_ancestor");
-                }
+    if job.probe {
+        match port.selected_chain_contains(job.initial_target).await {
+            Ok(SelectedChainMembership::Selected(_)) => {}
+            Ok(SelectedChainMembership::NotSelected) => {
+                return Output::End(HeadersOutcomeCode::TargetNotSelected)
             }
-            Ok(
-                reply @ (AcquirePathReply::NoLocatorIntersection | AcquirePathReply::HistoryPruned),
-            ) => {
-                // The probe found the target off the selected chain, or
-                // behind pruned history that will not return. Tell a target
-                // this node never retained from either.
-                let found = if matches!(reply, AcquirePathReply::HistoryPruned) {
-                    HeadersOutcomeCode::HistoryPruned
-                } else {
-                    HeadersOutcomeCode::TargetNotSelected
-                };
-                let locators = job.locators.clone();
-                let path = acquire(port, owner, selected, job.lease_target, locators).await;
-                return match path {
-                    Ok(AcquirePathReply::Acquired(path)) => {
-                        release(port, job.id, *path).await;
-                        Output::End(found)
-                    }
-                    Ok(AcquirePathReply::TargetNotRetained) => {
-                        Output::End(HeadersOutcomeCode::TargetNotRetained)
-                    }
-                    Ok(AcquirePathReply::CapacityBusy(signal)) => {
-                        Output::Stall(Stall::Capacity(signal), "capacity")
-                    }
-                    // The probe already settled the outcome.
-                    Ok(_) => Output::End(found),
-                    Err(error) => {
-                        log_port_failure(job.id, "target_retained", &error);
-                        Output::End(found)
-                    }
-                };
+            Ok(SelectedChainMembership::NotRetained) => {
+                return Output::End(HeadersOutcomeCode::TargetNotRetained)
             }
-            Ok(AcquirePathReply::CapacityBusy(signal)) => {
-                return Output::Stall(Stall::Capacity(signal), "capacity")
-            }
-            Ok(_) => return Output::Stall(Stall::Local, "probe"),
             Err(error) => return port_failure(job.id, "probe", &error),
         }
     }
+    // Keep leasing toward the pinned tip while it is selected, so the lease
+    // reuses state's continuation. Otherwise start a new run toward the tip.
+    let lease_target = match job.pin {
+        Some(pin) => match port.selected_chain_contains(pin.hash).await {
+            Ok(SelectedChainMembership::Selected(found)) if found == pin => pin.hash,
+            Ok(_) => job.lease_target,
+            Err(error) => return port_failure(job.id, "pin", &error),
+        },
+        None => job.lease_target,
+    };
     for _ in 0..LEASE_ATTEMPTS {
         let locators = job.locators.clone();
-        let reply = acquire(
-            port,
-            owner,
-            job.selected.as_ref(),
-            job.lease_target,
-            locators,
-        )
-        .await;
+        let reply = acquire(port, owner, job.selected.as_ref(), lease_target, locators).await;
         let path = match reply {
             Ok(AcquirePathReply::Acquired(path)) => *path,
             Ok(AcquirePathReply::CapacityBusy(signal)) => {
@@ -1183,34 +1136,17 @@ fn log_port_failure(id: u64, operation: &'static str, error: &PortError) {
 /// keep page credit after its target, and the publisher still owes it
 /// `SubscriptionSuperseded` when the chain stops extending that header.
 ///
-/// The job's locators are the last header and any tip a check already found
-/// extending it. Hash ancestry never changes, so reaching either one shows the
-/// new tip extends the last header, and the walk stops at the nearer one.
-async fn check_following(port: &dyn Port, owner: LeaseOwner, job: &Job) -> Output {
-    let reply = acquire(
-        port,
-        owner,
-        job.selected.as_ref(),
-        job.lease_target,
-        job.locators.clone(),
-    )
-    .await;
-    match reply {
-        Ok(AcquirePathReply::Acquired(path)) => {
-            release(port, job.id, *path).await;
+/// The selected tip is above the last header, so the chain extends that
+/// header exactly when it contains it.
+async fn check_following(port: &dyn Port, job: &Job) -> Output {
+    let last = job
+        .parent
+        .expect("a following subscription has sent or reached a header");
+    match port.selected_chain_contains(last.hash).await {
+        Ok(SelectedChainMembership::Selected(found)) if found == last => {
             Output::Extends(job.lease_target)
         }
-        Ok(AcquirePathReply::NoLocatorIntersection) => {
-            Output::End(HeadersOutcomeCode::SubscriptionSuperseded)
-        }
-        // `in_window` turns this into `SubscriptionSuperseded`.
-        Ok(AcquirePathReply::HistoryPruned) => Output::End(HeadersOutcomeCode::HistoryPruned),
-        Ok(AcquirePathReply::CapacityBusy(signal)) => {
-            Output::Stall(Stall::Capacity(signal), "capacity")
-        }
-        Ok(AcquirePathReply::TargetNotRetained | AcquirePathReply::Busy) => {
-            Output::Stall(Stall::Local, "selected_tip")
-        }
+        Ok(_) => Output::End(HeadersOutcomeCode::SubscriptionSuperseded),
         Err(error) => port_failure(job.id, "check", &error),
     }
 }
@@ -1329,6 +1265,7 @@ fn page_output<const HEADER_BYTES: usize>(job: &Job, page: RetainedHeaderPathPag
             Output::Page(Page {
                 parent: page.common_ancestor,
                 last,
+                target: page.target,
                 count: sent,
                 reaches_target,
                 frame,

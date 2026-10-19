@@ -161,6 +161,8 @@ Cadence exhaustion still records and forwards, so one peer can keep sending. The
 over a tight flood, not a per-message cap. Each of the first 32 changed keys, and one per millisecond
 after each pass ends, still pays a full pass of about 100 µs at 512 sessions, so full passes take at
 most about 9% of the reactor. At the 2.1 µs average, it takes about 475,000 statuses per second,
-roughly 57 MB/s from one peer, to saturate the reactor with 512 sessions. An honest event behind a
-full event queue of 128 waits about 0.27 ms instead of about 13 ms. What still grows with peers is the
-deadline scan, at about 3 ns per session.
+roughly 57 MB/s from one peer, to saturate the reactor with 512 sessions. An honest peer event behind
+a full event queue of 128 waits about 0.27 ms instead of about 13 ms. The committed-snapshot and VCT
+repair watches are different. The loop polls them only once the event queue drains, so a sustained
+flood can hold them off longer (#1516). What still grows with peers is the deadline scan, at about 3
+ns per session.

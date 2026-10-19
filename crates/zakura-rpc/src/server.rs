@@ -9,7 +9,7 @@
 
 use std::{
     collections::BTreeSet, fmt, fs::File, future::Future, io::Read, net::SocketAddr, panic,
-    path::Path, sync::Arc, time::Duration,
+    path::Path, pin::Pin, sync::Arc, time::Duration,
 };
 
 use chrono::{TimeZone, Utc};
@@ -27,7 +27,7 @@ use hyper_util::{
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{watch, Notify, Semaphore},
+    sync::{watch, Semaphore},
     task::{JoinHandle, JoinSet},
     time::{timeout, timeout_at, Instant},
 };
@@ -48,7 +48,7 @@ use crate::{
     config,
     methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, RPC_METHOD_ACCESS},
     server::{
-        http::{HttpBody, JsonRpcHttpService},
+        http::{HttpBody, JsonRpcHttpService, RequestLimit, MAX_CONCURRENT_REQUESTS},
         http_request_compatibility::HttpRequestMiddlewareLayer,
         rpc_call_compatibility::FixRpcResponseMiddleware,
         rpc_logger::RpcLoggerMiddleware,
@@ -138,12 +138,22 @@ const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// The server decodes every entry of an admitted batch before running the first
 /// one, and keeps them until the batch finishes. A larger batch is rejected after
-/// a shallow parse of the array, before any entry is decoded or run.
+/// the parser reaches the first entry over the limit, before any entry is decoded or
+/// run.
 const MAX_RPC_BATCH_REQUESTS: usize = 1_000;
 
-/// Time allowed for a plain HTTP client to send its first request, measured from
-/// TCP acceptance.
-const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum number of open plain HTTP connections per listener.
+///
+/// Connections over this limit are closed as soon as they are accepted.
+const MAX_HTTP_CONNECTIONS: usize = 256;
+
+/// Time a plain HTTP connection can stay open without a request in progress.
+///
+/// This covers the time before the first request, between keep-alive requests,
+/// and spent receiving a request's headers. A connection isn't idle while a
+/// request is being handled, or while its response is still being written. Request
+/// bodies have their own limit.
+const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of characters of each request or response payload in TRACE
 /// logs.
@@ -282,6 +292,7 @@ impl RpcServer {
             MAX_RPC_LOG_CHARS,
         );
         let service = tower::ServiceBuilder::new()
+            .layer_fn(|service| RequestLimit::new(service, MAX_CONCURRENT_REQUESTS))
             .layer(http_middleware_layer)
             .service(JsonRpcHttpService::new(
                 rpc_service,
@@ -429,9 +440,9 @@ fn stop_channel() -> (StopHandle, ServerHandle) {
 /// Accepts plain HTTP connections and serves each one in its own task, until the task running
 /// this future is aborted.
 ///
-/// Connections are served with HTTP/1 or HTTP/2, and closed if they don't send a request within
-/// [`FIRST_REQUEST_TIMEOUT`]. When this future is dropped, open connections finish their
-/// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
+/// Connections are served with HTTP/1 or HTTP/2. At most [`MAX_HTTP_CONNECTIONS`] are open at
+/// once, and each is closed after [`HTTP_IDLE_TIMEOUT`] without a request in progress. When
+/// this future is dropped, open connections finish their in-flight requests and close.
 async fn run_listener<S>(listener: TcpListener, service: S)
 where
     S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
@@ -440,8 +451,25 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    run_listener_with_limits(listener, service, MAX_HTTP_CONNECTIONS, HTTP_IDLE_TIMEOUT).await
+}
+
+/// [`run_listener`] with explicit connection limits.
+async fn run_listener_with_limits<S>(
+    listener: TcpListener,
+    service: S,
+    max_connections: usize,
+    idle_timeout: Duration,
+) where
+    S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
     // Dropping this future drops `_server_handle`, which tells every connection to shut down.
     let (stop_handle, _server_handle) = stop_channel();
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
 
     loop {
         let (socket, remote_addr) = match listener.accept().await {
@@ -452,18 +480,24 @@ where
             }
         };
 
+        // Reject excess sockets before spawning, like the TLS listener.
+        let Ok(connection_permit) = connection_permits.clone().try_acquire_owned() else {
+            debug!(%remote_addr, "Closing RPC connection: too many open connections");
+            continue;
+        };
+
         if let Err(error) = socket.set_nodelay(true) {
             warn!(?error, %remote_addr, "Could not set NODELAY on RPC socket");
             continue;
         }
 
-        let request_received = Arc::new(Notify::new());
+        let activity = Arc::new(watch::Sender::new(ConnectionActivity::default()));
         let service = {
-            let request_received = request_received.clone();
+            let activity = activity.clone();
             let service = service.clone();
-            tower::service_fn(move |request| {
-                request_received.notify_one();
-                tower::ServiceExt::oneshot(service.clone(), request)
+            tower::service_fn(move |request| TrackedResponse {
+                response: Box::pin(tower::ServiceExt::oneshot(service.clone(), request)),
+                _request_in_progress: RequestInProgress::new(activity.clone()),
             })
         };
 
@@ -471,7 +505,10 @@ where
         tokio::spawn(async move {
             let builder = auto::Builder::new(TokioExecutor::new());
             let connection = builder.serve_connection_with_upgrades(
-                TokioIo::new(socket),
+                TrackedIo {
+                    io: TokioIo::new(socket),
+                    activity: activity.clone(),
+                },
                 TowerToHyperService::new(service),
             );
             tokio::pin!(connection, stopped);
@@ -483,26 +520,125 @@ where
                     connection.as_mut().graceful_shutdown();
                     connection.await
                 }
-                () = no_request_within(&request_received, FIRST_REQUEST_TIMEOUT) => {
-                    Err("no request received in time".into())
+                () = idle_for(&activity, idle_timeout) => {
+                    Err(tower::BoxError::from("connection idle for too long"))
                 }
             };
 
             if let Err(error) = result {
                 debug!(?error, %remote_addr, "RPC connection failed");
             }
+            drop(connection_permit);
         });
     }
 }
 
-/// Returns after `timeout` if `request_received` isn't notified by then, or never returns
-/// otherwise.
-async fn no_request_within(request_received: &Notify, timeout_duration: Duration) {
-    if timeout(timeout_duration, request_received.notified())
-        .await
-        .is_ok()
-    {
-        std::future::pending::<()>().await;
+/// What a plain HTTP connection is doing, for its idle timeout.
+#[derive(Clone, Copy, Debug, Default)]
+struct ConnectionActivity {
+    /// The number of requests being handled.
+    requests_in_progress: usize,
+    /// The number of writes to the socket, which only matters when it changes.
+    writes: u64,
+}
+
+/// A response future that counts its request as in progress until it is dropped.
+///
+/// This is a named type rather than an `async` block, because `tokio::spawn` can't prove an
+/// `async` block wrapping a generic service's future is `Send`.
+struct TrackedResponse<F> {
+    response: Pin<Box<F>>,
+    _request_in_progress: RequestInProgress,
+}
+
+impl<F: Future> Future for TrackedResponse<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        self.response.as_mut().poll(cx)
+    }
+}
+
+/// Counts a request as in progress on its connection until it is dropped.
+struct RequestInProgress(Arc<watch::Sender<ConnectionActivity>>);
+
+impl RequestInProgress {
+    fn new(activity: Arc<watch::Sender<ConnectionActivity>>) -> Self {
+        activity.send_modify(|activity| activity.requests_in_progress += 1);
+        Self(activity)
+    }
+}
+
+impl Drop for RequestInProgress {
+    fn drop(&mut self) {
+        self.0
+            .send_modify(|activity| activity.requests_in_progress -= 1);
+    }
+}
+
+/// A connection's socket, which records writes in its activity.
+///
+/// Hyper finishes with a response once its bytes are buffered, so writes are what show that a
+/// large response is still being sent to a slow reader. Reads aren't recorded, so a client
+/// can't keep a connection open by sending a request slowly.
+struct TrackedIo<T> {
+    io: T,
+    activity: Arc<watch::Sender<ConnectionActivity>>,
+}
+
+impl<T: hyper::rt::Read + Unpin> hyper::rt::Read for TrackedIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<T: hyper::rt::Write + Unpin> hyper::rt::Write for TrackedIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let written = std::task::ready!(Pin::new(&mut self.io).poll_write(cx, buf));
+        if matches!(written, Ok(written) if written > 0) {
+            self.activity
+                .send_modify(|activity| activity.writes = activity.writes.wrapping_add(1));
+        }
+        std::task::Poll::Ready(written)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// Returns once `activity` has had no request in progress and no writes for `idle_timeout`.
+async fn idle_for(activity: &watch::Sender<ConnectionActivity>, idle_timeout: Duration) {
+    let mut activity = activity.subscribe();
+    loop {
+        // The sender outlives this future, so these only wait for changes.
+        let _ = activity
+            .wait_for(|activity| activity.requests_in_progress == 0)
+            .await;
+        if timeout(idle_timeout, activity.changed()).await.is_err() {
+            return;
+        }
     }
 }
 

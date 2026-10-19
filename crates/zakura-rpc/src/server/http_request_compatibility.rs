@@ -2,14 +2,13 @@
 //!
 //! These fixes are applied at the HTTP level, before the RPC request is parsed.
 
-use std::future::Future;
-
-use std::pin::Pin;
+use std::{future::Future, pin::Pin, time::Duration};
 
 use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
 use serde::{Deserialize, Serialize};
+use tokio::time::timeout;
 use tower::BoxError;
 use tower::Service;
 
@@ -20,6 +19,12 @@ use super::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+/// Time allowed for a client to send a request body, measured from when the server starts
+/// reading it.
+///
+/// Requests hold one of the server's request permits while their body is received.
+const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP [`HttpRequestMiddleware`] with compatibility workarounds.
 ///
@@ -134,10 +139,13 @@ impl<S> HttpRequestMiddleware<S> {
         B::Error: Into<BoxError>,
     {
         let (parts, body) = request.into_parts();
-        let bytes = Limited::new(body, max_request_body_size)
-            .collect()
-            .await?
-            .to_bytes();
+        let bytes = timeout(
+            REQUEST_BODY_TIMEOUT,
+            Limited::new(body, max_request_body_size).collect(),
+        )
+        .await
+        .map_err(|_| BoxError::from("timed out receiving the request body"))??
+        .to_bytes();
         let (version, bytes) =
             if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
                 let version = request.version();
@@ -154,7 +162,7 @@ impl<S> HttpRequestMiddleware<S> {
             };
         Ok((
             version,
-            HttpRequest::from_parts(parts, HttpBody::from(bytes.as_ref().to_vec())),
+            HttpRequest::from_parts(parts, HttpBody::from(bytes)),
         ))
     }
     /// Maps JSON-2.0 to whatever JSON-RPC version the client is using.
@@ -172,10 +180,7 @@ impl<S> HttpRequestMiddleware<S> {
             } else {
                 bytes
             };
-        Ok(HttpResponse::from_parts(
-            parts,
-            HttpBody::from(bytes.as_ref().to_vec()),
-        ))
+        Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)))
     }
 }
 

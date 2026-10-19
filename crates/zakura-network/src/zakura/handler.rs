@@ -19,7 +19,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, StreamExt as _};
+use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
 use tokio::{
@@ -2709,6 +2709,7 @@ impl ZakuraProtocolHandler {
                         context.direction,
                         session_exit_tx.clone(),
                     )
+                    .boxed()
                     .await
                 {
                     Ok(admitted) => admitted,
@@ -2877,6 +2878,7 @@ impl ZakuraProtocolHandler {
                             context.direction,
                             session_exit_tx.clone(),
                         )
+                        .boxed()
                         .await
                     {
                         Ok(admitted) => {

@@ -294,6 +294,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         },
                     ),
                 )
+                .boxed()
                 .await
                 {
                     Ok(Ok(zakura_state::Response::HeaderChainBodyUnavailableRecorded(_))) => {}
@@ -332,6 +333,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     expected_version,
                     invalid,
                 )
+                .boxed()
                 .await
                 {
                     BodyInvalidPersistOutcome::Recorded => {}
@@ -384,6 +386,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         },
                     ),
                 )
+                .boxed()
                 .await
                 {
                     Ok(Ok(zakura_state::Response::HeaderChainBodyAvailabilityRestarted(_))) => {}
@@ -423,6 +426,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         zakura_state::Request::RetryHeaderChainBodyAvailability { prepared },
                     ),
                 )
+                .boxed()
                 .await
                 {
                     Ok(Ok(zakura_state::Response::HeaderChainBodyAvailabilityRetried(_))) => {}

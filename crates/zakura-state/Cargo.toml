@@ -93,7 +93,7 @@ serde_json = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 
 halo2 = { workspace = true }
 orchard = { workspace = true }

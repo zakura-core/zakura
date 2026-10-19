@@ -33,6 +33,10 @@ indexer = ["zakura-state/indexer"]
 internal-miner = []
 
 # Test-only features
+
+# Exposes `server::fuzz`, the entry points of the fuzz targets in `qa/fuzz/rpc`
+fuzz-impl = []
+
 proptest-impl = [
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
@@ -45,11 +49,10 @@ proptest-impl = [
 chrono = { workspace = true }
 futures = { workspace = true }
 
-jsonrpsee = { workspace = true, features = ["server"] }
-jsonrpsee-types = { workspace = true }
-jsonrpsee-proc-macros = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
-hyper-util = { workspace = true, features = ["service", "tokio"] }
+hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
 http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -61,7 +64,6 @@ lazy_static = { workspace = true }
 
 # RPC endpoint basic auth
 base64 = { workspace = true }
-rand = { workspace = true }
 rand_10 = { workspace = true }
 # Constant-time cookie comparison to prevent a timing oracle on RPC auth.
 subtle = { workspace = true }

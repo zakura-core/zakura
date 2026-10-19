@@ -183,7 +183,6 @@ eyre = { workspace = true }
 thiserror = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-tracing-error = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }
@@ -223,7 +222,7 @@ hex.workspace = true
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 

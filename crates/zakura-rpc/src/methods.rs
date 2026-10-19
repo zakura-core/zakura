@@ -37,14 +37,13 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use chrono::Utc;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
 use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
-use jsonrpsee::core::async_trait;
-use jsonrpsee_proc_macros::rpc;
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -298,9 +297,9 @@ mod unix;
 #[cfg(test)]
 mod tests;
 
-#[rpc(server)]
+server::jsonrpc::rpc_trait! {
 /// RPC method signatures.
-pub trait Rpc {
+pub trait RpcServer {
     /// Returns software information from the RPC server, as a
     /// [`GetInfoResponse`] JSON struct.
     ///
@@ -803,9 +802,7 @@ pub trait Rpc {
         &self,
         num_blocks: Option<i32>,
         height: Option<i32>,
-    ) -> Result<u64> {
-        self.get_network_sol_ps(num_blocks, height).await
-    }
+    ) -> Result<u64>;
 
     /// Returns an object containing various state info regarding P2P networking.
     ///
@@ -1016,6 +1013,7 @@ pub trait Rpc {
         n: u32,
         include_mempool: Option<bool>,
     ) -> Result<GetTxOutResponse>;
+}
 }
 
 /// RPC method implementations.
@@ -3955,6 +3953,14 @@ where
         Ok(solution_rate.min(U256::from(u64::MAX)).as_u64())
     }
 
+    async fn get_network_hash_ps(
+        &self,
+        num_blocks: Option<i32>,
+        height: Option<i32>,
+    ) -> Result<u64> {
+        self.get_network_sol_ps(num_blocks, height).await
+    }
+
     async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {
         let version = GetInfoResponse::version_from_string(&self.build_version)
             .expect("invalid version string");
@@ -4460,7 +4466,7 @@ where
 
 /// Response to a `getinfo` RPC request.
 ///
-/// See the notes for the [`Rpc::get_info` method].
+/// See the notes for the [`RpcServer::get_info` method].
 #[allow(clippy::too_many_arguments)]
 #[derive(
     Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
@@ -4727,7 +4733,7 @@ where
 
 /// Response to a `getblockchaininfo` RPC request.
 ///
-/// See the notes for the [`Rpc::get_blockchain_info` method].
+/// See the notes for the [`RpcServer::get_blockchain_info` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct GetBlockchainInfoResponse {
     /// Current network name as defined in BIP70 (main, test, regtest)
@@ -5328,7 +5334,7 @@ impl TipConsensusBranch {
 ///
 /// Contains the hex-encoded hash of the sent transaction.
 ///
-/// See the notes for the [`Rpc::send_raw_transaction` method].
+/// See the notes for the [`RpcServer::send_raw_transaction` method].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SendRawTransactionResponse(#[serde(with = "hex")] transaction::Hash);
 
@@ -5717,7 +5723,7 @@ impl Default for GetBlockHashResponse {
 
 /// Response to a `getrawtransaction` RPC request.
 ///
-/// See the notes for the [`Rpc::get_raw_transaction` method].
+/// See the notes for the [`RpcServer::get_raw_transaction` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum GetRawTransactionResponse {
@@ -5762,7 +5768,7 @@ pub struct GetAddressUtxosResponseObject {
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
-/// See the notes for the [`Rpc::get_address_utxos` method].
+/// See the notes for the [`RpcServer::get_address_utxos` method].
 #[derive(
     Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
 )]
@@ -6248,7 +6254,7 @@ pub enum AddNodeCommand {
 
 /// Response to a `gettxout` RPC request.
 ///
-/// See the notes for the [`Rpc::get_tx_out` method].
+/// See the notes for the [`RpcServer::get_tx_out` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);

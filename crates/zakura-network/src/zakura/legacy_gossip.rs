@@ -15,7 +15,7 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, seq::SliceRandom, Rng};
+use rand_10::{seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -2218,7 +2218,7 @@ impl ZakuraRequestClient {
             &handles,
             preferred.as_ref(),
             request_kind.max_attempts(),
-            &mut OsRng,
+            &mut rand_10::rng(),
         );
 
         let mut missing_response = None;
@@ -4909,7 +4909,7 @@ mod tests {
     /// capped at the attempt limit, and every peer gets a turn across requests.
     #[test]
     fn request_candidates_prefer_source_and_randomize_the_rest() {
-        use rand::{rngs::StdRng, SeedableRng};
+        use rand_10::{rngs::StdRng, SeedableRng};
 
         let handles: Vec<_> = (1..=5)
             .map(|byte| {

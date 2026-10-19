@@ -327,11 +327,13 @@ pub struct ZakuraConfig {
     /// native peers together may make this node hold.
     ///
     /// Each connection can hold its `[network.zakura.quic]` receive and send
-    /// windows plus a 16 MiB datagram queue, 80 MiB at the defaults, whether
-    /// or not the node reads (zakura-quic CTRL-26 lists what this leaves
-    /// out). The node admits at most
-    /// this budget divided by that cost, so the default 8 GiB admits 102
-    /// connections and a larger `max_connections` is lowered at startup.
+    /// windows, 64 MiB at the defaults, whether or not the node reads. Each
+    /// bound socket can also queue 256 MiB of datagrams, however many
+    /// connections it serves (zakura-quic CTRL-26 lists what this leaves
+    /// out). The node reserves one socket queue per bound socket and admits at
+    /// most the rest divided by the per-connection cost, so the default 8 GiB
+    /// admits 124 connections on the one socket `listen_addr` binds, and a
+    /// larger `max_connections` is lowered at startup.
     /// Startup fails when the budget admits fewer than 16 connections, or
     /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
     /// peers), or fewer than `max_connections` when that is smaller.
@@ -437,6 +439,7 @@ impl ZakuraConfig {
         budgeted_max_connections(
             self.max_connections,
             self.peer_memory_budget_bytes,
+            self.bound_socket_count(),
             self.quic.connection_memory_bytes(),
             match local_node_id {
                 Some(local_node_id) => {
@@ -446,6 +449,12 @@ impl ZakuraConfig {
                 None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
             },
         )
+    }
+
+    /// Returns how many sockets the native endpoint binds for this config (see
+    /// `native_bind_addrs`), each with its own datagram queue.
+    fn bound_socket_count(&self) -> u64 {
+        u64::try_from(native_bind_addrs(self.listen_addr).len()).unwrap_or(u64::MAX)
     }
 
     /// Return the default bootstrap peers for `network`.
@@ -525,6 +534,7 @@ impl ZakuraLocalLimits {
                 .max(1)
                 .min(max_connections_for_budget(
                     config.zakura.peer_memory_budget_bytes,
+                    config.zakura.bound_socket_count(),
                     config.zakura.quic.connection_memory_bytes(),
                 )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),

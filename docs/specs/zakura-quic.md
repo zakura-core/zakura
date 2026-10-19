@@ -474,19 +474,23 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (102), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (124), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
 `peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
 
 - **CTRL-26.** One connection can make the node hold
-  `receive_window_bytes + send_window_bytes` plus its 16 MiB datagram queue
-  (DRV-3) in transport buffers, 80 MiB at the defaults, whether or not the
-  application reads. Per-stream receive windows sit inside the connection
-  window and add nothing. `zakura_quic::connection_memory_bytes` is the only
-  implementation of this formula. The node admits at most
-  `[network.zakura] peer_memory_budget_bytes` divided by this cost
-  connections. Startup lowers a larger `max_connections` to that count with
+  `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
+  at the defaults, whether or not the application reads. Per-stream receive
+  windows sit inside the connection window and add nothing.
+  `zakura_quic::connection_memory_bytes` is the only implementation of this
+  formula. Queued datagrams are bounded per socket instead: each bound socket
+  queues at most `SOCKET_DATAGRAM_QUEUE_BYTES` (256 MiB, DRV-3) however many
+  connections it serves, and connection tasks drain it whether or not the
+  application reads. The node reserves one socket queue per bound socket from
+  `[network.zakura] peer_memory_budget_bytes` and admits at most the rest
+  divided by the per-connection cost: 124 connections at the defaults, which
+  bind one socket. Startup lowers a larger `max_connections` to that count with
   a warning. It fails, naming `peer_memory_budget_bytes`, when the budget
   admits fewer than 16 connections or twice the discovery headroom plus one
   (19 with Mainnet's 9 bootstrap peers), so discovery keeps a dial slot when
@@ -497,8 +501,8 @@ These keys stay in `[network.zakura]` and keep their meaning:
   applies the exact floor. The budget never shrinks the windows, so it costs no
   per-connection throughput.
 
-  The budget counts flow-control credit and queued datagrams, not resident
-  memory, and only for admitted connections. An inbound connection takes its
+  The budget counts flow-control credit and the socket datagram queues, not
+  resident memory, and the credit only for admitted connections. An inbound connection takes its
   slot when TLS finishes, before its control handshake, and a dial takes one
   before its first attempt. The slot frees when the connection's serving task
   ends. These still hold buffers outside the budget: handshakes not yet
@@ -1028,6 +1032,7 @@ Changed:
 Added:
 
 - **CTRL-26.** No setting tied the connection count to the transport memory
-  that peers can fill, so 256 connections could hold 20 GiB at the defaults
-  (V12 F-69). `peer_memory_budget_bytes` now caps the count, and the default
-  `max_connections` drops from 256 to the 102 that the default budget admits.
+  that peers can fill, so 256 connections could hold 16 GiB of window credit
+  at the defaults (V12 F-69). `peer_memory_budget_bytes` now caps the count,
+  and the default `max_connections` drops from 256 to the 124 that the default
+  budget admits.

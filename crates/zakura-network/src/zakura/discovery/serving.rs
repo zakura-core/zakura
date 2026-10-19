@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn the_node_pool_follows_the_effective_connection_cap() {
-        for max_connections in [1, 102, 256] {
+        for max_connections in [1, 124, 256] {
             for largest in [LARGEST_PEERS, LARGEST_SERVICES] {
                 let limits = serving_limits(largest, max_connections);
                 assert_eq!(

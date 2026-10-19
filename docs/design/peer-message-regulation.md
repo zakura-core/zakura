@@ -46,9 +46,9 @@ today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
 Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
 peer can fill. The node bounds that credit by admitting fewer peers, not by shrinking windows:
-`peer_memory_budget_bytes` (8 GiB) divided by one connection's windows and datagram queue
-(80 MiB) caps the connection count at 102. CTRL-26 in the zakura-quic spec lists the buffers
-the budget leaves out.
+`peer_memory_budget_bytes` (8 GiB), less one 256 MiB datagram queue per bound socket, divided by
+one connection's windows (64 MiB) caps the connection count at 124. CTRL-26 in the zakura-quic
+spec lists the buffers the budget leaves out.
 
 ## Message checks and handler policy
 

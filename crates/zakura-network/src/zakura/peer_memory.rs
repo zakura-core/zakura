@@ -3,8 +3,11 @@
 //! Each native connection can make this node hold
 //! [`zakura_quic::connection_memory_bytes`] in QUIC buffers (zakura-quic
 //! CTRL-26). Regulation pauses reads on purpose, so that credit is where
-//! backpressure lands, and QUIC can't take it back. The node therefore admits
-//! at most `peer_memory_budget_bytes / connection_memory_bytes` connections.
+//! backpressure lands, and QUIC can't take it back. Each bound socket can also
+//! queue [`zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES`] of datagrams, however
+//! many connections it serves. The node therefore reserves one socket queue
+//! per bound socket and admits at most what is left divided by
+//! `connection_memory_bytes`.
 //!
 //! The budget lowers the connection count, never the windows, so every
 //! connection keeps the throughput that regulation sizing assumes (see
@@ -16,6 +19,7 @@
 //! [`zakura_quic::connection_memory_bytes`] lists.
 
 use thiserror::Error;
+use zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES;
 
 use super::{
     discovery::effective_discovery_connection_headroom, DEFAULT_ZAKURA_RECEIVE_WINDOW,
@@ -23,7 +27,7 @@ use super::{
 };
 
 /// Default budget for admitted native connections' flow-control credit and
-/// queued datagrams: 8 GiB. CTRL-26 in the zakura-quic spec lists what it
+/// the bound sockets' datagram queues: 8 GiB. CTRL-26 in the zakura-quic spec lists what it
 /// leaves out.
 pub const DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
@@ -48,20 +52,28 @@ pub fn min_budgeted_connections(bootstrap_peer_count: usize) -> usize {
         .max(MIN_ZAKURA_BUDGETED_CONNECTIONS)
 }
 
-/// Connections the default budget admits at the default windows: 102.
+/// Connections the default budget admits at the default windows, with the one
+/// socket the default `listen_addr` binds: 124.
 pub const DEFAULT_ZAKURA_BUDGETED_CONNECTIONS: usize = max_connections_for_budget(
     DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    1,
     zakura_quic::connection_memory_bytes(DEFAULT_ZAKURA_RECEIVE_WINDOW, DEFAULT_ZAKURA_SEND_WINDOW),
 );
 
 /// Returns how many connections of `connection_bytes` each fit in
-/// `budget_bytes`, rounding down.
+/// `budget_bytes` after reserving one socket datagram queue for each of
+/// `sockets`, rounding down.
 ///
 /// # Panics
 ///
 /// If `connection_bytes` is zero.
-pub const fn max_connections_for_budget(budget_bytes: u64, connection_bytes: u64) -> usize {
-    let connections = budget_bytes / connection_bytes;
+pub const fn max_connections_for_budget(
+    budget_bytes: u64,
+    sockets: u64,
+    connection_bytes: u64,
+) -> usize {
+    let reserved = sockets.saturating_mul(SOCKET_DATAGRAM_QUEUE_BYTES);
+    let connections = budget_bytes.saturating_sub(reserved) / connection_bytes;
     // Clamp before narrowing on targets where usize is smaller than u64.
     if connections > usize::MAX as u64 {
         usize::MAX
@@ -76,13 +88,16 @@ pub const fn max_connections_for_budget(budget_bytes: u64, connection_bytes: u64
 #[error(
     "invalid [network.zakura] peer_memory_budget_bytes: {budget_bytes} bytes admits \
      {admitted} connections of {connection_bytes} bytes each (the \
-     [network.zakura.quic] receive_window_bytes and send_window_bytes plus the \
-     connection's datagram queue); raise peer_memory_budget_bytes or lower those \
-     windows so it admits at least {required}"
+     [network.zakura.quic] receive_window_bytes plus send_window_bytes) after \
+     reserving {socket_queue_bytes} bytes for the bound sockets' datagram queues; \
+     raise peer_memory_budget_bytes or lower those windows so it admits at least \
+     {required}"
 )]
 pub struct PeerMemoryBudgetError {
     /// The configured budget.
     pub budget_bytes: u64,
+    /// Datagram queue bytes reserved for the bound sockets.
+    pub socket_queue_bytes: u64,
     /// Transport bytes one connection can hold at the configured windows.
     pub connection_bytes: u64,
     /// Connections the budget admits.
@@ -92,7 +107,8 @@ pub struct PeerMemoryBudgetError {
 }
 
 /// Returns the connection cap after the budget: `max_connections`, lowered to
-/// what `budget_bytes` admits at `connection_bytes` each.
+/// what `budget_bytes` admits at `connection_bytes` each once `sockets` socket
+/// queues are reserved (see [`max_connections_for_budget`]).
 ///
 /// Fails when the budget admits fewer than [`min_budgeted_connections`] for
 /// `bootstrap_peer_count`, or fewer than `max_connections` when that is
@@ -100,15 +116,17 @@ pub struct PeerMemoryBudgetError {
 pub fn budgeted_max_connections(
     max_connections: usize,
     budget_bytes: u64,
+    sockets: u64,
     connection_bytes: u64,
     bootstrap_peer_count: usize,
 ) -> Result<usize, PeerMemoryBudgetError> {
     let max_connections = max_connections.max(1);
-    let admitted = max_connections_for_budget(budget_bytes, connection_bytes);
+    let admitted = max_connections_for_budget(budget_bytes, sockets, connection_bytes);
     let required = max_connections.min(min_budgeted_connections(bootstrap_peer_count));
     if admitted < required {
         return Err(PeerMemoryBudgetError {
             budget_bytes,
+            socket_queue_bytes: sockets.saturating_mul(SOCKET_DATAGRAM_QUEUE_BYTES),
             connection_bytes,
             admitted,
             required,
@@ -130,17 +148,25 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// A budget that admits exactly `connections` at the default windows on
+    /// one socket.
+    fn budget_for(connections: u64) -> u64 {
+        256 * MIB + connections * 64 * MIB
+    }
+
     #[test]
     fn the_default_connection_cap_fits_the_default_budget() {
         let connection_bytes = QuicConfig::default().connection_memory_bytes();
-        assert_eq!(connection_bytes, 80 * MIB);
-        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 102);
+        assert_eq!(connection_bytes, 64 * MIB);
+        assert_eq!(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, 124);
         assert_eq!(
             DEFAULT_ZAKURA_MAX_CONNECTIONS,
             DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
         );
-        // Widening usize to u64 is lossless on supported targets.
-        let committed = DEFAULT_ZAKURA_MAX_CONNECTIONS as u64 * connection_bytes;
+        // Widening usize to u64 is lossless on supported targets. The default
+        // `listen_addr` binds one socket.
+        let committed =
+            DEFAULT_ZAKURA_MAX_CONNECTIONS as u64 * connection_bytes + SOCKET_DATAGRAM_QUEUE_BYTES;
         assert!(committed <= DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
         assert!(committed + connection_bytes > DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES);
 
@@ -158,7 +184,16 @@ mod tests {
             max_connections: 256,
             ..ZakuraConfig::default()
         };
-        assert_eq!(config.budgeted_max_connections(), Ok(102));
+        assert_eq!(config.budgeted_max_connections(), Ok(124));
+
+        // Without `listen_addr` the endpoint binds IPv4 and IPv6 loopback, so it
+        // reserves two socket queues: (8192 - 512) / 64.
+        let config = ZakuraConfig {
+            max_connections: 256,
+            listen_addr: None,
+            ..ZakuraConfig::default()
+        };
+        assert_eq!(config.budgeted_max_connections(), Ok(120));
 
         // Raising the windows lowers the cap instead of the throughput.
         let config = ZakuraConfig {
@@ -168,8 +203,8 @@ mod tests {
             },
             ..ZakuraConfig::default()
         };
-        // 8 GiB / (256 + 32 + 16) MiB.
-        assert_eq!(config.budgeted_max_connections(), Ok(26));
+        // (8 GiB - 256 MiB) / (256 + 32) MiB.
+        assert_eq!(config.budgeted_max_connections(), Ok(27));
 
         // A smaller cap stays as configured.
         let config = ZakuraConfig {
@@ -206,7 +241,7 @@ mod tests {
                 .iter()
                 .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
                 .collect(),
-            peer_memory_budget_bytes: 30 * 80 * MIB,
+            peer_memory_budget_bytes: budget_for(30),
             ..ZakuraConfig::default()
         };
         let outsider = NodeSecretKey::from_bytes(&[99; 32]).public();
@@ -234,7 +269,7 @@ mod tests {
                 .map(|port| format!("{}@192.0.2.1:{port}", node_ids[0]))
                 .chain(["not a bootstrap peer".to_string()])
                 .collect(),
-            peer_memory_budget_bytes: 30 * 80 * MIB,
+            peer_memory_budget_bytes: budget_for(30),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(), Ok(30));
@@ -254,7 +289,7 @@ mod tests {
             .map(|node_id| format!("{node_id}@192.0.2.1:8234"))
             .collect();
         config.zakura.max_connections = 256;
-        config.zakura.peer_memory_budget_bytes = 18 * 80 * MIB;
+        config.zakura.peer_memory_budget_bytes = budget_for(18);
         assert_eq!(config.zakura.budgeted_max_connections(), Ok(18));
         assert_eq!(
             config.zakura.budgeted_max_connections_for_node(node_ids[0]),
@@ -263,7 +298,7 @@ mod tests {
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);
 
         // A budget both checks refuse still caps the limits at its own count.
-        config.zakura.peer_memory_budget_bytes = 16 * 80 * MIB;
+        config.zakura.peer_memory_budget_bytes = budget_for(16);
         assert!(config.zakura.budgeted_max_connections().is_err());
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 16);
     }
@@ -278,7 +313,7 @@ mod tests {
             ..ZakuraConfig::default()
         };
         let error = config.budgeted_max_connections().unwrap_err();
-        // 8 GiB / (1024 + 32 + 16) MiB.
+        // (8 GiB - 256 MiB) / (1024 + 32) MiB.
         assert_eq!(error.admitted, 7);
         // Mainnet's 9 bootstrap peers, counting one as possibly this node.
         assert_eq!(error.required, 17);
@@ -286,8 +321,9 @@ mod tests {
             .to_string()
             .contains("[network.zakura] peer_memory_budget_bytes"));
         assert!(error.to_string().contains("receive_window_bytes"));
+        assert_eq!(error.socket_queue_bytes, 256 * MIB);
 
-        // 8 GiB / (512 + 32 + 16) MiB leaves room for 14, below the floor.
+        // (8 GiB - 256 MiB) / (512 + 32) MiB leaves room for 14, below the floor.
         let config = ZakuraConfig {
             quic: QuicConfig {
                 receive_window_bytes: 512 << 20,
@@ -306,12 +342,12 @@ mod tests {
         // A cap below the floor only needs the budget to cover that cap.
         let config = ZakuraConfig {
             max_connections: 2,
-            peer_memory_budget_bytes: 160 * MIB,
+            peer_memory_budget_bytes: budget_for(2),
             ..ZakuraConfig::default()
         };
         assert_eq!(config.budgeted_max_connections(), Ok(2));
         let config = ZakuraConfig {
-            peer_memory_budget_bytes: 160 * MIB - 1,
+            peer_memory_budget_bytes: budget_for(2) - 1,
             ..config
         };
         assert_eq!(config.budgeted_max_connections().unwrap_err().required, 2);

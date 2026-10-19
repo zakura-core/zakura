@@ -218,7 +218,7 @@ async fn spawn_discovery_dial_candidates(
     workers: &mut JoinSet<DiscoveryDialWorkerResult>,
     sought_services: &[ZakuraServiceId],
 ) {
-    if !endpoint.has_native_admission_capacity() {
+    if !endpoint.has_discovery_admission_capacity() {
         return;
     }
 
@@ -228,7 +228,7 @@ async fn spawn_discovery_dial_candidates(
         .await;
 
     for candidate in candidates {
-        if !endpoint.has_native_admission_capacity() {
+        if !endpoint.has_discovery_admission_capacity() {
             return;
         }
         let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(

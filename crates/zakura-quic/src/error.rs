@@ -38,9 +38,9 @@ pub enum ConnectError {
     /// The peer's key isn't the dialed node ID (TLS-7).
     #[error("the peer presented a different identity than the dialed node ID")]
     WrongIdentity,
-    /// This endpoint already holds `max_connections` QUIC connections
-    /// (ADM-12).
-    #[error("endpoint holds its maximum number of QUIC connections")]
+    /// This endpoint cannot reserve every address attempt under this dial's
+    /// connection ceiling (ADM-12).
+    #[error("endpoint has insufficient connection capacity for this dial")]
     ConnectionLimit,
     /// The endpoint is shut down or refused the remote address.
     #[error("endpoint can't dial: {0}")]

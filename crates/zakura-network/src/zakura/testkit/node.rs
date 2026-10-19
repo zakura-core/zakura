@@ -812,6 +812,7 @@ mod tests {
                     peer_addr,
                     &limits,
                     Some(admitted_ip_tx),
+                    crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
             });

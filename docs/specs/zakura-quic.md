@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-17. Version 0.9.
+Status: draft for review, 2026-10-17. Version 0.10.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -20,7 +20,9 @@ Version 0.8 adds CTRL-26, which ties the connection count to a memory budget;
 §17f explains it. Version 0.9 adds ADM-12, a transport cap on live QUIC
 connections, and ADM-13, which releases a closed connection's stream buffers
 and gives closed connections their own allowance, and makes CTRL-26 fund
-both; §17g lists each change.
+both; §17g lists each change. Version 0.10 limits discovery dials below
+inbound refusal while keeping the full dial reserve for maintained connections;
+§17h explains it.
 
 ## 0. Conventions
 
@@ -424,21 +426,31 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     the last `dial_reserve` slots, and peers that churn inbound connections
     can't stop this node's dials.
   - A dial MUST claim a live slot for every address it will try (DIAL-3)
-    before its first attempt. It tries at most the first `max_connections`
-    addresses, so an idle endpoint can always fit it. When the cap can't fit
-    them all right now, it fails with `ConnectFailed(ConnectionLimit)` before
-    sending any packet. That error therefore always means the table is busy,
-    and retrying it later can succeed. A dial
-    therefore never mixes this node's limit with the peer's results. Skipping
+    before its first attempt. The complete reservation MUST be atomic across
+    concurrent dials and inbound accepts. It tries at most the first
+    `max_connections` addresses, so an idle endpoint can fit it. When the cap
+    can't fit them all right now, it fails with `ConnectFailed(ConnectionLimit)`
+    before sending any packet. A dial therefore never mixes this node's
+    limit with the peer's results. Skipping
     a later address at the cap would either blame the peer for an address it
     never got to answer, since a signed record proves the node key and not
     that the node owns every address it lists, or call a dial that contacted
     the peer a local limit and retry it without backoff.
-  - `QuicEndpoint::has_dial_capacity()` reports whether a dial would get a
-    slot. `zakura-network` treats `ConnectionLimit` as its own resource limit,
+  - Discovery dials MUST leave one live slot below the inbound refusal
+    threshold. Their ceiling is
+    `max_connections.saturating_sub(dial_reserve).saturating_sub(1)`, 107 at
+    the defaults. `connect_discovery` caps its address list to this ceiling
+    and atomically claims every attempt under it. A zero ceiling disables
+    discovery dials and returns `ConnectionLimit`. Bootstrap and maintained
+    dials use `connect` and may use the full transport cap. This prevents
+    discovery records with unanswered addresses from consuming the last
+    capacity available to inbound peers.
+  - `QuicEndpoint::has_dial_capacity()` reports whether an ordinary dial would
+    get a slot, and `has_discovery_capacity()` checks discovery's lower ceiling.
+    `zakura-network` treats `ConnectionLimit` as its own resource limit,
     not the peer's fault. Its discovery dialer starts a dial only while both
-    the admission semaphore and the transport have room, and waits one tick
-    after a dial hits a local limit. Its supervised redials retry a limit hit
+    the admission semaphore and discovery's transport ceiling have room, and
+    waits one tick after a dial hits a local limit. Its supervised redials retry a limit hit
     before any packet was sent (admission or this cap) after the initial
     backoff, without counting an attempt or growing the backoff. A limit hit
     after the QUIC handshake, such as the pending control handshakes, counts
@@ -721,9 +733,11 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
 - **API-2.** `QuicEndpoint`:
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `local_id()`, `local_addrs()`, `socket_stats()`, `connection_count()`
-    and `has_dial_capacity()` (ADM-12), `closing_connection_count()`
-    (ADM-13), `network_changes()` and `config()`;
+    and `has_dial_capacity()` / `has_discovery_capacity()` (ADM-12),
+    `closing_connection_count()` (ADM-13), `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
+  - `connect_discovery(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`
+    uses ADM-12's discovery ceiling and otherwise follows `connect`.
   - `connect(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`, which
     offers `alpns` in order; an empty list fails with
     `ConnectFailed(AlpnMismatch)`;
@@ -929,6 +943,7 @@ this release tolerates, and keep each hard change explicit.
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
 | Inbound connections can't take the dial reserve; a dial at the cap fails with `ConnectionLimit`; a multi-address dial without a slot for every address fails before contacting the peer | ADM-12 |
 | A full transport reports no dial capacity while admission permits remain; supervised redials retry local limits without counting them | ADM-12 |
+| Silent multi-address discovery dials leave room for an inbound peer; concurrent reservations stay below their ceiling; small or zero discovery ceilings are handled without sending a forbidden attempt | ADM-12 |
 | Closing stops every receive half that may buffer data, unaccepted streams included, and resets every send half that may hold unacknowledged data | ADM-13 |
 | Entering the closing allowance drops and refunds the datagrams queued while live | ADM-13 |
 | Behind a relay that makes three PTOs last seconds, a draining connection leaves the live count so a new inbound peer connects, and with the allowance full it drops its state at once | ADM-13 |
@@ -1158,3 +1173,14 @@ Changed:
   connections hold no stream data. The default `max_connections` drops from
   124 to 92, and the exclusion list keeps only bookkeeping, allocator
   overhead and pending writes.
+
+## 17h. Changes in version 0.10
+
+Changed:
+
+- **ADM-12.** Discovery dials reserve all their address attempts atomically
+  below the inbound refusal threshold, leaving one inbound slot available.
+  Previously four discovery records with eight unanswered addresses each
+  could hold 32 live slots and refuse inbound peers until the dials timed out.
+  Bootstrap and maintained dials retain access to the full connection cap.
+- **API-2.** Adds `connect_discovery` and `has_discovery_capacity`.

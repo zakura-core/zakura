@@ -151,7 +151,6 @@ tonic-prost = "0.14"
 tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 tower = "0.5.3"
 tracing = "0.1.41"
-tracing-error = "0.2"
 tracing-subscriber = "0.3.19"
 uint = "0.10"
 zcash_note_encryption = { version = "=4.0.0-rc0", package = "zakura-note-encryption" }

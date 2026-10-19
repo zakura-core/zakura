@@ -3051,16 +3051,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-error"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1581020d7a273442f5b45074a6a57d5757ad0a47dac0e9f0bd57b81936f3db"
-dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3529,7 +3519,6 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
- "tracing-error",
  "tracing-subscriber",
  "webpki-roots",
  "windows-sys 0.61.2",
@@ -3848,7 +3837,6 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
- "tracing-error",
  "tracing-subscriber",
  "zakura-chain",
  "zakura-header-chain",
@@ -4220,7 +4208,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "tracing-error",
  "tracing-subscriber",
 ]
 
@@ -4257,7 +4244,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tracing-error",
  "tracing-subscriber",
  "zakura-chain",
  "zakura-node-services",

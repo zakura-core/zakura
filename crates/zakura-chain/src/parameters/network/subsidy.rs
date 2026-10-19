@@ -467,7 +467,7 @@ pub fn funding_stream_values(
 }
 
 /// Block subsidy errors.
-#[derive(thiserror::Error, Clone, Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, zakura_derive::OutlineDebug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum SubsidyError {
     #[error("no coinbase transaction in block")]

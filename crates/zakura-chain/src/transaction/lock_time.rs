@@ -22,7 +22,7 @@ use crate::{
 ///     (Unix timestamp less than [`LockTime::MIN_TIMESTAMP`]), or
 ///   - a timestamp after 5 February 2106
 ///     (Unix timestamp greater than [`LockTime::MAX_TIMESTAMP`]).
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LockTime {
     /// The transaction can only be included in a block if the block height is
     /// strictly greater than this height

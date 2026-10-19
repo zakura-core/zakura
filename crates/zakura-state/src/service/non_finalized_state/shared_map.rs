@@ -19,7 +19,7 @@ const PARTITIONS: usize = 256;
 ///
 /// Insertions replace existing values and return the previous value.
 /// Equality compares contents; iteration order is unspecified.
-#[derive(Clone, Debug)]
+#[derive(Clone, zakura_derive::OutlineDebug)]
 pub(crate) struct SharedMap<K, V> {
     // Clones must keep this seed so each key stays in the same partition.
     partition_hasher: RandomState,

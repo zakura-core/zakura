@@ -76,7 +76,7 @@ impl SharedPeerError {
 }
 
 /// An error related to peer connection handling.
-#[derive(Error, Debug)]
+#[derive(Error, zakura_derive::OutlineDebug)]
 #[allow(dead_code)]
 pub enum PeerError {
     /// The remote peer closed the connection.

@@ -19,7 +19,7 @@ pub(crate) struct SlotBudgetCapacityError {
 ///
 /// Each successful admission returns one linear permit. Moving it with the
 /// admitted item makes ordinary drop and cancellation release capacity.
-#[derive(Clone, Debug)]
+#[derive(Clone, zakura_derive::OutlineDebug)]
 pub(crate) struct SlotBudget {
     #[cfg(test)]
     capacity: usize,

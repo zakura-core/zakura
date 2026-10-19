@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Message families return this type directly or wrap it in their own error
 /// enum. Every variant holds static labels and numbers, so reporting an error
 /// on a hostile input allocates nothing.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Error)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Error)]
 #[non_exhaustive]
 pub enum WireError {
     /// The frame sets flag bits, and no row defines any.

@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 /// Structured invalid-evidence failure replacing stringly typed planner messages.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, Error, PartialEq)]
 pub enum InvalidTransitionEvidence {
     /// Request or resource bounds were exceeded.
     #[error(transparent)]

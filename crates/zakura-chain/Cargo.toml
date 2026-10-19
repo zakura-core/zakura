@@ -76,6 +76,7 @@ zcash_script.workspace = true
 halo2 = { workspace = true }
 orchard.workspace = true
 zakura-mmr-tree.workspace = true
+zakura-derive = { path = "../zakura-derive", version = "0.1.0" }
 zcash_note_encryption = { workspace = true }
 zcash_primitives.workspace = true
 sapling-crypto.workspace = true

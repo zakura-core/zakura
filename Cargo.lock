@@ -2957,6 +2957,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-derive",
  "zakura-header-chain",
  "zakura-jsonl-trace",
  "zakura-network",
@@ -3060,6 +3061,7 @@ dependencies = [
  "uint",
  "windows-sys 0.61.2",
  "zakura-address",
+ "zakura-derive",
  "zakura-equihash",
  "zakura-halo2-proofs",
  "zakura-jubjub",
@@ -3110,6 +3112,7 @@ dependencies = [
  "zakura-bellman",
  "zakura-bls12-381",
  "zakura-chain",
+ "zakura-derive",
  "zakura-halo2-proofs",
  "zakura-header-chain",
  "zakura-node-services",
@@ -3122,6 +3125,15 @@ dependencies = [
  "zakura-test",
  "zakura-transparent",
  "zcash_script",
+]
+
+[[package]]
+name = "zakura-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -3197,6 +3209,7 @@ dependencies = [
  "thiserror",
  "toml",
  "zakura-chain",
+ "zakura-derive",
  "zakura-test",
 ]
 
@@ -3285,6 +3298,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zakura-chain",
+ "zakura-derive",
  "zakura-header-chain",
  "zakura-jsonl-trace",
  "zakura-node-services",
@@ -3306,6 +3320,7 @@ dependencies = [
  "tokio",
  "tower",
  "zakura-chain",
+ "zakura-derive",
  "zakura-header-chain",
 ]
 
@@ -3585,6 +3600,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "zakura-chain",
+ "zakura-derive",
  "zakura-primitives",
  "zakura-test",
  "zcash_script",
@@ -3634,6 +3650,7 @@ dependencies = [
  "tracing",
  "zakura-assets",
  "zakura-chain",
+ "zakura-derive",
  "zakura-halo2-proofs",
  "zakura-header-chain",
  "zakura-node-services",

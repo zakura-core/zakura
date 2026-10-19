@@ -12,7 +12,7 @@ use zakura_chain::{
 ///
 /// Each projection entry uses a frontier to identify the selected or verified
 /// chain prefix that ends at that height.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub struct Frontier {
     /// Frontier height.
     pub height: block::Height,

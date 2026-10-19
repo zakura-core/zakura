@@ -307,7 +307,7 @@ pub struct AddressBook {
 }
 
 /// Metrics about the states of the addresses in an [`AddressBook`].
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Default, PartialEq, Eq, Hash)]
 pub struct AddressMetrics {
     /// The number of addresses in the `Responded` state.
     pub responded: usize,

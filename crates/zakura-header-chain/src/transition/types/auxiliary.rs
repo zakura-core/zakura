@@ -374,7 +374,7 @@ impl AuxDelivery {
 }
 
 /// Immutable schema-1 commitment inputs for one inferred block height.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq)]
 pub struct TreeAuxRecordV1 {
     /// Exact inferred height of this record.
     pub height: block::Height,

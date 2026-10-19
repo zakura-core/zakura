@@ -1518,7 +1518,7 @@ pub fn select_zakura_protocol(
 }
 
 /// An encoding or validation error in bounded Zakura protocol data.
-#[derive(Error, Debug)]
+#[derive(Error, zakura_derive::OutlineDebug)]
 pub enum ZakuraProtocolError {
     /// A payload exceeded its hard cap.
     #[error("Zakura payload length {actual} exceeds hard cap {max}")]

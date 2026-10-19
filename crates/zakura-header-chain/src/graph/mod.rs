@@ -164,7 +164,7 @@ pub(crate) trait HeaderGraphEdit: HeaderGraphView {
 }
 
 /// Failure to construct or query a coherent in-memory header DAG.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, Error, PartialEq)]
 pub enum GraphError {
     /// A delta was produced from a different graph revision.
     #[error(
@@ -297,7 +297,7 @@ pub enum HeaderNodeInvariant {
 }
 
 /// Monotonic capability that identifies one committed in-memory graph state.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Default, Eq, PartialEq)]
 pub struct GraphRevision(u64);
 
 impl GraphRevision {

@@ -202,7 +202,7 @@ impl From<sapling::Nullifier> for Spend {
 ///
 /// This enum implements `From` for [`block::Hash`] and [`block::Height`],
 /// so it can be created using `hash.into()` or `height.into()`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, PartialEq, Eq)]
 pub enum HashOrHeight {
     /// A block identified by hash.
     Hash(block::Hash),

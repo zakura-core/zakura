@@ -27,7 +27,7 @@ use zcash_script::{
 };
 
 /// Errors from transaction preparation and script verification.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// script verification failed

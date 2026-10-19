@@ -50,6 +50,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 # gets packaged and size-checked.
 PUBLISH_ORDER=(
   zakura-test
+  zakura-derive
   zakura-jsonl-trace
   zakura-quic
   zakura-mmr-tree

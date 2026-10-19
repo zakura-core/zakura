@@ -90,7 +90,7 @@ impl OperatorInvalidationId {
 }
 
 /// Opaque stable digest of a peer identity and connection domain.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SourceId([u8; 32]);
 
 impl SourceId {
@@ -106,7 +106,7 @@ impl SourceId {
 }
 
 /// Exact branch identity, qualified by both anchor and target hashes.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub struct BranchId {
     /// Immutable branch anchor hash.
     pub anchor_hash: block::Hash,

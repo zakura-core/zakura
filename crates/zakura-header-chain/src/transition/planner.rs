@@ -42,7 +42,7 @@ use settlement::{
 use write_set::{derive_plan, invariant_pins, no_change, resource_stalled, DerivePlanInputs};
 
 /// Typed failure that the planner produces before it attempts a durable mutation.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, Error, PartialEq)]
 pub enum TransitionFailure {
     /// The caller's version or asynchronous owner was stale.
     #[error("stale transition work at state version {current:?}")]

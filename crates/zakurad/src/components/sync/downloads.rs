@@ -119,7 +119,7 @@ impl<Request: Clone> hedge::Policy<Request> for AlwaysHedge {
 }
 
 /// Errors that can occur while downloading and verifying a block.
-#[derive(Error, Debug)]
+#[derive(Error, zakura_derive::OutlineDebug)]
 #[allow(dead_code)]
 pub enum BlockDownloadVerifyError {
     #[error("permanent readiness error from the network service: {error:?}")]

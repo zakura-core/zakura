@@ -151,6 +151,7 @@ tower = "0.5.3"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 uint = "0.10"
+url = "2.5"
 zcash_note_encryption = { version = "=4.0.0-rc2", package = "zakura-note-encryption" }
 zcash_script = "0.6"
 zeroize = "1.8"

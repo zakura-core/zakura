@@ -106,9 +106,7 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = [
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = [
-    "rpc-client",
-] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
 zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }

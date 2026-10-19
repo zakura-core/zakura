@@ -149,7 +149,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = ["rpc-client"] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
@@ -173,7 +173,7 @@ toml = { workspace = true }
 
 futures = { workspace = true }
 rayon = { workspace = true }
-tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "signal", "process", "io-util"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }
@@ -187,17 +187,18 @@ tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
 # Resolution constraint for transitive URL/DNS dependencies; no direct API use.
 idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 
-# Health check server dependencies
-hyper = { workspace = true, features = ["server", "http1"] }
+# Health check server and managed zcashd download dependencies
+hyper = { workspace = true, features = ["client", "server", "http1"] }
 http-body-util = { workspace = true }
-hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
+hyper-util = { workspace = true, features = ["client-proxy", "service", "server", "tokio"] }
 
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+url = { workspace = true }
 webpki-roots = "1"
 
 bytes = { workspace = true }
@@ -230,6 +231,7 @@ insta = { workspace = true, features = ["json"] }
 # zakura-rpc needs the preserve_order feature, it also makes test results more stable
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
@@ -244,6 +246,7 @@ zakura-state = { path = "../zakura-state", version = "11.0.0-rc0", features = ["
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0-rc0", features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "3.0.0-rc0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = ["rpc-client"] }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

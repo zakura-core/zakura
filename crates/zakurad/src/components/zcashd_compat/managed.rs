@@ -8,14 +8,17 @@ use std::{
 };
 
 use eyre::{eyre, Report};
-use reqwest::{blocking::Client, redirect::Policy, Url};
+use http_body_util::BodyExt;
+use hyper_util::client::proxy::matcher::Matcher;
 use sha2::{Digest, Sha256};
+use tokio::time::timeout;
+use url::Url;
 use zakura_chain::common::TempFile;
 
 use super::{
     Config, ConfigZcashdBinarySource, ZcashdReleaseManifest, EMBEDDED_ZCASHD_RELEASE_MANIFEST,
 };
-use crate::components::zcashd_compat::supervisor::is_command_resolvable;
+use crate::components::zcashd_compat::{download, supervisor::is_command_resolvable};
 
 /// Maximum time a managed binary download is allowed to take.
 const MANAGED_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -99,7 +102,12 @@ pub fn resolve_managed_zcashd_binary(state_cache_dir: &Path) -> Result<PathBuf, 
         )
     })?;
 
-    install_managed_zcashd_binary(&EMBEDDED_ZCASHD_RELEASE_MANIFEST, target, state_cache_dir)
+    install_managed_zcashd_binary(
+        &EMBEDDED_ZCASHD_RELEASE_MANIFEST,
+        target,
+        state_cache_dir,
+        &Matcher::from_env(),
+    )
 }
 
 /// Returns the managed zcashd binary cache path without creating directories,
@@ -141,6 +149,8 @@ pub(super) fn cached_managed_zcashd_binary_is_current(
 /// Installs the `target` executable pinned by `manifest` into the cache, unless
 /// the cached executable already has the pinned contents, and returns its path.
 ///
+/// Downloads go through the proxy that `proxies` selects.
+///
 /// The executable is streamed into a temporary file in the cache directory and
 /// hashed as it is written. Only a verified, executable, synced file replaces
 /// the cached binary, so a failed install leaves any previous binary in place.
@@ -148,6 +158,7 @@ fn install_managed_zcashd_binary(
     manifest: &ZcashdReleaseManifest,
     target: &str,
     state_cache_dir: &Path,
+    proxies: &Matcher,
 ) -> Result<PathBuf, Report> {
     let artifact = manifest.artifact_for_target(target).ok_or_else(|| {
         eyre!(
@@ -189,6 +200,7 @@ fn install_managed_zcashd_binary(
     download_verified_binary(
         &artifact.runtime_binary_url,
         &artifact.runtime_binary_sha256,
+        proxies,
         download.as_file_mut(),
     )?;
     make_executable(download.path())?;
@@ -282,9 +294,13 @@ fn download_url_is_allowed(url: &Url) -> bool {
 /// SHA-256 digest is `expected_sha256`.
 ///
 /// The initial URL and every redirect must pass [`download_url_is_allowed`].
+///
+/// This blocks on its own runtime, so it must be called from a blocking thread, not from an
+/// async task.
 fn download_verified_binary(
     url: &str,
     expected_sha256: &str,
+    proxies: &Matcher,
     out: &mut fs::File,
 ) -> Result<(), Report> {
     let parsed =
@@ -293,7 +309,6 @@ fn download_verified_binary(
         return Err(eyre!("managed zcashd URL must use https: {url}"));
     }
 
-    // Retain the bundled trust roots and ring provider across reqwest upgrades.
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -303,64 +318,25 @@ fn download_verified_binary(
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     })
     .with_no_client_auth();
-    let redirect_policy = Policy::custom(|attempt| {
-        // `previous()` includes the initial URL, matching `Policy::limited`.
-        if attempt.previous().len() > MANAGED_DOWNLOAD_MAX_REDIRECTS {
-            attempt.error(format!(
-                "more than {MANAGED_DOWNLOAD_MAX_REDIRECTS} redirects"
-            ))
-        } else if !download_url_is_allowed(attempt.url()) {
-            let error = format!("redirected to non-https URL {}", attempt.url());
-            attempt.error(error)
-        } else {
-            attempt.follow()
-        }
-    });
-    let client = Client::builder()
-        .tls_backend_preconfigured(tls)
-        .redirect(redirect_policy)
-        .timeout(MANAGED_DOWNLOAD_TIMEOUT)
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
-        .map_err(|err| eyre!("failed building managed zcashd HTTP client: {err}"))?;
-    let mut response = client.get(parsed).send().map_err(|err| {
-        eyre!(
-            "failed downloading managed zcashd binary from {url}: {}",
-            error_chain(&err)
+        .map_err(|err| eyre!("failed starting the managed zcashd download runtime: {err}"))?;
+    let hasher = runtime.block_on(async {
+        timeout(
+            MANAGED_DOWNLOAD_TIMEOUT,
+            download_into(parsed, Arc::new(tls), proxies, out),
         )
-    })?;
-    if !response.status().is_success() {
-        return Err(eyre!(
-            "managed zcashd download from {url} failed with HTTP status {}",
-            response.status()
-        ));
-    }
-
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; MANAGED_BINARY_BUFFER_BYTES];
-    let mut total_bytes: u64 = 0;
-    loop {
-        let n = response.read(&mut buf).map_err(|err| {
+        .await
+        .map_err(|_| {
             eyre!(
-                "failed downloading managed zcashd binary from {url}: {}",
-                error_chain(&err)
+                "managed zcashd download from {url} timed out after {} seconds",
+                MANAGED_DOWNLOAD_TIMEOUT.as_secs()
             )
-        })?;
-        if n == 0 {
-            break;
-        }
-
-        // `n` is at most the buffer length, which fits in a u64.
-        total_bytes = total_bytes.saturating_add(n as u64);
-        if total_bytes > MANAGED_BINARY_MAX_BYTES {
-            return Err(eyre!(
-                "managed zcashd download from {url} exceeded {MANAGED_BINARY_MAX_BYTES} bytes"
-            ));
-        }
-
-        hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])
-            .map_err(|err| eyre!("failed writing managed zcashd binary to cache: {err}"))?;
-    }
+        })?
+        .map_err(|err| eyre!("failed downloading managed zcashd binary from {url}: {err:#}"))
+    })?;
 
     let actual_sha256 = hex::encode(hasher.finalize());
     if actual_sha256 != expected_sha256 {
@@ -370,6 +346,47 @@ fn download_verified_binary(
     }
 
     Ok(())
+}
+
+/// Downloads `url` into `out`, and returns the hash of what it wrote.
+async fn download_into(
+    url: Url,
+    tls: Arc<rustls::ClientConfig>,
+    proxies: &Matcher,
+    out: &mut fs::File,
+) -> Result<Sha256, Report> {
+    let mut response = download::get_following_redirects(
+        url,
+        tls,
+        proxies,
+        MANAGED_DOWNLOAD_MAX_REDIRECTS,
+        download_url_is_allowed,
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(eyre!("HTTP status {}", response.status()));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
+    while let Some(frame) = response.body_mut().frame().await {
+        let frame = frame.map_err(|err| eyre!("{}", error_chain(&err)))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+
+        // A frame's length fits in a u64.
+        total_bytes = total_bytes.saturating_add(data.len() as u64);
+        if total_bytes > MANAGED_BINARY_MAX_BYTES {
+            return Err(eyre!("download exceeded {MANAGED_BINARY_MAX_BYTES} bytes"));
+        }
+
+        hasher.update(&data);
+        out.write_all(&data)
+            .map_err(|err| eyre!("failed writing managed zcashd binary to cache: {err}"))?;
+    }
+
+    Ok(hasher)
 }
 
 /// Formats `err` and its sources, so that redirect and body errors keep their cause.
@@ -562,6 +579,7 @@ mod tests {
         time::Duration,
     };
 
+    use hyper_util::client::proxy::matcher::Matcher;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -681,14 +699,78 @@ mod tests {
         (base_url, requests)
     }
 
+    /// Returns proxy settings that send every request directly.
+    fn no_proxy() -> Matcher {
+        Matcher::builder().build()
+    }
+
+    /// Reads an HTTP request head from `stream`.
+    fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).expect("request should be readable") == 0 {
+                break;
+            }
+            request.push(byte[0]);
+        }
+        String::from_utf8(request).expect("request head should be text")
+    }
+
+    /// Runs an HTTP proxy that answers each `CONNECT` request with `status`, and tunnels
+    /// accepted connections to their target. Returns the proxy's address and the request
+    /// heads it received.
+    fn serve_proxy(status: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy should bind");
+        let addr = listener
+            .local_addr()
+            .expect("proxy should have local address")
+            .to_string();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = requests.clone();
+
+        thread::spawn(move || {
+            for client in listener.incoming() {
+                let mut client = client.expect("client should connect to proxy");
+                let head = read_request_head(&mut client);
+                let target = head
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("CONNECT request should have a target")
+                    .to_string();
+                received.lock().expect("lock").push(head);
+                let _ = write!(client, "HTTP/1.1 {status}\r\n\r\n");
+                if !status.starts_with("200") {
+                    continue;
+                }
+
+                let server = std::net::TcpStream::connect(target).expect("target should accept");
+                let (mut client_reader, mut server_writer) = (
+                    client.try_clone().expect("socket should clone"),
+                    server.try_clone().expect("socket should clone"),
+                );
+                let (mut server_reader, mut client_writer) = (server, client);
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut client_reader, &mut server_writer);
+                });
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut server_reader, &mut client_writer);
+                });
+            }
+        });
+
+        (addr, requests)
+    }
+
     /// Runs an install that must fail, and checks that it kept `PREVIOUS_BINARY`
     /// and left no temporary files behind. Returns the error message.
     fn assert_failed_install_preserves_previous_binary(url: &str, sha256: &str) -> String {
         let temp = tempdir().expect("tempdir should exist");
         let binary_path = write_cached_binary(temp.path(), PREVIOUS_BINARY);
 
-        let error = install_managed_zcashd_binary(&manifest(url, sha256), TARGET, temp.path())
-            .expect_err("install should fail");
+        let error =
+            install_managed_zcashd_binary(&manifest(url, sha256), TARGET, temp.path(), &no_proxy())
+                .expect_err("install should fail");
 
         assert_eq!(
             std::fs::read(&binary_path).expect("previous binary should remain"),
@@ -763,6 +845,7 @@ mod tests {
             &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
             TARGET,
             temp.path(),
+            &no_proxy(),
         )
         .expect("managed install should succeed");
 
@@ -809,6 +892,7 @@ mod tests {
                 &manifest(UNREACHABLE_URL, &binary_sha256),
                 TARGET,
                 temp.path(),
+                &no_proxy(),
             )
             .unwrap_or_else(|error| {
                 panic!("cache with sidecar {sidecar:?} should be reused: {error:#}")
@@ -843,6 +927,7 @@ mod tests {
             &manifest(&format!("{base_url}/zcashd"), &binary_sha256),
             TARGET,
             temp.path(),
+            &no_proxy(),
         )
         .expect("corrupted cache should be repaired");
 
@@ -938,6 +1023,7 @@ mod tests {
             &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
             TARGET,
             temp.path(),
+            &no_proxy(),
         )
         .expect("five redirects should be followed");
 
@@ -977,7 +1063,9 @@ mod tests {
         let resolved: Vec<PathBuf> = thread::scope(|scope| {
             let installers: Vec<_> = (0..4)
                 .map(|_| {
-                    scope.spawn(|| install_managed_zcashd_binary(&manifest, TARGET, temp.path()))
+                    scope.spawn(|| {
+                        install_managed_zcashd_binary(&manifest, TARGET, temp.path(), &no_proxy())
+                    })
                 })
                 .collect();
             installers
@@ -1015,7 +1103,7 @@ mod tests {
         let installer = {
             let state_cache_dir = temp.path().to_path_buf();
             thread::spawn(move || {
-                install_managed_zcashd_binary(&manifest, TARGET, &state_cache_dir)
+                install_managed_zcashd_binary(&manifest, TARGET, &state_cache_dir, &no_proxy())
             })
         };
         // Let the installer find the stale binary and start waiting for the lock,
@@ -1156,5 +1244,126 @@ mod tests {
             lock_path.exists(),
             "live owner lock should remain for its owner"
         );
+    }
+
+    #[test]
+    fn installs_chunked_download() {
+        let (base_url, _) = serve(|_| {
+            let mut response =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            for chunk in BINARY.chunks(7) {
+                response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                response.extend_from_slice(chunk);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            vec![response]
+        });
+        let temp = tempdir().expect("tempdir should exist");
+
+        let resolved = install_managed_zcashd_binary(
+            &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
+            TARGET,
+            temp.path(),
+            &no_proxy(),
+        )
+        .expect("chunked download should install");
+
+        assert_eq!(
+            std::fs::read(resolved).expect("installed binary should be readable"),
+            BINARY
+        );
+    }
+
+    #[test]
+    fn downloads_through_proxy_tunnel_with_credentials() {
+        let (base_url, server_requests) = serve(|base_url| {
+            vec![
+                redirect_response(&format!("{base_url}/hop")),
+                ok_response(BINARY),
+            ]
+        });
+        let (proxy_addr, proxy_requests) = serve_proxy("200 Connection established");
+        let proxies = Matcher::builder()
+            .http(format!("http://user:secret@{proxy_addr}"))
+            .build();
+        let temp = tempdir().expect("tempdir should exist");
+
+        let resolved = install_managed_zcashd_binary(
+            &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
+            TARGET,
+            temp.path(),
+            &proxies,
+        )
+        .expect("download through the proxy should install");
+
+        assert_eq!(
+            std::fs::read(resolved).expect("installed binary should be readable"),
+            BINARY
+        );
+        assert_eq!(server_requests.load(Ordering::SeqCst), 2);
+        let proxy_requests = proxy_requests.lock().expect("lock");
+        assert_eq!(proxy_requests.len(), 2, "each request opens a tunnel");
+        let authority = base_url.trim_start_matches("http://");
+        for request in proxy_requests.iter() {
+            assert!(
+                request.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")),
+                "unexpected proxy request: {request}"
+            );
+            // `user:secret` in base64.
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic dxnlcjpzzwnyzxq="),
+                "proxy request should carry the credentials: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_refusal_preserves_previous_binary() {
+        let (proxy_addr, _) = serve_proxy("407 Proxy Authentication Required");
+        let proxies = Matcher::builder()
+            .http(format!("http://{proxy_addr}"))
+            .build();
+        let temp = tempdir().expect("tempdir should exist");
+        let binary_path = write_cached_binary(temp.path(), PREVIOUS_BINARY);
+
+        let error = install_managed_zcashd_binary(
+            &manifest("http://127.0.0.1:9/zcashd", &sha256_hex(BINARY)),
+            TARGET,
+            temp.path(),
+            &proxies,
+        )
+        .expect_err("a refused tunnel should fail the install");
+
+        assert!(
+            format!("{error:#}").contains("407"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&binary_path).expect("previous binary should remain"),
+            PREVIOUS_BINARY
+        );
+    }
+
+    #[test]
+    fn no_proxy_hosts_are_downloaded_directly() {
+        let (base_url, _) = serve(|_| vec![ok_response(BINARY)]);
+        // Nothing listens on the discard port, so using this proxy would fail.
+        let proxies = Matcher::builder()
+            .http("http://127.0.0.1:9")
+            .no("127.0.0.1")
+            .build();
+        let temp = tempdir().expect("tempdir should exist");
+
+        install_managed_zcashd_binary(
+            &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
+            TARGET,
+            temp.path(),
+            &proxies,
+        )
+        .expect("hosts in NO_PROXY should bypass the proxy");
     }
 }

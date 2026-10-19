@@ -700,7 +700,7 @@ impl Config {
         //
         // Sort to destroy any peer order, which could leak peer connection times.
         // (Currently the HashSet argument does this as well.)
-        peer_list.sort();
+        peer_list.sort_unstable();
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 

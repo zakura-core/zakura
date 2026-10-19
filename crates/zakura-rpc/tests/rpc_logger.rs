@@ -4,7 +4,6 @@
 //! and thread-scoped subscribers without affecting the other RPC tests.
 
 use std::{
-    borrow::Cow,
     collections::VecDeque,
     future::{ready, Future},
     io,
@@ -12,17 +11,15 @@ use std::{
 };
 
 use futures::executor::block_on;
-use jsonrpsee::{
-    core::middleware::{Batch, Notification},
-    server::middleware::rpc::RpcServiceT,
-    types::{Id, Request},
-    MethodResponse, ResponsePayload,
-};
 use serde_json::value::to_raw_value;
 use tracing::level_filters::{LevelFilter, STATIC_MAX_LEVEL};
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
 
-use zakura_rpc::server::{rpc_batch::RpcBatchMiddleware, rpc_logger::RpcLoggerMiddleware};
+use zakura_rpc::server::{
+    jsonrpc::{Id, MethodResponse, Notification, Request},
+    rpc_logger::RpcLoggerMiddleware,
+    rpc_service::{handle_rpc_call, RpcServiceT},
+};
 use zakura_test::allocations::{measure, AllocationStats, TrackingAllocator};
 
 #[global_allocator]
@@ -46,7 +43,7 @@ const MAX_LOG_CHARS: usize = 1024;
 struct PrebuiltResponses(Arc<Mutex<VecDeque<MethodResponse>>>);
 
 impl PrebuiltResponses {
-    /// Returns a service that answers calls and batches with `responses`.
+    /// Returns a service that answers calls with `responses`.
     fn new(responses: impl IntoIterator<Item = MethodResponse>) -> Self {
         Self(Arc::new(Mutex::new(responses.into_iter().collect())))
     }
@@ -57,20 +54,12 @@ impl PrebuiltResponses {
             .lock()
             .expect("test service lock is never poisoned")
             .pop_front()
-            .expect("tests prebuild a response for every call and batch")
+            .expect("tests prebuild a response for every call")
     }
 }
 
 impl RpcServiceT for PrebuiltResponses {
-    type MethodResponse = MethodResponse;
-    type NotificationResponse = MethodResponse;
-    type BatchResponse = MethodResponse;
-
     fn call<'a>(&self, _request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        ready(self.next())
-    }
-
-    fn batch<'a>(&self, _batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
         ready(self.next())
     }
 
@@ -168,43 +157,27 @@ fn trace_is_compiled_in() -> bool {
 /// Returns a `probe` request whose params are a string of `chars` copies of `c`.
 fn request(c: char, chars: usize) -> Request<'static> {
     let params = to_raw_value(&[c.to_string().repeat(chars)]).expect("a string serializes");
-    Request::owned("probe".to_owned(), Some(params), Id::Number(1))
+    Request::new("probe", Some(params), Id::Number(1))
 }
 
 /// Returns a `probe` notification whose params are a string of `chars` copies of `c`.
 fn notification(c: char, chars: usize) -> Notification<'static> {
     let params = to_raw_value(&[c.to_string().repeat(chars)]).expect("a string serializes");
-    Notification::new(Cow::Borrowed("probe"), Some(Cow::Owned(params)))
+    Notification::new("probe", Some(params))
 }
 
 /// Returns a successful response whose result is a string of `chars` copies of `c`.
 fn response(c: char, chars: usize) -> MethodResponse {
-    MethodResponse::response(
-        Id::Number(1),
-        ResponsePayload::success(c.to_string().repeat(chars)),
-        usize::MAX,
-    )
-}
-
-/// Returns a batch containing one large request.
-fn batch() -> Batch<'static> {
-    let mut batch = Batch::new();
-    batch.push(request('x', PAYLOAD_CHARS));
-    batch
+    MethodResponse::response(Id::Number(1), &Ok(c.to_string().repeat(chars)), usize::MAX)
 }
 
 /// Calls `logger` once with small payloads, so first-use allocations by the
 /// executor, tracing and the subscriber happen before any measurement.
 fn warm_up(output: &Output) {
-    let logger = RpcLoggerMiddleware::new(
-        PrebuiltResponses::new([response('w', 1), response('w', 1)]),
-        MAX_LOG_CHARS,
-    );
+    let logger =
+        RpcLoggerMiddleware::new(PrebuiltResponses::new([response('w', 1)]), MAX_LOG_CHARS);
     block_on(logger.call(request('w', 1)));
     block_on(logger.notification(notification('w', 1)));
-    let mut small_batch = Batch::new();
-    small_batch.push(request('w', 1));
-    block_on(logger.batch(small_batch));
     output.clear();
 }
 
@@ -243,7 +216,7 @@ fn disabled_trace_logging_does_no_payload_work() {
 
         let expected = response('y', PAYLOAD_CHARS).into_json();
         let logger = RpcLoggerMiddleware::new(
-            PrebuiltResponses::new([response('y', PAYLOAD_CHARS), response('y', PAYLOAD_CHARS)]),
+            PrebuiltResponses::new([response('y', PAYLOAD_CHARS)]),
             MAX_LOG_CHARS,
         );
 
@@ -257,11 +230,6 @@ fn disabled_trace_logging_does_no_payload_work() {
             measure(|| block_on(logger.notification(notification)));
         assert_no_payload_copy("a notification", stats);
         assert!(notification_response.is_notification());
-
-        let batch = batch();
-        let (batch_response, stats) = measure(|| block_on(logger.batch(batch)));
-        assert_no_payload_copy("a batch", stats);
-        assert_eq!(batch_response.as_json().get(), expected.get());
     });
 
     assert_eq!(output.lines(), Vec::<String>::new());
@@ -280,7 +248,7 @@ fn enabled_trace_logging_writes_truncated_payloads() {
         warm_up(&output);
 
         let logger = RpcLoggerMiddleware::new(
-            PrebuiltResponses::new([response('é', PAYLOAD_CHARS), response('é', PAYLOAD_CHARS)]),
+            PrebuiltResponses::new([response('é', PAYLOAD_CHARS)]),
             MAX_LOG_CHARS,
         );
 
@@ -290,20 +258,10 @@ fn enabled_trace_logging_writes_truncated_payloads() {
         assert_no_payload_copy("logging a response", stats);
 
         block_on(logger.notification(notification('é', PAYLOAD_CHARS)));
-
-        let batch = logger.batch(batch());
-        let (_, stats) = measure(|| block_on(batch));
-        assert_no_payload_copy("logging a batch response", stats);
     });
 
     let lines = output.lines();
-    for message in [
-        "request = ",
-        "response = ",
-        "notification request = ",
-        "batch request = ",
-        "batch response = ",
-    ] {
+    for message in ["request = ", "response = ", "notification request = "] {
         let payload = logged_payload(&lines, &format!("jsonrpsee: {message}"));
         assert_eq!(
             payload.chars().count(),
@@ -341,8 +299,7 @@ fn span_scoped_trace_filter_logs_payloads() {
     logged_payload(&lines, "jsonrpsee: response = ");
 }
 
-/// Behind the batch middleware, each batched call is logged once, and the batch
-/// isn't also logged as a whole.
+/// Each batched call is logged once, and the batch isn't also logged as a whole.
 #[test]
 fn batched_calls_are_logged_once_each() {
     if !trace_is_compiled_in() {
@@ -351,17 +308,18 @@ fn batched_calls_are_logged_once_each() {
 
     let output = Output::new();
     with_subscriber("jsonrpsee=trace", &output, || {
-        let service = RpcBatchMiddleware::new(
-            RpcLoggerMiddleware::new(
-                PrebuiltResponses::new([response('a', 10), response('b', 10)]),
-                MAX_LOG_CHARS,
-            ),
-            usize::MAX,
+        let service = RpcLoggerMiddleware::new(
+            PrebuiltResponses::new([response('a', 10), response('b', 10)]),
+            MAX_LOG_CHARS,
         );
-        let mut batch = Batch::new();
-        batch.push(request('x', 10));
-        batch.push(request('z', 10));
-        block_on(service.batch(batch));
+        let batch = br#"[{"jsonrpc":"2.0","method":"probe","params":["xxxxxxxxxx"],"id":1},{"jsonrpc":"2.0","method":"probe","params":["zzzzzzzzzz"],"id":2}]"#;
+        block_on(handle_rpc_call(
+            batch,
+            false,
+            &service,
+            usize::MAX,
+            usize::MAX,
+        ));
     });
 
     let lines = output.lines();

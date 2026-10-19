@@ -220,7 +220,7 @@ impl CoinbasePlan {
             })
             .collect::<Vec<_>>();
 
-        funding_stream_outputs.sort();
+        funding_stream_outputs.sort_unstable();
 
         Ok(Self {
             miner_reward_address,

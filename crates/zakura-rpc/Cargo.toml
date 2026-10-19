@@ -33,6 +33,10 @@ indexer = ["zakura-state/indexer"]
 internal-miner = []
 
 # Test-only features
+
+# Exposes `server::fuzz`, the entry points of the fuzz targets in `qa/fuzz/rpc`
+fuzz-impl = []
+
 proptest-impl = [
     "zakura-consensus/proptest-impl",
     "zakura-state/proptest-impl",
@@ -45,11 +49,10 @@ proptest-impl = [
 chrono = { workspace = true }
 futures = { workspace = true }
 
-jsonrpsee = { workspace = true, features = ["server"] }
-jsonrpsee-types = { workspace = true }
-jsonrpsee-proc-macros = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
-hyper-util = { workspace = true, features = ["service", "tokio"] }
+hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
 http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -61,7 +64,6 @@ lazy_static = { workspace = true }
 
 # RPC endpoint basic auth
 base64 = { workspace = true }
-rand = { workspace = true }
 rand_10 = { workspace = true }
 # Constant-time cookie comparison to prevent a timing oracle on RPC auth.
 subtle = { workspace = true }
@@ -104,9 +106,7 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = [
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "11.0.0-rc0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0-rc0" }
-zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0", features = [
-    "rpc-client",
-] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
 zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
@@ -120,9 +120,10 @@ bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["json", "ron"] }
 anyhow = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-no-provider"] }
+# Test RPC listeners with an HTTP/1.1 client.
+hyper = { workspace = true, features = ["client", "http1"] }
 tempfile = { workspace = true }
-toml = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 proptest = { workspace = true }

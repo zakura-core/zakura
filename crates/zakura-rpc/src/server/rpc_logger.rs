@@ -2,11 +2,9 @@
 
 use std::{fmt, future::Future};
 
-use jsonrpsee::{
-    core::middleware::{Batch, Notification},
-    server::middleware::rpc::RpcServiceT,
-    types::Request,
-    MethodResponse,
+use super::{
+    jsonrpc::{MethodResponse, Notification, Request},
+    rpc_service::RpcServiceT,
 };
 use serde::Serialize;
 use tracing::Instrument;
@@ -14,10 +12,10 @@ use tracing::Instrument;
 /// Middleware that logs JSON-RPC payloads at TRACE level, truncated to a
 /// maximum number of characters.
 ///
-/// The spans, targets and messages match `jsonrpsee`'s `RpcLogger`, so existing
-/// filters keep working, including span-scoped ones like `[method_call]=trace`.
-/// Unlike `RpcLogger`, a payload is only serialized when its event is enabled,
-/// and responses are logged without copying them.
+/// The spans, targets and messages match the `RpcLogger` of `jsonrpsee`, which
+/// Zakura used before, so existing filters keep working, including span-scoped
+/// ones like `[method_call]=trace`. A payload is only serialized when its event
+/// is enabled, and responses are logged without copying them.
 #[derive(Clone)]
 pub struct RpcLoggerMiddleware<S> {
     service: S,
@@ -32,22 +30,8 @@ impl<S> RpcLoggerMiddleware<S> {
     }
 }
 
-// The span targets are `RpcLogger`'s module path, so filters keep matching them.
-impl<S> RpcServiceT for RpcLoggerMiddleware<S>
-where
-    S: RpcServiceT<
-            MethodResponse = MethodResponse,
-            NotificationResponse = MethodResponse,
-            BatchResponse = MethodResponse,
-        > + Send
-        + Sync
-        + Clone
-        + 'static,
-{
-    type MethodResponse = MethodResponse;
-    type NotificationResponse = MethodResponse;
-    type BatchResponse = MethodResponse;
-
+// The span targets are `jsonrpsee`'s `RpcLogger` module path, so filters keep matching them.
+impl<S: RpcServiceT> RpcServiceT for RpcLoggerMiddleware<S> {
     #[tracing::instrument(
         name = "method_call",
         target = "jsonrpsee_core::middleware::layer::logger",
@@ -65,34 +49,6 @@ where
             tracing::trace!(
                 target: "jsonrpsee",
                 "response = {}",
-                Truncated(response.as_json().get(), max_chars)
-            );
-            response
-        }
-        .in_current_span()
-    }
-
-    #[tracing::instrument(
-        name = "batch",
-        target = "jsonrpsee_core::middleware::layer::logger",
-        skip_all,
-        fields(method = "batch"),
-        level = "trace"
-    )]
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        let max_chars = self.max_chars;
-        tracing::trace!(
-            target: "jsonrpsee",
-            "batch request = {}",
-            TruncatedJson(&batch, max_chars)
-        );
-
-        let service = self.service.clone();
-        async move {
-            let response = service.batch(batch).await;
-            tracing::trace!(
-                target: "jsonrpsee",
-                "batch response = {}",
                 Truncated(response.as_json().get(), max_chars)
             );
             response

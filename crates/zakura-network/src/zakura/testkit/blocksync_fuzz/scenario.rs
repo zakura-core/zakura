@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand_10::{rngs::StdRng, RngExt, SeedableRng};
 use zakura_chain::block;
 
 use crate::zakura::{BlockSyncStatus, ZakuraBlockSyncConfig, ZakuraPeerId, MAX_BS_RESPONSE_BYTES};
@@ -37,7 +37,7 @@ impl LatencyDist {
                 if hi == lo {
                     Duration::from_micros(u64::try_from(lo).unwrap_or(u64::MAX))
                 } else {
-                    let micros = rng.gen_range(lo..=hi);
+                    let micros = rng.random_range(lo..=hi);
                     Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
                 }
             }

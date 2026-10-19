@@ -514,7 +514,7 @@ impl AddressBook {
     /// Get the active addresses in `self` in random order with sanitized timestamps,
     /// including our local listener address.
     pub(crate) fn sanitized(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
-        use rand::seq::SliceRandom;
+        use rand_10::seq::SliceRandom;
         let _guard = self.span.enter();
 
         let mut peers = self.peers.clone();
@@ -541,7 +541,7 @@ impl AddressBook {
             .filter(|addr| addr.is_active_for_gossip(now))
             .collect();
 
-        peers.shuffle(&mut rand::thread_rng());
+        peers.shuffle(&mut rand_10::rng());
 
         peers
     }

@@ -6,18 +6,18 @@ use std::future::Future;
 
 use std::pin::Pin;
 
-use super::jsonrpc::ErrorObject;
 use futures::{future, FutureExt};
 use http_body_util::{BodyExt, Limited};
 use hyper::header;
-use jsonrpsee::{
-    core::BoxError,
-    server::{HttpBody, HttpRequest, HttpResponse},
-};
 use serde::{Deserialize, Serialize};
+use tower::BoxError;
 use tower::Service;
 
-use super::cookie::Cookie;
+use super::{
+    cookie::Cookie,
+    http::{HttpBody, HttpRequest, HttpResponse},
+    jsonrpc::ErrorObject,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 
@@ -35,7 +35,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 /// ### Add missing `content-type` HTTP header
 ///
 /// Some RPC clients don't include a `content-type` HTTP header.
-/// But unlike web browsers, [`jsonrpsee`] does not do content sniffing.
+/// But unlike web browsers, the RPC server does not do content sniffing.
 ///
 /// If there is no `content-type` header, we assume the content is JSON,
 /// and let the parser error if we are incorrect.
@@ -257,7 +257,7 @@ enum JsonRpcVersion {
     Lightwalletd,
     /// The client is indicating strict 2.0 handling.
     TwoPointZero,
-    /// On parse errors we don't modify anything, and let the `jsonrpsee` crate handle it.
+    /// On parse errors we don't modify anything, and let the JSON-RPC server handle it.
     Unknown,
 }
 
@@ -327,7 +327,7 @@ impl JsonRpcResponse {
                 self.error = self.error.or(Some(serde_json::Value::Null));
             }
             JsonRpcVersion::TwoPointZero => {
-                // `jsonrpsee` should be returning valid JSON-RPC 2.0 responses. However,
+                // The server should be returning valid JSON-RPC 2.0 responses. However,
                 // a valid result of `null` can be parsed into `None` by this parser, so
                 // we map the result explicitly to `Null` when there is no error.
                 assert_eq!(self.jsonrpc.as_deref(), Some("2.0"));

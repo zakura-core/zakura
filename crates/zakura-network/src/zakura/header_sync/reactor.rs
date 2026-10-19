@@ -3262,7 +3262,6 @@ impl HeaderSyncReactor {
     }
 
     fn try_assign_vct_repair(&mut self) {
-        self.prune_vct_supplier_history();
         let now = Instant::now();
         if let Some(task) = self.vct_repair.current_mut() {
             task.resume_retry(now);

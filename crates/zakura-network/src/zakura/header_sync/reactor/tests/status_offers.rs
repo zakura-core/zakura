@@ -1771,6 +1771,76 @@ async fn status_flood_during_context_backoff_keeps_supplier_history() {
     assert!(actions.try_recv().is_err());
 }
 
+/// Measure the per-Status repair cost separately from Tokio's frozen retry deadlines.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::print_stderr)]
+async fn active_repair_status_flood_cost() {
+    for peers in [16_u16, 92, 512] {
+        let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+        reactor.startup.config.peer_limits.max_inbound_peers = 512;
+        reactor.startup.config.peer_limits.max_outbound_peers = 512;
+        reactor.startup.committed_snapshots = None;
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
+        reactor.observe_latest_committed_snapshot(snapshot.clone());
+        let outputs: Vec<_> = (0..peers)
+            .map(|index| {
+                let mut id = vec![0xa5; 32];
+                id[..2].copy_from_slice(&index.to_le_bytes());
+                let peer = ZakuraPeerId::new(id).unwrap();
+                let (send, outbound) = framed_channel(8);
+                reactor.handle_peer_connected(PeerSession::from_parts(
+                    peer.clone(),
+                    send,
+                    CancellationToken::new(),
+                ));
+                (peer, outbound)
+            })
+            .collect();
+        ready_repair(&mut reactor, &mut actions, &snapshot);
+        let RepairPolicyState::Ready { context } =
+            reactor.vct_repair.current().unwrap().state.clone()
+        else {
+            panic!("ready repair")
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let phases = [
+            RepairPolicyState::QueryingContext {
+                deadline,
+                retry_at: deadline,
+            },
+            RepairPolicyState::ContextBackoff { retry_at: deadline },
+            RepairPolicyState::StateBlocked {
+                context: context.clone(),
+                state_version: snapshot.state_version,
+            },
+            RepairPolicyState::Assigned {
+                context: context.clone(),
+            },
+            RepairPolicyState::Completed,
+        ];
+        for (phase, state) in phases.into_iter().enumerate() {
+            reactor.vct_repair.current_mut().unwrap().state = state.clone();
+            let start = std::time::Instant::now();
+            for _ in 0..602 {
+                for (peer, _) in &outputs {
+                    reactor.handle_status(
+                        peer.clone(),
+                        0,
+                        status_for(&snapshot, snapshot.frontiers.header_best.hash),
+                    );
+                }
+            }
+            eprintln!(
+                "active_repair_status_flood peers={peers} phase={phase} ns_per_status={}",
+                start.elapsed().as_nanos() / (u128::from(peers) * 602)
+            );
+            assert_eq!(reactor.vct_repair.current().unwrap().state, state);
+            assert!(actions.try_recv().is_err());
+        }
+    }
+}
+
 /// Exercise the production QUIC handler, service pipe, and reactor at the default connection cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "92 loopback peers; explicit rollout load validation"]

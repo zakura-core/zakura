@@ -1047,7 +1047,8 @@ fn vct_admission_failures_preserve_retry_policy_state() {
             .expect("an admission failure cannot recreate the repair task");
         assert_eq!(task.attempts, 2);
         if supplier_attributed {
-            assert!(!task.tried_sources.contains(&prior));
+            // No membership event removed this synthetic prior source.
+            assert!(task.tried_sources.contains(&prior));
             assert!(!task.tried_sources.contains(&source));
             assert!(matches!(
                 &task.state,
@@ -2143,6 +2144,11 @@ fn disconnected_supplier_history_cannot_block_a_new_supplier() {
         assert!(!task.tried_sources.contains(&source));
     }
 
+    // Pruning runs when membership changes, not on every subsequent status.
+    let (departing, _output) = fixture.connect(&[0x72], 8);
+    fixture
+        .reactor
+        .handle_peer_disconnected(&departing[0], 8, "test disconnect");
     fixture.advertise(&peers, 7);
 
     assert!(fixture.reactor.peer_work_queue.active(peer).is_some());

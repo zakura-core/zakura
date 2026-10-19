@@ -413,7 +413,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   `quinn-proto` an event for a connection it already removed. A connection
   task that exits without a drained event reports one when it drops.
 - **ADM-12.** The endpoint MUST hold at most `QuicBindConfig::max_connections`
-  live QUIC connections across all its sockets. A connection is live from
+  live QUIC connections across all its sockets. `bind` MUST refuse a cap of
+  zero, since that endpoint could neither dial nor accept. A connection is live from
   `accept` or `connect` until it closes, so handshakes, dial attempts and
   established connections count. Each address attempt of a dial (DIAL-3)
   counts on its own. Closed connections move to ADM-13's allowance.

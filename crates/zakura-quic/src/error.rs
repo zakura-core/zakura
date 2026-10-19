@@ -108,6 +108,10 @@ pub enum BindError {
     /// No bind address was given.
     #[error("no bind address configured")]
     NoAddress,
+    /// `QuicBindConfig::max_connections` is zero, so the endpoint could
+    /// neither dial nor accept (ADM-12).
+    #[error("QuicBindConfig::max_connections must allow at least one connection")]
+    NoConnectionSlots,
     /// A socket failed to bind or configure.
     #[error("failed to bind {addr}: {source}")]
     Socket {

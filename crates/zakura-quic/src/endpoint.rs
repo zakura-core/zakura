@@ -194,6 +194,11 @@ impl QuicEndpoint {
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
         }
+        // ADM-12: with no slot, every dial and accept would fail, and a dial
+        // capped at zero addresses would have nothing to try.
+        if bind.max_connections == 0 {
+            return Err(BindError::NoConnectionSlots);
+        }
         let shared = Arc::new(Shared {
             id: secret.public(),
             config: config.clone(),
@@ -469,7 +474,10 @@ impl QuicEndpoint {
                 }
             }
         }
-        let error = best.expect("at least one attempt ran because targets was non-empty");
+        let error = best.expect(
+            "at least one attempt ran because targets was non-empty and bind refuses a zero \
+             connection cap, so truncating to it keeps at least one address",
+        );
         if matches!(error, ConnectError::AlpnMismatch) {
             metrics::counter!("zakura.quic.dial.alpn_mismatch").increment(1);
         }

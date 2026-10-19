@@ -2157,6 +2157,20 @@ async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
     .unwrap();
 }
 
+/// ADM-12: an endpoint with no connection slot could neither dial nor
+/// accept, so `bind` refuses it.
+#[tokio::test]
+async fn bind_refuses_a_zero_connection_cap() {
+    let bind = QuicBindConfig {
+        max_connections: 0,
+        ..loopback()
+    };
+    assert!(matches!(
+        QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()),
+        Err(crate::BindError::NoConnectionSlots)
+    ));
+}
+
 /// ADM-12: a dial tries at most as many addresses as the table can ever
 /// hold, so a record with more addresses than slots still dials instead of
 /// failing with `ConnectionLimit` forever.

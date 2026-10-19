@@ -82,7 +82,7 @@ ed25519-zebra = { workspace = true }
 hex = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-toml = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 

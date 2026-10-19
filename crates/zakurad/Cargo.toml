@@ -221,6 +221,7 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 criterion = { workspace = true }
 rand_10 = { workspace = true }
 regex = { workspace = true }

@@ -140,7 +140,8 @@ thiserror = "2.0"
 tokio = "1.44"
 tokio-stream = "0.1.17"
 tokio-util = "0.7.14"
-toml = "1.0"
+# Production code only parses TOML; tests that serialize it enable `display`.
+toml = { version = "1.0", default-features = false, features = ["parse", "serde", "std"] }
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 # `cleanup-markdown` only rewrites doc comments, and pulls in pulldown-cmark,

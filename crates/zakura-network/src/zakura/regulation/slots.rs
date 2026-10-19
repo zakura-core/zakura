@@ -63,7 +63,7 @@ impl SlotBudget {
 
     /// Create a non-owning handle to this same pool for registry bookkeeping.
     /// This does not change capacity or release any reserved slots.
-    pub(super) fn downgrade(&self) -> WeakSlotBudget {
+    pub(crate) fn downgrade(&self) -> WeakSlotBudget {
         WeakSlotBudget {
             #[cfg(test)]
             capacity: self.capacity,
@@ -219,7 +219,7 @@ pub(crate) struct SlotPermit {
 /// Once all strong owners are gone, upgrading returns `None`. The registry
 /// can then remove the stale entry.
 #[derive(Debug)]
-pub(super) struct WeakSlotBudget {
+pub(crate) struct WeakSlotBudget {
     #[cfg(test)]
     capacity: usize,
     permits: Weak<Semaphore>,
@@ -234,7 +234,7 @@ impl WeakSlotBudget {
 
     /// Obtain shared ownership of the existing pool, or `None` if it is gone.
     /// This never creates a new pool or resets its available capacity.
-    pub(super) fn upgrade(&self) -> Option<SlotBudget> {
+    pub(crate) fn upgrade(&self) -> Option<SlotBudget> {
         Some(SlotBudget {
             #[cfg(test)]
             capacity: self.capacity,

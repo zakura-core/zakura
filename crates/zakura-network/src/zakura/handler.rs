@@ -2356,7 +2356,7 @@ pub(crate) fn service_registry(
 struct LegacyReceiveCapacity {
     per_peer: usize,
     node: super::regulation::SlotBudget,
-    peers: std::sync::Mutex<HashMap<ZakuraPeerId, super::regulation::SlotBudget>>,
+    peers: std::sync::Mutex<HashMap<ZakuraPeerId, super::regulation::WeakSlotBudget>>,
 }
 
 impl LegacyReceiveCapacity {
@@ -2375,23 +2375,43 @@ impl LegacyReceiveCapacity {
         }
     }
 
-    /// Reserve both limits atomically from the caller's perspective, with no waiting queue.
-    fn reserve(
-        &self,
-        peer: &ZakuraPeerId,
-    ) -> Option<(super::regulation::SlotPermit, super::regulation::SlotPermit)> {
+    /// Find the peer's pool while retained permits and admission waiters keep it alive.
+    fn peer_budget(&self, peer: &ZakuraPeerId) -> super::regulation::SlotBudget {
         let mut peers = self
             .peers
             .lock()
             .expect("receive capacity mutex is never poisoned");
-        peers.retain(|_, budget| budget.available() < self.per_peer);
-        let budget = peers.entry(peer.clone()).or_insert_with(|| {
-            super::regulation::SlotBudget::new(self.per_peer)
-                .expect("peer receive slots fit the semaphore")
-        });
-        let peer = budget.try_reserve()?;
+        peers.retain(|_, budget| budget.upgrade().is_some());
+        if let Some(budget) = peers
+            .get(peer)
+            .and_then(super::regulation::WeakSlotBudget::upgrade)
+        {
+            return budget;
+        }
+        let budget = super::regulation::SlotBudget::new(self.per_peer)
+            .expect("peer receive slots fit the semaphore");
+        peers.insert(peer.clone(), budget.downgrade());
+        budget
+    }
+
+    /// Reserve both limits without adding an inbound waiting queue.
+    fn reserve(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Option<(super::regulation::SlotPermit, super::regulation::SlotPermit)> {
+        let peer = self.peer_budget(peer).try_reserve()?;
         let node = self.node.try_reserve()?;
         Some((peer, node))
+    }
+
+    /// Admit one already queued outbound request, with at most one waiter per connection.
+    async fn reserve_outbound(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> (super::regulation::SlotPermit, super::regulation::SlotPermit) {
+        let peer = self.peer_budget(peer).reserve().await;
+        let node = self.node.reserve().await;
+        (peer, node)
     }
 }
 
@@ -2761,7 +2781,7 @@ impl ZakuraProtocolHandler {
         connection: Connection,
         peer_id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
-        mut outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
+        outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
         context: RegisteredConnectionServeContext,
         mut cleanup_guard: RegisteredPeerCleanupGuard,
     ) -> Result<(), ZakuraHandlerError> {
@@ -2974,6 +2994,38 @@ impl ZakuraProtocolHandler {
                     .schedule_demand(&mut session_waits, demand);
             }
         }
+
+        // Unfold retains the dequeued request and its admission future across select
+        // turns. Waiting for receive capacity must not stop inbound/control work.
+        let response_capacity = self.legacy_responses.clone();
+        let response_peer = peer_id.clone();
+        let mut admitted_outbound = Box::pin(futures::stream::unfold(
+            outbound_rx,
+            move |mut receiver| {
+                let capacity = response_capacity.clone();
+                let peer = response_peer.clone();
+                async move {
+                    loop {
+                        let mut frame = receiver.recv().await?;
+                        let lease = match &mut frame {
+                            ZakuraOutboundFrame::Request {
+                                stream_kind,
+                                completion,
+                                ..
+                            } if *stream_kind == LEGACY_REQUEST_STREAM_KIND => {
+                                tokio::select! {
+                                    biased;
+                                    _ = completion.closed() => continue,
+                                    permit = capacity.reserve_outbound(&peer) => ReceiveLease { _permits: Some(Arc::new(permit)) },
+                                }
+                            }
+                            _ => ReceiveLease::default(),
+                        };
+                        return Some(((frame, lease), receiver));
+                    }
+                }
+            },
+        ));
 
         loop {
             let session_deadline = pending_sessions.deadline();
@@ -3288,8 +3340,8 @@ impl ZakuraProtocolHandler {
                         }
                     }
                 }
-                outbound = outbound_rx.recv() => {
-                    let Some(outbound) = outbound else {
+                outbound = admitted_outbound.next() => {
+                    let Some((outbound, response_lease)) = outbound else {
                         close_cause.record("outbound_closed");
                         break;
                     };
@@ -3309,17 +3361,6 @@ impl ZakuraProtocolHandler {
                                 )
                                 .into()));
                                 continue;
-                            };
-                            // Reserve a complete response before issuing the request. Refuse
-                            // locally instead of retaining partial responses while waiting.
-                            let response_lease = if stream_kind == LEGACY_REQUEST_STREAM_KIND {
-                                let Some(permit) = self.legacy_responses.reserve(&peer_id) else {
-                                    let _ = completion.send(Err("legacy response receive capacity exhausted".into()));
-                                    continue;
-                                };
-                                ReceiveLease { _permits: Some(Arc::new(permit)) }
-                            } else {
-                                ReceiveLease::default()
                             };
                             if let Some(started) = started {
                                 let _ = started.send(());

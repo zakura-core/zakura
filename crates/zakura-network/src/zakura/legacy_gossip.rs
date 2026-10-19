@@ -7621,4 +7621,104 @@ mod tests {
         node.shutdown().await;
         Ok(())
     }
+    /// Queued requests wait for retained responses without blocking inbound traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retained_responses_backpressure_real_connection_queues() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (receiver, _requests) = legacy_node(95000).await?;
+        let mut servers = Vec::new();
+        for index in 0..5_u64 {
+            let (server, _) = legacy_node(95100 + index).await?;
+            receiver.connect_native(&server, TEST_NET_TIMEOUT).await?;
+            servers.push(server);
+        }
+        let handles = receiver.supervisor().outbound_peer_handles().await;
+        assert_eq!(handles.len(), 5);
+        let mut held = Vec::new();
+        for (index, handle) in handles[..4].iter().enumerate() {
+            held.push(
+                handle
+                    .request(
+                        ZAKURA_STREAM_LEGACY_REQUESTS,
+                        u64::try_from(index).unwrap() + 1,
+                        MSG_REQUEST_PING,
+                        0,
+                        Vec::new(),
+                        None,
+                    )
+                    .await?,
+            );
+        }
+        let same_peer = handles[0].clone();
+        let queued = tokio::spawn(async move {
+            same_peer
+                .request(
+                    ZAKURA_STREAM_LEGACY_REQUESTS,
+                    10,
+                    MSG_REQUEST_PING,
+                    0,
+                    Vec::new(),
+                    None,
+                )
+                .await
+        });
+        let fifth = handles[4].clone();
+        let cancelled = tokio::spawn(async move {
+            fifth
+                .request(
+                    ZAKURA_STREAM_LEGACY_REQUESTS,
+                    11,
+                    MSG_REQUEST_PING,
+                    0,
+                    Vec::new(),
+                    None,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !queued.is_finished(),
+            "the second request must wait for its peer's retained response"
+        );
+        assert!(
+            !cancelled.is_finished(),
+            "the fifth peer must wait for node receive capacity"
+        );
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+
+        // All outbound response slots are occupied. Each connection must still
+        // accept inbound requests while its next outbound request waits.
+        for server in &servers {
+            let response = LegacyRequestAdapter::new(server.supervisor())
+                .request_from_source(Request::Ping(Default::default()), None)
+                .await?;
+            assert!(matches!(response, Response::Pong(_)));
+        }
+        let fifth = handles[4].clone();
+        let global = tokio::spawn(async move {
+            fifth
+                .request(
+                    ZAKURA_STREAM_LEGACY_REQUESTS,
+                    12,
+                    MSG_REQUEST_PING,
+                    0,
+                    Vec::new(),
+                    None,
+                )
+                .await
+        });
+        drop(held.pop());
+        let global = tokio::time::timeout(TEST_NET_TIMEOUT, global).await???;
+        assert_eq!(global.frames()[0].message_type, MSG_RESPONSE_PONG);
+        drop(held.remove(0));
+        let queued = tokio::time::timeout(TEST_NET_TIMEOUT, queued).await???;
+        assert_eq!(queued.frames()[0].message_type, MSG_RESPONSE_PONG);
+        drop((held, global, queued));
+        receiver.shutdown().await;
+        for server in servers {
+            server.shutdown().await;
+        }
+        Ok(())
+    }
 }

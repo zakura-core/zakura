@@ -120,7 +120,8 @@ bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["json", "ron"] }
 anyhow = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-no-provider"] }
+# Test RPC listeners with an HTTP/1.1 client.
+hyper = { workspace = true, features = ["client", "http1"] }
 tempfile = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -9,10 +9,10 @@ use std::{
 
 use eyre::{eyre, Report};
 use http_body_util::BodyExt;
+use hyper::Uri;
 use hyper_util::client::proxy::matcher::Matcher;
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
-use url::Url;
 use zakura_chain::common::TempFile;
 
 use super::{
@@ -281,11 +281,11 @@ fn cached_binary_matches(path: &Path, expected_sha256: &str) -> Result<bool, Rep
 /// Returns `true` if managed downloads may fetch `url`.
 ///
 /// Production code accepts HTTPS URLs only. Tests may also use localhost HTTP.
-fn download_url_is_allowed(url: &Url) -> bool {
-    match url.scheme() {
-        "https" => true,
+fn download_url_is_allowed(url: &Uri) -> bool {
+    match url.scheme_str() {
+        Some("https") => true,
         #[cfg(test)]
-        "http" => matches!(url.host_str(), Some("127.0.0.1" | "localhost")),
+        Some("http") => matches!(url.host(), Some("127.0.0.1" | "localhost")),
         _ => false,
     }
 }
@@ -303,8 +303,8 @@ fn download_verified_binary(
     proxies: &Matcher,
     out: &mut fs::File,
 ) -> Result<(), Report> {
-    let parsed =
-        Url::parse(url).map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err}"))?;
+    let parsed = download::parse_url(url)
+        .map_err(|err| eyre!("invalid managed zcashd URL '{url}': {err:#}"))?;
     if !download_url_is_allowed(&parsed) {
         return Err(eyre!("managed zcashd URL must use https: {url}"));
     }
@@ -350,7 +350,7 @@ fn download_verified_binary(
 
 /// Downloads `url` into `out`, and returns the hash of what it wrote.
 async fn download_into(
-    url: Url,
+    url: Uri,
     tls: Arc<rustls::ClientConfig>,
     proxies: &Matcher,
     out: &mut fs::File,
@@ -1365,5 +1365,42 @@ mod tests {
             &proxies,
         )
         .expect("hosts in NO_PROXY should bypass the proxy");
+    }
+
+    #[test]
+    fn follows_absolute_path_redirect_on_the_same_server() {
+        let (base_url, requests) =
+            serve(|_| vec![redirect_response("/elsewhere/zcashd"), ok_response(BINARY)]);
+        let temp = tempdir().expect("tempdir should exist");
+
+        let resolved = install_managed_zcashd_binary(
+            &manifest(&format!("{base_url}/zcashd"), &sha256_hex(BINARY)),
+            TARGET,
+            temp.path(),
+            &no_proxy(),
+        )
+        .expect("a same-server redirect should be followed");
+
+        assert_eq!(
+            std::fs::read(resolved).expect("installed binary should be readable"),
+            BINARY
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rejects_relative_path_redirect() {
+        let (base_url, requests) = serve(|_| vec![redirect_response("elsewhere/zcashd")]);
+
+        let error = assert_failed_install_preserves_previous_binary(
+            &format!("{base_url}/zcashd"),
+            &sha256_hex(BINARY),
+        );
+
+        assert!(
+            error.contains("'elsewhere/zcashd' is not a valid absolute URL"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }

@@ -187,8 +187,6 @@ tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-# Resolution constraint for transitive URL/DNS dependencies; no direct API use.
-idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 
 # Health check server and managed zcashd download dependencies
@@ -198,7 +196,6 @@ hyper-util = { workspace = true, features = ["client-proxy", "service", "server"
 
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-url = { workspace = true }
 webpki-roots = "1"
 
 bytes = { workspace = true }
@@ -261,7 +258,6 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7-rc0" }
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are used indirectly or constrain transitive resolution.
 normal = [
-    "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]
 development = [

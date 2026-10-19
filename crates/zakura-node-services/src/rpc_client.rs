@@ -148,9 +148,8 @@ impl RpcRequestClient {
     ) -> Result<Response<Bytes>, RpcRequestError> {
         let method = method.as_ref();
         let params = params.as_ref();
-        let body = format!(
-            r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#
-        );
+        let body =
+            format!(r#"{{"jsonrpc": "2.0", "method": "{method}", "params": {params}, "id":123 }}"#);
         self.send(Method::POST, content_type, body.into()).await
     }
 

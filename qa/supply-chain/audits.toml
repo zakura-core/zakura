@@ -4568,7 +4568,7 @@ delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 who = "Claude <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.24.0"
-notes = "Zakura's fork of rocksdb 0.24.0, which is audited above. The Rust sources are unchanged. The manifest renames the package, keeps the library named rocksdb through [lib], and points the librocksdb-sys dependency at zakura-librocksdb-sys with an exact version pin. The fork's test suite passed except one trybuild compile-fail test whose expected rustc diagnostic wording changed in newer compilers; that failure is unrelated to the fork."
+notes = "Zakura's fork of rocksdb 0.24.0, which is audited above. The manifest renames the package, keeps the library named rocksdb through [lib], points the librocksdb-sys dependency at zakura-librocksdb-sys with an exact version pin, and raises rust-version to 1.97. The only library source change adds six lint names to the crate-level allow list in src/lib.rs, for lints newer than upstream's Rust 1.85 baseline; no code changes. Two test files take clippy's suggested rewrites and one trybuild expectation is updated for newer compiler wording. The fork's full test suite, clippy with -D warnings, and rustdoc pass on Rust 1.97.1."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

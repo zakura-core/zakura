@@ -295,6 +295,7 @@ mod tests {
                     limits.node_output_responses,
                     PEER_OUTPUT_RESPONSES * max_connections
                 );
+                // Every test cap is at most 256, so the cast to u64 is lossless.
                 assert_eq!(
                     limits.node_output_bytes,
                     limits.peer_output_bytes * max_connections as u64

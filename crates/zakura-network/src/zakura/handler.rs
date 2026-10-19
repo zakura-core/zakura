@@ -19,8 +19,8 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, StreamExt as _};
-use rand::{rngs::OsRng, RngCore};
+use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
+use rand_10::Rng;
 use thiserror::Error;
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -328,17 +328,18 @@ pub struct ZakuraConfig {
     /// connections together may make this node hold.
     ///
     /// Each live QUIC connection can hold its `[network.zakura.quic]` receive
-    /// and send windows plus a 16 MiB datagram queue, 80 MiB at the defaults,
-    /// whether or not the node reads. A closed connection releases its stream
-    /// buffers and holds 64 KiB until it drains, and each live slot funds two
-    /// of those (zakura-quic CTRL-26 lists what this leaves out). The
-    /// transport holds at most 102 live connections at the defaults.
-    /// `max_pending_handshakes` of those are headroom for handshakes, so the
-    /// node admits 70 and a larger
-    /// `max_connections` is lowered at startup. Startup fails when the budget
-    /// admits fewer than 16 connections, or twice the discovery headroom plus
-    /// one (19 with Mainnet's 9 bootstrap peers), or fewer than
-    /// `max_connections` when that is smaller.
+    /// and send windows, 64 MiB at the defaults, whether or not the node
+    /// reads. Each bound socket can also queue 256 MiB of datagrams, however
+    /// many connections it serves (zakura-quic CTRL-26 lists what this leaves
+    /// out). The node reserves one socket queue per bound socket and funds the
+    /// rest divided by the per-connection cost, 124 live connections on the
+    /// one socket `listen_addr` binds. `max_pending_handshakes` of those are
+    /// headroom for handshakes, so the node admits 92, and a larger
+    /// `max_connections` is lowered at startup. A closed connection releases
+    /// its stream buffers and costs nothing more until it drains.
+    /// Startup fails when the budget admits fewer than 16 connections, or
+    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
+    /// peers), or fewer than `max_connections` when that is smaller.
     pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
@@ -445,6 +446,7 @@ impl ZakuraConfig {
         budgeted_max_connections(
             self.max_connections,
             self.peer_memory_budget_bytes,
+            self.bound_socket_count(),
             self.quic.connection_memory_bytes(),
             match local_node_id {
                 Some(local_node_id) => {
@@ -455,6 +457,12 @@ impl ZakuraConfig {
             },
             self.max_pending_handshakes.max(1),
         )
+    }
+
+    /// Returns how many sockets the native endpoint binds for this config (see
+    /// `native_bind_addrs`), each with its own datagram queue.
+    fn bound_socket_count(&self) -> u64 {
+        u64::try_from(native_bind_addrs(self.listen_addr).len()).unwrap_or(u64::MAX)
     }
 
     /// Return the default bootstrap peers for `network`.
@@ -534,6 +542,7 @@ impl ZakuraLocalLimits {
                 .max(1)
                 .min(budget_admitted_connections(
                     config.zakura.peer_memory_budget_bytes,
+                    config.zakura.bound_socket_count(),
                     config.zakura.quic.connection_memory_bytes(),
                     config.zakura.max_pending_handshakes.max(1),
                 )),
@@ -2315,7 +2324,7 @@ pub struct ZakuraProtocolHandler {
 }
 
 fn random_stream_session_seed() -> u64 {
-    let mut rng = OsRng;
+    let mut rng = rand_10::rng();
     loop {
         let seed = rng.next_u64();
         if seed != 0 {
@@ -2608,7 +2617,7 @@ impl ZakuraProtocolHandler {
         hello.validate(&expected)?;
 
         let mut local_nonce = [0; 32];
-        OsRng.fill_bytes(&mut local_nonce);
+        rand_10::rng().fill_bytes(&mut local_nonce);
 
         let accepted_limits = self.accepted_limits_for(&hello.initial_limits);
         let ack = ZakuraControlAck {
@@ -2803,6 +2812,7 @@ impl ZakuraProtocolHandler {
                         context.direction,
                         session_exit_tx.clone(),
                     )
+                    .boxed()
                     .await
                 {
                     Ok(admitted) => admitted,
@@ -2971,6 +2981,7 @@ impl ZakuraProtocolHandler {
                             context.direction,
                             session_exit_tx.clone(),
                         )
+                        .boxed()
                         .await
                     {
                         Ok(admitted) => {
@@ -4575,7 +4586,7 @@ async fn run_native_initiator_handshake(
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("open control stream"))??;
     let mut local_nonce = [0; 32];
-    OsRng.fill_bytes(&mut local_nonce);
+    rand_10::rng().fill_bytes(&mut local_nonce);
 
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,

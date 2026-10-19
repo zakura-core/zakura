@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use zakura_chain::{block, diagnostic::task::CheckForPanics};
 
-use super::wire::{Message, Range};
+use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
     regulation::{
@@ -58,11 +58,9 @@ impl<S: Source + ?Sized> Produce for Server<S> {
     type Message = Message;
 
     fn response_cap(&self, range: &Range) -> ResponseCap {
-        Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        }
-        .response_cap(self.max_body_bytes)
+        range
+            .truncated(self.max_blocks)
+            .response_cap(self.max_body_bytes)
     }
 
     async fn produce(
@@ -74,15 +72,12 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        let read_range = Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        };
+        let read_range = range.truncated(self.max_blocks);
         let result = self
             .source
             .read(Read {
-                start_height: read_range.start,
-                count: read_range.count,
+                start_height: read_range.start(),
+                count: read_range.count(),
                 max_body_bytes: self.max_body_bytes,
                 lease: BlockRangeReadLease {
                     work: lease,
@@ -97,7 +92,7 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         // Await the actual job, even after session cancellation, and keep the
         // source's lease with its retained blocks.
         tokio::task::spawn_blocking(move || {
-            encode_response(requested, read_range.count, max_body_bytes, result, sink)
+            encode_response(requested, read_range.count(), max_body_bytes, result, sink)
         })
         .await
         .check_for_panics_with(false)
@@ -127,7 +122,7 @@ fn encode_response(
         if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        if returned == max_blocks || height.0 != requested.start.0 + returned {
+        if returned == max_blocks || height.0 != requested.start().0 + returned {
             break;
         }
         // usize fits u64 on the supported 64-bit targets.
@@ -154,12 +149,9 @@ fn encode_response(
 }
 
 fn ending(range: Range, returned: u32) -> Message {
-    if returned == 0 {
-        Message::RangeUnavailable(range)
+    Message::End(if returned == 0 {
+        RangeEnding::unavailable(range.start(), range.count())
     } else {
-        Message::BlocksDone {
-            start: range.start,
-            returned,
-        }
-    }
+        RangeEnding::done(range.start(), returned)
+    })
 }

@@ -26,6 +26,8 @@
 //! | The bursts after an outage or a local pause are admitted | `the_burst_after_the_longest_outage_is_admitted`, `the_burst_after_a_local_pause_of_any_length_is_admitted` |
 //! | Bounded delays do not exhaust a conformant sender | `a_conformant_sender_is_never_exhausted` |
 //! | The sender paces rows and keeps one unwritten frame per row | `the_sender_waits_for_its_interval_and_keeps_only_the_latest_value`, `a_blocked_writer_holds_at_most_one_frame_per_row` |
+//! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
+//! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
 
 use std::{collections::HashMap, time::Duration};
 
@@ -315,6 +317,41 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
             .min()
     }
 
+    /// Raise `message_type`'s send interval to at least `interval`.
+    ///
+    /// A local policy may send less often than its row allows, never more.
+    pub(crate) fn with_min_interval(
+        mut self,
+        message_type: u16,
+        interval: Duration,
+    ) -> Result<Self, CadenceSendError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.message_type == message_type)
+            .ok_or(CadenceSendError::NoCadence { message_type })?;
+        slot.send_interval = slot.send_interval.max(interval);
+        Ok(self)
+    }
+
+    /// Try to queue the latest value of `message_type`'s row without waiting.
+    pub(crate) fn send_row(
+        &mut self,
+        message_type: u16,
+        send: &FramedSend,
+    ) -> Result<RowSend, CadenceSendError>
+    where
+        M::Error: std::fmt::Debug,
+    {
+        let now = self.clock.now();
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.message_type == message_type)
+            .ok_or(CadenceSendError::NoCadence { message_type })?;
+        send_slot(slot, now, send)
+    }
+
     /// Queue every due value on `send` without waiting.
     ///
     /// Returns the number of frames queued. A full queue leaves the value
@@ -326,30 +363,62 @@ impl<M: WireMessage, C: Clock> CadenceSender<M, C> {
         let now = self.clock.now();
         let mut queued = 0;
         for slot in &mut self.slots {
-            let interval_passed = slot
-                .last_sent
-                .is_none_or(|last| now.saturating_duration_since(last) >= slot.send_interval);
-            if slot.latest.is_none() || !interval_passed || slot.unwritten.strong_count() > 0 {
-                continue;
+            if send_slot(slot, now, send)? == RowSend::Queued {
+                queued += 1;
             }
-            let reserved = match send.try_reserve_guarded() {
-                Ok(reserved) => reserved,
-                Err(crate::zakura::transport::GuardedReserveError::Full) => continue,
-                Err(_) => return Err(CadenceSendError::Closed),
-            };
-            let message = slot
-                .latest
-                .take()
-                .expect("the slot was checked to hold a value above");
-            let frame = encode_frame(&message).map_err(|_| CadenceSendError::Encode {
-                message_type: slot.message_type,
-            })?;
-            let written = std::sync::Arc::new(());
-            slot.unwritten = std::sync::Arc::downgrade(&written);
-            reserved.send(frame, FrameGuard::new(written));
-            slot.last_sent = Some(now);
-            queued += 1;
         }
         Ok(queued)
     }
+}
+
+/// What one row did on a send attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RowSend {
+    /// No value waits.
+    Idle,
+    /// The latest value entered the queue.
+    Queued,
+    /// The row's interval has not passed. The value may be sent at this instant.
+    DeferredUntil(Instant),
+    /// The row's previous frame has not finished its transport write.
+    Unwritten,
+    /// The stream's outbound queue has no free slot.
+    QueueFull,
+}
+
+fn send_slot<M: WireMessage>(
+    slot: &mut Slot<M>,
+    now: Instant,
+    send: &FramedSend,
+) -> Result<RowSend, CadenceSendError> {
+    if slot.latest.is_none() {
+        return Ok(RowSend::Idle);
+    }
+    if let Some(due) = slot
+        .last_sent
+        .map(|last| last + slot.send_interval)
+        .filter(|due| *due > now)
+    {
+        return Ok(RowSend::DeferredUntil(due));
+    }
+    if slot.unwritten.strong_count() > 0 {
+        return Ok(RowSend::Unwritten);
+    }
+    let reserved = match send.try_reserve_guarded() {
+        Ok(reserved) => reserved,
+        Err(crate::zakura::transport::GuardedReserveError::Full) => return Ok(RowSend::QueueFull),
+        Err(_) => return Err(CadenceSendError::Closed),
+    };
+    let message = slot
+        .latest
+        .take()
+        .expect("the slot was checked to hold a value above");
+    let frame = encode_frame(&message).map_err(|_| CadenceSendError::Encode {
+        message_type: slot.message_type,
+    })?;
+    let written = std::sync::Arc::new(());
+    slot.unwritten = std::sync::Arc::downgrade(&written);
+    reserved.send(frame, FrameGuard::new(written));
+    slot.last_sent = Some(now);
+    Ok(RowSend::Queued)
 }

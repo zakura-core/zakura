@@ -75,7 +75,7 @@ impl PeerRegistry {
             .values()
             .cloned()
             .collect();
-        connected_peers.sort_by(|left, right| {
+        connected_peers.sort_unstable_by(|left, right| {
             left.addr
                 .cmp(&right.addr)
                 .then(left.is_inbound.cmp(&right.is_inbound))

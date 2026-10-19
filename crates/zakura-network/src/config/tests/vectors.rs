@@ -874,11 +874,11 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 24196939776
+        peer_memory_budget_bytes = 19595788288
         "#,
     )
     .unwrap();
-    // 288 live slots of 80 MiB, each with two 64 KiB closing slots: 256
+    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
     // admitted and 32 of headroom.
     assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
 
@@ -901,7 +901,7 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
             bind.dial_reserve,
             bind.max_closing_connections
         ),
-        (102, 16, 204)
+        (124, 16, 248)
     );
 
     // A 1 GiB receive window leaves the default budget room for 7 QUIC

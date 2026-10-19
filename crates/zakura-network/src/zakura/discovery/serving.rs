@@ -288,13 +288,14 @@ mod tests {
 
     #[test]
     fn the_node_pool_follows_the_effective_connection_cap() {
-        for max_connections in [1, 102, 256] {
+        for max_connections in [1, 124, 256] {
             for largest in [LARGEST_PEERS, LARGEST_SERVICES] {
                 let limits = serving_limits(largest, max_connections);
                 assert_eq!(
                     limits.node_output_responses,
                     PEER_OUTPUT_RESPONSES * max_connections
                 );
+                // Every test cap is at most 256, so the cast to u64 is lossless.
                 assert_eq!(
                     limits.node_output_bytes,
                     limits.peer_output_bytes * max_connections as u64

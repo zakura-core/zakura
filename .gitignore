@@ -105,6 +105,12 @@ target/
 /qa/fuzz/header-chain/coverage/
 /qa/fuzz/header-chain/*.profdata
 /qa/fuzz/header-chain/*.profraw
+/qa/fuzz/rpc/Cargo.lock
+/qa/fuzz/rpc/artifacts/
+/qa/fuzz/rpc/corpus/
+/qa/fuzz/rpc/coverage/
+/qa/fuzz/rpc/*.profdata
+/qa/fuzz/rpc/*.profraw
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html

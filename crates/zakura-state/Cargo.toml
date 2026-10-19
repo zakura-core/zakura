@@ -85,7 +85,7 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", feat
 eyre = { workspace = true }
 
 once_cell = { workspace = true }
-toml = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 
 hex = { workspace = true, features = ["serde"] }
 insta = { workspace = true, features = ["ron"] }
@@ -93,7 +93,7 @@ serde_json = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 
 halo2 = { workspace = true }
 orchard = { workspace = true }

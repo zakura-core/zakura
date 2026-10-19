@@ -448,7 +448,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 
   Zakura sets `max_connections` to its admitted cap plus
   `max_pending_handshakes`, and `dial_reserve` to half of
-  `max_pending_handshakes` rounded up, so at least one slot: 102 and 16 at
+  `max_pending_handshakes` rounded up, so at least one slot: 124 and 16 at
   the defaults (CTRL-26).
 - **ADM-13.** When a connection closes, its connection task MUST release the
   stream payload `quinn-proto` still holds, then move its slot from ADM-12's
@@ -468,9 +468,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     datagrams already queued at the switch, and only then does the live slot
     free. Datagrams that arrive later sit under the closing limit and are
     handled as usual, so concurrent arrivals can't extend that work. An
-    endpoint send racing the switch can add one datagram.
-    `CLOSING_CONNECTION_MEMORY_BYTES` is that queue: what a closed connection
-    can make the node hold beyond its bookkeeping.
+    endpoint send racing the switch can add one datagram. That queue counts
+    against its socket's `SOCKET_DATAGRAM_QUEUE_BYTES`, so beyond bookkeeping
+    a closed connection costs the CTRL-26 budget nothing.
   - If `max_closing_connections` are already held, the task MUST drop the
     connection's state at once instead of draining it. A late packet for it
     gets at most a stateless reset. Admission never counts closed
@@ -479,11 +479,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
     those.
 
   Zakura sets `max_closing_connections` to twice ADM-12's
-  `max_connections`, 204 at the defaults. A peer that completes handshakes and
+  `max_connections`, 248 at the defaults. A peer that completes handshakes and
   gets rejected over and over can fill that allowance. Later closes then skip
   their drain, but the closed connections take no live slot, so admission
-  and dials are unaffected by them. This replaces a table in which each closed connection kept its
-  stream buffers, up to 80 MiB, for up to three PTOs.
+  and dials are unaffected by them. This replaces a table in which each closed
+  connection kept its stream buffers, up to 64 MiB of window credit, for up
+  to three PTOs.
 
 ## 8. Dialing
 
@@ -550,27 +551,28 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 
 These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (70), `max_connections_per_ip` (16),
+`listen_addr`, `max_connections` (92), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
 `peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
 
 - **CTRL-26.** One live QUIC connection can make the node hold
-  `receive_window_bytes + send_window_bytes` plus its 16 MiB datagram queue
-  (DRV-3) in transport buffers, 80 MiB at the defaults, whether or not the
-  application reads. Per-stream receive windows sit inside the connection
-  window and add nothing. `zakura_quic::connection_memory_bytes` is the only
-  implementation of this formula. A closed connection holds
-  `CLOSING_CONNECTION_MEMORY_BYTES`, 64 KiB, once ADM-13 releases its
-  streams. The budget charges each live slot its connection plus two closing
-  slots, so `[network.zakura] peer_memory_budget_bytes` divided by
-  `connection_memory_bytes + 2 × CLOSING_CONNECTION_MEMORY_BYTES` is the
-  number of live connections it funds, 102 at the defaults.
-  `max_pending_handshakes` of them are headroom for handshakes not yet
-  admitted and extra address attempts of one dial, and the node admits the
-  rest, 70 at the defaults. ADM-12 holds the transport to the admitted cap
-  plus that headroom, and ADM-13 to two closing connections per live slot,
-  so every QUIC connection the node holds is funded. Startup lowers a larger
+  `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
+  at the defaults, whether or not the application reads. Per-stream receive
+  windows sit inside the connection window and add nothing.
+  `zakura_quic::connection_memory_bytes` is the only implementation of this
+  formula. Queued datagrams are bounded per socket instead: each bound socket
+  queues at most `SOCKET_DATAGRAM_QUEUE_BYTES` (256 MiB, DRV-3) however many
+  connections it serves, closed ones included, and connection tasks drain it
+  whether or not the application reads. A closed connection holds no stream
+  data once ADM-13 releases it. The node reserves one socket queue per bound
+  socket from `[network.zakura] peer_memory_budget_bytes`, and the rest
+  divided by the per-connection cost is the number of live connections it
+  funds, 124 at the defaults, which bind one socket. `max_pending_handshakes`
+  of them are headroom for handshakes not yet admitted and extra address
+  attempts of one dial, and the node admits the rest, 92 at the defaults.
+  ADM-12 holds the transport to the admitted cap plus that headroom, so every
+  live connection the node holds is funded. Startup lowers a larger
   `max_connections` to the admitted count with a warning. It fails, naming
   `peer_memory_budget_bytes`, when the budget admits fewer than 16
   connections or twice the discovery headroom plus one (19 with Mainnet's 9
@@ -582,10 +584,11 @@ These keys stay in `[network.zakura]` and keep their meaning:
   floor. The budget never shrinks the windows, so it costs no per-connection
   throughput.
 
-  The budget counts flow-control credit and queued datagrams, not resident
-  memory. Connection and stream bookkeeping, reassembly bookkeeping and
-  allocator overhead come on top, as do our writes still waiting for send
-  credit (DRV-4).
+  The budget counts flow-control credit and the socket datagram queues, not
+  resident memory. Connection and stream bookkeeping, including that of the
+  closed connections ADM-13 keeps, reassembly bookkeeping and allocator
+  overhead come on top, as do our writes still waiting for send credit
+  (DRV-4).
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -1119,9 +1122,10 @@ Changed:
 Added:
 
 - **CTRL-26.** No setting tied the connection count to the transport memory
-  that peers can fill, so 256 connections could hold 20 GiB at the defaults
-  (V12 F-69). `peer_memory_budget_bytes` now caps the count, and the default
-  `max_connections` drops from 256 to the 102 that the default budget admits.
+  that peers can fill, so 256 connections could hold 16 GiB of window credit
+  at the defaults (V12 F-69). `peer_memory_budget_bytes` now caps the count,
+  and the default `max_connections` drops from 256 to the 124 that the default
+  budget admits.
 
 ## 17g. Changes in version 0.9
 
@@ -1149,8 +1153,8 @@ Added:
 Changed:
 
 - **ADM-3.** The endpoint applies ADM-12 after rules 3 and 5.
-- **CTRL-26.** The budget now funds every QUIC connection the transport may
-  hold: each live slot carries its own cost and two closing slots, and the
-  live slots include `max_pending_handshakes` of headroom. The default
-  `max_connections` drops from 102 to 70, and the exclusion list keeps only
-  bookkeeping, allocator overhead and pending writes.
+- **CTRL-26.** The budget now funds every live QUIC connection the transport
+  may hold, `max_pending_handshakes` of headroom included, and closed
+  connections hold no stream data. The default `max_connections` drops from
+  124 to 92, and the exclusion list keeps only bookkeeping, allocator
+  overhead and pending writes.

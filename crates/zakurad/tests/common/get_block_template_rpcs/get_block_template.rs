@@ -107,7 +107,7 @@ pub(crate) async fn run() -> Result<()> {
 
     let is_response_success = getblocktemplate_response.status().is_success();
 
-    let mut response_text = getblocktemplate_response.text().await?;
+    let mut response_text = String::from_utf8_lossy(getblocktemplate_response.body()).into_owned();
     // This string can be extremely long in logs.
     if response_text.len() > 1003 {
         let end = response_text.len() - 500;

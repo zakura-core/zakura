@@ -1,12 +1,12 @@
 use super::{
-    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, trace::*,
-    wire::*, *,
+    config::*, events::*, peer_registry::*, regulated::status_sender::StatusSend, sequencer::*,
+    sequencer_task::*, state::*, trace::*, wire::*, *,
 };
 use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
 };
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
@@ -34,6 +34,24 @@ pub(super) const BS_ACTION_CONTROL_RESERVE: usize = 1;
 /// request; the routine never blocks on it (the only blocking routine send is the
 /// Sequencer `AcceptBody`), so a full channel just defers an idempotent ping.
 const ROUTINE_TO_REACTOR_DEPTH: usize = 1024;
+
+/// Node-wide cap on outbound block requests in flight, across every active and
+/// draining session. It preserves one full protocol window while bounding
+/// authorization state.
+///
+/// Each request holds one entry of the routines' shared request pool until its
+/// response ends, and asks for at most `advertised_max_blocks_per_response`
+/// heights, so in-flight heights never exceed this many requests' worth (per-peer
+/// and per-session limits only lower that). That also caps the refill low-water
+/// target, at this many requests' worth plus one [`NEEDED_BLOCK_REFILL_LIMIT`]
+/// batch. Past the pool's worth, every free entry already has a pending height
+/// to take. The extra batch lets a full pool start its next refill query while a
+/// batch of work is still pending, rather than only once pending work has run
+/// out and replacement requests are already waiting. Only one refill query runs
+/// at a time and each returns at most one batch, so a bigger reserve can't
+/// refill any faster. It only absorbs a longer burst by queuing more work.
+// `MAX_BS_INFLIGHT_REQUESTS` is a `u32`, which fits in `usize` on supported targets.
+const BS_REQUEST_POOL_ENTRIES: usize = MAX_BS_INFLIGHT_REQUESTS as usize;
 
 /// State's header range read cap, mirrored here to keep `zakura-network` from
 /// depending upward on `zakura-state`.
@@ -210,7 +228,7 @@ pub fn spawn_block_sync_reactor(
     registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
-    OsRng.fill_bytes(&mut retry_jitter_seed);
+    rand_10::rng().fill_bytes(&mut retry_jitter_seed);
 
     let sequencer_task = SequencerTask::new(
         sequencer,
@@ -245,12 +263,8 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
-        // Preserve one full protocol window while bounding authorization state
-        // across every active and draining session. The count fits usize.
-        request_pool: crate::zakura::regulation::ReservationPool::new(
-            MAX_BS_INFLIGHT_REQUESTS as usize,
-        )
-        .expect("the protocol request ceiling is positive and representable"),
+        request_pool: crate::zakura::regulation::ReservationPool::new(BS_REQUEST_POOL_ENTRIES)
+            .expect("the protocol request ceiling is positive and representable"),
         serving: Arc::new(super::regulated::session::Serving::new(
             startup.range_source.clone(),
             &startup.config,
@@ -775,7 +789,7 @@ impl BlockSyncReactor {
                 node_id_from_block_peer_id(&peer_id)
             })
             .collect();
-        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.sort_unstable();
         admitted_node_ids.dedup();
 
         let _ = self.candidates.send(ZakuraBlockSyncCandidateState {
@@ -818,7 +832,7 @@ impl BlockSyncReactor {
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
         // routine nor holds a per-peer inbound channel.
-        let peer_state = PeerBlockState::new(session, &self.startup.config);
+        let peer_state = PeerBlockState::new(session);
         self.state.peers.insert(peer.clone(), peer_state);
         set_block_reactor_active_connection_gauge(self.state.peers.len());
 
@@ -1829,19 +1843,7 @@ impl BlockSyncReactor {
     }
 
     fn refill_low_water_blocks(&self) -> usize {
-        let status_peers = self.registry.peers_with_status().max(1);
-        let max_blocks_per_response =
-            usize::try_from(self.startup.config.advertised_max_blocks_per_response())
-                .expect("advertised block count fits usize");
-        let max_inflight_per_peer =
-            usize::try_from(self.startup.config.advertised_max_inflight_requests())
-                .expect("u32 max inflight requests fits in usize on supported targets")
-                .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER);
-
-        status_peers
-            .saturating_mul(max_inflight_per_peer)
-            .saturating_mul(max_blocks_per_response)
-            .max(max_blocks_per_response)
+        refill_low_water_target(&self.registry, &self.startup.config)
     }
 
     fn send_status(
@@ -1859,24 +1861,30 @@ impl BlockSyncReactor {
         let sent = session.wire_status(status);
         let msg = BlockSyncMessage::Status(sent);
         let started = Instant::now();
-        let result = session.try_send_status(status);
-        match &result {
-            Ok(()) => peer_state.status_delivery.queued(status, now),
-            Err(OrderedSendError::Full) => {
-                peer_state.status_delivery.queue_full(now);
-                if let Some(deadline) = session.status_next_due() {
-                    peer_state.status_delivery.defer_until(deadline);
-                }
-            }
-            Err(_) => {}
-        }
-        match result {
-            Ok(()) => {
+        let error = match session.offer_status(status) {
+            Ok(StatusSend::Queued) => {
+                peer_state.status_delivery.queued(status);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
-                true
+                return true;
             }
-            Err(OrderedSendError::Full) => {
+            // The connection's cadence allows the next Status later.
+            // Legal pacing is not queue pressure.
+            Ok(StatusSend::Deferred(at)) => {
+                peer_state.status_delivery.deferred_until(at);
+                self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
+                return false;
+            }
+            // The previous Status frame is still waiting for its transport
+            // write. The queue may have free slots, so this is not a queue failure.
+            Ok(StatusSend::Unwritten) => {
+                peer_state.status_delivery.queue_full(now);
+                tracing::debug!(?peer, "previous Zakura block-sync Status is unwritten");
+                self.trace_message_sent(peer, &msg, "unwritten", started.elapsed());
+                return false;
+            }
+            Ok(StatusSend::QueueFull) => {
+                peer_state.status_delivery.queue_full(now);
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
                 self.trace_queue_send_failed(
@@ -1887,24 +1895,23 @@ impl BlockSyncReactor {
                     session.outbound_max_capacity(),
                     Some(reason),
                 );
-                false
+                return false;
             }
-            Err(error) => {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
-                self.trace_status_send_failed(peer, reason);
-                self.trace_message_sent(peer, &msg, "error", started.elapsed());
-                self.trace_queue_send_failed(
-                    peer,
-                    &msg,
-                    &error,
-                    session.outbound_capacity(),
-                    session.outbound_max_capacity(),
-                    Some(reason),
-                );
-                session.cancel_token().cancel();
-                false
-            }
-        }
+            Err(error) => error,
+        };
+        tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
+        self.trace_status_send_failed(peer, reason);
+        self.trace_message_sent(peer, &msg, "error", started.elapsed());
+        self.trace_queue_send_failed(
+            peer,
+            &msg,
+            &error,
+            session.outbound_capacity(),
+            session.outbound_max_capacity(),
+            Some(reason),
+        );
+        session.cancel_token().cancel();
+        false
     }
 
     fn flush_status_refresh(&mut self) {
@@ -2203,6 +2210,136 @@ fn set_block_reactor_active_connection_gauge(active_connections: usize) {
         .set(active_connections as f64);
 }
 
+/// Refill low-water target in heights: one full local per-peer window for each
+/// peer that sent a status, never more than the request pool's worth plus one
+/// refill batch (see [`BS_REQUEST_POOL_ENTRIES`]), and never less than one request.
+fn refill_low_water_target(registry: &PeerRegistry, config: &ZakuraBlockSyncConfig) -> usize {
+    let status_peers = registry.peers_with_status().max(1);
+    let max_blocks_per_response = usize::try_from(config.advertised_max_blocks_per_response())
+        .expect("advertised block count fits usize");
+    let max_inflight_per_peer = usize::try_from(config.advertised_max_inflight_requests())
+        .expect("u32 max inflight requests fits in usize on supported targets")
+        .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER);
+
+    let cap = BS_REQUEST_POOL_ENTRIES
+        .saturating_mul(max_blocks_per_response)
+        .saturating_add(
+            usize::try_from(NEEDED_BLOCK_REFILL_LIMIT).expect("the refill batch fits usize"),
+        );
+
+    status_peers
+        .saturating_mul(max_inflight_per_peer)
+        .saturating_mul(max_blocks_per_response)
+        .min(cap)
+        .max(max_blocks_per_response)
+}
+
 pub(super) fn tolerated_bytes(reserved_bytes: u64, tolerance_percent: u32) -> u64 {
     reserved_bytes.saturating_mul(u64::from(tolerance_percent.max(100))) / 100
+}
+
+#[cfg(test)]
+mod refill_target_tests {
+    use super::*;
+
+    /// Admit `count` peers, each with a status that advertises `[low, high]`.
+    fn registry_with_status_peers(
+        config: &ZakuraBlockSyncConfig,
+        count: u16,
+        low: u32,
+        high: u32,
+    ) -> PeerRegistry {
+        let registry = PeerRegistry::new();
+        for id in 0..count {
+            let mut bytes = vec![0; 32];
+            bytes[..2].copy_from_slice(&id.to_be_bytes());
+            let peer = ZakuraPeerId::new(bytes).expect("32-byte test peer id is valid");
+            let generation = registry
+                .admit_session(
+                    &peer,
+                    ServicePeerDirection::Inbound,
+                    config,
+                    0,
+                    std::time::Instant::now(),
+                )
+                .generation();
+            registry.upsert_status(
+                &peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(low),
+                    servable_high: block::Height(high),
+                    ..BlockSyncStatus::default()
+                },
+            );
+        }
+        registry
+    }
+
+    /// One refill batch in heights.
+    fn refill_batch() -> usize {
+        usize::try_from(NEEDED_BLOCK_REFILL_LIMIT).unwrap()
+    }
+
+    /// The default config's cap: a full pool of one-block requests plus one batch.
+    fn default_cap() -> usize {
+        BS_REQUEST_POOL_ENTRIES + refill_batch()
+    }
+
+    /// Status-only peers count toward the target but can't push it past the cap.
+    #[test]
+    fn status_only_peers_cannot_grow_the_refill_target_past_the_cap() {
+        let config = ZakuraBlockSyncConfig::default();
+        // The default inbound limit's worth of peers whose statuses advertise only
+        // genesis, so none of them can serve a far-behind node's missing work.
+        let registry = registry_with_status_peers(&config, 256, 0, 0);
+        assert_eq!(registry.peers_with_status(), 256);
+
+        // Before the cap this was 256 * 32,000 = 8,192,000 queued heights.
+        assert_eq!(refill_low_water_target(&registry, &config), default_cap());
+    }
+
+    /// Useful suppliers still grow the target until it covers the whole pool.
+    #[test]
+    fn useful_suppliers_still_fill_the_refill_target_up_to_the_cap() {
+        // One default supplier keeps its full window, as on main, and a second
+        // one reaches the cap.
+        let config = ZakuraBlockSyncConfig::default();
+        let one = registry_with_status_peers(&config, 1, 0, 3_000_000);
+        assert_eq!(
+            refill_low_water_target(&one, &config),
+            usize::try_from(DEFAULT_BS_MAX_INFLIGHT).unwrap()
+        );
+        let two = registry_with_status_peers(&config, 2, 0, 3_000_000);
+        assert_eq!(refill_low_water_target(&two, &config), default_cap());
+
+        // Small per-peer windows still add up until the cap is reached.
+        let config = ZakuraBlockSyncConfig {
+            max_inflight_requests: 64,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let some = registry_with_status_peers(&config, 512, 0, 3_000_000);
+        assert_eq!(
+            refill_low_water_target(&some, &config),
+            BS_REQUEST_POOL_ENTRIES
+        );
+        let enough = registry_with_status_peers(&config, 600, 0, 3_000_000);
+        assert_eq!(refill_low_water_target(&enough, &config), default_cap());
+    }
+
+    /// With every pool entry outstanding, refill becomes due as soon as pending
+    /// work drops below one batch, not only once it has run out.
+    #[test]
+    fn a_full_request_pool_still_refills_before_pending_work_runs_out() {
+        let config = ZakuraBlockSyncConfig::default();
+        let registry = registry_with_status_peers(&config, 12, 0, 3_000_000);
+        let target = refill_low_water_target(&registry, &config);
+
+        let outstanding = BS_REQUEST_POOL_ENTRIES;
+        let pending = refill_batch() - 1;
+        assert!(
+            outstanding + pending < target,
+            "a full pool with less than a batch pending must still refill"
+        );
+    }
 }

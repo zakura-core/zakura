@@ -28,7 +28,7 @@ pub(crate) const RECEIPT_SESSION_HEADER: &str = "x-zakura-receipt-session";
 /// Receipt orders in this process share one session.
 pub(crate) fn receipt_session() -> &'static str {
     static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SESSION.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+    SESSION.get_or_init(|| format!("{:032x}", rand_10::random::<u128>()))
 }
 
 impl BlockHashAndHeight {

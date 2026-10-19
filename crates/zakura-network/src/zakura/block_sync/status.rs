@@ -1,67 +1,49 @@
 //! Per-peer delivery of the latest local serving range.
 
-use super::{state::RateMeter, BlockSyncStatus, Duration, Instant};
+use super::{BlockSyncStatus, Duration, Instant};
 
 const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A queued frame is the delivery boundary of the ordered, reliable stream.
-/// Failed attempts retain the difference from the latest local status. There is
-/// no cached retry payload to become stale while the outbound queue is full.
+/// This tracks whether the peer still needs the latest local status, and when
+/// another attempt can succeed. The connection's Status cadence owns pacing and
+/// the unsent value, so a failed attempt leaves no stale retry payload here.
 #[derive(Debug)]
 pub(super) struct StatusDelivery {
     last_queued: Option<BlockSyncStatus>,
-    updates: RateMeter,
-    queue_retry_at: Option<Instant>,
-    queue_retry_interval: Duration,
+    retry_at: Instant,
 }
 
 impl StatusDelivery {
-    pub(super) fn new(interval: Duration, now: Instant) -> Self {
-        let interval = interval.max(Duration::from_millis(1));
+    pub(super) fn new(now: Instant) -> Self {
         Self {
             last_queued: None,
-            updates: RateMeter {
-                next_allowed: now,
-                interval,
-            },
-            queue_retry_at: None,
-            queue_retry_interval: interval.min(QUEUE_RETRY_INTERVAL),
+            retry_at: now,
         }
     }
 
-    /// The next send is due only while a range change or handshake remains pending.
+    /// A send is due only while a range change or handshake remains pending.
     pub(super) fn next_deadline(
         &self,
         latest: BlockSyncStatus,
         received_status: bool,
     ) -> Option<Instant> {
-        if self.last_queued == Some(latest) && received_status {
-            return None;
-        }
-        let deadline = self.updates.next_allowed;
-        Some(
-            self.queue_retry_at
-                .map_or(deadline, |retry| deadline.max(retry)),
-        )
+        (self.last_queued != Some(latest) || !received_status).then_some(self.retry_at)
     }
 
-    /// Advance the update allowance only after a frame enters the stream.
-    pub(super) fn queued(&mut self, status: BlockSyncStatus, now: Instant) {
-        self.updates.mark_taken(now);
+    pub(super) fn queued(&mut self, status: BlockSyncStatus) {
         self.last_queued = Some(status);
-        self.queue_retry_at = None;
     }
 
-    pub(super) fn defer_until(&mut self, deadline: Instant) {
-        self.queue_retry_at = Some(
-            self.queue_retry_at
-                .map_or(deadline, |retry| retry.max(deadline)),
-        );
+    /// The cadence allows the next send at `at`.
+    pub(super) fn deferred_until(&mut self, at: Instant) {
+        self.retry_at = at;
     }
 
-    /// Back off failed queue attempts without spending the range-change allowance.
+    /// Back off a full queue or an unwritten previous Status without waiting
+    /// for the next cadence interval.
     pub(super) fn queue_full(&mut self, now: Instant) {
-        self.queue_retry_at = Some(now + self.queue_retry_interval);
+        self.retry_at = now + QUEUE_RETRY_INTERVAL;
     }
 }
 
@@ -82,31 +64,28 @@ mod tests {
     }
 
     #[test]
-    fn growth_and_corrections_share_the_update_deadline() {
+    fn a_deferred_correction_retries_at_the_cadence_deadline() {
         let now = Instant::now();
-        let interval = Duration::from_secs(30);
-        let mut delivery = StatusDelivery::new(interval, now);
+        let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(initial, true), Some(now));
-        delivery.queued(initial, now);
-        for latest in [status(1_000, 6_001), status(1_001, 6_001), status(0, 0)] {
-            assert_eq!(delivery.next_deadline(latest, true), Some(now + interval));
-        }
-        let latest = status(1_999, 6_002);
-        delivery.queued(latest, now + interval);
-        assert_eq!(delivery.next_deadline(latest, true), None);
-        assert_eq!(
-            delivery.next_deadline(status(2_000, 6_003), true),
-            Some(now + interval * 2)
-        );
+        delivery.queued(initial);
+        assert_eq!(delivery.next_deadline(initial, true), None);
+        let correction = status(1_000, 6_001);
+        assert_eq!(delivery.next_deadline(correction, true), Some(now));
+        let cadence = now + Duration::from_secs(30);
+        delivery.deferred_until(cadence);
+        assert_eq!(delivery.next_deadline(correction, true), Some(cadence));
+        delivery.queued(correction);
+        assert_eq!(delivery.next_deadline(correction, true), None);
     }
 
     #[test]
     fn queue_pressure_retries_the_latest_range_at_its_own_deadline() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
+        let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial, now);
+        delivery.queued(initial);
         let full_at = now + Duration::from_secs(30);
         delivery.queue_full(full_at);
         let latest = status(1_002, 6_002);
@@ -119,42 +98,31 @@ mod tests {
             delivery.next_deadline(latest, true),
             Some(deadline + QUEUE_RETRY_INTERVAL)
         );
-        delivery.queued(latest, deadline + QUEUE_RETRY_INTERVAL);
+        delivery.queued(latest);
         assert_eq!(delivery.next_deadline(latest, true), None);
     }
 
     #[test]
     fn unchanged_status_retries_only_until_the_peer_supplies_its_status() {
         let now = Instant::now();
-        let interval = Duration::from_secs(30);
-        let mut delivery = StatusDelivery::new(interval, now);
+        let mut delivery = StatusDelivery::new(now);
         let latest = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
-        delivery.queued(latest, now);
-        assert_eq!(delivery.next_deadline(latest, false), Some(now + interval));
+        delivery.queued(latest);
+        // The handshake keeps an unchanged Status due. The connection's cadence
+        // paces the resend; see the reactor test for that deferral.
+        assert_eq!(delivery.next_deadline(latest, false), Some(now));
         assert_eq!(delivery.next_deadline(latest, true), None);
     }
 
     #[test]
     fn returning_to_the_queued_range_cancels_a_failed_correction() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
+        let mut delivery = StatusDelivery::new(now);
         let initial = status(1_000, 6_000);
-        delivery.queued(initial, now);
+        delivery.queued(initial);
         delivery.queue_full(now);
         assert!(delivery.next_deadline(status(1_001, 6_001), true).is_some());
         assert_eq!(delivery.next_deadline(initial, true), None);
-    }
-
-    #[test]
-    fn a_connection_deadline_defers_updates_without_spending_the_allowance() {
-        let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(1), now);
-        let latest = status(1_000, 6_000);
-        let deadline = now + Duration::from_secs(30);
-        delivery.queue_full(now);
-        delivery.defer_until(deadline);
-        assert_eq!(delivery.next_deadline(latest, false), Some(deadline));
-        assert_eq!(delivery.last_queued, None);
     }
 }

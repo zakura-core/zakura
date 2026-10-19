@@ -1,4 +1,10 @@
-use super::{config::*, error::*, *};
+use super::{
+    config::*,
+    error::*,
+    regulated::wire::{decode_control, Control, Message, Outcome, Range, RangeEnding},
+    *,
+};
+use crate::zakura::wire_codec::{WireError, WireMessage};
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
@@ -76,95 +82,78 @@ impl BlockSyncMessage {
     }
 
     /// Encode this message as `[u8 message_type][bounded fields...]`.
+    ///
+    /// Control messages use the regulated stream-6 codec and its checks.
     pub fn encode(&self) -> Result<Vec<u8>, BlockSyncWireError> {
         let mut bytes = Vec::new();
-        bytes.write_u8(self.message_type())?;
-        match self {
-            Self::Status(status) => status.encode_to(&mut bytes)?,
-            Self::GetBlocks {
-                start_height,
-                count,
-            }
-            | Self::RangeUnavailable {
-                start_height,
-                count,
-            } => {
-                validate_block_count(*count)?;
-                write_height(&mut bytes, *start_height)?;
-                bytes.write_u32::<LittleEndian>(*count)?;
-            }
+        let control = match self {
             Self::Block(block) => {
+                bytes.write_u8(MSG_BS_BLOCK)?;
                 block.zcash_serialize_into_vec(&mut bytes)?;
                 validate_encoded_block_len(
                     bytes.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
                 )?;
+                validate_payload_len(bytes.len())?;
+                return Ok(bytes);
             }
+            Self::Status(status) => Message::Status(*status),
+            Self::GetBlocks {
+                start_height,
+                count,
+            } => Message::GetBlocks(Range::new(*start_height, *count)?),
             Self::BlocksDone {
                 start_height,
                 returned,
-            } => {
-                validate_block_count(*returned)?;
-                write_height(&mut bytes, *start_height)?;
-                bytes.write_u32::<LittleEndian>(*returned)?;
-            }
-        }
-        validate_payload_len(bytes.len())?;
+            } => Message::End(RangeEnding::done(*start_height, *returned)),
+            Self::RangeUnavailable {
+                start_height,
+                count,
+            } => Message::End(RangeEnding::unavailable(*start_height, *count)),
+        };
+        control.encode_payload(&mut bytes)?;
         Ok(bytes)
     }
 
     /// Decode a stream-6 message.
+    ///
+    /// Control messages use the regulated stream-6 codec and its checks.
     pub fn decode(bytes: &[u8]) -> Result<Self, BlockSyncWireError> {
         validate_payload_len(bytes.len())?;
-        let mut reader = Cursor::new(bytes);
-        let message_type = reader.read_u8()?;
-        let message = match message_type {
-            MSG_BS_STATUS => Self::Status(BlockSyncStatus::decode_from(&mut reader)?),
-            MSG_BS_GET_BLOCKS => {
-                let start_height = read_height(&mut reader)?;
-                let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
-                Self::GetBlocks {
-                    start_height,
-                    count,
-                }
+        match bytes.first().copied() {
+            Some(MSG_BS_BLOCK) => decode_block(bytes).map(Self::Block),
+            Some(MSG_BS_STATUS..=MSG_BS_RANGE_UNAVAILABLE) => {
+                Ok(Self::from_control(decode_control(bytes)?))
             }
-            MSG_BS_BLOCK => {
-                let block_start = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
-                let mut block_bytes = &bytes[block_start..];
-                let block = Arc::new(block::Block::zcash_deserialize_from_slice(
-                    &mut block_bytes,
-                )?);
-                let block_end = bytes.len() - block_bytes.len();
-                reader.set_position(
-                    u64::try_from(block_end)
-                        .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?,
-                );
-                validate_encoded_block_len(block_end.saturating_sub(block_start))?;
-                Self::Block(block)
-            }
-            MSG_BS_BLOCKS_DONE => {
-                let start_height = read_height(&mut reader)?;
-                let returned = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(returned)?;
-                Self::BlocksDone {
-                    start_height,
-                    returned,
-                }
-            }
-            MSG_BS_RANGE_UNAVAILABLE => {
-                let start_height = read_height(&mut reader)?;
-                let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
-                Self::RangeUnavailable {
-                    start_height,
-                    count,
-                }
-            }
-            value => return Err(BlockSyncWireError::UnknownMessageType(value)),
-        };
-        reject_trailing(bytes, &reader)?;
-        Ok(message)
+            Some(other) => Err(BlockSyncWireError::UnknownMessageType(other)),
+            None => Err(WireError::Truncated("message type").into()),
+        }
+    }
+
+    /// The public form of a decoded control message.
+    pub(super) fn from_control(control: Control) -> Self {
+        match control {
+            Control::Status(status) => Self::Status(status),
+            Control::GetBlocks(range) => Self::GetBlocks {
+                start_height: range.start(),
+                count: range.count(),
+            },
+            Control::End(RangeEnding {
+                start,
+                count,
+                outcome: Outcome::Done,
+            }) => Self::BlocksDone {
+                start_height: start,
+                returned: count,
+            },
+            Control::End(RangeEnding {
+                start,
+                count,
+                outcome: Outcome::Unavailable,
+            }) => Self::RangeUnavailable {
+                start_height: start,
+                count,
+            },
+        }
     }
 
     /// Convert this message into a bounded Zakura frame.
@@ -183,9 +172,9 @@ impl BlockSyncMessage {
 
     /// Decode this message and return the raw frame payload for block bodies.
     ///
-    /// The returned raw payload includes the stream-6 message type byte. Keeping
-    /// the whole payload lets the decoder move the frame allocation into the
-    /// reorder buffer without copying; consumers skip
+    /// The returned raw payload includes the stream-6 message type byte. The
+    /// decoder copies the payload once into an `Arc<[u8]>`, which the reorder
+    /// buffer then shares without further copies; consumers skip
     /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
@@ -196,54 +185,54 @@ impl BlockSyncMessage {
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
 
+        if let Some(&payload_message_type) = frame.payload.first() {
+            if payload_message_type != frame_message_type {
+                return Err(BlockSyncWireError::MismatchedFrameMessageType {
+                    frame: frame.message_type,
+                    payload: payload_message_type,
+                });
+            }
+        }
+
         // If this is a block message, keep the original raw block payload as well;
         // it can be stored in compact form in the reorder backlog.
         let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
-            let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
-            let message = Self::decode(&raw_block_payload)?;
-            (message, Some(raw_block_payload))
+            let (block, raw_block_payload) = decode_block_payload(frame.payload)?;
+            (Self::Block(block), Some(raw_block_payload))
         } else {
             (Self::decode(&frame.payload)?, None)
         };
-
-        if frame_message_type != message.message_type() {
-            return Err(BlockSyncWireError::MismatchedFrameMessageType {
-                frame: frame.message_type,
-                payload: message.message_type(),
-            });
-        }
         Ok((message, raw_block_payload))
-    }
-
-    /// Exact serialized length of a `Block` body, derived from the frame payload
-    /// length the per-peer decode task already has in hand.
-    ///
-    /// A block payload is `[message_type][block serialization]` with no trailing
-    /// bytes — `encode` writes exactly those two parts and `decode` calls
-    /// `reject_trailing`, so the block occupies exactly
-    /// `payload_len - BLOCK_SYNC_MESSAGE_TYPE_BYTES`. Returning this lets the
-    /// reactor account body bytes without re-serializing the whole block on its
-    /// single thread (the per-peer task already paid the deserialization cost).
-    /// Returns `None` for non-block messages.
-    pub(super) fn block_body_wire_bytes(&self, payload_len: usize) -> Option<u64> {
-        matches!(self, Self::Block(_)).then(|| {
-            u64::try_from(payload_len.saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES))
-                .unwrap_or(u64::MAX)
-        })
     }
 }
 
-pub(super) fn validate_block_count(count: u32) -> Result<(), BlockSyncWireError> {
-    if count == 0 {
-        return Err(BlockSyncWireError::ZeroBlockCount);
+/// Decode a `Block` payload, including its type byte, and keep the raw payload.
+///
+/// The payload is copied once into an `Arc<[u8]>`, which the reorder buffer
+/// then shares without further copies; consumers skip
+/// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
+pub(super) fn decode_block_payload(
+    payload: Vec<u8>,
+) -> Result<(Arc<block::Block>, Arc<[u8]>), BlockSyncWireError> {
+    let raw = Arc::<[u8]>::from(payload.into_boxed_slice());
+    validate_payload_len(raw.len())?;
+    Ok((decode_block(&raw)?, raw))
+}
+
+/// Decode a complete block after its type byte and reject trailing bytes.
+fn decode_block(payload: &[u8]) -> Result<Arc<block::Block>, BlockSyncWireError> {
+    if payload.first() != Some(&MSG_BS_BLOCK) {
+        return Err(WireError::OutOfRange("a Block payload starts with its type").into());
     }
-    if count > MAX_BS_BLOCKS_PER_REQUEST {
-        return Err(BlockSyncWireError::BlockCountLimit {
-            actual: count,
-            max: MAX_BS_BLOCKS_PER_REQUEST,
-        });
+    let mut block_bytes = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
+    let block = Arc::new(block::Block::zcash_deserialize_from_slice(
+        &mut block_bytes,
+    )?);
+    if !block_bytes.is_empty() {
+        return Err(BlockSyncWireError::TrailingBytes);
     }
-    Ok(())
+    validate_encoded_block_len(payload.len() - BLOCK_SYNC_MESSAGE_TYPE_BYTES)?;
+    Ok(block)
 }
 
 pub(super) fn validate_payload_len(len: usize) -> Result<(), BlockSyncWireError> {
@@ -261,31 +250,6 @@ fn validate_encoded_block_len(len: usize) -> Result<(), BlockSyncWireError> {
         .map_err(|_| BlockSyncWireError::NumericOverflow("max block bytes"))?;
     if len > max {
         return Err(BlockSyncWireError::OversizedBlock { actual: len, max });
-    }
-    Ok(())
-}
-
-pub(super) fn write_height<W: Write>(
-    writer: &mut W,
-    height: block::Height,
-) -> Result<(), BlockSyncWireError> {
-    writer.write_u32::<LittleEndian>(height.0)?;
-    Ok(())
-}
-
-pub(super) fn read_height<R: Read>(reader: &mut R) -> Result<block::Height, BlockSyncWireError> {
-    let raw = reader.read_u32::<LittleEndian>()?;
-    block::Height::try_from(raw).map_err(|_| BlockSyncWireError::HeightOutOfRange(raw))
-}
-
-pub(super) fn reject_trailing(
-    bytes: &[u8],
-    reader: &Cursor<&[u8]>,
-) -> Result<(), BlockSyncWireError> {
-    let consumed = usize::try_from(reader.position())
-        .map_err(|_| BlockSyncWireError::NumericOverflow("payload cursor"))?;
-    if consumed != bytes.len() {
-        return Err(BlockSyncWireError::TrailingBytes);
     }
     Ok(())
 }

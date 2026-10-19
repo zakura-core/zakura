@@ -10,6 +10,7 @@ use zakura_chain::{
         Network, NetworkKind, NetworkUpgrade,
     },
 };
+use zakura_jsonl_trace::JsonlTraceTables;
 
 use crate::{
     config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
@@ -498,6 +499,76 @@ fn zakura_dev_network_defaults_off_and_roundtrips() {
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
     assert_eq!(config, deserialized);
+}
+
+#[test]
+fn zakura_trace_tables_default_to_all_and_reject_unknown_names() {
+    let _init_guard = zakura_test::init();
+
+    let default = Config::default().zakura;
+    assert!(default.trace_enabled);
+    assert_eq!(default.trace_tables, JsonlTraceTables::all());
+
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        trace_dir = "traces"
+        trace_tables = ["mining", "conn"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.zakura.trace_tables.names().collect::<Vec<_>>(),
+        ["mining", "conn"]
+    );
+
+    let serialized = toml::to_string(&config).unwrap();
+    let deserialized: Config = toml::from_str(&serialized).unwrap();
+    assert_eq!(config, deserialized);
+
+    let error = toml::from_str::<Config>(
+        r#"
+        [zakura]
+        trace_tables = ["minig"]
+        "#,
+    )
+    .expect_err("a misspelled trace table must not load")
+    .to_string();
+    assert!(
+        error.contains("unknown trace table"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn zakura_trace_switch_disables_every_table() {
+    let _init_guard = zakura_test::init();
+    let trace_dir = tempfile::tempdir().unwrap();
+    let mut zakura = Config::default().zakura;
+
+    assert!(
+        !zakura.spawn_tracer().is_enabled(),
+        "no trace_dir means no tracer"
+    );
+
+    zakura.trace_dir = Some(trace_dir.path().to_path_buf());
+    zakura.trace_tables = JsonlTraceTables::from_names(["mining"]).unwrap();
+    let tracer = zakura.spawn_tracer();
+    assert!(tracer.is_table_enabled("mining"));
+    assert!(!tracer.is_table_enabled("block_sync"));
+
+    zakura.trace_enabled = false;
+    assert!(
+        !zakura.spawn_tracer().is_enabled(),
+        "trace_enabled = false stops every table"
+    );
+
+    zakura.trace_enabled = true;
+    zakura.trace_tables = JsonlTraceTables::none();
+    assert!(
+        !zakura.spawn_tracer().is_enabled(),
+        "an empty table list stops every table"
+    );
 }
 
 #[test]

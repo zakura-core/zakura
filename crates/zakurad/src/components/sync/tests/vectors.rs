@@ -3615,7 +3615,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
         Height(0),
-        LegacySyncTrace::new(None, false),
+        LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
     );
 
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
@@ -3663,7 +3663,7 @@ async fn block_download_network_readiness_times_out() {
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
         Height(0),
-        LegacySyncTrace::new(None, false),
+        LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
     );
     let hash = block::Hash::from([0xCE; 32]);
 
@@ -3697,7 +3697,7 @@ fn setup_downloads(
         sync::MIN_CONCURRENCY_LIMIT,
         Network::Mainnet,
         Height(0),
-        LegacySyncTrace::new(None, false),
+        LegacySyncTrace::new(zakura_jsonl_trace::JsonlTracer::noop(), false),
     )
 }
 

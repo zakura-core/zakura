@@ -109,6 +109,23 @@ max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
 stream_open_rate_per_second = 32
+trace_enabled = true
+trace_tables = [
+    "handshake",
+    "conn",
+    "stream",
+    "discovery",
+    "ratelimit",
+    "header_sync",
+    "legacy_request",
+    "block_sync",
+    "commit_state",
+    "quic_conn",
+    "queue_send",
+    "legacy_peer_request",
+    "legacy_sync",
+    "mining",
+]
 
 [network.zakura.quic]
 ack_frequency = false

@@ -3870,6 +3870,7 @@ dependencies = [
  "zakura-bls12-381",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-jsonl-trace",
  "zakura-jubjub",
  "zakura-network",
  "zakura-node-services",

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use blake2b_simd::Params as Blake2bParams;
 use serde_json::{Map, Number, Value};
-use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
+use zakura_jsonl_trace::{tables, JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
@@ -25,23 +25,22 @@ use first_block_source::FirstBlockSourceTracker;
 pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
 
 /// Legacy upgrade and control-handshake transitions.
-pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("handshake", "handshake.jsonl");
+pub const HANDSHAKE_TABLE: ZakuraTraceTable = tables::HANDSHAKE;
 
 /// Connection admission and close transitions.
-pub const CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("conn", "conn.jsonl");
+pub const CONN_TABLE: ZakuraTraceTable = tables::CONN;
 
 /// Per-connection stream admission transitions.
-pub const STREAM_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("stream", "stream.jsonl");
+pub const STREAM_TABLE: ZakuraTraceTable = tables::STREAM;
 
 /// Discovery dialer decisions and backoff classification.
-pub const DISCOVERY_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("discovery", "discovery.jsonl");
+pub const DISCOVERY_TABLE: ZakuraTraceTable = tables::DISCOVERY;
 
 /// Frame and message rate-limit decisions.
-pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("ratelimit", "ratelimit.jsonl");
+pub const RATELIMIT_TABLE: ZakuraTraceTable = tables::RATELIMIT;
 
 /// Header-sync policy, accounting, and frontier events.
-pub const HEADER_SYNC_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("header_sync", "header_sync.jsonl");
+pub const HEADER_SYNC_TABLE: ZakuraTraceTable = tables::HEADER_SYNC;
 
 /// Stable header-sync JSONL event and field names.
 #[allow(dead_code)]
@@ -122,24 +121,20 @@ pub(crate) mod header_sync_trace {
 }
 
 /// Legacy compatibility request/response events.
-pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("legacy_request", "legacy_request.jsonl");
+pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = tables::LEGACY_REQUEST;
 
 /// Block-sync (stream-6) scheduling, download, submit, and commit events.
-pub const BLOCK_SYNC_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("block_sync", "block_sync.jsonl");
+pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = tables::BLOCK_SYNC;
 
 /// Zakurad adapter boundary events for commits, state reads, and frontier mirrors.
-pub const COMMIT_STATE_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("commit_state", "commit_state.jsonl");
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable = tables::COMMIT_STATE;
 
 /// Per-connection QUIC transport samples, every 10 s and on close
 /// (zakura-quic OBS-3).
-pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("quic_conn", "quic_conn.jsonl");
+pub const QUIC_CONN_TABLE: ZakuraTraceTable = tables::QUIC_CONN;
 
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
-pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable = tables::QUEUE_SEND;
 
 /// Shared queue-send trace event names and field keys.
 #[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.

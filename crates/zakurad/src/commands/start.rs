@@ -730,6 +730,7 @@ impl StartCmd {
         node_tasks.track(&rpc_tx_queue_handle);
         let rpc_impl = rpc_impl
             .with_pending_blocks(pending_blocks)
+            .with_mining_trace(config.network.zakura.spawn_tracer())
             .with_end_of_support_height(sync::end_of_support::end_of_support_height(
                 &config.network.network,
             ));

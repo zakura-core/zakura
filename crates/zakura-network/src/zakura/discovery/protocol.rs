@@ -2706,7 +2706,7 @@ impl ZakuraDiscoveryBook {
             keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
             keyed.truncate(take);
         }
-        keyed.sort_by_key(|a| a.0);
+        keyed.sort_unstable_by_key(|a| a.0);
 
         keyed
             .into_iter()
@@ -2775,7 +2775,7 @@ impl ZakuraDiscoveryBook {
 
     fn recent_node_ids(&self, limit: usize) -> Vec<NodeId> {
         let mut entries: Vec<_> = self.entries.values().collect();
-        entries.sort_by_key(|entry| {
+        entries.sort_unstable_by_key(|entry| {
             (
                 Reverse(entry.last_seen),
                 node_id_sort_key(&entry.record.body.node_id),

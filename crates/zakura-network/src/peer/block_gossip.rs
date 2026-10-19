@@ -280,7 +280,7 @@ pub(crate) fn order_peers(
         })
         .collect();
     peers.shuffle(rng);
-    peers.sort_by_key(|(sidecar, rtt, _)| (!sidecar, *rtt));
+    peers.sort_unstable_by_key(|(sidecar, rtt, _)| (!sidecar, *rtt));
     let sidecars = peers.iter().take_while(|(sidecar, ..)| *sidecar).count();
     let mut remaining = peers.split_off(sidecars);
     let mut ordered: Vec<_> = peers.into_iter().map(|(_, _, peer)| peer).collect();

@@ -2850,7 +2850,7 @@ where
                     .collect();
 
                 // Sort returned transaction IDs in numeric/string order.
-                tx_ids.sort();
+                tx_ids.sort_unstable();
 
                 Ok(GetRawMempoolResponse::TxIds(tx_ids))
             }
@@ -4113,7 +4113,7 @@ where
             });
 
         // Use the same funding stream order as zcashd
-        funding_streams.sort_by_key(|(receiver, _funding_stream)| {
+        funding_streams.sort_unstable_by_key(|(receiver, _funding_stream)| {
             ZCASHD_FUNDING_STREAM_ORDER
                 .iter()
                 .position(|zcashd_receiver| zcashd_receiver == receiver)

@@ -1337,7 +1337,7 @@ impl HeaderSyncReactor {
                 Some((priority, peer.clone(), target))
             })
             .collect();
-        offers.sort_by(
+        offers.sort_unstable_by(
             |(left_priority, left_peer, _), (right_priority, right_peer, _)| {
                 right_priority
                     .cmp(left_priority)
@@ -3839,7 +3839,7 @@ impl HeaderSyncReactor {
             .keys()
             .filter_map(node_id_from_peer)
             .collect();
-        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.sort_unstable();
         admitted_node_ids.dedup();
         let now = Instant::now();
         let mut backed_off_node_ids: Vec<_> = self
@@ -3848,7 +3848,7 @@ impl HeaderSyncReactor {
             .filter(|(_, until)| **until > now)
             .filter_map(|(peer, _)| node_id_from_peer(peer))
             .collect();
-        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        backed_off_node_ids.sort_unstable();
         backed_off_node_ids.dedup();
         let tip = *self.tip.borrow();
         let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {

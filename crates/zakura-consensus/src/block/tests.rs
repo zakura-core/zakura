@@ -51,6 +51,9 @@ fn prepared_test_verifier(
             zs::Request::CheckParentInputs { .. } => {
                 zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
             }
+            zs::Request::CheckBlockAuthCommitment(_) => {
+                zs::Response::BlockAuthCommitment(Some(true))
+            }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
         Ok::<_, BoxError>(response)
@@ -1408,7 +1411,12 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
 
     for case in cases {
         let network = librustzcash_conversion_test_network(case.network_upgrade);
-        let block = block_with_librustzcash_conversion_failure(case, &network);
+        let mut block = block_with_librustzcash_conversion_failure(case, &network);
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &block.auth_data_root(),
+        );
+        Arc::make_mut(&mut block.header).commitment_bytes = <[u8; 32]>::from(commitment).into();
         let state_service = zakura_state::init_test(&network).await;
         let genesis =
             Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
@@ -2048,6 +2056,9 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
 
             let state = service_fn(move |request: zs::Request| async move {
                 let response = match request {
+                    zs::Request::CheckBlockAuthCommitment(_) => {
+                        zs::Response::BlockAuthCommitment(Some(true))
+                    }
                     zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                     zs::Request::AwaitBlockInfo(requested_parent) => {
                         assert_eq!(requested_parent, expected_parent);
@@ -2187,6 +2198,9 @@ async fn derived_nsm_crossing_gates_block_verification() {
             let expected_parent = block.header.previous_block_hash;
             let state = service_fn(move |request: zs::Request| async move {
                 Ok::<_, BoxError>(match request {
+                    zs::Request::CheckBlockAuthCommitment(_) => {
+                        zs::Response::BlockAuthCommitment(Some(true))
+                    }
                     zs::Request::KnownBlock(requested_hash) => {
                         assert_eq!(requested_hash, hash);
                         zs::Response::KnownBlock(None)
@@ -2263,6 +2277,9 @@ async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting(
         let expected_parent = block.header.previous_block_hash;
         let state = service_fn(move |request: zs::Request| async move {
             Ok::<_, BoxError>(match request {
+                zs::Request::CheckBlockAuthCommitment(_) => {
+                    zs::Response::BlockAuthCommitment(Some(true))
+                }
                 zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                 zs::Request::BlockInfo(parent) => {
                     assert_eq!(parent, expected_parent);
@@ -3210,4 +3227,388 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     })
     .await
     .expect("duplicate receipt regression must finish");
+}
+
+/// A substituted coinbase authorization cannot poison a header, even when it changes rule selection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn substituted_authorizations_leave_the_honest_body_committable() {
+    use zakura_chain::chain_tip::ChainTip;
+    use zakura_header_chain::BodyVerificationClass;
+
+    let _guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let (state, read, tip, _) = zs::init_test_services(&network).await;
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        state
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            ))
+            .await
+            .unwrap();
+        let mut honest = nu5_prepared_test_block(&network, None);
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &honest.auth_data_root(),
+        );
+        let header = Arc::make_mut(&mut honest.header);
+        header.previous_block_hash = genesis.hash();
+        header.time = genesis.header.time + chrono::Duration::seconds(150);
+        header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+        let honest = Arc::new(honest);
+        let transaction = Buffer::new(
+            crate::transaction::Verifier::new_for_tests(&network, state.clone())
+                .map_err(|error| -> BoxError { Box::new(error) }),
+            16,
+        );
+        let mut verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state.clone()),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
+
+        for forged_height in [Height(2), Height(100)] {
+            let mut poisoned = honest.as_ref().clone();
+            let coinbase = Arc::make_mut(&mut poisoned.transactions[0]);
+            let transparent::Input::Coinbase { height, .. } = &mut coinbase.inputs_mut()[0] else {
+                unreachable!()
+            };
+            *height = forged_height;
+            assert_eq!(honest.transactions[0].hash(), coinbase.hash());
+            assert_ne!(honest.auth_data_root(), poisoned.auth_data_root());
+            assert_eq!(honest.hash(), poisoned.hash());
+            let error = verifier
+                .call(Request::Commit(Arc::new(poisoned)))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::PayloadMismatch(_)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(tip.best_tip_hash(), Some(genesis.hash()));
+        }
+        assert_eq!(
+            verifier
+                .call(Request::Commit(honest.clone()))
+                .await
+                .unwrap(),
+            honest.hash()
+        );
+        assert_eq!(tip.best_tip_hash(), Some(honest.hash()));
+
+        // Equal-work siblings have different history roots. Attribution must use
+        // the delivered parent even when that parent is not the selected tip.
+        let mut sibling = honest.as_ref().clone();
+        Arc::make_mut(&mut sibling.header).nonce.0[0] ^= 1;
+        let sibling = Arc::new(sibling);
+        verifier
+            .call(Request::Commit(sibling.clone()))
+            .await
+            .unwrap();
+        assert_eq!(tip.best_tip_hash(), Some(honest.hash()));
+        for parent in [honest.clone(), sibling] {
+            let history = zakura_chain::history_tree::HistoryTree::from_block(
+                &network,
+                parent.clone(),
+                &zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
+                &zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
+                &zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            )
+            .unwrap();
+            let mut child = honest.as_ref().clone();
+            let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &history.hash().unwrap(),
+                &child.auth_data_root(),
+            );
+            let header = Arc::make_mut(&mut child.header);
+            header.previous_block_hash = parent.hash();
+            header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+            // Deliberately leave the child coinbase height at one. The actual
+            // parent at height one selects the height-two history commitment.
+            assert!(matches!(
+                read.clone()
+                    .oneshot(zs::ReadRequest::CheckBlockAuthCommitment(Arc::new(
+                        child.clone()
+                    ),))
+                    .await
+                    .unwrap(),
+                zs::ReadResponse::BlockAuthCommitment(Some(true))
+            ));
+            Arc::make_mut(&mut child.header).previous_block_hash = block::Hash([0x55; 32]);
+            assert!(matches!(
+                read.clone()
+                    .oneshot(zs::ReadRequest::CheckBlockAuthCommitment(Arc::new(child),))
+                    .await
+                    .unwrap(),
+                zs::ReadResponse::BlockAuthCommitment(None)
+            ));
+        }
+    })
+    .await
+    .expect("body replacement must finish");
+}
+
+/// Attribution is conservative on local failures and preserves proven consensus failures.
+#[tokio::test(start_paused = true)]
+async fn body_failure_attribution_requires_exact_commitment_evidence() {
+    use zakura_header_chain::BodyVerificationClass;
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(&network, None));
+    for result in [Some(true), Some(false), None] {
+        let expected = block.clone();
+        let state = service_fn(move |request| {
+            let expected = expected.clone();
+            async move {
+                let zs::Request::CheckBlockAuthCommitment(delivered) = request else {
+                    panic!("unexpected request")
+                };
+                assert!(Arc::ptr_eq(&expected, &delivered));
+                Ok::<_, BoxError>(zs::Response::BlockAuthCommitment(result))
+            }
+        });
+        let error = attribute_body_failure(
+            state,
+            block.clone(),
+            BlockError::DuplicateTransaction.into(),
+        )
+        .await
+        .unwrap_err();
+        match result {
+            Some(true) => assert!(matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(_)
+            )),
+            Some(false) => assert!(matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(_)
+            )),
+            None => assert!(matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::Retryable(_)
+            )),
+        }
+    }
+    for stalled in [false, true] {
+        let state = service_fn(move |_| async move {
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            Err::<zs::Response, BoxError>("state read failed".into())
+        });
+        let error = attribute_body_failure(
+            state,
+            block.clone(),
+            BlockError::DuplicateTransaction.into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.body_verification_class(),
+            BodyVerificationClass::Retryable(_)
+        ));
+        assert_eq!(error.misbehavior_score(), 0);
+    }
+}
+
+/// Real ECDSA failures are replaceable unless the header commits to the invalid signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn substituted_transparent_signature_is_replaceable() {
+    use zakura_chain::chain_tip::ChainTip;
+    use zakura_chain::{local_genesis::LocalTestnetGenesisOptions, transaction::HashType};
+    use zakura_header_chain::BodyVerificationClass;
+    let _guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["fixture".into()],
+            LocalTestnetGenesisOptions {
+                latest_network_upgrade: NetworkUpgrade::Nu5,
+                maturity_padding_blocks: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let height = Height(102);
+        let network = Parameters::build()
+            .with_genesis_hash(generated.blocks[0].hash())
+            .unwrap()
+            .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(
+                generated.checkpoints.clone(),
+            ))
+            .unwrap()
+            .with_activation_heights(ConfiguredActivationHeights {
+                overwinter: Some(102),
+                sapling: Some(102),
+                blossom: Some(102),
+                heartwood: Some(102),
+                canopy: Some(102),
+                nu5: Some(102),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .with_slow_start_interval(Height(0))
+            .with_disable_pow(true)
+            .with_unshielded_coinbase_spends(true)
+            .with_target_difficulty_limit(
+                generated.blocks[0]
+                    .header
+                    .difficulty_threshold
+                    .to_expanded()
+                    .unwrap(),
+            )
+            .unwrap()
+            .to_network()
+            .unwrap();
+        let (state, read, tip, _) = zs::init_test_services(&network).await;
+        for block in &generated.blocks {
+            state
+                .clone()
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                    Arc::new(block.clone()).into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let zs::ReadResponse::ChainInfo(info) =
+            read.oneshot(zs::ReadRequest::ChainInfo).await.unwrap()
+        else {
+            panic!("chain info")
+        };
+        let funded = &generated.blocks[1].transactions[0];
+        let previous = funded.outputs()[0].clone();
+        let mut spend = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: funded.hash(),
+                    index: 0,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![transparent::Output {
+                value: (previous.value - Amount::try_from(1000).unwrap()).unwrap(),
+                lock_script: previous.lock_script.clone(),
+            }],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        };
+        let digest = spend
+            .sighash(
+                NetworkUpgrade::Nu5,
+                HashType::ALL,
+                Arc::new(vec![previous.clone()]),
+                Some((0, previous.lock_script.as_raw_bytes().to_vec())),
+            )
+            .unwrap();
+        let secret = secp256k1::SecretKey::from_secret_bytes(
+            hex::decode(&generated.funded_keys[0].secret_key_hex)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut signature =
+            secp256k1::ecdsa::sign(secp256k1::Message::from_digest(digest.0), &secret)
+                .serialize_der()
+                .to_vec();
+        signature.push(1);
+        let public = hex::decode(&generated.funded_keys[0].public_key_hex).unwrap();
+        let mut script = vec![u8::try_from(signature.len()).unwrap()];
+        script.extend(signature);
+        script.push(u8::try_from(public.len()).unwrap());
+        script.extend(public);
+        let transparent::Input::PrevOut { unlock_script, .. } = &mut spend.inputs_mut()[0] else {
+            unreachable!()
+        };
+        *unlock_script = transparent::Script::new(&script);
+        let mut coinbase = v5_coinbase_transaction(NetworkUpgrade::Nu5, height, &network);
+        coinbase.outputs_mut()[0].value =
+            (coinbase.outputs()[0].value + Amount::try_from(1000).unwrap()).unwrap();
+        let mut honest = generated.blocks.last().unwrap().clone();
+        honest.transactions = vec![Arc::new(coinbase), Arc::new(spend)];
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &honest.auth_data_root(),
+        );
+        let header = Arc::make_mut(&mut honest.header);
+        header.previous_block_hash = info.tip_hash;
+        header.time = info.cur_time.into();
+        header.difficulty_threshold = info.expected_difficulty;
+        header.merkle_root = honest.transactions.iter().collect();
+        header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+        let mut bad = honest.clone();
+        let transparent::Input::PrevOut { unlock_script, .. } =
+            &mut Arc::make_mut(&mut bad.transactions[1]).inputs_mut()[0]
+        else {
+            unreachable!()
+        };
+        script[10] ^= 1;
+        *unlock_script = transparent::Script::new(&script);
+        assert_eq!(honest.transactions[1].hash(), bad.transactions[1].hash());
+        assert_eq!(honest.hash(), bad.hash());
+        let transaction = Buffer::new(
+            crate::transaction::Verifier::new_for_tests(&network, state.clone())
+                .map_err(|error| -> BoxError { Box::new(error) }),
+            16,
+        );
+        let mut verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state.clone()),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
+        let rejected = verifier
+            .call(Request::Commit(Arc::new(bad.clone())))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                rejected.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(_)
+            ),
+            "{rejected:?}"
+        );
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &bad.auth_data_root(),
+        );
+        Arc::make_mut(&mut bad.header).commitment_bytes = <[u8; 32]>::from(commitment).into();
+        let rejected = verifier
+            .call(Request::Commit(Arc::new(bad)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                rejected.body_verification_class(),
+                BodyVerificationClass::ConsensusInvalid(_)
+            ),
+            "{rejected:?}"
+        );
+        assert!(
+            matches!(
+                rejected,
+                VerifyBlockError::Transaction(TransactionError::Script(_))
+            ),
+            "{rejected:?}"
+        );
+        let honest = Arc::new(honest);
+        assert_eq!(
+            verifier
+                .call(Request::Commit(honest.clone()))
+                .await
+                .unwrap(),
+            honest.hash()
+        );
+        assert_eq!(tip.best_tip_hash(), Some(honest.hash()));
+    })
+    .await
+    .expect("the real signature replacement test must finish");
 }

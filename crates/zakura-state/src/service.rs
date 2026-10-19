@@ -2205,6 +2205,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckBlockAuthCommitment(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
@@ -3531,6 +3532,51 @@ impl Service<ReadRequest> for ReadStateService {
                 )?;
 
                 Ok(ReadResponse::ValidBestChainTipNullifiersAndAnchors)
+            }
+
+            ReadRequest::CheckBlockAuthCommitment(block) => {
+                let chains = state.latest_non_finalized_state();
+                let parent = block.header.previous_block_hash;
+                let chain = chains.find_chain(|chain| chain.contains_block_hash(parent));
+                let parent_height = read::height_by_hash(chain.clone(), &state.db, parent);
+                let Some(height) = parent_height.and_then(|height| height.next().ok()) else {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                };
+                // Use the committed parent, never the supplied coinbase height, to choose rules.
+                if NetworkUpgrade::current(&state.network, height) < NetworkUpgrade::Nu5 {
+                    // V5 transactions are intrinsically invalid before NU5. Their version is
+                    // bound by the transaction Merkle root checked by the caller.
+                    return Ok(ReadResponse::BlockAuthCommitment(Some(true)));
+                }
+                let Some(history) = read::tree::history_tree(chain, &state.db, parent.into())
+                else {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                };
+                // Finalization can advance between the tip and tree reads. Such a context
+                // cannot authenticate this parent and must remain retryable.
+                if history
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(|tree| Some(tree.current_height()) != parent_height)
+                {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                }
+                let Some(history_root) = history.hash().or_else(|| {
+                    (NetworkUpgrade::Heartwood.activation_height(&state.network) == Some(height))
+                        .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+                }) else {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                };
+                let expected: [u8; 32] =
+                    block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                        &history_root,
+                        &block.auth_data_root(),
+                    )
+                    .into();
+                let delivered: [u8; 32] = *block.header.commitment_bytes;
+                Ok(ReadResponse::BlockAuthCommitment(Some(
+                    expected == delivered,
+                )))
             }
 
             ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {

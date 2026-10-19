@@ -134,6 +134,10 @@ pub enum Response {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Whether the exact body matches its header, or `None` without committed parent context.
+    /// Response to [`Request::CheckBlockAuthCommitment`].
+    BlockAuthCommitment(Option<bool>),
+
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
@@ -638,6 +642,10 @@ pub enum ReadResponse {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Whether the exact body matches its header, or `None` without committed parent context.
+    /// Response to [`ReadRequest::CheckBlockAuthCommitment`].
+    BlockAuthCommitment(Option<bool>),
+
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
@@ -760,6 +768,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHeaders(headers) => Ok(Response::BlockHeaders(headers)),
 
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
+            ReadResponse::BlockAuthCommitment(matches) => Ok(Response::BlockAuthCommitment(matches)),
             ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
             }

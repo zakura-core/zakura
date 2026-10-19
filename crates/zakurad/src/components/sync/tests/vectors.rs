@@ -3954,7 +3954,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
 /// leaving the newest block for the next discovery round.
 #[tokio::test]
 async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    for error_kind in 0..4 {
+    for error_kind in 0..5 {
         let (
             mut chain_sync,
             _sync_status,
@@ -4001,6 +4001,14 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                             },
                         },
                     )),
+                },
+                height: Height(1_687_105),
+                hash: block_hash,
+                advertiser_addr: Some(addr),
+            },
+            4 => BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block {
+                    source: Box::new(VerifyBlockError::AuthDataMismatch),
                 },
                 height: Height(1_687_105),
                 hash: block_hash,

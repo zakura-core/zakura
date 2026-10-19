@@ -76,6 +76,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
+secp256k1.workspace = true
 eyre = { workspace = true }
 ed25519-zebra = { workspace = true }
 

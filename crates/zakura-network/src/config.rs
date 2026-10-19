@@ -1399,11 +1399,13 @@ impl<'de> Deserialize<'de> for Config {
             ));
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
-        // The endpoint lowers a larger `max_connections` when it starts, after
-        // tracing is up, so its warning reaches the log.
-        zakura
-            .budgeted_max_connections()
-            .map_err(de::Error::custom)?;
+        if p2p_stack.resolve(&network).runs_zakura() {
+            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
+            // lowers a larger cap after tracing starts so its warning is logged.
+            zakura
+                .budgeted_max_connections()
+                .map_err(de::Error::custom)?;
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),

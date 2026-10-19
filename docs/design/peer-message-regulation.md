@@ -54,6 +54,9 @@ slot from inbound peers. The node keeps `max_pending_handshakes` (32) of the liv
 handshakes and admits 92 peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules
 and the overheads the budget leaves out.
 
+Configuration loading checks this budget only when the resolved P2P stack runs v2. Legacy-only
+nodes retain the configured value without enforcing it because they create no QUIC endpoint.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a

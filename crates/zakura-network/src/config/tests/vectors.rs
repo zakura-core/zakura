@@ -908,6 +908,8 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     // connections, less than its headroom alone.
     let error = toml::from_str::<Config>(
         r#"
+        p2p_stack = "dual"
+
         [zakura.quic]
         receive_window_bytes = 1073741824
         "#,
@@ -919,6 +921,49 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         "{error}"
     );
     assert!(error.contains("receive_window_bytes"), "{error}");
+}
+
+/// An unused QUIC budget cannot reject legacy startup, but every resolved
+/// stack that runs v2 must enforce it before the endpoint starts.
+#[test]
+fn zakura_peer_memory_budget_only_rejects_v2_stacks() {
+    let _init_guard = zakura_test::init();
+
+    for network in ["Mainnet", "Testnet"] {
+        for stack in [
+            None,
+            Some("default"),
+            Some("legacy"),
+            Some("zakura"),
+            Some("dual"),
+        ] {
+            let stack_config = stack
+                .map(|stack| format!("p2p_stack = \"{stack}\"\n"))
+                .unwrap_or_default();
+            let source = format!(
+                "network = \"{network}\"\n{stack_config}\n[zakura]\npeer_memory_budget_bytes = 1\n"
+            );
+            let result = toml::from_str::<Config>(&source);
+            let runs_v2 = match stack {
+                None | Some("default") => network == "Testnet",
+                Some("legacy") => false,
+                Some("zakura" | "dual") => true,
+                _ => unreachable!("the test only supplies supported stack names"),
+            };
+            if runs_v2 {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("peer_memory_budget_bytes"),
+                    "{source}: {error}"
+                );
+            } else {
+                let config = result.unwrap_or_else(|error| panic!("{source}: {error}"));
+                assert!(!config.v2_p2p());
+                assert!(config.legacy_p2p());
+                assert_eq!(config.zakura.peer_memory_budget_bytes, 1);
+            }
+        }
+    }
 }
 
 #[test]

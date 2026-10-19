@@ -8,7 +8,6 @@ use std::{
 use eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_error::ErrorLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
@@ -151,10 +150,7 @@ impl Tracing {
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            logger
-                .finish()
-                .with(warn_error_layer)
-                .with(ErrorLayer::default())
+            logger.finish().with(warn_error_layer)
         };
 
         // Initialise the global tracing subscriber

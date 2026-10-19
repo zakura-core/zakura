@@ -17,7 +17,7 @@ use super::zec::Zec;
 
 /// Response to a `getrawmempool` RPC request.
 ///
-/// See the notes for the [`Rpc::get_raw_mempool` method].
+/// See the notes for the [`RpcServer::get_raw_mempool` method].
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum GetRawMempoolResponse {

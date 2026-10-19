@@ -2,7 +2,7 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use eyre::Result;
-use rand::RngCore;
+use rand_10::Rng;
 use subtle::ConstantTimeEq;
 
 use std::{
@@ -38,7 +38,7 @@ impl Cookie {
 impl Default for Cookie {
     fn default() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand_10::rng().fill_bytes(&mut bytes);
 
         Self(STANDARD.encode(bytes))
     }
@@ -106,7 +106,7 @@ fn temporary_cookie_path(path: &Path) -> PathBuf {
         .file_name()
         .map(|file_name| file_name.to_string_lossy())
         .unwrap_or_else(|| FILE.into());
-    let random_suffix = rand::thread_rng().next_u64();
+    let random_suffix = rand_10::rng().next_u64();
 
     path.with_file_name(format!("{file_name}.{random_suffix:x}.tmp"))
 }

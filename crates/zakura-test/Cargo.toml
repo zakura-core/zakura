@@ -31,11 +31,10 @@ futures = { workspace = true }
 eyre = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-tracing-error = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-rand = { workspace = true }
+rand_10 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

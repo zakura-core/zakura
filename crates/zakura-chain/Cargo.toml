@@ -132,7 +132,6 @@ eyre = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
-rand = { workspace = true }
 rand_10 = { workspace = true }
 rand_chacha_10 = { workspace = true }
 rand_core_10 = { workspace = true }

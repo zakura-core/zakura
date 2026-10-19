@@ -1556,10 +1556,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> 
     // Test rpc endpoint response
     assert!(res.status().is_success());
 
-    let body = res.bytes().await;
-    let (body, mut child) = child.kill_on_error(body)?;
-
-    let parsed: Value = serde_json::from_slice(&body)?;
+    let parsed: Value = serde_json::from_slice(res.body())?;
 
     // Check that we have at least 4 characters in the `build` field.
     let build = parsed["result"]["build"].as_str().unwrap();
@@ -2356,8 +2353,7 @@ async fn fully_synced_rpc_z_getsubtreesbyindex_snapshot_test() -> Result<()> {
 
     for i in zcashd_test_vectors {
         let res = client.call("z_getsubtreesbyindex", i.1).await?;
-        let body = res.bytes().await;
-        let parsed: Value = serde_json::from_slice(&body.expect("Response is valid json"))?;
+        let parsed: Value = serde_json::from_slice(res.body())?;
         insta::assert_json_snapshot!(i.0, parsed);
     }
 
@@ -3947,19 +3943,9 @@ async fn generate_with_cookie(
         .trim()
         .split_once(':')
         .ok_or_else(|| eyre!("RPC cookie does not contain basic-auth credentials"))?;
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let response = reqwest::Client::builder()
-        .timeout(EXTENDED_LAUNCH_DELAY)
-        .build()?
-        .post(format!("http://{rpc_address}"))
-        .basic_auth(username, Some(password))
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"jsonrpc":"2.0","method":"generate","params":[{num_blocks}],"id":123}}"#
-        ))
-        .send()
-        .await?
-        .text()
+    let response = RpcRequestClient::new_with_timeout(rpc_address, EXTENDED_LAUNCH_DELAY)
+        .with_basic_auth(username, password)
+        .text_from_call("generate", format!("[{num_blocks}]"))
         .await?;
 
     let mut response: serde_json::Map<String, Value> = serde_json::from_str(&response)?;
@@ -4018,32 +4004,27 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .expect("already checked config")?;
 
     config.network.cache_dir = false.into();
-    config.network.listen_addr = format!("127.0.0.1:{}", random_known_port()).parse()?;
+    // Let each child bind its own ports: probing and releasing a port in the
+    // parent leaves a race before the child can bind it.
+    config.network.listen_addr = "127.0.0.1:0".parse()?;
+    config.rpc.listen_addr = Some("127.0.0.1:0".parse()?);
     config.state.ephemeral = true;
     config.network.initial_testnet_peers = [].into();
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     // Invalid blocks log the full custom network at warn level. Keep the
     // expected logs from filling the child process pipes while this test polls
     // the nodes over RPC, but allow the listener readiness event used below.
-    config.tracing.filter = Some("error,zakura_network::peer_set::initialize=info".to_string());
+    config.tracing.filter =
+        Some("error,zakura_network::peer_set::initialize=info,zakura_rpc::server=info".to_string());
 
-    let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
-    let node_1_listen_addr = config.network.listen_addr;
-    let admin_rpc_listen_addr = loop {
-        let address = format!("127.0.0.1:{}", random_known_port()).parse()?;
-        if address != rpc_listen_addr && address != node_1_listen_addr {
-            break address;
-        }
-    };
     let rpc_cookie_dir = tempfile::tempdir()?;
-    config.rpc.admin_listen_addr = Some(admin_rpc_listen_addr);
+    config.rpc.admin_listen_addr = Some("127.0.0.1:0".parse()?);
     config.rpc.cookie_dir = rpc_cookie_dir.path().to_path_buf();
     config.rpc.cookie_file_name = "admin.cookie".to_string();
     let rpc_cookie_path = config.rpc.cookie_dir.join(&config.rpc.cookie_file_name);
 
     tracing::info!(
-        ?rpc_listen_addr,
+        rpc_listen_addr = ?config.rpc.listen_addr,
         network_listen_addr = ?config.network.listen_addr,
         "starting a zakurad child on incompatible custom Testnet"
     );
@@ -4057,15 +4038,27 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
 
     // A refused initial dial marks the only configured address unreachable in
     // this isolated test, so only start node 2 once node 1 is listening.
-    let node_1_listener_result = zakurad_child_1.expect_stdout_line_matches(regex::escape(
-        &format!("Opened Zcash protocol endpoint at {node_1_listen_addr}"),
-    ));
-    if let Err(error) = node_1_listener_result {
-        zakurad_child_1
-            .kill_and_consume_output(true)
-            .wrap_err("failed to stop the PoW-disabled zakurad child")?;
-        return Err(error);
-    }
+    // Startup emits these markers in P2P, primary RPC, admin RPC order.
+    // Read them in that order because each read consumes preceding log lines.
+    let node_1_listener_result = (|| -> Result<_> {
+        let p2p_addr =
+            read_listen_addr_from_logs(&mut zakurad_child_1, "Opened Zcash protocol endpoint at ")?;
+        let rpc_addr = read_listen_addr_from_logs(&mut zakurad_child_1, OPENED_RPC_ENDPOINT_MSG)?;
+        let admin_addr = read_listen_addr_from_logs(
+            &mut zakurad_child_1,
+            zakura_rpc::server::OPENED_ADMIN_RPC_ENDPOINT_MSG,
+        )?;
+        Ok((p2p_addr, rpc_addr, admin_addr))
+    })();
+    let (node_1_listen_addr, rpc_listen_addr, admin_rpc_listen_addr) = match node_1_listener_result
+    {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            let cleanup = zakurad_child_1.kill_and_consume_output(true);
+            return Err(error).wrap_err(format!("node 1 startup failed; cleanup: {cleanup:?}"));
+        }
+    };
+    let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
 
     let network2 = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -4086,30 +4079,42 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.network.network = network2;
     config.network.initial_testnet_peers = [node_1_listen_addr.to_string()].into();
     config.network.listen_addr = "127.0.0.1:0".parse()?;
-    config.rpc.listen_addr = Some(format!("127.0.0.1:{}", random_known_port()).parse()?);
+    config.rpc.listen_addr = Some("127.0.0.1:0".parse()?);
     config.rpc.admin_listen_addr = None;
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     config.network.cache_dir = false.into();
     config.state.ephemeral = true;
-    config.tracing.filter = Some("error".to_string());
-
-    let rpc_listen_addr = config.rpc.listen_addr.unwrap();
-    let rpc_client_2 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
+    config.tracing.filter = Some("error,zakura_rpc::server=info".to_string());
 
     tracing::info!(
-        ?rpc_listen_addr,
+        rpc_listen_addr = ?config.rpc.listen_addr,
         network_listen_addr = ?config.network.listen_addr,
         "starting a zakurad child on the default Testnet"
     );
 
     let (zakurad_failure_messages, zakurad_ignore_messages) = test_type.zakurad_failure_messages();
-    let mut zakurad_child_2 = testdir()?
-        .with_exact_config(&config)?
-        .spawn_child(args!["start"])?
-        .with_timeout(test_type.zakurad_timeout())
-        .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages);
+    let node_2_spawn_result = (|| -> Result<_> {
+        Ok(testdir()?
+            .with_exact_config(&config)?
+            .spawn_child(args!["start"])?
+            .with_timeout(test_type.zakurad_timeout())
+            .with_failure_regex_iter(zakurad_failure_messages, zakurad_ignore_messages))
+    })();
+    let mut zakurad_child_2 = match node_2_spawn_result {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup = zakurad_child_1.kill_and_consume_output(true);
+            return Err(error)
+                .wrap_err(format!("node 2 spawn failed; node 1 cleanup: {cleanup:?}"));
+        }
+    };
 
     let test_result: Result<()> = async {
+        let rpc_listen_addr =
+            read_listen_addr_from_logs(&mut zakurad_child_2, OPENED_RPC_ENDPOINT_MSG)?;
+        let rpc_client_2 =
+            RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
+
         tracing::info!("waiting for zakurad nodes to connect");
 
         let peer_info = tokio::time::timeout(EXTENDED_LAUNCH_DELAY, async {

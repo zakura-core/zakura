@@ -46,6 +46,16 @@ fn encode<A: StreamConformance>(row: &MessageRule, exchange: u32) -> Result<Fram
     encode_frame(&A::message(row, exchange)).map_err(|error| error.to_string().into())
 }
 
+fn encode_all<A: StreamConformance>(
+    row: &MessageRule,
+    exchanges: impl IntoIterator<Item = u32>,
+) -> Result<Vec<Frame>, BoxError> {
+    exchanges
+        .into_iter()
+        .map(|exchange| encode::<A>(row, exchange))
+        .collect()
+}
+
 /// Credit that adds nothing, as `Close` carries.
 const NO_CREDIT: Credit = Credit {
     objects: 0,
@@ -169,13 +179,23 @@ async fn read_subscription_ending<A: StreamConformance>(
     read_until::<A>(raw, subscription.response_stream, subscription.end).await
 }
 
+/// The most exchanges a property cycles through a request window as one
+/// window. Block sync allows 32,768 requests in flight, and four windows of
+/// that through the real stack in a debug build take minutes, so a property
+/// that only needs the window to cycle uses at most this many. P2's margin
+/// still sends the full limit and twice it.
+const MAX_CYCLED_WINDOW: u32 = 256;
+
 /// Four windows of each kind of row: exchanges of the first request row and
-/// pages of the first subscription row. A missing row gets zero.
+/// pages of the first subscription row. A missing row gets zero. A request
+/// window counts at most [`MAX_CYCLED_WINDOW`] exchanges.
 fn four_windows(plan: &LayoutPlan) -> (u32, u32) {
-    let exchanges = plan
-        .requests
-        .first()
-        .map_or(0, |request| request.max_in_flight.saturating_mul(4));
+    let exchanges = plan.requests.first().map_or(0, |request| {
+        request
+            .max_in_flight
+            .min(MAX_CYCLED_WINDOW)
+            .saturating_mul(4)
+    });
     let pages = plan.subscriptions.first().map_or(0, |subscription| {
         subscription.limits.credit.objects.saturating_mul(4)
     });
@@ -306,14 +326,16 @@ pub(crate) async fn request_margin<A: StreamConformance>(
         let limit = plan.max_in_flight;
         let serving = &victim.shared().serving[index];
 
-        // Refill at every ending for at least one complete window. Small
-        // windows exercise more rounds without turning large limits into load tests.
-        let exchanges = (limit * 2).max(256).min(limit * 32);
+        // Refill at every ending for at least one complete window, up to
+        // `MAX_CYCLED_WINDOW` refills. Small windows exercise more rounds
+        // without turning large limits into load tests.
+        let exchanges = (limit * 2)
+            .max(256)
+            .min(limit * 32)
+            .min(limit + MAX_CYCLED_WINDOW);
         let (mut raw, _) = raw_peer(&victim, layout, seed + 1).await?;
-        for exchange in 0..limit {
-            raw.send(plan.stream, &encode::<A>(plan.row, exchange)?)
-                .await?;
-        }
+        raw.send_all(plan.stream, encode_all::<A>(plan.row, 0..limit)?)
+            .await?;
         for exchange in limit..exchanges {
             read_ending::<A>(&mut raw, plan).await?;
             raw.send(plan.stream, &encode::<A>(plan.row, exchange)?)
@@ -334,10 +356,8 @@ pub(crate) async fn request_margin<A: StreamConformance>(
         let (mut raw, _) = raw_peer(&victim, layout, seed + 2).await?;
         let session = victim.wait_session(&raw.id()).await?;
         let hold = serving.hold_node_for_test();
-        for exchange in 0..2 * limit {
-            raw.send(plan.stream, &encode::<A>(plan.row, exchange)?)
-                .await?;
-        }
+        raw.send_all(plan.stream, encode_all::<A>(plan.row, 0..2 * limit)?)
+            .await?;
         await_until("every request admitted", CONFORMANCE_DEADLINE, || {
             session.serving_open(victim.shared(), plan.row.message_type) == 2 * limit
         })
@@ -364,16 +384,10 @@ pub(crate) async fn request_margin<A: StreamConformance>(
         // One more than the margin disconnects.
         let (mut raw, _) = raw_peer(&victim, layout, seed + 3).await?;
         let hold = serving.hold_node_for_test();
-        for exchange in 0..=2 * limit {
-            // The victim may close before the last request is written.
-            if raw
-                .send(plan.stream, &encode::<A>(plan.row, exchange)?)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        // The victim may close before the last request is written.
+        let _ = raw
+            .send_all(plan.stream, encode_all::<A>(plan.row, 0..=2 * limit)?)
+            .await;
         raw.closed().await?;
         drop(hold);
         let violations = victim.shared().violations();

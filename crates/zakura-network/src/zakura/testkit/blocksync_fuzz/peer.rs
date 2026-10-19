@@ -7,7 +7,7 @@
 
 use std::{future, sync::Arc, time::Duration};
 
-use rand::Rng;
+use rand_10::RngExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
@@ -149,7 +149,7 @@ async fn serve_loop(
 
         // Silent drop: no response at all, exercising the node's request-timeout path.
         let drop_p = spec.serve.drop_probability.clamp(0.0, 1.0);
-        if drop_p > 0.0 && rng.gen_bool(drop_p) {
+        if drop_p > 0.0 && rng.random_bool(drop_p) {
             continue;
         }
 
@@ -157,7 +157,7 @@ async fn serve_loop(
         // ended response.
         let late = spec.serve.late.filter(|late| {
             let late_p = late.probability.clamp(0.0, 1.0);
-            late_p > 0.0 && rng.gen_bool(late_p)
+            late_p > 0.0 && rng.random_bool(late_p)
         });
         if let Some(late) = late {
             if sleep_or_cancel(shutdown, late.delay).await {

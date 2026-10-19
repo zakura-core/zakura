@@ -1835,7 +1835,15 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
                 state_service.block_write_sender.finalized.is_some(),
                 "the header runtime must become ready after genesis while checkpoint writes remain open",
             );
-            assert!(read.subscribe_header_runtime_status().borrow().is_ready());
+            // The writer publishes the attached runtime's snapshot before marking it ready.
+            let mut status = read.subscribe_header_runtime_status();
+            timeout(
+                Duration::from_secs(5),
+                status.wait_for(|status| status.is_ready()),
+            )
+            .await
+            .expect("the header runtime becomes ready after genesis")
+            .expect("the header runtime status sender stays open");
         }
     }
 

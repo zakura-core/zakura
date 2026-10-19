@@ -4548,6 +4548,12 @@ criteria = "safe-to-deploy"
 delta = "1.1.0-rc.0 -> 1.1.0-rc.1"
 notes = "Compared every Rust file in the rc0 registry package with rc1 staged from fork revision 6562f6f3be8a9c9591fc89911cf8217196b824ec; all are byte-identical. Release metadata and exact sibling package versions change. The archive rebuilt successfully. Prior audit scope and limitations remain."
 
+[[audits.zakura-librocksdb-sys]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.17.3+10.4.2"
+notes = "Zakura's fork of librocksdb-sys 0.17.3+10.4.2, which is audited above. The packaged file list matches the published upstream crate file for file, and the bundled RocksDB sources are the same 10.4.2 submodule commit. The changes are the package name, description, and repository; a [lib] name that keeps the library called librocksdb_sys; an exclude for rocksdb/docs; and about 30 lines in build.rs. That build.rs change writes generated unity_NNN.cc files into OUT_DIR, each #including 16 of the same RocksDB sources by absolute path, and compiles those instead of the individual files. It adds no new sources, flags, downloads, or links, and ROCKSDB_UNITY_CHUNK=1 restores the per-file build. The fork's test suite and Zakura's zakura-state tests passed against it."
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4557,6 +4563,12 @@ delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
+
+[[audits.zakura-rocksdb]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "0.24.0"
+notes = "Zakura's fork of rocksdb 0.24.0, which is audited above. The manifest renames the package, keeps the library named rocksdb through [lib], points the librocksdb-sys dependency at zakura-librocksdb-sys with an exact version pin, and raises rust-version to 1.97. The only library source change adds six lint names to the crate-level allow list in src/lib.rs, for lints newer than upstream's Rust 1.85 baseline; no code changes. Two test files take clippy's suggested rewrites and one trybuild expectation is updated for newer compiler wording. The fork's full test suite, clippy with -D warnings, and rustdoc pass on Rust 1.97.1."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

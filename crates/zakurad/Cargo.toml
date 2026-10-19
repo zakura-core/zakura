@@ -106,7 +106,7 @@ internal-miner = [
 # Legacy flag accepted for build compatibility; journald logging is removed.
 journald = []
 
-prometheus = ["metrics-exporter-prometheus"]
+prometheus = []
 
 # Production features that modify dependency behaviour
 
@@ -201,7 +201,6 @@ webpki-roots = "1"
 bytes = { workspace = true }
 
 # prod feature prometheus
-metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], optional = true }
 
 # prod feature release_max_level_info
 #

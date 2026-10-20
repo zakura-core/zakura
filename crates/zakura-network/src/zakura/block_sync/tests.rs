@@ -14665,10 +14665,11 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
 /// Runs the native sequencer through a forged checkpoint body and its resubmission.
 ///
 /// The test submits checkpoint range `1..=range_end` plus `later_pending` bodies from the next
-/// range. The verifier rejects height 1, and the stranded heights `range_end - stranded + 1..=
-/// range_end` never complete, because the state never answers them. The later-range bodies also
-/// stay pending, because their range waits for this one. Every other descendant gets a
-/// retryable error. The sequencer then receives fresh bodies for the whole range.
+/// range. The verifier rejects height 1. The stranded heights `range_end - stranded + 1..=
+/// range_end` get no verifier answer, so the driver's commit deadline finishes them with a
+/// timeout. The later-range bodies stay pending, because their range waits for this one. Every
+/// other descendant gets a retryable error. The sequencer then receives fresh bodies for the
+/// whole range.
 ///
 /// Returns the fresh range heights that the sequencer submits. The checkpoint verifier needs every
 /// height in the range before it forwards any of them.
@@ -14790,13 +14791,21 @@ async fn resubmitted_checkpoint_heights_after_stranding(
 
     // Descendants that reached the writer get `AncestorBodyRejected`, a retryable error.
     let first_stranded = range_end - stranded + 1;
-    for (token, block) in &initial[1..usize::try_from(first_stranded - 1).expect("fits usize")] {
+    let first_stranded_index = usize::try_from(first_stranded - 1).expect("fits usize");
+    for (token, block) in &initial[1..first_stranded_index] {
         control_tx
             .send(finish(*token, block, BlockApplyResult::Unavailable))
             .expect("control channel remains live");
     }
+    // The driver's commit deadline finishes the stranded submissions.
+    let range_len = usize::try_from(range_end).expect("fits usize");
+    for (token, block) in &initial[first_stranded_index..range_len] {
+        control_tx
+            .send(finish(*token, block, BlockApplyResult::TimedOut))
+            .expect("control channel remains live");
+    }
 
-    let expected_in_flight = u64::from(stranded + later_pending);
+    let expected_in_flight = u64::from(later_pending);
     time::timeout(CHANNEL_TIMEOUT, async {
         loop {
             let view = *view_rx.borrow_and_update();
@@ -14810,7 +14819,7 @@ async fn resubmitted_checkpoint_heights_after_stranding(
         }
     })
     .await
-    .expect("only stranded and later-range submissions stay in flight");
+    .expect("only later-range submissions stay in flight");
 
     // Block sync downloads the whole range again.
     send_bodies(1..=range_end).await;
@@ -14826,35 +14835,20 @@ async fn resubmitted_checkpoint_heights_after_stranding(
     resubmitted
 }
 
-/// Root cause A on native block sync: submissions that the state strands never finish, so they
-/// keep their slots in the 401-block checkpoint submission window. A resubmitted 400-block range
-/// then cannot be fully in flight, and the checkpoint verifier never forwards any of it.
+/// Root cause A on native block sync: a submission that the state never answers used to keep its
+/// slot in the 401-block checkpoint submission window. A resubmitted 400-block range then could
+/// not be fully in flight, so the checkpoint verifier never forwarded any of it. The driver's
+/// commit deadline now finishes such a submission, and the window holds the whole range again.
 #[tokio::test]
-async fn stranded_checkpoint_submissions_starve_a_resubmitted_full_range() {
+async fn timed_out_checkpoint_submissions_leave_room_for_a_resubmitted_full_range() {
     let _init_guard = zakura_test::init();
 
-    // No stranding: the window holds the whole range again.
-    let heights = resubmitted_checkpoint_heights_after_stranding(400, 0, 1).await;
-    assert_eq!(heights.len(), 400, "{heights:?}");
-
-    // One stranded submission plus one pending next-range body leaves 399 slots.
-    let heights = resubmitted_checkpoint_heights_after_stranding(400, 1, 1).await;
-    assert_eq!(heights.len(), 399);
-    assert_eq!(heights.last(), Some(&block::Height(399)));
-
-    // The natural-scheduling reproduction strands about 390 descendants.
-    let heights = resubmitted_checkpoint_heights_after_stranding(400, 390, 1).await;
-    assert_eq!(heights.len(), 10);
-}
-
-/// A shorter checkpoint range still fits after stranding, so this condition needs a wide range.
-#[tokio::test]
-async fn stranded_checkpoint_submissions_leave_room_for_a_short_range() {
-    let _init_guard = zakura_test::init();
-
-    let heights = resubmitted_checkpoint_heights_after_stranding(200, 2, 1).await;
-    assert_eq!(heights.len(), 200);
-
-    let heights = resubmitted_checkpoint_heights_after_stranding(200, 199, 1).await;
-    assert_eq!(heights.len(), 200);
+    for stranded in [0, 1, 390] {
+        let heights = resubmitted_checkpoint_heights_after_stranding(400, stranded, 1).await;
+        assert_eq!(
+            heights,
+            (1..=400).map(block::Height).collect::<Vec<_>>(),
+            "{stranded} timed-out submissions",
+        );
+    }
 }

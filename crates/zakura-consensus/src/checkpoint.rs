@@ -1182,13 +1182,22 @@ impl VerifyCheckpointError {
 
     /// Returns `true` if the state dropped this block because an ancestor's delivered body
     /// failed its authorizing data commitment.
+    ///
+    /// This includes a ZIP 234 block whose wait for its parent's block info ended because the
+    /// state rejected the parent. Checkpoints authenticate the parent's hash, so the rejected
+    /// parent is still wanted.
     pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
         match self {
-            VerifyCheckpointError::CommitCheckpointVerified(source) => source
-                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
-                .is_some_and(
+            VerifyCheckpointError::CommitCheckpointVerified(source) => {
+                source
+                    .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                    .is_some_and(
                     zs::CommitCheckpointVerifiedError::is_descendant_of_auth_commitment_mismatch,
-                ),
+                ) || matches!(
+                    source.downcast_ref::<zs::AwaitBlockInfoError>(),
+                    Some(zs::AwaitBlockInfoError::Rejected { .. })
+                )
+            }
             VerifyCheckpointError::VerifyBlock(error) => {
                 error.is_descendant_of_auth_commitment_mismatch()
             }
@@ -1367,8 +1376,10 @@ where
 
                 // We use a `ServiceExt::oneshot`, so that every state service
                 // `poll_ready` has a corresponding `call`. See #1593.
+                // The generation lets the state fail late copies after a rejection resets us.
+                let block = req_block.block.with_verifier_generation(reset_generation);
                 match state_service
-                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(block))
                     .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                     .await?
                 {

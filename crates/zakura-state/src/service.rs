@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     num::NonZeroU32,
     ops::Bound,
@@ -198,10 +198,19 @@ pub(crate) struct StateService {
 
     /// If an invalid block is sent on `finalized_block_write_sender`
     /// or `non_finalized_block_write_sender`,
-    /// this channel gets the [`block::Hash`] of the valid tip.
+    /// this channel gets the valid tip and the rejected block.
     //
     // TODO: add tests for finalized and non-finalized resets (#2654)
-    invalid_block_write_reset_receiver: tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+    invalid_block_write_reset_receiver:
+        tokio::sync::mpsc::UnboundedReceiver<write::FinalizedWriteReset>,
+
+    /// The latest finalized writer reset whose rejected block had a checkpoint verifier
+    /// generation.
+    ///
+    /// The verifier resets after that rejection, so the blocks it released in that generation
+    /// or an earlier one are never committed. Every such block is either at or below the durable
+    /// tip, or descends from the rejected block. The state fails them instead of queueing them.
+    stale_checkpoint_reset: Option<write::FinalizedWriteReset>,
 
     /// Receives the hash of every non-finalized block that the write task
     /// rejected or evicted, so the corresponding entry can be removed from
@@ -606,6 +615,7 @@ impl StateService {
             )),
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
+            stale_checkpoint_reset: None,
             non_finalized_write_update_receiver,
             block_commit_sender,
             await_block_info_timeout: AWAIT_BLOCK_INFO_TIMEOUT,
@@ -686,6 +696,16 @@ impl StateService {
         let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
         let queued_height = checkpoint_verified.height;
 
+        // Apply writer resets first, so a stale block cannot enter the queue or the sent hashes.
+        if self.block_write_sender.finalized.is_some() {
+            self.drain_finalized_queue_and_commit();
+            if let Some(error) = self.stale_checkpoint_error(&checkpoint_verified) {
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(error.into()));
+                return rsp_rx;
+            }
+        }
+
         // If we're close to the final checkpoint, make the block's UTXOs available for
         // semantic block verification, even when it is in the channel.
         if self.is_close_to_final_checkpoint(queued_height) {
@@ -762,7 +782,7 @@ impl StateService {
     ///
     /// Returns an error if the block commit channel has been closed.
     pub fn drain_finalized_queue_and_commit(&mut self) {
-        use tokio::sync::mpsc::error::{SendError, TryRecvError};
+        use tokio::sync::mpsc::error::SendError;
 
         // # Correctness & Performance
         //
@@ -770,14 +790,8 @@ impl StateService {
         // because it is called directly from the tokio executor's Future threads.
 
         // If a block failed, we need to start again from a valid tip.
-        match self.invalid_block_write_reset_receiver.try_recv() {
-            Ok(reset_tip_hash) => self.finalized_block_write_last_sent_hash = reset_tip_hash,
-            Err(TryRecvError::Disconnected) => {
-                info!("Block commit task closed the block reset channel. Is Zakura shutting down?");
-                return;
-            }
-            // There are no errors, so we can just use the last block hash we sent
-            Err(TryRecvError::Empty) => {}
+        if !self.apply_finalized_write_resets() {
+            return;
         }
 
         while let Some(queued_block) = self
@@ -808,6 +822,95 @@ impl StateService {
                 };
             }
         }
+    }
+
+    /// Applies every pending finalized writer reset.
+    ///
+    /// Returns `false` if the block write task closed the reset channel.
+    fn apply_finalized_write_resets(&mut self) -> bool {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        loop {
+            match self.invalid_block_write_reset_receiver.try_recv() {
+                Ok(reset) => self.apply_finalized_write_reset(reset),
+                // There are no errors, so we can just use the last block hash we sent
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => {
+                    info!(
+                        "Block commit task closed the block reset channel. \
+                         Is Zakura shutting down?"
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Restarts finalized writes from the durable tip after the writer rejected a block.
+    ///
+    /// This answers every queued block that can no longer commit, and forgets the hashes of
+    /// blocks above the tip, so the syncer can download the rejected block again.
+    fn apply_finalized_write_reset(&mut self, reset: write::FinalizedWriteReset) {
+        tracing::warn!(
+            rejected_height = ?reset.rejected_height,
+            rejected_hash = ?reset.rejected_hash,
+            body_rejected = reset.body_rejected,
+            tip = ?reset.tip,
+            "finalized state rejected a checkpoint block, restarting writes from the durable tip",
+        );
+        metrics::counter!("state.checkpoint.rejected.block.count").increment(1);
+
+        self.finalized_block_write_last_sent_hash = reset.tip_hash();
+        if reset.rejected_generation.is_some()
+            && self
+                .stale_checkpoint_reset
+                .is_none_or(|stale| stale.rejected_generation < reset.rejected_generation)
+        {
+            self.stale_checkpoint_reset = Some(reset);
+        }
+
+        // Blocks from the rejected generation wait on parents the writer has dropped,
+        // so fail them now instead of leaving them queued.
+        let stale_parents: Vec<block::Hash> = self
+            .finalized_state_queued_blocks
+            .iter()
+            .filter(|(_, queued)| self.stale_checkpoint_error(&queued.0).is_some())
+            .map(|(parent_hash, _)| *parent_hash)
+            .collect();
+        for parent_hash in stale_parents {
+            let queued = self
+                .finalized_state_queued_blocks
+                .remove(&parent_hash)
+                .expect("the stale parent hash was collected from the queue");
+            let error = self
+                .stale_checkpoint_error(&queued.0)
+                .expect("the queued block was selected because it is stale");
+            Self::send_checkpoint_verified_block_error(queued, error);
+        }
+
+        // The writer dropped every block above the tip, so the syncer must be able to download
+        // them again. Blocks that are still queued keep their hashes and outputs.
+        let queued_hashes: HashSet<block::Hash> = self
+            .finalized_state_queued_blocks
+            .values()
+            .map(|queued| queued.0.hash)
+            .collect();
+        let dropped_hashes: Vec<block::Hash> = self
+            .non_finalized_block_write_sent_hashes
+            .hashes_above(reset.tip.map(|(height, _)| height))
+            .into_iter()
+            .filter(|hash| !queued_hashes.contains(hash))
+            .collect();
+        self.non_finalized_block_write_sent_hashes
+            .remove_many(&dropped_hashes);
+    }
+
+    /// Returns the error for a checkpoint block that the verifier released before its latest
+    /// reset, or `None` if the block can still commit.
+    fn stale_checkpoint_error(&self, block: &CheckpointVerifiedBlock) -> Option<CommitBlockError> {
+        let stale = self.stale_checkpoint_reset?;
+        let generation = block.verifier_generation()?;
+        (Some(generation) <= stale.rejected_generation).then(|| stale.descendant_error())
     }
 
     /// Drain writer updates, clear retired sent hashes, and complete failed descendants.

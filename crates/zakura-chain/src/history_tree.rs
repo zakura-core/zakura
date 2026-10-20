@@ -5,7 +5,7 @@ mod tests;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    io,
+    fmt, io,
     ops::Deref,
     sync::Arc,
 };
@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// An error describing why a history tree operation failed.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum HistoryTreeError {
@@ -42,6 +42,28 @@ pub enum HistoryTreeError {
 
     #[error("{network_upgrade:?} has no consensus branch ID, so it cannot have a history tree")]
     MissingBranchId { network_upgrade: NetworkUpgrade },
+}
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for HistoryTreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InnerError { inner } => {
+                f.debug_struct("InnerError").field("inner", inner).finish()
+            }
+            Self::IOError(error) => f.debug_tuple("IOError").field(error).finish(),
+            Self::InvalidCachedTree { reason } => f
+                .debug_struct("InvalidCachedTree")
+                .field("reason", reason)
+                .finish(),
+            Self::MissingBranchId { network_upgrade } => f
+                .debug_struct("MissingBranchId")
+                .field("network_upgrade", network_upgrade)
+                .finish(),
+        }
+    }
 }
 
 impl PartialEq for HistoryTreeError {

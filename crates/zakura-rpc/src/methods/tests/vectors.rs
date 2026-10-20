@@ -49,38 +49,25 @@ use crate::methods::{
 };
 
 use super::super::*;
+use crate::tests::test_rpc::{TestChainTip, TestRpcImpl};
 
 use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
-type MockRpc<Mempool, State, ReadState, Tip> = RpcImpl<
-    Mempool,
-    State,
-    ReadState,
-    Tip,
-    MockAddressBookPeers,
-    MockService<zakura_consensus::Request, Hash, PanicAssertion, BoxError>,
-    MockSyncStatus,
->;
-
-fn mock_rpc<Mempool, State, ReadState, Tip>(
+fn mock_rpc<Mempool, State, ReadState>(
     network: Network,
     mempool: Mempool,
     state: State,
     read_state: ReadState,
-    tip: Tip,
+    tip: impl Into<TestChainTip>,
     last_warn_error_log_rx: LoggedLastEvent,
-) -> (
-    MockRpc<Mempool, State, ReadState, Tip>,
-    tokio::task::JoinHandle<()>,
-)
+) -> (TestRpcImpl, tokio::task::JoinHandle<()>)
 where
     Mempool: MempoolService,
     State: zakura_state::State,
     ReadState: zakura_state::ReadState,
-    Tip: ChainTip + Clone + Send + Sync + 'static,
 {
-    RpcImpl::new(
+    TestRpcImpl::new_for_tests(
         network,
         Default::default(),
         Default::default(),
@@ -2375,7 +2362,7 @@ async fn getaddresstxids_single_equals_object_full_range() {
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
-    let (rpc, queue) = RpcImpl::new(
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
         network,
         Default::default(),
         false,
@@ -2564,7 +2551,7 @@ async fn rpc_getblockcount() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -2608,7 +2595,7 @@ async fn rpc_getblockcount_empty_state() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -2730,7 +2717,7 @@ async fn rpc_getpeerinfo() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network,
         Default::default(),
         Default::default(),
@@ -2784,7 +2771,7 @@ async fn rpc_getblockhash() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -3176,7 +3163,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             mock_tip_sender.send_best_tip_hash(tip_hash);
 
             let (_tx, rx) = tokio::sync::watch::channel(None);
-            let (rpc, _) = RpcImpl::new(
+            let (rpc, _) = TestRpcImpl::new_for_tests(
                 network.clone(),
                 crate::config::mining::Config {
                     miner_address: Some(miner_address.clone()),
@@ -3325,7 +3312,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, queue) = RpcImpl::new(
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(
@@ -3491,7 +3478,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         net.clone(),
         mining_conf,
         Default::default(),
@@ -3767,7 +3754,7 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (mined_tx, mut mined_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (rpc, queue_task) = RpcImpl::new(
+    let (rpc, queue_task) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         false,
@@ -3855,7 +3842,7 @@ async fn rpc_submitblock_errors() {
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (mined_tx, mut mined_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         Default::default(),
         Default::default(),
@@ -3925,7 +3912,7 @@ async fn rpc_client_proposal_can_submit_solution() {
     let pending_blocks = PendingBlockRegistry::default();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         Default::default(),
         Default::default(),
@@ -4119,7 +4106,7 @@ async fn completed_mined_verification_precedes_admission() {
         let sender = channel.sender();
         let mut events = channel.receiver();
         let (_tx, rx) = tokio::sync::watch::channel(None);
-        let (rpc, _queue) = RpcImpl::new(
+        let (rpc, _queue) = TestRpcImpl::new_for_tests(
             Mainnet,
             Default::default(),
             false,
@@ -4489,7 +4476,7 @@ async fn rpc_getdifficulty() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining_conf,
         Default::default(),
@@ -5117,7 +5104,7 @@ async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
     let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _queue) = RpcImpl::new(
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(
@@ -5275,7 +5262,7 @@ async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_templat
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _queue) = RpcImpl::new(
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(
@@ -5405,7 +5392,7 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _queue) = RpcImpl::new(
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(
@@ -5501,7 +5488,7 @@ async fn a_timed_out_parent_is_not_speculated_on_again() {
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _queue) = RpcImpl::new(
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
         Mainnet,
         mining::Config {
             miner_address: Some(ZcashAddress::from_transparent_p2pkh(

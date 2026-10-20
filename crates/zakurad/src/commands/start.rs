@@ -95,7 +95,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::spawn_erased;
-use zakura_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
+use zakura_rpc::SubmitBlockChannel;
 use zakura_state::StorageMode;
 
 use zakura::{
@@ -715,28 +715,27 @@ impl StartCmd {
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
+        let (rpc_impl, mut rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
-            build_version(),
+            build_version().to_string(),
             user_agent(),
-            mempool.clone(),
-            state.clone(),
-            read_only_state_service.clone(),
-            block_verifier_router.clone(),
-            sync_status.clone(),
-            latest_chain_tip.clone(),
-            address_book.clone(),
+            zakura_rpc::node::NodeRpcServices {
+                mempool: mempool.clone(),
+                state: state.clone(),
+                read_state: read_only_state_service.clone(),
+                block_verifier_router: block_verifier_router.clone(),
+                sync_status: zakura_rpc::node::NodeSyncStatus::new(sync_status.clone()),
+                latest_chain_tip: latest_chain_tip.clone(),
+                address_book: address_book.clone(),
+            },
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
+            pending_blocks,
+            sync::end_of_support::end_of_support_height(&config.network.network),
         );
         node_tasks.track(&rpc_tx_queue_handle);
-        let rpc_impl = rpc_impl
-            .with_pending_blocks(pending_blocks)
-            .with_end_of_support_height(sync::end_of_support::end_of_support_height(
-                &config.network.network,
-            ));
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
             read_state: read_only_state_service.clone(),
@@ -747,8 +746,7 @@ impl StartCmd {
         });
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
-            RpcServer::start(rpc_impl.clone(), config.rpc.clone())
-                .boxed()
+            zakura_rpc::node::start_server(&rpc_impl, config.rpc.clone())
                 .await
                 .expect("server should start")
         } else {
@@ -757,8 +755,7 @@ impl StartCmd {
         node_tasks.track(&rpc_task_handle);
 
         let admin_rpc_task_handle = if config.rpc.admin_listen_addr.is_some() {
-            RpcServer::start_admin(rpc_impl.clone(), config.rpc.clone())
-                .boxed()
+            zakura_rpc::node::start_admin_server(&rpc_impl, config.rpc.clone())
                 .await
                 .expect("admin server should start")
         } else {
@@ -802,16 +799,16 @@ impl StartCmd {
         let indexer_rpc_task_handle = {
             if let Some(indexer_listen_addr) = config.rpc.indexer_listen_addr {
                 info!("spawning indexer RPC server");
-                let (indexer_rpc_task_handle, _listen_addr) = zakura_rpc::indexer::server::init(
-                    indexer_listen_addr,
-                    config.rpc.indexer_tls.clone(),
-                    read_only_state_service.clone(),
-                    latest_chain_tip.clone(),
-                    mempool_transaction_subscriber.clone(),
-                )
-                .boxed()
-                .await
-                .map_err(|err| eyre!(err))?;
+                let (indexer_rpc_task_handle, _listen_addr) =
+                    zakura_rpc::node::start_indexer_server(
+                        indexer_listen_addr,
+                        config.rpc.indexer_tls.clone(),
+                        read_only_state_service.clone(),
+                        latest_chain_tip.clone(),
+                        mempool_transaction_subscriber.clone(),
+                    )
+                    .await
+                    .map_err(|err| eyre!(err))?;
 
                 indexer_rpc_task_handle
             } else {

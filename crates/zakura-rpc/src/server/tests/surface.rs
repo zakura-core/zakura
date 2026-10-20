@@ -1,5 +1,6 @@
 //! Tests for restricted unauthenticated and authenticated RPC method surfaces.
 
+use crate::tests::test_rpc::TestRpcImpl;
 use std::{
     collections::BTreeSet,
     fs,
@@ -13,7 +14,7 @@ use tower::buffer::Buffer;
 
 use crate::{
     config::rpc::{Config, TlsConfig},
-    methods::{RpcAccess, RpcImpl, RpcSurface, METHODS, RPC_METHOD_ACCESS},
+    methods::{RpcAccess, RpcSurface, METHODS, RPC_METHOD_ACCESS},
     server::{enabled_rpc_methods, primary_rpc_surface, MAX_RPC_BATCH_REQUESTS},
 };
 
@@ -143,7 +144,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     let block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, rpc_queue_task) = RpcImpl::new(
+    let (rpc_impl, rpc_queue_task) = TestRpcImpl::new_for_tests(
         Network::Mainnet,
         Default::default(),
         false,
@@ -346,7 +347,7 @@ async fn oversized_batches_are_rejected_before_dispatch() {
     let block_verifier_router: MockService<_, _, _, BoxError> =
         MockService::build().for_unit_tests();
     let (_tx, rx) = watch::channel(None);
-    let (rpc_impl, rpc_queue_task) = RpcImpl::new(
+    let (rpc_impl, rpc_queue_task) = TestRpcImpl::new_for_tests(
         Network::Mainnet,
         Default::default(),
         false,

@@ -28,6 +28,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | `test-docker.yml` | Builds the production runtime image once, then smoke-tests its packaged binaries, privilege drop, default startup, and combined config overrides. | PR/push on Cargo, Docker, `zakurad`, or runtime-config paths; weekly; manual |
 | `zakura-e2e.yml` | The heaviest PR-path job, isolated in its own workflow: regtest docker-compose end-to-end gate, multi-node testkit test, block-sync fuzz on every push to `main`, and long four-node modes nightly. PR runs are gated by a `changes` job or the `run-zakura-e2e` label. | PR/push (self-gated), merge queue, nightly, manual |
 | `docs-check.yml` | markdownlint, codespell, and lychee link checking over all Markdown. | PR/push on Markdown paths |
+| `legacy-pages.yml` | Validates the legacy Pages redirect to the canonical download page. Publishing requires a manual run from `main`. | PR/push on redirect paths, manual |
 | `changelog.yml` | Requires one fragment for Rust/Cargo.toml PRs and tests release assembly. | Every PR/push/merge group |
 | `coverage.yml` | llvm-cov + nextest coverage uploaded to Codecov. A 120-minute instrumented build, kept off the PR path. | Push to `main`/`release/**`, nightly, manual |
 | `benchmarks.yml` | Criterion benchmarks. Runs on PRs carrying the `C-benchmark` label; results publish to the dashboard data on `gh-pages/dev/bench`. | Labeled PRs, manual |

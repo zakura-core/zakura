@@ -748,14 +748,20 @@ impl Service for HeaderSyncService {
             service_cancel_token.clone(),
         );
 
-        let _ = self
-            .header_sync
-            .send_lifecycle(Event::PeerConnected(session.clone()));
+        let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
         let pipe_cancel = service_cancel_token.clone();
         let protocol_connection_cancel = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
         let pipe: BoxRunFuture<'static, ()> = Box::pin(async move {
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            tokio::select! {
+                biased;
+                _ = pipe_cancel.cancelled() => return,
+                result = admitted => if result.is_err() { return; },
+            }
             let result = if header_bytes == REGTEST_HEADER_BYTES {
                 run_peer::<REGTEST_HEADER_BYTES>(
                     handle,
@@ -790,13 +796,13 @@ impl Service for HeaderSyncService {
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
         let on_teardown = move || {
-            if teardown_sessions.remove(&teardown_peer, key).is_some() {
-                let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
-                    peer: teardown_peer,
-                    session_id,
-                    reason: teardown_close_cause.get_or("stream_closed"),
-                });
-            }
+            teardown_sessions.remove(&teardown_peer, key);
+            // Replaced sessions still own a reserved teardown slot. The reactor checks generations.
+            let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
+                peer: teardown_peer,
+                session_id,
+                reason: teardown_close_cause.get_or("stream_closed"),
+            });
         };
         let panic_connection_cancel = connection_cancel_token.clone();
         let panic_close_cause = close_cause.clone();

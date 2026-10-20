@@ -126,3 +126,8 @@ required-features = ["internal-bench"]
 name = "finality_witness"
 harness = false
 required-features = ["internal-bench"]
+
+[[bench]]
+name = "height_map"
+harness = false
+required-features = ["internal-bench"]

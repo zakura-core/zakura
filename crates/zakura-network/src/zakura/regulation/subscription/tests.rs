@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::zakura::{
     framed_channel,
-    regulation::{ServeCapacity, ServeLimits, WriterFence, UNFINISHED_EXCHANGE},
-    CloseCause, Frame, PayloadLen, ZakuraPeerId,
+    regulation::{ResponsePrecheck, ServeCapacity, ServeLimits, WriterFence, UNFINISHED_EXCHANGE},
+    CloseCause, Frame, FrameRejection, PayloadLen, ZakuraPeerId,
 };
 
 mod message_type {
@@ -507,7 +507,7 @@ fn every_publisher_outcome_row() {
         Ok(Applied::Live)
     );
 
-    // `Grant` or a second `Close` after `Close`.
+    // `Grant` or a second `Close` after `Close`, before and after the end.
     assert_eq!(publications.close(&1, 2, &1), Ok(Applied::Live));
     assert_eq!(
         publications.grant(&1, 3, &1, credit(1, 0)),
@@ -518,16 +518,28 @@ fn every_publisher_outcome_row() {
         publications.reserve_page(&1, 1, 8, 2),
         Err(PageStall::Closing)
     );
+    drop(publications.end(&1));
+    assert_eq!(
+        publications.grant(&1, 3, &1, credit(1, 0)),
+        Err(F::AfterClose)
+    );
+    assert_eq!(publications.close(&1, 3, &1), Err(F::AfterClose));
 
     // A crossed `Grant` is dropped and keeps the tombstone; a crossed `Close`
-    // is dropped and consumes it. Both still follow the sequence.
+    // is dropped and consumes it. Both still follow the sequence, and a
+    // crossed `Grant` must add credit. The page leaves room for the grant.
     let mut publications = opened(1, &[1]);
+    publications.reserve_page(&1, 1, 8, 1).unwrap();
     let _permit = publications.end(&1).unwrap();
     assert_eq!(
         publications.grant(&1, 1, &0, credit(1, 0)),
         Ok(Applied::Crossed)
     );
     assert_eq!(publications.tombstones(), 1);
+    assert_eq!(
+        publications.grant(&1, 2, &0, credit(0, 0)),
+        Err(F::EmptyCredit)
+    );
     assert_eq!(
         publications.close(&1, 1, &0),
         Err(F::Sequence {
@@ -579,6 +591,8 @@ fn the_next_open_clears_tombstones_the_subscriber_has_passed() {
     // With none live, the newest tombstone stays: its terminal outcome may be
     // in flight while the subscriber opens its second subscription.
     drop(publications.end(&2));
+    // The page leaves room for a crossed grant.
+    publications.reserve_page(&3, 1, 8, 1).unwrap();
     drop(publications.end(&3));
     publications.open(4, 0, LIMIT, 0).unwrap();
     assert_eq!(publications.tombstones(), 1);
@@ -590,6 +604,42 @@ fn the_next_open_clears_tombstones_the_subscriber_has_passed() {
         publications.grant(&2, 1, &0, credit(1, 0)),
         Err(SubscriptionFault::Unknown)
     );
+}
+
+#[test]
+fn a_crossed_grant_is_held_by_the_ended_window() {
+    use SubscriptionFault as F;
+
+    // A conformant subscriber reaches the bound exactly. The publisher sends
+    // one page of 1 object and 8 bytes and ends on its own outcome. While the
+    // outcome is in flight, the subscriber accepts the page and grants the
+    // room it reopened.
+    let limits = limits(1);
+    let mut subscriptions = Subscriptions::<u8, u32>::new(limits, RULES);
+    let mut publications = Publications::<u8, u32>::new(limits);
+    let open = subscriptions.open(1, LIMIT, 0).unwrap();
+    publications
+        .open(1, open.sequence, open.added, open.acknowledged)
+        .unwrap();
+    publications.reserve_page(&1, 1, 8, 1).unwrap();
+    subscriptions.claim_page(&1, 1, 8, 1).unwrap();
+    let _permit = publications.end(&1).unwrap();
+    subscriptions.accept(&1, &1).unwrap();
+    let grant = subscriptions
+        .grant(&1, subscriptions.grantable(&1).unwrap())
+        .unwrap();
+    assert_eq!(grant.added, credit(1, 8));
+    assert_eq!(
+        publications.grant(&1, grant.sequence, &grant.acknowledged, grant.added),
+        Ok(Applied::Crossed)
+    );
+    // No acknowledgement could reopen one more object or byte.
+    for over in [credit(1, 0), credit(0, 1)] {
+        assert_eq!(
+            publications.grant(&1, grant.sequence + 1, &1, over),
+            Err(F::CrossedAboveWindow)
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -645,7 +695,8 @@ fn publisher_op() -> impl Strategy<Value = PublisherOp> {
             sequence.clone(),
             cursor.clone(),
             0u32..3,
-            0u32..40
+            // Often no bytes, so some grants add no credit at all.
+            prop_oneof![1 => Just(0u32), 3 => 0u32..40],
         )
             .prop_map(
                 |(key, sequence, acknowledged, objects, bytes)| PublisherOp::Grant {
@@ -676,10 +727,64 @@ fn publisher_op() -> impl Strategy<Value = PublisherOp> {
     ]
 }
 
+/// A tombstone as the publisher model sees it.
+#[derive(Debug)]
+struct ModeledTombstone {
+    key: u8,
+    sequence: u32,
+    granted: Totals,
+    consumed: Totals,
+    close_received: bool,
+}
+
+/// The model's result for an update on `key` when no live subscription has
+/// it. `added` is a `Grant`'s credit, or `None` for `Close`. Applies the
+/// update to `tombstones` if it is dropped as crossed.
+fn modeled_crossing(
+    tombstones: &mut VecDeque<ModeledTombstone>,
+    key: u8,
+    sequence: u32,
+    added: Option<Credit>,
+) -> Result<Applied, SubscriptionFault> {
+    let Some(index) = tombstones.iter().position(|dead| dead.key == key) else {
+        return Err(SubscriptionFault::Unknown);
+    };
+    let dead = &mut tombstones[index];
+    if dead.close_received {
+        return Err(SubscriptionFault::AfterClose);
+    }
+    if sequence != dead.sequence + 1 {
+        return Err(SubscriptionFault::Sequence {
+            expected: dead.sequence + 1,
+            got: sequence,
+        });
+    }
+    let Some(added) = added else {
+        tombstones.remove(index);
+        return Ok(Applied::Crossed);
+    };
+    if added.objects == 0 && added.bytes == 0 {
+        return Err(SubscriptionFault::EmptyCredit);
+    }
+    let granted = totals(
+        dead.granted.objects + u64::from(added.objects),
+        dead.granted.bytes + u64::from(added.bytes),
+    );
+    if granted.objects > dead.consumed.objects + u64::from(LIMIT.objects)
+        || granted.bytes > dead.consumed.bytes + u64::from(LIMIT.bytes)
+    {
+        return Err(SubscriptionFault::CrossedAboveWindow);
+    }
+    dead.granted = granted;
+    dead.sequence = sequence;
+    Ok(Applied::Crossed)
+}
+
 proptest! {
     /// Under any update sequence, a hostile one included, a refused update
     /// changes nothing, and live subscriptions, tombstones, and the cursor
-    /// history stay within their bounds.
+    /// history stay within their bounds. Every update on a key that is not
+    /// live returns exactly what a tombstone model says.
     #[test]
     fn publisher_operation_sequences_keep_every_bound(
         max_live in 1u32..3,
@@ -688,23 +793,72 @@ proptest! {
         let bound = 2 * max_live as usize;
         let mut publications = Publications::<u8, u32>::new(limits(max_live));
         let mut permits = VecDeque::new();
+        // The last update sequence applied to each live key.
+        let mut sequences: HashMap<u8, u32> = HashMap::new();
+        let mut tombstones: VecDeque<ModeledTombstone> = VecDeque::new();
         for op in ops {
             let before = format!("{publications:?}");
+            let live = sequences.len();
             let result = match op {
-                PublisherOp::Open { key, sequence, objects, bytes, start } => publications
-                    .open(key, sequence, credit(objects, bytes), start)
-                    .map(|()| Applied::Live),
+                PublisherOp::Open { key, sequence, objects, bytes, start } => {
+                    let result = publications
+                        .open(key, sequence, credit(objects, bytes), start)
+                        .map(|()| Applied::Live);
+                    if sequence == 0 {
+                        let reused = sequences.contains_key(&key)
+                            || tombstones.iter().any(|dead| dead.key == key);
+                        prop_assert_eq!(result == Err(SubscriptionFault::ReusedKey), reused);
+                    }
+                    if result.is_ok() {
+                        sequences.insert(key, 0);
+                        let keep = (max_live as usize - 1).saturating_sub(live);
+                        while tombstones.len() > keep {
+                            tombstones.pop_front();
+                        }
+                    }
+                    result
+                }
                 PublisherOp::Grant { key, sequence, acknowledged, objects, bytes } => {
-                    publications.grant(&key, sequence, &acknowledged, credit(objects, bytes))
+                    let added = credit(objects, bytes);
+                    let expected = (!sequences.contains_key(&key))
+                        .then(|| modeled_crossing(&mut tombstones, key, sequence, Some(added)));
+                    let result = publications.grant(&key, sequence, &acknowledged, added);
+                    if let Some(expected) = expected {
+                        prop_assert_eq!(result, expected);
+                    } else if result.is_ok() {
+                        sequences.insert(key, sequence);
+                    }
+                    result
                 }
                 PublisherOp::Close { key, sequence, acknowledged } => {
-                    publications.close(&key, sequence, &acknowledged)
+                    let expected = (!sequences.contains_key(&key))
+                        .then(|| modeled_crossing(&mut tombstones, key, sequence, None));
+                    let result = publications.close(&key, sequence, &acknowledged);
+                    if let Some(expected) = expected {
+                        prop_assert_eq!(result, expected);
+                    } else if result.is_ok() {
+                        sequences.insert(key, sequence);
+                    }
+                    result
                 }
                 PublisherOp::Page { key, objects, bytes, cursor } => {
                     let _ = publications.reserve_page(&key, objects, bytes, cursor);
                     Ok(Applied::Live)
                 }
                 PublisherOp::End { key } => {
+                    if let Some(sequence) = sequences.remove(&key) {
+                        let ended = publications.credit(&key).expect("a live key has credit");
+                        tombstones.push_back(ModeledTombstone {
+                            key,
+                            sequence,
+                            granted: ended.granted(),
+                            consumed: ended.consumed(),
+                            close_received: publications.is_closing(&key),
+                        });
+                        if tombstones.len() > bound {
+                            tombstones.pop_front();
+                        }
+                    }
                     permits.extend(publications.end(&key));
                     Ok(Applied::Live)
                 }
@@ -716,6 +870,8 @@ proptest! {
             if result.is_err() {
                 prop_assert_eq!(format!("{publications:?}"), before);
             }
+            prop_assert_eq!(publications.keys().count(), sequences.len());
+            prop_assert_eq!(publications.tombstones(), tombstones.len());
             prop_assert!(publications.keys().count() + permits.len() <= bound);
             prop_assert!(publications.tombstones() <= bound);
             for key in publications.keys() {
@@ -808,7 +964,7 @@ fn pick<T: Copy + Ord>(keys: impl Iterator<Item = T>, pick: usize) -> Option<T> 
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("HEADER_SYNC_PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(512)))]
 
     /// A conformant subscriber and publisher, joined by two ordered queues,
     /// never fault each other under any interleaving of updates, pages, and
@@ -1266,4 +1422,51 @@ async fn pushed_pages_keep_response_slots_until_transport_completion() {
             .unwrap(),
     );
     assert_eq!(capacity.node_output_held(), 0);
+}
+
+/// A reader that admits pages ahead of the handler queues at most the
+/// unspent credit, in objects and in bytes. Claiming a page turns its charge
+/// into spent credit, and a terminal outcome takes none.
+#[test]
+fn queued_pages_never_exceed_the_unspent_credit() {
+    let mut tool = Subscriptions::<u8, u32>::new(limits(1), RULES);
+    tool.open(1, credit(3, 40), 0)
+        .expect("the first Open is recorded");
+    let reader = SharedSubscriptions::new(tool);
+    let admitting = reader.admitting();
+    let full = Err(FrameRejection::AboveReservation {
+        bytes: u64::from(LIMIT.bytes),
+    });
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+    assert_eq!(
+        admitting.check(message_type::PAGE, 1),
+        full,
+        "the queued bytes already fill the unspent credit"
+    );
+    assert_eq!(admitting.check(message_type::ENDED, 1), Ok(()), "no charge");
+    reader
+        .lock()
+        .claim_admitted_page(&1, 1, 20, 1)
+        .expect("within credit");
+    assert_eq!(
+        admitting.check(message_type::PAGE, 1),
+        full,
+        "the claim spent the credit its charge held"
+    );
+    let mut tool = reader.lock();
+    tool.accept(&1, &1).expect("the page was claimed");
+    tool.grant(&1, credit(1, 20)).expect("within the window");
+    drop(tool);
+    assert_eq!(admitting.check(message_type::PAGE, 20), Ok(()));
+
+    // One object per page: three pages of one byte fill three objects.
+    let mut tool = Subscriptions::<u8, u32>::new(limits(1), RULES);
+    tool.open(1, credit(3, 40), 0)
+        .expect("the first Open is recorded");
+    let admitting = SharedSubscriptions::new(tool).admitting();
+    for _ in 0..3 {
+        assert_eq!(admitting.check(message_type::PAGE, 1), Ok(()));
+    }
+    assert!(admitting.check(message_type::PAGE, 1).is_err());
 }

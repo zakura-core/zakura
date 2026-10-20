@@ -135,18 +135,6 @@ pub struct ConnLimits {
 }
 
 impl ConnLimits {
-    /// Sets the connection-level receive window.
-    pub fn with_receive_window(mut self, bytes: u64) -> Self {
-        self.receive_window = Some(bytes);
-        self
-    }
-
-    /// Sets the connection-level send window.
-    pub fn with_send_window(mut self, bytes: u64) -> Self {
-        self.send_window = Some(bytes);
-        self
-    }
-
     /// Sets how many bidirectional streams the peer may have open.
     pub fn with_max_bidi_streams(mut self, streams: u32) -> Self {
         self.max_bidi_streams = Some(streams);

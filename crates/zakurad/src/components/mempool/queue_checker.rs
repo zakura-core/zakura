@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::{task::JoinHandle, time::sleep};
 use tower::{BoxError, Service, ServiceExt};
 use tracing::Instrument;
+use zakura_node_services::task::spawn_erased;
 
 use crate::components::mempool;
 
@@ -46,7 +47,7 @@ where
     pub fn spawn(mempool: Mempool) -> JoinHandle<Result<(), BoxError>> {
         let queue_checker = QueueChecker { mempool };
 
-        tokio::spawn(queue_checker.run().in_current_span())
+        spawn_erased(queue_checker.run().in_current_span())
     }
 
     /// Periodically check if the mempool has newly verified transactions.

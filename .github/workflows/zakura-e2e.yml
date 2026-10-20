@@ -169,7 +169,7 @@ jobs:
           ZAKURA_REGTEST_E2E_LABEL: zakura-pr-gate
       - name: Upload Zakura e2e traces
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-regtest-e2e-pr-gate
           path: ${{ runner.temp }}/zakura-regtest-e2e-traces-pr-gate
@@ -214,7 +214,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 #v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -224,7 +224,7 @@ jobs:
           ZAKURA_TEST_TRACE: keep
       - name: Upload Zakura block-sync fuzz traces
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-blocksync-fuzz-traces
           path: target/zakura-traces
@@ -280,7 +280,7 @@ jobs:
           ZAKURA_REGTEST_E2E_LABEL: zakura-${{ matrix.zakura-mode }}
       - name: Upload Zakura e2e traces
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
         with:
           name: zakura-regtest-e2e-${{ matrix.zakura-mode }}
           path: ${{ runner.temp }}/zakura-regtest-e2e-traces-${{ matrix.zakura-mode }}

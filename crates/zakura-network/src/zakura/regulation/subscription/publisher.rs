@@ -81,10 +81,16 @@ struct Published<C> {
     slot: SlotPermit,
 }
 
+/// An ended subscription; see the module docs for the rules it enforces.
 #[derive(Debug)]
 struct Tombstone<K> {
     key: K,
+    /// The last update sequence applied.
     sequence: u32,
+    /// The ended subscription's credit. Crossed grants add to it.
+    credit: ResponseCredit,
+    /// Whether the subscriber sent `Close` before the end.
+    close_received: bool,
 }
 
 /// The subscriptions a peer opened on one session, keyed by `K`, with
@@ -195,7 +201,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         let limit = self.limits.credit;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
-            return self.crossed(key, sequence, false);
+            return self.crossed(key, sequence, Some(added));
         };
         if published.closing {
             return Err(fault(SubscriptionFault::AfterClose));
@@ -227,7 +233,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         let message_type = self.limits.message_type;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let Some(published) = self.live.get_mut(key) else {
-            return self.crossed(key, sequence, true);
+            return self.crossed(key, sequence, None);
         };
         if published.closing {
             return Err(fault(SubscriptionFault::AfterClose));
@@ -240,27 +246,41 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         Ok(Applied::Live)
     }
 
-    /// Match an update for no live subscription against the tombstones. A
-    /// `Close` consumes its tombstone; a `Grant` keeps it.
+    /// Match an update for no live subscription against the tombstones; see
+    /// the module docs. `added` is a `Grant`'s credit, or `None` for `Close`.
     fn crossed(
         &mut self,
         key: &K,
         sequence: u32,
-        close: bool,
+        added: Option<Credit>,
     ) -> Result<Applied, SubscriptionFault> {
         let message_type = self.limits.message_type;
+        let limit = self.limits.credit;
         let fault = move |fault: SubscriptionFault| fault.counted(message_type);
         let index = self
             .tombstones
             .iter()
             .position(|dead| dead.key == *key)
             .ok_or_else(|| fault(SubscriptionFault::Unknown))?;
-        next_sequence(self.tombstones[index].sequence, sequence).map_err(fault)?;
-        if close {
-            self.tombstones.remove(index);
-        } else {
-            self.tombstones[index].sequence = sequence;
+        let dead = &mut self.tombstones[index];
+        if dead.close_received {
+            return Err(fault(SubscriptionFault::AfterClose));
         }
+        next_sequence(dead.sequence, sequence).map_err(fault)?;
+        let Some(added) = added else {
+            self.tombstones.remove(index);
+            return Ok(Applied::Crossed);
+        };
+        if is_empty(added) {
+            return Err(fault(SubscriptionFault::EmptyCredit));
+        }
+        // The subscriber acknowledged at most every page sent before the end,
+        // so its window starts at or before the consumed credit.
+        let consumed = dead.credit.consumed();
+        dead.credit
+            .grant(added, consumed, limit)
+            .map_err(|_| fault(SubscriptionFault::CrossedAboveWindow))?;
+        dead.sequence = sequence;
         Ok(Applied::Crossed)
     }
 
@@ -313,6 +333,8 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         self.tombstones.push_back(Tombstone {
             key: key.clone(),
             sequence: published.sequence,
+            credit: published.credit,
+            close_received: published.closing,
         });
         let bound = self.limits.max_live().saturating_mul(2);
         while self.tombstones.len() > bound {

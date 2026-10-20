@@ -11,9 +11,7 @@ version = 2
 yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
-ignore = [
-    "RUSTSEC-2025-0141", # bincode — direct dependency
-]
+ignore = []
 
 # This section is considered when running `cargo deny check licenses`.
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
@@ -87,15 +85,6 @@ skip = [
     # still resolves Rand 0.9. Remove these when the workspace converges.
     { name = "rand", version = "=0.9.4" },
     { name = "rand_chacha", version = "=0.9.0" },
-
-    # Common v3 note encryption uses RustCrypto's newer AEAD/cipher traits.
-    # Orchard/Sapling AES and FPE, plus networking's AES-GCM, still require
-    # the older traits. Skip only these exact older versions until those
-    # consumers upgrade; keep checking their dependencies and all new versions.
-    { name = "aead", version = "=0.5.2" },
-    { name = "cipher", version = "=0.4.4" },
-    { name = "inout", version = "=0.1.4" },
-    { name = "universal-hash", version = "=0.5.1" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate
@@ -108,19 +97,6 @@ skip-tree = [
 
     # wait for ordered-map to release a dependency fix
     { name = "ordered-map", version = "=0.4.2" },
-
-    # wait for abscissa_core to upgrade
-    {name = "tracing-log", version = "=0.1.4" },
-
-    # wait for abscissa_core to update toml
-    { name = "toml", version = "=0.5.11" },
-
-    # wait for zebra to update tower
-    { name = "tower", version = "=0.4.13" },
-
-    # wait for zebra to update vergen
-    { name = "thiserror", version = "=1.0.69" },
-    { name = "thiserror-impl", version = "=1.0.69" },
 
     # wait for all librustzcash crates to update sha2, secp256k1, and ripemd
     { name = "sha2", version = "=0.10.9" },
@@ -140,9 +116,6 @@ skip-tree = [
     # toml 1.x is the spec-1.1 line; remove once zakurad migrates its direct dep.
     { name = "toml", version = "=0.9.12+spec-1.1.0" },
 
-    # wait for abscissa_core to update synstructure
-    { name = "synstructure", version = "=0.12.6" },
-
     { name = "windows-sys", version = "=0.52.0" },
 
     { name = "indexmap", version = "1.9" },
@@ -160,9 +133,6 @@ skip-tree = [
     { name = "rand_core", version = "0.6" },
     { name = "rand_chacha", version = "0.3" },
 
-    # wait for derive_builder to update
-    { name = "darling", version = "0.20.11" },
-
     # wait until `config` updates `convert_case`
     { name = "convert_case", version = "0.6.0" },
 
@@ -172,7 +142,6 @@ skip-tree = [
     # Existing consumers still use these versions alongside newer ones.
     { name = "convert_case", version = "=0.8.0" },
     { name = "rand_core", version = "=0.9.5" },
-    { name = "reqwest", version = "=0.12.28" },
     { name = "shlex", version = "=1.3.0" },
 
     # documented-macros has moved ahead of the rest of the workspace.

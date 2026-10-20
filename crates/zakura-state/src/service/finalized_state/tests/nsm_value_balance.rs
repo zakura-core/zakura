@@ -331,7 +331,8 @@ fn migration_requires_resync_after_the_reissuance_start() {
     let _guard = zakura_test::init();
     let network = accounting_network(true);
     let (mut state, parent) = state_below_start(&network);
-    let (_cancel, cancel_receiver) = crossbeam_channel::bounded(1);
+    let (_cancel, cancel_receiver) =
+        crate::service::finalized_state::disk_format::upgrade::cancel_channel();
 
     // A tip below the start migrates.
     Upgrade

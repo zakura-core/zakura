@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
 use indexmap::IndexSet;
 use tower::{timeout::Timeout, Service};

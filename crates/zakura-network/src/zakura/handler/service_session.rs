@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::zakura::transport::SessionLayout;
+use zakura_node_services::task::erased;
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.
 ///
@@ -249,13 +250,13 @@ pub(super) fn spawn_service_session(
             .await;
         });
     }
-    workers.spawn(async move {
+    workers.spawn(erased(async move {
         let _cancel_on_exit = cancel.clone().drop_guard();
         while running.next().await.is_some() {
             cancel.cancel();
         }
         let _ = exits.send(exit);
-    });
+    }));
     admitted
 }
 

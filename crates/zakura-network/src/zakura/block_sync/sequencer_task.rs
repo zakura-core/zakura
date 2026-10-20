@@ -783,7 +783,14 @@ impl SequencerTask {
             let _ = self.sequencer.remove_applying(height);
             self.sequencer
                 .finish_submission(owner, source, token, height, hash);
-            return (false, false);
+            // Removing this submitted body can leave the decoded-cap window with
+            // nothing submitted, so wake its pending work (see
+            // `Sequencer::submission_admitted`). With nothing pending, a stale
+            // completion still schedules nothing.
+            return (
+                false,
+                self.sequencer.submission_window_idle_with_pending_work(),
+            );
         };
         let attribution_matches = outcome
             .attributed_source()
@@ -868,11 +875,18 @@ impl SequencerTask {
                             unreachable!("only rejected outcomes reach peer scoring")
                         }
                     };
-                    self.send_action(BlockSyncAction::Misbehavior {
+                    let disconnects = reason.proves_tampered_body();
+                    let action = BlockSyncAction::Misbehavior {
                         peer: applying.source_peer.clone(),
                         reason,
-                    })
-                    .await;
+                    };
+                    // The driver disconnects a proven tampering supplier, so that
+                    // record must not be dropped when the action channel is busy.
+                    if disconnects {
+                        self.send_required_action(action).await;
+                    } else {
+                        self.send_action(action).await;
+                    }
                 }
             }
             BlockApplyResult::Rejected
@@ -987,6 +1001,11 @@ impl SequencerTask {
 
         self.submission_retry_at = None;
         for height in submittable_heights {
+            // Each decode replaces an estimate with the measured size, so recheck
+            // the cap before every submission (see `submittable_heights`).
+            if !self.sequencer.submission_fits_decoded_window(height) {
+                break;
+            }
             let Some(item) = self.sequencer.prepare_submit(height) else {
                 continue;
             };
@@ -1277,15 +1296,15 @@ fn publish_sequencer_view(view_tx: &watch::Sender<SequencerView>, next: Sequence
 /// True when two views differ in any field the reactor or per-peer routines
 /// schedule against. Ignores the observability-only committed throughput rates,
 /// which move on nearly every sample and must not, on their own, wake — or under a
-/// paused test clock, spin — the whole fleet of watchers.
+/// paused test clock, spin — the whole fleet of watchers. Admission reads the
+/// reorder and applying decoded totals, so a release there wakes gated routines;
+/// the input total and pipeline sum are sampled from an atomic and stay ignored.
 fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
     let strip_rates = |v: &SequencerView| {
         let mut v = *v;
         v.committed_bytes_per_sec = 0;
         v.committed_blocks_per_sec = 0;
         v.sequencer_input_decoded_attributed_memory_bytes = 0;
-        v.reorder_decoded_attributed_memory_bytes = 0;
-        v.applying_decoded_attributed_memory_bytes = 0;
         v.active_pipeline_decoded_attributed_memory_bytes = 0;
         v
     };
@@ -1299,6 +1318,7 @@ mod tests {
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 
+    use super::super::tests::genesis_frontiers;
     use super::*;
 
     #[test]
@@ -1454,11 +1474,7 @@ mod tests {
     }
 
     fn retention_test_task(limit: u64) -> SequencerTask {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, _actions_rx) = mpsc::channel(1);
@@ -1608,11 +1624,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_version_refresh_does_not_retire_body_authority() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let scope = super::test_work_scope();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
@@ -1654,11 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_target_scope_advance_preserves_downloaded_bodies() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let old_scope = super::test_work_scope();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1710,11 +1718,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_invalid_reselection_resets_block_pipeline() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let old_authority = super::test_work_scope();
         let work = Arc::new(WorkQueue::new(block::Height(0)));
         work.extend(
@@ -1776,11 +1780,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_retry_completion_releases_only_exact_infrastructure() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -1871,11 +1871,7 @@ mod tests {
 
     #[tokio::test]
     async fn consensus_invalid_evidence_waits_for_action_capacity() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -1988,11 +1984,7 @@ mod tests {
 
     #[tokio::test]
     async fn retryable_evidence_waits_for_action_capacity() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2101,11 +2093,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_action_receiver_retains_exact_required_evidence() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions, actions_rx) = mpsc::channel(1);
@@ -2176,11 +2164,7 @@ mod tests {
         ];
         for (index, kind) in kinds.into_iter().enumerate() {
             for attribution_matches in [true, false] {
-                let frontiers = BlockSyncFrontiers {
-                    finalized_height: block::Height(0),
-                    verified_block_tip: block::Height(0),
-                    verified_block_hash: block::Hash([0; 32]),
-                };
+                let frontiers = genesis_frontiers();
                 let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2276,16 +2260,118 @@ mod tests {
         }
     }
 
+    /// A tampered body's record waits for a busy driver instead of timing out.
+    /// The height is still reset so another supplier can serve it.
+    #[tokio::test]
+    async fn tampered_body_misbehavior_waits_for_a_busy_driver() {
+        let frontiers = genesis_frontiers();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, mut actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let mut task = SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(123),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions.clone(),
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_millis(20),
+            ZakuraTrace::noop(),
+        );
+
+        let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+        body.leave_queue();
+        task.handle_accept_body(body);
+        task.submit_pending_blocks().await;
+        let BlockSyncAction::SubmitBlock {
+            owner,
+            source,
+            token,
+            block,
+        } = actions_rx.recv().await.expect("body is submitted")
+        else {
+            panic!("expected a body submission");
+        };
+        let height = block.coinbase_height().expect("test block has height");
+        let hash = block.hash();
+        let busy_peer = ZakuraPeerId::new(vec![7; 32]).expect("test peer ID is valid");
+        actions
+            .send(BlockSyncAction::Misbehavior {
+                peer: busy_peer,
+                reason: BlockSyncMisbehavior::StatusSpam,
+            })
+            .await
+            .expect("the filler action fills the channel");
+        let mismatch = zakura_header_chain::BodyPayloadMismatch {
+            evidence: zakura_header_chain::EvidenceId::from_digest([0x81; 32]),
+            requested: hash,
+            delivered: hash,
+            kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+            source,
+        };
+        let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+
+        let finished = {
+            let finish = task.handle_apply_finished(
+                owner,
+                source,
+                token,
+                height,
+                hash,
+                &mut outcome,
+                BTreeSet::new(),
+                None,
+                Some((owner, zakura_header_chain::StateVersion::default())),
+            );
+            tokio::pin!(finish);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut finish)
+                    .await
+                    .is_err(),
+                "the record must outlast the 20ms bounded send timeout"
+            );
+            assert!(matches!(
+                actions_rx.recv().await,
+                Some(BlockSyncAction::Misbehavior {
+                    reason: BlockSyncMisbehavior::StatusSpam,
+                    ..
+                })
+            ));
+            finish.await
+        };
+        assert_eq!(finished, (true, true));
+        assert!(matches!(
+            actions_rx.recv().await,
+            Some(BlockSyncAction::Misbehavior {
+                peer,
+                reason: BlockSyncMisbehavior::BodyPayloadMismatch(actual),
+            }) if peer == ZakuraPeerId::new(vec![1; 32]).expect("test peer ID is valid")
+                && actual == mismatch
+        ));
+        assert!(!task.sequencer.applying_contains(height));
+        assert!(
+            task.sequencer.floor() < height,
+            "the height is requestable again"
+        );
+    }
+
     #[tokio::test]
     // IN-02: persist a consensus-invalid result.
     // Attribute it only to the authenticated supplier.
     async fn body_invalid_after_header_extension_reaches_header_dag() {
         for attribution_matches in [true, false] {
-            let frontiers = BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(0),
-                verified_block_hash: block::Hash([0; 32]),
-            };
+            let frontiers = genesis_frontiers();
             let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let (_body_tx, body_rx) = mpsc::channel(1);
@@ -2397,11 +2483,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn submission_retries_after_action_channel_capacity_returns() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2478,11 +2560,7 @@ mod tests {
 
     #[test]
     fn handoff_publishes_applying_decoded_bytes_before_submission() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2529,11 +2607,7 @@ mod tests {
 
     #[test]
     fn dropping_task_releases_queue_and_publishes_terminal_decoded_view() {
-        let frontiers = BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        };
+        let frontiers = genesis_frontiers();
         let (body_tx, body_rx) = mpsc::channel(1);
         let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let body_input_decoded_attributed_memory_bytes =

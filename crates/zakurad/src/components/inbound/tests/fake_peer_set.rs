@@ -998,9 +998,9 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     // The poisoned block must not reach the state.
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // The block must also be re-requested, without a download source, so it routes through the
     // peer set rather than back to the peer that just poisoned it. Honest peers' `inv`s for this
@@ -1096,9 +1096,9 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
 
     let response = state_service
         .clone()
-        .oneshot(zakura_state::Request::Depth(block_hash))
+        .oneshot(zakura_state::Request::Block(block_hash.into()))
         .await?;
-    assert_eq!(response, zakura_state::Response::Depth(None));
+    assert_eq!(response, zakura_state::Response::Block(None));
 
     // TODO: check that the block is not queued in the checkpoint verifier or non-finalized state
 
@@ -1253,17 +1253,20 @@ async fn setup(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
@@ -1304,17 +1307,20 @@ async fn setup_with_misbehavior_receiver(
     add_transactions: bool,
 ) -> (
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
     Vec<Arc<Block>>,
     Vec<VerifiedUnminedTx>,
     MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
     MockService<Request, Response, PanicAssertion>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,

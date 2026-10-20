@@ -9,14 +9,14 @@ use crate::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::MAX_BLOCK_BYTES,
     fmt::HexDebug,
-    primitives::{x25519, Bctv14Proof, Groth16Proof, ZkSnarkProof},
+    primitives::{Bctv14Proof, Groth16Proof, ZkSnarkProof},
     serialization::{
         ReadZcashExt, SerializationError, TrustedPreallocate, WriteZcashExt, ZcashDeserialize,
         ZcashSerialize,
     },
 };
 
-use super::{commitment, note, tree};
+use super::{commitment, keys::EphemeralPublicKey, note, tree};
 
 /// A 256-bit seed that must be chosen independently at
 /// random for each [JoinSplit description].
@@ -76,8 +76,8 @@ pub struct JoinSplit<P: ZkSnarkProof> {
     pub nullifiers: [note::Nullifier; 2],
     /// A note commitment for this output note.
     pub commitments: [commitment::NoteCommitment; 2],
-    /// An X25519 public key.
-    pub ephemeral_key: x25519::PublicKey,
+    /// An ephemeral X25519 public key, kept as its encoded bytes.
+    pub ephemeral_key: EphemeralPublicKey,
     /// A 256-bit seed that must be chosen independently at random for each
     /// JoinSplit description.
     pub random_seed: RandomSeed,
@@ -109,8 +109,8 @@ pub struct GenericJoinSplit {
     pub nullifiers: [note::Nullifier; 2],
     /// A note commitment for this output note.
     pub commitments: [commitment::NoteCommitment; 2],
-    /// An X25519 public key.
-    pub ephemeral_key: x25519::PublicKey,
+    /// An ephemeral X25519 public key, kept as its encoded bytes.
+    pub ephemeral_key: EphemeralPublicKey,
     /// A 256-bit seed that must be chosen independently at random for each
     /// JoinSplit description.
     pub random_seed: RandomSeed,
@@ -141,9 +141,9 @@ impl<P: ZkSnarkProof> fmt::Debug for JoinSplit<P> {
 }
 
 impl<P: ZkSnarkProof> ZcashSerialize for JoinSplit<P> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.vpub_old.zcash_serialize(&mut writer)?;
-        self.vpub_new.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.vpub_old.zcash_serialize(writer)?;
+        self.vpub_new.zcash_serialize(writer)?;
 
         writer.write_32_bytes(&self.anchor.into())?;
         writer.write_32_bytes(&self.nullifiers[0].into())?;
@@ -156,12 +156,12 @@ impl<P: ZkSnarkProof> ZcashSerialize for JoinSplit<P> {
         #[allow(clippy::needless_borrow)]
         writer.write_32_bytes(&(&self.random_seed).into())?;
 
-        self.vmacs[0].zcash_serialize(&mut writer)?;
-        self.vmacs[1].zcash_serialize(&mut writer)?;
-        self.zkproof.zcash_serialize(&mut writer)?;
+        self.vmacs[0].zcash_serialize(writer)?;
+        self.vmacs[1].zcash_serialize(writer)?;
+        self.zkproof.zcash_serialize(writer)?;
 
-        self.enc_ciphertexts[0].zcash_serialize(&mut writer)?;
-        self.enc_ciphertexts[1].zcash_serialize(&mut writer)?;
+        self.enc_ciphertexts[0].zcash_serialize(writer)?;
+        self.enc_ciphertexts[1].zcash_serialize(writer)?;
 
         Ok(())
     }
@@ -220,7 +220,7 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
             ],
             // Type is `KA^{Sprout}.Public`, i.e. `B^Y^{[32]}`, i.e. 32 bytes.
             // https://zips.z.cash/protocol/protocol.pdf#concretesproutkeyagreement
-            ephemeral_key: x25519_dalek::PublicKey::from(reader.read_32_bytes()?),
+            ephemeral_key: EphemeralPublicKey::from(reader.read_32_bytes()?),
             // Type is `B^{[ℓ_{Seed}]}`, i.e. 32 bytes
             random_seed: RandomSeed::from(reader.read_32_bytes()?),
             // Types are `B^{ℓ^{Sprout}_{PRF}}` i.e. 32 bytes.

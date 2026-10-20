@@ -564,7 +564,7 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
             zakura_chain::sprout::commitment::NoteCommitment::from([2; 32]),
             zakura_chain::sprout::commitment::NoteCommitment::from([3; 32]),
         ],
-        ephemeral_key: zakura_chain::primitives::x25519::PublicKey::from([0; 32]),
+        ephemeral_key: zakura_chain::sprout::keys::EphemeralPublicKey::from([0; 32]),
         random_seed: zakura_chain::sprout::RandomSeed::from([0; 32]),
         vmacs: [
             zakura_chain::sprout::note::Mac::from([0; 32]),
@@ -1506,7 +1506,7 @@ fn legacy_block_info_replay_preserves_slow_start_deferred_funding_and_nsm_seed()
             .zs_delete(&Height(h));
     }
     state.db.write_batch(batch).unwrap();
-    let (_tx, rx) = crossbeam_channel::bounded(1);
+    let (_tx, rx) = crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     Upgrade.run(Some(Height(3)), &state.db, &rx).unwrap();
     for (index, expected) in snapshots.into_iter().enumerate() {
         let height = Height(u32::try_from(index + 1).unwrap());

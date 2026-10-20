@@ -36,7 +36,7 @@ pub(crate) mod sample;
 mod tests;
 
 pub use error::WireError;
-pub use item::{HeightLe, LeU32, Wire, U8};
+pub use item::{BlockHash, Bool, HeightLe, LeU16, LeU32, LeU64, Wire, U8};
 pub use list::List;
 pub use message::{decode_frame, encode_frame, WireMessage};
 pub use reader::BoundedReader;

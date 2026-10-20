@@ -374,6 +374,8 @@ pub enum InsertResult {
 pub struct MemHeaderStore {
     graph_revision: GraphRevision,
     finalized_frontier: Frontier,
+    // Integrated selection restores this preference from the durable selected tip.
+    preferred_header_tip: Option<Frontier>,
     // Nodes by hash.
     nodes: HashMap<block::Hash, HeaderNode>,
     // Children by parent hash.
@@ -422,6 +424,7 @@ impl MemHeaderStore {
         );
         Ok(Self {
             graph_revision: GraphRevision::default(),
+            preferred_header_tip: None,
             finalized_frontier,
             nodes,
             children: HashMap::new(),
@@ -819,7 +822,8 @@ impl MemHeaderStore {
         tips
     }
 
-    /// Select the deterministic greatest-work eligible tip after the finalized anchor.
+    /// Select maximal work, preserving the preferred eligible tip on equal work.
+    /// Raw hash order resolves ties when no preferred tip remains competitive.
     pub fn select_best_header_chain(&self) -> Result<(Frontier, ChainScore), GraphError> {
         let anchor = self
             .nodes
@@ -837,11 +841,24 @@ impl MemHeaderStore {
                     .suffix_after(anchor.work_coordinate())?,
                 tip.hash,
             );
-            if best.is_none_or(|(_, best_score)| score > best_score) {
+            let rank = |tip: Frontier, score: ChainScore| {
+                (
+                    score.suffix_work,
+                    Some(tip) == self.preferred_header_tip,
+                    tip.hash.0,
+                )
+            };
+            if best
+                .is_none_or(|(best_tip, best_score)| rank(tip, score) > rank(best_tip, best_score))
+            {
                 best = Some((tip, score));
             }
         }
         best.ok_or(GraphError::UnknownHeaderNode(self.finalized_frontier.hash))
+    }
+
+    pub(crate) fn prefer_header_tip(&mut self, tip: Option<Frontier>) {
+        self.preferred_header_tip = tip;
     }
 
     /// Return the selection score of one retained descendant of the finalized anchor.
@@ -1017,6 +1034,7 @@ impl MemHeaderStore {
         }
         let mut store = Self {
             graph_revision: GraphRevision::default(),
+            preferred_header_tip: None,
             finalized_frontier,
             nodes: node_map,
             children,

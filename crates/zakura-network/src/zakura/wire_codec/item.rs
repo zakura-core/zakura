@@ -104,6 +104,102 @@ impl Wire for LeU32 {
     }
 }
 
+/// A little-endian `u16`.
+#[derive(Debug)]
+pub enum LeU16 {}
+
+impl Wire for LeU16 {
+    type Value = u16;
+    const MIN_LEN: usize = 2;
+    const MAX_LEN: usize = 2;
+
+    fn max_heap_bytes(_input_len: usize) -> usize {
+        0
+    }
+
+    fn encode(value: &u16, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<u16, WireError> {
+        Ok(u16::from_le_bytes(reader.array("u16")?))
+    }
+}
+
+/// A little-endian `u64`.
+#[derive(Debug)]
+pub enum LeU64 {}
+
+impl Wire for LeU64 {
+    type Value = u64;
+    const MIN_LEN: usize = 8;
+    const MAX_LEN: usize = 8;
+
+    fn max_heap_bytes(_input_len: usize) -> usize {
+        0
+    }
+
+    fn encode(value: &u64, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<u64, WireError> {
+        Ok(u64::from_le_bytes(reader.array("u64")?))
+    }
+}
+
+/// A canonical boolean: one byte, `0` or `1`.
+#[derive(Debug)]
+pub enum Bool {}
+
+impl Wire for Bool {
+    type Value = bool;
+    const MIN_LEN: usize = 1;
+    const MAX_LEN: usize = 1;
+
+    fn max_heap_bytes(_input_len: usize) -> usize {
+        0
+    }
+
+    fn encode(value: &bool, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.push(u8::from(*value));
+        Ok(())
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<bool, WireError> {
+        match reader.read::<U8>()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WireError::OutOfRange("boolean")),
+        }
+    }
+}
+
+/// A block hash: its 32 bytes in the order Zcash serializes them.
+#[derive(Debug)]
+pub enum BlockHash {}
+
+impl Wire for BlockHash {
+    type Value = block::Hash;
+    const MIN_LEN: usize = 32;
+    const MAX_LEN: usize = 32;
+
+    fn max_heap_bytes(_input_len: usize) -> usize {
+        0
+    }
+
+    fn encode(value: &block::Hash, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&value.0);
+        Ok(())
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<block::Hash, WireError> {
+        Ok(block::Hash(reader.array("block hash")?))
+    }
+}
+
 /// A block height as a little-endian `u32`, at most [`block::Height::MAX`].
 #[derive(Debug)]
 pub enum HeightLe {}

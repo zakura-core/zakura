@@ -168,15 +168,15 @@ mod peer_cache_updater;
 mod peer_registry;
 mod peer_set;
 pub use block_feedback::BlockFeedback;
-mod policies;
 mod protocol;
 pub mod zakura;
 
-#[allow(unused)]
-pub(crate) use peer_set::PeerSet;
-
 #[cfg(any(test, feature = "proptest-impl"))]
-pub use crate::{isolated::connect_isolated_with_inbound, protocol::external::canonical_peer_addr};
+pub use crate::{
+    isolated::connect_isolated_with_inbound,
+    peer_set::{init, init_with_zakura_header_sync},
+    protocol::external::canonical_peer_addr,
+};
 
 pub use crate::{
     address_book::{AddressBook, BannedIps},
@@ -188,8 +188,7 @@ pub use crate::{
         SharedPeerError,
     },
     peer_registry::ConnectedPeer,
-    peer_set::{init, init_with_zakura, init_with_zakura_header_sync},
-    policies::RetryLimit,
+    peer_set::init_with_zakura,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
         internal::{InventoryResponse, PeerSource, Request, Response},

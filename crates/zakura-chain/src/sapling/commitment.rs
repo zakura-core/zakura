@@ -149,7 +149,7 @@ impl ZcashDeserialize for ValueCommitment {
 }
 
 impl ZcashSerialize for ValueCommitment {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.0)?;
         Ok(())
     }

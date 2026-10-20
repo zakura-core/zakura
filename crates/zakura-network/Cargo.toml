@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "10.0.0-rc0"
+version = "10.0.0-rc1"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -54,21 +54,19 @@ indexmap = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pin-project = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 rayon = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 futures = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "tracing", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, features = ["codec", "rt"] }
 tower = { workspace = true, features = ["retry", "discover", "load", "load-shed", "timeout", "util", "buffer"] }
 
 metrics = { workspace = true }
-tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
 
@@ -90,8 +88,8 @@ curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-toml = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+toml = { workspace = true, features = ["display"] }
 tracing-subscriber = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
@@ -111,5 +109,10 @@ harness = false
 
 [[bench]]
 name = "address_book"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "supervised_spawn"
 harness = false
 required-features = ["internal-bench"]

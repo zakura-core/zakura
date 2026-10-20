@@ -1,0 +1,9 @@
+[Unit]
+Description=Restrict NU7 collector port to API gateway and localhost
+Before=nu7-activation.service
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/zakura/nu7-activation.nft
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

@@ -16,7 +16,7 @@
 //! Keeping the Sequencer free of download-side state is what lets it run on its
 //! own serial task ([`super::sequencer_task`]), off the reactor's thread.
 
-use super::{events::BlockApplyToken, reorder::*, state::*, *};
+use super::{admission::DESERIALIZED_MEM_FACTOR, events::BlockApplyToken, reorder::*, state::*, *};
 
 /// A received body draining contiguously toward the verified tip, awaiting (or
 /// undergoing) verifier submission.
@@ -124,6 +124,18 @@ pub(super) struct Sequencer {
     body_download_floor: block::Height,
     verified_block_tip: block::Height,
     submitted_apply_limit: usize,
+    /// Decoded-byte cap above the last checkpoint, or `None` for a count-only window.
+    decoded_window_cap: Option<DecodedWindowCap>,
+}
+
+/// Decoded-byte cap on the submission window; see
+/// [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`](super::config::BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES)
+/// for the policy.
+#[derive(Copy, Clone, Debug)]
+struct DecodedWindowCap {
+    /// The verifier's last checkpoint height. The cap only applies above it.
+    max_checkpoint_height: block::Height,
+    max_decoded_bytes: u64,
 }
 
 impl Sequencer {
@@ -143,6 +155,39 @@ impl Sequencer {
             body_download_floor: verified_block_tip,
             verified_block_tip,
             submitted_apply_limit,
+            decoded_window_cap: None,
+        }
+    }
+
+    /// Cap the decoded heap of the submission window at `max_decoded_bytes` for
+    /// heights above `max_checkpoint_height`. Heights at or below it keep the
+    /// count-only window.
+    pub(super) fn with_decoded_window_cap(
+        mut self,
+        max_checkpoint_height: block::Height,
+        max_decoded_bytes: u64,
+    ) -> Self {
+        self.decoded_window_cap = Some(DecodedWindowCap {
+            max_checkpoint_height,
+            max_decoded_bytes,
+        });
+        self
+    }
+
+    /// Whether `height` may add `additional_decoded_bytes` to a decoded window
+    /// already holding `resident_decoded_bytes`.
+    fn decoded_window_admits(
+        &self,
+        height: block::Height,
+        resident_decoded_bytes: u64,
+        additional_decoded_bytes: u64,
+    ) -> bool {
+        match self.decoded_window_cap {
+            Some(cap) if height > cap.max_checkpoint_height => {
+                resident_decoded_bytes.saturating_add(additional_decoded_bytes)
+                    <= cap.max_decoded_bytes
+            }
+            _ => true,
         }
     }
 
@@ -413,8 +458,9 @@ impl Sequencer {
     /// exception is the front of the drain that will be submitted immediately:
     /// those keep an already-present decoded copy so the common steady-state
     /// path (receive next block → drain → submit) never decodes twice. Bodies
-    /// past the free submission slots are demoted to raw bytes, so the decoded
-    /// backlog stays bounded by the submission window.
+    /// past the free submission slots, or past the decoded-byte cap above the
+    /// last checkpoint, are demoted to raw bytes, so the decoded backlog stays
+    /// bounded by the submission window.
     pub(super) fn drain_ready_into_applying(&mut self) -> Vec<block::Height> {
         let released = self
             .reorder
@@ -425,9 +471,17 @@ impl Sequencer {
         let mut covered = Vec::with_capacity(released.len());
         for drained in released {
             let mut body = drained.body;
-            if free_submit_slots > 0 {
+            if free_submit_slots > 0
+                && self.decoded_window_admits(
+                    drained.height,
+                    self.applying_decoded_attributed_memory_bytes(),
+                    body.decoded_attributed_memory_size_bytes(),
+                )
+            {
                 free_submit_slots -= 1;
             } else {
+                // Keep the decoded copies a contiguous prefix of this drain.
+                free_submit_slots = 0;
                 body.retain_for_backlog_in_place();
             }
             self.body_download_floor = drained.height;
@@ -459,8 +513,13 @@ impl Sequencer {
 
     // ---- submission ----
 
-    /// The unsubmitted `applying` heights eligible for verifier submission,
-    /// bounded by the remaining submission window.
+    /// The unsubmitted `applying` heights eligible for verifier submission, in
+    /// height order, bounded by the remaining submission window and, above the
+    /// last checkpoint, by the projected decoded-byte cap (see
+    /// [`Self::submission_admitted`]).
+    ///
+    /// The projection uses estimates for raw bodies, so callers must recheck
+    /// [`Self::submission_fits_decoded_window`] before each `prepare_submit`.
     pub(super) fn submittable_heights(&self) -> Vec<block::Height> {
         let available = self
             .submitted_apply_limit
@@ -468,11 +527,82 @@ impl Sequencer {
         if available == 0 {
             return Vec::new();
         }
-        self.applying
+        let mut resident_decoded_bytes = self.applying_decoded_attributed_memory_bytes();
+        let mut attached_submissions = self.attached_submission_count;
+        let mut heights = Vec::new();
+        for (height, applying) in self
+            .applying
             .iter()
-            .filter_map(|(height, applying)| (!applying.submitted).then_some(*height))
+            .filter(|(_, applying)| !applying.submitted)
             .take(available)
-            .collect()
+        {
+            if !self.submission_admitted(
+                *height,
+                applying,
+                resident_decoded_bytes,
+                attached_submissions,
+            ) {
+                break;
+            }
+            resident_decoded_bytes =
+                resident_decoded_bytes.saturating_add(Self::submission_decode_charge(applying));
+            attached_submissions = attached_submissions.saturating_add(1);
+            heights.push(*height);
+        }
+        heights
+    }
+
+    /// Whether submitting `height` now keeps the measured decoded window within
+    /// its cap. `true` when `height` is not applying, so `prepare_submit`
+    /// decides that case.
+    pub(super) fn submission_fits_decoded_window(&self, height: block::Height) -> bool {
+        self.applying.get(&height).is_none_or(|applying| {
+            self.submission_admitted(
+                height,
+                applying,
+                self.applying_decoded_attributed_memory_bytes(),
+                self.attached_submission_count,
+            )
+        })
+    }
+
+    /// Whether no `applying` body is submitted while unsubmitted work waits.
+    /// The next submission attempt then always admits one body.
+    pub(super) fn submission_window_idle_with_pending_work(&self) -> bool {
+        self.attached_submission_count == 0 && self.unsubmitted_applying_count() > 0
+    }
+
+    /// Decoded-cap admission for one submission. A raw body's decoded size is
+    /// unknown until `prepare_submit` decodes it, so it is charged
+    /// `bytes × DESERIALIZED_MEM_FACTOR`.
+    ///
+    /// When no `applying` body is submitted, the body is always admitted, so one
+    /// oversized body still progresses. Detached submissions still count toward
+    /// the cap but never block this: they can be successors waiting in state
+    /// for the very parent this admits, and may never complete without it.
+    fn submission_admitted(
+        &self,
+        height: block::Height,
+        applying: &ApplyingBlock,
+        resident_decoded_bytes: u64,
+        attached_submissions: usize,
+    ) -> bool {
+        attached_submissions == 0
+            || self.decoded_window_admits(
+                height,
+                resident_decoded_bytes,
+                Self::submission_decode_charge(applying),
+            )
+    }
+
+    /// Decoded bytes that submitting `applying` adds: none when it is already
+    /// decoded, otherwise the raw-body estimate.
+    fn submission_decode_charge(applying: &ApplyingBlock) -> u64 {
+        if applying.body.is_decoded() {
+            0
+        } else {
+            applying.bytes.saturating_mul(DESERIALIZED_MEM_FACTOR)
+        }
     }
 
     /// Assign a token to `height`, mark it submitted, and return the dispatch
@@ -481,7 +611,8 @@ impl Sequencer {
     ///
     /// Submission is the decode point: a body still held as raw bytes is decoded
     /// here (and cached on the entry until apply-finished or unsubmit), so at
-    /// most `submitted_apply_limit` decoded bodies are resident at once.
+    /// most `submitted_apply_limit` decoded bodies are resident at once, within
+    /// the decoded-byte cap above the last checkpoint (see `submittable_heights`).
     pub(super) fn prepare_submit(&mut self, height: block::Height) -> Option<SubmitItem> {
         if self
             .applying

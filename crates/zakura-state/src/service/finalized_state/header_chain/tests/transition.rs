@@ -2166,3 +2166,20 @@ fn selected_availability_projection_survives_restart_before_and_after_alarm() {
         assert!(verified.alarms.header_best_body_unavailable_at.is_none());
     }
 }
+
+/// Header sync classifies an insert refusal by its planner failure, so the
+/// store error must expose that failure as its source.
+#[test]
+fn store_error_exposes_its_transition_failure_as_the_source() {
+    let error = HeaderChainStoreError::from(TransitionFailure::AuxiliaryLimitExceeded);
+    let source = std::error::Error::source(&error).and_then(|source| source.downcast_ref());
+
+    assert!(matches!(
+        source,
+        Some(TransitionFailure::AuxiliaryLimitExceeded)
+    ));
+    assert_eq!(
+        error.to_string(),
+        TransitionFailure::AuxiliaryLimitExceeded.to_string()
+    );
+}

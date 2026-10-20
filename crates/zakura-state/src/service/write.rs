@@ -225,7 +225,6 @@ impl FullStateEvidenceAuthority for PreparedHeaderCompletionAuthority {
     }
 }
 
-#[allow(dead_code)] // Called when the dark header engine is attached to the writer task.
 impl PreparedFullStateTransition {
     /// Construct a staged mutation only when its duplicated identity and verified path agree.
     pub fn new(
@@ -338,7 +337,6 @@ impl PreparedFullStateTransition {
 }
 
 /// Incoherent duplicated facts at the staging boundary.
-#[allow(dead_code)] // Returned when the dark header engine stages writer mutations.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum PreparedFullStateTransitionError {
     /// The header request did not carry the exact state-writer transition identity.

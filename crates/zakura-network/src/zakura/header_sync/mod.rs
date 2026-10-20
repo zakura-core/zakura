@@ -3,7 +3,7 @@
 use thiserror::Error;
 use zakura_chain::block;
 
-use super::{Frame, ZakuraPeerId, FRAME_HEADER_BYTES};
+use super::{ZakuraPeerId, FRAME_HEADER_BYTES};
 
 mod config;
 mod error;
@@ -16,6 +16,7 @@ mod scheduler;
 mod service;
 #[cfg(test)]
 mod tests;
+pub(crate) mod v9;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
@@ -23,8 +24,7 @@ pub use error::HeaderSyncStartError;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub use events::HeaderSyncAction;
 pub use events::{
-    Event, FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
-    HeaderPathPageResult, HeaderSyncFatalEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
+    Event, FullStateFrontiers, HeaderSyncFatalEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
     HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
     HeaderTargetPreparationResult, VctRepairContextResult,
 };
@@ -39,13 +39,11 @@ pub use scheduler::retry::{
 pub(crate) use service::drive_header_sync_actions;
 pub use service::PeerSession;
 pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
-#[cfg(test)]
-pub(crate) use wire::headers_response_bytes;
-pub(crate) use wire::headers_response_capacity;
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use v9::replay_header_sync_v9_codec_bytes;
+pub use v9::{Headers, HeadersOutcome, HeadersOutcomeCode, Status};
 pub use wire::{
-    AuxSchema, GetHeaders, HeaderEntry, HeaderServingLimits, HeaderSyncCodec,
-    HeaderSyncDecodeContext, HeaderSyncMessage, HeaderSyncWireError, Headers, HeadersOutcome,
-    HeadersOutcomeCode, Status, TreeAuxRecordV1, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
-    MAX_HS_RANGE, MSG_HS_GET_HEADERS, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME, MSG_HS_STATUS,
-    TREE_AUX_SCHEMA_V1_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    AuxSchema, HeaderEntry, HeaderSyncWireError, TreeAuxRecordV1, DEFAULT_HS_RANGE,
+    MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };

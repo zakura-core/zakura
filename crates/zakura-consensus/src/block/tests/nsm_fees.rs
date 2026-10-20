@@ -125,8 +125,8 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
             });
             let verifier = SemanticBlockVerifier::new(
                 &network,
-                with_parent_context(state, context),
-                transaction,
+                crate::transaction::boxed_state(with_parent_context(state, context)),
+                crate::transaction::boxed_transaction_verifier(transaction),
             );
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -218,7 +218,7 @@ proptest::proptest! {
                         Ok::<_, BoxError>(response)
                     }
                 });
-                let verifier = SemanticBlockVerifier::new(&network, with_parent_context(state, context), transaction);
+                let verifier = SemanticBlockVerifier::new(&network, crate::transaction::boxed_state(with_parent_context(state, context)), crate::transaction::boxed_transaction_verifier(transaction));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(10),
                     verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
                 if excess > 0 {

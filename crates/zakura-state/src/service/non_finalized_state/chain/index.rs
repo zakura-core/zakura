@@ -1,7 +1,7 @@
 //! Transparent address indexes for non-finalized chains.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     ops::RangeInclusive,
 };
 
@@ -13,7 +13,7 @@ use zakura_chain::{
 
 use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
-use super::{counted_set::CountedSet, RevertPosition, UpdateWith};
+use super::{counted_set::CountedSet, RevertPosition, SharedMap, UpdateWith};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {
@@ -249,9 +249,9 @@ impl TransparentTransfers {
     /// index.
     ///
     /// [1]: super::super::Chain
-    pub fn tx_ids(
+    pub(crate) fn tx_ids(
         &self,
-        chain_tx_loc_by_hash: &HashMap<transaction::Hash, TransactionLocation>,
+        chain_tx_loc_by_hash: &SharedMap<transaction::Hash, TransactionLocation>,
         query_height_range: RangeInclusive<Height>,
     ) -> BTreeMap<TransactionLocation, transaction::Hash> {
         self.tx_ids

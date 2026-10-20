@@ -4,8 +4,8 @@
 //! NU7 it falls by each block's additional block subsidy. Earlier records carry zero.
 //! Live commits derive the same seed with `ValueBalance::seed_nsm_value_balance`.
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
+use std::sync::mpsc::TryRecvError;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
@@ -23,7 +23,7 @@ use zakura_chain::{
 
 use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+use super::{CancelFormatChange, CancelReceiver, DiskFormatUpgrade, FormatChangeError};
 
 /// The number of block info records to rewrite per database batch.
 #[cfg(not(test))]
@@ -50,7 +50,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         backfill(initial_finalized_tip_height, db, cancel_receiver, |batch| {
             db.write_batch(batch)
@@ -61,7 +61,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         // The periodic check runs while blocks commit. A commit between the reads below
         // would pair the new tip pools with the old tip's BlockInfo, so retry until the tip
@@ -120,7 +120,7 @@ impl DiskFormatUpgrade for Upgrade {
 fn backfill(
     initial_finalized_tip_height: Option<Height>,
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
     mut write: impl FnMut(DiskWriteBatch) -> Result<(), FormatChangeError>,
 ) -> Result<(), FormatChangeError> {
     let Some(tip_height) = initial_finalized_tip_height else {
@@ -393,9 +393,7 @@ fn read_block_info(db: &ZakuraDb, height: Height) -> Result<BlockInfo, FormatCha
     Ok(BlockInfo::new(pools, size))
 }
 
-fn check_cancelled(
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
+fn check_cancelled(cancel_receiver: &CancelReceiver) -> Result<(), CancelFormatChange> {
     match cancel_receiver.try_recv() {
         Err(TryRecvError::Empty) => Ok(()),
         _ => Err(CancelFormatChange),
@@ -545,6 +543,7 @@ mod tests {
 
 #[cfg(test)]
 mod database_tests {
+    use super::super::cancel_channel;
     use super::*;
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
@@ -653,7 +652,7 @@ mod database_tests {
                 expected
             );
         }
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
     }
 
@@ -663,7 +662,7 @@ mod database_tests {
         const ROWS: u32 = 6;
 
         let db = legacy_db_with_seed(ROWS, 48, SEED);
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(ROWS - 1)), &db, &rx).unwrap();
 
         let stored = |height: u32| {
@@ -709,7 +708,7 @@ mod database_tests {
             .zs_insert(&Height(1), &stale_info);
         db.write_batch(batch).unwrap();
 
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(ROWS - 1)), &db, &rx).unwrap();
         assert_eq!(
             read_block_info(&db, Height(1))
@@ -761,7 +760,7 @@ mod database_tests {
             .with_batch_for_writing(&mut batch)
             .zs_delete(&Height(0));
         offset.write_batch(batch).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         for db in [&healthy, &offset] {
             Upgrade.run(Some(Height(3)), db, &rx).unwrap();
             assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
@@ -812,7 +811,7 @@ mod database_tests {
                 .zs_insert(&Height(overdraw_height), &RawBytes(bytes));
             db.write_batch(batch).unwrap();
 
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             let result = Upgrade.run(Some(Height(3)), &db, &rx);
             assert!(matches!(
                 result,
@@ -826,7 +825,7 @@ mod database_tests {
         const SEED: i64 = 1_234_567;
         let db = legacy_db_with_seed(2, 48, SEED);
         let genesis = db.raw_block_info_cf().zs_get(&Height(0)).unwrap().0;
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(1)), &db, &rx).unwrap();
         assert_eq!(
             db.raw_block_info_cf().zs_get(&Height(0)).unwrap().0,
@@ -851,7 +850,7 @@ mod database_tests {
     #[test]
     fn empty_migration_does_not_write() {
         let db = legacy_db(0, 48);
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         backfill(None, &db, &rx, |_| panic!("empty migration must not write")).unwrap();
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
@@ -878,7 +877,7 @@ mod database_tests {
                 .with_batch_for_writing(&mut batch)
                 .zs_delete(&Height(0));
             db.write_batch(batch).unwrap();
-            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (tx, rx) = cancel_channel();
             backfill(Some(Height(1)), &db, &rx, |_| {
                 panic!("pre-NU7 migration must not write")
             })
@@ -902,7 +901,7 @@ mod database_tests {
                 let before: Vec<_> = (0..1)
                     .map(|h| db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0)
                     .collect();
-                let (_tx, rx) = crossbeam_channel::bounded(1);
+                let (_tx, rx) = cancel_channel();
                 Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
                 assert_upgraded(&db, rows);
                 for (h, bytes) in before.iter().enumerate() {
@@ -937,7 +936,7 @@ mod database_tests {
             .with_batch_for_writing(&mut batch)
             .zs_delete(&Height(0));
         db.write_batch(batch).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
@@ -952,7 +951,7 @@ mod database_tests {
         // Genesis is the only unaffected row; the seed row is always rewritten.
         let rows = affected + 1;
         let db = legacy_db(rows, pool_len);
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         let mut writes = 0;
         let result = backfill(Some(Height(rows - 1)), &db, &rx, |batch| {
             let current = writes;
@@ -1027,7 +1026,7 @@ mod database_tests {
             .expect("the regtest schedule halves within u32 heights")
             + 1;
         let db = legacy_db(rows, 48);
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
         assert_upgraded(&db, rows);
     }
@@ -1035,7 +1034,7 @@ mod database_tests {
     #[test]
     fn migration_cancellation_between_batches_is_retryable() {
         let db = legacy_db(BATCH_BLOCKS + 3, 48);
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, rx) = cancel_channel();
         let result = backfill(Some(Height(BATCH_BLOCKS + 2)), &db, &rx, |batch| {
             db.write_batch(batch).unwrap();
             tx.send(CancelFormatChange).unwrap();
@@ -1051,7 +1050,7 @@ mod database_tests {
     #[test]
     fn cancellation_after_tip_write_prevents_validation_and_allows_retry() {
         let db = legacy_db(4, 48);
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, rx) = cancel_channel();
         backfill(Some(Height(3)), &db, &rx, |batch| {
             db.write_batch(batch).unwrap();
             tx.send(CancelFormatChange).unwrap();
@@ -1113,7 +1112,7 @@ mod database_tests {
                     .with_batch_for_writing(&mut batch)
                     .zs_insert(&tip, &block::Hash([0; 32]));
                 db.write_batch(batch).unwrap();
-                let (_tx, rx) = crossbeam_channel::bounded(1);
+                let (_tx, rx) = cancel_channel();
                 backfill(Some(tip), &db, &rx, |_| {
                     panic!("pre-NU7 migration must not write")
                 })
@@ -1215,7 +1214,7 @@ mod database_tests {
                     let db =
                         healthy_deferred_db(slow_start_deferred_network(nu7), tip + 1, pool_len);
                     let before = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
-                    let (_tx, rx) = crossbeam_channel::bounded(1);
+                    let (_tx, rx) = cancel_channel();
                     let mut writes = 0;
                     backfill(Some(Height(tip)), &db, &rx, |batch| {
                         writes += 1;
@@ -1278,7 +1277,7 @@ mod database_tests {
                     .deferred_amount()
                     > Amount::<NonNegative>::zero()
             );
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             Upgrade.run(Some(Height(9)), &db, &rx).unwrap();
             assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
         }
@@ -1305,7 +1304,7 @@ mod database_tests {
             .with_batch_for_writing(&mut batch)
             .zs_delete(&Height(2));
         db.write_batch(batch).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(10)), &db, &rx).unwrap();
         assert_eq!(
             i64::from(read_tip_pools(&db).unwrap().nsm_value_balance_amount()),
@@ -1339,7 +1338,7 @@ mod database_tests {
             .with_batch_for_writing(&mut batch)
             .zs_insert(&(), &pools);
         offset.write_batch(batch).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         for db in [&healthy, &offset] {
             Upgrade.run(Some(Height(10)), db, &rx).unwrap();
             assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
@@ -1388,7 +1387,7 @@ mod database_tests {
                     .zs_insert(&(), &pools);
             }
             db.write_batch(batch).unwrap();
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             let error = backfill(Some(Height(10)), &db, &rx, |_| {
                 panic!("inconsistent Deferred changes in the first batch must not be written")
             })
@@ -1426,7 +1425,7 @@ mod database_tests {
         db.write_batch(batch).unwrap();
         let original_tip = db.raw_block_info_cf().zs_get(&Height(4)).unwrap();
         let original_pools = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         let upgrade = DbFormatChange::open_database(&running_version, Some(old_version.clone()));
         for _ in 0..2 {
             let error = upgrade
@@ -1479,7 +1478,7 @@ mod database_tests {
             after < before,
             "disbursement exceeds this block's Deferred funding"
         );
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         Upgrade.run(Some(Height(4)), &db, &rx).unwrap();
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
@@ -1499,7 +1498,7 @@ mod database_tests {
         let old_version = Version::new(28, 1, 5);
         let running_version = state_database_format_version_in_code();
         db.update_format_version_on_disk(&old_version).unwrap();
-        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (_tx, rx) = cancel_channel();
         DbFormatChange::open_database(&running_version, Some(old_version))
             .apply_format_upgrade(&db, Some(Height(10)), &rx)
             .unwrap();
@@ -1540,7 +1539,7 @@ mod database_tests {
                 .with_batch_for_writing(&mut batch)
                 .zs_insert(&Height(2), &RawBytes(bytes));
             db.write_batch(batch).unwrap();
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             assert!(matches!(
                 Upgrade.run(Some(Height(3)), &db, &rx),
                 Err(FormatChangeError::InvalidPostcondition(_))
@@ -1568,7 +1567,7 @@ mod database_tests {
                     .zs_delete(&Height(missing));
             }
             db.write_batch(batch).unwrap();
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             assert!(
                 matches!(
                     Upgrade.run(Some(Height(3)), &db, &rx),
@@ -1583,7 +1582,7 @@ mod database_tests {
     fn migration_cancelled_before_first_write_preserves_legacy_records() {
         let db = legacy_db(4, 48);
         let original = db.raw_block_info_cf().zs_get(&Height(2)).unwrap().0;
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, rx) = cancel_channel();
         tx.send(CancelFormatChange).unwrap();
         let mut writes = 0;
         let result = backfill(Some(Height(3)), &db, &rx, |_| {
@@ -1604,7 +1603,7 @@ mod database_tests {
     fn migration_validates_tip_agreement_and_rejects_invalid_pool_totals() {
         for invalid_total in [false, true] {
             let db = legacy_db(4, 48);
-            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let (_tx, rx) = cancel_channel();
             Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
             let mut bytes = db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0;
             if invalid_total {

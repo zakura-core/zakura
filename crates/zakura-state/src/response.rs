@@ -96,9 +96,6 @@ pub enum Response {
     /// and applied the preference where it could.
     Precious,
 
-    /// Response to [`Request::Depth`] with the depth of the specified block.
-    Depth(Option<u32>),
-
     /// Response to [`Request::Tip`] with the current best chain tip.
     //
     // TODO: remove this request, and replace it with a call to
@@ -110,9 +107,6 @@ pub enum Response {
 
     /// Response to [`Request::BlockLocator`] with a block locator object.
     BlockLocator(Vec<block::Hash>),
-
-    /// Response to [`Request::Transaction`] with the specified transaction.
-    Transaction(Option<Arc<Transaction>>),
 
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
@@ -535,7 +529,7 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
-    /// Response to [`Request::Transaction`] with the specified transaction.
+    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified transaction.
     AnyChainTransaction(Option<AnyTx>),
 
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
@@ -588,6 +582,9 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::ReleaseRetainedHeaderPath`].
     RetainedHeaderPathReleased(bool),
+
+    /// Response to [`ReadRequest::SelectedChainMembership`].
+    SelectedChainMembership(zakura_node_services::header_chain::SelectedChainMembership),
 
     /// Response to [`ReadRequest::BestHeaderTip`].
     BestHeaderTip(Option<(block::Height, block::Hash)>),
@@ -755,7 +752,6 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::FinalizedTip(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
-            ReadResponse::Depth(depth) => Ok(Response::Depth(depth)),
             ReadResponse::BestChainNextMedianTimePast(median_time_past) => Ok(Response::BestChainNextMedianTimePast(median_time_past)),
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
@@ -774,9 +770,6 @@ impl TryFrom<ReadResponse> for Response {
                 height,
                 next_block_hash
             }),
-            ReadResponse::Transaction(tx_info) => {
-                Ok(Response::Transaction(tx_info.map(|tx_info| tx_info.tx)))
-            }
             ReadResponse::AnyChainTransaction(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
@@ -798,7 +791,9 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
 
-            ReadResponse::UsageInfo(_)
+            ReadResponse::Depth(_)
+            | ReadResponse::Transaction(_)
+            | ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::BlockSizesByHash(_)
@@ -823,6 +818,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::RetainedHeaderPathLease(_)
             | ReadResponse::RetainedHeaderPathPage(_)
             | ReadResponse::RetainedHeaderPathReleased(_)
+            | ReadResponse::SelectedChainMembership(_)
             | ReadResponse::BestHeaderTip(_)
             | ReadResponse::MissingBlockBodyMetadata(_)
             | ReadResponse::Blocks(_)

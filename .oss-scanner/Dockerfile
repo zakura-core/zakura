@@ -39,6 +39,11 @@ ENV RUSTUP_TOOLCHAIN=1.97.1 \
     CARGO_PROFILE_CI_TESTS_DEBUG=limited \
     RUSTFLAGS="-C force-frame-pointers=yes" \
     SKIP_NETWORK_TESTS=1
+RUN rustup component add clippy rustfmt
+
+# Every crate in Cargo.lock, for every target and feature, so that builds with other
+# features than the ones below also work offline.
+RUN cargo fetch --locked
 
 # Build as CI does: the ci-tests profile and the release feature set. `portable` selects
 # Pasta arithmetic that runs on any x86-64 CPU, not only the one that built it.
@@ -51,9 +56,9 @@ RUN cargo nextest run --locked --cargo-profile ci-tests \
       --features default-release-binaries,portable --no-run
 
 # Run the cheap tests so the image is known to work, but do not let a failing test abort
-# the build.
+# the build. The filterset picks the tests without changing which packages Cargo builds.
 RUN (timeout 900 cargo nextest run --locked --cargo-profile ci-tests \
-      --features default-release-binaries,portable --package zakura-chain \
+      --features default-release-binaries,portable -E 'package(zakura-chain)' \
      || echo "WARNING: zakura-chain tests reported failures")
 
 # Everything is fetched: from here on cargo never tries the network.

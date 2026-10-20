@@ -16,7 +16,7 @@ Zakura's security policy is [`docs/security.md`](../docs/security.md).
   peer sends is attacker-controlled: handshake and version messages, address
   gossip, inventory, headers, blocks, transactions, and every message of
   Zakura's own peer protocol (header sync, block sync, and the QUIC transport
-  in `zakura-quic`). Zakura speaks to a few hundred peers at once and must stay
+  in `zakura-quic`). Zakura keeps many peer connections open and must stay
   healthy while some of them are hostile.
 - **Blocks and transactions are untrusted even from honest peers.** Their
   content comes from whoever mined or broadcast them. Deserialization in
@@ -43,7 +43,7 @@ In descending order:
    wrong arithmetic, serialization that is not canonical or not round-trip
    safe, sigop or size accounting errors, and state transitions that do not
    match the protocol all belong here. `TrustedPreallocate` and bounded
-   deserialization are the defence against memory exhaustion from oversized
+   deserialization are the defense against memory exhaustion from oversized
    collections.
 2. `zakura-network` and `zakura-quic`: denial of service and eclipse
    resistance. One hostile peer, or a handful of Sybil identities, must not be
@@ -76,23 +76,26 @@ of scope.
   or it recompiles the workspace. `SKIP_NETWORK_TESTS=1` is set, which makes
   the tests that need Internet peers skip themselves, and `CARGO_NET_OFFLINE`
   keeps Cargo off the network.
-- Run a crate's tests:
-  `cargo nextest run --cargo-profile ci-tests --features default-release-binaries,portable -p zakura-network`.
-  The profiles in `.config/nextest.toml` select larger or slower sets. Unit
-  and property tests live in `src/**/tests/` (`prop.rs`, `vectors.rs`,
-  `preallocate.rs`); acceptance tests that start a node are in
+- Run one crate's tests with a nextest filterset, which picks tests without
+  changing the set of packages Cargo builds, so nothing is recompiled:
+  `cargo nextest run --cargo-profile ci-tests --features default-release-binaries,portable -E 'package(zakura-network)'`.
+  (`-p zakura-network` would fail: the features belong to the `zakura`
+  package.) The profiles in `.config/nextest.toml` select larger or slower
+  sets. Unit and property tests live in `src/**/tests/` (`prop.rs`,
+  `vectors.rs`, `preallocate.rs`); acceptance tests that start a node are in
   `crates/zakurad/tests/`.
 - The node binary is `target/ci-tests/zakurad`. `zakurad generate` prints a
   default configuration, and `docker/default-zakura-config.toml` is an
   annotated one. Set `network = "Regtest"` under `[network]` to run a node
-  with no peers and mine blocks locally; mainnet and testnet need the
-  Internet.
+  that needs no peers; mainnet and testnet need the Internet. The end-to-end
+  test in `crates/zakurad/tests/zakura_regtest_e2e.rs` shows how regtest
+  nodes are driven, though it needs Docker, which the image does not have.
 - `qa/fuzz/` holds `cargo-fuzz` targets for the header chain and the RPC
   server. They need a nightly toolchain, which the image does not have, but
   they show which parsers are worth attacking.
 - The specifications in `docs/specs/` and the design notes in `docs/design/`
   say how the peer protocol, block sync, header sync and QUIC transport are
-  meant to behave. A behaviour that contradicts them is a bug even before it
+  meant to behave. A behavior that contradicts them is a bug even before it
   is an exploit.
 
 ## How we rate severity
@@ -136,7 +139,8 @@ refactor.
   any issue that needs cookie credentials to have been stolen.
 - The theoretical cost of a syncing node downloading the whole chain, and
   resource use that a documented configuration limit already bounds.
-- Timing side channels: a validator node holds no secret keys.
+- Timing side channels: the node holds no wallet or signing keys, and the
+  RPC cookie is compared in constant time.
 - Dependencies that are not in this repository, including the `zakura-*`
   cryptography and protocol crates from
   [`zakura-core/common`](https://github.com/zakura-core/common), which is

@@ -24,6 +24,18 @@ keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "network-programming"]
 
+# Test-only sources are over a third of the crate and only compile under
+# `cfg(test)`. These two `tests` modules also build under `proptest-impl`.
+exclude = [
+    "tests/",
+    "proptest-regressions/",
+    "src/**/tests/",
+    "src/**/tests.rs",
+    "src/**/*_tests.rs",
+    "!src/peer/client/tests.rs",
+    "!src/peer/minimum_peer_version/tests.rs",
+]
+
 [features]
 default = []
 

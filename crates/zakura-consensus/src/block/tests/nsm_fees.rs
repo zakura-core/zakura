@@ -90,6 +90,7 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
                 block.transactions.push(Arc::new(transaction));
             }
             Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+            let context = bind_parent_context(&mut block, &network);
             let mut parent_pools = zakura_chain::value_balance::ValueBalance::zero();
             parent_pools
                 .set_nsm_value_balance_amount(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap());
@@ -124,7 +125,7 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
             });
             let verifier = SemanticBlockVerifier::new(
                 &network,
-                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_state(with_parent_context(state, context)),
                 crate::transaction::boxed_transaction_verifier(transaction),
             );
             let result = tokio::time::timeout(
@@ -188,6 +189,7 @@ proptest::proptest! {
                     block.transactions.push(Arc::new(tx));
                 }
                 Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+                let context = bind_parent_context(&mut block, &network);
                 let mut parent_pools = zakura_chain::value_balance::ValueBalance::zero();
                 parent_pools.set_nsm_value_balance_amount(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap());
                 let state = service_fn(move |request: zs::Request| async move {
@@ -216,7 +218,7 @@ proptest::proptest! {
                         Ok::<_, BoxError>(response)
                     }
                 });
-                let verifier = SemanticBlockVerifier::new(&network, crate::transaction::boxed_state(state), crate::transaction::boxed_transaction_verifier(transaction));
+                let verifier = SemanticBlockVerifier::new(&network, crate::transaction::boxed_state(with_parent_context(state, context)), crate::transaction::boxed_transaction_verifier(transaction));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(10),
                     verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
                 if excess > 0 {

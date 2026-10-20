@@ -119,6 +119,8 @@ pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
+#[cfg(feature = "internal-bench")]
+pub use service::non_finalized_state::{benchmark_height_map, HeightMapBenchmarkSample};
 pub use service::read::{
     derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,
     HistoricalTreeCache, MAX_CACHED_FRONTIERS,

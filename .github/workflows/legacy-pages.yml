@@ -1,0 +1,59 @@
+name: Legacy Pages redirect
+
+on:
+  pull_request:
+    paths:
+      - docs/legacy-pages/**
+      - scripts/check-legacy-pages.py
+      - .github/workflows/legacy-pages.yml
+  push:
+    branches: [main]
+    paths:
+      - docs/legacy-pages/**
+      - scripts/check-legacy-pages.py
+      - .github/workflows/legacy-pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-pages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate redirect and fallback
+        run: python3 scripts/check-legacy-pages.py docs/legacy-pages/index.html
+      - name: Stage only the public page
+        run: |
+          mkdir -p "${RUNNER_TEMP}/legacy-pages"
+          cp docs/legacy-pages/index.html "${RUNNER_TEMP}/legacy-pages/index.html"
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 #v5.0.0
+        with:
+          path: ${{ runner.temp }}/legacy-pages
+
+  deploy:
+    # Publishing is an explicit maintainer action after merging to main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d #v6.0.0
+      - name: Deploy redirect
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 #v5.0.0

@@ -15,7 +15,7 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, seq::SliceRandom, Rng};
+use rand_10::{seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -31,6 +31,7 @@ use zakura_chain::{
     },
     transaction::{Transaction, UnminedTx, UnminedTxId},
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::MAX_FIND_BLOCKS_RESPONSE_HASHES,
@@ -1866,7 +1867,8 @@ impl LegacyRequestAdapter {
     }
 
     /// Request inventory, preferring the Zakura peer that advertised it when known.
-    pub async fn request_from_source(
+    #[cfg(test)]
+    async fn request_from_source(
         &self,
         request: Request,
         source: Option<PeerSource>,
@@ -2216,7 +2218,7 @@ impl ZakuraRequestClient {
             &handles,
             preferred.as_ref(),
             request_kind.max_attempts(),
-            &mut OsRng,
+            &mut rand_10::rng(),
         );
 
         let mut missing_response = None;
@@ -2547,7 +2549,12 @@ impl LegacyGossipSink {
         Inbound: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
         Inbound::Future: Send + 'static,
     {
-        Self::spawn_with_trace(inbound, supervisor, ZakuraTrace::noop())
+        // Boxed so callers with different inbound services share one compiled worker.
+        Self::spawn_with_trace(
+            tower::util::BoxCloneService::new(inbound),
+            supervisor,
+            ZakuraTrace::noop(),
+        )
     }
 
     /// Spawn a bounded inbound worker with a trace emitter.
@@ -2561,7 +2568,7 @@ impl LegacyGossipSink {
         Inbound::Future: Send + 'static,
     {
         let (inbound_tx, inbound_rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
-        tokio::spawn(legacy_gossip_worker(
+        spawn_erased(legacy_gossip_worker(
             inbound,
             inbound_rx,
             LegacyGossipForwarder::new(supervisor.clone()),
@@ -4902,7 +4909,7 @@ mod tests {
     /// capped at the attempt limit, and every peer gets a turn across requests.
     #[test]
     fn request_candidates_prefer_source_and_randomize_the_rest() {
-        use rand::{rngs::StdRng, SeedableRng};
+        use rand_10::{rngs::StdRng, SeedableRng};
 
         let handles: Vec<_> = (1..=5)
             .map(|byte| {

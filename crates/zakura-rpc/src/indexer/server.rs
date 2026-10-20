@@ -24,6 +24,7 @@ use tonic::transport::{
 use tower::BoxError;
 use zakura_chain::chain_tip::ChainTip;
 use zakura_node_services::mempool::MempoolTxSubscriber;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::ReadState;
 
 use crate::{
@@ -118,11 +119,6 @@ where
         mempool_change,
     };
 
-    let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(crate::indexer::FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .unwrap();
-
     let request_limit = usize::try_from(MAX_CONCURRENT_STREAMS_PER_CONNECTION)
         .expect("the small HTTP/2 stream limit fits in usize");
     let mut server = Server::builder()
@@ -140,9 +136,8 @@ where
     tracing::info!("{OPENED_RPC_ENDPOINT_MSG}{}", listen_addr);
 
     let incoming = limited_tcp_incoming(tcp_listener, MAX_CONNECTIONS);
-    let server_task: JoinHandle<Result<(), BoxError>> = tokio::spawn(async move {
+    let server_task: JoinHandle<Result<(), BoxError>> = spawn_erased(async move {
         server
-            .add_service(reflection_service)
             .add_service(IndexerServer::new(indexer_service))
             .serve_with_incoming(incoming)
             .await?;

@@ -1,4 +1,4 @@
-//! Durations encoded as human-readable strings using [`humantime`].
+//! Durations encoded as human-readable strings, such as `1h 30m`.
 
 use std::{fmt, time::Duration};
 
@@ -7,12 +7,14 @@ use serde::{
     Deserializer, Serializer,
 };
 
-/// Serializes a [`Duration`] using [`humantime::format_duration`].
+use crate::fmt::human_duration::{format_duration, parse_duration};
+
+/// Serializes a [`Duration`] as a human-readable string.
 pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+    serializer.serialize_str(&format_duration(*duration).to_string())
 }
 
-/// Deserializes a string using [`humantime::parse_duration`].
+/// Deserializes a human-readable duration string.
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     struct DurationVisitor;
 
@@ -24,8 +26,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duratio
         }
 
         fn visit_str<E: de::Error>(self, value: &str) -> Result<Duration, E> {
-            humantime::parse_duration(value)
-                .map_err(|_| E::invalid_value(de::Unexpected::Str(value), &self))
+            parse_duration(value).map_err(|_| E::invalid_value(de::Unexpected::Str(value), &self))
         }
     }
 

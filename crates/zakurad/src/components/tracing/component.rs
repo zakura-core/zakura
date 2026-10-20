@@ -5,12 +5,9 @@ use std::{
     io::Write,
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_error::ErrorLayer;
-#[cfg(all(feature = "tokio-console", tokio_unstable))]
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
@@ -39,9 +36,6 @@ use super::non_blocking::{non_blocking, WorkerGuard};
 // paste -d "\0" logo.utf8 heart.utf8 > zakura.utf8
 static ZAKURA_ART: [u8; include_bytes!("zakura.utf8").len()] = *include_bytes!("zakura.utf8");
 
-#[cfg(all(test, feature = "opentelemetry"))]
-mod tests;
-
 /// Returns a tracing setup error, with the prefix `zakurad` has always printed for it.
 fn io_error(error: std::io::Error) -> Report {
     eyre!("I/O operation failed: {error}")
@@ -50,12 +44,8 @@ fn io_error(error: std::io::Error) -> Report {
 /// A type-erased boxed writer that can be sent between threads safely.
 pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
-/// The global `tracing` subscriber's log writer and OpenTelemetry exporter.
+/// The global `tracing` subscriber's log writer.
 pub struct Tracing {
-    /// The OpenTelemetry tracer provider, if enabled.
-    #[cfg(feature = "opentelemetry")]
-    otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-
     /// Drop guard for worker thread of non-blocking logger,
     /// responsible for flushing any remaining logs when the program terminates.
     //
@@ -149,9 +139,6 @@ impl Tracing {
             non_blocking(writer, config.buffer_limit.max(100)).map_err(io_error)?;
 
         // Construct a format subscriber with the supplied global logging filter.
-        //
-        // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
-        #[cfg(not(all(feature = "tokio-console", tokio_unstable)))]
         let subscriber = {
             use tracing_subscriber::FmtSubscriber;
 
@@ -163,101 +150,8 @@ impl Tracing {
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            logger
-                .finish()
-                .with(warn_error_layer)
-                .with(ErrorLayer::default())
+            logger.finish().with(warn_error_layer)
         };
-
-        // Construct a tracing registry with the supplied per-layer logging filter.
-        //
-        // TODO: when fmt::Subscriber supports per-layer filtering,
-        //       remove this registry code, and layer tokio-console on top of fmt::Subscriber
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let subscriber = {
-            use tracing_subscriber::{fmt, Layer};
-
-            let subscriber = tracing_subscriber::registry();
-            // TODO: find out why crawl_and_dial and try_to_sync evade this filter,
-            //       and why they also don't get the global net/commit span.
-            // Note: this might have been fixed by tracing 0.3.15, or by recent Zebra refactors.
-            //
-            // Using `registry` as the base subscriber, the logs from most other functions get filtered.
-            // Using `FmtSubscriber` as the base subscriber, all the logs get filtered.
-            let logger = fmt::Layer::new()
-                .with_ansi(use_color)
-                .with_writer(non_blocking)
-                .with_filter(EnvFilter::from(&filter));
-
-            let subscriber = subscriber.with(logger);
-
-            let span_logger = ErrorLayer::default().with_filter(EnvFilter::from(&filter));
-            subscriber.with(span_logger)
-        };
-
-        // Add optional layers based on dynamic and compile-time configs
-
-        #[cfg(feature = "journald")]
-        let journaldlayer = if config.use_journald {
-            let layer = tracing_journald::layer().map_err(|e| eyre!("component error: {e}"))?;
-
-            // If the global filter can't be used, add a per-layer filter instead.
-            // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
-            #[cfg(all(feature = "tokio-console", tokio_unstable))]
-            let layer = {
-                use tracing_subscriber::Layer;
-                layer.with_filter(EnvFilter::from(&filter))
-            };
-
-            Some(layer)
-        } else {
-            None
-        };
-        #[cfg(feature = "journald")]
-        let subscriber = subscriber.with(journaldlayer);
-
-        // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
-        #[cfg(feature = "opentelemetry")]
-        let (otel_layer, otel_provider, otel_resolved_config) = {
-            // Check standard OTEL_* env vars as fallback (lower precedence than config/ZAKURA_*)
-            let endpoint = config
-                .opentelemetry_endpoint
-                .clone()
-                .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
-            let service_name = config
-                .opentelemetry_service_name
-                .clone()
-                .or_else(|| std::env::var("OTEL_SERVICE_NAME").ok());
-            let sample_percent = config.opentelemetry_sample_percent.or_else(|| {
-                std::env::var("OTEL_TRACES_SAMPLER_ARG")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            });
-
-            // Keep only non-endpoint values for status logging. URLs can contain credentials.
-            let resolved_config = (
-                service_name.clone().unwrap_or_else(|| "zakura".to_string()),
-                sample_percent.unwrap_or(100),
-            );
-
-            match super::otel::layer(endpoint.as_deref(), service_name.as_deref(), sample_percent) {
-                Ok((layer, provider)) => (layer, provider, resolved_config),
-                Err(e) => {
-                    tracing::warn!(
-                        ?e,
-                        "failed to initialize OpenTelemetry, traces will not be exported"
-                    );
-                    (None, None, resolved_config)
-                }
-            }
-        };
-        #[cfg(feature = "opentelemetry")]
-        let subscriber = subscriber.with(otel_layer);
-
-        // spawn the console server in the background, and apply the console layer
-        // TODO: set Builder::poll_duration_histogram_max() if needed
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let subscriber = subscriber.with(console_subscriber::spawn());
 
         // Initialise the global tracing subscriber
         subscriber.init();
@@ -270,47 +164,7 @@ impl Tracing {
             "started tracing component",
         );
 
-        if config.use_journald {
-            if cfg!(feature = "journald") {
-                info!("installed journald tracing layer");
-            } else {
-                warn!(
-                    "unable to activate configured journald tracing: \
-                     enable the 'journald' feature when compiling zakurad",
-                );
-            }
-        }
-
-        #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        info!(
-            TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-            LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-            "installed tokio-console tracing layer",
-        );
-
-        // Log OpenTelemetry status
-        #[cfg(feature = "opentelemetry")]
-        if otel_provider.is_some() {
-            let (ref service_name, sample_percent) = otel_resolved_config;
-            info!(
-                %service_name,
-                sample_percent,
-                "installed OpenTelemetry tracing layer",
-            );
-        }
-
-        // Warning if OpenTelemetry is configured but feature not compiled
-        #[cfg(not(feature = "opentelemetry"))]
-        if config.opentelemetry_endpoint.is_some() {
-            warn!(
-                "unable to activate OpenTelemetry tracing: \
-                 enable the 'opentelemetry' feature when compiling zakurad",
-            );
-        }
-
         Ok(Self {
-            #[cfg(feature = "opentelemetry")]
-            otel_provider,
             _guard: Some(worker_guard),
         })
     }
@@ -318,16 +172,8 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     ///
-    /// Shuts down the OpenTelemetry exporter first, so its errors are logged. Calling this
-    /// more than once, or dropping `Tracing` afterwards, does nothing more.
+    /// Calling this more than once, or dropping `Tracing` afterwards, does nothing more.
     pub fn shutdown(&mut self) {
-        #[cfg(feature = "opentelemetry")]
-        if let Some(provider) = self.otel_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                tracing::warn!(?e, "OpenTelemetry shutdown error");
-            }
-        }
-
         self._guard.take();
     }
 }

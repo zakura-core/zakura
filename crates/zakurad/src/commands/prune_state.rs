@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use color_eyre::eyre::Result;
+use eyre::Result;
 
 use zakura_chain::parameters::Network;
 use zakura_state::{PruneFinalizedStateOptions, PruneFinalizedStateSummary};

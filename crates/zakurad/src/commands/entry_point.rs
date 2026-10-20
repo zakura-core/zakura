@@ -1,7 +1,7 @@
 //! Zakurad EntryPoint
 
 use clap::Parser;
-use color_eyre::eyre::Report;
+use eyre::Report;
 use std::{ffi::OsString, path::PathBuf};
 
 use crate::config::ZakuradConfig;

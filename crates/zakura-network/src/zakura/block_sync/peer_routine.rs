@@ -34,6 +34,7 @@ use super::{
     peer_registry::{hard_outbound_capacity, PeerRegistry},
     pipe::block_sync_guard,
     reactor::tolerated_bytes,
+    regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
     sequencer_task::{SequencedBody, SequencerView},
@@ -43,7 +44,7 @@ use super::{
     },
     work_queue::{RequestWrite, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
-    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
+    ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
@@ -128,6 +129,9 @@ enum FillStop {
     /// The probe-first cap: an unproven peer's single cold-start probe is in flight,
     /// so no further request is issued until it serves (or fails) a body.
     InitialBlockProbeRequestCap,
+    /// Too many fully received requests still owe their ending
+    /// (see `MAX_PENDING_ENDINGS`).
+    PendingEndings,
 }
 
 impl FillStop {
@@ -145,6 +149,7 @@ impl FillStop {
             FillStop::SendError => "send_error",
             FillStop::NoBlockProgressRequestCap => "no_block_progress_request_cap",
             FillStop::InitialBlockProbeRequestCap => "initial_block_probe_request_cap",
+            FillStop::PendingEndings => "pending_endings",
         }
     }
 }
@@ -178,10 +183,6 @@ fn liveness_grace_allowed(
     outbound_full
         && outbound_full_since
             .is_some_and(|since| now.saturating_duration_since(since) < request_timeout)
-}
-
-fn is_block_frame(frame: &crate::zakura::Frame) -> bool {
-    frame.payload.first().copied() == Some(MSG_BS_BLOCK)
 }
 
 /// Records decoded-memory metrics for an accepted block and returns its attributed size.
@@ -325,6 +326,8 @@ pub(super) struct PeerRoutine {
     /// Clamped limits last published to the registry. Request issuance uses the
     /// latest limits immediately; only publication waits for the meter.
     published_limits: (u32, u32, u32),
+    /// Whether the last slot publication showed a requester that refuses work.
+    published_requester_stopped: bool,
     /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
     pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
@@ -441,6 +444,7 @@ impl PeerRoutine {
             inbound_status_meter,
             status_range_bypass_available: false,
             published_limits,
+            published_requester_stopped: false,
             pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
@@ -619,10 +623,11 @@ impl PeerRoutine {
         }
     }
 
-    /// Admit, decode, and dispatch one inbound frame in this task. `Block` /
-    /// `BlocksDone` / `RangeUnavailable` (download) are handled locally; `Status`
+    /// Admit, decode, and dispatch one inbound frame in this task. Authorization
+    /// decodes each control frame once and consumes an ending's reservation.
+    /// `Block` and both endings (download) are handled locally; `Status`
     /// updates own servable/caps locally and pings the reactor to advertise;
-    /// `GetBlocks` (serving) forwards to the reactor; a decode error reports
+    /// `GetBlocks` goes to serving admission; a malformed body reports
     /// `MalformedMessage` and rejects the peer.
     async fn handle_frame(
         &mut self,
@@ -645,41 +650,61 @@ impl PeerRoutine {
             }
         }
 
-        let authorized_height = {
-            use super::regulated::live_requester::Authorization;
-            match self.requester.authorize(&frame)? {
-                Authorization::Block(height) => Some(height),
-                Authorization::Control => None,
-                Authorization::IncompatibleHeader => {
-                    // Height-only requests cannot identify which live range the
-                    // unexpected header belongs to. Defer each still-wanted
-                    // body for this supplier without delaying other suppliers.
-                    let bodies = self
-                        .requester
-                        .unreceived_expected(super::peer_registry::MAX_SUPPLIER_RETRIES)
-                        .into_iter()
-                        .filter_map(|(height, hash)| {
-                            self.work
-                                .item_for_height(height)
-                                .filter(|item| item.hash == hash)
-                                .map(|item| (item.scope, hash))
-                        });
-                    self.registry.defer_incompatible_bodies(
-                        self.source,
-                        bodies,
-                        time::Instant::now().into_std() + self.config.effective_liveness_timeout(),
-                    );
-                    return Err(SinkReject::local(
-                        "GetBlocks header does not match the next expected header",
-                    ));
-                }
+        use super::regulated::live_requester::Authorization;
+        let was_stopped = self.requester_stop().is_some();
+        let authorization = self.requester.authorize(&frame)?;
+        // A last body or an ending can close or open the requester. Other
+        // routines must re-rank the floor now, not at this window's next change.
+        if self.requester_stop().is_some() != was_stopped {
+            self.publish_slot_diagnostics();
+        }
+        let height = match authorization {
+            Authorization::Block(height) => height,
+            Authorization::Status(status) => {
+                self.trace_message_received("status");
+                self.handle_status(status);
+                return Ok(());
+            }
+            Authorization::GetBlocks(range) => {
+                self.trace_message_received("get_blocks");
+                return self.serving.admit(range);
+            }
+            Authorization::Ended(completed) => {
+                self.trace_message_received(match completed.outcome {
+                    Outcome::Done => "blocks_done",
+                    Outcome::Unavailable => "range_unavailable",
+                });
+                self.handle_ending(completed);
+                return Ok(());
+            }
+            Authorization::IncompatibleHeader => {
+                // Height-only requests cannot identify which live range the
+                // unexpected header belongs to. Defer each still-wanted
+                // body for this supplier without delaying other suppliers.
+                let bodies = self
+                    .requester
+                    .unreceived_expected(super::peer_registry::MAX_SUPPLIER_RETRIES)
+                    .into_iter()
+                    .filter_map(|(height, hash)| {
+                        self.work
+                            .item_for_height(height)
+                            .filter(|item| item.hash == hash)
+                            .map(|item| (item.scope, hash))
+                    });
+                self.registry.defer_incompatible_bodies(
+                    self.source,
+                    bodies,
+                    time::Instant::now().into_std() + self.config.effective_liveness_timeout(),
+                );
+                return Err(SinkReject::local(
+                    "GetBlocks header does not match the next expected header",
+                ));
             }
         };
-        let frame_payload_bytes = frame.payload.len();
-        let body_permit = if is_block_frame(&frame) {
+        let body_permit = {
             let permit = self.reserve_body_decode_permit();
             tokio::pin!(permit);
-            Some(tokio::select! {
+            tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
                     if self.recv.failure().is_none() {
@@ -690,79 +715,61 @@ impl PeerRoutine {
                     permit.await?
                 }
                 permit = &mut permit => permit?,
-            })
-        } else {
-            None
+            }
         };
-        // Measured here, on the per-peer task, so the body size never has to be
-        // recomputed by re-serializing the block on another thread (A1).
-        let (msg, raw_block_payload) =
-            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection. Report via the shared
-                    // channel, then reject; the report is best-effort and never blocks.
-                    let protocol_error =
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                    tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
-                    let _ = self
-                        .routine_to_reactor
-                        .try_send(RoutineToReactor::Misbehavior {
-                            peer: self.peer.clone(),
-                            reason: BlockSyncMisbehavior::MalformedMessage,
-                        });
-                    return Err(SinkReject::protocol(protocol_error));
-                }
-            };
-        let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
-        self.trace_message_received(&msg);
-        if let Some(height) = authorized_height {
-            if let BlockSyncMessage::Block(block) = &msg {
-                if block.coinbase_height() != Some(height) {
-                    return Err(SinkReject::protocol(
-                        "authorized block has a different coinbase height",
-                    ));
-                }
-                if !transactions_match_header(block) {
-                    let _ = self
-                        .routine_to_reactor
-                        .try_send(RoutineToReactor::Misbehavior {
-                            peer: self.peer.clone(),
-                            reason: BlockSyncMisbehavior::InvalidBlock,
-                        });
-                    return Err(SinkReject::protocol(
-                        "authorized block's transactions do not match its header",
-                    ));
-                }
+        // Authorization checked the envelope, so the body is the payload after
+        // its type byte. Measured here, on the per-peer task, so the body size
+        // never has to be recomputed by re-serializing the block on another thread.
+        let body_wire_bytes = u64::try_from(
+            frame
+                .payload
+                .len()
+                .saturating_sub(super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+        )
+        .unwrap_or(u64::MAX);
+        let (block, raw_block_payload) = match super::wire::decode_block_payload(frame.payload) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                // A malformed body is `MalformedMessage` misbehavior AND a fatal
+                // protocol reject for the whole connection. Report via the shared
+                // channel, then reject; the report is best-effort and never blocks.
+                let protocol_error =
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
+                let _ = self
+                    .routine_to_reactor
+                    .try_send(RoutineToReactor::Misbehavior {
+                        peer: self.peer.clone(),
+                        reason: BlockSyncMisbehavior::MalformedMessage,
+                    });
+                return Err(SinkReject::protocol(protocol_error));
             }
+        };
+        self.trace_message_received("block");
+        if block.coinbase_height() != Some(height) {
+            return Err(SinkReject::protocol(
+                "authorized block has a different coinbase height",
+            ));
         }
-        if let Some(start) = super::regulated::live_requester::LiveRequester::ending_start(&msg) {
-            if self.window.outstanding_key_for_start(start).is_none() {
-                return Ok(());
-            }
+        if !transactions_match_header(&block) {
+            let _ = self
+                .routine_to_reactor
+                .try_send(RoutineToReactor::Misbehavior {
+                    peer: self.peer.clone(),
+                    reason: BlockSyncMisbehavior::InvalidBlock,
+                });
+            return Err(SinkReject::protocol(
+                "authorized block's transactions do not match its header",
+            ));
         }
-
-        match msg {
-            BlockSyncMessage::Status(status) => self.handle_status(status),
-            BlockSyncMessage::GetBlocks {
-                start_height,
-                count,
-            } => self.serving.admit(start_height, count)?,
-            BlockSyncMessage::Block(block) => {
-                self.trace_wake("own_body");
-                self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
-                    .await;
-            }
-            BlockSyncMessage::BlocksDone {
-                start_height,
-                returned: _,
-            } => self.handle_blocks_done(start_height).await,
-            BlockSyncMessage::RangeUnavailable {
-                start_height,
-                count: _,
-            } => self.handle_range_unavailable(start_height).await,
-        }
+        self.trace_wake("own_body");
+        self.handle_body(
+            block,
+            Some(body_wire_bytes),
+            Some(body_permit),
+            Some(raw_block_payload),
+        )
+        .await;
         Ok(())
     }
 
@@ -821,6 +828,12 @@ impl PeerRoutine {
             self.max_response_bytes,
             self.window.max_inflight_requests,
         ) = limits;
+        // Publish a stop before the rate limiter, so no routine keeps deferring
+        // the floor to this peer. A reopen waits for a rate-limited publication,
+        // so a Status flood cannot toggle the shared ranking on every frame.
+        if self.requester_stop().is_some() && !self.published_requester_stopped {
+            self.publish_slot_diagnostics();
+        }
         let limits_changed = limits != self.published_limits;
         if self.inbound_status_meter.try_take(now) {
             self.status_range_bypass_available = true;
@@ -836,6 +849,9 @@ impl PeerRoutine {
             return;
         }
         self.pending_status = None;
+        if self.requester_stop().is_some() != self.published_requester_stopped {
+            self.publish_slot_diagnostics();
+        }
         // Replies have their own allowance. The reactor also retries any local
         // status that has not entered this peer's outbound queue.
         let send_reply = self.status_reply_meter.try_take(now);
@@ -1009,12 +1025,8 @@ impl PeerRoutine {
                 break FillStop::CwndSaturated;
             }
             self.request_pool_waiting = false;
-            // Count unanswered exchanges, including scheduler-abandoned work.
-            // The peer's u32 advertised limit fits usize on supported targets.
-            if self.requester.at_capacity()
-                || self.requester.len() >= self.window.max_inflight_requests as usize
-            {
-                break FillStop::CwndSaturated;
+            if let Some(stop) = self.requester_stop() {
+                break stop;
             }
             let Some(entry) = self.requester.pool.try_entry() else {
                 self.request_pool_waiting = true;
@@ -2027,22 +2039,6 @@ impl PeerRoutine {
 
     // ===================== unmatched fallthroughs (ported) ==================
 
-    /// Whether a response for `height` is stale (already downloaded or held). The
-    /// held-height portion is recovered through the WorkQueue's `in_flight`
-    /// (every buffered/applying height stays claimed until the download floor
-    /// passes it). Reads `download_floor` from the view.
-    fn is_stale_response_height(&self, height: block::Height) -> bool {
-        height <= self.download_floor() || self.work.in_flight_contains(height)
-    }
-
-    async fn ignore_stale_response(&mut self, height: block::Height, response_kind: &str) -> bool {
-        if !self.is_stale_response_height(height) {
-            return false;
-        }
-        tracing::debug!(peer = ?self.peer, ?height, response_kind, "ignoring stale block-sync response");
-        true
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn forward_body_to_sequencer(
         &self,
@@ -2222,41 +2218,35 @@ impl PeerRoutine {
         true
     }
 
-    // ===================== terminators (ports `handle_blocks_done` etc.) =====
+    // ===================== terminators =====================================
 
-    async fn handle_blocks_done(&mut self, start_height: block::Height) {
+    /// Both endings close the whole original request. A short `BlocksDone`
+    /// retries its missing suffix; `RangeUnavailable` retries the original
+    /// range even if the peer reported a smaller count.
+    fn handle_ending(&mut self, completed: CompletedRange) {
+        let start_height = completed.range.start();
+        // Local timeouts, reorgs, and finality can retire the scheduler's work
+        // while the peer's authority, already consumed above, remained live.
         let Some(key) = self.window.outstanding_key_for_start(start_height) else {
             return;
         };
-        let disposition = self.stale_adjusted_disposition(key, Disposition::RetryMissing);
-        self.charge_short_response_reliability(key, disposition);
-        self.finish_outstanding_at(key, disposition);
-    }
-
-    async fn handle_range_unavailable(&mut self, start_height: block::Height) {
-        let Some(key) = self.window.outstanding_key_for_start(start_height) else {
-            if self
-                .ignore_stale_response(start_height, "unavailable range")
-                .await
-            {
-                return;
+        let retry = match completed.outcome {
+            Outcome::Done => Disposition::RetryMissing,
+            Outcome::Unavailable => {
+                let outstanding = self
+                    .window
+                    .outstanding
+                    .get(key)
+                    .expect("the key was just found in the window");
+                self.trace_range_unavailable(
+                    start_height,
+                    outstanding.request.count,
+                    elapsed_ms_u64(time::Instant::from_std(outstanding.queued_at).elapsed()),
+                );
+                Disposition::RetryOriginal
             }
-            self.trace_range_unavailable(start_height, None, None);
-            return;
         };
-        let outstanding = self
-            .window
-            .outstanding
-            .get(key)
-            .expect("the key was just found in the window");
-        self.trace_range_unavailable(
-            start_height,
-            Some(outstanding.request.count),
-            Some(elapsed_ms_u64(
-                time::Instant::from_std(outstanding.queued_at).elapsed(),
-            )),
-        );
-        let disposition = self.stale_adjusted_disposition(key, Disposition::RetryOriginal);
+        let disposition = self.stale_adjusted_disposition(key, retry);
         self.charge_short_response_reliability(key, disposition);
         self.finish_outstanding_at(key, disposition);
     }
@@ -2472,17 +2462,39 @@ impl PeerRoutine {
             .remove_outstanding_for_owner(&self.peer, self.generation, owner, [height]);
     }
 
+    /// Why the live requester refuses another request, whatever the window allows.
+    fn requester_stop(&self) -> Option<FillStop> {
+        let occupancy = self.requester.occupancy();
+        // Count unanswered exchanges, including scheduler-abandoned work.
+        // The peer's u32 advertised limit fits usize on supported targets.
+        if occupancy.at_capacity || occupancy.len >= self.window.max_inflight_requests as usize {
+            return Some(FillStop::CwndSaturated);
+        }
+        if occupancy.pending_endings >= super::regulated::live_requester::MAX_PENDING_ENDINGS {
+            return Some(FillStop::PendingEndings);
+        }
+        None
+    }
+
     /// Publish the window diagnostics for the reactor's periodic trace row and
-    /// for other routines' cross-peer floor-bias decisions.
-    fn publish_slot_diagnostics(&self) {
+    /// for other routines' cross-peer floor-bias decisions. A routine whose
+    /// requester refuses new requests publishes no free slots, so no other
+    /// routine defers the floor to it.
+    fn publish_slot_diagnostics(&mut self) {
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
+        self.published_requester_stopped = self.requester_stop().is_some();
+        let available_slots = if self.published_requester_stopped {
+            0
+        } else {
+            self.window.available_slots()
+        };
         self.registry.publish_slots(
             &self.peer,
             self.generation,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
-                available_slots: self.window.available_slots(),
+                available_slots,
                 outstanding_requests: self.window.outstanding.len(),
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
@@ -2599,10 +2611,10 @@ mod tests {
     use super::super::sequencer_task::initial_view;
     use super::super::source::EmptyBlockRangeSource;
     use super::super::state::{ByteBudget, ThroughputMeter};
+    use super::super::tests::genesis_frontiers;
     use super::super::work_queue::WorkQueue;
     use super::super::{
-        BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
-        ZakuraBlockSyncConfig,
+        BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig,
     };
     use super::PeerRoutine;
     use super::RoutineToReactor;
@@ -2684,11 +2696,7 @@ mod tests {
         let work = Arc::new(WorkQueue::new(block::Height(0)));
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) =
             test_authorization(&session, &in_recv, &config, pool, connection);
         let routine = PeerRoutine::new(
@@ -3247,11 +3255,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3357,11 +3361,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -3505,11 +3505,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3772,11 +3768,7 @@ mod tests {
             .generation();
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let (requester, serving) = test_authorization(
             &session,
             &in_recv,
@@ -3962,11 +3954,7 @@ mod tests {
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
 
         let (requester, serving) = test_authorization(
             &session,
@@ -4286,11 +4274,7 @@ mod tests {
             }
         }
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause.clone());
         let (requester, serving) = test_authorization(
             &session,
@@ -4397,10 +4381,10 @@ mod tests {
             | BufferedResponse::MalformedBlockAlreadyProcessing => {
                 // The requested header passes authorization, so the missing
                 // transactions fail only in body decoding.
-                let mut payload = vec![super::MSG_BS_BLOCK];
+                let mut payload = vec![super::super::MSG_BS_BLOCK];
                 body.header.zcash_serialize(&mut payload).unwrap();
                 let frame = crate::zakura::Frame {
-                    message_type: u16::from(super::MSG_BS_BLOCK),
+                    message_type: u16::from(super::super::MSG_BS_BLOCK),
                     flags: 0,
                     payload,
                 };
@@ -4558,11 +4542,7 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
         let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
         let (reactor_input, mut reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }));
+        let (_view_tx, view_rx) = watch::channel(initial_view(genesis_frontiers()));
         let in_recv = in_recv.with_failure_cause(cause);
         let (requester, serving) = test_authorization(
             &session,

@@ -5,7 +5,7 @@ mod vectors;
 mod zip218_funding_streams;
 mod zip218_rounding;
 
-use color_eyre::Report;
+use eyre::Report;
 
 use super::Network;
 use crate::{

@@ -81,7 +81,7 @@ impl LongPollInput {
 
         // The mempool returns unordered transactions, we need to sort them here so
         // that the longpollid doesn't change unexpectedly.
-        tx_mined_ids.sort();
+        tx_mined_ids.sort_unstable();
 
         LongPollInput {
             tip_height,

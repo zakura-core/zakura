@@ -11,10 +11,9 @@
 
 use std::{future::Future, time::Instant};
 
-use jsonrpsee::{
-    core::middleware::{Batch, Notification},
-    server::middleware::rpc::RpcServiceT,
-    MethodResponse,
+use super::{
+    jsonrpc::{MethodResponse, Notification, Request},
+    rpc_service::RpcServiceT,
 };
 
 use crate::methods::RPC_METHOD_ACCESS;
@@ -41,25 +40,8 @@ impl<S> RpcMetricsMiddleware<S> {
     }
 }
 
-impl<S> RpcServiceT for RpcMetricsMiddleware<S>
-where
-    S: RpcServiceT<
-            MethodResponse = MethodResponse,
-            NotificationResponse = MethodResponse,
-            BatchResponse = MethodResponse,
-        > + Send
-        + Sync
-        + Clone
-        + 'static,
-{
-    type MethodResponse = MethodResponse;
-    type NotificationResponse = MethodResponse;
-    type BatchResponse = MethodResponse;
-
-    fn call<'a>(
-        &self,
-        request: jsonrpsee::types::Request<'a>,
-    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+impl<S: RpcServiceT> RpcServiceT for RpcMetricsMiddleware<S> {
+    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
         let method = method_label(request.method_name());
         let start = Instant::now();
@@ -105,10 +87,6 @@ where
 
             response
         }
-    }
-
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        self.service.batch(batch)
     }
 
     fn notification<'a>(

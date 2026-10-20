@@ -4,7 +4,6 @@ use std::{borrow::Cow, sync::Arc};
 
 use thiserror::Error;
 
-use tracing_error::TracedError;
 use zakura_chain::serialization::SerializationError;
 
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
 /// branch on the `notfound` kind without string-matching `Debug` output (which a variant rename
 /// would silently break, disabling the syncer's retry paths).
 #[derive(Debug, Clone)]
-pub struct SharedPeerError(Arc<TracedError<PeerError>>, NotFoundClass);
+pub struct SharedPeerError(Arc<PeerError>, NotFoundClass);
 
 /// Typed classification of `notfound`-style peer errors, computed when a [`SharedPeerError`] is
 /// constructed (the only construction path is the `From` impl below, so this stays in sync with
@@ -58,14 +57,12 @@ where
             PeerError::NotFoundRegistry(_) => NotFoundClass::Registry,
             _ => NotFoundClass::Other,
         };
-        Self(Arc::new(TracedError::from(inner)), class)
+        Self(Arc::new(inner), class)
     }
 }
 
 impl SharedPeerError {
     /// Returns a debug-formatted string describing the inner [`PeerError`].
-    ///
-    /// Unfortunately, [`TracedError`] makes it impossible to get a reference to the original error.
     pub fn inner_debug(&self) -> String {
         format!("{:?}", self.0.as_ref())
     }

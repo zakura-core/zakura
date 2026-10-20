@@ -2,7 +2,8 @@
 
 > **Status: first draft.** This document describes focused tests for the
 > [design](peer-message-regulation.md) and [specification](../specs/peer-message-regulation.md).
-> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths.
+> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths,
+> and the [header sync plan](property-testing-header-sync.md) covers header subscriptions.
 
 ## Scope and claim strength
 
@@ -47,12 +48,14 @@ Four suites read the declarations, so each property is written once:
 | Item | one codec item | Tight length bounds against real encodings, round trips, exact reads, truncation, canonical decoding of arbitrary and mutated input, and the allocation bound |
 | Message | one message family | Closed coverage of its rows, tight row bounds, round trips, header and payload mutations, domain violations, and the allocation bound for every decode |
 | Frame | one layout | Each reader accepts its rows at both bounds and rejects short, flagged, other-role, sibling-stream, and undeclared frames from the header |
-| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses, the request margin, sustained and mutually saturated exchanges, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, and `Close` progress while pages and execution are blocked |
+| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses and pages beyond their credit, the request and subscription margins, sustained and mutually saturated exchanges and subscriptions, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, and `Close` progress while pages and execution are blocked |
 
 The stream conformance adapter only encodes a valid message for a row and names the exchange a
-message belongs to. For a subscription row it also encodes and reads updates and encodes pages. The
-suite's harness serves, downloads, and publishes through the tools, so it tests the tools and the
-transport together. A reactor that bypasses the tools gets no coverage from it.
+message belongs to. For a subscription row it also encodes and reads updates and encodes and reads
+pages. The suite's harness serves, downloads, publishes, and subscribes through the tools, so it
+tests the tools and the transport together. The
+[suite's module docs](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) say
+which rows each property checks. A reactor that bypasses the tools gets no coverage from it.
 
 Tuples and lists of items are items, so the item suite checks composition once. A message whose
 payload composes checked items needs no bound test of its own. The test allocator measures heap
@@ -141,4 +144,5 @@ and load runs can execute on a schedule. Choose counts from measured runtime and
 coverage honestly.
 
 Start with existing codec and reservation tests. Add GetBlocks ownership and bidirectional cases,
-then subscription tests. Expand the harness only when a named property exposes a gap.
+then subscription tests from the [header sync plan](property-testing-header-sync.md). Expand the
+harness only when a named property exposes a gap.

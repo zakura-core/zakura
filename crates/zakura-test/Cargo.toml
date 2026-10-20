@@ -24,22 +24,17 @@ proptest = { workspace = true }
 once_cell = { workspace = true }
 regex = { workspace = true }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true }
 
-color-eyre = { workspace = true }
-
-humantime = { workspace = true }
-owo-colors = { workspace = true }
-thiserror = { workspace = true }
+eyre = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-tracing-error = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-rand = { workspace = true }
+rand_10 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

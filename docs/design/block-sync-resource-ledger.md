@@ -20,27 +20,34 @@ it is sized to the throughput target, not below it.
 ## Node budget
 
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
-connection; the node admits at most `zakura.max_connections` = 256 of them.
+connection; the node admits at most `zakura.max_connections` = 92 of them. The transport holds
+at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): the most that
+`zakura.peer_memory_budget_bytes` = 8 GiB funds after one 256 MiB datagram queue for the one
+bound socket, with 32 of them headroom for handshakes (CTRL-26). Closed connections release their
+stream buffers and drain in a separate allowance of 248 (ADM-13). The QUIC rows count all 124
+live connections; the application rows count the 92 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |
-| QUIC receive buffers | 32 MiB connection window (16 MiB per stream) | 8 GiB | `DEFAULT_ZAKURA_RECEIVE_WINDOW`, `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` in `handler.rs`, enforced by QUIC flow control |
-| QUIC send buffers | 32 MiB | 8 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
+| QUIC receive buffers | 32 MiB connection window (16 MiB per stream) | 3.9 GiB | `DEFAULT_ZAKURA_RECEIVE_WINDOW`, `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` in `handler.rs`, enforced by QUIC flow control |
+| QUIC send buffers | 32 MiB | 3.9 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
 | Serving bookkeeping | 1 MiB (144 KiB + 2 × 2,816 × 160 B) | 512 MiB | `BOOKKEEPING_BUDGET_BYTES` in `regulated/session.rs`; config validation refuses a config that cannot fund one request per slot |
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
 | Serving encoded output | 64 MiB | 1.25 GB, 1 response slot per 4 KiB | `regulation/sizing.rs` (`peer_output_bytes`, `node_output_bytes`) |
 | Requester bookkeeping | ≤ live ranges | 32,768 ranges; ≤ 128 MiB of expected hashes | `MAX_BS_INFLIGHT_REQUESTS` request pool in `reactor.rs` |
-| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 5.1 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
+| Raw stream-6 frames awaiting the routine | ≤ 10 frames, about 20 MB, and ≤ what live reservations owe | 1.8 GB | `BLOCK_SYNC_INBOUND_QUEUE_DEPTH` in `block_sync/service.rs`; `Reservations::admit` in `regulation/reservations.rs` disconnects over-sending |
 | Look-ahead backlog (raw) | — | `max_reorder_lookahead_bytes` = 1.5 GiB plus one range | `admission.rs` byte gate, re-checked by the sequencer on every body |
 | Decoded bodies | one transient junk decode before rejection | 401 submissions × measured decoded size | `max_submitted_block_applies`; admission charges `max(4 × wire, measured decoded)` |
 | Control state | bounded maps | 8,192 supplier cooldowns; Status keeps the latest value | `MAX_SUPPLIER_RETRIES` in `peer_registry.rs` |
 
-At defaults, block-sync application memory sums to about 14 GB in the worst case: 0.5 GiB
+At defaults, block-sync application memory sums to about 11 GB in the worst case: 0.5 GiB
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
-for real blocks), 0.13 GiB requester hashes, 5.1 GB of raw frames awaiting their routines and
+for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
-add 8 + 8 GiB. They are shared with every other service on the connection and stay unchanged:
-256 connections × 32 MiB is the transport budget, not a block-sync choice.
+add 3.9 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
+connections it serves. They are shared with every other service on the connection and stay
+unchanged: the 8 GiB peer memory budget covers all three for every live QUIC connection the
+transport holds, and is a transport budget, not a block-sync choice.
 
 ## Serving
 
@@ -79,9 +86,15 @@ needed.
 
 ### Requester bookkeeping
 
-The node-wide request pool holds 32,768 live ranges. Each range keeps at most 128 expected
-hashes, so hashes total at most 128 MiB. Range maps release their excess capacity after a
-peak (`shrink_after_peak`), so a burst does not pin its high-water allocation.
+The node-wide request pool holds 32,768 live ranges. One session holds at most an eighth of
+them, 4,096 (`SESSION_RESERVATIONS`), so two sessions take at most a quarter of the pool. Normal
+sync stays below that: a default Zakura server advertises 2,816 in-flight requests, and the header
+lead keeps missing heights within 4,000. Abandoned exchanges after GC or a reorg, or a larger
+custom advertisement, can briefly reach it, and the session then waits for endings. A session also
+stops issuing while 64 fully received ranges still owe an ending (`MAX_PENDING_ENDINGS`). Each
+range keeps at most 128 expected hashes, so hashes total at most 128 MiB. Range maps release their
+excess capacity after a peak (`shrink_after_peak`), so a burst does not pin its high-water
+allocation.
 
 ### Raw frames
 
@@ -104,7 +117,7 @@ range's cap, and the padding survives until consensus checks the auth-data commi
 Stream 6 therefore also declares an inbound queue depth of 8 frames
 (`BLOCK_SYNC_INBOUND_QUEUE_DEPTH`). A session holds at most those 8, the one the reader is
 forwarding and the one the routine keeps while it waits for decode capacity. Its raw frames
-therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 5.1 GB across 256
+therefore stay under 10 × 2 MB, about 20 MB, whatever the window. That is 1.8 GB across 92
 connections. Later frames wait in the 16 MiB QUIC stream receive
 window the transport already budgets. The owed check still disconnects a peer that sends more
 than it was asked for. `block_sync_queues_a_fixed_number_of_bodies_whatever_the_reservations_owe`
@@ -160,6 +173,16 @@ At `r` ≈ 4 this is about 5.6 GB, of which about 3.2 GB is the decoded window. 
 built, proof-of-work-paid chain at `r` ≈ 26 raises the window term to about 21 GB; admission
 then charges the measured size and stops requesting ahead. The check costs one txid pass per
 body, about 11% of decode time on real blocks, on the per-peer routine tasks.
+
+Above the last checkpoint the sequencer also gates new decoded submissions on
+`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` (512 MiB). Past the cap, bodies stay raw until earlier
+submissions finish, so in steady sync the window term there is 512 MiB plus about one block of
+estimate error. The cap is an admission target, not a hard ceiling. Submissions detached by a
+failure or reset stay charged but never block the next submission, since they can be successors
+waiting for that very block. While they hold the cap, the window advances one body at a time,
+so repeated resets can push it past 512 MiB, bounded by the submission count limit. That rules
+out the 21 GB case for steady sync, because below the last checkpoint the window holds fixed
+Mainnet blocks of about 7 MB decoded at most, about 2.8 GB in total.
 
 The Merkle check departs from the Block section's SHOULD to reuse downstream validation
 rather than add a duplicate ingress check. The downstream check runs only after the junk body

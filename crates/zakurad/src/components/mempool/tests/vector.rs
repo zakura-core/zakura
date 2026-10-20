@@ -8,14 +8,14 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use tokio::time::{self, timeout};
 use tower::{
     util::{BoxCloneService, BoxService},
     ServiceBuilder, ServiceExt,
 };
 
-use rand::{seq::SliceRandom, thread_rng};
+use rand_10::{rng as thread_rng, seq::IndexedRandom};
 use zakura_chain::{
     amount::Amount,
     block::Block,

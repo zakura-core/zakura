@@ -20,6 +20,7 @@ use crate::{
     },
     transaction::{arbitrary::v5_transactions, LockTime, Transaction},
     transparent,
+    work::equihash::Solution,
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
@@ -552,6 +553,50 @@ fn coinbase_parsing_rejects_above_0x80() {
 }
 
 /// Checks that the block commitment field parses without errors.
+/// Header sizes are computed from the Equihash solution without encoding the
+/// header, so they must match the encoded length on every network.
+#[test]
+fn header_serialized_size_matches_encoding() {
+    let _init_guard = zakura_test::init();
+
+    let mut headers: Vec<Header> = Network::iter()
+        .flat_map(|net| {
+            net.block_iter()
+                .map(|(_, bytes)| {
+                    *bytes
+                        .zcash_deserialize_into::<Block>()
+                        .expect("block test vectors are structurally valid")
+                        .header
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let regtest_header = *crate::block::genesis::regtest_genesis_block().header;
+    assert!(matches!(regtest_header.solution, Solution::Regtest(_)));
+    assert!(headers
+        .iter()
+        .all(|header| matches!(header.solution, Solution::Common(_))));
+    headers.push(regtest_header);
+
+    for header in headers {
+        let encoded = header
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+        assert_eq!(header.zcash_serialized_size(), encoded.len());
+        assert!(encoded.len() <= crate::block::header::MAX_SERIALIZED_HEADER_BYTES);
+        if matches!(header.solution, Solution::Common(_)) {
+            assert_eq!(
+                encoded.len(),
+                crate::block::header::MAX_SERIALIZED_HEADER_BYTES
+            );
+        }
+        assert_eq!(
+            header.solution.zcash_serialized_size(),
+            encoded.len() - crate::block::header::HEADER_BYTES_BEFORE_SOLUTION,
+        );
+    }
+}
+
 /// For sapling and blossom blocks, also check the final sapling root value.
 ///
 /// TODO: add chain history test vectors?

@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
 
 use crate::{
@@ -25,6 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod peer_memory;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
@@ -39,6 +41,7 @@ pub use handshake::*;
 pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
+pub use peer_memory::*;
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -59,20 +62,22 @@ use std::sync::{
 /// Capability bit for the legacy gossip compatibility service.
 pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
 
-/// Capability bit for the native discovery service.
-pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 2;
+/// Capability bit for the native discovery service (stream version 2).
+pub const ZAKURA_CAP_DISCOVERY: u64 = 1 << 9;
 
 /// Capability bit for the native header-sync service.
 ///
 /// Bit `1 << 4` belonged to the retired predecessor protocol and remains unused.
-pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 5;
+pub const ZAKURA_CAP_HEADER_SYNC: u64 = 1 << 10;
 
 // Bit `1 << 1` advertised the retired header-sync stream that correlated responses by order.
 // Do not assign it to another service.
 // Bit `1 << 3` identified the retired block-sync stream version 2. Do not reuse it.
 // Bit `1 << 4` identifies the retired predecessor header-sync protocol.
+// Bit `1 << 5` identified the retired header-sync stream version 8. Do not reuse it.
 // Bits 6 and 7 are reserved for spentness hints and wallet transaction submission.
 // Bit `1 << 8` identifies block sync (stream version 3) in `block_sync::wire`.
+// Bit `1 << 2` identified the retired discovery stream version 1. Do not reuse it.
 
 /// Production default for per-service peer caps.
 pub const DEFAULT_SERVICE_MAX_PEERS: usize = 256;
@@ -126,10 +131,6 @@ pub enum ServiceAdmissionDecision {
     RejectFull,
     /// The peer is not useful for this service right now.
     RejectNotUseful,
-    /// The peer is still in a local retry backoff window.
-    RejectBackoff,
-    /// The peer does not support this service.
-    RejectUnsupported,
 }
 
 /// Direction of the underlying Zakura connection.
@@ -419,7 +420,7 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
-        tokio::spawn(run_legacy_liveness_keeper(
+        spawn_erased(run_legacy_liveness_keeper(
             book_addr,
             address_book_updater,
             dial_lifetime,

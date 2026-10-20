@@ -74,17 +74,15 @@ fn sum_payouts(network: &Network, heights: std::ops::Range<u32>) -> Payouts {
 /// = 6,249,999. So every three NU7 blocks pay grants 2 zatoshi less, the lockbox 3 less, and
 /// the miner 4 more, and issue 1 zatoshi less in total.
 ///
-/// This test sums every block, so any height with a different amount changes the totals.
-#[test]
-fn nu7_rounding_loss_over_every_block_until_the_third_halving() {
+/// This sums every block from each NU7 height in `nu7_heights`, so any height with a
+/// different amount changes the totals. zcash/zips#1370 requires NU7 heights that are
+/// multiples of 3.
+fn rounding_loss_over_every_block_until_the_third_halving(nu7_heights: &[u32]) {
     let _init_guard = zakura_test::init();
 
     let without_nu7 = testnet_network_with_nu7(None);
 
-    // NU7 at the zakura#1059 estimate, at #1213's configured fork height, and one group of
-    // three NU7 blocks before the old third halving. zcash/zips#1370 requires NU7 heights
-    // that are multiples of 3.
-    for nu7 in [4_386_000, 4_398_756, TESTNET_THIRD_HALVING - 3] {
+    for &nu7 in nu7_heights {
         let network = testnet_network_with_nu7(Some(nu7));
         let old_blocks = TESTNET_THIRD_HALVING - nu7;
         let third_halving = nu7 + 3 * old_blocks;
@@ -115,6 +113,24 @@ fn nu7_rounding_loss_over_every_block_until_the_third_halving() {
             "NU7 at {nu7}",
         );
     }
+}
+
+/// One group of three NU7 blocks, and a thousand groups, before the old third halving, on
+/// every pull request.
+#[test]
+fn nu7_rounding_loss_over_every_block_until_the_third_halving() {
+    rounding_loss_over_every_block_until_the_third_halving(&[
+        TESTNET_THIRD_HALVING - 3,
+        TESTNET_THIRD_HALVING - 3_000,
+    ]);
+}
+
+/// NU7 at the zakura#1059 estimate and at #1213's configured fork height, about 670,000
+/// blocks in all, in full-coverage CI runs.
+#[test]
+#[ignore = "broad sweep; full-coverage CI passes --run-ignored"]
+fn nu7_rounding_loss_over_every_block_from_the_planned_heights() {
+    rounding_loss_over_every_block_until_the_third_halving(&[4_386_000, 4_398_756]);
 }
 
 /// In every halving era after NU7, the block subsidy is ZIP 218's single floor,

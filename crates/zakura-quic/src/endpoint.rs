@@ -5,7 +5,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
     time::{Duration, Instant},
@@ -129,6 +129,7 @@ pub(crate) struct Shared {
     pub(crate) max_bidi_streams: u32,
     pub(crate) tls: TlsConfig,
     pub(crate) pending: PendingTable,
+    pub(crate) connections: ConnectionSlots,
     pub(crate) hooks: Arc<Hooks>,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) network: watch::Sender<u64>,
@@ -193,12 +194,22 @@ impl QuicEndpoint {
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
         }
+        // ADM-12: with no slot, every dial and accept would fail, and a dial
+        // capped at zero addresses would have nothing to try.
+        if bind.max_connections == 0 {
+            return Err(BindError::NoConnectionSlots);
+        }
         let shared = Arc::new(Shared {
             id: secret.public(),
             config: config.clone(),
             max_bidi_streams: bind.max_bidi_streams,
             tls: TlsConfig::new(&secret),
             pending: PendingTable::default(),
+            connections: ConnectionSlots::new(
+                bind.max_connections,
+                bind.dial_reserve,
+                bind.max_closing_connections,
+            ),
             hooks: Arc::new(Hooks::default()),
             shutdown: watch::Sender::new(false),
             network: watch::Sender::new(0),
@@ -305,6 +316,31 @@ impl QuicEndpoint {
             .collect()
     }
 
+    /// Live QUIC connections the endpoint holds across its sockets:
+    /// handshakes, dial attempts and established connections (ADM-12).
+    pub fn connection_count(&self) -> usize {
+        self.inner.shared.connections.live()
+    }
+
+    /// Closed connections the endpoint keeps until they drain (ADM-13).
+    pub fn closing_connection_count(&self) -> usize {
+        self.inner.shared.connections.closing()
+    }
+
+    /// Whether the table has a free live connection slot right now (ADM-12).
+    /// Callers that dial in a loop check this first, so a full table doesn't
+    /// make them spin on `ConnectionLimit`. A dial needs one slot per address
+    /// it tries, so a multi-address dial can still fail with that error.
+    pub fn has_dial_capacity(&self) -> bool {
+        self.inner.shared.connections.can_dial()
+    }
+
+    /// Whether discovery can reserve an address attempt while leaving one
+    /// live slot below the inbound refusal threshold (ADM-12).
+    pub fn has_discovery_capacity(&self) -> bool {
+        self.inner.shared.connections.live() < self.inner.shared.connections.discovery_limit()
+    }
+
     /// Network changes the endpoint has passed to its connections (SOCK-12).
     pub fn network_changes(&self) -> u64 {
         self.inner.shared.network_changes.load(Ordering::Relaxed)
@@ -363,6 +399,32 @@ impl QuicEndpoint {
     /// of a protocol lets a node reach peers on older versions in one
     /// handshake. An empty list fails with [`ConnectError::AlpnMismatch`].
     pub async fn connect(&self, addr: NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.max())
+            .await
+    }
+
+    /// Dials a discovery candidate without taking the dial reserve or the
+    /// last slot available to inbound connections (ADM-12).
+    ///
+    /// Like [`Self::connect`], but reserves all address attempts below this
+    /// lower ceiling before sending any packet. A ceiling of zero disables
+    /// discovery dials and returns [`ConnectError::ConnectionLimit`].
+    pub async fn connect_discovery(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+    ) -> Result<Conn, ConnectError> {
+        self.connect_with_limit(addr, alpns, self.inner.shared.connections.discovery_limit())
+            .await
+    }
+
+    /// Reserves a dial's address attempts together under `limit` before any packet.
+    async fn connect_with_limit(
+        &self,
+        addr: NodeAddr,
+        alpns: &[&[u8]],
+        limit: usize,
+    ) -> Result<Conn, ConnectError> {
         let shared = &self.inner.shared;
         if alpns.is_empty() {
             return Err(ConnectError::AlpnMismatch);
@@ -392,13 +454,25 @@ impl QuicEndpoint {
             return Err(ConnectError::NoUsableAddress);
         }
 
+        // ADM-12: either every address fits before the first packet, or none
+        // is tried. Bound the target set by this dial's ceiling so an idle
+        // endpoint can fit it whenever that ceiling is nonzero.
+        targets.truncate(limit);
+        if targets.is_empty() {
+            return Err(ConnectError::ConnectionLimit);
+        }
+        let slots = shared
+            .connections
+            .claim_dial_slots(targets.len(), limit)
+            .ok_or(ConnectError::ConnectionLimit)?;
+
         let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();
         let deadline = shared.config.handshake_timeout();
         let mut attempts = FuturesUnordered::new();
-        for (index, (target, socket)) in targets.into_iter().enumerate() {
+        for (index, ((target, socket), slot)) in targets.into_iter().zip(slots).enumerate() {
             let crypto = crypto.clone();
             // Bounded by the 8 addresses discovery admits per record; the cast can't truncate.
             let delay = stagger * index as u32;
@@ -408,7 +482,7 @@ impl QuicEndpoint {
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = self.dial_once(socket, crypto, target, deadline).await;
+                let result = self.dial_once(socket, crypto, target, deadline, slot).await;
                 record_handshake(&result, started);
                 (target, result)
             });
@@ -430,7 +504,8 @@ impl QuicEndpoint {
                 }
             }
         }
-        let error = best.expect("at least one attempt ran because targets was non-empty");
+        let error =
+            best.expect("at least one attempt ran because the capped targets were non-empty");
         if matches!(error, ConnectError::AlpnMismatch) {
             metrics::counter!("zakura.quic.dial.alpn_mismatch").increment(1);
         }
@@ -443,6 +518,7 @@ impl QuicEndpoint {
         crypto: Arc<quinn_proto::crypto::rustls::QuicClientConfig>,
         target: SocketAddr,
         deadline: Option<Duration>,
+        slot: Arc<ConnectionSlot>,
     ) -> Result<(ConnRef, Handshake), ConnectError> {
         let probe = Arc::new(CongestionProbe::default());
         let mut client = ClientConfig::new(crypto);
@@ -458,6 +534,7 @@ impl QuicEndpoint {
                 config: client,
                 remote: target,
                 probe,
+                slot,
                 reply,
             })
             .map_err(|_| ConnectError::Endpoint(quinn_proto::ConnectError::EndpointStopping))?;
@@ -516,7 +593,13 @@ impl QuicEndpoint {
             .socket_for(target)
             .expect("tests dial an address family the endpoint bound");
         let deadline = self.inner.shared.config.handshake_timeout();
-        self.dial_once(socket, Arc::new(crypto), target, deadline)
+        let slot = self
+            .inner
+            .shared
+            .connections
+            .claim_dial()
+            .ok_or(ConnectError::ConnectionLimit)?;
+        self.dial_once(socket, Arc::new(crypto), target, deadline, slot)
             .await
     }
 
@@ -656,17 +739,27 @@ pub(crate) fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &Incomi
     Admit::Accept
 }
 
+/// Counts a handshake result, and records its duration when it completed.
 fn record_handshake<T>(result: &Result<T, ConnectError>, started: Instant) {
+    let Some(counter) = handshake_counter(result) else {
+        return;
+    };
+    metrics::counter!(counter).increment(1);
+    if result.is_ok() {
+        metrics::histogram!("zakura.quic.handshake.duration_seconds")
+            .record(started.elapsed().as_secs_f64());
+    }
+}
+
+/// The handshake counter a dial or accept result belongs to, or `None` when
+/// no handshake happened: `ConnectionLimit` is this node's own cap refusing
+/// the attempt before any packet (ADM-12), so it isn't a failed handshake.
+fn handshake_counter<T>(result: &Result<T, ConnectError>) -> Option<&'static str> {
     match result {
-        Ok(_) => {
-            metrics::counter!("zakura.quic.handshake.completed").increment(1);
-            metrics::histogram!("zakura.quic.handshake.duration_seconds")
-                .record(started.elapsed().as_secs_f64());
-        }
-        Err(ConnectError::HandshakeTimeout) => {
-            metrics::counter!("zakura.quic.handshake.timed_out").increment(1);
-        }
-        Err(_) => metrics::counter!("zakura.quic.handshake.failed").increment(1),
+        Ok(_) => Some("zakura.quic.handshake.completed"),
+        Err(ConnectError::HandshakeTimeout) => Some("zakura.quic.handshake.timed_out"),
+        Err(ConnectError::ConnectionLimit) => None,
+        Err(_) => Some("zakura.quic.handshake.failed"),
     }
 }
 
@@ -784,5 +877,241 @@ impl Drop for PendingGuard {
                 counts.by_ip.remove(&self.ip);
             }
         }
+    }
+}
+
+/// QUIC connections held across every socket of one endpoint: live ones
+/// (ADM-12) and closed ones still draining (ADM-13).
+pub(crate) struct ConnectionSlots {
+    counts: Arc<SlotCounts>,
+    max: usize,
+    max_inbound: usize,
+    max_closing: usize,
+}
+
+#[derive(Default)]
+struct SlotCounts {
+    live: AtomicUsize,
+    closing: AtomicUsize,
+}
+
+impl ConnectionSlots {
+    /// Allows `max` live connections, of which inbound attempts may take all
+    /// but `dial_reserve`, and `max_closing` closed ones.
+    pub(crate) fn new(max: usize, dial_reserve: usize, max_closing: usize) -> Self {
+        Self {
+            counts: Arc::default(),
+            max,
+            max_inbound: max.saturating_sub(dial_reserve),
+            max_closing,
+        }
+    }
+
+    /// Live connections held right now, dial attempts in flight included.
+    pub(crate) fn live(&self) -> usize {
+        self.counts.live.load(Ordering::Acquire)
+    }
+
+    /// Closed connections held right now.
+    pub(crate) fn closing(&self) -> usize {
+        self.counts.closing.load(Ordering::Acquire)
+    }
+
+    /// The most live connections the table ever holds, so the most addresses
+    /// one dial can claim slots for.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    /// The discovery ceiling leaves the dial reserve and one inbound slot free.
+    fn discovery_limit(&self) -> usize {
+        self.max_inbound.saturating_sub(1)
+    }
+
+    /// Whether a dial attempt would get a slot right now.
+    pub(crate) fn can_dial(&self) -> bool {
+        self.live() < self.max
+    }
+
+    /// Claims a live slot for an inbound attempt, or `None` when only the dial
+    /// reserve is left. Closed connections don't count (ADM-13).
+    pub(crate) fn claim_inbound(&self) -> Option<Arc<ConnectionSlot>> {
+        self.claim(self.max_inbound)
+    }
+
+    /// Claims a live slot for one dial attempt, or `None` at the cap.
+    #[cfg(test)]
+    pub(crate) fn claim_dial(&self) -> Option<Arc<ConnectionSlot>> {
+        self.claim(self.max)
+    }
+
+    /// Reserves every address attempt atomically, or leaves the count unchanged.
+    fn claim_dial_slots(&self, attempts: usize, limit: usize) -> Option<Vec<Arc<ConnectionSlot>>> {
+        if !try_add(&self.counts.live, attempts, limit) {
+            return None;
+        }
+        Some((0..attempts).map(|_| self.new_slot()).collect())
+    }
+
+    /// Claims a live slot while fewer than `limit` are held.
+    fn claim(&self, limit: usize) -> Option<Arc<ConnectionSlot>> {
+        if !try_add(&self.counts.live, 1, limit) {
+            return None;
+        }
+        Some(self.new_slot())
+    }
+
+    /// Tracks one already reserved live slot until its connection drains.
+    fn new_slot(&self) -> Arc<ConnectionSlot> {
+        metrics::gauge!("zakura.quic.connections.held").increment(1.0);
+        Arc::new(ConnectionSlot {
+            counts: self.counts.clone(),
+            max_closing: self.max_closing,
+            closing: AtomicBool::new(false),
+        })
+    }
+}
+
+/// Adds `additional` to `count` only if the result fits `limit`. Concurrent
+/// dials and endpoint tasks reserve their slots in one atomic step. A plain
+/// CAS loop: `fetch_update` is deprecated on newer toolchains and `try_update`
+/// doesn't exist on older ones.
+fn try_add(count: &AtomicUsize, additional: usize, limit: usize) -> bool {
+    let mut held = count.load(Ordering::Acquire);
+    loop {
+        let Some(next) = held.checked_add(additional).filter(|next| *next <= limit) else {
+            return false;
+        };
+        match count.compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => held = current,
+        }
+    }
+}
+
+/// One connection's slot, shared by its table entry and its connection task.
+/// It counts as live until the connection closes, then as closing, and frees
+/// when the last holder drops it: the table entry leaves only once
+/// `quinn-proto` reports the connection drained (ADM-11).
+pub(crate) struct ConnectionSlot {
+    counts: Arc<SlotCounts>,
+    max_closing: usize,
+    closing: AtomicBool,
+}
+
+impl ConnectionSlot {
+    /// Moves the slot from live to closing. Returns `false`, leaving it live,
+    /// when the closing allowance is full: the caller then drops the
+    /// connection's state at once instead of draining it (ADM-13). Only the
+    /// connection task calls this, once.
+    ///
+    /// `shrink` runs after the endpoint switches to the closing queue limit
+    /// and before the live slot frees, so the caller can drop the datagrams
+    /// queued under the live limit before the cheaper charge applies.
+    pub(crate) fn begin_closing(&self, shrink: impl FnOnce()) -> bool {
+        if self.is_closing() {
+            return true;
+        }
+        if !try_add(&self.counts.closing, 1, self.max_closing) {
+            return false;
+        }
+        self.closing.store(true, Ordering::Release);
+        shrink();
+        self.counts.live.fetch_sub(1, Ordering::AcqRel);
+        metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        metrics::gauge!("zakura.quic.connections.closing").increment(1.0);
+        true
+    }
+
+    /// Whether the connection has closed and moved to the closing allowance.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        if self.is_closing() {
+            self.counts.closing.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.closing").decrement(1.0);
+        } else {
+            self.counts.live.fetch_sub(1, Ordering::AcqRel);
+            metrics::gauge!("zakura.quic.connections.held").decrement(1.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concurrent address batches cannot cross the discovery ceiling, and a
+    /// refused batch leaves no partial claim. Inbound and maintained dials
+    /// retain their separate capacity, and dropping every claim refunds it.
+    #[test]
+    fn concurrent_discovery_reservations_preserve_inbound_capacity() {
+        let slots = ConnectionSlots::new(8, 2, 0);
+        let barrier = std::sync::Barrier::new(9);
+        let observed = std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (slots, barrier) = (&slots, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let held = slots.claim_dial_slots(2, slots.discovery_limit());
+                    barrier.wait();
+                    barrier.wait();
+                    drop(held);
+                });
+            }
+            barrier.wait();
+            barrier.wait();
+            let live = slots.live();
+            let overflow_refused = slots.claim_dial_slots(usize::MAX, usize::MAX).is_none();
+            let inbound = [
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+                slots.claim_inbound(),
+            ];
+            let maintained = slots.claim_dial_slots(2, slots.max());
+            let observed = (
+                live,
+                overflow_refused,
+                inbound.iter().flatten().count(),
+                maintained.as_ref().map_or(0, Vec::len),
+                slots.live(),
+            );
+            drop((inbound, maintained));
+            // Release workers before asserting, so a regression cannot leave
+            // the test blocked at a barrier.
+            barrier.wait();
+            observed
+        });
+        // Two whole batches fit under the ceiling of five. A third
+        // batch must fail without retaining even its first slot.
+        let (discovery_slots, overflow_refused, inbound_slots, maintained_slots, full_count) =
+            observed;
+        assert_eq!(discovery_slots, 4);
+        assert!(overflow_refused);
+        assert_eq!(inbound_slots, 2);
+        assert_eq!(maintained_slots, 2);
+        assert_eq!(full_count, 8);
+        assert_eq!(slots.live(), 0);
+    }
+
+    /// A dial refused at this node's own cap never reached the peer, so it
+    /// isn't counted as a failed handshake (ADM-12).
+    #[test]
+    fn a_local_cap_refusal_is_not_a_handshake_result() {
+        let counter = |result: Result<(), ConnectError>| handshake_counter(&result);
+        assert_eq!(counter(Err(ConnectError::ConnectionLimit)), None);
+        assert_eq!(counter(Ok(())), Some("zakura.quic.handshake.completed"));
+        assert_eq!(
+            counter(Err(ConnectError::HandshakeTimeout)),
+            Some("zakura.quic.handshake.timed_out")
+        );
+        assert_eq!(
+            counter(Err(ConnectError::Refused)),
+            Some("zakura.quic.handshake.failed")
+        );
     }
 }

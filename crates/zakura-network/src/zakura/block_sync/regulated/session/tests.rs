@@ -69,7 +69,7 @@ fn mainnet_blocks(heights: std::ops::RangeInclusive<u32>) -> BTreeMap<Height, Ve
 #[derive(Debug, Eq, PartialEq)]
 enum Served {
     Block(Height),
-    End(super::super::wire::Message),
+    End(super::super::wire::RangeEnding),
 }
 
 /// The next served message.
@@ -79,16 +79,17 @@ async fn served(output: &mut crate::zakura::FramedRecv) -> Served {
             let block: Block = bytes.zcash_deserialize_into().unwrap();
             Served::Block(block.coinbase_height().unwrap())
         }
-        ending => Served::End(ending),
+        super::super::wire::Message::End(ending) => Served::End(ending),
+        other => panic!("served an unexpected {other:?}"),
     }
 }
 
 /// The `BlocksDone` ending of a range from `start` that returned `returned` blocks.
 fn done(start: u32, returned: u32) -> Served {
-    Served::End(super::super::wire::Message::BlocksDone {
-        start: Height(start),
+    Served::End(super::super::wire::RangeEnding::done(
+        Height(start),
         returned,
-    })
+    ))
 }
 
 /// Wait for the production completion drain to release a range.
@@ -127,30 +128,31 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
         CancellationToken::new(),
         Default::default(),
     );
-    session.admit(Height(1), 1).unwrap();
-    session.admit(Height(2), 1).unwrap();
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     wait_completed(&mut session, Height(2)).await;
     assert!(session.ranges.contains_key(&Height(1)));
-    assert!(session.admit(Height(1), 1).is_err());
+    assert!(session.admit(Range::new(Height(1), 1).unwrap()).is_err());
     let next_gate = Arc::new(Semaphore::new(0));
     source
         .gates
         .lock()
         .unwrap()
         .insert(Height(2), next_gate.clone());
-    session.admit(Height(2), 1).unwrap();
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
     first_gate.add_permits(1);
     // Ready order wrote the old range 2 before range 1's read finished.
     for height in [2, 1] {
         assert!(matches!(super::super::tests::receive(&mut output).await,
-            super::super::wire::Message::RangeUnavailable(range) if range.start == Height(height)));
+            super::super::wire::Message::End(ending)
+                if ending == super::super::wire::RangeEnding::unavailable(Height(height), 1)));
     }
     session.remove_completed();
     assert!(
         session.ranges.contains_key(&Height(2)),
         "old completion cannot release the replacement"
     );
-    assert!(session.admit(Height(2), 1).is_err());
+    assert!(session.admit(Range::new(Height(2), 1).unwrap()).is_err());
     next_gate.add_permits(1);
     super::super::tests::receive(&mut output).await;
     wait_completed(&mut session, Height(2)).await;
@@ -179,7 +181,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
         CancellationToken::new(),
         Default::default(),
     );
-    old.admit(Height(1), 1).unwrap();
+    old.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while source.started.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -204,7 +206,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
         CancellationToken::new(),
         Default::default(),
     );
-    new.admit(Height(1), 1).unwrap();
+    new.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     old_gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), async {
         while source.started.load(Ordering::SeqCst) < 2
@@ -217,7 +219,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     .unwrap();
     new.remove_completed();
     assert!(new.ranges.contains_key(&Height(1)));
-    assert!(new.admit(Height(1), 1).is_err());
+    assert!(new.admit(Range::new(Height(1), 1).unwrap()).is_err());
     new_gate.add_permits(1);
     super::super::tests::receive(&mut output).await;
     wait_completed(&mut new, Height(1)).await;
@@ -263,8 +265,8 @@ async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
         .unwrap()
         .insert(Height(2), blocked.clone());
     let (_serving, mut session, mut output, cancel) = ready_session(&source, 64, 4);
-    session.admit(Height(2), 1).unwrap();
-    session.admit(Height(1), 1).unwrap();
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
     assert_eq!(served(&mut output).await, Served::Block(Height(1)));
     assert_eq!(served(&mut output).await, done(1, 1));
     wait_completed(&mut session, Height(1)).await;
@@ -297,7 +299,9 @@ async fn concurrent_multi_block_requests_get_one_block_prefixes() {
     for _round in 0..16 {
         // Every range from the last round has ended, so each admission reuses its heights.
         for (start, count) in RANGES {
-            session.admit(Height(start), count).unwrap();
+            session
+                .admit(Range::new(Height(start), count).unwrap())
+                .unwrap();
         }
         gate.add_permits(RANGES.len());
         let mut received = [0; RANGES.len()];
@@ -306,7 +310,9 @@ async fn concurrent_multi_block_requests_get_one_block_prefixes() {
             let served = served(&mut output).await;
             let height = match &served {
                 Served::Block(height) => *height,
-                Served::End(super::super::wire::Message::BlocksDone { start, .. }) => *start,
+                Served::End(ending) if ending.outcome == super::super::wire::Outcome::Done => {
+                    ending.start
+                }
                 Served::End(other) => panic!("unexpected ending {other:?}"),
             };
             let index = RANGES
@@ -344,13 +350,13 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
     });
     // One transport slot that nobody reads holds the old output back.
     let (serving, mut session, mut output, cancel) = ready_session(&source, 66, 1);
-    session.admit(Height(1), 3).unwrap();
+    session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
     wait_completed(&mut session, Height(1)).await;
     assert!(
         serving.capacity.node_output_held() > 0,
         "the old range's output is not all written"
     );
-    session.admit(Height(1), 3).unwrap();
+    session.admit(Range::new(Height(1), 3).unwrap()).unwrap();
     for _ in 0..2 {
         assert_eq!(served(&mut output).await, Served::Block(Height(1)));
         assert_eq!(served(&mut output).await, done(1, 1));
@@ -424,9 +430,13 @@ async fn serving_enforces_the_budgeted_limit() {
         Default::default(),
     );
     for height in 1..=2 * limit {
-        session.admit(Height(height), 1).unwrap();
+        session
+            .admit(Range::new(Height(height), 1).unwrap())
+            .unwrap();
     }
-    assert!(session.admit(Height(2 * limit + 1), 1).is_err());
+    assert!(session
+        .admit(Range::new(Height(2 * limit + 1), 1).unwrap())
+        .is_err());
     cancel.cancel();
 }
 
@@ -450,7 +460,9 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     );
     // Heights 10..=14, then the ranges that end just below and start just above it.
     for (start, count) in [(10, 5), (5, 5), (15, 3)] {
-        session.admit(Height(start), count).unwrap();
+        session
+            .admit(Range::new(Height(start), count).unwrap())
+            .unwrap();
     }
     for (start, count) in [
         (10, 5),
@@ -464,7 +476,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     ] {
         assert!(
             matches!(
-                session.admit(Height(start), count),
+                session.admit(Range::new(Height(start), count).unwrap()),
                 Err(SinkReject::Protocol(_))
             ),
             "{count} heights from {start} overlap a live range"
@@ -474,7 +486,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
         session.ranges.keys().copied().collect::<Vec<_>>(),
         [Height(5), Height(10), Height(15)]
     );
-    session.admit(Height(18), 1).unwrap();
-    session.admit(Height(1), 4).unwrap();
+    session.admit(Range::new(Height(18), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(1), 4).unwrap()).unwrap();
     cancel.cancel();
 }

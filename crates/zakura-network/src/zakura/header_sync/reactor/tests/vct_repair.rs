@@ -38,12 +38,9 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
         (large_peer.clone(), large_send),
         (small_peer.clone(), small_send),
     ] {
+        let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
         handle
-            .send(Event::PeerConnected(PeerSession::from_parts(
-                peer,
-                send,
-                CancellationToken::new(),
-            )))
+            .send(Event::PeerConnected(session.clone()))
             .await
             .expect("the repair supplier connects");
     }
@@ -57,10 +54,10 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
         .expect("the local status is sent");
     for (peer, max_headers_per_response) in [(small_peer.clone(), 1), (large_peer.clone(), 3)] {
         handle
-            .send(Event::WireMessage {
+            .send(Event::Status {
                 peer,
                 session_id: 0,
-                msg: HeaderSyncMessage::Status(Status {
+                status: Status {
                     work_anchor_height: anchor.height,
                     work_anchor_hash: anchor.hash,
                     selected_tip_height: selected[2].height,
@@ -68,10 +65,10 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
                     suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(3_u8),
                     oldest_retained_height: anchor.height,
                     max_headers_per_response,
-                    max_inflight_requests: 1,
+                    max_subscriptions: 1,
                     max_message_bytes: 2_000_000,
                     tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-                }),
+                },
             })
             .await
             .expect("the repair supplier status reaches the reactor");
@@ -105,15 +102,9 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
         .await
         .expect("the local response cap permits a bounded repair request")
         .expect("the first supplier receives the request");
-    let HeaderSyncMessage::GetHeaders(request) = handle
-        .codec()
-        .decode_frame(frame, None)
-        .expect("the selected repair request decodes")
-    else {
-        panic!("the range repair uses GetHeaders");
-    };
-    assert_eq!(request.target_tip_hash, selected[1].hash);
-    assert_eq!(request.max_header_count, 2);
+    let request = update(frame);
+    assert_eq!(request.initial_target_tip_hash, selected[1].hash);
+    assert_eq!(request.added_credit.objects, 2);
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
 
@@ -311,12 +302,9 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
 
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the repair supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
@@ -328,15 +316,15 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     };
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(supplier_status.clone()),
+            status: supplier_status.clone(),
         })
         .await
         .expect("the repair supplier status reaches the reactor");
@@ -355,17 +343,11 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         .expect("the exact repair context reaches the reactor");
 
     let request = outbound.recv().await.expect("the repair request is sent");
-    let HeaderSyncMessage::GetHeaders(request) = handle
-        .codec()
-        .decode_frame(request, None)
-        .expect("the canonical repair request decodes")
-    else {
-        panic!("the repair uses the canonical GetHeaders message");
-    };
-    assert_ne!(request.request_id, 0);
-    assert_eq!(request.target_tip_hash, repair_header.hash);
+    let request = update(request);
+    assert_ne!(request.subscription_id, 0);
+    assert_eq!(request.initial_target_tip_hash, repair_header.hash);
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
-    assert_eq!(request.max_header_count, 1);
+    assert_eq!(request.added_credit.objects, 1);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
     let repair_aux = TreeAuxRecordV1 {
         height: repair_header.height,
@@ -378,24 +360,22 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
     };
     handle
-        .send(Event::SessionResponse {
-            peer: peer.clone(),
-            session_id: 0,
-            scope: owner.header_authority(),
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: request.request_id,
-                target_tip_hash: repair_header.hash,
+        .send(page_event(
+            &session,
+            Headers {
+                subscription_id: request.subscription_id,
+                initial_target_tip_hash: repair_header.hash,
                 common_ancestor_height: anchor.height,
                 common_ancestor_hash: anchor.hash,
-                complete: true,
+                reaches_initial_target: true,
                 tree_aux_schema: AuxSchema::V1,
                 entries: vec![HeaderEntry {
                     header: repair_block_header.clone(),
                     body_size: 0,
                     tree_aux: Some(repair_aux),
                 }],
-            }),
-        })
+            },
+        ))
         .await
         .expect("the exact repair response reaches the reactor");
     let HeaderPortOperation::PrepareHeaderTarget {
@@ -558,12 +538,13 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
 
     let replacement_peer = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID is bounded");
     let (replacement_send, mut replacement_outbound) = framed_channel(8);
+    let replacement_session = PeerSession::from_parts(
+        replacement_peer.clone(),
+        replacement_send,
+        CancellationToken::new(),
+    );
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            replacement_peer.clone(),
-            replacement_send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(replacement_session.clone()))
         .await
         .expect("the replacement supplier connects");
     let _status = replacement_outbound
@@ -571,10 +552,10 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         .await
         .expect("the replacement supplier receives local status");
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: replacement_peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(supplier_status),
+            status: supplier_status,
         })
         .await
         .expect("the replacement supplier status reaches the reactor");
@@ -605,36 +586,31 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         .recv()
         .await
         .expect("the replacement generation fetches another delivery");
-    let HeaderSyncMessage::GetHeaders(replacement_request) = handle
-        .codec()
-        .decode_frame(replacement_request, None)
-        .expect("the replacement request decodes")
-    else {
-        panic!("the replacement generation uses GetHeaders");
-    };
-    assert_eq!(replacement_request.target_tip_hash, repair_header.hash);
-    assert_eq!(replacement_request.max_header_count, 1);
+    let replacement_request = update(replacement_request);
+    assert_eq!(
+        replacement_request.initial_target_tip_hash,
+        repair_header.hash
+    );
+    assert_eq!(replacement_request.added_credit.objects, 1);
     assert_eq!(replacement_request.tree_aux_schema, AuxSchema::V1);
 
     handle
-        .send(Event::SessionResponse {
-            peer: replacement_peer,
-            session_id: 0,
-            scope: replacement_owner.header_authority(),
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: replacement_request.request_id,
-                target_tip_hash: repair_header.hash,
+        .send(page_event(
+            &replacement_session,
+            Headers {
+                subscription_id: replacement_request.subscription_id,
+                initial_target_tip_hash: repair_header.hash,
                 common_ancestor_height: anchor.height,
                 common_ancestor_hash: anchor.hash,
-                complete: true,
+                reaches_initial_target: true,
                 tree_aux_schema: AuxSchema::V1,
                 entries: vec![HeaderEntry {
                     header: repair_block_header,
                     body_size: 0,
                     tree_aux: Some(repair_aux),
                 }],
-            }),
-        })
+            },
+        ))
         .await
         .expect("the repeated semantic input reaches the reactor under a new request");
     assert!(
@@ -643,13 +619,22 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
             .is_err(),
         "a rejected semantic input cannot reach state under a new request"
     );
+    // Reaching the target closes the subscription, but nothing reopens it.
+    let reopened = time::timeout(std::time::Duration::from_millis(1_100), async {
+        while let Some(frame) = replacement_outbound.recv().await {
+            if let Ok(v9::Message::SubscribeHeaders(update)) =
+                decode_frame::<v9::RegtestMessage>(&frame)
+            {
+                if update.operation == v9::Operation::Open {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
     assert!(
-        time::timeout(
-            std::time::Duration::from_millis(1_100),
-            replacement_outbound.recv(),
-        )
-        .await
-        .is_err(),
+        !reopened.unwrap_or(false),
         "an unchanged episode cannot clear supplier exclusions and repeat the request"
     );
 
@@ -690,20 +675,17 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
 
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(Status {
+            status: Status {
                 work_anchor_height: anchor.height,
                 work_anchor_hash: anchor.hash,
                 selected_tip_height: selected_tip.height,
@@ -711,10 +693,10 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
                 suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
                 oldest_retained_height: anchor.height,
                 max_headers_per_response: 1,
-                max_inflight_requests: 1,
+                max_subscriptions: 1,
                 max_message_bytes: 2_000_000,
                 tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-            }),
+            },
         })
         .await
         .expect("the supplier status reaches the reactor");
@@ -732,13 +714,7 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         .await
         .expect("the exact repair context reaches the reactor");
     let frame = outbound.recv().await.expect("the repair request is sent");
-    let HeaderSyncMessage::GetHeaders(request) = handle
-        .codec()
-        .decode_frame(frame, None)
-        .expect("the repair request decodes")
-    else {
-        panic!("the repair uses GetHeaders");
-    };
+    let request = update(frame);
 
     snapshot.verified_generation = snapshot
         .verified_generation
@@ -752,16 +728,14 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
         HeaderPortOperation::QueryVctRepairContext { .. }
     ));
     handle
-        .send(Event::SessionResponse {
-            peer,
-            session_id: 0,
-            scope: owner.header_authority(),
-            msg: HeaderSyncMessage::Headers(Headers {
-                request_id: request.request_id,
-                target_tip_hash: repair_header.hash,
+        .send(page_event(
+            &session,
+            Headers {
+                subscription_id: request.subscription_id,
+                initial_target_tip_hash: repair_header.hash,
                 common_ancestor_height: anchor.height,
                 common_ancestor_hash: anchor.hash,
-                complete: true,
+                reaches_initial_target: true,
                 tree_aux_schema: AuxSchema::V1,
                 entries: vec![HeaderEntry {
                     header: repair_block_header,
@@ -777,8 +751,8 @@ async fn retired_vct_request_response_has_no_actions_or_peer_score() {
                         auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
                     }),
                 }],
-            }),
-        })
+            },
+        ))
         .await
         .expect("the late reserved response reaches the reactor");
     assert!(
@@ -843,20 +817,17 @@ async fn repair_awaiting_supplier(
 
     let (send, mut outbound) = framed_channel(8);
     let peer = peer();
+    let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
     handle
-        .send(Event::PeerConnected(PeerSession::from_parts(
-            peer.clone(),
-            send,
-            CancellationToken::new(),
-        )))
+        .send(Event::PeerConnected(session.clone()))
         .await
         .expect("the repair supplier connects");
     let _status = outbound.recv().await.expect("the local status is sent");
     handle
-        .send(Event::WireMessage {
+        .send(Event::Status {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::Status(supplier_status(anchor)),
+            status: supplier_status(anchor),
         })
         .await
         .expect("the repair supplier status reaches the reactor");
@@ -892,7 +863,7 @@ async fn repair_awaiting_supplier(
 async fn vct_repair_accepts_a_supplier_ahead_of_the_stalled_branch() {
     let shutdown = CancellationToken::new();
     let RepairAwaitingSupplier {
-        handle,
+        handle: _handle,
         mut outbound,
         reactor,
         anchor,
@@ -907,23 +878,17 @@ async fn vct_repair_accepts_a_supplier_ahead_of_the_stalled_branch() {
         // Finalized past the repair predecessor, so nothing below is retained.
         oldest_retained_height: block::Height(5),
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     })
     .await;
 
     let request = outbound.recv().await.expect("the repair request is sent");
-    let HeaderSyncMessage::GetHeaders(request) = handle
-        .codec()
-        .decode_frame(request, None)
-        .expect("the canonical repair request decodes")
-    else {
-        panic!("the repair uses the canonical GetHeaders message");
-    };
-    assert_eq!(request.target_tip_hash, repair_header.hash);
+    let request = update(request);
+    assert_eq!(request.initial_target_tip_hash, repair_header.hash);
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
-    assert_eq!(request.max_header_count, 1);
+    assert_eq!(request.added_credit.objects, 1);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
 
     shutdown.cancel();
@@ -955,7 +920,7 @@ async fn vct_repair_defers_when_no_peer_reaches_the_repair_height() {
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response: 1,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     })
@@ -1092,7 +1057,7 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
         max_headers_per_response,
-        max_inflight_requests: 1,
+        max_subscriptions: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
     };
@@ -1101,64 +1066,51 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
         async move {
             let peer = ZakuraPeerId::new(vec![identity; 32]).expect("the peer ID length is valid");
             let (send, mut outbound) = framed_channel(8);
+            let session = PeerSession::from_parts(peer.clone(), send, CancellationToken::new());
             handle
-                .send(Event::PeerConnected(PeerSession::from_parts(
-                    peer.clone(),
-                    send,
-                    CancellationToken::new(),
-                )))
+                .send(Event::PeerConnected(session.clone()))
                 .await
                 .expect("the repair supplier connects");
             let _ = outbound.recv().await.expect("the local status is sent");
             handle
-                .send(Event::WireMessage {
+                .send(Event::Status {
                     peer: peer.clone(),
                     session_id: 0,
-                    msg: HeaderSyncMessage::Status(supplier_status(max_headers_per_response)),
+                    status: supplier_status(max_headers_per_response),
                 })
                 .await
                 .expect("the repair supplier status reaches the reactor");
-            (peer, outbound)
+            (session, outbound)
         }
     };
-    let decode_request = |frame| {
-        let HeaderSyncMessage::GetHeaders(request) = handle
-            .codec()
-            .decode_frame(frame, None)
-            .expect("the repair request decodes")
-        else {
-            panic!("the repair uses GetHeaders");
-        };
-        request
-    };
-    let respond = |peer: ZakuraPeerId, request_id, successor_input| Event::SessionResponse {
-        peer,
-        session_id: 0,
-        scope: owner.header_authority(),
-        msg: HeaderSyncMessage::Headers(Headers {
-            request_id,
-            target_tip_hash: successor.hash,
-            common_ancestor_height: anchor.height,
-            common_ancestor_hash: anchor.hash,
-            complete: true,
-            tree_aux_schema: AuxSchema::V1,
-            entries: vec![
-                HeaderEntry {
-                    header: target_header.clone(),
-                    body_size: 0,
-                    tree_aux: Some(honest_target),
-                },
-                HeaderEntry {
-                    header: successor_header.clone(),
-                    body_size: 0,
-                    tree_aux: Some(successor_input),
-                },
-            ],
-        }),
+    let respond = |session: &PeerSession, subscription_id, successor_input| {
+        page_event(
+            session,
+            Headers {
+                subscription_id,
+                initial_target_tip_hash: successor.hash,
+                common_ancestor_height: anchor.height,
+                common_ancestor_hash: anchor.hash,
+                reaches_initial_target: true,
+                tree_aux_schema: AuxSchema::V1,
+                entries: vec![
+                    HeaderEntry {
+                        header: target_header.clone(),
+                        body_size: 0,
+                        tree_aux: Some(honest_target),
+                    },
+                    HeaderEntry {
+                        header: successor_header.clone(),
+                        body_size: 0,
+                        tree_aux: Some(successor_input),
+                    },
+                ],
+            },
+        )
     };
 
-    let (_short_peer, mut short_outbound) = connect(0x61, 1).await;
-    let (repeating_peer, mut repeating_outbound) = connect(0x62, 2).await;
+    let (_short, mut short_outbound) = connect(0x61, 1).await;
+    let (repeating, mut repeating_outbound) = connect(0x62, 2).await;
     handle
         .send(Event::VctRepairContextReady {
             owner,
@@ -1166,7 +1118,7 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
         })
         .await
         .expect("the ambiguous repair context reaches the reactor");
-    let request = decode_request(
+    let request = update(
         time::timeout(std::time::Duration::from_secs(1), repeating_outbound.recv())
             .await
             .expect("the supplier that serves both headers receives the request")
@@ -1178,14 +1130,14 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
             .is_err(),
         "a supplier limited to one header cannot serve the ambiguous boundary"
     );
-    assert_eq!(request.target_tip_hash, successor.hash);
+    assert_eq!(request.initial_target_tip_hash, successor.hash);
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
-    assert_eq!(request.max_header_count, 2);
+    assert_eq!(request.added_credit.objects, 2);
 
     handle
         .send(respond(
-            repeating_peer,
-            request.request_id,
+            &repeating,
+            request.subscription_id,
             corrupt_successor,
         ))
         .await
@@ -1197,16 +1149,16 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
         "a response that repeats both retained payloads cannot reach state"
     );
 
-    let (slot_peer, mut slot_outbound) = connect(0x64, 2).await;
-    assert_eq!(slot_peer, successor_slot_peer);
-    let request = decode_request(
+    let (slot, mut slot_outbound) = connect(0x64, 2).await;
+    assert_eq!(slot.peer_id(), &successor_slot_peer);
+    let request = update(
         time::timeout(std::time::Duration::from_secs(1), slot_outbound.recv())
             .await
             .expect("a supplier with only a successor slot can still replace the target")
             .expect("the supplier stream stays open"),
     );
     handle
-        .send(respond(slot_peer, request.request_id, honest_successor))
+        .send(respond(&slot, request.subscription_id, honest_successor))
         .await
         .expect("the second successor payload reaches the reactor");
     assert!(
@@ -1216,8 +1168,8 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
         "state drops a second rooted successor payload from the same supplier"
     );
 
-    let (replacing_peer, mut replacing_outbound) = connect(0x63, 2).await;
-    let request = decode_request(
+    let (replacing, mut replacing_outbound) = connect(0x63, 2).await;
+    let request = update(
         time::timeout(std::time::Duration::from_secs(1), replacing_outbound.recv())
             .await
             .expect("the next supplier receives the ambiguous repair request")
@@ -1225,8 +1177,8 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
     );
     handle
         .send(respond(
-            replacing_peer,
-            request.request_id,
+            &replacing,
+            request.subscription_id,
             honest_successor,
         ))
         .await

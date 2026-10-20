@@ -1,6 +1,6 @@
 //! Constant values used in mining rpcs methods.
 
-use jsonrpsee_types::ErrorCode;
+use crate::server::jsonrpc::ErrorCode;
 
 use zakura_chain::{
     block,

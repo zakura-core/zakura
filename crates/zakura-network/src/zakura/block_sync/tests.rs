@@ -34,6 +34,7 @@ use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
     trace::BlockBodySource,
+    wire_codec::WireError,
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
@@ -170,6 +171,66 @@ fn fill_loop_mechanics_config() -> ZakuraBlockSyncConfig {
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..immediate_body_download_config()
     }
+}
+
+/// The zero-height local frontiers most block-sync tests start from.
+pub(super) fn genesis_frontiers() -> BlockSyncFrontiers {
+    BlockSyncFrontiers {
+        finalized_height: block::Height(0),
+        verified_block_tip: block::Height(0),
+        verified_block_hash: block::Hash([0; 32]),
+    }
+}
+
+/// A header-tip watch channel that starts at genesis.
+fn genesis_tip_channel() -> (
+    watch::Sender<(block::Height, block::Hash)>,
+    watch::Receiver<(block::Height, block::Hash)>,
+) {
+    watch::channel((block::Height(0), block::Hash([0; 32])))
+}
+
+/// Reactor startup with genesis frontiers and a genesis header tip.
+fn genesis_startup(
+    tip_rx: watch::Receiver<(block::Height, block::Hash)>,
+    config: ZakuraBlockSyncConfig,
+) -> BlockSyncStartup {
+    BlockSyncStartup::new(
+        genesis_frontiers(),
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config,
+    )
+}
+
+/// Spawns a reactor from [`genesis_startup`], returning the tip sender with its outputs.
+fn spawn_genesis_reactor(
+    config: ZakuraBlockSyncConfig,
+) -> (
+    watch::Sender<(block::Height, block::Hash)>,
+    BlockSyncHandle,
+    mpsc::Receiver<BlockSyncAction>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tip_tx, tip_rx) = genesis_tip_channel();
+    let (handle, actions, reactor_task) =
+        spawn_block_sync_reactor(genesis_startup(tip_rx, config)).expect("valid block-sync config");
+    (tip_tx, handle, actions, reactor_task)
+}
+
+/// Spawns a genesis reactor plus a test service attached to a clone of its handle.
+fn spawn_genesis_service(
+    config: ZakuraBlockSyncConfig,
+) -> (
+    watch::Sender<(block::Height, block::Hash)>,
+    BlockSyncHandle,
+    mpsc::Receiver<BlockSyncAction>,
+    tokio::task::JoinHandle<()>,
+    BlockSyncService,
+) {
+    let (tip_tx, handle, actions, reactor_task) = spawn_genesis_reactor(config.clone());
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    (tip_tx, handle, actions, reactor_task, service)
 }
 
 fn alarmed_committed_snapshot(
@@ -1992,7 +2053,7 @@ fn codec_rejects_malformed_discriminator_and_truncated_payload() {
 
     assert!(matches!(
         BlockSyncMessage::decode(&[MSG_BS_GET_BLOCKS, 1, 0]),
-        Err(BlockSyncWireError::Io(_))
+        Err(BlockSyncWireError::Wire(WireError::Truncated(_)))
     ));
 }
 
@@ -2036,7 +2097,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: 0,
         }
         .encode(),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_get_blocks = vec![MSG_BS_GET_BLOCKS];
@@ -2044,7 +2105,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_get_blocks.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_get_blocks),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_range_unavailable = vec![MSG_BS_RANGE_UNAVAILABLE];
@@ -2052,7 +2113,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_range_unavailable.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_range_unavailable),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2061,7 +2122,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2070,7 +2131,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2079,7 +2140,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 }
 
@@ -2122,28 +2183,73 @@ fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
     ));
 }
 
+/// The public decoder shares the regulated Status checks instead of clamping
+/// limits that a regulated peer would be disconnected for sending.
 #[test]
-fn status_decode_clamps_peer_capacity_advertisements() {
-    let mut payload = Vec::new();
-    payload.push(MSG_BS_STATUS);
-    payload.extend_from_slice(&block::Height(1).0.to_le_bytes());
-    payload.extend_from_slice(&block::Height(2).0.to_le_bytes());
-    block::Hash([9; 32])
-        .zcash_serialize(&mut payload)
-        .expect("hash serializes");
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+fn status_decode_rejects_limits_outside_the_protocol_bounds() {
+    let valid = BlockSyncMessage::Status(status())
+        .encode()
+        .expect("message encodes");
+    assert_eq!(valid.len(), 53);
+    // Tag, two heights, and the tip hash precede the three limits.
+    for (offset, max) in [
+        (41, MAX_BS_BLOCKS_PER_REQUEST),
+        (45, MAX_BS_INFLIGHT_REQUESTS),
+        (49, MAX_BS_RESPONSE_BYTES),
+    ] {
+        for value in [0, max + 1, u32::MAX] {
+            let mut payload = valid.clone();
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                matches!(
+                    BlockSyncMessage::decode(&payload),
+                    Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
+                ),
+                "limit at byte {offset} accepted {value}"
+            );
+        }
+        let mut payload = valid.clone();
+        payload[offset..offset + 4].copy_from_slice(&max.to_le_bytes());
+        assert!(BlockSyncMessage::decode(&payload).is_ok());
+    }
+}
 
-    let BlockSyncMessage::Status(status) =
-        BlockSyncMessage::decode(&payload).expect("status decodes")
-    else {
-        panic!("expected status message");
-    };
-
-    assert_eq!(status.max_blocks_per_response, MAX_BS_BLOCKS_PER_REQUEST);
-    assert_eq!(status.max_inflight_requests, MAX_BS_INFLIGHT_REQUESTS);
-    assert_eq!(status.max_response_bytes, MAX_BS_RESPONSE_BYTES);
+/// The public encoder rejects the Status values the decoder rejects, instead of
+/// clamping them into a different advertisement.
+#[test]
+fn status_encode_rejects_what_the_decoder_rejects() {
+    let invalid = [
+        BlockSyncStatus {
+            max_blocks_per_response: 0,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST + 1,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_inflight_requests: 0,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_response_bytes: MAX_BS_RESPONSE_BYTES + 1,
+            ..status()
+        },
+        BlockSyncStatus {
+            servable_low: block::Height(2),
+            servable_high: block::Height(1),
+            ..status()
+        },
+    ];
+    for status in invalid {
+        assert!(
+            matches!(
+                BlockSyncMessage::Status(status).encode(),
+                Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
+            ),
+            "encoded {status:?}"
+        );
+    }
 }
 
 #[test]
@@ -3321,19 +3427,7 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         WriteState::Dropped,
     ] {
         let config = immediate_body_download_config();
-        let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-        let startup = BlockSyncStartup::new(
-            BlockSyncFrontiers {
-                finalized_height: block::Height(0),
-                verified_block_tip: block::Height(0),
-                verified_block_hash: block::Hash([0; 32]),
-            },
-            (block::Height(0), block::Hash([0; 32])),
-            tip_rx,
-            config.clone(),
-        );
-        let (handle, _actions, reactor_task) =
-            spawn_block_sync_reactor(startup).expect("valid block-sync config");
+        let (_tip_tx, handle, _actions, reactor_task) = spawn_genesis_reactor(config.clone());
         let wiring = handle.routine_wiring.as_ref().unwrap();
         let now = Instant::now();
         let mut generation = 0;
@@ -3664,20 +3758,7 @@ fn work_queue_height_is_in_exactly_one_set() {
 #[tokio::test]
 async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
     let config = fill_loop_mechanics_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Peer serves heights 1..=4 and accepts four concurrent single-block requests.
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -3748,19 +3829,7 @@ async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
 #[tokio::test]
 async fn reactor_suppresses_duplicate_needed_block_query_until_response() {
     let config = immediate_body_download_config();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config,
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, mut actions, reactor_task) = spawn_genesis_reactor(config);
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3815,19 +3884,7 @@ async fn reactor_suppresses_duplicate_needed_block_query_until_response() {
 #[tokio::test]
 async fn reactor_requeries_a_height_stranded_below_higher_claimed_work() {
     let config = immediate_body_download_config();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config,
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, mut actions, reactor_task) = spawn_genesis_reactor(config);
     let best_hash = block::Hash([10; 32]);
 
     handle
@@ -3872,19 +3929,7 @@ async fn reactor_requeries_a_height_stranded_below_higher_claimed_work() {
 #[tokio::test]
 async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
     let config = immediate_body_download_config();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config,
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, mut actions, reactor_task) = spawn_genesis_reactor(config);
     let best_hash = block::Hash([4; 32]);
 
     handle
@@ -3940,20 +3985,7 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
 #[tokio::test]
 async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
     let config = fill_loop_mechanics_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Three peers, each willing to serve heights 1..=12 and accept four
     // concurrent single-block requests. The budget is ample, so the fill order
@@ -4064,20 +4096,7 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
 #[tokio::test]
 async fn reactor_budget_constrained_issuance_rotates_across_peers() {
     let config = fill_loop_mechanics_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Three peers, each able to serve height 1 with a single in-flight slot.
     // Distinct ascending id bytes give the old sorted order a fixed lowest peer
@@ -4177,20 +4196,7 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     config.request_timeout = Duration::from_millis(400);
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Two peers, both able to serve heights 1..=2 with a single in-flight slot.
     // One will be left holding an unanswered request (the slow peer); the other
@@ -4320,17 +4326,8 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     config.request_timeout = Duration::from_millis(400);
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let mut startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
+    let (tip_tx, tip_rx) = genesis_tip_channel();
+    let mut startup = genesis_startup(tip_rx, config.clone());
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -4444,20 +4441,7 @@ async fn check_cold_probe_deadline(expired: bool) {
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
 
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     let peer = peer(0x53);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -4574,17 +4558,8 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
         .expect("trace capture initializes");
     let config = immediate_body_download_config();
 
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let mut startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
+    let (_tip_tx, tip_rx) = genesis_tip_channel();
+    let mut startup = genesis_startup(tip_rx, config.clone());
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (_handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -5013,6 +4988,135 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
+/// Build a sequencer with a decoded-byte cap, buffer Mainnet blocks 1 to 3
+/// charged `wire_bytes` each, and drain them into `applying`.
+fn capped_sequencer_with_blocks_1_to_3(
+    max_checkpoint_height: u32,
+    max_decoded_bytes: u64,
+    wire_bytes: u64,
+) -> (Sequencer, Vec<Arc<block::Block>>) {
+    let mut seq = test_sequencer(0, 8)
+        .with_decoded_window_cap(block::Height(max_checkpoint_height), max_decoded_bytes);
+    let blocks = mainnet_blocks_1_to_3();
+    for (index, block) in blocks.iter().enumerate() {
+        let height = block::Height(index as u32 + 1);
+        let body =
+            BufferedBlockBody::from_decoded_block(block.clone(), Some(raw_block_payload(block)));
+        seq.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            block.hash(),
+            block.header.previous_block_hash,
+            body,
+            wire_bytes,
+            peer(0),
+        );
+    }
+    seq.drain_ready_into_applying();
+    (seq, blocks)
+}
+
+/// Submit every currently submittable height the way the sequencer task does,
+/// rechecking the measured decoded window before each one, and return the
+/// dispatch items.
+fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
+    let mut items = Vec::new();
+    for height in seq.submittable_heights() {
+        if !seq.submission_fits_decoded_window(height) {
+            break;
+        }
+        items.push(seq.prepare_submit(height).expect("height is applying"));
+    }
+    items
+}
+
+/// Retire a submission the way a committed apply completion does.
+fn finish_committed(seq: &mut Sequencer, item: &SubmitItem) {
+    seq.remove_applying(item.height);
+    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+}
+
+#[test]
+fn sequencer_decoded_cap_holds_above_last_checkpoint() {
+    // Height 1 drains decoded; heights 2 and 3 arrived out of order and stay
+    // raw, so each is charged its wire bytes times the decode factor.
+    let wire_bytes = 1_000;
+    let raw_estimate = wire_bytes * DESERIALIZED_MEM_FACTOR;
+    let decoded_1 = mainnet_blocks_1_to_3()[0].attributed_memory_size_bytes();
+    let cap = decoded_1 + raw_estimate;
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(0, cap, wire_bytes);
+    assert_eq!(seq.decoded_applying_count(), 1);
+
+    // The count window has room for all three, but the cap fits only two.
+    let items = submit_all(&mut seq);
+    assert_eq!(
+        items.iter().map(|item| item.height).collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert_eq!(seq.decoded_applying_count(), 2);
+    assert!(seq.submittable_heights().is_empty());
+    assert_eq!(
+        seq.applying_decoded_attributed_memory_bytes(),
+        seq.applying_decoded_attributed_memory_bytes_scanned()
+    );
+
+    // Height 3 waits raw until the earlier submissions release their charge.
+    for item in &items {
+        finish_committed(&mut seq, item);
+    }
+    assert_eq!(seq.decoded_applying_count(), 0);
+    assert_eq!(seq.submittable_heights(), vec![block::Height(3)]);
+}
+
+#[test]
+fn sequencer_checkpoint_heights_ignore_decoded_cap() {
+    // At or below the last checkpoint only the count window applies, even with
+    // a cap smaller than one block, because checkpoint ranges must be
+    // co-resident.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(3, 1, 1_000);
+    assert_eq!(seq.decoded_applying_count(), 1);
+    assert_eq!(
+        submit_all(&mut seq)
+            .iter()
+            .map(|item| item.height)
+            .collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2), block::Height(3)]
+    );
+
+    // A window straddling the last checkpoint submits the checkpoint heights,
+    // then caps the first height above it.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(2, 1, 1_000);
+    assert_eq!(
+        submit_all(&mut seq)
+            .iter()
+            .map(|item| item.height)
+            .collect::<Vec<_>>(),
+        vec![block::Height(1), block::Height(2)]
+    );
+    assert!(seq.submittable_heights().is_empty());
+}
+
+#[test]
+fn sequencer_decoded_cap_still_submits_one_oversized_body() {
+    // Every block exceeds a one-byte cap above the checkpoint.
+    let (mut seq, _) = capped_sequencer_with_blocks_1_to_3(0, 1, 1_000);
+    // Draining does not keep a decoded copy past the cap.
+    assert_eq!(seq.decoded_applying_count(), 0);
+
+    // With nothing in flight, one body is always submittable, one at a time.
+    for height in 1..=3 {
+        let items = submit_all(&mut seq);
+        assert_eq!(
+            items.iter().map(|item| item.height).collect::<Vec<_>>(),
+            vec![block::Height(height)]
+        );
+        assert!(seq.submittable_heights().is_empty());
+        finish_committed(&mut seq, &items[0]);
+    }
+    assert_eq!(seq.applying_len(), 0);
+}
+
 #[test]
 fn sequencer_applying_counters_match_scan_across_transitions() {
     // Assert the O(1) applying and in-flight-submission counters never drift
@@ -5135,11 +5239,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     assert_eq!(submission_limit, 401);
 
     let blocks = fake_sequential_blocks(BLOCK_COUNT);
-    let frontiers = BlockSyncFrontiers {
-        finalized_height: block::Height(0),
-        verified_block_tip: block::Height(0),
-        verified_block_hash: block::Hash([0; 32]),
-    };
+    let frontiers = genesis_frontiers();
     let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
@@ -5321,6 +5421,286 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     task.abort();
 }
 
+/// Wait up to `timeout` for the next `SubmitBlock`, skipping other actions.
+async fn next_submission(
+    actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
+    timeout: Duration,
+) -> Option<(BlockApplyToken, Arc<block::Block>)> {
+    time::timeout(timeout, async {
+        loop {
+            let action = actions_rx
+                .recv()
+                .await
+                .expect("sequencer action channel remains live");
+            if let BlockSyncAction::SubmitBlock { token, block, .. } = action {
+                return (token, block);
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// A running sequencer task whose window is decoded-capped above height 0.
+struct CappedSequencerTask {
+    body_tx: mpsc::Sender<SequencedBody>,
+    control_tx: mpsc::UnboundedSender<SequencerControlInput>,
+    actions_rx: mpsc::Receiver<BlockSyncAction>,
+    body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl CappedSequencerTask {
+    const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
+    const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+    /// Spawn a sequencer task at genesis with a `max_decoded_bytes` cap above
+    /// height 0 and a full checkpoint-sized count window.
+    fn spawn(max_decoded_bytes: u64) -> Self {
+        let frontiers = genesis_frontiers();
+        let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body_input_decoded_attributed_memory_bytes =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (body_tx, body_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, actions_rx) = mpsc::channel(8);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let task = SequencerTask::new(
+            Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+                .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
+            ByteBudget::new(1),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions_tx,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            body_input_bytes.clone(),
+            body_input_decoded_attributed_memory_bytes.clone(),
+            view_tx,
+            Self::CHANNEL_TIMEOUT,
+            ZakuraTrace::noop(),
+        );
+        Self {
+            body_tx,
+            control_tx,
+            actions_rx,
+            body_input_bytes,
+            body_input_decoded_attributed_memory_bytes,
+            task: tokio::spawn(task.run()),
+        }
+    }
+
+    /// Queue `block` at `height` for `owner`, charged `wire_bytes`.
+    async fn send_body(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: u32,
+        block: &Arc<block::Block>,
+        wire_bytes: u64,
+    ) {
+        self.body_tx
+            .send(SequencedBody::new_queued(
+                owner,
+                zakura_header_chain::SourceId::from_digest([1; 32]),
+                block::Height(height),
+                block.hash(),
+                block.header.previous_block_hash,
+                BufferedBlockBody::from_decoded_block(
+                    block.clone(),
+                    Some(raw_block_payload(block)),
+                ),
+                wire_bytes,
+                peer(1),
+                Instant::now(),
+                self.body_input_bytes.clone(),
+                self.body_input_decoded_attributed_memory_bytes.clone(),
+            ))
+            .await
+            .expect("sequencer body channel remains live");
+    }
+
+    /// The next submission, failing the test if none arrives.
+    async fn expect_submission(&mut self, height: u32) -> BlockApplyToken {
+        let (token, block) = next_submission(&mut self.actions_rx, Self::CHANNEL_TIMEOUT)
+            .await
+            .unwrap_or_else(|| panic!("height {height} is submitted"));
+        assert_eq!(block.coinbase_height(), Some(block::Height(height)));
+        token
+    }
+
+    /// Fail the test if any submission arrives shortly.
+    async fn expect_no_submission(&mut self, reason: &str) {
+        assert!(
+            next_submission(&mut self.actions_rx, Self::MISSING_SUBMISSION_TIMEOUT)
+                .await
+                .is_none(),
+            "{reason}",
+        );
+    }
+
+    /// Report an apply completion for a submitted block.
+    fn finish(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        token: BlockApplyToken,
+        height: u32,
+        block: &Arc<block::Block>,
+        result: BlockApplyResult,
+        semantic_completion: Option<zakura_header_chain::BodyWorkOwner>,
+    ) {
+        self.control_tx
+            .send(SequencerControlInput::ApplyFinished {
+                owner: Box::new(owner),
+                source: zakura_header_chain::SourceId::from_digest([1; 32]),
+                token,
+                height: block::Height(height),
+                hash: block.hash(),
+                outcome: test_block_apply_outcome(result),
+                eligible_sources: BTreeSet::new(),
+                persisted_availability: None,
+                semantic_completion: semantic_completion
+                    .map(|owner| (owner, zakura_header_chain::StateVersion::default())),
+            })
+            .expect("apply completion queues");
+    }
+}
+
+#[tokio::test]
+async fn decoded_cap_wakes_pending_work_after_superseded_owner_completion() {
+    let blocks = fake_sequential_blocks(2);
+    // Both blocks exceed a one-byte cap above the checkpoint, so only one is
+    // submitted at a time.
+    let mut task = CappedSequencerTask::spawn(1);
+    for (index, block) in blocks.iter().enumerate() {
+        task.send_body(
+            test_work_owner(),
+            index as u32 + 1,
+            block,
+            u64::from(block_size(block)),
+        )
+        .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_no_submission("the cap holds height 2 back while height 1 is submitted")
+        .await;
+
+    // A completion without a semantic owner removes height 1 from `applying`.
+    // The window then has nothing submitted, so height 2 must be woken.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::Committed,
+        None,
+    );
+    task.expect_submission(2).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_detached_submissions_never_block_current_work() {
+    let blocks = fake_sequential_blocks(2);
+    let mut task = CappedSequencerTask::spawn(1);
+    task.send_body(
+        test_work_owner(),
+        1,
+        &blocks[0],
+        u64::from(block_size(&blocks[0])),
+    )
+    .await;
+    task.expect_submission(1).await;
+
+    // An epoch change detaches height 1, which stays charged and never
+    // completes here. The new epoch's height 2 must still be submitted.
+    let mut changed_authority = test_work_scope();
+    changed_authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+    let changed_owner =
+        changed_authority.bind(test_work_owner().session_id, test_work_owner().request_id);
+    task.control_tx
+        .send(SequencerControlInput::BodyWorkEpochChanged {
+            authority: changed_authority,
+            frontiers: BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(1),
+                verified_block_hash: blocks[0].hash(),
+            },
+        })
+        .expect("epoch change queues");
+    task.send_body(
+        changed_owner,
+        2,
+        &blocks[1],
+        u64::from(block_size(&blocks[1])),
+    )
+    .await;
+    task.expect_submission(2).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_resubmits_failed_parent_while_successors_stay_detached() {
+    let blocks = fake_sequential_blocks(3);
+    // Heights 3 and 2 arrive first claiming one wire byte, so height 1 releases
+    // a batch. The cap fits height 1 plus height 2's estimate, so 1 and 2 are
+    // submitted and the measured recheck stops height 3.
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let mut task = CappedSequencerTask::spawn(decoded_1 + DESERIALIZED_MEM_FACTOR);
+    for height in [3, 2, 1] {
+        task.send_body(test_work_owner(), height, &blocks[height as usize - 1], 1)
+            .await;
+    }
+    let token_1 = task.expect_submission(1).await;
+    task.expect_submission(2).await;
+    task.expect_no_submission("the measured recheck holds height 3 back")
+        .await;
+
+    // Height 1 times out. Height 2 is detached and keeps its charge, as a
+    // successor waiting in state for its parent would, and never completes.
+    task.finish(
+        test_work_owner(),
+        token_1,
+        1,
+        &blocks[0],
+        BlockApplyResult::TimedOut,
+        Some(test_work_owner()),
+    );
+    // The retried parent's estimate alone exceeds the cap, but the window has
+    // nothing submitted, so it must be admitted.
+    task.send_body(test_work_owner(), 1, &blocks[0], 1_000_000)
+        .await;
+    task.expect_submission(1).await;
+    task.task.abort();
+}
+
+#[tokio::test]
+async fn decoded_cap_rechecks_measured_size_between_batch_submissions() {
+    let blocks = fake_sequential_blocks(3);
+    // Each body claims one wire byte, so the projection charges a raw body only
+    // `DESERIALIZED_MEM_FACTOR` bytes. The cap fits height 1 decoded plus both
+    // raw estimates, but not height 2's real decoded size.
+    let decoded_1 = blocks[0].attributed_memory_size_bytes();
+    let mut task = CappedSequencerTask::spawn(decoded_1 + 2 * DESERIALIZED_MEM_FACTOR);
+    // Heights 3 and 2 arrive first and stay raw, so height 1 releases all
+    // three in one batch.
+    for height in [3, 2, 1] {
+        task.send_body(test_work_owner(), height, &blocks[height as usize - 1], 1)
+            .await;
+    }
+    task.expect_submission(1).await;
+    task.expect_submission(2).await;
+    task.expect_no_submission(
+        "height 2's measured decoded size must stop the batch before height 3",
+    )
+    .await;
+    task.task.abort();
+}
+
 #[tokio::test]
 async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     const BLOCK_COUNT: u32 = 402;
@@ -5331,11 +5711,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     assert_eq!(submission_limit, 401);
     let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("402 test bodies fit in usize");
     let blocks = fake_sequential_blocks(BLOCK_COUNT);
-    let frontiers = BlockSyncFrontiers {
-        finalized_height: block::Height(0),
-        verified_block_tip: block::Height(0),
-        verified_block_hash: block::Hash([0; 32]),
-    };
+    let frontiers = genesis_frontiers();
     let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let body_input_decoded_attributed_memory_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (body_tx, body_rx) = mpsc::channel(body_channel_capacity);
@@ -6819,6 +7195,273 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
     drop(new_inbound_tx);
 }
 
+/// How the first session ends in [`stale_disconnect_keeps_replacement_registry_entry`].
+#[derive(Clone, Copy, Debug)]
+enum FirstSessionEnd {
+    /// The stream closes and reopens on the same connection.
+    StreamReopened,
+    /// The connection closes and the peer returns on a new connection.
+    Reconnected,
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reopened_stream_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::StreamReopened).await;
+}
+
+#[tokio::test]
+async fn stale_disconnect_keeps_reconnected_peer_registry_entry() {
+    stale_disconnect_keeps_replacement_registry_entry(FirstSessionEnd::Reconnected).await;
+}
+
+/// A spawned reactor and a service whose lifecycle events the test relays to
+/// it, so the test decides when the reactor handles each one.
+pub(super) struct RelayedBlockSync {
+    handle: BlockSyncHandle,
+    pub(super) service: BlockSyncService,
+    lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    snapshots: watch::Receiver<ServicePeerSnapshot>,
+    _tip: watch::Sender<(block::Height, block::Hash)>,
+    _actions: mpsc::Receiver<BlockSyncAction>,
+}
+
+impl RelayedBlockSync {
+    /// Spawn a reactor and a relayed service, both using `config`.
+    pub(super) fn spawn(config: ZakuraBlockSyncConfig) -> Self {
+        let (tip, handle, actions, _reactor_task) = spawn_genesis_reactor(config.clone());
+        let (lifecycle_tx, lifecycle) = mpsc::unbounded_channel();
+        let service = BlockSyncService::new_with_handle_for_test(
+            config,
+            BlockSyncHandle {
+                lifecycle: lifecycle_tx,
+                ..handle.clone()
+            },
+        );
+        Self {
+            snapshots: handle.subscribe_peer_snapshot(),
+            handle,
+            service,
+            lifecycle,
+            _tip: tip,
+            _actions: actions,
+        }
+    }
+
+    /// The registry the reactor shares with the service's routines.
+    fn registry(&self) -> &PeerRegistry {
+        &self
+            .handle
+            .routine_wiring
+            .as_ref()
+            .expect("a spawned reactor wires peer routines")
+            .registry
+    }
+
+    /// Whether the registry has an entry for `peer`.
+    pub(super) fn has_entry(&self, peer: &ZakuraPeerId) -> bool {
+        self.registry()
+            .candidate_snapshot()
+            .iter()
+            .any(|(candidate, ..)| candidate == peer)
+    }
+
+    /// Open a regulated outbound block-sync stream for `peer` on `conn_id`.
+    /// Dropping the returned inbound sender ends the stream.
+    pub(super) fn add_outbound(
+        &self,
+        conn_id: u64,
+        peer: &ZakuraPeerId,
+    ) -> (FramedSend, FramedRecv) {
+        let (inbound_tx, inbound_rx) = framed_channel(4);
+        let (outbound_tx, outbound_rx) = framed_channel(4);
+        self.service.add_peer(Peer::new_with_conn_id_and_direction(
+            conn_id,
+            peer.clone(),
+            None,
+            ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+            ServicePeerDirection::Outbound,
+            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+            CancellationToken::new(),
+        ));
+        (inbound_tx, outbound_rx)
+    }
+
+    /// Wait for the next lifecycle event the service queued for the reactor.
+    pub(super) async fn next_event(&mut self) -> BlockSyncEvent {
+        tokio::time::timeout(Duration::from_secs(3), self.lifecycle.recv())
+            .await
+            .expect("lifecycle event arrives")
+            .expect("lifecycle channel stays open")
+    }
+
+    /// Relay `event` to the reactor and return its admitted outbound peer count
+    /// once the reactor has handled it.
+    pub(super) async fn relay(&mut self, event: BlockSyncEvent) -> usize {
+        self.snapshots.borrow_and_update();
+        self.handle
+            .send_control(event)
+            .expect("the reactor is running");
+        // The reactor republishes its peer snapshot for every peer lifecycle
+        // event it handles, except a connect it skips.
+        tokio::time::timeout(Duration::from_secs(3), self.snapshots.changed())
+            .await
+            .expect("the reactor handles the relayed event")
+            .expect("the peer snapshot stays open");
+        self.snapshots.borrow().outbound_peers
+    }
+}
+
+/// Whether `event` is a connect for `peer`.
+fn connects(event: &BlockSyncEvent, peer: &ZakuraPeerId) -> bool {
+    matches!(event, BlockSyncEvent::PeerConnected(session) if session.peer_id() == peer)
+}
+
+/// Whether `event` is a disconnect for `peer`.
+fn disconnects(event: &BlockSyncEvent, peer: &ZakuraPeerId) -> bool {
+    matches!(event, BlockSyncEvent::PeerDisconnected(gone) if gone == peer)
+}
+
+/// Admit a replacement session before the reactor handles the first session's
+/// disconnect. The stale disconnect must leave the replacement's registry entry
+/// in place, so the replacement's `Status` still reaches the registry. The
+/// replacement's own disconnect then removes its handle and entry.
+async fn stale_disconnect_keeps_replacement_registry_entry(end: FirstSessionEnd) {
+    let mut relayed = RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
+    let peer = peer(0x52);
+    let first_conn_id = 1;
+
+    let (first_inbound_tx, _first_outbound_rx) = relayed.add_outbound(first_conn_id, &peer);
+    let connected = relayed.next_event().await;
+    assert!(connects(&connected, &peer));
+    assert_eq!(relayed.relay(connected).await, 1);
+
+    let second_conn_id = match end {
+        FirstSessionEnd::StreamReopened => {
+            drop(first_inbound_tx);
+            first_conn_id
+        }
+        FirstSessionEnd::Reconnected => {
+            relayed.service.remove_peer(&peer, first_conn_id);
+            first_conn_id + 1
+        }
+    };
+    let disconnected = relayed.next_event().await;
+    assert!(disconnects(&disconnected, &peer));
+
+    // The replacement is admitted before the reactor handles that disconnect.
+    let (second_inbound_tx, _second_outbound_rx) = relayed.add_outbound(second_conn_id, &peer);
+    let replacement = relayed.next_event().await;
+    assert!(connects(&replacement, &peer));
+
+    assert_eq!(relayed.relay(disconnected).await, 0);
+    assert_eq!(relayed.relay(replacement).await, 1);
+    assert!(
+        relayed.has_entry(&peer),
+        "a stale disconnect must not remove the replacement's registry entry",
+    );
+
+    second_inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+    await_until(
+        "the replacement's status reaches the registry",
+        Duration::from_secs(3),
+        || relayed.registry().has_received_status(&peer),
+    )
+    .await
+    .expect("the replacement routine publishes its peer's status");
+
+    drop(second_inbound_tx);
+    let gone = relayed.next_event().await;
+    assert!(disconnects(&gone, &peer));
+    assert_eq!(relayed.relay(gone).await, 0);
+    assert!(
+        !relayed.has_entry(&peer),
+        "the replacement's own disconnect removes its registry entry",
+    );
+}
+
+/// A replaced session sends no disconnect of its own. If its replacement ends
+/// before the reactor handles the replacement's connect, the reactor skips that
+/// connect. The replacement's disconnect must still drop the replaced session's
+/// serving handle and the replacement's closed registry entry.
+#[tokio::test]
+async fn disconnect_of_a_skipped_replacement_removes_the_older_handle() {
+    let mut relayed = RelayedBlockSync::spawn(ZakuraBlockSyncConfig::default());
+    let peer = peer(0x53);
+
+    let _old_stream = relayed.add_outbound(1, &peer);
+    let connected = relayed.next_event().await;
+    assert_eq!(relayed.relay(connected).await, 1);
+
+    let _new_stream = relayed.add_outbound(2, &peer);
+    let BlockSyncEvent::PeerConnected(replacement) = relayed.next_event().await else {
+        panic!("the replacement session connects");
+    };
+    replacement.cancel_token().cancel();
+    let disconnect = relayed.next_event().await;
+    assert!(disconnects(&disconnect, &peer));
+
+    // The reactor skips the cancelled connect without publishing a snapshot.
+    relayed
+        .handle
+        .send_control(BlockSyncEvent::PeerConnected(replacement))
+        .expect("the reactor is running");
+    assert_eq!(
+        relayed.relay(disconnect).await,
+        0,
+        "the replaced session's handle must not outlive its replacement",
+    );
+    assert!(!relayed.has_entry(&peer));
+}
+
+/// The reactor parks a session it has no slot for but leaves the session's
+/// registry entry to the session's teardown, since by then the entry could
+/// belong to a replacement. The rejected session's disconnect removes it.
+#[tokio::test]
+async fn a_rejected_session_leaves_its_registry_entry_to_its_teardown() {
+    let mut config = ZakuraBlockSyncConfig::default();
+    config.peer_limits.max_outbound_peers = 1;
+    let mut relayed = RelayedBlockSync::spawn(config);
+    let (holder, rejected) = (peer(0x54), peer(0x55));
+
+    // The holder's ended session keeps the reactor's only outbound slot until
+    // the reactor handles its disconnect.
+    let (holder_inbound_tx, _holder_outbound_rx) = relayed.add_outbound(1, &holder);
+    let connected = relayed.next_event().await;
+    assert_eq!(relayed.relay(connected).await, 1);
+    drop(holder_inbound_tx);
+    let holder_gone = relayed.next_event().await;
+    assert!(disconnects(&holder_gone, &holder));
+
+    let _stream = relayed.add_outbound(2, &rejected);
+    let connect = relayed.next_event().await;
+    assert!(connects(&connect, &rejected));
+    assert_eq!(relayed.relay(connect).await, 1, "the reactor has no slot");
+    assert!(
+        relayed.has_entry(&rejected),
+        "rejection leaves the registry entry to the session's teardown",
+    );
+
+    let rejected_gone = relayed.next_event().await;
+    assert!(disconnects(&rejected_gone, &rejected));
+    assert_eq!(relayed.relay(holder_gone).await, 0);
+    assert_eq!(relayed.relay(rejected_gone).await, 0);
+    assert!(!relayed.has_entry(&rejected));
+}
+
 #[tokio::test]
 async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let mut config = ZakuraBlockSyncConfig::default();
@@ -6888,20 +7531,7 @@ async fn add_peer_malformed_frame_cancels_connection() {
     // The per-peer routine checks each frame's envelope before decoding it. A
     // malformed frame is a fatal protocol reject for the whole connection.
     let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, _reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, _handle, _actions, _reactor_task, service) = spawn_genesis_service(config);
 
     let peer = peer(3);
     let (inbound_tx, inbound_rx) = framed_channel(4);
@@ -6939,11 +7569,7 @@ async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
     let config = immediate_body_download_config();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(1), blocks[0].hash()),
         tip_rx,
         config.clone(),
@@ -7111,17 +7737,8 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
 #[tokio::test]
 async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     let config = immediate_body_download_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let mut startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
+    let (tip_tx, tip_rx) = genesis_tip_channel();
+    let mut startup = genesis_startup(tip_rx, config.clone());
     let trace = ZakuraTrace::noop();
     startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) =
@@ -7251,20 +7868,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     // advertised body fills the budget, throttling to one in-flight request.
     config.max_inflight_block_bytes = u64::from(block1_size);
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7396,20 +8000,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 4;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(73);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7560,20 +8151,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     // would have left no headroom for an underestimated body.
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -7653,20 +8231,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
     // budget stays far from binding for these tiny blocks.
     config.max_inflight_requests = 1;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
@@ -7821,11 +8386,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
@@ -7938,20 +8499,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
 async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_height() {
     let blocks = fake_sequential_blocks(3);
     let config = immediate_body_download_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8063,20 +8611,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8247,20 +8782,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     let mut config = immediate_body_download_config();
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8484,20 +9006,7 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Peer serves heights 1..=4 with four concurrent single-block slots.
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -8566,20 +9075,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
         &mut actions,
@@ -8680,20 +9176,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 4;
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -8780,20 +9263,7 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     };
     assert_eq!(config.bbr_cwnd_unit, CwndUnit::Bytes);
 
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Generous slot, response-byte and block-count advertisements, so only the
     // byte budget could limit how many requests go out.
@@ -8854,20 +9324,7 @@ async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
         ..ZakuraBlockSyncConfig::default()
     };
 
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
@@ -8917,19 +9374,7 @@ async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
 #[tokio::test]
 async fn reactor_zero_pause_threshold_preserves_lag_one_downloads() {
     let config = immediate_body_download_config();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config,
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, mut actions, reactor_task) = spawn_genesis_reactor(config);
 
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
@@ -8964,11 +9409,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(4), block::Hash([4; 32])),
         tip_rx,
         config.clone(),
@@ -9111,20 +9552,7 @@ async fn reactor_requests_single_blocks_and_submits_parent_first() {
         ..ZakuraBlockSyncConfig::default()
     };
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -9245,20 +9673,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     // deadline — that would hide the very regression this test guards.
     config.request_timeout = Duration::from_secs(300);
 
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(64);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -9388,11 +9803,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(3), blocks[2].hash()),
         tip_rx,
         config.clone(),
@@ -9462,20 +9873,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
 async fn reactor_accepts_blocks_done_after_completed_range() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10287,11 +10685,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
@@ -10464,20 +10858,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     let config = immediate_body_download_config();
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_hash = block.hash();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(61);
     let (inbound_tx, inbound_rx) = framed_channel(16);
     let (outbound_tx, mut outbound_rx) = framed_channel(16);
@@ -10554,11 +10935,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     };
 
     handle
-        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        }))
+        .send(BlockSyncEvent::ChainTipReset(genesis_frontiers()))
         .await
         .expect("reset event queues");
     // the reset's `reset_above` runs on the Sequencer task while routines
@@ -10989,20 +11366,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -11076,18 +11440,9 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 #[tokio::test]
 async fn reactor_accepts_rapid_status_growth_without_spam_score() {
     let config = ZakuraBlockSyncConfig::default();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (tip_tx, tip_rx) = genesis_tip_channel();
     drop(tip_tx);
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
+    let startup = genesis_startup(tip_rx, config.clone());
     let (handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
@@ -11140,18 +11495,9 @@ async fn reactor_accepts_rapid_status_growth_without_spam_score() {
 #[tokio::test]
 async fn reactor_ignores_redundant_status_burst_without_spam_score() {
     let config = ZakuraBlockSyncConfig::default();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (tip_tx, tip_rx) = genesis_tip_channel();
     drop(tip_tx);
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
+    let startup = genesis_startup(tip_rx, config.clone());
     let (handle, mut actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
@@ -11201,19 +11547,8 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
 
 #[tokio::test]
 async fn mismatched_header_retires_the_connection_without_a_fault_report() {
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        immediate_body_download_config(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (tip_tx, handle, mut actions, reactor_task) =
+        spawn_genesis_reactor(immediate_body_download_config());
     let service = BlockSyncService::new_with_handle_for_test(
         immediate_body_download_config(),
         handle.clone(),
@@ -11312,20 +11647,7 @@ async fn mismatched_header_retires_the_connection_without_a_fault_report() {
 #[tokio::test]
 async fn scheduled_get_blocks_is_sent_once_via_session() {
     let config = immediate_body_download_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Admit a peer through the production `add_peer` path with an observable
     // outbound transport channel.
@@ -11415,20 +11737,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
     };
 
     let blocks = mainnet_blocks_1_to_3();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (bad_peer, bad_inbound, mut bad_outbound) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -11646,20 +11955,7 @@ async fn reactor_retries_connect_status_after_a_full_outbound_queue() {
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 2;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, _actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(64);
     let (_inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(2);
@@ -11713,19 +12009,7 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, _actions, reactor_task) = spawn_genesis_reactor(config.clone());
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
     let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
@@ -11750,6 +12034,78 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
             .await
             .is_err(),
         "an inbound Status must not trigger a Status reply"
+    );
+
+    reactor_task.abort();
+}
+
+/// A Status the connection's cadence defers is legal pacing. The reactor waits
+/// for the cadence instant instead of retrying a full queue every 100 ms.
+#[tokio::test]
+async fn reactor_waits_for_a_deferred_status_without_reporting_queue_pressure() {
+    let mut capture = TraceCapture::for_test(
+        "reactor_waits_for_a_deferred_status_without_reporting_queue_pressure",
+    )
+    .expect("trace capture initializes");
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+    let (_inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer(66),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+
+    // The peer never sends its Status, so our Status stays due after the
+    // first one queues. The next attempt falls inside the 30 s cadence.
+    wait_for_outbound_status(&mut outbound_rx).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), outbound_rx.recv())
+            .await
+            .is_err(),
+        "the cadence holds the second Status"
+    );
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    let status_results: Vec<_> = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| {
+            row.get("event").and_then(|event| event.as_str()) == Some(bs_trace::BLOCK_MESSAGE_SENT)
+                && row.get("kind").and_then(|kind| kind.as_str()) == Some("status")
+        })
+        .filter_map(|row| row.get("result").and_then(|result| result.as_str()))
+        .collect();
+    assert_eq!(status_results, ["queued", "deferred"]);
+    assert!(
+        !reader
+            .rows()
+            .into_iter()
+            .any(|row| row.get("event").and_then(|event| event.as_str())
+                == Some("queue_send_failed")),
+        "a cadence deferral is not a queue failure"
     );
 
     reactor_task.abort();
@@ -12513,13 +12869,9 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     config.max_submitted_block_applies = 2;
     config.request_timeout = Duration::from_secs(300);
 
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_tip_tx, tip_rx) = genesis_tip_channel();
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(4), blocks[3].hash()),
         tip_rx,
         config.clone(),
@@ -12590,11 +12942,7 @@ async fn reactor_far_ahead_header_tip_queries_only_next_refill_window() {
         ..ZakuraBlockSyncConfig::default()
     };
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
         config,
@@ -12684,11 +13032,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
         ZakuraBlockSyncConfig::default(),
@@ -12773,11 +13117,7 @@ async fn failed_needed_block_query_retries_without_losing_newer_query_ownership(
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
         ZakuraBlockSyncConfig::default(),
@@ -12836,11 +13176,7 @@ async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
     let best_header_tip = block::Height(10);
     let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (best_header_tip, block::Hash([10; 32])),
         tip_rx,
         ZakuraBlockSyncConfig::default(),
@@ -12920,11 +13256,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         ..ZakuraBlockSyncConfig::default()
     };
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (best_header_tip, block::Hash([50; 32])),
         tip_rx,
         config,
@@ -13039,11 +13371,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
@@ -13099,7 +13427,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 /// — the honest peer is still offered the range and makes progress.
 ///
 /// The audit flagged the unpenalized retry path as a possible wedge (two peers
-/// re-occupying the whole fanout). Verified here that it is not: `handle_range_unavailable`
+/// re-occupying the whole fanout). Verified here that it is not: `handle_ending`
 /// reschedules immediately after each response, and with one in-flight request per
 /// peer the other misbehaving peer is still busy holding its stale request when the
 /// first frees its slot, so the honest peer claims the freed companion slot. The
@@ -13115,11 +13443,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     config.request_timeout = Duration::from_secs(300);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
@@ -13219,11 +13543,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
+        genesis_frontiers(),
         (block::Height(2), blocks[1].hash()),
         tip_rx,
         config.clone(),
@@ -13522,20 +13842,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
 #[tokio::test]
 async fn reactor_publishes_block_sync_candidate_gap() {
     let config = immediate_body_download_config();
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(77);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -13748,20 +14055,7 @@ async fn oversize_body_hint_keeps_the_body_without_scoring_the_supplier() {
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 8;
-    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -13894,20 +14188,7 @@ async fn unsolicited_terminator_closes_the_connection() {
 #[tokio::test]
 async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
     let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, mut actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
     // Connect the probe peer with a real pipe-routine (per-peer routines) so its inbound frames
     // are decoded and dispatched.
@@ -13976,20 +14257,7 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
 #[tokio::test]
 async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
     let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, _actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(93);
     let old_conn_id = 7;
     let new_conn_id = 8;
@@ -14021,20 +14289,7 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
 #[tokio::test]
 async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_work() {
     let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_tip_tx, handle, _actions, reactor_task, service) = spawn_genesis_service(config);
     let peer = peer(9);
     let conn_id = 17;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
@@ -14079,19 +14334,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     };
 
     let config = ZakuraBlockSyncConfig::default();
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
-        BlockSyncFrontiers {
-            finalized_height: block::Height(0),
-            verified_block_tip: block::Height(0),
-            verified_block_hash: block::Hash([0; 32]),
-        },
-        (block::Height(0), block::Hash([0; 32])),
-        tip_rx,
-        config.clone(),
-    );
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let (_tip_tx, handle, _actions, reactor_task) = spawn_genesis_reactor(config.clone());
     let applying = SyncServiceDemand {
         header: HeaderServiceDemand::Enabled {
             capability_epoch: LifecycleEpoch::new(1),

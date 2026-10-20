@@ -5,12 +5,11 @@
 
 use std::future::Future;
 
-use jsonrpsee::{
-    core::middleware::{Batch, Notification},
-    server::middleware::rpc::RpcServiceT,
-    MethodResponse,
+use super::{
+    error::LegacyCode,
+    jsonrpc::{ErrorCode, ErrorObject, MethodResponse, Notification, Request},
+    rpc_service::RpcServiceT,
 };
-use jsonrpsee_types::ErrorObject;
 
 /// JSON-RPC [`FixRpcResponseMiddleware`] with compatibility workarounds.
 ///
@@ -18,12 +17,9 @@ use jsonrpsee_types::ErrorObject;
 ///
 /// ## Make RPC framework response codes match `zcashd`
 ///
-/// [`jsonrpsee_types`] returns specific error codes while parsing requests:
-/// <https://docs.rs/jsonrpsee-types/latest/jsonrpsee_types/error/enum.ErrorCode.html>
-///
-/// But these codes are different from `zcashd`, and some RPC clients rely on the exact code.
-/// Specifically, the [`jsonrpsee_types::error::INVALID_PARAMS_CODE`] is different:
-/// <https://docs.rs/jsonrpsee-types/latest/jsonrpsee_types/error/constant.INVALID_PARAMS_CODE.html>
+/// JSON-RPC 2.0 uses [`ErrorCode::InvalidParams`] for parameters that can't be decoded,
+/// but `zcashd` uses [`LegacyCode::Misc`], and some RPC clients rely on the exact code.
+/// So this middleware replaces the code of every invalid params error.
 #[derive(Clone)]
 pub struct FixRpcResponseMiddleware<S> {
     service: S,
@@ -36,68 +32,42 @@ impl<S> FixRpcResponseMiddleware<S> {
     }
 }
 
-impl<S> RpcServiceT for FixRpcResponseMiddleware<S>
-where
-    S: RpcServiceT<
-            MethodResponse = MethodResponse,
-            NotificationResponse = MethodResponse,
-            BatchResponse = MethodResponse,
-        > + Send
-        + Sync
-        + Clone
-        + 'static,
-{
-    type MethodResponse = MethodResponse;
-    type NotificationResponse = MethodResponse;
-    type BatchResponse = MethodResponse;
-
-    fn call<'a>(
-        &self,
-        request: jsonrpsee::types::Request<'a>,
-    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+impl<S: RpcServiceT> RpcServiceT for FixRpcResponseMiddleware<S> {
+    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
         let service = self.service.clone();
+        let id = request.id.clone();
+
         async move {
             let response = service.call(request).await;
-            if response.is_error() {
-                let original_error_code = response
-                    .as_error_code()
-                    .expect("response should have an error code");
-                if original_error_code == jsonrpsee_types::ErrorCode::InvalidParams.code() {
-                    let new_error_code = crate::server::error::LegacyCode::Misc.into();
-                    tracing::debug!(
-                        "Replacing RPC error: {original_error_code} with {new_error_code}"
-                    );
-                    let json: serde_json::Value = serde_json::from_str(response.into_json().get())
-                        .expect("response string should be valid json");
-                    let id = match &json["id"] {
-                        serde_json::Value::Null => Some(jsonrpsee::types::Id::Null),
-                        serde_json::Value::Number(n) => {
-                            n.as_u64().map(jsonrpsee::types::Id::Number)
-                        }
-                        serde_json::Value::String(s) => Some(jsonrpsee::types::Id::Str(s.into())),
-                        _ => None,
-                    }
-                    .expect("response json should have an id");
-
-                    return MethodResponse::error(
-                        id,
-                        ErrorObject::borrowed(
-                            new_error_code,
-                            json.get("error")
-                                .and_then(|v| v.get("message"))
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("Invalid params"),
-                            None,
-                        ),
-                    );
-                }
+            if response.as_error_code() != Some(ErrorCode::InvalidParams.code()) {
+                return response;
             }
-            response
-        }
-    }
 
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
-        self.service.batch(batch)
+            let new_error_code = LegacyCode::Misc;
+            tracing::debug!(
+                "Replacing RPC error: {} with {}",
+                ErrorCode::InvalidParams.code(),
+                i32::from(LegacyCode::Misc),
+            );
+
+            #[derive(serde::Deserialize)]
+            struct ErrorResponse {
+                error: ErrorMessage,
+            }
+
+            #[derive(serde::Deserialize)]
+            struct ErrorMessage {
+                message: String,
+            }
+
+            let message = serde_json::from_str::<ErrorResponse>(response.as_json().get())
+                .map_or_else(
+                    |_| ErrorCode::InvalidParams.message().to_string(),
+                    |response| response.error.message,
+                );
+
+            MethodResponse::error(id, ErrorObject::new(new_error_code, message))
+        }
     }
 
     fn notification<'a>(

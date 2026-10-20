@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use color_eyre::Report;
+use eyre::Report;
 
 use zakura_chain::{
     block::Height,

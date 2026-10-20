@@ -60,6 +60,10 @@ pub struct BlockSyncStartup {
     pub state_queries_enabled: bool,
     /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
+    /// The verifier's last checkpoint height. When set, the submission window
+    /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
+    /// decoded blocks. `None` keeps the count-only window.
+    pub max_checkpoint_height: Option<block::Height>,
 }
 
 impl BlockSyncStartup {
@@ -83,6 +87,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -106,6 +111,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 
@@ -149,6 +155,7 @@ impl BlockSyncStartup {
             shutdown: CancellationToken::new(),
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
+            max_checkpoint_height: None,
         }
     }
 }
@@ -307,12 +314,6 @@ impl BlockSyncHandle {
         wiring
             .registry
             .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
-    }
-
-    /// Subscribe to the reactor's current local serving status.
-    /// Peer delivery is tracked separately and can lag while outbound queues are full.
-    pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
-        self.status.clone()
     }
 
     /// Return the reactor's current local serving status, independent of peer delivery.
@@ -885,13 +886,10 @@ pub(super) struct PeerBlockState {
 }
 
 impl PeerBlockState {
-    pub(super) fn new(session: BlockSyncPeerSession, config: &ZakuraBlockSyncConfig) -> Self {
+    pub(super) fn new(session: BlockSyncPeerSession) -> Self {
         Self {
             direction: session.direction(),
-            status_delivery: super::status::StatusDelivery::new(
-                config.status_refresh_interval,
-                Instant::now(),
-            ),
+            status_delivery: super::status::StatusDelivery::new(Instant::now()),
             session,
         }
     }
@@ -1068,10 +1066,6 @@ impl RateMeter {
 
     pub(super) fn is_ready(&self, now: Instant) -> bool {
         now >= self.next_allowed
-    }
-
-    pub(super) fn mark_taken(&mut self, now: Instant) {
-        self.next_allowed = now + self.interval;
     }
 }
 

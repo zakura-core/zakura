@@ -9,13 +9,13 @@
 //! This migration backfills the empty Ironwood tree and anchor at the genesis height so upgraded
 //! databases match genesis-synced databases.
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::{block::Height, ironwood};
 
 use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+use super::{CancelFormatChange, CancelReceiver, DiskFormatUpgrade, FormatChangeError};
 
 /// Implements [`DiskFormatUpgrade`] for backfilling the genesis Ironwood tree and anchor.
 pub struct Upgrade;
@@ -34,7 +34,7 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         _initial_finalized_tip_height: Option<Height>,
         db: &ZakuraDb,
-        cancel_receiver: &Receiver<CancelFormatChange>,
+        cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         check_cancelled(cancel_receiver)?;
 
@@ -61,7 +61,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         db: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
     ) -> Result<Result<(), String>, FormatChangeError> {
         if db.finalized_tip_height().is_none() {
             return Ok(Ok(()));
@@ -91,9 +91,7 @@ fn has_genesis_ironwood_tree(db: &ZakuraDb) -> bool {
         .is_some()
 }
 
-fn check_cancelled(
-    cancel_receiver: &Receiver<CancelFormatChange>,
-) -> Result<(), CancelFormatChange> {
+fn check_cancelled(cancel_receiver: &CancelReceiver) -> Result<(), CancelFormatChange> {
     match cancel_receiver.try_recv() {
         Err(TryRecvError::Empty) => Ok(()),
         _ => Err(CancelFormatChange),

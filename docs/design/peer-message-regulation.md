@@ -44,6 +44,19 @@ connection at 500 ms round-trip time, and a test checks each default against its
 local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
 today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
+Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
+peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
+`peer_memory_budget_bytes` (8 GiB), less one 256 MiB datagram queue per bound socket, divided by
+one connection's windows (64 MiB) caps the transport at 124 live QUIC connections. A closed
+connection releases its stream buffers and waits out its drain in a separate, cheap allowance, so a
+peer that gets rejected and reconnects can't pile up buffers, and its closed connections take no
+slot from inbound peers. The node keeps `max_pending_handshakes` (32) of the live slots for
+handshakes and admits 92 peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules
+and the overheads the budget leaves out.
+
+Configuration loading checks this budget only when the resolved P2P stack runs v2. Legacy-only
+nodes retain the configured value without enforcing it because they create no QUIC endpoint.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a
@@ -244,12 +257,13 @@ Remove the mandatory push deadline. The publisher produces eligible pages when c
 and capacity are available. The subscriber can track progress and select another peer under local
 policy. Slow progress alone is not a protocol violation. Idle subscription state stays bounded.
 
-Regulated block sync negotiates version 3 with version-2 message encodings, and peers without the
-regulation capability keep the complete version 2 contract. Live ranges cannot overlap on one
-regulated connection because the wire format lacks a request ID. A separate successor protocol can
-improve correlation later. A well-formed body with a different hash can come from an honest peer on
-another chain, so it retires the connection as a local incompatibility rather than a peer fault.
-The [specification](../specs/peer-message-regulation.md) states the version 3 rules.
+Regulated block sync negotiates version 3 with version-2 message encodings. Version 3 replaced
+version 2, so a peer that offers only version 2 negotiates no block sync stream. Live ranges cannot
+overlap on one regulated connection because the wire format lacks a request ID. A separate
+successor protocol can improve correlation later. A well-formed body with a different hash can
+come from an honest peer on another chain, so it retires the connection as a local incompatibility
+rather than a peer fault. The [specification](../specs/peer-message-regulation.md) states the
+version 3 rules.
 
 ### Subscriptions
 
@@ -271,8 +285,8 @@ write finishes. The slot also reserves that outcome's output, so spent credit an
 cannot prevent closure. A conformant subscriber holds at most `max_live` slots when its `Open`
 arrives. As with requests, the toolkit acts only above a proven margin: it admits an `Open` beyond
 `max_live` within `2 × max_live`, counts it in `zakura.p2p.subscription.over_limit`, and
-disconnects only beyond that. This departs from header sync version 9's rule that an `Open`
-without a free slot returns `Disconnect`.
+disconnects only beyond that. Header sync version 9 takes this rule with `max_live = 1`, so its
+publisher holds two slots per peer.
 
 **Tombstones.** An ended subscription leaves a tombstone. A crossing `Grant` that matches it is
 dropped and keeps it; a crossing `Close` is dropped and consumes it. A subscriber below its limit
@@ -281,10 +295,48 @@ arrive in the order the publisher ended the subscriptions. So an `Open` clears t
 tombstones until live subscriptions plus tombstones number at most `max_live - 1`. With one live
 subscription, this is header sync version 9's rule that the next `Open` clears the tombstone.
 
+A tombstone also keeps a credit window for crossing grants and records whether `Close` came
+first, so every update after `Close` faults. The [specification](../specs/peer-message-regulation.md)
+states both rules for header sync version 9.
+
 **Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
 terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's
 pages and outcomes from one task, so each outcome follows its pages. Each update wakes that task,
 so `Close` never waits behind a page that waits for capacity.
+
+**Cursors.** The tools compare cursors by equality only, and each tool records the consumed totals
+through every page itself. The specification defines header sync version 9's cursor, which adds
+cumulative header and byte counts to height and hash. An implementation can store only height and
+hash in the sent-cursor ring and compare the counts against the totals already stored with each
+entry.
+
+### Header sync version 9
+
+The [specification](../specs/peer-message-regulation.md) states the version 9 rules. This section
+records why some of them changed from the first draft.
+
+**Status cadence.** The first draft gave `Status` a bucket of four messages that disconnects when
+empty. The layout validator rejects that row, because a one-second sender needs a capacity of
+`10 min / 1 s + 2 = 602`. `CadenceBuckets` also never disconnects. The row now records and
+forwards like block sync's `Status`. Pushed pages now deliver new tips to a subscription that has
+reached its target, so a longer sender interval could shrink the bucket. It would also loosen the
+two-second freshness bound and delay recovery after `SubscriptionSuperseded`, which needs a fresh
+`Status`, so the interval stays at one second until measurements show that recovery stays
+acceptable.
+
+**Grant minimum.** A `Grant` that adds one byte was legal, so a subscriber could send millions of
+grants inside one 8 MiB window. Each grant now adds at least one header or one smallest legal page
+of bytes, which caps grants at about one window's worth plus at most three per header sent.
+The codec checks the minimum at decode because it depends only on the network. A larger minimum,
+such as an eighth of the window, would cut grants further, the way TCP receivers avoid tiny window
+updates, but it would delay acknowledgements during tip following. A cadence on the subscription
+row would not bound the flood at all, because buckets record and forward.
+
+**Compatibility.** Version 9 replaces version 8 in one step, as block sync version 3 replaced
+version 2. It takes capability bit 10 and retires bit 5. One release of both versions would have
+kept native header sync working between upgraded and older nodes, but it would have left the
+version 8 path unregulated for that release and doubled the codec, reactor, and tests. Until most
+peers upgrade, upgraded and older nodes cannot exchange headers over native header sync.
 
 ## Tests and diagnostics
 
@@ -296,8 +348,9 @@ Diagnostics identify protocol violations and local failures with bounded logging
 Sampling or aggregation is allowed. Complete per-decision traces are optional test/debug output.
 No particular file name or schema is required.
 
-A new exhaustive model explorer and universal panic-recovery suite are deferred. The [testing design](property-testing.md) and
-[GetBlocks plan](property-testing-block-sync-infrastructure.md) describe the initial checks.
+A new exhaustive model explorer and universal panic-recovery suite are deferred. The
+[testing design](property-testing.md), [GetBlocks plan](property-testing-block-sync-infrastructure.md),
+and [header sync plan](property-testing-header-sync.md) describe the checks.
 
 ## Adoption order
 

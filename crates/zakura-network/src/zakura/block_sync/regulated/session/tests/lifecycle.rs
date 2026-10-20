@@ -54,22 +54,29 @@ fn compact_session_lifecycle_peak() {
                     );
                     let fixed = measurement.snapshot();
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     let admitted = measurement.snapshot();
                     gate.add_permits(usize::try_from(count).unwrap());
                     // Ready order writes each range as its read finishes.
                     for _ in 0..count {
-                        let super::super::super::wire::Message::RangeUnavailable(range) =
+                        let super::super::super::wire::Message::End(ending) =
                             super::super::super::tests::receive(&mut output).await
                         else {
                             panic!("every range is unavailable");
                         };
                         assert!(
-                            (1..=count).contains(&range.start.0),
-                            "{range:?} was not requested"
+                            (1..=count).contains(&ending.start.0)
+                                && ending
+                                    == super::super::super::wire::RangeEnding::unavailable(
+                                        ending.start,
+                                        1
+                                    ),
+                            "{ending:?} was not requested"
                         );
-                        let start = usize::try_from(range.start.0).unwrap();
+                        let start = usize::try_from(ending.start.0).unwrap();
                         assert!(!std::mem::replace(&mut ended[start], true));
                     }
                     while serving.capacity.node_execution_held() != 0 {
@@ -81,7 +88,9 @@ fn compact_session_lifecycle_peak() {
                     let idle = measurement.snapshot();
                     // The first new admission drains every old completion before overlap checks.
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     cancel.cancel();
                     drop((session, output, cancel));
@@ -97,7 +106,9 @@ fn compact_session_lifecycle_peak() {
                         Default::default(),
                     );
                     for height in 1..=count {
-                        session.admit(Height(height), 1).unwrap();
+                        session
+                            .admit(Range::new(Height(height), 1).unwrap())
+                            .unwrap();
                     }
                     let replacement = measurement.snapshot();
                     cancel.cancel();

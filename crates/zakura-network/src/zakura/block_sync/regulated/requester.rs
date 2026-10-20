@@ -8,11 +8,11 @@ use std::{
 use thiserror::Error;
 use zakura_chain::block::{Hash, Height};
 
-use super::wire::{Message, Range, GET_BLOCKS, RULES};
+use super::wire::{Outcome, Range, RangeEnding, GET_BLOCKS, RULES};
 use crate::zakura::{
     block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES},
     regulation::{
-        shrink_after_peak, ClaimRefused, Claimed, Ended, Exchange, ExchangeWriter, PoolEntry,
+        shrink_after_peak, ClaimRefused, Claimed, Exchange, ExchangeWriter, PoolEntry,
         Reservations, ReserveRefused,
     },
     wire_codec::WireError,
@@ -42,6 +42,14 @@ pub(super) enum ResponseError {
     Ending,
 }
 
+/// A consumed ending. It names the original request, not the reported count,
+/// so the scheduler reconsiders every unreceived height of that request.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedRange {
+    pub(crate) range: Range,
+    pub(crate) outcome: Outcome,
+}
+
 #[derive(Debug)]
 struct Pending {
     range: Range,
@@ -66,6 +74,8 @@ pub(super) struct Requester {
     next: HashMap<Hash, Height>,
     // Abandoned work and fully received ranges still waiting for an ending.
     retiring: BTreeSet<(Instant, Height)>,
+    // Ranges in `ranges` whose every body arrived.
+    pending_endings: usize,
     read_paused: Duration,
     capacity: usize,
 }
@@ -81,6 +91,7 @@ impl Requester {
             ranges: BTreeMap::new(),
             next: HashMap::new(),
             retiring: BTreeSet::new(),
+            pending_endings: 0,
             read_paused: Duration::ZERO,
             capacity,
         }
@@ -101,7 +112,7 @@ impl Requester {
                     .skip(pending.received)
                     .map(|(offset, hash)| {
                         // A validated range contains at most 128 heights without overflow.
-                        (Height(pending.range.start.0 + offset as u32), *hash)
+                        (Height(pending.range.start().0 + offset as u32), *hash)
                     })
             })
             .take(limit)
@@ -114,6 +125,11 @@ impl Requester {
 
     pub(super) fn at_capacity(&self) -> bool {
         self.len() >= self.capacity
+    }
+
+    /// Live ranges whose every body arrived but whose ending has not.
+    pub(super) fn pending_endings(&self) -> usize {
+        self.pending_endings
     }
 
     /// Old abandoned work must not pin a height forever while other work advances.
@@ -135,7 +151,8 @@ impl Requester {
         let Some((start, pending)) = self.ranges.range_mut(..=height).next_back() else {
             return false;
         };
-        if u64::from(pending.range.start.0) + u64::from(pending.range.count) <= u64::from(height.0)
+        if u64::from(pending.range.start().0) + u64::from(pending.range.count())
+            <= u64::from(height.0)
         {
             return false;
         }
@@ -159,37 +176,36 @@ impl Requester {
         entry: PoolEntry,
         exchange: Exchange,
     ) -> Result<ExchangeWriter, RequestError> {
-        Range::new(range.start, range.count)?;
         if !(1..=MAX_BS_RESPONSE_BYTES).contains(&max_body_bytes) {
             return Err(WireError::OutOfRange("response body bytes").into());
         }
         // The protocol count is at most 128 and fits usize on supported targets.
-        if expected.len() != range.count as usize || self.next.contains_key(&expected[0]) {
+        if expected.len() != range.count() as usize || self.next.contains_key(&expected[0]) {
             return Err(RequestError::ExpectedHeaders);
         }
-        let last = Height(range.start.0 + range.count - 1);
+        let last = range.last();
         if self
             .ranges
             .range(..=last)
             .next_back()
             .is_some_and(|(_, pending)| {
-                u64::from(pending.range.start.0) + u64::from(pending.range.count)
-                    > u64::from(range.start.0)
+                u64::from(pending.range.start().0) + u64::from(pending.range.count())
+                    > u64::from(range.start().0)
             })
         {
             return Err(RequestError::Overlap);
         }
         let writer = exchange.writer();
         self.reservations.reserve_fenced(
-            range.start,
+            range.start(),
             GET_BLOCKS.message_type,
             range.response_cap(max_body_bytes),
             entry,
             exchange,
         )?;
-        self.next.insert(expected[0], range.start);
+        self.next.insert(expected[0], range.start());
         self.ranges.insert(
-            range.start,
+            range.start(),
             Pending {
                 range,
                 expected: expected.into(),
@@ -231,8 +247,8 @@ impl Requester {
     }
 
     /// Release a frame the transport admitted, when the routine takes it.
-    pub(super) fn take_admitted(&mut self, len: usize) {
-        self.reservations.take_admitted(len);
+    pub(super) fn take_admitted(&mut self, tag: u16, len: usize) {
+        self.reservations.take_admitted(tag, len);
     }
 
     /// Claim the hash computed from this frame's header before decoding its
@@ -272,35 +288,48 @@ impl Requester {
             // deadline, or start one when the last block is claimed.
             let at = *pending.retirement_started_at.get_or_insert(now);
             self.retiring.insert((at, start));
+            self.pending_endings += 1;
         }
         Ok((height, claimed))
     }
 
     /// Validate the small ending payload before consuming the reservation or
     /// ending its writer fence. A rejected ending changes no authorization.
-    pub(super) fn finish(&mut self, message: &Message) -> Result<(Range, Ended), ResponseError> {
-        let (start, count, tag) = match message {
-            Message::BlocksDone { start, returned } => (*start, *returned, 4),
-            Message::RangeUnavailable(range) => (range.start, range.count, 5),
-            _ => return Err(ResponseError::Ending),
-        };
-        let pending = self.ranges.get(&start).ok_or(ResponseError::Ending)?;
+    pub(super) fn finish(&mut self, ending: RangeEnding) -> Result<CompletedRange, ResponseError> {
+        let pending = self
+            .ranges
+            .get(&ending.start)
+            .ok_or(ResponseError::Ending)?;
         // Counts fit usize on supported targets.
-        if (tag == 4 && (count == 0 || count as usize != pending.received))
-            || (tag == 5 && (pending.received != 0 || count == 0 || count > pending.range.count))
-        {
+        let matches = ending.count != 0
+            && match ending.outcome {
+                Outcome::Done => ending.count as usize == pending.received,
+                Outcome::Unavailable => {
+                    pending.received == 0 && ending.count <= pending.range.count()
+                }
+            };
+        if !matches {
             return Err(ResponseError::Ending);
         }
         let range = pending.range;
-        let ended = self.reservations.claim_end(&start, tag, 9)?;
-        self.remove_range(start);
-        Ok((range, ended))
+        self.reservations
+            .claim_end(&ending.start, u16::from(ending.message_type()), 9)?;
+        self.remove_range(ending.start);
+        Ok(CompletedRange {
+            range,
+            outcome: ending.outcome,
+        })
     }
 
     fn remove_range(&mut self, start: Height) {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
+            } else {
+                self.pending_endings = self
+                    .pending_endings
+                    .checked_sub(1)
+                    .expect("claiming a range's last body counted it as owing an ending");
             }
             // A complete range already left `next` when its last block was
             // claimed, so shrink on every removal, not only an unfinished one.
@@ -350,11 +379,7 @@ mod tests {
 
         for index in 1..=RANGES {
             book.claim_block(hash(index), 3).unwrap();
-            book.finish(&Message::BlocksDone {
-                start: Height(index),
-                returned: 1,
-            })
-            .unwrap();
+            book.finish(RangeEnding::done(Height(index), 1)).unwrap();
         }
         assert!(book.next.is_empty());
         assert!(

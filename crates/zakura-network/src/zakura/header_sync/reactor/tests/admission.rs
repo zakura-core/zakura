@@ -385,13 +385,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         .recv()
         .await
         .expect("the initial committed status is sent");
-    assert!(matches!(
-        handle
-            .codec()
-            .decode_frame(initial_status, None)
-            .expect("the initial status decodes"),
-        HeaderSyncMessage::Status(_)
-    ));
+    decode_status(initial_status);
 
     let (source, owner, old_branch) =
         seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
@@ -461,13 +455,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         .recv()
         .await
         .expect("the bounded status floor eventually publishes the new anchor");
-    let HeaderSyncMessage::Status(status) = handle
-        .codec()
-        .decode_frame(refreshed, None)
-        .expect("the refreshed status decodes")
-    else {
-        panic!("the re-anchor publication must be Status");
-    };
+    let status = decode_status(refreshed);
     assert_eq!(status.work_anchor_height, replacement.height);
     assert_eq!(status.work_anchor_hash, replacement.hash);
     assert_eq!(status.selected_tip_height, replacement.height);
@@ -616,15 +604,15 @@ async fn restart_rejects_old_ordered_stream_response() {
         .pop()
         .expect("the fixture has one response entry");
     let stale_response = Headers {
-        request_id: old_active.request_id.get(),
-        target_tip_hash: old_active.target.status.selected_tip_hash,
+        subscription_id: old_active.request_id.get(),
+        initial_target_tip_hash: old_active.target.status.selected_tip_hash,
         common_ancestor_height: anchor.height,
         common_ancestor_hash: anchor.hash,
-        complete: true,
+        reaches_initial_target: true,
         tree_aux_schema: AuxSchema::None,
         entries: vec![response_entry],
     };
-    let stale_scope = old_active.owner.header_authority();
+    let _stale_scope = old_active.owner.header_authority();
     drop(old_reactor);
 
     let mut fresh_startup = startup(CancellationToken::new());
@@ -645,13 +633,7 @@ async fn restart_rejects_old_ordered_stream_response() {
         .recv()
         .await
         .expect("the replacement stream receives its initial status");
-    assert!(matches!(
-        fresh_handle
-            .codec()
-            .decode_frame(status, None)
-            .expect("the replacement status decodes"),
-        HeaderSyncMessage::Status(_)
-    ));
+    decode_status(status);
     let _ = seed_applying_request(&mut fresh_reactor, &snapshot, peer.clone(), 8);
     let fresh_active = fresh_reactor
         .peer_work_queue
@@ -664,12 +646,7 @@ async fn restart_rejects_old_ordered_stream_response() {
     let published_tip = fresh_handle.best_header_tip();
     let published_candidates = fresh_handle.candidate_state();
 
-    fresh_reactor.handle_event(Event::SessionResponse {
-        peer: peer.clone(),
-        session_id: 7,
-        scope: stale_scope,
-        msg: HeaderSyncMessage::Headers(stale_response),
-    });
+    fresh_reactor.deliver_page(peer.clone(), 7, stale_response);
 
     assert_eq!(
         fresh_reactor
@@ -758,13 +735,7 @@ async fn peer_admission_catches_up_snapshot_before_initial_status() {
         .await
         .expect("the initial status is sent promptly")
         .expect("the peer outbound remains open");
-    let HeaderSyncMessage::Status(status) = handle
-        .codec()
-        .decode_frame(status_frame, None)
-        .expect("the initial status decodes")
-    else {
-        panic!("the first session message must be the committed status");
-    };
+    let status = decode_status(status_frame);
     assert_eq!(status.selected_tip_height, header_best.height);
     assert_eq!(status.selected_tip_hash, header_best.hash);
 
@@ -887,10 +858,11 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
     startup.committed_snapshots = Some(snapshots_rx);
     let (_handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
     let peer = peer();
-    let (send, _outbound) = framed_channel(8);
+    let (send, mut outbound) = framed_channel(8);
     reactor.handle_event(Event::PeerConnected(
         PeerSession::from_parts_with_session_id(peer.clone(), 7, send, CancellationToken::new()),
     ));
+    decode_status(outbound.try_recv().expect("the initial status was sent"));
     reactor.observe_vct_root_repair(zakura_header_chain::VctRootRepairStatus {
         state: zakura_header_chain::VctRootRepairState::Unavailable {
             height: block::Height(500),
@@ -902,10 +874,10 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
         panic!("the repair must request its context");
     };
     let target = frontier(20_000);
-    reactor.handle_wire_message(
+    reactor.handle_status(
         peer.clone(),
         7,
-        HeaderSyncMessage::Status(Status {
+        Status {
             work_anchor_height: anchor.height,
             work_anchor_hash: anchor.hash,
             selected_tip_height: target.height,
@@ -913,10 +885,10 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(20_000_u32),
             oldest_retained_height: anchor.height,
             max_headers_per_response: 401,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
-        }),
+        },
     );
     if window_open {
         assert!(matches!(
@@ -947,6 +919,11 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
     assert_eq!(reactor.peer_work_queue.reserved_header_count(&peer), 401);
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 401);
     assert!(actions.try_recv().is_err());
+    let repair_open = update(
+        outbound
+            .try_recv()
+            .expect("the repair opens a subscription"),
+    );
 
     for (advance, expected_queries) in [(1, 1), (2, 0)] {
         snapshot.frontiers.verified_best = frontier(initial_window + advance);
@@ -954,6 +931,26 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
         snapshot.state_version = snapshot.state_version.checked_next().unwrap();
         reactor.observe_latest_committed_snapshot(snapshot.clone());
         assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
+        if advance == 1 {
+            assert!(
+                std::iter::from_fn(|| actions.try_recv().ok()).all(|action| !matches!(
+                    action,
+                    HeaderPortOperation::QueryHeaderLocator { .. }
+                )),
+                "refill waits for the retired repair's subscription to end"
+            );
+            let session = reactor.peer_state[&peer].session.clone();
+            reactor.handle_event(outcome_event(
+                &session,
+                HeadersOutcome {
+                    subscription_id: repair_open.subscription_id,
+                    initial_target_tip_hash: repair_open.initial_target_tip_hash,
+                    outcome: HeadersOutcomeCode::SubscriptionClosed,
+                },
+            ));
+            // The run loop schedules cached statuses after every event.
+            reactor.schedule_cached_statuses();
+        }
         let mut locator_queries = 0;
         while let Ok(action) = actions.try_recv() {
             match action {
@@ -972,7 +969,7 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
         }
         assert_eq!(
             locator_queries, expected_queries,
-            "retiring the repair must wake refill once, without waiting for peer status"
+            "ending the repair must wake refill once, without waiting for peer status"
         );
     }
 }

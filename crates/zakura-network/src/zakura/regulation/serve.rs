@@ -73,6 +73,7 @@
 //! | The node slot returns before the peer slot | `the_node_slot_returns_before_the_peer_slot` |
 //! | A non-reading peer holds output but no execution | `a_non_reading_peer_holds_output_bytes_but_no_execution_slot` |
 //! | Output returns when the last frame is written | `output_bytes_return_only_when_the_last_frame_is_written` |
+//! | `responses_written` waits for every admitted response's last write | `responses_written_waits_for_the_last_frame_or_cancellation` |
 //! | Tiny responses stop at the response count limit | `tiny_responses_with_a_blocked_writer_hold_response_slots` |
 //! | Response slots span peers and session replacement | `response_slots_bound_all_peers_and_survive_session_replacement` |
 //! | A stalled peer does not block another | `a_stalled_produce_on_one_peer_does_not_block_another` |
@@ -104,17 +105,16 @@ use std::{
 
 use futures::future::Either;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
-pub(crate) use lease::WorkLease;
-pub(crate) use push::{Push, PushPermit};
+pub(crate) use lease::{ExecutionSlots, WorkLease};
+pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
 use capacity::{PeerBudgets, ServeMetrics};
-use lease::ExecutionSlots;
 pub(super) use sink::ending_reserve;
 use sink::{ResponseFrame, SinkCore};
 
@@ -247,12 +247,47 @@ pub(super) struct ResponseGrants {
     _peer_response: SlotPermit,
     // Keep every peer budget discoverable while queued output survives a session.
     _peer_budgets: PeerBudgets,
+    // Returns last, once every grant above has returned.
+    _unwritten: Option<Unwritten>,
+}
+
+/// One admitted request in its session's count of unwritten responses.
+/// Dropping it marks the response written or abandoned.
+#[derive(Debug)]
+pub(super) struct Unwritten(Arc<watch::Sender<usize>>);
+
+impl Unwritten {
+    fn new(count: &Arc<watch::Sender<usize>>) -> Self {
+        count.send_modify(|count| *count += 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Unwritten {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
+/// Waits until a session has written every response it admitted.
+#[derive(Clone, Debug)]
+pub(crate) struct ResponsesWritten(Arc<watch::Sender<usize>>);
+
+impl ResponsesWritten {
+    /// Resolves once every admitted request's last frame has finished its
+    /// transport write, or the request was dropped with its session.
+    pub(crate) async fn wait(&self) {
+        let mut count = self.0.subscribe();
+        // The sender lives in `self`, so the wait cannot fail.
+        let _ = count.wait_for(|count| *count == 0).await;
+    }
 }
 
 /// An admitted request that waits for capacity.
 struct Job<R> {
     request: R,
     commitment: Commitment,
+    unwritten: Unwritten,
 }
 
 /// Serving for one peer session and one request row.
@@ -261,6 +296,8 @@ struct Job<R> {
 /// is cancelled.
 pub(crate) struct Serve<P: Produce> {
     commitments: Arc<Commitments>,
+    /// Admitted requests whose responses are not fully written.
+    unwritten: Arc<watch::Sender<usize>>,
     max_in_flight: u32,
     jobs: mpsc::UnboundedSender<Job<P::Request>>,
     metrics: Arc<ServeMetrics>,
@@ -346,6 +383,7 @@ impl ServeCapacity {
                 open: AtomicU32::new(0),
                 limit: AtomicU32::new(0),
             }),
+            unwritten: Arc::new(watch::Sender::new(0)),
             max_in_flight: self.max_in_flight,
             jobs,
             metrics: self.metrics.clone(),
@@ -365,8 +403,8 @@ impl ServeCapacity {
             cancel,
             tasks: tasks.clone(),
         };
-        tasks.spawn(dispatch.run(queued));
-        tasks.spawn(writer);
+        tasks.spawn_session(dispatch.run(queued));
+        tasks.spawn_session(writer);
         serve
     }
 }
@@ -411,6 +449,7 @@ impl<P: Produce> Serve<P> {
         let _ = self.jobs.send(Job {
             request,
             commitment,
+            unwritten: Unwritten::new(&self.unwritten),
         });
         Ok(())
     }
@@ -424,6 +463,11 @@ impl<P: Produce> Serve<P> {
         self.commitments
             .limit
             .fetch_max(limit.clamp(1, self.max_in_flight), Ordering::AcqRel);
+    }
+
+    /// Waits until this session has written every response it admitted.
+    pub(crate) fn responses_written(&self) -> ResponsesWritten {
+        ResponsesWritten(self.unwritten.clone())
     }
 
     /// Open requests on this session.
@@ -443,20 +487,36 @@ struct ServingTasks {
 }
 
 impl ServingTasks {
-    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
-        let cancel = self.cancel.clone();
-        let connection = self.connection.clone();
-        let close_cause = self.close_cause.clone();
+    /// Spawn a task that runs once per serving session, boxed like other per-session tasks.
+    fn spawn_session(&self, task: impl Future<Output = ()> + Send + 'static) {
         crate::zakura::transport::spawn_supervised_peer_task(
             self.peer.clone(),
             || {},
-            move || {
-                close_cause.record("service_panic");
-                cancel.cancel();
-                connection.cancel();
-            },
+            self.on_panic(),
             task,
         );
+    }
+
+    /// Spawn a task for one served request.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        // Dispatch spawns one task per served request, so keep it unboxed.
+        crate::zakura::transport::spawn_supervised_peer_task_unboxed(
+            self.peer.clone(),
+            || {},
+            self.on_panic(),
+            task,
+        );
+    }
+
+    fn on_panic(&self) -> impl FnOnce() + Send + 'static {
+        let cancel = self.cancel.clone();
+        let connection = self.connection.clone();
+        let close_cause = self.close_cause.clone();
+        move || {
+            close_cause.record("service_panic");
+            cancel.cancel();
+            connection.cancel();
+        }
     }
 }
 
@@ -506,9 +566,11 @@ impl<P: Produce> Dispatch<P> {
             };
             let waiting = self.capacity.metrics.waiting();
             let cap = self.produce.response_cap(&job.request);
-            let Some((grants, slots)) = self.acquire(cap).await else {
+            let Some((mut grants, slots)) = self.acquire(cap).await else {
                 return;
             };
+            // The grants return when the response's last frame is written.
+            grants._unwritten = Some(job.unwritten);
             drop(waiting);
             // Dispatch consumes jobs in admission order. Take the response's
             // output before spawning its producer, after capacity is reserved.
@@ -563,6 +625,7 @@ impl<P: Produce> Dispatch<P> {
             _peer: peer,
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
+            _unwritten: None,
         };
         let peer = self
             .wait("peer_execution", self.peer.execution.reserve())

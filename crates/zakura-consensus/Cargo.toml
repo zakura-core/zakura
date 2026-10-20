@@ -34,8 +34,9 @@ blake2b_simd = { workspace = true }
 bellman = { workspace = true }
 bls12_381 = { workspace = true }
 halo2 = { workspace = true }
-rand = { workspace = true }
 rand_10 = { workspace = true }
+# ed25519-zebra takes `rand_core` 0.6 RNGs.
+rand_core = { workspace = true, features = ["getrandom"] }
 rayon = { workspace = true }
 
 chrono = { workspace = true }
@@ -48,7 +49,7 @@ futures-util = { workspace = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 pin-project = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync", "tracing", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["time", "sync", "macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["timeout", "util", "buffer"] }
 tracing = { workspace = true }
@@ -65,7 +66,7 @@ zakura-script = { path = "../zakura-script", version = "5.0.0-rc0" }
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 
 zcash_protocol.workspace = true
 
@@ -75,15 +76,15 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
-color-eyre = { workspace = true }
+eyre = { workspace = true }
 ed25519-zebra = { workspace = true }
 
 hex = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-toml = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 zakura-state = { path = "../zakura-state", version = "11.0.0-rc0", features = ["proptest-impl"] }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }

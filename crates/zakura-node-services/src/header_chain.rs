@@ -4,9 +4,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, Frontier, HeaderChainError, HeaderLocator,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion,
-    VctRepairContext,
+    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, EngineSnapshot, Frontier, HeaderChainError,
+    HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId,
+    TargetCompletion, VctRepairContext,
 };
 
 /// A boxed operation returned by [`Port`].
@@ -216,6 +216,17 @@ pub enum AcquirePathReply {
     Busy,
     /// An occupied resource refused the request.
     CapacityBusy(ServingCapacitySignal),
+}
+
+/// Where a header hash sits relative to the selected header chain.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SelectedChainMembership {
+    /// The selected chain contains the header at this frontier.
+    Selected(Frontier),
+    /// The adapter retains the header off the selected chain.
+    NotSelected,
+    /// The adapter retains no header with this hash.
+    NotRetained,
 }
 
 /// A bounded read from an already acquired retained path.
@@ -513,6 +524,26 @@ pub trait Port: Send + Sync + 'static {
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply>;
+
+    /// Watch the selected header chain.
+    ///
+    /// The value is the latest committed engine snapshot, or `None` before the
+    /// first commit. It changes after each committed transition, so a change
+    /// wakes work that follows the selected tip. The default never changes,
+    /// for a port without durable header-chain state.
+    fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
+        tokio::sync::watch::channel(None).1
+    }
+
+    /// Report whether the selected chain contains the header `hash`.
+    ///
+    /// The answer comes from the latest committed selected chain, which is at
+    /// least as new as the latest value of [`Self::selected_chain`]. It costs
+    /// no ancestry walk and no retained-path lease.
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
 }
 
 impl std::fmt::Debug for dyn Port {
@@ -587,6 +618,13 @@ impl Port for UnavailablePort {
             )))
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(async { Ok(SelectedChainMembership::NotRetained) })
+    }
 }
 
 /// Inert port used by state-machine tests that drive completions explicitly.
@@ -643,6 +681,13 @@ impl Port for InertHeaderChainPort {
         &self,
         _target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
+        Box::pin(std::future::pending())
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         Box::pin(std::future::pending())
     }
 }

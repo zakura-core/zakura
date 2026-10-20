@@ -13,7 +13,7 @@ use std::{
 use crate::primitives::batch_control::{Batch, BatchControl};
 use crate::primitives::fallback::Fallback;
 use chrono::{DateTime, TimeZone, Utc};
-use color_eyre::eyre::Report;
+use eyre::Report;
 use futures::{FutureExt, TryFutureExt};
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use tokio::time::timeout;
@@ -5352,7 +5352,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     };
 
     // Create a usable signing key
-    let signing_key = ed25519::SigningKey::new(rand::thread_rng());
+    let signing_key = ed25519::SigningKey::new(rand_core::OsRng);
     let verification_key = ed25519::VerificationKey::from(&signing_key);
 
     // Populate join split data with the dummy join split.

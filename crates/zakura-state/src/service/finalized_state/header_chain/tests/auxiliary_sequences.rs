@@ -477,45 +477,73 @@ fn saturated_selected_repair_retains_roots_or_reports_no_capacity() {
     );
 }
 
+/// Run the fixed fork, repair, and reopen prefix, then `operations`, then a
+/// final finalize and reopen, over `bucket`-block buckets.
+fn auxiliary_sequence(bucket: usize, operations: Vec<(u8, u32)>) {
+    let _guard = zakura_test::init();
+    let mut sequence = Sequence::new(bucket);
+    sequence.grow(false);
+    for offset in [1, 2] {
+        for _ in 0..bucket {
+            sequence.deliver(offset, true);
+        }
+    }
+    sequence.deliver(3, false);
+    sequence.deliver(4, false);
+    sequence.deliver(5, true);
+    sequence.observe(1, true);
+    sequence.observe(1, false);
+    sequence.deliver(1, true);
+    sequence.reopen();
+    sequence.deliver(1, true);
+    sequence.grow(true);
+    for (operation, offset) in operations {
+        match operation {
+            0 => sequence.deliver(offset, false),
+            1 => sequence.deliver(offset, true),
+            2 => sequence.observe(offset, false),
+            3 => sequence.observe(offset, true),
+            4 => sequence.grow(true),
+            5 => sequence.finalize(),
+            6 => sequence.reopen(),
+            7 => sequence.grow(false),
+            _ => unreachable!(),
+        }
+    }
+    sequence.grow(false);
+    sequence.deliver(1, true);
+    sequence.deliver(2, true);
+    sequence.finalize();
+    sequence.reopen();
+}
+
+fn auxiliary_operations() -> impl Strategy<Value = Vec<(u8, u32)>> {
+    prop::collection::vec((0u8..8, 1u32..6), 1..32)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(4))]
+
+    /// Four sequences, on every pull request.
     #[test]
     fn auxiliary_capacity_survives_generated_fork_and_reopen_sequences(
         bucket in 2usize..5,
-        operations in prop::collection::vec((0u8..8, 1u32..6), 1..32),
+        operations in auxiliary_operations(),
     ) {
-        let _guard = zakura_test::init();
-        let mut sequence = Sequence::new(bucket);
-        sequence.grow(false);
-        for offset in [1, 2] {
-            for _ in 0..bucket { sequence.deliver(offset, true); }
-        }
-        sequence.deliver(3, false);
-        sequence.deliver(4, false);
-        sequence.deliver(5, true);
-        sequence.observe(1, true);
-        sequence.observe(1, false);
-        sequence.deliver(1, true);
-        sequence.reopen();
-        sequence.deliver(1, true);
-        sequence.grow(true);
-        for (operation, offset) in operations {
-            match operation {
-                0 => sequence.deliver(offset, false),
-                1 => sequence.deliver(offset, true),
-                2 => sequence.observe(offset, false),
-                3 => sequence.observe(offset, true),
-                4 => sequence.grow(true),
-                5 => sequence.finalize(),
-                6 => sequence.reopen(),
-                7 => sequence.grow(false),
-                _ => unreachable!(),
-            }
-        }
-        sequence.grow(false);
-        sequence.deliver(1, true);
-        sequence.deliver(2, true);
-        sequence.finalize();
-        sequence.reopen();
+        auxiliary_sequence(bucket, operations);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Thirty-two sequences, in full-coverage CI runs.
+    #[test]
+    #[ignore = "broad property run; full-coverage CI passes --run-ignored"]
+    fn many_auxiliary_capacity_sequences_survive_forks_and_reopens(
+        bucket in 2usize..5,
+        operations in auxiliary_operations(),
+    ) {
+        auxiliary_sequence(bucket, operations);
     }
 }

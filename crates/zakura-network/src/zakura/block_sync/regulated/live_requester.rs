@@ -7,23 +7,57 @@ use std::{
 use zakura_chain::{block, serialization::ZcashDeserialize};
 
 use super::{
-    requester::{Requester, ResponseError},
-    wire::{Message, Range, RULES},
+    requester::{CompletedRange, Requester, ResponseError},
+    wire::{decode_control, Control, Range, RULES},
 };
 use crate::zakura::{
-    block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncMessage},
+    block_sync::{
+        config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncStatus, MSG_BS_BLOCK,
+    },
     regulation::{
         ClaimRefused, Exchange, ExchangeWriter, PoolEntry, ReservationPool, ResponsePrecheck,
         WriterFence,
     },
     transport::FrameWriteClaim,
-    wire_codec::decode_frame,
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
 };
 
-/// Leave at least half the node pool for other sessions, including draining ones.
+/// Live GetBlocks exchanges one session may hold from the node pool: an eighth
+/// of the pool, so the share follows the pool size.
+///
+/// Two sessions hold at most a quarter of the pool, so peers that grow large
+/// windows and then stop answering cannot starve every other session. Normal
+/// sync stays below it: a default Zakura server advertises 2,816 in-flight
+/// requests (`serving_max_inflight_requests`), and the integrated header lead
+/// keeps distinct missing heights within 4,000
+/// (`INTEGRATED_HEADER_BODY_WINDOW_V1`). Exchanges abandoned after GC or a
+/// reorg, or a larger custom advertisement, can briefly reach it, and the
+/// session then waits for endings before it requests more.
 // The protocol ceiling fits usize on supported targets.
-pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 2;
+pub(crate) const SESSION_RESERVATIONS: usize = MAX_BS_INFLIGHT_REQUESTS as usize / 8;
+
+/// Fully received ranges one session may hold while their endings are owed.
+///
+/// A peer that sends every body but withholds the ending still looks
+/// productive, so without this bound it could keep taking work until its
+/// unended exchanges fill [`SESSION_RESERVATIONS`]. An honest server queues
+/// each ending right after its body. Its ready-order output interleaves at most
+/// one body per running read-and-encode job (`PEER_EXECUTION`, 12 per peer),
+/// and one stream keeps frames in that order. So an honest session stays well
+/// below this bound, while a withholding one holds at most this many pool
+/// entries beyond the requests its window already has in flight.
+pub(crate) const MAX_PENDING_ENDINGS: usize = 64;
+
+/// One consistent read of a session's requester limits.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct RequesterOccupancy {
+    /// Whether the session holds its whole [`SESSION_RESERVATIONS`] share.
+    pub(crate) at_capacity: bool,
+    /// Live exchanges, including abandoned ones still awaiting an ending.
+    pub(crate) len: usize,
+    /// Fully received ranges still owing an ending.
+    pub(crate) pending_endings: usize,
+}
 
 /// The precheck may outlive the routine. Its sender retains session capacity
 /// until the authorization maps and transport reader have both been dropped.
@@ -41,14 +75,6 @@ impl Shared {
     }
 }
 
-fn frame_rejection(error: ClaimRefused) -> FrameRejection {
-    match error {
-        ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-        ClaimRefused::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
-        _ => FrameRejection::Unsolicited,
-    }
-}
-
 /// The transport reader's gate. Every response it queues stays charged until
 /// [`LiveRequester::authorize`] takes it, so the queue never holds more than
 /// the live ranges owe.
@@ -57,13 +83,21 @@ impl ResponsePrecheck for Shared {
         if !(3..=5).contains(&tag) {
             return Ok(());
         }
-        self.lock().admit(tag, len).map_err(frame_rejection)
+        self.lock()
+            .admit(tag, len)
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
+/// A frame that passed its checks, carrying the values that its handler uses.
 pub(crate) enum Authorization {
-    Control,
+    Status(BlockSyncStatus),
+    GetBlocks(Range),
+    /// The claimed body's height. Its transactions are still undecoded.
     Block(block::Height),
+    /// The ending already consumed its reservation.
+    Ended(CompletedRange),
+    /// A local incompatibility, not a protocol fault.
     IncompatibleHeader,
 }
 
@@ -122,12 +156,14 @@ impl LiveRequester {
         self.shared.lock().unreceived_expected(limit)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.shared.lock().len()
-    }
-
-    pub(crate) fn at_capacity(&self) -> bool {
-        self.shared.lock().at_capacity()
+    /// The share, live exchange count and owed endings, read under one lock.
+    pub(crate) fn occupancy(&self) -> RequesterOccupancy {
+        let requester = self.shared.lock();
+        RequesterOccupancy {
+            at_capacity: requester.at_capacity(),
+            len: requester.len(),
+            pending_endings: requester.pending_endings(),
+        }
     }
 
     pub(crate) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
@@ -181,9 +217,12 @@ impl LiveRequester {
 
     /// Authorize the exact header before decoding the block's transactions.
     /// Endings are small and must validate before their reservation is removed.
+    /// Control frames are decoded here, once.
     pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
         if self.transport_admits && (3..=5).contains(&frame.message_type) {
-            self.shared.lock().take_admitted(frame.payload.len());
+            self.shared
+                .lock()
+                .take_admitted(frame.message_type, frame.payload.len());
         }
         let rule = MessageRule::find(RULES, frame.message_type)
             .ok_or_else(|| SinkReject::protocol("unknown GetBlocks message"))?;
@@ -194,12 +233,12 @@ impl LiveRequester {
         {
             return Err(SinkReject::protocol("invalid GetBlocks frame envelope"));
         }
-        if frame.message_type == 3 {
+        if frame.message_type == u16::from(MSG_BS_BLOCK) {
             self.shared
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
-                .map_err(|error| SinkReject::protocol(frame_rejection(error)))?;
-            let header = block::Header::zcash_deserialize(&frame.payload[1..])
+                .map_err(|error| SinkReject::protocol(error.frame_rejection()))?;
+            let header = block::Header::zcash_deserialize_from_slice(&mut &frame.payload[1..])
                 .map_err(SinkReject::protocol)?;
             let result = self
                 .shared
@@ -214,22 +253,18 @@ impl LiveRequester {
                 Err(error) => Err(SinkReject::protocol(error)),
             };
         }
-        let message: Message = decode_frame(frame).map_err(SinkReject::protocol)?;
-        if matches!(frame.message_type, 4 | 5) {
-            self.shared
-                .lock()
-                .finish(&message)
-                .map_err(SinkReject::protocol)?;
-        }
-        Ok(Authorization::Control)
-    }
-
-    pub(crate) fn ending_start(message: &BlockSyncMessage) -> Option<block::Height> {
-        match message {
-            BlockSyncMessage::BlocksDone { start_height, .. }
-            | BlockSyncMessage::RangeUnavailable { start_height, .. } => Some(*start_height),
-            _ => None,
-        }
+        Ok(
+            match decode_control(&frame.payload).map_err(SinkReject::protocol)? {
+                Control::Status(status) => Authorization::Status(status),
+                Control::GetBlocks(range) => Authorization::GetBlocks(range),
+                Control::End(ending) => Authorization::Ended(
+                    self.shared
+                        .lock()
+                        .finish(ending)
+                        .map_err(SinkReject::protocol)?,
+                ),
+            },
+        )
     }
 }
 
@@ -302,7 +337,7 @@ mod tests {
         assert_eq!(reader.check(1, 53), Ok(()));
 
         // The routine takes and claims the body, then the ending.
-        requester.shared.lock().take_admitted(50);
+        requester.shared.lock().take_admitted(3, 50);
         requester.shared.lock().claim_block(hash, 50).unwrap();
         let mut ending = vec![4];
         ending.extend_from_slice(&1u32.to_le_bytes());
@@ -314,7 +349,7 @@ mod tests {
         };
         assert!(matches!(
             requester.authorize(&ending),
-            Ok(Authorization::Control)
+            Ok(Authorization::Ended(_))
         ));
         assert_eq!(pool.held(), 0);
         assert_eq!(reader.check(4, 9), Err(FrameRejection::Unsolicited));

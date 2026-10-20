@@ -2205,6 +2205,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckBlockAuthCommitment(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
@@ -3531,6 +3532,34 @@ impl Service<ReadRequest> for ReadStateService {
                 )?;
 
                 Ok(ReadResponse::ValidBestChainTipNullifiersAndAnchors)
+            }
+
+            ReadRequest::CheckBlockAuthCommitment(block) => {
+                let chains = state.latest_non_finalized_state();
+                let parent = block.header.previous_block_hash;
+                let chain = chains.find_chain(|chain| chain.contains_block_hash(parent));
+                let parent_height = read::height_by_hash(chain.clone(), &state.db, parent);
+                let Some(height) = parent_height.and_then(|height| height.next().ok()) else {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                };
+                // Use the committed parent, never the supplied coinbase height, to choose rules.
+                if NetworkUpgrade::current(&state.network, height) < NetworkUpgrade::Nu5 {
+                    // V5 transactions are intrinsically invalid before NU5. Their version is
+                    // bound by the transaction Merkle root checked by the caller.
+                    return Ok(ReadResponse::BlockAuthCommitment(Some(true)));
+                }
+                let Some(history) = read::tree::history_tree(chain, &state.db, parent.into())
+                else {
+                    return Ok(ReadResponse::BlockAuthCommitment(None));
+                };
+                Ok(ReadResponse::BlockAuthCommitment(
+                    read::block::auth_commitment_for_parent(
+                        &block,
+                        &state.network,
+                        parent_height.expect("the parent height selected this child"),
+                        &history,
+                    ),
+                ))
             }
 
             ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {

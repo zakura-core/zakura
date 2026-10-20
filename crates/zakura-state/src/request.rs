@@ -1482,6 +1482,10 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks whether the exact body authorizations match the header at its committed parent.
+    /// Returns `None` when the actual parent history is unavailable.
+    CheckBlockAuthCommitment(Arc<Block>),
+
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
@@ -1578,6 +1582,7 @@ impl Request {
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            Request::CheckBlockAuthCommitment(_) => "check_block_auth_commitment",
             Request::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
@@ -2063,6 +2068,10 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks whether the exact body authorizations match the header at its committed parent.
+    /// Returns `None` when the actual parent history is unavailable.
+    CheckBlockAuthCommitment(Arc<Block>),
+
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
@@ -2191,6 +2200,7 @@ impl ReadRequest {
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
             }
+            ReadRequest::CheckBlockAuthCommitment(_) => "check_block_auth_commitment",
             ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
                 "check_prepared_mined_relay_eligibility"
             }
@@ -2254,6 +2264,9 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
+            }
+            Request::CheckBlockAuthCommitment(block) => {
+                Ok(ReadRequest::CheckBlockAuthCommitment(block))
             }
             Request::CheckPreparedMinedRelayEligibility(block) => {
                 Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))

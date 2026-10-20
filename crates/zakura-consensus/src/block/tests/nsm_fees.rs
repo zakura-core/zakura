@@ -96,6 +96,9 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
             let state = service_fn(move |request: zs::Request| async move {
                 Ok::<_, BoxError>(match request {
                     zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckBlockAuthCommitment(_) => {
+                        zs::Response::BlockAuthCommitment(Some(true))
+                    }
                     zs::Request::CheckParentInputs { .. } => {
                         zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
                     }
@@ -193,6 +196,7 @@ proptest::proptest! {
                 let state = service_fn(move |request: zs::Request| async move {
                     Ok::<_, BoxError>(match request {
                         zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                        zs::Request::CheckBlockAuthCommitment(_) => zs::Response::BlockAuthCommitment(Some(true)),
                         zs::Request::CheckParentInputs { .. } => zs::Response::ParentInputs(zs::ParentInputs::Inconclusive),
                         zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0))),
                         zs::Request::CommitSemanticallyVerifiedBlock(block) => {

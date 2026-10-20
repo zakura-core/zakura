@@ -164,6 +164,7 @@ pub(crate) fn frame_payload_bounds(
 }
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
+const LEGACY_GOSSIP_DECODED_SLOTS: usize = 8;
 const LEGACY_GOSSIP_OUTBOUND_BYTES: usize = 32 * 1024 * 1024;
 const LEGACY_GOSSIP_PEER_OUTBOUND_BYTES: usize = 4 * 1024 * 1024;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
@@ -2664,6 +2665,7 @@ impl LegacyGossipForwarder {
 #[derive(Debug)]
 pub struct LegacyGossipSink {
     inbound_tx: mpsc::Sender<LegacyInboundWork>,
+    gossip_slots: Arc<Semaphore>,
     outbound: LegacyGossipOutbound,
     trace: ZakuraTrace,
 }
@@ -2703,6 +2705,7 @@ impl LegacyGossipSink {
         let outbound = outbound_for_supervisor(&supervisor);
         Self {
             inbound_tx,
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             outbound,
             trace,
         }
@@ -2712,13 +2715,18 @@ impl LegacyGossipSink {
 impl LegacyGossipSink {
     fn enqueue_gossip_frame(
         inbound_tx: &mpsc::Sender<LegacyInboundWork>,
+        gossip_slots: &Arc<Semaphore>,
         peer_id: ZakuraPeerId,
         frame: Frame,
     ) -> Result<(), SinkReject> {
+        let Ok(admission) = gossip_slots.clone().try_acquire_owned() else {
+            return Ok(());
+        };
         let frame = LegacyGossipFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
         match inbound_tx.try_send(LegacyInboundWork::Gossip(LegacyGossipInbound {
             peer_id,
             frame,
+            _admission: admission,
         })) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2741,7 +2749,7 @@ impl LegacyGossipSink {
             return Ok(());
         }
 
-        Self::enqueue_gossip_frame(&self.inbound_tx, peer_id, frame)
+        Self::enqueue_gossip_frame(&self.inbound_tx, &self.gossip_slots, peer_id, frame)
     }
 
     /// Keep receive capacity attached to the work queued for the inbound service.
@@ -2854,6 +2862,7 @@ impl ZakuraService for LegacyGossipSink {
         };
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
+        let gossip_slots = self.gossip_slots.clone();
         let peer_id = peer.id.clone();
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
@@ -2937,7 +2946,12 @@ impl ZakuraService for LegacyGossipSink {
                         panic!("injected legacy gossip recv-loop panic after state registration");
                     }
 
-                    match Self::enqueue_gossip_frame(&inbound_tx, peer_id.clone(), frame) {
+                    match Self::enqueue_gossip_frame(
+                        &inbound_tx,
+                        &gossip_slots,
+                        peer_id.clone(),
+                        frame,
+                    ) {
                         Ok(()) => {}
                         Err(SinkReject::Protocol(error)) => {
                             debug!(
@@ -3027,6 +3041,7 @@ enum LegacyInboundWork {
 
 #[derive(Debug)]
 struct LegacyGossipInbound {
+    _admission: OwnedSemaphorePermit,
     peer_id: ZakuraPeerId,
     frame: LegacyGossipFrame,
 }
@@ -4930,6 +4945,7 @@ mod tests {
             .await?;
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
                 peer_id: peer_id.clone(),
                 frame: LegacyGossipFrame::AdvertiseBlock(block_hash(12)),
             }))
@@ -4987,6 +5003,7 @@ mod tests {
         for _ in 0..4 {
             inbound_tx
                 .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                    _admission: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
                     peer_id: peer_id.clone(),
                     frame: frame.clone(),
                 }))
@@ -5625,6 +5642,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5651,6 +5669,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5674,6 +5693,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5775,6 +5795,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5830,6 +5851,7 @@ mod tests {
     async fn a_received_frame_resets_gossip_churn() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: LegacyGossipOutbound::default(),
             trace: ZakuraTrace::noop(),
@@ -5875,6 +5897,7 @@ mod tests {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5929,6 +5952,7 @@ mod tests {
         drop(inbound_rx);
         let outbound = LegacyGossipOutbound::default();
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: outbound.clone(),
             trace: ZakuraTrace::noop(),
@@ -5993,12 +6017,14 @@ mod tests {
 
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
                 peer_id: peer_id.clone(),
                 frame: frame.clone(),
             }))
             .await?;
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
                 peer_id: peer_id.clone(),
                 frame: frame.clone(),
             }))
@@ -6015,6 +6041,7 @@ mod tests {
 
         inbound_tx
             .send(LegacyInboundWork::Gossip(LegacyGossipInbound {
+                _admission: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
                 peer_id,
                 frame,
             }))
@@ -6035,6 +6062,7 @@ mod tests {
     fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let sink = LegacyGossipSink {
+            gossip_slots: Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS)),
             inbound_tx,
             outbound: LegacyGossipOutbound::default(),
             trace: ZakuraTrace::noop(),
@@ -7917,6 +7945,40 @@ mod tests {
             outbound.node_bytes.available_permits(),
             LEGACY_GOSSIP_OUTBOUND_BYTES
         );
+        Ok(())
+    }
+    /// Decoded gossip cannot fill the shared service queue or release admission on dequeue.
+    #[test]
+    fn decoded_gossip_keeps_request_queue_capacity() -> Result<(), BoxError> {
+        let (tx, mut rx) = mpsc::channel(LEGACY_GOSSIP_INBOUND_QUEUE);
+        let slots = Arc::new(Semaphore::new(LEGACY_GOSSIP_DECODED_SLOTS));
+        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let frame = LegacyGossipFrame::AdvertiseTransactionIds(vec![
+            legacy_tx_id(1);
+            usize::try_from(
+                MAX_TX_INV_IN_SENT_MESSAGE
+            )?
+        ])
+        .encode_frame()?;
+        for _ in 0..LEGACY_GOSSIP_INBOUND_QUEUE {
+            LegacyGossipSink::enqueue_gossip_frame(&tx, &slots, peer.clone(), frame.clone())?;
+        }
+        assert_eq!(rx.len(), LEGACY_GOSSIP_DECODED_SLOTS);
+        assert_eq!(slots.available_permits(), 0);
+        let running = rx.try_recv()?;
+        assert_eq!(slots.available_permits(), 0);
+        let (response_tx, _) = oneshot::channel();
+        tx.try_send(LegacyInboundWork::Request(LegacyRequestInbound {
+            peer_id: peer,
+            request_id: 1,
+            frame: LegacyRequestFrame::Ping,
+            response_tx,
+            _receive_lease: Default::default(),
+        }))?;
+        drop(running);
+        assert_eq!(slots.available_permits(), 1);
+        drop(rx);
+        assert_eq!(slots.available_permits(), LEGACY_GOSSIP_DECODED_SLOTS);
         Ok(())
     }
 }

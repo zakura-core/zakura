@@ -412,7 +412,9 @@ disputes both deliveries when the boundary cannot identify which delivery is inv
 failure starts metadata repair immediately.
 
 The writer also runs a bounded sweep before waiting on a parked checkpoint block. Queued bodies
-cannot make this recovery pass yield. If authentication changes header state, the writer retries
+cannot make this recovery pass yield. It examines the first boundary even if setup exhausts the
+time budget, then honors the budget before later heights. If authentication changes header state,
+the writer retries
 the parked block before waiting for more peer input. Without a state change it keeps waiting, so
 unchanged disputes do not cause a retry loop.
 

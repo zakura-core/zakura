@@ -313,9 +313,8 @@ impl VctWriteRetryManager {
 
     /// Publishes the repair that can unblock the writer.
     ///
-    /// The repair channel stores one latest value. A committer repair takes priority because the
-    /// authentication sweep runs only after the checkpoint queue becomes empty. The sweep cannot
-    /// clear its repair while a missing committer root keeps that queue nonempty.
+    /// The repair channel stores one latest value. A committer repair takes priority because it
+    /// blocks body commits. Sweep repair can concern a higher boundary that bodies have not reached.
     fn publish_effective_repair_status(
         &mut self,
         requester_with_new_episode: Option<VctRepairRequester>,

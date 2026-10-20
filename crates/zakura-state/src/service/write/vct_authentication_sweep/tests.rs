@@ -795,6 +795,78 @@ fn queued_commit_work_yields_before_authentication() {
     );
 }
 
+/// An exhausted budget must not strand the honest pair at a parked commit boundary.
+#[test]
+fn recovery_examines_a_crossed_dispute_with_an_exhausted_budget() {
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    let blocked = Height(BODY_TIP + 1);
+    let successor = Height(blocked.0 + 1);
+    fixture.insert_headers(None, Some((successor, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthenticationSweeper::default();
+    fixture.sweep(&mut sweeper);
+    fixture.redeliver(blocked, Some(Corruption::SaplingRoot), 0x80);
+    let VctAuxiliaryWindowRead::Ready(window) = fixture
+        .writer
+        .vct_auxiliary_window(blocked, fixture.chain[blocked.0 as usize].hash())
+        .expect("the selected boundary is coherent")
+    else {
+        panic!("both deliveries are retained");
+    };
+    assert!(matches!(
+        fixture
+            .writer
+            .record_vct_auxiliary_failure(
+                &window,
+                VctAuxiliaryFailureAttribution::AmbiguousDeliveries,
+                VctCommitFailure::SuccessorBoundary,
+            )
+            .expect("the second failed pair is disputed"),
+        Some(ApplyResult::Committed)
+    ));
+    assert_eq!(
+        fixture.authentications(blocked),
+        vec![TestAuxStatus::Disputed; 2]
+    );
+    assert_eq!(
+        fixture.authentications(successor),
+        vec![TestAuxStatus::Disputed; 2]
+    );
+    let before = fixture.writer.runtime.publisher().snapshot();
+    sweeper.sweep_with_budget(
+        &fixture.finalized_state,
+        &fixture.writer,
+        &mut fixture.repair,
+        Duration::ZERO,
+        0,
+        || false,
+    );
+    assert_eq!(fixture.writer.runtime.publisher().snapshot(), before);
+
+    sweeper.sweep_with_budget(
+        &fixture.finalized_state,
+        &fixture.writer,
+        &mut fixture.repair,
+        Duration::ZERO,
+        1,
+        || false,
+    );
+    assert_eq!(
+        fixture.authentication(blocked),
+        Some(TestAuxStatus::Authenticated)
+    );
+    assert_eq!(
+        sweeper
+            .verified_selected_prefix
+            .as_ref()
+            .expect("the first boundary verifies")
+            .frontier
+            .height,
+        blocked,
+        "the expired budget stops recovery before the next height"
+    );
+}
+
 #[test]
 fn stops_below_a_height_with_no_supplied_metadata() {
     let _init_guard = zakura_test::init();

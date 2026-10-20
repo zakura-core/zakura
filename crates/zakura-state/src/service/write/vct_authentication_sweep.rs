@@ -49,7 +49,7 @@ use crate::{
 /// The sweep authenticates at most this many selected heights before it yields.
 const MAX_HEIGHTS_PER_SWEEP: u32 = 128;
 
-/// The sweep consumes at most this much writer time before it yields.
+/// Target writer time between selected-height checks.
 const MAX_SWEEP_TIME: Duration = Duration::from_millis(5);
 
 /// A contiguous selected prefix whose auxiliary roots the sweep has verified and folded.
@@ -71,8 +71,8 @@ pub(super) struct VctAuthenticationSweeper {
 impl VctAuthenticationSweeper {
     /// Authenticates available alternatives before a parked block waits for more peer input.
     ///
-    /// Queued bodies must not suppress this recovery pass. Retry only when the sweep changes
-    /// header state, since re-verifying unchanged disputes cannot make progress.
+    /// The first boundary is examined even if setup exhausts the time budget. Retry only when
+    /// header state changes, since re-verifying unchanged disputes cannot make progress.
     pub(super) fn sweep_before_retry_wait(
         &mut self,
         finalized_state: &FinalizedState,
@@ -83,7 +83,14 @@ impl VctAuthenticationSweeper {
             return false;
         };
         let before = writer.runtime.publisher().snapshot().state_version;
-        self.sweep(finalized_state, writer, repair_manager, || false);
+        self.sweep_with_budget(
+            finalized_state,
+            writer,
+            repair_manager,
+            MAX_SWEEP_TIME,
+            1,
+            || false,
+        );
         writer.runtime.publisher().snapshot().state_version != before
     }
 
@@ -96,6 +103,28 @@ impl VctAuthenticationSweeper {
         finalized_state: &FinalizedState,
         writer: &HeaderChainWriter,
         repair_manager: &mut VctWriteRetryManager,
+        should_yield: impl FnMut() -> bool,
+    ) {
+        self.sweep_with_budget(
+            finalized_state,
+            writer,
+            repair_manager,
+            MAX_SWEEP_TIME,
+            0,
+            should_yield,
+        );
+    }
+
+    /// Defers time and yield checks until `minimum_heights` have been examined.
+    ///
+    /// The height cap still applies. Setup and one boundary check can exceed `time_budget`.
+    fn sweep_with_budget(
+        &mut self,
+        finalized_state: &FinalizedState,
+        writer: &HeaderChainWriter,
+        repair_manager: &mut VctWriteRetryManager,
+        time_budget: Duration,
+        minimum_heights: u32,
         mut should_yield: impl FnMut() -> bool,
     ) {
         let sweep_started_at = Instant::now();
@@ -175,9 +204,10 @@ impl VctAuthenticationSweeper {
         while let Some(selected_frontier) =
             captured_projection.frontiers.get(projection_index).copied()
         {
+            let examined_heights = MAX_HEIGHTS_PER_SWEEP - remaining_height_budget;
             if remaining_height_budget == 0
-                || sweep_started_at.elapsed() >= MAX_SWEEP_TIME
-                || should_yield()
+                || (examined_heights >= minimum_heights
+                    && (sweep_started_at.elapsed() >= time_budget || should_yield()))
             {
                 break;
             }

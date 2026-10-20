@@ -37,6 +37,9 @@ audit-as-crates-io = false
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
+[policy.zakura-derive]
+audit-as-crates-io = false
+
 [policy.zakura-header-chain]
 audit-as-crates-io = false
 

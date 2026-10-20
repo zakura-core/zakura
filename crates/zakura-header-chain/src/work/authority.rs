@@ -8,7 +8,7 @@ use crate::{BodyWorkEpoch, BranchId, HeaderGeneration, VerifiedGeneration};
 ///
 /// Header work authority omits global state versions and verified-body generations.
 /// Neither value can authorize or stale pure header work.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub struct HeaderWorkAuthority {
     /// Selected-header generation that scheduled the work.
     pub header_generation: HeaderGeneration,
@@ -28,7 +28,7 @@ impl HeaderWorkAuthority {
 }
 
 /// Header authority plus the verified generation required by body-affecting work.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub struct BodyWorkAuthority {
     /// Header branch on which the body work is valid.
     pub header: HeaderWorkAuthority,
@@ -86,7 +86,7 @@ impl std::ops::Deref for HeaderWorkOwner {
 }
 
 /// Exact owner of body-affecting work.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub struct BodyWorkOwner {
     /// Durable authority for this attempt.
     pub authority: BodyWorkAuthority,
@@ -136,7 +136,7 @@ impl std::ops::Deref for BodyWorkAuthority {
 
 /// Domain-discriminated owner used only where header sync can carry either a
 /// normal header target or a verified-generation-bound auxiliary repair.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 pub enum HeaderSyncWorkOwner {
     /// Ordinary header target work.
     Header(HeaderWorkOwner),

@@ -71,7 +71,7 @@ use crate::{
 /// Zcash has a number of different transaction formats. They are represented
 /// internally by different enum variants. Because we checkpoint on Canopy
 /// activation, we do not validate any pre-Sapling transaction types.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, zakura_derive::OutlineDebug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub enum Transaction {
     /// A fully transparent transaction (`version = 1`).

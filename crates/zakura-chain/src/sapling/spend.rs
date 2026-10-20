@@ -34,7 +34,7 @@ use super::{
 /// `V5` transactions split them into multiple arrays.
 ///
 /// [ps]: https://zips.z.cash/protocol/protocol.pdf#spendencoding
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Getters)]
+#[derive(Clone, zakura_derive::OutlineDebug, Serialize, Deserialize, PartialEq, Getters)]
 pub struct Spend<AnchorV: AnchorVariant> {
     /// A value commitment to the value of the input note.
     #[getset(get = "pub")]

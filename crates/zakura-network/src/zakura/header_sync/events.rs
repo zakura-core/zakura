@@ -146,7 +146,7 @@ pub(crate) enum PortDispatch {
 }
 
 /// Cheap cloneable handle used by transport and discovery services.
-#[derive(Clone, Debug)]
+#[derive(Clone, zakura_derive::OutlineDebug)]
 pub struct HeaderSyncHandle {
     pub(super) events: mpsc::Sender<Event>,
     pub(super) lifecycle: mpsc::UnboundedSender<Event>,

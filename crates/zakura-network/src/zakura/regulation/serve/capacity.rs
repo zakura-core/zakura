@@ -182,7 +182,7 @@ impl Drop for Tally {
 /// A peer's budgets live as long as any session or unfinished response holds
 /// them. A reconnect finds and shares the live budgets instead of getting new
 /// ones, so reconnecting never adds capacity.
-#[derive(Clone, Debug)]
+#[derive(Clone, zakura_derive::OutlineDebug)]
 pub(crate) struct ServeCapacity {
     pub(super) request: &'static MessageRule,
     pub(super) max_in_flight: u32,

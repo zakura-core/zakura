@@ -20,7 +20,7 @@ fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
 }
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, Hash, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum PeerSource {
     /// A peer connected through the legacy TCP socket transport.
@@ -55,7 +55,7 @@ impl From<PeerSocketAddr> for PeerSource {
 /// while waiting for a response, the peer connection resets its state and makes
 /// a best-effort attempt to ignore any messages responsive to the cancelled
 /// request, subject to limitations in the underlying Zcash protocol.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Request {
     /// Disconnect a legacy peer without changing its misbehavior score or ban status.

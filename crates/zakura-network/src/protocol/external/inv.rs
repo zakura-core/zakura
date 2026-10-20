@@ -28,7 +28,7 @@ use super::MAX_PROTOCOL_MESSAGE_LEN;
 /// container, so we do not use that term to avoid confusion with `Vec<T>`.
 ///
 /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#Inventory_Vectors)
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Hash)]
 pub enum InventoryHash {
     /// An error.
     ///

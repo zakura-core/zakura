@@ -6,7 +6,7 @@ use std::sync::Arc;
 use zakura_header_chain::Frontier;
 
 /// Checked monotonic identity for one lifecycle generation.
-#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LifecycleEpoch(u64);
 
 impl LifecycleEpoch {

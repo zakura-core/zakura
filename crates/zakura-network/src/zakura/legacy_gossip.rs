@@ -3194,7 +3194,7 @@ enum InventoryKey {
 }
 
 /// Errors produced by the legacy gossip adapter.
-#[derive(Debug, Error)]
+#[derive(zakura_derive::OutlineDebug, Error)]
 pub enum LegacyGossipError {
     /// The request is intentionally outside this phase's gossip-only scope.
     #[error("unsupported legacy gossip request: {0}")]

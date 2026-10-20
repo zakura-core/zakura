@@ -149,7 +149,7 @@ pub enum HistoricalSubtreeUnavailableReason {
 ///
 /// These errors are recoverable open-time failures that the caller can report,
 /// as opposed to invariant violations that indicate a bug.
-#[derive(Debug, Error)]
+#[derive(zakura_derive::OutlineDebug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
     /// The configured historical frontier artifact could not be read or decoded.
@@ -303,7 +303,7 @@ pub enum StateInitError {
 pub struct TransparentIndexesUnavailable;
 
 /// An error describing why a block could not be queued to be committed to the state.
-#[derive(Debug, Error, Clone, PartialEq, Eq, new)]
+#[derive(zakura_derive::OutlineDebug, Error, Clone, PartialEq, Eq, new)]
 pub enum CommitBlockError {
     #[error("block hash is a duplicate: already in {location}")]
     /// The block is a duplicate: it is already queued or committed in the state.
@@ -655,7 +655,7 @@ pub enum PreciousError {
 }
 
 /// An error describing why a block failed contextual validation.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(zakura_derive::OutlineDebug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum ValidateContextError {

@@ -62,7 +62,7 @@ pub const ONE_THIRD_DUST_THRESHOLD_RATE: u32 = 100;
 /// OutPoint
 ///
 /// A particular transaction output reference.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Hash)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub struct OutPoint {
@@ -311,7 +311,7 @@ impl Input {
 /// I only own one UTXO worth 2 ZEC, I would construct a transaction
 /// that spends my UTXO and sends 1 ZEC to you and 1 ZEC back to me
 /// (just like receiving change).
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Hash)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary, Deserialize))]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Serialize))]
 pub struct Output {

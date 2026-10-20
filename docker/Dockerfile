@@ -153,6 +153,7 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-mmr-tree,target=crates/zakura-mmr-tree \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
+    --mount=type=bind,source=crates/zakura-derive,target=crates/zakura-derive \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \

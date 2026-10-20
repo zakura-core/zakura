@@ -102,7 +102,7 @@ pub struct RollbackFinalizedStateSummary {
 }
 
 /// Errors returned by finalized-state rollback.
-#[derive(Debug, thiserror::Error)]
+#[derive(zakura_derive::OutlineDebug, thiserror::Error)]
 pub enum RollbackFinalizedStateError {
     /// The state database could not be opened for this configuration.
     #[error("cannot open the state database to roll back: {0}")]

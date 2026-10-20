@@ -1,0 +1,23 @@
+[package]
+name = "zakura-derive"
+version = "0.1.0"
+authors.workspace = true
+description = "Derive macros for Zakura. Internal crate, published to support cargo install zakura"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+bench = false
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+
+[lints]
+workspace = true

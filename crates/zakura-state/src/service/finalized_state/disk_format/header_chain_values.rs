@@ -61,7 +61,7 @@ impl FallibleDiskValue for HeaderRowCountDisk {
 }
 
 /// Malformed, truncated, oversized, or unknown version-one value data.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Eq, Error, PartialEq)]
 pub enum HeaderChainValueError {
     /// The decoder reached the value's end before it read a complete field.
     #[error("truncated header-chain value")]

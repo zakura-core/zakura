@@ -7,7 +7,7 @@ use halo2::pasta::{group::ff::PrimeField, pallas};
 use crate::serialization::{serde_helpers, SerializationError};
 
 /// A Nullifier for Orchard transactions
-#[derive(Clone, Copy, Debug, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, zakura_derive::OutlineDebug, Eq, Serialize, Deserialize)]
 pub struct Nullifier(#[serde(with = "serde_helpers::Base")] pub(crate) pallas::Base);
 
 impl Hash for Nullifier {

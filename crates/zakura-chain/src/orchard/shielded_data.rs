@@ -36,7 +36,7 @@ pub(crate) fn expected_proof_size(num_actions: usize) -> usize {
 }
 
 /// A bundle of [`Action`] descriptions and signature data.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, zakura_derive::OutlineDebug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ShieldedData {
     /// The orchard flags for this transaction.
     /// Denoted as `flagsOrchard` in the spec.

@@ -611,7 +611,7 @@ pub enum DiscoveryMessage {
 }
 
 /// A malformed discovery wire message.
-#[derive(Error, Debug)]
+#[derive(Error, zakura_derive::OutlineDebug)]
 pub enum DiscoveryWireError {
     /// A payload exceeded its hard cap.
     #[error("Zakura discovery payload length {actual} exceeds hard cap {max}")]

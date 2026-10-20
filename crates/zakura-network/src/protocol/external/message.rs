@@ -35,7 +35,7 @@ use zakura_chain::serialization::arbitrary::datetime_full;
 /// during serialization).
 ///
 /// [btc_wiki_protocol]: https://en.bitcoin.it/wiki/Protocol_documentation
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, zakura_derive::OutlineDebug)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Message {
     /// A `version` message.

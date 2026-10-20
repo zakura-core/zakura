@@ -529,7 +529,7 @@ fn auxiliary_rows_are_coherent(
 }
 
 /// Failure at the durable header-chain boundary.
-#[derive(Debug, Error)]
+#[derive(zakura_derive::OutlineDebug, Error)]
 pub enum HeaderChainStoreError {
     /// Migration or bootstrap has not initialized the database yet.
     #[error("header-chain metadata is not initialized")]

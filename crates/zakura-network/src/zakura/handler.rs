@@ -6325,7 +6325,7 @@ impl<C: Clock> TokenBucket<C> {
 }
 
 /// Errors produced by the Zakura protocol handler.
-#[derive(Debug, Error)]
+#[derive(zakura_derive::OutlineDebug, Error)]
 pub enum ZakuraHandlerError {
     /// The stream's message table rejected a frame from its header.
     #[error("rejected a frame of message type {message_type}: {rejection}")]

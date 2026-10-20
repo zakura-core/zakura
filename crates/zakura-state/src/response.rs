@@ -46,7 +46,7 @@ pub enum PreparedMinedRelayEligibility {
     Unavailable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, zakura_derive::OutlineDebug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
     /// Response to [`Request::ApplyHeaderChainInsert`].

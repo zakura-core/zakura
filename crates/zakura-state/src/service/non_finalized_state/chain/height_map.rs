@@ -11,7 +11,7 @@ const HEIGHTS_PER_CHUNK: u32 = 64;
 
 /// A private ordered index with copy-on-write 64-height chunks.
 /// Snapshots copy the outer index; writes copy only touched chunks.
-#[derive(Debug)]
+#[derive(zakura_derive::OutlineDebug)]
 pub(crate) struct HeightMap<V> {
     chunks: BTreeMap<u32, Arc<BTreeMap<Height, V>>>,
 }

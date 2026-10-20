@@ -86,7 +86,7 @@ pub trait AnchorVariant {
 /// there is a single `shared_anchor` for the entire transaction, which is only
 /// present when there is at least one spend. These structural differences are
 /// modeled using the `AnchorVariant` type trait and `TransferData` enum.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Getters)]
+#[derive(Clone, zakura_derive::OutlineDebug, Serialize, Deserialize, PartialEq, Eq, Getters)]
 pub struct ShieldedData<AnchorV>
 where
     AnchorV: AnchorVariant + Clone,
@@ -120,7 +120,7 @@ where
 /// Specifically, TransferData ensures that:
 /// * there is at least one spend or output, and
 /// * the shared anchor is only present when there are spends.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, zakura_derive::OutlineDebug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TransferData<AnchorV>
 where
     AnchorV: AnchorVariant + Clone,

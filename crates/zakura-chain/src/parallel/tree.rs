@@ -38,7 +38,7 @@ pub struct NoteCommitmentTrees {
 }
 
 /// Note commitment tree errors.
-#[derive(Error, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Error, Copy, Clone, zakura_derive::OutlineDebug, Eq, PartialEq, Hash)]
 pub enum NoteCommitmentTreeError {
     /// A sprout tree error
     #[error("sprout error: {0}")]

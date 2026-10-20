@@ -28,7 +28,7 @@ use proptest_derive::Arbitrary;
 const MAX_EXPIRY_HEIGHT: block::Height = block::Height::MAX_EXPIRY_HEIGHT;
 
 /// Errors for semantic transaction validation.
-#[derive(Error, Clone, Debug, PartialEq, Eq)]
+#[derive(Error, Clone, zakura_derive::OutlineDebug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[allow(missing_docs)]
 pub enum TransactionError {

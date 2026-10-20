@@ -158,7 +158,12 @@ impl<'a> FrameFilter<'a> {
             if payload_len < payload.min() {
                 return Err(FrameRejection::PayloadTooShort { min: payload.min() });
             }
-            frame_cap.min(payload.max().saturating_add(FRAME_HEADER_BYTES))
+            let cap = frame_cap.min(payload.max().saturating_add(FRAME_HEADER_BYTES));
+            // Let the reader report oversize before local capacity can mask bad framing.
+            if payload_len.saturating_add(FRAME_HEADER_BYTES) > cap {
+                return Ok(cap);
+            }
+            cap
         } else {
             frame_cap
         };

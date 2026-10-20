@@ -1,6 +1,6 @@
 # Legacy receive admission
 
-Legacy streams use the same transport frame reader as native services. Their message types, reserved flags, and fixed or bounded payload lengths are now checked before payload allocation. These checks retain the existing wire limits and exact-budget EOF behavior.
+Legacy streams use the same transport frame reader as native services. Their message types, reserved flags, and fixed or bounded payload lengths are now checked before payload allocation. Impossible legacy lengths reach the fatal oversize path before local capacity checks. These checks retain the existing wire limits and exact-budget EOF behavior.
 
 ## Ownership
 

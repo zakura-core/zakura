@@ -2071,3 +2071,54 @@ async fn legacy_partial_requests_release_capacity_at_local_deadline() -> Result<
     drop(streams);
     Ok(())
 }
+
+/// Impossible response lengths remain fatal even when receive capacity would reject them.
+#[tokio::test]
+async fn legacy_oversize_headers_are_fatal_before_capacity_checks() -> Result<(), BoxError> {
+    let (server, client, connection, remote) = raw_connection().await?;
+    let local = ZakuraLocalLimits::from_config(&Config::default());
+    let limits = local.clamp(&local.initial_limits());
+    let stream = Stream {
+        kind: LEGACY_REQUEST_STREAM_KIND,
+        version: 1,
+        frame_cap: limits.max_frame_bytes,
+        ..Stream::REQUEST_RESPONSE
+    };
+    for declared in [9, u32::MAX] {
+        let response = write_outbound_request_frame(
+            &connection,
+            limits,
+            stream,
+            42,
+            LEGACY_REQUEST_PING,
+            0,
+            Vec::new(),
+        );
+        let responder = async {
+            let (mut send, mut recv) = remote.accept_bi().await?;
+            read_stream_prelude(&mut recv, TEST_TIMEOUT).await?;
+            let mut header = Vec::new();
+            header.extend_from_slice(&LEGACY_RESPONSE_PONG.to_le_bytes());
+            header.extend_from_slice(&0u16.to_le_bytes());
+            header.extend_from_slice(&declared.to_le_bytes());
+            send.write_all(&header).await?;
+            Ok::<_, BoxError>((send, recv))
+        };
+        let (result, held_stream) =
+            tokio::join!(timeout(Duration::from_secs(2), response), responder);
+        let _held_stream = held_stream?;
+        let result = result.expect("oversize headers fail without waiting for their payload");
+        assert!(
+            matches!(result,
+                Err(OutboundRequestError::Fatal(ref error))
+                    if matches!(error.downcast_ref::<ZakuraHandlerError>(),
+                        Some(ZakuraHandlerError::OversizeFrame { .. }))
+            ),
+            "impossible declaration must be a fatal oversize: {result:?}"
+        );
+    }
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, server.shutdown()).await?;
+    Ok(())
+}

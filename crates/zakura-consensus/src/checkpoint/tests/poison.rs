@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use futures::future::BoxFuture;
 use tokio::{sync::watch, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -298,18 +298,17 @@ where
         .call(block)
 }
 
-/// A same-hash forged body strands every descendant that reaches the state after the rejection.
+/// A same-hash forged body gets every descendant answered, and the honest resubmission commits.
 ///
-/// Root cause A: the state removes each queued block as it sends it to the writer. After the
-/// writer rejects the forged body, the state rewinds to the parent, but the queue no longer holds
-/// the rejected hash, so later descendants never drain and never receive a response. The checkpoint
-/// verifier has already removed those descendants from its own queue, so it waits for them before
-/// it forwards an honest copy of the forged block.
+/// Root cause A: the state removes each queued block as it sends it to the writer. A descendant
+/// that reaches the state after the writer rejects the forged body used to wait for a parent the
+/// writer had dropped, so it never got a response. The verifier tags each commit with its reset
+/// generation, so the state now fails every block from the rejected generation.
 ///
-/// Root cause B: near the final checkpoint, the state also reports the rejected hash as known.
+/// Root cause B: near the final checkpoint, the state used to report the rejected hash as known
+/// until a process restart. The state now forgets the hashes above the durable tip.
 #[tokio::test(flavor = "multi_thread")]
-async fn forged_body_strands_descendants_that_reach_state_after_the_rejection() -> Result<(), Report>
-{
+async fn forged_body_answers_every_descendant_and_the_resubmission_commits() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
     const RANGE_END: u32 = 10;
@@ -334,7 +333,8 @@ async fn forged_body_strands_descendants_that_reach_state_after_the_rejection() 
     let genesis = submit(&mut verifier, fixture.blocks[0].clone()).await;
     assert_eq!(timeout(STRANDED_AFTER, genesis).await??, fixture.hash(0));
 
-    // The syncer submits the whole range. One body is forged.
+    // The syncer submits the whole range. One body is forged, and the commit of a later block
+    // reaches the state only after the forged body is rejected.
     let mut pending = BTreeMap::new();
     for height in 1..=RANGE_END {
         let block = if height == FORGED {
@@ -362,23 +362,13 @@ async fn forged_body_strands_descendants_that_reach_state_after_the_rejection() 
         "the forged body fails its commitment: {:?}",
         results[&FORGED],
     );
-    for height in FORGED + 1..SLOW {
+    for height in FORGED + 1..=RANGE_END {
         assert!(
             matches!(&results[&height], Ok(Err(error)) if error.is_descendant_of_auth_commitment_mismatch()),
-            "height {height} reached the writer and gets the retryable error: {:?}",
+            "height {height} gets the retryable descendant error: {:?}",
             results[&height],
         );
     }
-    let stranded: Vec<u32> = results
-        .iter()
-        .filter(|(_, result)| result.is_err())
-        .map(|(height, _)| *height)
-        .collect();
-    assert_eq!(
-        stranded,
-        (SLOW..=RANGE_END).collect::<Vec<_>>(),
-        "every block from the slow commit onward never gets a response",
-    );
 
     let tip = state.clone().oneshot(zs::Request::Tip).await;
     assert!(
@@ -386,70 +376,31 @@ async fn forged_body_strands_descendants_that_reach_state_after_the_rejection() 
         "the state tip stays at the forged block's parent: {tip:?}",
     );
 
-    // Root cause B: the uncommitted forged hash is reported as known.
-    let known = state
-        .clone()
-        .oneshot(zs::Request::KnownBlock(fixture.hash(FORGED)))
-        .await;
-    assert!(
-        matches!(
-            known,
-            Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel)))
-        ),
-        "the rejected hash stays in the sent-hash set: {known:?}",
-    );
+    // Root cause B: the syncer can download the rejected hash again.
+    for height in FORGED..=RANGE_END {
+        let known = state
+            .clone()
+            .oneshot(zs::Request::KnownBlock(fixture.hash(height)))
+            .await;
+        assert!(
+            matches!(known, Ok(zs::Response::KnownBlock(None))),
+            "height {height} is not reported as known after the rejection: {known:?}",
+        );
+    }
 
-    // The syncer requeues the forged block and its rejected descendants.
-    // The honest body cannot commit, because the verifier waits for the stranded heights.
+    // The syncer requeues the forged block and its descendants, and the honest range commits.
     let mut retried = Vec::new();
-    for height in FORGED..SLOW {
+    for height in FORGED..=RANGE_END {
         retried.push((
             height,
             submit(&mut verifier, fixture.blocks[height as usize].clone()).await,
         ));
     }
-    let mut retried_waiting = Vec::new();
     for (height, future) in retried {
-        match timeout(STRANDED_AFTER, future).await {
-            Err(_) => retried_waiting.push(height),
-            Ok(result) => {
-                panic!("height {height} resolved without the stranded heights: {result:?}")
-            }
-        }
-    }
-    assert_eq!(retried_waiting, (FORGED..SLOW).collect::<Vec<_>>());
-
-    let known = state
-        .clone()
-        .oneshot(zs::Request::KnownBlock(fixture.hash(FORGED)))
-        .await;
-    assert!(
-        matches!(
-            known,
-            Ok(zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel)))
-        ),
-        "the rejected hash is still reported as known while it is uncommitted: {known:?}",
-    );
-
-    // Legacy sync recovers only when its verify timeout makes it download the stranded heights.
-    let mut recovered = Vec::new();
-    for height in SLOW..=RANGE_END {
-        recovered.push((
-            height,
-            submit(&mut verifier, fixture.blocks[height as usize].clone()).await,
-        ));
-    }
-    for (height, future) in recovered {
-        // The first copy can commit before the second copy reaches the state.
-        // The syncer treats a finalized duplicate as a success.
         let result = timeout(STRANDED_AFTER, future).await;
         assert!(
-            match &result {
-                Ok(Ok(hash)) => *hash == fixture.hash(height),
-                Ok(Err(error)) => error.duplicate_location() == Some(&zs::KnownBlock::Finalized),
-                Err(_) => false,
-            },
-            "height {height} commits after the stranded heights are downloaded again: {result:?}",
+            matches!(&result, Ok(Ok(hash)) if *hash == fixture.hash(height)),
+            "height {height} commits after one resubmission: {result:?}",
         );
     }
     let tip = state.clone().oneshot(zs::Request::Tip).await;
@@ -461,13 +412,14 @@ async fn forged_body_strands_descendants_that_reach_state_after_the_rejection() 
     Ok(())
 }
 
-/// Measures how often a forged body strands descendants without any injected delay.
+/// Checks that a forged body strands no descendants without any injected delay.
 ///
 /// Run with `--ignored --nocapture`. The test submits a full 400-block range and counts the
-/// verifier futures that never resolve.
+/// verifier futures that never resolve. Before the fix, heights 2 and 5 stranded descendants in
+/// about two thirds of the trials.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn forged_body_strand_rate_under_natural_scheduling() -> Result<(), Report> {
+async fn forged_body_strands_nothing_under_natural_scheduling() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
     const RANGE_END: u32 = 400;
@@ -514,6 +466,10 @@ async fn forged_body_strand_rate_under_natural_scheduling() -> Result<(), Report
             }
             stranded_blocks.push(stranded);
         }
+        assert_eq!(
+            stranded_trials, 0,
+            "forged height {forged_height} stranded descendants: {stranded_blocks:?}",
+        );
 
         #[allow(clippy::print_stderr)]
         {
@@ -528,17 +484,26 @@ async fn forged_body_strand_rate_under_natural_scheduling() -> Result<(), Report
 }
 
 /// At ZIP 234 heights, a descendant of a rejected body fails while it waits for its parent's
-/// block info. Root cause C: that error is not classified as a descendant of a forged body.
+/// block info. Root cause C: the syncer must requeue that block without scoring its peer.
 #[test]
-fn await_block_info_rejection_is_not_classified_as_a_forged_body_descendant() {
-    let error = VerifyCheckpointError::CommitCheckpointVerified(
+fn await_block_info_rejection_is_classified_as_a_forged_body_descendant() {
+    let rejected = VerifyCheckpointError::CommitCheckpointVerified(
         zs::AwaitBlockInfoError::Rejected {
             hash: block::Hash([7; 32]),
         }
         .into(),
     );
+    assert!(rejected.is_descendant_of_auth_commitment_mismatch());
+    assert_eq!(rejected.misbehavior_score(), 0);
 
-    assert!(!error.is_descendant_of_auth_commitment_mismatch());
+    let timed_out = VerifyCheckpointError::CommitCheckpointVerified(
+        zs::AwaitBlockInfoError::TimedOut {
+            hash: block::Hash([7; 32]),
+            limit: Duration::from_secs(1),
+        }
+        .into(),
+    );
+    assert!(!timed_out.is_descendant_of_auth_commitment_mismatch());
 }
 
 /// Holds checkpoint commits for chosen hashes until a chosen commit finishes.
@@ -670,16 +635,14 @@ async fn settle(
     (finished, pending)
 }
 
-/// Native block sync resubmits a whole checkpoint range after a forged body. That recovery
-/// commits the range but leaks never-answered commits into the state queue.
+/// Native block sync resubmits a whole checkpoint range after a forged body. Every copy of every
+/// block must get a response, or it holds one of the 401 window slots for good.
 ///
-/// After the honest copy of the forged block commits, the state drains the old stranded copies of
-/// its descendants, because they are still keyed by their parent hashes. A fresh copy of the same
-/// height that reaches the state after that drain is keyed by a parent the state has already sent,
-/// so it never drains and never gets a response. Native block sync keeps each such submission in
-/// its 401-block window, so repeated attacks shrink the window until a range no longer fits.
+/// Before the fix, the state drained the old stranded copies of the forged block's descendants
+/// after the honest copy committed. A fresh copy that reached the state after that drain was keyed
+/// by a parent the state had already sent, so it never drained and never got a response.
 #[tokio::test(flavor = "multi_thread")]
-async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> Result<(), Report> {
+async fn range_resubmission_after_a_forged_body_answers_every_copy() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
     const FORGED: u32 = 3;
@@ -710,20 +673,31 @@ async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> 
         first.push((height, spawn_submit(&mut verifier, block).await));
     }
     let (finished, old_stranded) = settle(first).await;
-    assert_eq!(
-        finished.keys().copied().collect::<Vec<_>>(),
-        (1..SLOW).collect::<Vec<_>>()
-    );
-    assert_eq!(
+    assert!(
+        old_stranded.is_empty(),
+        "every old copy gets a response: {:?}",
         old_stranded
             .iter()
             .map(|(height, _)| *height)
             .collect::<Vec<_>>(),
-        (SLOW..=10).collect::<Vec<_>>(),
     );
+    for (height, result) in &finished {
+        let expected = match height.cmp(&FORGED) {
+            std::cmp::Ordering::Less => {
+                matches!(result, Ok(hash) if *hash == fixture.hash(*height))
+            }
+            std::cmp::Ordering::Equal => {
+                matches!(result, Err(error) if error.is_auth_commitment_mismatch())
+            }
+            std::cmp::Ordering::Greater => {
+                matches!(result, Err(error) if error.is_descendant_of_auth_commitment_mismatch())
+            }
+        };
+        assert!(expected, "old copy of height {height}: {result:?}");
+    }
 
     // Block sync downloads the whole range again. The fresh descendants reach the state after the
-    // honest copy of the forged block's child commits.
+    // honest copy of the slow block's parent commits.
     gate.hold(
         (SLOW..=10).map(|height| fixture.hash(height)),
         fixture.hash(SLOW - 1),
@@ -737,21 +711,11 @@ async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> 
         ));
     }
     let (fresh_finished, fresh_stranded) = settle(fresh).await;
-    for height in FORGED..SLOW {
-        assert!(
-            matches!(&fresh_finished.get(&height), Some(Ok(hash)) if *hash == fixture.hash(height)),
-            "fresh height {height} commits: {:?}",
-            fresh_finished.get(&height),
-        );
-    }
-
-    // The old stranded copies commit the range.
-    let (old_finished, old_still_stranded) = settle(old_stranded).await;
-    assert!(old_still_stranded.is_empty());
-    for (height, result) in &old_finished {
+    assert!(fresh_stranded.is_empty());
+    for (height, result) in &fresh_finished {
         assert!(
             matches!(result, Ok(hash) if *hash == fixture.hash(*height)),
-            "old copy of height {height} commits once its parent commits: {result:?}",
+            "fresh copy of height {height} commits: {result:?}",
         );
     }
     let tip = state.clone().oneshot(zs::Request::Tip).await;
@@ -760,16 +724,7 @@ async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> 
         "{tip:?}",
     );
 
-    // Every fresh copy of a stranded height is now a never-answered commit.
-    assert_eq!(
-        fresh_stranded
-            .iter()
-            .map(|(height, _)| *height)
-            .collect::<Vec<_>>(),
-        (SLOW..=10).collect::<Vec<_>>(),
-    );
-
-    // Later ranges still commit, and the leaked commits stay pending.
+    // Later ranges still commit.
     let mut next = Vec::new();
     for height in 11..=20 {
         next.push((
@@ -783,24 +738,18 @@ async fn range_resubmission_strands_fresh_copies_behind_drained_old_copies() -> 
         next_finished.values().all(Result::is_ok),
         "{next_finished:?}"
     );
-    let (_, fresh_still_stranded) = settle(fresh_stranded).await;
-    assert_eq!(
-        fresh_still_stranded.len(),
-        (SLOW..=10).count(),
-        "the leaked commits never resolve before the checkpoint handoff",
-    );
 
     Ok(())
 }
 
-/// Measures native-sync slot leaks without any injected delay.
+/// Checks that native-sync range resubmission leaks no commits without any injected delay.
 ///
-/// Each trial forges height 2 of a 400-block range and, if descendants strand, resubmits the whole
-/// range as native block sync does. It reports old stranded copies and fresh copies that never
-/// resolve. Run with `--ignored --nocapture`.
+/// Each trial forges height 2 of a 400-block range and resubmits the whole range as native block
+/// sync does. It reports old stranded copies and fresh copies that never resolve. Before the fix,
+/// half the trials leaked 45–340 commits. Run with `--ignored --nocapture`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn range_resubmission_leak_rate_under_natural_scheduling() -> Result<(), Report> {
+async fn range_resubmission_leaks_nothing_under_natural_scheduling() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
     const RANGE_END: u32 = 400;
@@ -834,10 +783,6 @@ async fn range_resubmission_leak_rate_under_natural_scheduling() -> Result<(), R
             first.push((height, spawn_submit(&mut verifier, block).await));
         }
         let (_, old_stranded) = settle(first).await;
-        if old_stranded.is_empty() {
-            report.push((0, 0, 0));
-            continue;
-        }
 
         let mut fresh = Vec::new();
         for height in FORGED..=RANGE_END {
@@ -860,6 +805,10 @@ async fn range_resubmission_leak_rate_under_natural_scheduling() -> Result<(), R
              (0, 0, 0) means nothing stranded: {report:?}"
         );
     }
+    assert!(
+        report.iter().all(|counts| *counts == (0, 0, 0)),
+        "no trial strands or leaks a commit: {report:?}",
+    );
 
     Ok(())
 }

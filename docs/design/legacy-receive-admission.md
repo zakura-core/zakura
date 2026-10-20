@@ -12,6 +12,8 @@ Each response has a 32 MiB retained-memory envelope in addition to its unchanged
 
 Gossip ingress is separately bounded to eight queued frames per stream. The request/response reservations are not a complete process RSS limit. QUIC buffers, gossip queues, decoded objects, allocator retention, and unrelated node state remain separate consumers.
 
+Responder encoding also stops at 8,192 frames per response. Chunk iteration allocates no per-chunk index, and each frame is charged before its payload allocation. Tiny peer-selected caps therefore cause a local resource reset instead of millions of small allocations.
+
 ## Validation
 
 The partial-payload test uses actual QUIC connections with default flow-control windows. Eight identities each hold eight almost-complete 1 MiB transaction frames. A ninth stream per identity and a ninth identity are refused without cancelling their connections. A separate Ping/Pong exchange progresses while all 64 inbound slots are occupied. Cancellation releases the slots.

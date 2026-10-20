@@ -234,6 +234,8 @@ const LEGACY_RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 /// Sized well above any single response the local service emits (zakurad caps
 /// `getdata` at ~1 MiB) yet far below memory-risk thresholds.
 const LEGACY_RESPONSE_MAX_AGGREGATE_BYTES: usize = 8 * MAX_PROTOCOL_MESSAGE_LEN;
+/// Bound framing work while allowing a maximum-size item in 256-byte chunks.
+pub(super) const LEGACY_RESPONSE_MAX_FRAMES: usize = 8192;
 const REQUEST_ID_BYTES: usize = 8;
 const RESPONSE_CHUNK_HEADER_BYTES: usize = REQUEST_ID_BYTES + 1;
 const NO_STOP_HASH: block::Hash = block::Hash([0; 32]);
@@ -1115,6 +1117,7 @@ fn ensure_header_count(count: usize) -> Result<(), LegacyGossipError> {
 #[derive(Default)]
 struct ResponseEncodeBudget {
     bytes: usize,
+    frames: usize,
 }
 
 impl ResponseEncodeBudget {
@@ -1122,6 +1125,10 @@ impl ResponseEncodeBudget {
     /// response once cumulative payload bytes exceed the responder aggregate
     /// budget.
     fn account(&mut self, payload_len: usize) -> Result<(), LegacyGossipError> {
+        if self.frames >= LEGACY_RESPONSE_MAX_FRAMES {
+            return Err(LegacyGossipError::ResponseFrameBudget);
+        }
+        self.frames += 1;
         self.bytes = self.bytes.saturating_add(payload_len);
         if self.bytes > LEGACY_RESPONSE_MAX_AGGREGATE_BYTES {
             return Err(LegacyGossipError::ResponseAggregateBudget(self.bytes));
@@ -1173,19 +1180,17 @@ fn push_chunked_response(
     let chunk_bytes = LEGACY_RESPONSE_CHUNK_BYTES.min(max_chunk_bytes);
 
     debug_assert!(!bytes.is_empty());
-    let chunks = bytes.chunks(chunk_bytes).collect::<Vec<_>>();
+    let chunks = bytes.chunks(chunk_bytes);
+    let chunk_count = chunks.len();
 
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in chunks.enumerate() {
+        budget.account(RESPONSE_CHUNK_HEADER_BYTES + chunk.len())?;
         let mut payload = Vec::with_capacity(RESPONSE_CHUNK_HEADER_BYTES + chunk.len());
         // The stream prelude already has this id, but each response frame repeats it so
         // malformed peers are rejected at the frame boundary before decoding payload bytes.
         payload.extend_from_slice(&request_id.to_le_bytes());
-        payload.push(u8::from(index + 1 == chunks.len()));
+        payload.push(u8::from(index + 1 == chunk_count));
         payload.extend_from_slice(chunk);
-        // Charge each chunk against the shared budget so a response that
-        // aggregates many available items aborts mid-encode rather than after
-        // the whole `Vec<Frame>` has been materialized.
-        budget.account(payload.len())?;
         frames.push(Frame {
             message_type,
             flags: 0,
@@ -3341,6 +3346,9 @@ pub enum LegacyGossipError {
     /// The encoded response would exceed the responder-side aggregate budget.
     #[error("legacy response exceeded responder aggregate budget: {0} bytes")]
     ResponseAggregateBudget(usize),
+    /// Peer-selected chunk sizes would require excessive frame allocations.
+    #[error("legacy response exceeded local frame budget")]
+    ResponseFrameBudget,
     /// The legacy service returned an unexpected response variant.
     #[error("unexpected legacy response: {0}")]
     UnexpectedResponse(&'static str),
@@ -3398,6 +3406,7 @@ impl LegacyGossipError {
             | Self::Serialization(_) => true,
             Self::UnsupportedRequest(_)
             | Self::ResponseAggregateBudget(_)
+            | Self::ResponseFrameBudget
             | Self::UnexpectedResponse(_)
             | Self::MissingResponse(_)
             | Self::Io(_)
@@ -7795,5 +7804,27 @@ mod tests {
         receiver.shutdown().await;
         server.shutdown().await;
         Ok(())
+    }
+    /// One-byte chunks cannot multiply a legal block into millions of allocations.
+    #[test]
+    fn tiny_response_caps_stop_at_local_frame_budget() {
+        let mut frames = Vec::new();
+        let mut budget = ResponseEncodeBudget::default();
+        let error = push_chunked_response(
+            &mut frames,
+            &mut budget,
+            MSG_RESPONSE_BLOCK,
+            1,
+            u32::try_from(FRAME_HEADER_BYTES + RESPONSE_CHUNK_HEADER_BYTES + 1).unwrap(),
+            u32::try_from(MAX_PROTOCOL_MESSAGE_LEN).unwrap(),
+            vec![0; MAX_PROTOCOL_MESSAGE_LEN],
+        )
+        .unwrap_err();
+        assert!(matches!(error, LegacyGossipError::ResponseFrameBudget));
+        assert!(!error.is_peer_fault());
+        assert_eq!(frames.len(), LEGACY_RESPONSE_MAX_FRAMES);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.payload.capacity() == RESPONSE_CHUNK_HEADER_BYTES + 1));
     }
 }

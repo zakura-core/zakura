@@ -11079,6 +11079,58 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
     reactor_task.abort();
 }
 
+/// A caught-up forward reset must not count obsolete queued heights against the next refill.
+#[tokio::test]
+async fn reactor_forward_reset_clears_obsolete_pending_before_refill() {
+    let blocks = mainnet_blocks_1_to_3();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_requests: 1,
+        ..immediate_body_download_config()
+    };
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(3), blocks[2].hash()),
+        tip_rx,
+        config,
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup).unwrap();
+    wait_for_query_needed_blocks(&mut actions, block::Height(1), block::Height(3)).await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![
+            block_meta(&blocks[1]),
+            block_meta(&blocks[2]),
+        ]))
+        .await
+        .unwrap();
+    handle
+        .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(3),
+            verified_block_hash: blocks[2].hash(),
+        }))
+        .await
+        .unwrap();
+    await_until("reset reaches the reactor", Duration::from_secs(1), || {
+        handle.local_status().servable_high == block::Height(3)
+    })
+    .await
+    .unwrap();
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(4),
+            hash: block::Hash([4; 32]),
+        })
+        .await
+        .unwrap();
+    wait_for_query_needed_blocks(&mut actions, block::Height(3), block::Height(4)).await;
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {

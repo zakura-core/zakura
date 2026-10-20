@@ -1103,7 +1103,13 @@ impl PeerRoutine {
             };
             self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let in_bypass = normal_slots == 0;
-            let (servable_low, servable_high) = (self.servable_low, self.servable_high);
+            let view = *self.sequencer_view.borrow();
+            let Ok(first_needed) = view.download_floor.next() else {
+                break FillStop::NoWork;
+            };
+            // A forward reset can leave old pending entries at or below its floor.
+            let (servable_low, servable_high) =
+                (self.servable_low.max(first_needed), self.servable_high);
 
             // Compute this chunk's count and byte ceiling before taking any work.
             // The count cap is the peer/request cap; the byte cap is enforced by
@@ -1111,7 +1117,6 @@ impl PeerRoutine {
             let max_count = self.request_count_cap();
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
-            let view = *self.sequencer_view.borrow();
             let floor_high = floor_rescue_high(view.download_floor);
             // One snapshot per iteration: the floor and speculative lanes decide
             // against the same memory picture, and `admit` is the single authority
@@ -2788,6 +2793,64 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    /// A forward reset can retain old pending work, but only new heights may be requested.
+    #[tokio::test]
+    async fn fill_skips_pending_work_at_or_below_reset_floor() {
+        for floor in [block::Height(3), block::Height::MAX] {
+            let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+            routine.received_status = true;
+            routine.servable_low = block::Height(1);
+            routine.servable_high = block::Height::MAX;
+            routine.work.extend(
+                super::super::test_work_scope(),
+                (2..=3).map(|height| {
+                    (
+                        block::Height(height),
+                        block::Hash([u8::try_from(height).unwrap(); 32]),
+                        BlockSizeEstimate::Advertised(1_000),
+                    )
+                }),
+            );
+            routine.work.reset_above(floor);
+            assert!(routine.work.pending_contains(block::Height(2)));
+            assert!(routine.work.pending_contains(block::Height(3)));
+            let mut view = *routine.sequencer_view.borrow();
+            view.download_floor = floor;
+            view.reset_epoch += 1;
+            let (_view_tx, view_rx) = watch::channel(view);
+            routine.sequencer_view = view_rx;
+            routine.on_view_changed();
+            if floor == block::Height(3) {
+                routine.work.extend(
+                    super::super::test_work_scope(),
+                    [(
+                        block::Height(4),
+                        block::Hash([4; 32]),
+                        BlockSizeEstimate::Advertised(1_000),
+                    )],
+                );
+            }
+
+            routine.try_fill().await;
+
+            if floor == block::Height(3) {
+                let frame = outbound
+                    .try_recv()
+                    .expect("the next needed block is requested");
+                assert!(matches!(
+                    BlockSyncMessage::decode_frame(frame).unwrap(),
+                    BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(4),
+                        count: 1
+                    }
+                ));
+            }
+            assert!(outbound.try_recv().is_err(), "no obsolete request is sent");
+            assert!(!routine.work.in_flight_contains(block::Height(2)));
+            assert!(!routine.work.in_flight_contains(block::Height(3)));
+        }
     }
 
     #[tokio::test(start_paused = true)]

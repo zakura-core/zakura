@@ -508,6 +508,32 @@ impl Fixture {
         marker: u8,
     ) -> ApplyResult {
         let snapshot = self.writer.runtime.publisher().snapshot();
+        let insert = self.redelivery(height, corruption, marker);
+        self.writer
+            .runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(insert),
+                },
+                &TransitionContext {
+                    config: &self.writer.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .expect("the selected auxiliary replacement applies")
+    }
+
+    /// Builds a supplier response for the selected repair range without applying it.
+    fn redelivery(
+        &self,
+        height: Height,
+        corruption: Option<(Height, Corruption)>,
+        marker: u8,
+    ) -> Box<InsertHeaders> {
+        let snapshot = self.writer.runtime.publisher().snapshot();
         let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
             u64::from(marker),
             NonZeroU64::new(1).expect("one is nonzero"),
@@ -576,33 +602,19 @@ impl Fixture {
                 )
             })
             .collect();
-        self.writer
-            .runtime
-            .apply(
-                TransitionRequest {
-                    expected_version: snapshot.state_version,
-                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
-                        owner,
-                        source,
-                        parent_hash: parent.hash(),
-                        target_tip_hash: request_target.hash,
-                        completion: TargetCompletion::SelectedAuxiliaryRepair {
-                            common_ancestor: Frontier::new(Height(first_height - 1), parent.hash()),
-                            selected_target: request_target,
-                            episode: context.episode,
-                        },
-                        batch,
-                        aux,
-                    })),
-                },
-                &TransitionContext {
-                    config: &self.writer.config,
-                    clock: &SystemClock,
-                    full_state_authority: None,
-                    retention_references: &[],
-                },
-            )
-            .expect("the selected auxiliary replacement applies")
+        Box::new(InsertHeaders {
+            owner,
+            source,
+            parent_hash: parent.hash(),
+            target_tip_hash: request_target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: Frontier::new(Height(first_height - 1), parent.hash()),
+                selected_target: request_target,
+                episode: context.episode,
+            },
+            batch,
+            aux,
+        })
     }
 
     fn authentications(&self, height: Height) -> Vec<TestAuxStatus> {

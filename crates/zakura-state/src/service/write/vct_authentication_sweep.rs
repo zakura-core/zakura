@@ -69,6 +69,24 @@ pub(super) struct VctAuthenticationSweeper {
 }
 
 impl VctAuthenticationSweeper {
+    /// Authenticates available alternatives before a parked block waits for more peer input.
+    ///
+    /// Queued bodies must not suppress this recovery pass. Retry only when the sweep changes
+    /// header state, since re-verifying unchanged disputes cannot make progress.
+    pub(super) fn sweep_before_retry_wait(
+        &mut self,
+        finalized_state: &FinalizedState,
+        writer: Option<&HeaderChainWriter>,
+        repair_manager: &mut VctWriteRetryManager,
+    ) -> bool {
+        let Some(writer) = writer else {
+            return false;
+        };
+        let before = writer.runtime.publisher().snapshot().state_version;
+        self.sweep(finalized_state, writer, repair_manager, || false);
+        writer.runtime.publisher().snapshot().state_version != before
+    }
+
     /// Authenticates a bounded prefix of selected deliveries above the committed body tip.
     ///
     /// The sweep keeps its durable repair need when a transient condition stops progress.

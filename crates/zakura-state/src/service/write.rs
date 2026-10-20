@@ -2563,6 +2563,13 @@ impl WriteBlockWorkerTask {
                             },
                             ordered_block,
                         );
+                        if vct_authentication_sweeper.sweep_before_retry_wait(
+                            finalized_state,
+                            header_chain.as_ref(),
+                            &mut vct_write_retry_manager,
+                        ) {
+                            continue;
+                        }
                         if let Some(exit) = wait_for_vct_retry(
                             wait,
                             non_finalized_block_write_receiver,
@@ -2645,6 +2652,13 @@ impl WriteBlockWorkerTask {
                         retry_cause,
                         ordered_block,
                     );
+                    if vct_authentication_sweeper.sweep_before_retry_wait(
+                        finalized_state,
+                        header_chain.as_ref(),
+                        &mut vct_write_retry_manager,
+                    ) {
+                        continue;
+                    }
                     if let Some(exit) = wait_for_vct_retry(
                         wait,
                         non_finalized_block_write_receiver,
@@ -2827,6 +2841,13 @@ impl WriteBlockWorkerTask {
                             retry_cause,
                             ordered_block,
                         );
+                        if vct_authentication_sweeper.sweep_before_retry_wait(
+                            finalized_state,
+                            header_chain.as_ref(),
+                            &mut vct_write_retry_manager,
+                        ) {
+                            continue;
+                        }
                         if let Some(exit) = wait_for_vct_retry(
                             wait,
                             non_finalized_block_write_receiver,

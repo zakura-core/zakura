@@ -312,25 +312,19 @@ mod tests {
     }
 
     #[test]
-    fn test_only_november_mainnet_activation_rotates_to_zip_2008_recipient() {
-        // Test-only November 5 fixture; ZIP 259 has not assigned Mainnet NU7.
-        // TODO(zip-259): use the assigned height and recheck the first new slot.
-        const ACTIVATION: u32 = 3_543_000;
-        const ROTATION: u32 = 3_613_200;
-        const STREAM_END: u32 = 6_133_200;
+    fn mainnet_activation_rotates_to_zip_2008_recipient() {
+        const ACTIVATION: u32 = 3_543_405;
+        const ROTATION: u32 = 3_612_390;
+        const STREAM_END: u32 = 6_132_390;
         let addresses = nu7_fpf_addresses(Some(Height(ACTIVATION)));
         let old = "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow";
         let new = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
 
-        let mut activation_heights: crate::parameters::testnet::ConfiguredActivationHeights =
-            Network::Mainnet.activation_list().into();
-        activation_heights.nu7 = Some(ACTIVATION);
-        let network = crate::parameters::testnet::Parameters::build()
-            .with_activation_heights(activation_heights)
-            .unwrap()
-            .clear_funding_streams()
-            .to_network()
-            .unwrap();
+        let network = Network::Mainnet;
+        assert_eq!(
+            NetworkUpgrade::Nu7.activation_height(&network),
+            Some(Height(ACTIVATION))
+        );
         let start_period = funding_stream_address_period(Height(3_146_400), &network);
 
         assert!(addresses[..12].iter().all(|address| *address == old));

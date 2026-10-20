@@ -764,7 +764,11 @@ fn nsm_reissuance_requires_nu7_and_a_crossing() {
         ..Default::default()
     });
 
-    for network in [Network::Mainnet, configured, regtest] {
+    for network in [
+        Network::new_regtest(Default::default()),
+        configured,
+        regtest,
+    ] {
         assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
         assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
     }
@@ -1202,9 +1206,10 @@ fn nsm_reissuance_crossing_can_be_absent() {
 
     let _init_guard = zakura_test::init();
     assert_eq!(
-        nsm_reissuance_crossing_height(&Network::Mainnet).expect("valid arithmetic"),
+        nsm_reissuance_crossing_height(&Network::new_regtest(Default::default()))
+            .expect("valid arithmetic"),
         None,
-        "Mainnet has no NU7 height yet"
+        "default Regtest has no NU7 activation height"
     );
 
     let regtest = Network::new_regtest(

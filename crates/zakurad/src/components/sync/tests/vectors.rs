@@ -21,7 +21,7 @@ use tower::{timeout::Timeout, Service};
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    parameters::{testnet::ConfiguredActivationHeights, Network},
+    parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
@@ -4327,7 +4327,7 @@ async fn lookahead_limit_scales_with_target_spacing() {
     let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;
     let full_limit = sync_config.full_verify_concurrency_limit;
 
-    // Mainnet has no NU7 height, so its limits stay unscaled.
+    // Mainnet limits stay unscaled below NU7.
     let mainnet_checkpoint = Height(3_000_000);
     assert_eq!(
         lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(2_000_000)),
@@ -4336,6 +4336,14 @@ async fn lookahead_limit_scales_with_target_spacing() {
     assert_eq!(
         lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(3_500_000)),
         full_limit
+    );
+
+    let mainnet_nu7 = NetworkUpgrade::Nu7
+        .activation_height(&Network::Mainnet)
+        .expect("Mainnet schedules NU7");
+    assert_eq!(
+        lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, mainnet_nu7),
+        full_limit * multiplier
     );
 
     // Checkpoint verification continues past NU7.

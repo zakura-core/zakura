@@ -2,7 +2,7 @@
 //! funding streams and the funding stream address period.
 //!
 //! The Testnet NU7 height below is a zakura#1059 estimate; the Mainnet height is a
-//! separate test-only November 5 fixture. Neither is a final consensus parameter,
+//! separate synthetic schedule. Neither is a built-in consensus parameter,
 //! so the expected halving heights also follow from the closed forms below.
 
 use std::collections::HashMap;
@@ -28,9 +28,8 @@ use crate::{
 
 use crate::{parameters::NetworkKind, transparent::Address};
 
-/// Test-only Mainnet NU7 activation height, projected for November 5, 2026.
-/// This is not a Mainnet consensus parameter.
-// TODO(zip-259): replace this fixture once the ZIP assigns the Mainnet activation height.
+/// Synthetic NU7 activation height for the fixed Mainnet subsidy oracle.
+/// The built-in Mainnet schedule is checked separately.
 const TEST_ONLY_MAINNET_NU7: u32 = 3_543_000;
 
 /// The Testnet NU7 activation height estimate.
@@ -48,7 +47,7 @@ const REVISION_2: usize = 2;
 
 /// Returns a configured network with the Mainnet activation heights and NU7 at `nu7`.
 ///
-/// Mainnet has no NU7 activation height, so this network stands in for Mainnet with one.
+/// This allows testing alternate schedules without changing built-in Mainnet.
 fn mainnet_with_nu7(nu7: Option<u32>) -> Network {
     let mut activation_heights: testnet::ConfiguredActivationHeights =
         Network::Mainnet.activation_list().into();
@@ -109,8 +108,8 @@ fn test_only_mainnet_nu7_boundaries_match_fixed_oracle() {
     let network = test_only_mainnet_schedule_with_stream();
     assert_eq!(
         crate::parameters::NetworkUpgrade::Nu7.activation_height(&Network::Mainnet),
-        None,
-        "the hypothetical height must not modify built-in Mainnet",
+        Some(activation_heights::mainnet::NU7),
+        "the synthetic height must not modify built-in Mainnet",
     );
     assert_eq!(
         crate::parameters::NetworkUpgrade::Nu7.activation_height(&network),
@@ -322,12 +321,16 @@ fn nu7_adjusted_funding_stream_height_cases() {
 fn revision_2_funding_streams_end_at_the_zip_218_third_halving() {
     let _init_guard = zakura_test::init();
 
-    // Mainnet has no NU7 activation height, so the built-in streams keep their heights.
+    // Built-in Mainnet moves the Revision 2 end to its ZIP 218 third halving.
     let mainnet_streams = Network::Mainnet.all_funding_streams();
     assert_eq!(mainnet_streams.len(), 3);
     assert_eq!(
         mainnet_streams[REVISION_2].height_range().end,
-        Height(MAINNET_THIRD_HALVING)
+        Height(6_132_390)
+    );
+    assert_eq!(
+        height_for_halving(3, &Network::Mainnet),
+        Some(mainnet_streams[REVISION_2].height_range().end),
     );
     assert_eq!(mainnet_streams, &*mainnet::FUNDING_STREAMS);
 

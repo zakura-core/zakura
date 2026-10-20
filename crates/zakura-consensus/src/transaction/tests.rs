@@ -4484,11 +4484,12 @@ fn v4_deprecation_boundary() {
 
     for network in [
         configured_network_with_nu7(Some(Height(2_000_000))),
+        Network::Mainnet,
         Network::new_default_testnet(),
     ] {
         let nu7 = NetworkUpgrade::Nu7
             .activation_height(&network)
-            .expect("NU7 is scheduled on configured and default Testnet");
+            .expect("NU7 is scheduled on Mainnet and configured and default Testnet");
         assert!(
             verify_v4_at(
                 &network,
@@ -4519,7 +4520,10 @@ fn v4_deprecation_boundary() {
         );
     }
 
-    for network in [Network::Mainnet, configured_network_with_nu7(None)] {
+    for network in [
+        configured_network_with_nu7(None),
+        Network::new_regtest(Default::default()),
+    ] {
         assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
         assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
         assert!(

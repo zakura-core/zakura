@@ -353,12 +353,21 @@ mod tests {
     fn progress_timing_follows_tip_target_spacing() {
         let _init_guard = zakura_test::init();
 
-        // Mainnet and Testnet have no NU7 height, so their values stay unchanged.
+        // Both public networks keep their original timing below NU7.
         let tip = Height(3_500_000);
         assert_eq!(stall_interval_seconds(&Network::Mainnet, tip), 600);
         assert_eq!(
             min_minutes_after_checkpoint_update(&Network::Mainnet, tip),
             13
+        );
+
+        let nu7 = NetworkUpgrade::Nu7
+            .activation_height(&Network::Mainnet)
+            .expect("Mainnet schedules NU7");
+        assert_eq!(stall_interval_seconds(&Network::Mainnet, nu7), 200);
+        assert_eq!(
+            min_minutes_after_checkpoint_update(&Network::Mainnet, nu7),
+            5
         );
 
         let testnet = Network::new_default_testnet();

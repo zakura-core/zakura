@@ -29,7 +29,8 @@ fn test_funding_stream_values() -> Result<(), Report> {
     let nu6_1_fund_height_range = network.all_funding_streams()[2].height_range();
 
     let nu6_fund_end = Height(3_146_400);
-    let nu6_1_fund_end = Height(4_406_400);
+    let nu6_1_fund_end = Height(6_132_390);
+    let nu7_activation_height = Nu7.activation_height(network).unwrap();
 
     assert_eq!(canopy_activation_height, Height(1_046_400));
     assert_eq!(nu6_activation_height, Height(2_726_400));
@@ -86,6 +87,9 @@ fn test_funding_stream_values() -> Result<(), Report> {
         nu6_1_fund_height_range.start.previous().unwrap(),
         nu6_1_fund_height_range.start,
         nu6_1_fund_height_range.start.next().unwrap(),
+        nu7_activation_height.previous().unwrap(),
+        nu7_activation_height,
+        nu7_activation_height.next().unwrap(),
         nu6_1_fund_height_range.end.previous().unwrap(),
         nu6_1_fund_height_range.end,
         nu6_1_fund_height_range.end.next().unwrap(),
@@ -97,9 +101,17 @@ fn test_funding_stream_values() -> Result<(), Report> {
             assert!(fsv.is_empty());
         } else if height < nu6_activation_height {
             assert_eq!(fsv, expected_dev_fund);
-        } else if height < nu6_1_fund_end {
-            // NU6 and NU6.1 funding streams are in the same halving and expected to have the same values
+        } else if height < nu7_activation_height {
             assert_eq!(fsv, expected_nu6_fund);
+        } else if height < nu6_1_fund_end {
+            assert_eq!(
+                fsv[&FundingStreamReceiver::Deferred],
+                Amount::try_from(6_250_000)?
+            );
+            assert_eq!(
+                fsv[&FundingStreamReceiver::MajorGrants],
+                Amount::try_from(4_166_666)?
+            );
         } else {
             assert!(fsv.is_empty());
         }
@@ -132,8 +144,6 @@ fn test_funding_stream_addresses() -> Result<(), Report> {
                 );
 
                 // ZIP 2008 changes only Mainnet's NU7 FPF recipient to P2PKH.
-                // TODO(zip-259): verify the built-in stream contains this recipient
-                // once the final Mainnet activation height is assigned.
                 let zip_2008_mainnet_fpf = network.kind() == NetworkKind::Mainnet
                     && *receiver == FundingStreamReceiver::MajorGrants
                     && address.to_string() == "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
@@ -181,8 +191,7 @@ const TESTNET_THIRD_HALVING: u32 = 4_476_000;
 /// The Testnet third halving after ZIP 218 with NU7 at [`TESTNET_NU7`].
 const TESTNET_ZIP_218_THIRD_HALVING: u32 = 4_656_000;
 
-/// Test-only projected November 5 Mainnet activation, not a consensus parameter.
-// TODO(zip-259): replace this fixture once the ZIP assigns Mainnet NU7.
+/// Synthetic NU7 activation height for the fixed coinbase oracle.
 const TEST_ONLY_MAINNET_NU7: u32 = 3_543_000;
 
 /// A configured Testnet with Mainnet's activation schedule and synthetic P2SH
@@ -236,7 +245,10 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
     const MOVED_END: u32 = 6_133_200;
 
     let (network, addresses) = test_only_mainnet_schedule_with_stream();
-    assert_eq!(Nu7.activation_height(&Network::Mainnet), None);
+    assert_eq!(
+        Nu7.activation_height(&Network::Mainnet),
+        Some(Height(3_543_405))
+    );
     assert_eq!(
         Nu7.activation_height(&network),
         Some(Height(TEST_ONLY_MAINNET_NU7))

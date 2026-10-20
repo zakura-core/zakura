@@ -23,7 +23,7 @@ use std::{
 
 use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tower::{Service, ServiceExt};
 use tracing::instrument;
 
@@ -203,6 +203,8 @@ where
     reset_sender: mpsc::Sender<CheckpointReset>,
     /// The generation assigned to new checkpoint commits.
     reset_generation: u64,
+    /// The latest generation with a rejected body, including descendants waiting for parent info.
+    rejected_generation: watch::Sender<Option<u64>>,
 }
 
 impl<S> std::fmt::Debug for CheckpointVerifier<S>
@@ -337,6 +339,7 @@ where
             reset_receiver: receiver,
             reset_sender: sender,
             reset_generation: 0,
+            rejected_generation: watch::channel(None).0,
         };
 
         if !verifier_progress.is_final_checkpoint() {
@@ -1315,6 +1318,8 @@ where
             .then(|| self.state_service.clone());
         let recovery_state = self.state_service.clone();
         let reset_sender = self.reset_sender.clone();
+        let rejected_generation = self.rejected_generation.clone();
+        let mut rejection = rejected_generation.subscribe();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
             let queued_result = req_block
@@ -1330,11 +1335,20 @@ where
 
                 if is_zip234_active(&network, req_block.block.height) {
                     let parent_hash = req_block.block.block.header.previous_block_hash;
-                    let response = state_service
-                        .clone()
-                        .oneshot(zs::Request::AwaitBlockInfo(parent_hash))
-                        .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                        .await?;
+                    let response = tokio::select! {
+                        response = state_service
+                            .clone()
+                            .oneshot(zs::Request::AwaitBlockInfo(parent_hash)) => {
+                            response.map_err(VerifyCheckpointError::CommitCheckpointVerified)?
+                        }
+                        _ = rejection.wait_for(|rejected| {
+                            rejected.is_some_and(|generation| reset_generation <= generation)
+                        }) => {
+                            return Err(VerifyCheckpointError::CommitCheckpointVerified(
+                                zs::AwaitBlockInfoError::Rejected { hash: parent_hash }.into(),
+                            ));
+                        }
+                    };
                     let zs::Response::BlockInfo(parent_info) = response else {
                         unreachable!("wrong response to Request::AwaitBlockInfo");
                     };
@@ -1417,6 +1431,22 @@ where
                 }
             }
             .await;
+
+            // ZIP 234 descendants can wait before submitting a state commit. State cannot
+            // notify their children, so release all parent waits from the failed generation.
+            if result.as_ref().is_err_and(|error| {
+                error.is_auth_commitment_mismatch()
+                    || error.is_descendant_of_auth_commitment_mismatch()
+            }) {
+                rejected_generation.send_if_modified(|rejected| {
+                    if rejected.is_none_or(|generation| reset_generation > generation) {
+                        *rejected = Some(reset_generation);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
 
             // The commit task owns recovery so a canceled caller cannot discard the reset.
             if zakura_chain::shutdown::is_shutting_down() {

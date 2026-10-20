@@ -812,3 +812,73 @@ async fn range_resubmission_leaks_nothing_under_natural_scheduling() -> Result<(
 
     Ok(())
 }
+
+/// A rejected parent must also release descendants waiting on blocks that never reached state.
+#[tokio::test(flavor = "multi_thread")]
+async fn zip234_rejection_releases_parent_waits_and_allows_retry() -> Result<(), Report> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zakura_chain::{block_info::BlockInfo, serialization::ZcashDeserializeInto};
+
+    let _init_guard = zakura_test::init();
+    let (network, block0, block1) = super::zip234_crossing_fixture()?;
+    let block2 = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .as_slice()
+        .zcash_deserialize_into::<Arc<Block>>()?;
+    let hash0 = block0.hash();
+    let hash1 = block1.hash();
+    let hash2 = block2.hash();
+    let retry = Arc::new(AtomicBool::new(false));
+    let state_retry = retry.clone();
+    let descendant_waiting = Arc::new(tokio::sync::Notify::new());
+    let state = tower::service_fn(move |request| {
+        let retry = state_retry.clone();
+        let descendant_waiting = descendant_waiting.clone();
+        async move {
+            match request {
+                zs::Request::AwaitBlockInfo(hash) if !retry.load(Ordering::SeqCst) => {
+                    if hash == hash0 {
+                        descendant_waiting.notified().await;
+                        Err(zs::AwaitBlockInfoError::Rejected { hash }.into())
+                    } else {
+                        descendant_waiting.notify_one();
+                        // This parent failed before it submitted a state commit, so state has
+                        // no write rejection to publish for it.
+                        futures::future::pending().await
+                    }
+                }
+                zs::Request::AwaitBlockInfo(_) => {
+                    Ok(zs::Response::BlockInfo(Some(BlockInfo::default())))
+                }
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    Ok(zs::Response::Committed(block.hash))
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(Some((block::Height(0), hash0)))),
+                zs::Request::CheckCheckpointHandoff => Ok(zs::Response::CheckpointHandoffChecked),
+                _ => unreachable!("the verifier only uses checkpoint requests"),
+            }
+        }
+    });
+    let mut verifier = CheckpointVerifier::from_list(
+        [(block::Height(0), hash0), (block::Height(2), hash2)],
+        &network,
+        Some((block::Height(0), hash0)),
+        crate::transaction::boxed_state(state),
+    )?;
+    let first = submit(&mut verifier, block1.clone()).await;
+    let descendant = submit(&mut verifier, block2.clone()).await;
+    for future in [first, descendant] {
+        let error = timeout(STRANDED_AFTER, future)
+            .await?
+            .expect_err("the generation failed");
+        assert!(
+            error.is_descendant_of_auth_commitment_mismatch(),
+            "{error:?}"
+        );
+    }
+    retry.store(true, Ordering::SeqCst);
+    let first = submit(&mut verifier, block1).await;
+    let descendant = submit(&mut verifier, block2).await;
+    assert_eq!(timeout(STRANDED_AFTER, first).await??, hash1);
+    assert_eq!(timeout(STRANDED_AFTER, descendant).await??, hash2);
+    Ok(())
+}

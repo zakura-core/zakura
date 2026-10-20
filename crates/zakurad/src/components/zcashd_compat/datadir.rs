@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use color_eyre::eyre::{eyre, Report, WrapErr};
+use eyre::{eyre, Report, WrapErr};
 use tracing::{info, warn};
 
 use super::Config;

@@ -67,16 +67,27 @@ impl Push {
             _peer: peer,
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
+            _unwritten: None,
         };
+        PushPermit {
+            grants,
+            execution: self.execution().await,
+        }
+    }
+
+    /// Wait for execution slots alone, for state work a frame needs after
+    /// [`PushPermit::reserve_send`] gave its slots back. The frame already
+    /// holds its output, and execution comes after output as in
+    /// [`Self::acquire`], so the wait cannot invert that order. Cancelling
+    /// the wait takes nothing.
+    pub(crate) async fn execution(&self) -> ExecutionSlots {
+        let delayed = |bound| self.capacity.metrics.delayed(bound);
         let peer = wait(self.peer.execution.reserve(), || delayed("peer_execution")).await;
         let node = wait(self.capacity.node_execution.reserve(), || {
             delayed("node_execution")
         })
         .await;
-        PushPermit {
-            grants,
-            execution: ExecutionSlots::new(peer, node, self.peer.clone()),
-        }
+        ExecutionSlots::new(peer, node, self.peer.clone())
     }
 }
 

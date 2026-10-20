@@ -22,12 +22,12 @@ use zakura_chain::{
 };
 use zcash_protocol::value::ZatBalance;
 
+use super::batch_control::{Batch, BatchControl, RequestWeight};
+use super::fallback::Fallback;
 use crate::{error::TransactionError, BoxError};
 use thiserror::Error;
 use tokio::sync::watch;
 use tower::Service;
-use tower_batch_control::{Batch, BatchControl, RequestWeight};
-use tower_fallback::Fallback;
 
 use super::spawn_fifo;
 
@@ -140,7 +140,7 @@ lazy_static::lazy_static! {
 /// pool.
 #[derive(Clone, Debug)]
 pub struct Item {
-    // `Arc`-wrapped so cloning an `Item` — which `tower-fallback` does eagerly for every request —
+    // `Arc`-wrapped so cloning an `Item` — which `Fallback` does eagerly for every request —
     // shares the bundle instead of deep-copying its actions and multi-KB proof. `add_bundle` only
     // needs `&Bundle`.
     bundle: Arc<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
@@ -150,11 +150,16 @@ pub struct Item {
 
 impl RequestWeight for Item {
     fn request_weight(&self) -> usize {
-        self.bundle.actions().len()
+        self.action_count()
     }
 }
 
 impl Item {
+    /// Returns the number of Orchard actions in this item's bundle, which is its batch weight.
+    pub fn action_count(&self) -> usize {
+        self.bundle.actions().len()
+    }
+
     /// Creates a new [`Item`] from a bundle and sighash.
     ///
     /// Items constructed without their transaction's [`WtxId`] are verified

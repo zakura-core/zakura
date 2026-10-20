@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::Receiver;
 use zakura_chain::{history_tree::HistoryTree, sprout};
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::CancelFormatChange;
+use super::{CancelFormatChange, CancelReceiver};
 
 /// Quickly check that the sprout and history tip trees have updated key formats.
 ///
@@ -94,7 +93,7 @@ pub(super) fn quick_check(db: &ZakuraDb) -> Result<(), String> {
 /// If the state is empty.
 pub(super) fn detailed_check(
     db: &ZakuraDb,
-    _cancel_receiver: &Receiver<CancelFormatChange>,
+    _cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), String>, CancelFormatChange> {
     // This upgrade only changes two key-value pairs, so checking it is always quick.
     Ok(quick_check(db))

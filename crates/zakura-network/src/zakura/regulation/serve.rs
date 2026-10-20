@@ -14,9 +14,11 @@
 //! 3. **`produce` never waits for the peer.** Its [`ResponseSink`] queues
 //!    frames against output bytes that are already granted. `produce` gives
 //!    back its execution slots as soon as it returns.
-//! 4. **Output is ordered.** Each session's writer sends whole responses in
-//!    admission order. A response's output grants return when its last frame
-//!    finishes its transport write. Response slots return at the same time.
+//! 4. **Each response keeps its order.** By default each session's writer
+//!    sends whole responses in admission order. A row may choose
+//!    [`OutputOrder::Ready`] instead, so a finished response never waits for an
+//!    earlier one. Either way, a response's output grants return when its last
+//!    frame finishes its transport write. Response slots return at the same time.
 //!    These slots bound response bookkeeping even when encoded responses are tiny.
 //!    Waiting requests retain commitments, so each session queues at most twice
 //!    its advertised limit beyond the responses that hold output capacity.
@@ -58,7 +60,10 @@
 //! | Property | Test |
 //! | --- | --- |
 //! | Parts, then exactly one ending | `a_request_ends_with_its_parts_then_one_ending` |
-//! | Whole responses in admission order | `output_is_whole_responses_in_admission_order` |
+//! | Admission order (the default): whole responses in admission order | `output_is_whole_responses_in_admission_order` |
+//! | Ready order: a finished response does not wait for an earlier one | `ready_output_does_not_wait_for_an_earlier_response` |
+//! | Ready order: interleaved responses keep their own order, and each returns its grants at its last write | `ready_output_interleaves_responses_and_returns_each_grant_at_its_last_write` |
+//! | Ready order: a completed range's output always precedes a replacement for the same heights | `a_same_height_replacement_never_precedes_the_old_ranges_output` (GetBlocks) |
 //! | Running `produce` steps never exceed node slots | `peak_running_produce_steps_stay_within_node_slots` |
 //! | `limit` requests re-sent at each ending never fault | `exactly_limit_open_requests_never_fault_when_resent_at_each_ending` |
 //! | Up to `2 × limit` served and traced; one more faults | `requests_within_twice_the_limit_are_served_and_traced_and_one_more_faults` |
@@ -68,6 +73,7 @@
 //! | The node slot returns before the peer slot | `the_node_slot_returns_before_the_peer_slot` |
 //! | A non-reading peer holds output but no execution | `a_non_reading_peer_holds_output_bytes_but_no_execution_slot` |
 //! | Output returns when the last frame is written | `output_bytes_return_only_when_the_last_frame_is_written` |
+//! | `responses_written` waits for every admitted response's last write | `responses_written_waits_for_the_last_frame_or_cancellation` |
 //! | Tiny responses stop at the response count limit | `tiny_responses_with_a_blocked_writer_hold_response_slots` |
 //! | Response slots span peers and session replacement | `response_slots_bound_all_peers_and_survive_session_replacement` |
 //! | A stalled peer does not block another | `a_stalled_produce_on_one_peer_does_not_block_another` |
@@ -97,18 +103,18 @@ use std::{
     },
 };
 
+use futures::future::Either;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
-pub(crate) use lease::WorkLease;
-pub(crate) use push::{Push, PushPermit};
+pub(crate) use lease::{ExecutionSlots, WorkLease};
+pub(crate) use push::{Push, PushPermit, PushSend};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
 use capacity::{PeerBudgets, ServeMetrics};
-use lease::ExecutionSlots;
 pub(super) use sink::ending_reserve;
 use sink::{ResponseFrame, SinkCore};
 
@@ -167,6 +173,31 @@ pub(crate) enum ServeViolation {
     },
 }
 
+/// How a session's writer orders the frames of different responses.
+///
+/// Each response always sends its own frames in order, then its ending.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) enum OutputOrder {
+    /// Whole responses in admission order.
+    #[default]
+    Admission,
+    /// Frames in the order producers queue them, so a finished response never
+    /// waits for an earlier one.
+    ///
+    /// Every sink queues straight into one session queue, so frames of
+    /// different responses may interleave. That is simpler than holding a
+    /// started response back until it ends, and it keeps no per-response
+    /// buffer. A row may choose this only if its requester matches each frame
+    /// to its exchange without relying on response order.
+    ///
+    /// Reusing a request key stays ordered: the ending enters that one queue
+    /// under the completion lock (see [`Commitment::queue_ending`]), and the
+    /// sink accepts nothing after it. So once a caller drains a key's
+    /// completion, all of that request's frames are already queued ahead of
+    /// anything a replacement admitted afterwards can queue.
+    Ready,
+}
+
 /// The open requests of one session, and the limit they are checked against.
 #[derive(Debug)]
 struct Commitments {
@@ -216,12 +247,47 @@ pub(super) struct ResponseGrants {
     _peer_response: SlotPermit,
     // Keep every peer budget discoverable while queued output survives a session.
     _peer_budgets: PeerBudgets,
+    // Returns last, once every grant above has returned.
+    _unwritten: Option<Unwritten>,
+}
+
+/// One admitted request in its session's count of unwritten responses.
+/// Dropping it marks the response written or abandoned.
+#[derive(Debug)]
+pub(super) struct Unwritten(Arc<watch::Sender<usize>>);
+
+impl Unwritten {
+    fn new(count: &Arc<watch::Sender<usize>>) -> Self {
+        count.send_modify(|count| *count += 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Unwritten {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
+}
+
+/// Waits until a session has written every response it admitted.
+#[derive(Clone, Debug)]
+pub(crate) struct ResponsesWritten(Arc<watch::Sender<usize>>);
+
+impl ResponsesWritten {
+    /// Resolves once every admitted request's last frame has finished its
+    /// transport write, or the request was dropped with its session.
+    pub(crate) async fn wait(&self) {
+        let mut count = self.0.subscribe();
+        // The sender lives in `self`, so the wait cannot fail.
+        let _ = count.wait_for(|count| *count == 0).await;
+    }
 }
 
 /// An admitted request that waits for capacity.
 struct Job<R> {
     request: R,
     commitment: Commitment,
+    unwritten: Unwritten,
 }
 
 /// Serving for one peer session and one request row.
@@ -230,6 +296,8 @@ struct Job<R> {
 /// is cancelled.
 pub(crate) struct Serve<P: Produce> {
     commitments: Arc<Commitments>,
+    /// Admitted requests whose responses are not fully written.
+    unwritten: Arc<watch::Sender<usize>>,
     max_in_flight: u32,
     jobs: mpsc::UnboundedSender<Job<P::Request>>,
     metrics: Arc<ServeMetrics>,
@@ -268,13 +336,54 @@ impl ServeCapacity {
         connection: CancellationToken,
         close_cause: crate::zakura::CloseCause,
     ) -> Serve<P> {
+        self.session_with_order(
+            OutputOrder::Admission,
+            produce,
+            peer,
+            advertised,
+            send,
+            cancel,
+            connection,
+            close_cause,
+        )
+    }
+
+    /// [`Self::session`], writing responses in `order`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn session_with_order<P: Produce>(
+        &self,
+        order: OutputOrder,
+        produce: Arc<P>,
+        peer: &ZakuraPeerId,
+        advertised: u32,
+        send: FramedSend,
+        cancel: CancellationToken,
+        connection: CancellationToken,
+        close_cause: crate::zakura::CloseCause,
+    ) -> Serve<P> {
         let (jobs, queued) = mpsc::unbounded_channel();
-        let (order, responses) = mpsc::unbounded_channel();
+        let (output, writer) = match order {
+            OutputOrder::Admission => {
+                let (order, responses) = mpsc::unbounded_channel();
+                (
+                    Output::Admission(order),
+                    Either::Left(write_in_order(responses, send, cancel.clone())),
+                )
+            }
+            OutputOrder::Ready => {
+                let (frames, ready) = mpsc::unbounded_channel();
+                (
+                    Output::Ready(frames),
+                    Either::Right(write_ready(ready, send, cancel.clone())),
+                )
+            }
+        };
         let serve = Serve {
             commitments: Arc::new(Commitments {
                 open: AtomicU32::new(0),
                 limit: AtomicU32::new(0),
             }),
+            unwritten: Arc::new(watch::Sender::new(0)),
             max_in_flight: self.max_in_flight,
             jobs,
             metrics: self.metrics.clone(),
@@ -290,12 +399,12 @@ impl ServeCapacity {
             produce,
             capacity: self.clone(),
             peer: self.peer(peer),
-            order,
-            cancel: cancel.clone(),
+            output,
+            cancel,
             tasks: tasks.clone(),
         };
-        tasks.spawn(dispatch.run(queued));
-        tasks.spawn(write_in_order(responses, send, cancel));
+        tasks.spawn_session(dispatch.run(queued));
+        tasks.spawn_session(writer);
         serve
     }
 }
@@ -340,6 +449,7 @@ impl<P: Produce> Serve<P> {
         let _ = self.jobs.send(Job {
             request,
             commitment,
+            unwritten: Unwritten::new(&self.unwritten),
         });
         Ok(())
     }
@@ -353,6 +463,11 @@ impl<P: Produce> Serve<P> {
         self.commitments
             .limit
             .fetch_max(limit.clamp(1, self.max_in_flight), Ordering::AcqRel);
+    }
+
+    /// Waits until this session has written every response it admitted.
+    pub(crate) fn responses_written(&self) -> ResponsesWritten {
+        ResponsesWritten(self.unwritten.clone())
     }
 
     /// Open requests on this session.
@@ -372,20 +487,36 @@ struct ServingTasks {
 }
 
 impl ServingTasks {
-    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
-        let cancel = self.cancel.clone();
-        let connection = self.connection.clone();
-        let close_cause = self.close_cause.clone();
+    /// Spawn a task that runs once per serving session, boxed like other per-session tasks.
+    fn spawn_session(&self, task: impl Future<Output = ()> + Send + 'static) {
         crate::zakura::transport::spawn_supervised_peer_task(
             self.peer.clone(),
             || {},
-            move || {
-                close_cause.record("service_panic");
-                cancel.cancel();
-                connection.cancel();
-            },
+            self.on_panic(),
             task,
         );
+    }
+
+    /// Spawn a task for one served request.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        // Dispatch spawns one task per served request, so keep it unboxed.
+        crate::zakura::transport::spawn_supervised_peer_task_unboxed(
+            self.peer.clone(),
+            || {},
+            self.on_panic(),
+            task,
+        );
+    }
+
+    fn on_panic(&self) -> impl FnOnce() + Send + 'static {
+        let cancel = self.cancel.clone();
+        let connection = self.connection.clone();
+        let close_cause = self.close_cause.clone();
+        move || {
+            close_cause.record("service_panic");
+            cancel.cancel();
+            connection.cancel();
+        }
     }
 }
 
@@ -394,9 +525,32 @@ struct Dispatch<P> {
     produce: Arc<P>,
     capacity: ServeCapacity,
     peer: PeerBudgets,
-    order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
+    output: Output,
     cancel: CancellationToken,
     tasks: ServingTasks,
+}
+
+/// Where dispatch sends each response's frames, by [`OutputOrder`].
+enum Output {
+    /// One channel per response, handed to the writer in admission order.
+    Admission(mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>),
+    /// One frame queue that every response of the session shares.
+    Ready(mpsc::UnboundedSender<ResponseFrame>),
+}
+
+impl Output {
+    /// The frame sender for the next dispatched response, or `None` once the
+    /// writer has stopped.
+    fn response(&self) -> Option<mpsc::UnboundedSender<ResponseFrame>> {
+        match self {
+            Self::Admission(order) => {
+                let (frames, response) = mpsc::unbounded_channel();
+                order.send(response).ok()?;
+                Some(frames)
+            }
+            Self::Ready(frames) => (!frames.is_closed()).then(|| frames.clone()),
+        }
+    }
 }
 
 impl<P: Produce> Dispatch<P> {
@@ -412,17 +566,18 @@ impl<P: Produce> Dispatch<P> {
             };
             let waiting = self.capacity.metrics.waiting();
             let cap = self.produce.response_cap(&job.request);
-            let Some((grants, slots)) = self.acquire(cap).await else {
+            let Some((mut grants, slots)) = self.acquire(cap).await else {
                 return;
             };
+            // The grants return when the response's last frame is written.
+            grants._unwritten = Some(job.unwritten);
             drop(waiting);
-            // Dispatch consumes jobs in admission order. Publish the response
-            // slot before spawning its producer, after capacity is reserved.
-            let (frames, response) = mpsc::unbounded_channel();
-            if self.order.send(response).is_err() {
+            // Dispatch consumes jobs in admission order. Take the response's
+            // output before spawning its producer, after capacity is reserved.
+            let Some(frames) = self.output.response() else {
                 self.cancel.cancel();
                 return;
-            }
+            };
             let task = Task {
                 produce: self.produce.clone(),
                 metrics: self.capacity.metrics.clone(),
@@ -470,6 +625,7 @@ impl<P: Produce> Dispatch<P> {
             _peer: peer,
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
+            _unwritten: None,
         };
         let peer = self
             .wait("peer_execution", self.peer.execution.reserve())
@@ -568,26 +724,64 @@ async fn write_in_order(
                 () = cancel.cancelled() => return,
                 frame = response.recv() => frame,
             };
-            let Some(ResponseFrame { frame, guard, ends }) = frame else {
+            let Some(frame) = frame else {
                 tracing::warn!("a served response ended without an ending; retiring the session");
                 cancel.cancel();
                 return;
             };
-            let slot = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                slot = send.reserve_response_guarded() => slot,
-            };
-            match slot {
-                Ok(slot) => slot.send(frame, guard),
-                Err(_) => {
-                    cancel.cancel();
-                    return;
-                }
+            let ends = frame.ends;
+            if !write(&send, &cancel, frame).await {
+                return;
             }
             if ends {
                 break;
             }
+        }
+    }
+}
+
+/// Write frames in the order producers queue them.
+///
+/// This writer cannot see a response stop without an ending. [`Task::run`]
+/// covers that instead: it queues the failure ending or retires the session,
+/// and a panic closes the connection.
+async fn write_ready(
+    mut frames: mpsc::UnboundedReceiver<ResponseFrame>,
+    send: FramedSend,
+    cancel: CancellationToken,
+) {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = frames.recv() => match frame {
+                Some(frame) => frame,
+                None => return,
+            },
+        };
+        if !write(&send, &cancel, frame).await {
+            return;
+        }
+    }
+}
+
+/// Write one frame through a guarded response slot, so its guard holds the
+/// response's grants until the transport write finishes. Returns `false` once
+/// the session is cancelled, cancelling it if the transport closed.
+async fn write(send: &FramedSend, cancel: &CancellationToken, frame: ResponseFrame) -> bool {
+    let slot = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return false,
+        slot = send.reserve_response_guarded() => slot,
+    };
+    match slot {
+        Ok(slot) => {
+            slot.send(frame.frame, frame.guard);
+            true
+        }
+        Err(_) => {
+            cancel.cancel();
+            false
         }
     }
 }

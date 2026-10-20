@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use color_eyre::eyre::{eyre, Report, Result};
+use eyre::{eyre, Report, Result};
 use futures::stream::{FuturesOrdered, StreamExt};
 use tower::ServiceExt;
 
@@ -21,7 +21,7 @@ where
     let mut results = FuturesOrdered::new();
     for i in 0..n {
         let span = tracing::trace_span!("sig", i);
-        let sk = SigningKey::new(thread_rng());
+        let sk = SigningKey::new(OsRng);
         let vk_bytes = VerificationKeyBytes::from(&sk);
         let msg = b"BatchVerifyTest";
         let sig = if Some(i) == bad_index {

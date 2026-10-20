@@ -34,6 +34,14 @@ pub enum FrameRejection {
         /// The largest remaining payload bytes among the live reservations.
         bytes: u64,
     },
+    /// Queued responses would exceed what the live reservations still owe.
+    #[error("queued responses exceed the {frames} frames and {bytes} bytes still owed")]
+    AboveOwed {
+        /// Frames, endings included, the live reservations still owe.
+        frames: u64,
+        /// Payload bytes the live reservations still owe.
+        bytes: u64,
+    },
 }
 
 impl FrameRejection {
@@ -45,6 +53,7 @@ impl FrameRejection {
             Self::PayloadTooShort { .. } => "payload_too_short",
             Self::Unsolicited => "unsolicited",
             Self::AboveReservation { .. } => "above_reservation",
+            Self::AboveOwed { .. } => "above_owed",
         }
     }
 }

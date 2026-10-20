@@ -15,7 +15,7 @@ use zakura_node_services::mempool::{MempoolChange, MempoolTxSubscriber};
 use zakura_state::{HashOrHeight, ReadRequest, ReadResponse};
 use zakura_test::{
     mock_service::{MockService, PanicAssertion},
-    prelude::color_eyre::{eyre::eyre, Result},
+    prelude::eyre::{eyre, Result},
 };
 
 #[cfg(feature = "indexer")]

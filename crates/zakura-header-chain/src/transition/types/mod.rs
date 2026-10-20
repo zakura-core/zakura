@@ -35,8 +35,8 @@ pub use outcome::{
 };
 pub(crate) use preparation::hash_network_policy;
 pub use preparation::{
-    ContextFreePreparationReceipt, HeaderContextFact, PreparedHeader, PreparedHeaderBatch,
-    ValidationLease,
+    ContextFreePreparationReceipt, HashedHeader, HeaderContextFact, PreparedHeader,
+    PreparedHeaderBatch, ValidationLease,
 };
 pub use snapshot::{
     AlarmSet, BodySizeHintBatch, CommittedHeaderChainView, EngineMetadata, EngineSnapshot,

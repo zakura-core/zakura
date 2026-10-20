@@ -16,6 +16,27 @@ pub enum BodyCommitmentKind {
     Other(&'static str),
 }
 
+impl BodyCommitmentKind {
+    /// NU5+ header commitment to the parent history root and this body's auth data root.
+    pub const CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT: Self =
+        Self::Other("chain_history_block_tx_auth_commitment");
+
+    /// Whether this mismatch proves the supplier altered the body of the requested header.
+    ///
+    /// Each kind compares the body with a root the header chain authenticates, and none
+    /// depends on supplied auxiliary roots, so an honest supplier never fails it.
+    /// `HeaderHash` can be a fork response, and the remaining kinds depend on header
+    /// interpretation, local trees or supplied auxiliary roots.
+    pub fn proves_tampered_body(self) -> bool {
+        matches!(
+            self,
+            Self::TransactionMerkleRoot
+                | Self::AuthDataRoot
+                | Self::CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT
+        )
+    }
+}
+
 /// Supplier-attributed mismatched body payload.
 /// A payload mismatch cannot affect eligibility.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

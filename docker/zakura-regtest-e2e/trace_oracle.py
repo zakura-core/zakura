@@ -230,6 +230,8 @@ class NodeTrace:
             [row for rows in tables.values() for row in rows],
             key=lambda row: (row.ts if row.ts is not None else -1, row.table, row.index),
         )
+        # Untimed rows sort first, so the last row holds the latest timestamp if any row has one.
+        self.latest_ts = self.rows[-1].ts if self.rows else None
 
     def table(self, name: str) -> list[TraceRow]:
         return self.tables.get(name, [])
@@ -729,11 +731,11 @@ def body_sync_has_pinned_queue(state: TraceRow) -> bool:
 
 def check_header_recovery(node: NodeTrace, options: OracleOptions) -> list[Failure]:
     failures: list[Failure] = []
-    recoveries = [
+    recoveries = HeaderRecoveries(
         row
         for row in node.table("header_sync")
         if row.event in {HEADER_FRONTIER_REANCHORED, HEADER_FRONTIER_ADVANCED, HEADER_RANGE_COMMITTED, HEADER_GET_HEADERS_SENT}
-    ]
+    )
 
     for rejected in node.events("header_sync", HEADER_RANGE_REJECTED):
         stage = str(rejected.row.get("validation_stage", ""))
@@ -764,17 +766,32 @@ def check_header_recovery(node: NodeTrace, options: OracleOptions) -> list[Failu
     return failures
 
 
-def header_reject_has_recovery(rejected: TraceRow, recoveries: list[TraceRow], options: OracleOptions) -> bool:
+class HeaderRecoveries:
+    """Recovery rows indexed so each rejected range searches only its own window."""
+
+    def __init__(self, rows: Iterable[TraceRow]) -> None:
+        rows = list(rows)
+        self.timed = sorted((row for row in rows if row.ts is not None), key=lambda row: row.ts)
+        self.timed_ts = [row.ts for row in self.timed]
+        self.untimed = sorted((row for row in rows if row.ts is None), key=lambda row: row.index)
+        self.untimed_index = [row.index for row in self.untimed]
+        self.all = sorted(rows, key=lambda row: row.index)
+        self.all_index = [row.index for row in self.all]
+
+    def near(self, rejected: TraceRow, lag_micros: int) -> Iterable[TraceRow]:
+        """Rows in the time window after a timed reject, else in the next recent rows."""
+        if rejected.ts is not None:
+            yield from self.timed[bisect_left(self.timed_ts, rejected.ts):bisect_right(self.timed_ts, rejected.ts + lag_micros)]
+            rows, indexes = self.untimed, self.untimed_index
+        else:
+            rows, indexes = self.all, self.all_index
+        yield from rows[bisect_right(indexes, rejected.index):bisect_right(indexes, rejected.index + RECENT_ACTIVITY_EVENTS)]
+
+
+def header_reject_has_recovery(rejected: TraceRow, recoveries: HeaderRecoveries, options: OracleOptions) -> bool:
     start = int_field(rejected.row, "range_start")
-    rejected_ts = rejected.ts
 
-    for row in recoveries:
-        if rejected_ts is not None and row.ts is not None:
-            if not (rejected_ts <= row.ts <= rejected_ts + options.persistent_lag_micros):
-                continue
-        elif row.index <= rejected.index or row.index > rejected.index + RECENT_ACTIVITY_EVENTS:
-            continue
-
+    for row in recoveries.near(rejected, options.persistent_lag_micros):
         if row.event == HEADER_FRONTIER_REANCHORED:
             return True
         if row.event == HEADER_RANGE_COMMITTED:
@@ -794,7 +811,7 @@ def header_reject_has_recovery(rejected: TraceRow, recoveries: list[TraceRow], o
 def trace_extends_past(node: NodeTrace, row: TraceRow, micros: int) -> bool:
     if row.ts is None:
         return True
-    latest_ts = max((candidate.ts for candidate in node.rows if candidate.ts is not None), default=row.ts)
+    latest_ts = node.latest_ts if node.latest_ts is not None else row.ts
     return latest_ts - row.ts >= micros
 
 
@@ -834,12 +851,11 @@ def checkpoint_to_full_handoff(
         for row in node.events("legacy_sync", LEGACY_ROUND_FINISH)
         if row.row.get("reason") == LEGACY_CHECKPOINT_HANDOFF
     ]
-    full_finishes = [
-        row
-        for row in node.events("commit_state", COMMIT_FINISH)
-        if row.row.get("apply_class") == APPLY_CLASS_FULL
-        and row.row.get("result") == "committed"
-    ]
+    full_finishes = defaultdict(list)
+    for row in node.events("commit_state", COMMIT_FINISH):
+        if row.row.get("apply_class") == APPLY_CLASS_FULL and row.row.get("result") == "committed":
+            full_finishes[row.row.get("process_trace_id")].append(row)
+    full_searches = {process: FullFinishSearch(rows) for process, rows in full_finishes.items()}
     latest_detail: dict[str, Any] = {}
     slow_failure: Failure | None = None
 
@@ -863,31 +879,23 @@ def checkpoint_to_full_handoff(
             continue
 
         boundary = max(checkpoint_height, state_tip)
-        for full in full_finishes:
-            height = int_field(full.row, "height")
-            if (
-                full.row.get("process_trace_id") != process_trace_id
-                or height is None
-                or height <= boundary
-                or full.ts is None
-                or full.ts <= handoff.ts
-            ):
-                continue
-
-            elapsed = full.ts - handoff.ts
-            if elapsed > options.handoff_stall_micros:
-                slow_failure = failure(
-                    node,
-                    "checkpoint_to_full_handoff_within_window",
-                    full,
-                    {
-                        "handoff": compact_row(handoff),
-                        "full": compact_row(full),
-                        "elapsed_us": elapsed,
-                    },
-                )
-                continue
+        search = full_searches.get(process_trace_id)
+        full = search.first_above(handoff.ts, boundary) if search is not None else None
+        if full is None:
+            continue
+        elapsed = full.ts - handoff.ts
+        if elapsed <= options.handoff_stall_micros:
             return (None, {})
+        slow_failure = failure(
+            node,
+            "checkpoint_to_full_handoff_within_window",
+            full,
+            {
+                "handoff": compact_row(handoff),
+                "full": compact_row(full),
+                "elapsed_us": elapsed,
+            },
+        )
 
     if slow_failure is not None:
         return (slow_failure, {})
@@ -902,6 +910,43 @@ def checkpoint_to_full_handoff(
         ),
         latest_detail,
     )
+
+
+class FullFinishSearch:
+    """Committed full finishes of one process, searchable by time and height."""
+
+    def __init__(self, rows: Iterable[TraceRow]) -> None:
+        self.rows = sorted(
+            (row for row in rows if row.ts is not None and int_field(row.row, "height") is not None),
+            key=lambda row: row.ts,
+        )
+        self.ts = [row.ts for row in self.rows]
+        # A max segment tree over heights in time order.
+        self.size = 1
+        while self.size < len(self.rows):
+            self.size *= 2
+        self.max_height = [-1] * (2 * self.size)
+        for position, row in enumerate(self.rows):
+            self.max_height[self.size + position] = int_field(row.row, "height")
+        for position in range(self.size - 1, 0, -1):
+            self.max_height[position] = max(self.max_height[2 * position], self.max_height[2 * position + 1])
+
+    def first_above(self, after_ts: int, height: int) -> TraceRow | None:
+        """The earliest finish later than `after_ts` whose height exceeds `height`."""
+        start = bisect_right(self.ts, after_ts)
+        position = self._first_above(1, 0, self.size, start, height)
+        return self.rows[position] if position is not None else None
+
+    def _first_above(self, node: int, low: int, high: int, start: int, height: int) -> int | None:
+        if high <= start or self.max_height[node] <= height:
+            return None
+        if high - low == 1:
+            return low
+        middle = (low + high) // 2
+        found = self._first_above(2 * node, low, middle, start, height)
+        if found is None:
+            found = self._first_above(2 * node + 1, middle, high, start, height)
+        return found
 
 
 def failure(node: NodeTrace, invariant: str, row: TraceRow | None, detail: dict[str, Any]) -> Failure:
@@ -1116,7 +1161,7 @@ def print_failures(failures: list[Failure]) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
 
 
-def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def write_csv(path: Path, rows: Iterable[dict[str, Any]], raw_extra: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     header = CSV_SCHEMAS[path.stem]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1134,7 +1179,9 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
                 key: value if isinstance(value, str) else json.dumps(value)
                 for key, value in row.items() if key in header and value is not None
             }
-            record["extra"] = json.dumps({key: value for key, value in row.items() if key not in header})
+            record["extra"] = raw_extra if raw_extra is not None else json.dumps(
+                {key: value for key, value in row.items() if key not in header}
+            )
             writer.writerow(record)
 
 
@@ -1938,16 +1985,17 @@ def run_self_test() -> None:
             )
             assert any(f.invariant == "trace_csv_is_valid" for f in run_oracle(root / "malformed_csv"))
 
-        duplicate_json = root / "duplicate_json" / "node1"
-        duplicate_json.mkdir(parents=True)
-        (duplicate_json / "commit_state.csv").write_text(
-            '{"ts":1,"event":"commit_start","event":"commit_finish"}\n',
-            encoding="utf-8",
-        )
-        assert any(
-            f.invariant == "trace_csv_is_valid"
-            for f in run_oracle(root / "duplicate_json")
-        )
+        # Each row is valid apart from its raw `extra` text, so the JSON check must reject it.
+        def json_rejection(case: str, raw_extra: str) -> list[str]:
+            write_csv(root / case / "node1" / "commit_state.csv", [{"ts": 1, "event": COMMIT_START}], raw_extra)
+            return [
+                str(f.row.row.get("error"))
+                for f in run_oracle(root / case)
+                if f.invariant == "trace_csv_is_valid" and f.row is not None
+            ]
+
+        assert not json_rejection("valid_json", '{"label":1}')
+        assert any("ambiguous JSON" in error for error in json_rejection("duplicate_json", '{"label":1,"label":2}'))
 
         invalid_key = root / "invalid_key" / "node1"
         write_csv(
@@ -1959,15 +2007,9 @@ def run_self_test() -> None:
             for f in run_oracle(root / "invalid_key")
         )
 
-        nested_json = root / "nested_json" / "node1"
-        nested_json.mkdir(parents=True)
-        (nested_json / "commit_state.csv").write_text(
-            "[" * 20_000 + "]" * 20_000 + "\n",
-            encoding="utf-8",
-        )
         assert any(
-            f.invariant == "trace_csv_is_valid"
-            for f in run_oracle(root / "nested_json")
+            "JSON nesting budget exceeded" in error
+            for error in json_rejection("nested_json", '{"label":' + "[" * 20_000 + "]" * 20_000 + "}")
         )
 
         extra_collision = root / "extra_collision" / "node1"

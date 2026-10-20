@@ -36,7 +36,7 @@ defines required fields for events consumed by the checks.
 | F-273530 | Inspect nested candidates even when root files exist; bound discovery. |
 | F-273534 | Fresh run directory, expected run ID, and sealed process acknowledgements. |
 | F-273535, F-273536, F-273548 | No-follow regular-file access, snapshot locks, bounded lock acquisition, and guarded-shutdown timeout. |
-| F-273540, F-273545 | Capture-wide input limits, cached diagnostics, bounded diagnostic rows, and capped failure reports. |
+| F-273540, F-273545 | Capture-wide input limits (including decoded JSON values), cached diagnostics, bounded diagnostic rows, capped failure reports, and indexed header-recovery and handoff searches. |
 | F-273542, F-273544 | Shared Python decoder and cross-language fixtures for duplicate keys, schema headers, and extra-field collisions. |
 | F-273546 | One parsed, process-scoped commit matcher for both validation and flush checks. |
 

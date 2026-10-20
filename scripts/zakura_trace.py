@@ -44,6 +44,8 @@ class Budget:
     rows_left: int = 500_000
     files_left: int = 256
     entries_left: int = 4096
+    # Decoded JSON values. A small value such as `{}` costs far more memory than its text.
+    values_left: int = 8_000_000
 
     def file(self, size):
         if size > self.bytes_left or self.files_left <= 0:
@@ -55,6 +57,11 @@ class Budget:
         if self.rows_left <= 0:
             raise TraceInputError("trace row budget exceeded")
         self.rows_left -= 1
+
+    def values(self, count):
+        if count > self.values_left:
+            raise TraceInputError("trace JSON value budget exceeded")
+        self.values_left -= count
 
 
 def unique_object(pairs):
@@ -77,8 +84,10 @@ def invalid_constant(_):
     raise TraceInputError("nonfinite JSON number")
 
 
-def load_json(text):
+def load_json(text, budget=None):
     depth = 0
+    # Commas and container openings bound the number of decoded values.
+    values = 1
     quoted = escaped = False
     for char in text:
         if escaped:
@@ -90,10 +99,15 @@ def load_json(text):
         elif not quoted:
             if char in "[{":
                 depth += 1
+                values += 1
                 if depth > MAX_JSON_DEPTH:
                     raise TraceInputError("JSON nesting budget exceeded")
             elif char in "]}":
                 depth -= 1
+            elif char == ",":
+                values += 1
+    if budget is not None:
+        budget.values(values)
     try:
         return json.loads(text, object_pairs_hook=unique_object, parse_float=finite_float, parse_constant=invalid_constant)
     except (ValueError, RecursionError) as error:
@@ -255,7 +269,7 @@ def segments(path, budget=None):
     return result
 
 
-def decode_field(name, value):
+def decode_field(name, value, budget=None):
     if name not in TYPED_FIELDS:
         return value
     # Fast paths for the canonical forms the writer emits; JSON handles the rest.
@@ -264,7 +278,7 @@ def decode_field(name, value):
         return int(value)
     if name in BOOLEAN_FIELDS and value in ("true", "false"):
         return value == "true"
-    return load_json(value)
+    return load_json(value, budget)
 
 
 def validate_header(table, header):
@@ -337,9 +351,9 @@ def read_segment(path, table, budget):
                 if not value:
                     continue
                 if name == "extra":
-                    extra = load_json(value)
+                    extra = load_json(value, budget)
                 else:
-                    row[name] = decode_field(name, value)
+                    row[name] = decode_field(name, value, budget)
             if not isinstance(extra, dict) or set(header).intersection(extra):
                 raise TraceInputError("CSV extra must be an object with no declared columns")
             row.update(extra)
@@ -362,4 +376,4 @@ def read_status(path, budget):
         if size > MAX_STATUS_BYTES:
             raise TraceInputError("capture status budget exceeded")
         budget.file(size)
-        return load_json(handle.read(size + 1).decode("utf-8"))
+        return load_json(handle.read(size + 1).decode("utf-8"), budget)

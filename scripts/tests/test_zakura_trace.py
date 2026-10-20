@@ -155,7 +155,8 @@ wait_for_block_sync_reset node1 162 1 1
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "commit_state.csv"
             oracle.write_csv(path, [dict(event="sample"), dict(event="sample")])
-            for budget in (trace.Budget(bytes_left=1), trace.Budget(rows_left=1), trace.Budget(files_left=0)):
+            for budget in (trace.Budget(bytes_left=1), trace.Budget(rows_left=1), trace.Budget(files_left=0),
+                           trace.Budget(values_left=3)):
                 with self.assertRaises(trace.TraceInputError):
                     list(trace.read_table(path, budget))
 
@@ -221,6 +222,60 @@ wait_for_block_sync_reset node1 162 1 1
             oracle.write_csv(path, [dict(event="new")])
             with self.assertRaises(trace.TraceInputError):
                 oracle.main(["--dump-csv", str(path), "--after", "1"])
+
+
+    def test_full_finish_search_matches_a_linear_scan(self):
+        import random
+        rng = random.Random(7)
+        rows = [
+            oracle.TraceRow("node1", "commit_state", index, dict(height=rng.randrange(50)))
+            for index in range(200)
+        ]
+        for index, value in enumerate(rows):
+            value.row["ts"] = rng.randrange(400)
+        search = oracle.FullFinishSearch(rows)
+        for _ in range(2000):
+            after_ts, height = rng.randrange(-1, 401), rng.randrange(-1, 51)
+            later = [value for value in search.rows if value.ts > after_ts and value.row["height"] > height]
+            self.assertIs(search.first_above(after_ts, height), later[0] if later else None)
+
+    def test_imported_trace_checks_do_not_scale_quadratically(self):
+        import time
+        count = 20_000
+        options = oracle.OracleOptions()
+        header_rows = [
+            oracle.TraceRow("node1", "header_sync", index, dict(
+                event=oracle.HEADER_RANGE_REJECTED, ts=index, validation_stage="link", range_start=10**9,
+            ))
+            for index in range(count)
+        ] + [
+            oracle.TraceRow("node1", "header_sync", count + index, dict(
+                event=oracle.HEADER_FRONTIER_ADVANCED, ts=index, height=10**9,
+            ))
+            for index in range(count)
+        ]
+        handoffs = [
+            oracle.TraceRow("node1", "legacy_sync", index, dict(
+                event=oracle.LEGACY_ROUND_FINISH, ts=index, reason=oracle.LEGACY_CHECKPOINT_HANDOFF,
+                checkpoint_height=10**9, state_tip=10**9, process_trace_id="p",
+            ))
+            for index in range(count)
+        ]
+        fulls = [
+            oracle.TraceRow("node1", "commit_state", index, dict(
+                event=oracle.COMMIT_FINISH, ts=index, apply_class=oracle.APPLY_CLASS_FULL, result="committed",
+                height=index, process_trace_id="p",
+            ))
+            for index in range(count)
+        ]
+        node = oracle.NodeTrace("node1", {"header_sync": header_rows, "legacy_sync": handoffs, "commit_state": fulls})
+        started = time.monotonic()
+        # Every reject recovers, so the check searches a window for each one.
+        self.assertEqual(oracle.check_header_recovery(node, options), [])
+        failure, _ = oracle.checkpoint_to_full_handoff(node, options)
+        self.assertEqual(failure.invariant, "checkpoint_to_full_handoff_observed")
+        # The quadratic scans took minutes at this size.
+        self.assertLess(time.monotonic() - started, 10)
 
 
 if __name__ == "__main__":

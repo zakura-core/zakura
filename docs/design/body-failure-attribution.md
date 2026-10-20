@@ -4,7 +4,7 @@
 
 A transaction ID from ZIP 244 does not commit to its authorization bytes. A failed signature therefore cannot invalidate the header until the exact delivered body's authorization root has been checked against that header.
 
-The semantic verifier performs this check on rejection, before returning a permanent body verdict. Successful verification keeps its existing pipeline. The rejection path first checks the transaction Merkle root, then asks state for the actual parent's height and history tree. It does not select the commitment rules using the supplied coinbase height.
+The semantic verifier performs this check on rejection, before returning a permanent body verdict. Successful verification keeps its existing pipeline. RPC proposals and template preparation return candidate verdicts without this extra attribution work because they cannot invalidate a stored header. The rejection path first checks the transaction Merkle root, then asks state for the actual parent's height and history tree. It does not select the commitment rules using the supplied coinbase height.
 
 A mismatched commitment is a supplier payload failure. Missing parent context, an unavailable history tree, a state error, or a five-second timeout is retryable with no peer score. A matching commitment preserves the original consensus error. The timeout does not cancel a state read already executing on a blocking worker.
 

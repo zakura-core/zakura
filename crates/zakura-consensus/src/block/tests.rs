@@ -3492,3 +3492,36 @@ async fn substituted_transparent_signature_is_replaceable() {
     .await
     .expect("the real signature replacement test must finish");
 }
+
+/// Invalid proposals retain their verdict without scheduling header-attribution work.
+#[tokio::test]
+async fn invalid_proposal_skips_body_attribution() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, None);
+    block.transactions.push(block.transactions[0].clone());
+    Arc::make_mut(&mut block.header).merkle_root =
+        block.transactions.iter().map(|tx| tx.hash()).collect();
+    let state = service_fn(|request| async move {
+        match request {
+            zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+            _ => panic!("invalid proposal must not schedule attribution: {request:?}"),
+        }
+    });
+    let transactions =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transactions),
+    );
+    let error = verifier
+        .oneshot(Request::CheckProposal(Arc::new(block)))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        VerifyBlockError::Block {
+            source: BlockError::DuplicateTransaction
+        }
+    ));
+}

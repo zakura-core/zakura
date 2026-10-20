@@ -371,6 +371,7 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
+        let is_proposal = request.is_proposal();
         let attribution_state = state_service.clone();
         let attribution_block = block.clone();
         async move {
@@ -759,10 +760,11 @@ where
         }
         .then(move |verification| async move {
             match verification {
-                Err(error) => {
+                Err(error) if !is_proposal => {
                     attribute_body_failure(attribution_state, attribution_block, error).await
                 }
-                Ok(hash) => Ok(hash),
+                // Proposals return a candidate verdict and never invalidate a stored header.
+                result => result,
             }
         })
         .instrument(span)

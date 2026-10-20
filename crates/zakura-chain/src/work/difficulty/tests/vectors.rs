@@ -1,5 +1,5 @@
-use color_eyre::eyre::eyre;
-use color_eyre::eyre::Report;
+use eyre::eyre;
+use eyre::Report;
 
 use crate::serialization::ZcashDeserialize;
 use crate::{block::Block, parameters::NetworkUpgrade};

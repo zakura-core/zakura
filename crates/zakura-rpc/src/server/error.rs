@@ -1,5 +1,5 @@
 //! RPC error codes & their handling.
-use jsonrpsee_types::{ErrorCode, ErrorObject, ErrorObjectOwned};
+use super::jsonrpc::{ErrorCode, ErrorObject};
 
 /// Bitcoin RPC error codes
 ///
@@ -64,13 +64,13 @@ impl From<LegacyCode> for i32 {
     }
 }
 
-/// A trait for mapping errors to [`jsonrpsee_types::ErrorObjectOwned`].
+/// A trait for mapping errors to [`ErrorObject`].
 pub(crate) trait MapError<T>: Sized {
-    /// Maps errors to [`jsonrpsee_types::ErrorObjectOwned`] with a specific error code.
-    fn map_error(self, code: impl Into<ErrorCode>) -> std::result::Result<T, ErrorObjectOwned>;
+    /// Maps errors to [`ErrorObject`] with a specific error code.
+    fn map_error(self, code: impl Into<ErrorCode>) -> std::result::Result<T, ErrorObject>;
 
-    /// Maps errors to [`jsonrpsee_types::ErrorObjectOwned`] with a [`LegacyCode::Misc`] error code.
-    fn map_misc_error(self) -> std::result::Result<T, ErrorObjectOwned> {
+    /// Maps errors to [`ErrorObject`] with a [`LegacyCode::Misc`] error code.
+    fn map_misc_error(self) -> std::result::Result<T, ErrorObject> {
         self.map_error(LegacyCode::Misc)
     }
 }
@@ -83,10 +83,10 @@ pub(crate) trait OkOrError<T>: Sized {
         self,
         code: impl Into<ErrorCode>,
         message: impl ToString,
-    ) -> std::result::Result<T, ErrorObjectOwned>;
+    ) -> std::result::Result<T, ErrorObject>;
 
     /// Converts the implementing type to `Result<T, jsonrpc_core::Error>`, using a [`LegacyCode::Misc`] error code.
-    fn ok_or_misc_error(self, message: impl ToString) -> std::result::Result<T, ErrorObjectOwned> {
+    fn ok_or_misc_error(self, message: impl ToString) -> std::result::Result<T, ErrorObject> {
         self.ok_or_error(LegacyCode::Misc, message)
     }
 }
@@ -95,8 +95,8 @@ impl<T, E> MapError<T> for Result<T, E>
 where
     E: ToString,
 {
-    fn map_error(self, code: impl Into<ErrorCode>) -> Result<T, ErrorObjectOwned> {
-        self.map_err(|error| ErrorObject::owned(code.into().code(), error.to_string(), None::<()>))
+    fn map_error(self, code: impl Into<ErrorCode>) -> Result<T, ErrorObject> {
+        self.map_err(|error| ErrorObject::new(code, error.to_string()))
     }
 }
 
@@ -105,11 +105,7 @@ impl<T> OkOrError<T> for Option<T> {
         self,
         code: impl Into<ErrorCode>,
         message: impl ToString,
-    ) -> Result<T, ErrorObjectOwned> {
-        self.ok_or(ErrorObject::owned(
-            code.into().code(),
-            message.to_string(),
-            None::<()>,
-        ))
+    ) -> Result<T, ErrorObject> {
+        self.ok_or(ErrorObject::new(code, message.to_string()))
     }
 }

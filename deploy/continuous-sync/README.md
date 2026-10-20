@@ -122,6 +122,9 @@ Host files:
 - trace symlink: `/var/log/zakura/traces`
 - legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
 - monitor log: `/var/log/zakura/monitor.log`
+- network sysctls: `/etc/sysctl.d/60-zakura-network.conf`, copied from
+  `deploy/sysctl/` and loaded on every deploy. The next run's `zakurad` gets
+  its full 7 MiB UDP socket buffers.
 
 ## Deployment
 
@@ -515,7 +518,7 @@ For a fresh Ubuntu x86_64 host:
    apt-get update
    apt-get install -y \
      build-essential clang cmake git libclang-dev pkg-config \
-     protobuf-compiler python3 logrotate
+     python3 logrotate
    ```
 
 5. Install the Rust toolchain specified by `rust-toolchain.toml`.

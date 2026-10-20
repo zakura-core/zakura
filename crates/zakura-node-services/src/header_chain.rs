@@ -4,9 +4,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, Frontier, HeaderChainError, HeaderLocator,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion,
-    VctRepairContext,
+    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, EngineSnapshot, Frontier, HeaderChainError,
+    HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId,
+    TargetCompletion, VctRepairContext,
 };
 
 /// A boxed operation returned by [`Port`].
@@ -87,7 +87,7 @@ pub struct RetainedHeaderPath {
     adapter_id: u64,
     source: SourceId,
     session_id: u64,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
@@ -216,6 +216,17 @@ pub enum AcquirePathReply {
     Busy,
     /// An occupied resource refused the request.
     CapacityBusy(ServingCapacitySignal),
+}
+
+/// Where a header hash sits relative to the selected header chain.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SelectedChainMembership {
+    /// The selected chain contains the header at this frontier.
+    Selected(Frontier),
+    /// The adapter retains the header off the selected chain.
+    NotSelected,
+    /// The adapter retains no header with this hash.
+    NotRetained,
 }
 
 /// A bounded read from an already acquired retained path.
@@ -428,6 +439,28 @@ pub enum ApplyHeaderTargetOutcome {
     ResourceStalled(CommittedStallReceipt),
 }
 
+/// Capacity owned by one locator read through its last non-cancellable operation.
+///
+/// Clones share one permit. Adapters must move a clone into accepted work before
+/// awaiting it, so dropping a timed-out caller cannot release that work's capacity.
+#[derive(Clone, Debug)]
+pub struct LocatorReadPermit(Arc<tokio::sync::OwnedSemaphorePermit>);
+
+impl LocatorReadPermit {
+    /// Wrap a permit acquired by the locator scheduler.
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(Arc::new(permit))
+    }
+}
+
+impl PartialEq for LocatorReadPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LocatorReadPermit {}
+
 /// Header-chain operations that header-sync policy requires.
 ///
 /// Each operation returns one typed future for its request and reply.
@@ -435,8 +468,12 @@ pub enum ApplyHeaderTargetOutcome {
 /// An implementation translates its backing service protocol into this contract.
 pub trait Port: Send + Sync + 'static {
     /// Return a coherent locator for the current selected path.
+    ///
+    /// Retain `permit` in any accepted work that can outlive this future. A timeout
+    /// or cancellation must not release capacity while that work still executes.
     fn continuation_locator(
         &self,
+        permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>>;
 
     /// Resolve selected-path context for the auxiliary repair at `height`.
@@ -487,6 +524,26 @@ pub trait Port: Send + Sync + 'static {
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply>;
+
+    /// Watch the selected header chain.
+    ///
+    /// The value is the latest committed engine snapshot, or `None` before the
+    /// first commit. It changes after each committed transition, so a change
+    /// wakes work that follows the selected tip. The default never changes,
+    /// for a port without durable header-chain state.
+    fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
+        tokio::sync::watch::channel(None).1
+    }
+
+    /// Report whether the selected chain contains the header `hash`.
+    ///
+    /// The answer comes from the latest committed selected chain, which is at
+    /// least as new as the latest value of [`Self::selected_chain`]. It costs
+    /// no ancestry walk and no retained-path lease.
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
 }
 
 impl std::fmt::Debug for dyn Port {
@@ -502,6 +559,7 @@ pub struct UnavailablePort;
 impl Port for UnavailablePort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(async { Err(PortError::Unavailable { source: None }) })
     }
@@ -560,6 +618,13 @@ impl Port for UnavailablePort {
             )))
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(async { Ok(SelectedChainMembership::NotRetained) })
+    }
 }
 
 /// Inert port used by state-machine tests that drive completions explicitly.
@@ -570,6 +635,7 @@ pub struct InertHeaderChainPort;
 impl Port for InertHeaderChainPort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(std::future::pending())
     }
@@ -615,6 +681,13 @@ impl Port for InertHeaderChainPort {
         &self,
         _target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
+        Box::pin(std::future::pending())
+    }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
         Box::pin(std::future::pending())
     }
 }

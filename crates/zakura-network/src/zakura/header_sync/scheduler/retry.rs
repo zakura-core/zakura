@@ -167,11 +167,6 @@ impl BodyRetryEpisode {
         );
     }
 
-    /// Whether a repeated supplier attempt or persistent-alarm probe is due.
-    pub fn is_due<C: Clock>(&self, clock: &C) -> bool {
-        clock.now() >= self.next_probe_at
-    }
-
     /// Record one failed supplier attempt and return its bounded scheduling consequence.
     pub fn record_failure<C: Clock, J: RetryJitter>(
         &mut self,
@@ -494,7 +489,7 @@ mod tests {
         assert_eq!(episode.attempts, attempts.saturating_add(1));
         episode.restart(&clock);
         assert_eq!(episode.attempts, 0);
-        assert!(episode.is_due(&clock));
+        assert!(clock.now() >= episode.next_probe_at);
     }
 
     #[test]
@@ -564,7 +559,7 @@ mod tests {
         );
 
         assert_eq!(episode.summary(), summary);
-        assert!(!episode.is_due(&clock));
+        assert!(clock.now() < episode.next_probe_at);
         assert_eq!(
             episode.record_failure(first, &clock, &FixedJitter(0)),
             RetryUpdate::TooEarly

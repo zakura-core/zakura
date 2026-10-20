@@ -4,7 +4,7 @@
 //! real network is present.  They are skipped or reduced to structural checks
 //! in managed (regtest) mode.
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 
 use super::setup_zcashd_compat;
 

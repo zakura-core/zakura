@@ -1,11 +1,11 @@
 //! `generate` subcommand - generates a default `zakura.toml` config.
 
 use crate::config::ZakuradConfig;
-use abscissa_core::{Command, Runnable};
 use clap::Parser;
+use eyre::Report;
 
 /// Generate a default `zakura.toml` configuration
-#[derive(Command, Debug, Default, Parser)]
+#[derive(Debug, Default, Parser)]
 pub struct GenerateCmd {
     /// The file to write the generated config to.
     //
@@ -18,64 +18,19 @@ pub struct GenerateCmd {
     output_file: Option<String>,
 }
 
-impl Runnable for GenerateCmd {
-    /// Start the application.
-    #[allow(clippy::print_stdout)]
-    fn run(&self) {
-        let default_config = ZakuradConfig::default();
-        let mut output = r"# Default configuration for zakurad.
-#
-# This file can be used as a skeleton for custom configs.
-#
-# Unspecified fields use default values. Optional fields are Some(field) if the
-# field is present and None if it is absent.
-#
-# This file is generated as an example using zakurad's current defaults.
-# You should set only the config options you want to keep, and delete the rest.
-# Only a subset of fields are present in the skeleton, since optional values
-# whose default is None are omitted.
-#
-# The config format (including a complete list of sections and fields) is
-# documented here:
-# https://docs.rs/zakura/latest/zakurad/config/struct.ZakuradConfig.html
-#
-# CONFIGURATION SOURCES (in order of precedence, highest to lowest):
-#
-# 1. Environment variables with ZAKURA_ prefix (highest precedence)
-#    - Format: ZAKURA_SECTION__KEY (double underscore for nested keys)
-#    - Examples:
-#      - ZAKURA_NETWORK__NETWORK=Testnet
-#      - ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232
-#      - ZAKURA_STATE__CACHE_DIR=/path/to/cache
-#      - ZAKURA_TRACING__FILTER=debug
-#      - ZAKURA_METRICS__ENDPOINT_ADDR=0.0.0.0:9999
-#
-# 2. Environment variables with deprecated ZEBRA_ prefix
-#
-# 3. Configuration file (TOML format)
-#    - At the path specified via -c flag, e.g. `zakurad -c myconfig.toml start`, or
-#    - At the default path in the user's preference directory (platform-dependent, see below)
-#
-# 4. Hard-coded defaults (lowest precedence)
-#
-# The user's preference directory and the default path to the `zakurad` config
-# are platform dependent:
-#
-# | Platform | Value                                 | Example                                        |
-# | -------- | ------------------------------------- | ---------------------------------------------- |
-# | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
-# | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
-# | Windows  | `{FOLDERID_LocalAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
-
-"
-        .to_owned();
-
-        // this avoids a ValueAfterTable error
-        // https://github.com/alexcrichton/toml-rs/issues/145
-        let mut conf = toml::Value::try_from(default_config).unwrap();
-        remove_experimental_sync_config(&mut conf);
-        let conf = toml::to_string_pretty(&conf).expect("default config should be serializable");
-        output += &document_network_p2p_config(&conf);
+impl GenerateCmd {
+    /// `generate` sub-command entrypoint.
+    ///
+    /// # Panics
+    ///
+    /// If the output file can't be created or written.
+    //
+    // A file error panics, as it always has: the panic report names the failed step and
+    // exits with status 101. Returning it would only exit with status 1, because the
+    // caller turns errors into statuses without printing them.
+    #[allow(clippy::print_stdout, clippy::unwrap_in_result)]
+    pub(crate) fn run(&self) -> Result<(), Report> {
+        let output = default_config_toml(&ZakuradConfig::default());
         match self.output_file {
             Some(ref output_file) => {
                 use std::{fs::File, io::Write};
@@ -88,89 +43,87 @@ impl Runnable for GenerateCmd {
                 println!("{output}");
             }
         }
+
+        Ok(())
     }
 }
 
-/// Omit unstable native sync tuning knobs from the generated config skeleton.
-///
-/// The fields remain deserializable for advanced overrides, while absent
-/// sections use their defaults from code.
-fn remove_experimental_sync_config(config: &mut toml::Value) {
-    let Some(zakura) = config
-        .get_mut("network")
-        .and_then(toml::Value::as_table_mut)
-        .and_then(|network| network.get_mut("zakura"))
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return;
-    };
+/// The generated config, written by hand so `zakurad` does not carry a TOML
+/// serializer for this one command. A unit test checks it against
+/// `ZakuradConfig::default()`.
+const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("default_config.toml");
 
-    zakura.remove("block_sync");
-    zakura.remove("header_sync");
-}
-
-fn document_network_p2p_config(config: &str) -> String {
-    let had_trailing_newline = config.ends_with('\n');
-    let mut lines = config.lines().map(ToString::to_string).collect::<Vec<_>>();
-
-    let Some(network_start) = lines.iter().position(|line| line == "[network]") else {
-        return config.to_string();
-    };
-    let network_end = lines
-        .iter()
-        .enumerate()
-        .skip(network_start + 1)
-        .find_map(|(index, line)| line.starts_with('[').then_some(index))
-        .unwrap_or(lines.len());
-
-    let Some(p2p_stack_index) = lines[network_start + 1..network_end]
-        .iter()
-        .position(|line| line.starts_with("p2p_stack = "))
-        .map(|index| index + network_start + 1)
-    else {
-        return config.to_string();
-    };
-
-    let comments = [
-        "# The peer-to-peer stack to run:",
-        "# - \"legacy\": the legacy TCP Zcash P2P stack only.",
-        "# - \"zakura\": the experimental native Zakura P2P v2 stack only.",
-        "# - \"dual\": both stacks, enabling experimental v2 with legacy fallback.",
-        "# - \"default\": Zakura's default for this network, which can change between",
-        "#   releases. Currently \"legacy\" on Mainnet, and \"dual\" everywhere else.",
+/// Fill the template's platform-dependent default paths.
+fn default_config_toml(config: &ZakuradConfig) -> String {
+    [
+        ("\"@NETWORK_IDENTITY_DIR@\"", &config.network.identity_dir),
+        ("\"@RPC_COOKIE_DIR@\"", &config.rpc.cookie_dir),
+        ("\"@STATE_CACHE_DIR@\"", &config.state.cache_dir),
     ]
-    .map(ToString::to_string);
+    .into_iter()
+    .fold(
+        DEFAULT_CONFIG_TEMPLATE.to_owned(),
+        |toml, (placeholder, path)| {
+            toml.replace(placeholder, &toml_basic_string(&path.to_string_lossy()))
+        },
+    )
+}
 
-    lines.splice(p2p_stack_index..p2p_stack_index, comments);
-
-    let mut output = lines.join("\n");
-    if had_trailing_newline {
-        output.push('\n');
+/// Quote `value` as a TOML basic string.
+fn toml_basic_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{0}'..='\u{1f}' | '\u{7f}' => {
+                quoted.push_str(&format!("\\u{:04X}", u32::from(character)))
+            }
+            character => quoted.push(character),
+        }
     }
-    output
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
+    /// Native sync tuning stays out of the generated skeleton; absent sections
+    /// use their defaults from code.
+    fn expected_default_config(config: &ZakuradConfig) -> toml::Value {
+        let mut expected = toml::Value::try_from(config).expect("the default config serializes");
+        let zakura = expected
+            .get_mut("network")
+            .and_then(|network| network.get_mut("zakura"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("the default config has a native Zakura section");
+        zakura.remove("block_sync");
+        zakura.remove("header_sync");
+        expected
+    }
+
     #[test]
-    fn generated_config_omits_experimental_sync_config_and_uses_defaults() {
+    fn template_matches_default_config() {
         let default_config = ZakuradConfig::default();
-        let mut config = toml::Value::try_from(&default_config).unwrap();
+        let generated = default_config_toml(&default_config);
+        let generated_value: toml::Value =
+            toml::from_str(&generated).expect("the generated config is valid TOML");
+        let expected = expected_default_config(&default_config);
 
-        remove_experimental_sync_config(&mut config);
+        assert!(
+            generated_value == expected,
+            "crates/zakurad/src/commands/default_config.toml is out of date with \
+             ZakuradConfig::default(). Update the changed values to match:\n{}",
+            toml::to_string_pretty(&expected).expect("the expected config serializes"),
+        );
 
-        let zakura = config
-            .get("network")
-            .and_then(|network| network.get("zakura"))
-            .expect("default config contains the native Zakura section");
-        assert!(zakura.get("block_sync").is_none());
-        assert!(zakura.get("header_sync").is_none());
-        assert!(zakura.get("bootstrap_peers").is_some());
-
-        let config = toml::to_string_pretty(&config).unwrap();
-        let parsed: ZakuradConfig = toml::from_str(&config).unwrap();
+        let parsed: ZakuradConfig =
+            toml::from_str(&generated).expect("zakurad accepts the generated config");
         assert_eq!(
             parsed.network.zakura.block_sync,
             default_config.network.zakura.block_sync
@@ -179,5 +132,21 @@ mod tests {
             parsed.network.zakura.header_sync,
             default_config.network.zakura.header_sync
         );
+    }
+
+    #[test]
+    fn template_paths_are_toml_escaped() {
+        let mut config = ZakuradConfig::default();
+        let path = PathBuf::from("C:\\Users\\\"Alice\"\n\u{7f}");
+        config.network.identity_dir = path.clone();
+        config.rpc.cookie_dir = path.clone();
+        config.state.cache_dir = path.clone();
+
+        let parsed: ZakuradConfig = toml::from_str(&default_config_toml(&config))
+            .expect("escaped paths are valid TOML strings");
+
+        assert_eq!(parsed.network.identity_dir, path);
+        assert_eq!(parsed.rpc.cookie_dir, path);
+        assert_eq!(parsed.state.cache_dir, path);
     }
 }

@@ -514,7 +514,7 @@ impl AddressBook {
     /// Get the active addresses in `self` in random order with sanitized timestamps,
     /// including our local listener address.
     pub(crate) fn sanitized(&self, now: chrono::DateTime<Utc>) -> Vec<MetaAddr> {
-        use rand::seq::SliceRandom;
+        use rand_10::seq::SliceRandom;
         let _guard = self.span.enter();
 
         let mut peers = self.peers.clone();
@@ -541,7 +541,7 @@ impl AddressBook {
             .filter(|addr| addr.is_active_for_gossip(now))
             .collect();
 
-        peers.shuffle(&mut rand::thread_rng());
+        peers.shuffle(&mut rand_10::rng());
 
         peers
     }
@@ -565,6 +565,8 @@ impl AddressBook {
             // This prevents Zebra from caching nodes that are likely unreachable,
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
+            // An inbound peer's entry holds its ephemeral source port, not a listener.
+            .filter(|addr| !addr.is_inbound())
             .cloned()
             .collect()
     }
@@ -825,18 +827,6 @@ impl AddressBook {
         }
     }
 
-    /// Returns true if the given [`PeerSocketAddr`] is pending a reconnection
-    /// attempt.
-    pub fn pending_reconnection_addr(&mut self, addr: PeerSocketAddr) -> bool {
-        let meta_addr = self.get(addr);
-
-        let _guard = self.span.enter();
-        match meta_addr {
-            None => false,
-            Some(peer) => peer.last_connection_state == PeerAddrState::AttemptPending,
-        }
-    }
-
     /// Return an iterator over all peers.
     ///
     /// Returns peers in reconnection attempt order, including recently connected peers.
@@ -879,7 +869,10 @@ impl AddressBook {
         self.peers
             .ordered_values()
             .filter(move |peer| {
-                peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
+                // Inbound entries stay in the book for liveness, bans, and per-IP dial
+                // limits, but their ephemeral source ports are not listeners to dial.
+                !peer.is_inbound()
+                    && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
             .cloned()

@@ -7,6 +7,7 @@ use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
+pub(crate) mod human_duration;
 pub mod time;
 
 pub use time::{duration_short, humantime_milliseconds, humantime_seconds};

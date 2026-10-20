@@ -118,7 +118,6 @@ apt-get -qq install -y --no-install-recommends \
     libclang-dev \
     libicu-dev \
     pkg-config \
-    protobuf-compiler \
     python3 \
     tar
 

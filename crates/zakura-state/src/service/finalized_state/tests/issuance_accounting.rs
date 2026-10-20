@@ -412,10 +412,12 @@ fn mining_template_requires_parent_pools_at_reissuance_activation() {
 }
 
 proptest::proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(std::env::var("NSM_HISTORY_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(64)))]
+    #![proptest_config(proptest::test_runner::Config::with_cases(std::env::var("NSM_HISTORY_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(8)))]
 
     /// Exercise accounting transitions through real databases. Partial claims intentionally
     /// bypass semantic subsidy validation; this property tests the state accounting layer.
+    /// Pull requests run eight cases; the extended reissuance CI job sets
+    /// `NSM_HISTORY_CASES` for a broader search.
     #[test]
     fn balance_rollback_replay_and_fork_equivalence(
         claims in proptest::collection::vec(0u32..=1_000_000, 2..12),
@@ -891,7 +893,8 @@ fn deficit_validation_accepts_block_info_rows_with_appended_fields() {
         .zs_insert(&START, &RawBytes::from_bytes(bytes));
     state.db.write_batch(batch).unwrap();
 
-    let (_cancel_sender, cancel_receiver) = crossbeam_channel::bounded(1);
+    let (_cancel_sender, cancel_receiver) =
+        crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     assert_eq!(
         nsm_value_balance_pool::Upgrade
             .validate(&state.db, &cancel_receiver)

@@ -4,7 +4,7 @@ use std::fmt;
 
 use bellman::{
     gadgets::multipack,
-    groth16::{batch, PreparedVerifyingKey, VerifyingKey},
+    groth16::{batch, PreparedVerifyingKey},
     VerificationError,
 };
 use bls12_381::Bls12;
@@ -14,8 +14,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::watch;
 use tower::util::ServiceFn;
 
-use tower_batch_control::RequestWeight;
-use tower_fallback::BoxedError;
+use super::batch_control::RequestWeight;
+use super::fallback::BoxedError;
 
 use zakura_chain::{
     primitives::{
@@ -65,10 +65,6 @@ impl Item {
     }
 }
 
-/// The type of a raw verifying key.
-/// This is the key used to verify batches.
-pub type BatchVerifyingKey = VerifyingKey<Bls12>;
-
 /// The type of a prepared verifying key.
 /// This is the key used to verify individual items.
 pub type ItemVerifyingKey = PreparedVerifyingKey<Bls12>;
@@ -94,7 +90,7 @@ pub static JOINSPLIT_VERIFIER: Lazy<
                 .map(|result| {
                     result
                         .map_err(|e| TransactionError::Groth16(e.to_string()))
-                        .map_err(tower_fallback::BoxedError::from)
+                        .map_err(super::fallback::BoxedError::from)
                 })
                 .boxed()
         }) as fn(_) -> _,

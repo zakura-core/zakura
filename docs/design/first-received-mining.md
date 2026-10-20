@@ -47,12 +47,12 @@ this policy is tracked separately in [#1127](https://github.com/zakura-core/zaku
 
 ## Header sync
 
-The header engine still uses greatest work and raw hash to select downloads.
-Native block sync requests bodies on that selected header chain. If both headers
-arrive before either body is handed off for verification, the higher-hash branch
-can be the only one whose body reaches the verifier.
-Making header selection agree with full state on equal work is tracked in
-[#1137](https://github.com/zakura-core/zakura/issues/1137).
+The integrated header engine selects greatest work and preserves its selected
+eligible tip on equal work. It restores that preference from durable metadata.
+A stronger fork or loss of eligibility changes selection. Raw hash resolves ties
+when no selected tip remains competitive. Headers-only mode retains raw-hash
+ordering. This prevents equal-work arrivals from repeatedly replacing an active
+body download. Header arrival order and full-block receipt order can still differ.
 
 Peers also serve retained bodies on the selected header branch. A node can keep
 mining on the earlier block A while serving an equal-work side-fork block B to a

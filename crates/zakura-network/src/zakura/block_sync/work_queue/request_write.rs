@@ -30,6 +30,11 @@ impl RequestWriteStatus {
         self.0.load(Ordering::Acquire) == EXPIRED
     }
 
+    /// Whether transport started writing the frame, after which it cannot skip it.
+    pub(in crate::zakura::block_sync) fn has_started(&self) -> bool {
+        matches!(self.0.load(Ordering::Acquire), STARTED | WRITTEN)
+    }
+
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
@@ -110,6 +115,8 @@ impl RequestWrite {
                 .expect("every provisional item was checked under this lock");
             item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
             item.provisional = false;
+            let charge = item.estimated_bytes;
+            inner.in_flight_reserved.add(charge);
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
         inner.request_writes.insert(

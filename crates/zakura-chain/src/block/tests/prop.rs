@@ -74,6 +74,7 @@ proptest! {
         let _init_guard = zakura_test::init();
 
         let bytes = header.zcash_serialize_to_vec()?;
+        prop_assert_eq!(header.zcash_serialized_size(), bytes.len());
         let other_header = bytes.zcash_deserialize_into()?;
 
         prop_assert_eq![&header, &other_header];

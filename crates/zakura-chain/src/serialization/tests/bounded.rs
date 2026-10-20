@@ -85,6 +85,46 @@ fn nested_limits_preserve_available_bytes_and_advance_the_parent() {
 }
 
 #[test]
+fn nested_limits_restore_the_enclosing_limit_less_what_was_read() {
+    let mut bytes = &[1, 2, 3, 4, 5, 6][..];
+    let mut reader = ZcashReader::from_slice(&mut bytes);
+    let mut outer = reader.with_limit(5);
+    {
+        let mut inner = outer.with_limit(2);
+        assert_eq!(inner.remaining_bytes(), Some(2));
+        assert_eq!(inner.read_bytes(2).unwrap(), [1, 2]);
+        assert!(inner.read_bytes(1).is_err());
+    }
+    assert_eq!(outer.remaining_bytes(), Some(3));
+    assert!(outer.read_bytes(4).is_err());
+    assert_eq!(outer.read_bytes(3).unwrap(), [3, 4, 5]);
+    drop(outer);
+    assert_eq!(reader.remaining_bytes(), Some(1));
+    assert_eq!(reader.read_bytes(1).unwrap(), [6]);
+}
+
+#[test]
+fn limits_stop_stream_reads_including_nested_values() {
+    let mut stream = ZcashReader::from_stream(io::Cursor::new([1, 2, 3]));
+    let mut buf = [0; 3];
+    {
+        let mut limited = stream.with_limit(2);
+        assert_eq!(limited.read(&mut buf).unwrap(), 2);
+        assert_eq!(limited.read(&mut buf).unwrap(), 0);
+    }
+    assert_eq!(stream.read(&mut buf).unwrap(), 1);
+
+    // Stream decoders read nested values through the limited reader too.
+    let mut stream = ZcashReader::from_stream(io::Cursor::new([0; 32]));
+    assert!(stream.with_limit(31).read_value::<Hash>().is_err());
+    let mut stream = ZcashReader::from_stream(io::Cursor::new([0; 32]));
+    assert_eq!(
+        stream.with_limit(32).read_value::<Hash>().unwrap(),
+        Hash([0; 32])
+    );
+}
+
+#[test]
 fn counted_collections_reject_missing_input_before_decoding_elements() {
     // These bytes would decode as valid hashes if the count were satisfiable.
     for remaining in [0, 1, 31, 32, 63] {
@@ -184,28 +224,36 @@ fn bounded_blocks_match_streaming_fixtures_and_preserve_trailing_input() {
 }
 
 #[test]
-fn external_streaming_implementations_remain_usable_but_do_not_claim_bounds() {
+fn external_decoders_work_for_stream_and_slice_input() {
     #[derive(Debug)]
-    struct StreamingByte(u8);
+    struct ExternalByte(u8);
 
-    impl ZcashDeserialize for StreamingByte {
-        fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    impl ZcashDeserialize for ExternalByte {
+        fn zcash_deserialize_from<R: Read>(
+            reader: &mut ZcashReader<R>,
+        ) -> Result<Self, SerializationError> {
             let mut byte = [0];
             reader.read_exact(&mut byte)?;
             Ok(Self(byte[0]))
         }
     }
 
-    impl TrustedPreallocate for StreamingByte {
+    impl TrustedPreallocate for ExternalByte {
         fn max_allocation() -> u64 {
             10
         }
+
+        fn min_serialized_size() -> u64 {
+            1
+        }
     }
 
-    let streamed = Vec::<StreamingByte>::zcash_deserialize(&[1, 7][..]).unwrap();
+    let streamed = Vec::<ExternalByte>::zcash_deserialize(&[1, 7][..]).unwrap();
     assert_eq!(streamed[0].0, 7);
-    assert!(StreamingByte::zcash_deserialize_from_slice(&mut &[7][..]).is_err());
-    assert!(Vec::<StreamingByte>::zcash_deserialize_from_slice(&mut &[1, 7][..]).is_err());
+    let sliced = Vec::<ExternalByte>::zcash_deserialize_from_slice(&mut &[1, 7][..]).unwrap();
+    assert_eq!(sliced[0].0, 7);
+    // Slice input knows its length, so a count the bytes cannot hold is rejected.
+    assert!(Vec::<ExternalByte>::zcash_deserialize_from_slice(&mut &[2, 7][..]).is_err());
 }
 
 #[test]

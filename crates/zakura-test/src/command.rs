@@ -13,10 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
-use color_eyre::{
-    eyre::{eyre, Context, Report, Result},
-    Help, SectionExt,
-};
+use eyre::{eyre, Context, Report, Result};
 use regex::RegexSet;
 use tracing::instrument;
 
@@ -27,6 +24,7 @@ pub mod to_regex;
 
 pub use self::arguments::Arguments;
 use self::to_regex::{CollectRegexSet, RegexSetExt, ToRegexSet};
+use crate::report::{Section, SectionExt};
 
 /// A super-trait for [`Iterator`] + [`Debug`].
 pub trait IteratorDebug: Iterator + Debug {}
@@ -800,7 +798,7 @@ impl<T> TestChild<T> {
             }
         }
 
-        let timeout = humantime::format_duration(timeout).to_string();
+        let timeout = format!("{timeout:?}");
         let mut error = eyre!("command did not exit within the {timeout} command timeout");
 
         if let Err(kill_err) = self.kill(true) {
@@ -1047,7 +1045,7 @@ impl<T> TestChild<T> {
 
         let timeout = self
             .timeout
-            .map(|timeout| humantime::format_duration(timeout).to_string())
+            .map(|timeout| format!("{timeout:?}"))
             .unwrap_or_else(|| "unlimited".to_string());
 
         let report = eyre!(

@@ -107,7 +107,7 @@ impl RawLayoutPeer {
         self.members.clear();
         let multi = layout.len() > 1;
         if i_open_collision_winner(&self.endpoint.local_id(), &self.connection.remote_id()) {
-            let wire_id: u64 = rand::random::<u64>().max(1);
+            let wire_id: u64 = rand_10::random::<u64>().max(1);
             for member in layout {
                 let (mut send, recv) = self.open_stream(member.kind, member.version).await?;
                 if multi {
@@ -165,6 +165,20 @@ impl RawLayoutPeer {
     /// Send one frame on a member.
     pub(crate) async fn send(&mut self, member: usize, frame: &Frame) -> Result<(), BoxError> {
         let bytes = frame.encode(self.limits.max_frame_bytes)?;
+        self.write(member, &bytes).await
+    }
+
+    /// Send frames on a member in one write, so a burst of small requests
+    /// costs one stream write instead of one per frame.
+    pub(crate) async fn send_all(
+        &mut self,
+        member: usize,
+        frames: impl IntoIterator<Item = Frame>,
+    ) -> Result<(), BoxError> {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(frame.encode(self.limits.max_frame_bytes)?);
+        }
         self.write(member, &bytes).await
     }
 

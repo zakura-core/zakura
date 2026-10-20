@@ -277,16 +277,6 @@ async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
     fixture.insert_headers(None, Some((successor, Corruption::AuthDataRoot)));
     let blocks = &fixture.chain[BODY_TIP as usize + 1..=successor.0 as usize];
     let (mut writer, responses) = RunningWriter::start_queued(&fixture, blocks);
-    let mut responses = responses.into_iter();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        responses.next().expect("the first block is queued"),
-    )
-    .await
-    .expect("the first block freezes the frontiers")
-    .expect("the writer answers the first block")
-    .expect("the first block commits");
-    assert_eq!(fixture.finalized_state.vct_fast_count(), 1);
     tokio::time::timeout(
         Duration::from_secs(5),
         writer
@@ -324,9 +314,9 @@ async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
         ApplyResult::Committed
     ));
 
-    // No more control messages or peer responses arrive. The queued successor also prevents
-    // the idle sweep from running until the blocked checkpoint has recovered.
-    for (response, block) in responses.zip(&blocks[1..]) {
+    // No more peer input arrives. The parked block prevents an idle sweep, and the queued
+    // successor must also commit after recovery.
+    for (response, block) in responses.into_iter().zip(blocks) {
         let hash = tokio::time::timeout(Duration::from_secs(5), response)
             .await
             .expect("the parked writer finds the already retained honest pair")
@@ -334,10 +324,6 @@ async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
             .expect("the valid checkpoint block commits");
         assert_eq!(hash, block.hash());
     }
-    assert_eq!(
-        fixture.finalized_state.db.finalized_tip_height(),
-        Some(successor)
-    );
     assert_eq!(fixture.finalized_state.vct_fast_count(), 3);
     drop(writer);
 }

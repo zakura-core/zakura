@@ -2004,3 +2004,70 @@ async fn legacy_partial_payloads_share_receive_capacity() -> Result<(), BoxError
     }
     Ok(())
 }
+
+/// Partial headers reserve no payload slots, and partial payloads expire at one local deadline.
+#[tokio::test]
+async fn legacy_partial_requests_release_capacity_at_local_deadline() -> Result<(), BoxError> {
+    let (_server, client, connection, remote) = raw_connection().await?;
+    let capacity = Arc::new(LegacyReceiveCapacity::new());
+    let registry = Arc::new(ServiceRegistry::new(vec![])?);
+    let mut workers = Vec::new();
+    let mut streams = Vec::new();
+    let mut cancellations = Vec::new();
+    for complete_header in [false, true] {
+        let (mut peer_send, peer_recv) = connection.open_bi().await?;
+        let mut header = LEGACY_REQUEST_PUSH_TRANSACTION.to_le_bytes().to_vec();
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&64u32.to_le_bytes());
+        peer_send
+            .write_all(
+                &header[..if complete_header {
+                    FRAME_HEADER_BYTES
+                } else {
+                    1
+                }],
+            )
+            .await?;
+        let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+        let mut context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
+        let local = ZakuraLocalLimits::from_config(&Config::default());
+        context.limits = local.clamp(&local.initial_limits());
+        assert!(context.limits.idle_timeout > LEGACY_REQUEST_READ_TIMEOUT);
+        cancellations.push(context.connection_token.clone());
+        workers.push(tokio::spawn(request_stream_worker(
+            send,
+            recv,
+            StreamPrelude {
+                magic: STREAM_PRELUDE_MAGIC,
+                stream_kind: LEGACY_REQUEST_STREAM_KIND,
+                stream_version: 1,
+                request_id: Some(1),
+                max_frame_bytes: crate::zakura::LOCAL_MAX_CONTROL_FRAME_BYTES,
+            },
+            context,
+            registry.clone(),
+            capacity.clone(),
+        )));
+        streams.push((peer_send, peer_recv));
+    }
+    timeout(TEST_TIMEOUT, async {
+        while capacity.node.available() == 64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(
+        capacity.node.available(),
+        63,
+        "the incomplete header owns no payload reservation"
+    );
+    tokio::time::pause();
+    tokio::time::advance(LEGACY_REQUEST_READ_TIMEOUT + Duration::from_millis(1)).await;
+    for worker in workers {
+        worker.await?;
+    }
+    assert_eq!(capacity.node.available(), 64);
+    assert!(cancellations.iter().all(CancellationToken::is_cancelled));
+    drop(streams);
+    Ok(())
+}

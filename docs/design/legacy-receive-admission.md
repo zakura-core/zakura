@@ -20,6 +20,8 @@ Outgoing gossip reserves 4 MiB per session and 32 MiB node-wide before encoding.
 
 Decoded gossip has eight node-wide permits acquired before decoding and retained through queueing and service processing. Gossip therefore occupies at most eight entries of the shared 256-entry service queue, leaving room for the separately bounded legacy requests.
 
+A legacy request reserves payload capacity only after its complete validated header arrives. A single local ten-second deadline covers the entire header and payload, capped by any shorter negotiated idle timeout. Partial progress cannot renew this deadline. Expiry cancels the stalled peer and releases its reservations.
+
 ## Validation
 
 The partial-payload test uses actual QUIC connections with default flow-control windows. Eight identities each hold eight almost-complete 1 MiB transaction frames. A ninth stream per identity and a ninth identity are refused without cancelling their connections. A separate Ping/Pong exchange progresses while all 64 inbound slots are occupied. Cancellation releases the slots.

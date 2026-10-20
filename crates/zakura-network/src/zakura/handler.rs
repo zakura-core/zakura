@@ -2414,6 +2414,38 @@ impl LegacyReceiveCapacity {
     }
 }
 
+/// Charge request memory only after its complete header, immediately before allocation.
+#[derive(Debug)]
+struct LegacyRequestAdmission<'a> {
+    capacity: &'a LegacyReceiveCapacity,
+    peer: &'a ZakuraPeerId,
+    lease: std::sync::Mutex<Option<ReceiveLease>>,
+}
+
+impl super::regulation::ResponsePrecheck for LegacyRequestAdmission<'_> {
+    /// Reserve the request's payload allowance once for this one-shot stream.
+    #[allow(clippy::unwrap_in_result)] // Poisoning is a local invariant failure, not peer overload.
+    fn check(&self, _message_type: u16, _payload_len: usize) -> Result<(), FrameRejection> {
+        let mut lease = self
+            .lease
+            .lock()
+            .expect("request admission mutex is never poisoned");
+        if lease.is_none() {
+            let permits = self
+                .capacity
+                .reserve(self.peer)
+                .ok_or(FrameRejection::LocalCapacity)?;
+            *lease = Some(ReceiveLease {
+                _permits: Some(Arc::new(permits)),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One absolute deadline covers the header and payload, regardless of peer idle limits.
+const LEGACY_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// zakura-quic acceptor for the Zakura `p2p-v2/3` ALPN.
 #[derive(Debug, Clone)]
 pub struct ZakuraProtocolHandler {
@@ -5131,20 +5163,12 @@ async fn request_stream_worker(
     registry: Arc<ServiceRegistry>,
     receive: Arc<LegacyReceiveCapacity>,
 ) {
-    // Overload is local: reset only this exchange, leaving the peer and native streams live.
-    let receive_capacity =
-        if prelude.stream_kind == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS {
-            let Some(capacity) = receive.reserve(&context.peer_id) else {
-                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
-                let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
-                return;
-            };
-            ReceiveLease {
-                _permits: Some(Arc::new(capacity)),
-            }
-        } else {
-            ReceiveLease::default()
-        };
+    let legacy = prelude.stream_kind == super::legacy_gossip::ZAKURA_STREAM_LEGACY_REQUESTS;
+    let admission = LegacyRequestAdmission {
+        capacity: &receive,
+        peer: &context.peer_id,
+        lease: std::sync::Mutex::new(None),
+    };
     let Some(request_id) = prelude.request_id else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
         context.close_cause.record("request_without_id");
@@ -5152,23 +5176,45 @@ async fn request_stream_worker(
         return;
     };
 
+    let read = read_frame(
+        &mut recv,
+        context.inbound_frame_cap,
+        FrameFilter::new(context.messages, InboundReader::Responder)
+            .with_legacy_stream(prelude.stream_kind)
+            .with_precheck(
+                legacy.then_some(&admission as &dyn super::regulation::ResponsePrecheck),
+            ),
+        context.limits.idle_timeout,
+        Some(context.limits.idle_timeout),
+    );
+    let read = async {
+        if legacy {
+            timeout(
+                LEGACY_REQUEST_READ_TIMEOUT.min(context.limits.idle_timeout),
+                read,
+            )
+            .await
+            .unwrap_or(Err(ZakuraHandlerError::Timeout("legacy request frame")))
+        } else {
+            read.await
+        }
+    };
     let frame = tokio::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
-        frame = read_frame(
-            &mut recv,
-            context.inbound_frame_cap,
-            FrameFilter::new(context.messages, InboundReader::Responder).with_legacy_stream(prelude.stream_kind),
-            context.limits.idle_timeout,
-            // A request stream carries its request frame immediately after the
-            // prelude, so a peer that opens one and then goes silent is treated
-            // as a stalled one-shot stream and bounded by the idle timeout.
-            Some(context.limits.idle_timeout),
-        ) => frame,
+        frame = read => frame,
     };
 
     let frame = match frame {
         Ok(frame) => frame,
+        Err(ZakuraHandlerError::RejectedFrame {
+            rejection: FrameRejection::LocalCapacity,
+            ..
+        }) => {
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            return;
+        }
         Err(error) => {
             debug!(
                 ?error,
@@ -5198,6 +5244,11 @@ async fn request_stream_worker(
         }
     }
 
+    let receive_capacity = admission
+        .lease
+        .into_inner()
+        .expect("request admission mutex is never poisoned")
+        .unwrap_or_default();
     let response_frame_cap = context.outbound_frame_cap;
     let response_frames = match registry
         .request_with_lease(

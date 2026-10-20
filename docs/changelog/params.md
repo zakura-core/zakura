@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `LEGACY_REQUEST_READ_TIMEOUT` | `crates/zakura-network/src/zakura/handler.rs` | negotiated idle timeout per read phase → 10 s for the complete frame | [#1564](https://github.com/zakura-core/zakura/pull/1564) | Bound partial requests independently of peer progress and negotiated timeout. |
 | Legacy request receive slots | `crates/zakura-network/src/zakura/handler.rs` | new → 64 per node, 8 per peer | [#1564](https://github.com/zakura-core/zakura/pull/1564) | Reserve the 1 MiB frame allowance before payload allocation and retain it through processing. |
 | `LEGACY_RESPONSE_MAX_FRAMES` | `crates/zakura-network/src/zakura/legacy_gossip.rs` | no encoder ceiling → 8,192 per response | [#1564](https://github.com/zakura-core/zakura/pull/1564) | Bound allocations for tiny peer-selected chunks while allowing a maximum-size item in 256-byte chunks. |
 | Legacy response receive slots and memory envelope | `crates/zakura-network/src/zakura/handler.rs` | new → 4 per node, 1 per peer, 32 MiB retained bytes per response | [#1564](https://github.com/zakura-core/zakura/pull/1564) | Bound frame metadata and reassembly independently of the unchanged 16 MiB wire budget. |

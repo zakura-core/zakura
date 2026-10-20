@@ -226,7 +226,6 @@ const LEGACY_COMPACT_SIZE_PREFIX_BYTES: usize = 9;
 const LEGACY_BLOCK_HASH_BYTES: usize = 32;
 // A witnessed transaction inventory entry has a four-byte type and two hashes.
 const LEGACY_INVENTORY_HASH_BYTES: usize = 68;
-const LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM: usize = 8;
 /// Maximum cumulative response payload bytes the requester will retain in the
 /// accepted-frame `Vec` before `decode_response` consumes it.
 ///
@@ -5697,9 +5696,7 @@ impl LegacyResponseBudget {
         let (max_items, max_frames, max_bytes) = match kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
                 let item_count = legacy_inventory_count(payload, kind)?;
-                let max_frames = item_count
-                    .saturating_mul(LEGACY_RESPONSE_MAX_FRAMES_PER_ITEM)
-                    .saturating_add(1);
+                let max_frames = super::legacy_gossip::LEGACY_RESPONSE_MAX_FRAMES;
                 let item_bytes = match kind {
                     LegacyResponseKind::Blocks => LEGACY_BLOCK_HASH_BYTES,
                     LegacyResponseKind::Transactions => LEGACY_INVENTORY_HASH_BYTES,
@@ -5775,7 +5772,12 @@ struct LegacyResponseReadState {
 impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
     fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         if self.frames >= self.budget.max_frames {
-            return Err(FrameRejection::Unsolicited);
+            return Err(match self.budget.kind {
+                LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                    FrameRejection::LocalCapacity
+                }
+                _ => FrameRejection::Unsolicited,
+            });
         }
         // Keep protocol bytes separate: a maximum legal response still fits.
         // Vec growth can retain almost twice the logical item size, both during
@@ -12699,5 +12701,43 @@ mod tests {
             .unwrap();
             assert!(capacity.reserve(&test_peer(1)).is_some());
         }
+    }
+    /// A peer with a small negotiated frame cap can return a full-size block.
+    #[test]
+    fn small_frame_caps_accept_full_block_responses() -> Result<(), BoxError> {
+        use zakura_chain::serialization::ZcashSerialize;
+        let mut block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let size = block.zcash_serialize_to_vec()?.len();
+        let output = &mut Arc::make_mut(&mut block.transactions[0]).outputs_mut()[0];
+        let script_size = output.lock_script.as_raw_bytes().len() + 2_000_000 - size - 4;
+        output.lock_script = zakura_chain::transparent::Script::new(&vec![0; script_size]);
+        let block = Arc::new(block);
+        let request = LegacyRequestFrame::BlocksByHash(vec![block.hash()]).encode_frame()?;
+        let mut limits = test_connection_limits();
+        limits.max_frame_bytes = 64 * 1024;
+        let budget =
+            LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                .map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        let frames = LegacyResponseCodec::encode_response(
+            1,
+            Response::Blocks(vec![InventoryResponse::Available((block, None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        assert!(frames.len() > 9);
+        for frame in frames {
+            state
+                .validate_frame(1, &frame)
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        state.finish().map_err(|error| format!("{error:?}"))?;
+        let mut state = LegacyResponseReadState::new(budget);
+        state.frames = state.budget.max_frames;
+        assert_eq!(
+            super::super::regulation::ResponsePrecheck::check(&state, LEGACY_RESPONSE_BLOCK, 10),
+            Err(FrameRejection::LocalCapacity),
+        );
+        Ok(())
     }
 }

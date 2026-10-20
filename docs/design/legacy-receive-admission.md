@@ -14,6 +14,8 @@ Gossip ingress is separately bounded to eight queued frames per stream. The requ
 
 Responder encoding also stops at 8,192 frames per response. Chunk iteration allocates no per-chunk index, and each frame is charged before its payload allocation. Tiny peer-selected caps therefore cause a local resource reset instead of millions of small allocations.
 
+Requesters use the same 8,192-frame local ceiling rather than assuming eight chunks per item. A legal full block can therefore cross smaller negotiated frames. Exhausting the framing allowance resets the exchange without marking conforming chunks as unsolicited.
+
 ## Validation
 
 The partial-payload test uses actual QUIC connections with default flow-control windows. Eight identities each hold eight almost-complete 1 MiB transaction frames. A ninth stream per identity and a ninth identity are refused without cancelling their connections. A separate Ping/Pong exchange progresses while all 64 inbound slots are occupied. Cancellation releases the slots.

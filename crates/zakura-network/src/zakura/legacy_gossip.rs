@@ -7193,8 +7193,9 @@ mod tests {
         Ok(())
     }
 
+    /// Exhausting the local framing allowance ends only the response exchange.
     #[tokio::test]
-    async fn excessive_outbound_response_frames_disconnects_peer() -> Result<(), BoxError> {
+    async fn excessive_outbound_response_frames_preserves_peer() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let node = ZakuraTestNode::builder(75).spawn().await?;
         let hostile = HostilePeer::connect_native(&node, 76).await?;
@@ -7208,7 +7209,7 @@ mod tests {
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
             let mut frames = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..=LEGACY_RESPONSE_MAX_FRAMES {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&request_id.to_le_bytes());
                 payload.extend_from_slice(&encoded_count(0));
@@ -7228,13 +7229,13 @@ mod tests {
             matches!(
                 error.downcast_ref::<crate::zakura::handler::ZakuraHandlerError>(),
                 Some(crate::zakura::handler::ZakuraHandlerError::RejectedFrame {
-                    rejection: crate::zakura::FrameRejection::Unsolicited,
+                    rejection: crate::zakura::FrameRejection::LocalCapacity,
                     ..
                 })
             ),
             "unexpected error: {error}"
         );
-        wait_registered_count(&node, 0).await?;
+        wait_registered_count(&node, 1).await?;
 
         hostile.shutdown().await;
         node.shutdown().await;

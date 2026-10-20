@@ -14,7 +14,7 @@ Gossip ingress is separately bounded to eight queued frames per stream. The requ
 
 Responder encoding also stops at 8,192 frames per response. Chunk iteration allocates no per-chunk index, and each frame is charged before its payload allocation. Tiny peer-selected caps therefore cause a local resource reset instead of millions of small allocations.
 
-Requesters use the same 8,192-frame local ceiling rather than assuming eight chunks per item. A legal full block can therefore cross smaller negotiated frames. Exhausting the framing allowance resets the exchange without marking conforming chunks as unsolicited.
+Requesters use the same 8,192-frame local ceiling rather than assuming eight chunks per item. The byte allowance includes a chunk header for every admitted frame, still subject to the aggregate wire and retained-memory ceilings. A legal full block can therefore cross smaller negotiated frames even when its serialized size equals the negotiated message limit. Exhausting the framing allowance resets the exchange without marking conforming chunks as unsolicited.
 
 Outgoing gossip reserves 4 MiB per session and 32 MiB node-wide before encoding. The reservation covers payload-vector growth and the transport encoding copy, and remains held while queued or writing. Slow recipients cause best-effort gossip drops at capacity rather than multiplying the per-peer frame queue into gigabytes.
 

@@ -5756,8 +5756,12 @@ impl LegacyResponseBudget {
                 let missing_bytes = LEGACY_RESPONSE_REQUEST_ID_BYTES
                     .saturating_add(LEGACY_COMPACT_SIZE_PREFIX_BYTES)
                     .saturating_add(item_count.saturating_mul(item_bytes));
+                // Chunks retain their own headers in addition to each assembled item.
+                // Allow any chunking within the local frame ceiling, not just full frames.
+                let chunk_headers = max_frames.saturating_mul(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 let max_bytes = item_count
                     .saturating_mul(max_message_bytes)
+                    .saturating_add(chunk_headers)
                     .saturating_add(missing_bytes)
                     .max(LEGACY_RESPONSE_CHUNK_HEADER_BYTES);
                 (item_count, max_frames, max_bytes)
@@ -12766,6 +12770,8 @@ mod tests {
         let request = LegacyRequestFrame::BlocksByHash(vec![block.hash()]).encode_frame()?;
         let mut limits = test_connection_limits();
         limits.max_frame_bytes = 64 * 1024;
+        limits.max_message_bytes = u32::try_from(block.zcash_serialize_to_vec()?.len())?;
+        assert_eq!(limits.max_message_bytes, 2_000_000);
         let budget =
             LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
                 .map_err(|error| format!("{error:?}"))?;

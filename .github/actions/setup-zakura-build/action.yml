@@ -99,13 +99,6 @@ runs:
           echo "ROCKSDB_LIB_DIR=/usr/local/lib" >> $GITHUB_ENV
         fi
 
-    - name: Configure RocksDB on Windows
-      if: runner.os == 'Windows'
-      shell: bash
-      # Unity builds expose RocksDB's CreateFile helper to Windows API macros.
-      # Compile each source separately to keep those names isolated.
-      run: echo 'ROCKSDB_UNITY_CHUNK=1' >> "$GITHUB_ENV"
-
     - name: Install protoc on Windows
       if: runner.os == 'Windows' && inputs.protoc == 'true'
       shell: bash

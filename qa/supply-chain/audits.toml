@@ -4560,6 +4560,12 @@ criteria = "safe-to-deploy"
 delta = "0.17.3+10.4.2 -> 0.17.4+10.4.2"
 notes = "Changes are confined to build.rs and two new data files; the bundled RocksDB 10.4.2 sources are the same submodule commit and are not modified. build.rs compiles the six port/win sources outside unity groups (fixing the Windows build), and adds a default-on `full` feature. Without `full`, build.rs skips the sources listed in zakura_excluded_sources.txt and compiles edited copies, written to OUT_DIR by zakura_minimal.rs, of five RocksDB files: each edit makes an entry point of an unused feature (SST ingestion, column family import, remote compaction, tracing and replay, encrypted file systems, plain and cuckoo tables) return Status::NotSupported or skip its call. Each edit asserts its anchor occurs exactly once. No new sources, flags, downloads, or links. The fork's test suite passes with `full`; zakura-state's tests pass without it."
 
+[[audits.zakura-librocksdb-sys]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.4+10.4.2 -> 0.17.5+10.4.2"
+notes = "build.rs defaults ROCKSDB_UNITY_CHUNK to 1 on Windows targets, so Windows compiles one translation unit per RocksDB source (other targets unchanged; the variable still overrides). zakura_minimal.rs is restructured so each edit is an InsertAfter or Replace whose C++ is a raw multi-line string, and normalizes CRLF to LF before matching; the edited sources it generates are byte-for-byte identical to 0.17.4's. No new sources, flags, downloads, or links. Published from fork commit ed52fdf, which passed the fork's CI on Linux, macOS, and Windows, including a build without `full`."
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4581,6 +4587,12 @@ who = "Claude <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 delta = "0.24.0 -> 0.24.1"
 notes = "Adds a default-on `full` feature forwarded to zakura-librocksdb-sys and bumps its exact pin to 0.17.4. The only code change is in src/db.rs: without `full`, opening a TTL database returns an error instead of calling RocksDB's TTL open. README and CHANGELOG document the feature."
+
+[[audits.zakura-rocksdb]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.1 -> 0.24.2"
+notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.5; the Rust sources are unchanged. The CI workflow adds a build without `full` on each platform."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

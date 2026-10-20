@@ -127,7 +127,7 @@ rustls-pki-types = "1.12"
 # clang-sys into runtime mode while this bindgen never loads the library, and
 # the build script panics with "a `libclang` shared library is not loaded on
 # this thread".
-rocksdb = { version = "=0.24.1", package = "zakura-rocksdb", default-features = false, features = ["bindgen-runtime"] }
+rocksdb = { version = "=0.24.2", package = "zakura-rocksdb", default-features = false, features = ["bindgen-runtime"] }
 secp256k1 = "0.33"
 semver = "1.0.26"
 serde = "1.0.219"

@@ -32,7 +32,7 @@ use zakura_chain::{
 
 use crate::BoxError;
 
-use super::{sapling_prover, Authorized, Bundle, CacheKey, Cached, CachedItem, Item, ZatBalance};
+use super::{verifying_keys, Authorized, Bundle, CacheKey, Cached, CachedItem, Item, ZatBalance};
 
 /// The `verifier` label the test caches report their metrics under.
 ///
@@ -41,8 +41,29 @@ use super::{sapling_prover, Authorized, Bundle, CacheKey, Cached, CachedItem, It
 const TEST_CACHE_VERIFIER_LABEL: &str = "groth16_sapling_test";
 
 #[test]
-fn sapling_prover_is_reused() {
-    assert!(std::ptr::eq(sapling_prover(), sapling_prover()));
+fn sapling_verifying_keys_are_reused() {
+    assert!(std::ptr::eq(verifying_keys(), verifying_keys()));
+}
+
+#[tokio::test]
+async fn historical_sapling_coinbase_verifies_without_proving_parameters() {
+    let _guard = zakura_test::init();
+    let height = 949_496;
+    let block: Block = zakura_test::vectors::MAINNET_BLOCKS[&height]
+        .zcash_deserialize_into()
+        .expect("historical shielded coinbase block vector must deserialize");
+    let tx = &block.transactions[0];
+    assert!(tx.is_coinbase());
+    assert!(tx.sapling_outputs().next().is_some());
+    let nu = NetworkUpgrade::current(&Network::Mainnet, Height(height));
+    let item = item(tx, nu).expect("historical coinbase has a Sapling bundle");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::verify_single(item),
+    )
+    .await
+    .expect("historical Sapling verification completes within the timeout")
+    .expect("historical shielded coinbase remains valid");
 }
 
 /// Returns the mainnet test transactions that carry a Sapling bundle, with the network upgrade

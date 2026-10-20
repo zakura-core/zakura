@@ -165,3 +165,37 @@ fn finalization_and_owned_queries_preserve_other_snapshot_payloads() {
         "the shared payload is released with its last snapshot"
     );
 }
+
+#[test]
+fn snapshots_share_block_records_until_their_last_owner_drops() {
+    let (chain, block, _) = funded_chain();
+    let mut chain = chain
+        .push(
+            block
+                .make_fake_child()
+                .prepare()
+                .test_with_zero_spent_utxos(),
+        )
+        .expect("the child updates the chain");
+    let snapshot = chain.clone();
+    assert!(chain
+        .blocks
+        .values()
+        .zip(snapshot.blocks.values())
+        .all(|(current, retained)| Arc::ptr_eq(current, retained)));
+
+    let root = Arc::downgrade(chain.blocks.values().next().expect("the chain has blocks"));
+    let (finalized, _) = chain.pop_root();
+    assert_eq!(finalized.hash, block.hash());
+    assert_eq!(snapshot.non_finalized_root_hash(), block.hash());
+    drop(finalized);
+    assert!(
+        root.upgrade().is_some(),
+        "the snapshot still owns the popped root record"
+    );
+    drop(snapshot);
+    assert!(
+        root.upgrade().is_none(),
+        "the record is released with its last owner"
+    );
+}

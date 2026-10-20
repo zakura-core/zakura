@@ -23,18 +23,18 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::Batch;
+use crate::primitives::fallback::Fallback;
 use futures::future::join_all;
 use orchard::{
     builder::{Builder, BundleType},
     bundle::{Authorized, Bundle, BundleVersion, Flags, TxVersion},
     circuit::{OrchardCircuitVersion, ProvingKey},
-    keys::{FullViewingKey, Scope, SpendingKey},
+    keys::{Diversifier, FullViewingKey, Scope, SpendingKey},
     value::NoteValue,
     Anchor,
 };
 use tower::{Service, ServiceExt};
-use tower_batch_control::Batch;
-use tower_fallback::Fallback;
 use zakura_chain::{
     block::Block,
     parameters::NetworkUpgrade,
@@ -907,23 +907,24 @@ async fn cache_miss_propagates_an_inner_readiness_failure() {
     );
 }
 
-/// Builds an output-only NU6.2-era (fixed circuit) Orchard bundle and proves
-/// it with `pk`.
+/// Builds an output-only post-NU6.3 (Ironwood v3) bundle and proves it with
+/// `pk`.
 ///
 /// Returns the authorized bundle and the sighash its signatures commit to.
 fn prove_shielding_bundle(pk: &ProvingKey) -> (Bundle<Authorized, ZatBalance>, SigHash) {
     let mut rng = rand_10::rng();
 
     let sk = SpendingKey::from_bytes([7; 32]).expect("hard-coded test key bytes are valid");
-    let recipient = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
+    let recipient =
+        FullViewingKey::from(&sk).address(Diversifier::from_bytes([0; 11]), Scope::External);
 
     let mut builder = Builder::new(
         BundleType::DEFAULT,
-        BundleVersion::orchard_v2(),
+        BundleVersion::ironwood_v3(),
         Flags::SPENDS_DISABLED,
         Anchor::empty_tree(),
     )
-    .expect("spends-disabled flags are valid for an Orchard v2 bundle");
+    .expect("spends-disabled flags are valid for an Ironwood v3 bundle");
     builder
         .add_output(None, recipient, NoteValue::from_raw(5000), [0u8; 512])
         .expect("adding one output to an empty builder succeeds");
@@ -934,8 +935,8 @@ fn prove_shielding_bundle(pk: &ProvingKey) -> (Bundle<Authorized, ZatBalance>, S
         .expect("the bundle is nonempty: it has an output");
 
     let sighash: [u8; 32] = unauthorized
-        .commitment(TxVersion::V5)
-        .expect("spends-disabled flags are representable in a v5 bundle")
+        .commitment(TxVersion::V6)
+        .expect("spends-disabled flags are representable in a v6 bundle")
         .into();
 
     let bundle = unauthorized
@@ -971,6 +972,7 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
     // Unarmed control keys, freshly built so no prepared state is cached.
     let unarmed_insecure_vk = ItemVerifyingKey::build(OrchardCircuitVersion::InsecurePreNu6_2);
     let unarmed_fixed_vk = ItemVerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+    let unarmed_nu6_3_vk = ItemVerifyingKey::build(OrchardCircuitVersion::PostNu6_3);
 
     // Verification parity on a real mainnet proof: armed and unarmed keys
     // must accept it under its own circuit era and reject it under the wrong
@@ -995,8 +997,10 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
 
     // Proving parity: prove once with an unarmed proving key, arm it, prove
     // again. Both proofs must verify under both the armed static and the
-    // unarmed control key.
-    let pk = ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2);
+    // unarmed control key. Proving uses the post-NU6.3 circuit, the only
+    // circuit the coinbase proving path still exercises.
+    let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3)
+        .expect("the current Orchard circuit supports proving");
     let unarmed_prover_result = prove_shielding_bundle(&pk);
 
     let first_arming = pk.prepare_proving();
@@ -1013,12 +1017,12 @@ fn prepared_msm_arming_does_not_change_proving_or_verification() {
         (armed_prover_result.0, armed_prover_result.1, "armed"),
     ] {
         assert!(
-            Item::new(bundle.clone(), sighash).verify_single(&VERIFYING_KEY_NU6_2),
-            "armed NU6.2 key must accept the proof from the {prover} prover",
+            Item::new(bundle.clone(), sighash).verify_single(&VERIFYING_KEY_NU6_3_ONWARD),
+            "armed NU6.3 key must accept the proof from the {prover} prover",
         );
         assert!(
-            Item::new(bundle, sighash).verify_single(&unarmed_fixed_vk),
-            "unarmed NU6.2 key must accept the proof from the {prover} prover",
+            Item::new(bundle, sighash).verify_single(&unarmed_nu6_3_vk),
+            "unarmed NU6.3 key must accept the proof from the {prover} prover",
         );
     }
 }

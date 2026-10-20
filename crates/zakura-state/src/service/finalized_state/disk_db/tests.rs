@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 #![allow(dead_code)]
 
-use std::{ops::Deref, sync::atomic::Ordering};
+use std::{cell::Cell, io, ops::Deref, sync::atomic::Ordering};
 
 use semver::Version;
 use zakura_chain::parameters::Network;
@@ -137,4 +137,75 @@ fn zs_iter_opts_increments_key_by_one() {
             assert_eq!(extra_bytes.len(), 0, "there should be no extra bytes");
         }
     }
+}
+
+#[test]
+fn file_limit_success_does_not_retry_or_query() {
+    let limit = DiskDb::increase_open_file_limit_with(
+        |requested| {
+            assert_eq!(requested, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+            Ok(requested)
+        },
+        || panic!("a successful increase must not query again"),
+    );
+    assert_eq!(limit, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+}
+
+#[test]
+fn file_limit_retries_the_minimum() {
+    let attempts = Cell::new(0);
+    let limit = DiskDb::increase_open_file_limit_with(
+        |requested| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                assert_eq!(requested, DiskDb::IDEAL_OPEN_FILE_LIMIT);
+                Err(io::ErrorKind::PermissionDenied.into())
+            } else {
+                assert_eq!(requested, DiskDb::MIN_OPEN_FILE_LIMIT);
+                Ok(requested)
+            }
+        },
+        || panic!("a successful minimum retry must not query again"),
+    );
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(limit, DiskDb::MIN_OPEN_FILE_LIMIT);
+}
+
+#[test]
+fn file_limit_errors_use_actual_capacity() {
+    let attempts = Cell::new(0);
+    let actual_limit = DiskDb::MIN_OPEN_FILE_LIMIT + DiskDb::RESERVED_FILE_COUNT;
+    let limit = DiskDb::increase_open_file_limit_with(
+        |_| {
+            attempts.set(attempts.get() + 1);
+            Err(io::ErrorKind::PermissionDenied.into())
+        },
+        || {
+            assert_eq!(attempts.get(), 2);
+            Ok(actual_limit)
+        },
+    );
+    assert_eq!(limit, actual_limit);
+    assert_eq!(
+        DiskDb::get_db_open_file_limit(limit),
+        DiskDb::MIN_OPEN_FILE_LIMIT / 2
+    );
+}
+
+#[test]
+#[should_panic(expected = "open file limit too low")]
+fn file_limit_errors_cannot_bypass_the_minimum() {
+    DiskDb::increase_open_file_limit_with(
+        |_| Err(io::ErrorKind::PermissionDenied.into()),
+        || Ok(64),
+    );
+}
+
+#[test]
+#[should_panic(expected = "unable to determine the current open file limit")]
+fn file_limit_query_errors_cannot_fabricate_capacity() {
+    DiskDb::increase_open_file_limit_with(
+        |_| Err(io::ErrorKind::PermissionDenied.into()),
+        || Err(io::ErrorKind::PermissionDenied.into()),
+    );
 }

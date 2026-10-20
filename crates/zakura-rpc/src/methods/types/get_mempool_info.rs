@@ -2,7 +2,7 @@
 
 /// Response to a `getmempoolinfo` RPC request.
 ///
-/// See the notes for the [`Rpc::get_mempool_info` method].
+/// See the notes for the [`RpcServer::get_mempool_info` method].
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct GetMempoolInfoResponse {
     /// Current tx count

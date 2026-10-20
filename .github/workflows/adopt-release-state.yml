@@ -1,0 +1,208 @@
+# Adoption is separate from daily publication; only reviewed PRs change committed checkpoints.
+name: Adopt Mainnet release state
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate and upload the diff without opening a PR"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 6 * * 1"
+permissions: {}
+concurrency:
+  group: adopt-release-state-${{ inputs.dry_run && github.ref || 'main' }}
+  cancel-in-progress: false
+jobs:
+  adopt:
+    name: Propose adoption of a complete published set
+    if: >-
+      github.repository == 'zakura-core/zakura' &&
+      (github.ref == 'refs/heads/main' || inputs.dry_run) &&
+      (github.event_name == 'workflow_dispatch' || vars.MAINNET_RELEASE_STATE_ADOPTION_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    environment: ${{ inputs.dry_run && 'release-dry-run' || 'release-automation' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+          cache-save-if: false
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Fetch one complete published set
+        env:
+          READY_URL: ${{ vars.MAINNET_RELEASE_STATE_READY_URL }}
+        run: python3 .github/scripts/release_state.py ready --state "$RUNNER_TEMP/release-state"
+      - name: Export the selected asset identity
+        id: selection
+        run: |
+          jq -r '"name=\(.name)", "version=\(.version)", "has_changes=\(.has_changes)"' "$RUNNER_TEMP/release-state/selection.json" >> "$GITHUB_OUTPUT"
+      - name: Validate the ready candidate
+        if: steps.selection.outputs.has_changes == 'true'
+        run: python3 .github/scripts/release_state.py validate --state "$RUNNER_TEMP/release-state"
+      - name: Resolve the currently pinned frontier grid
+        if: steps.selection.outputs.has_changes == 'true'
+        id: pinned
+        run: |
+          path=$(python3 .github/scripts/release_state.py pinned-grid)
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      # Release preparation owns end-of-support changes.
+      - name: Import checkpoints, frontier, subtrees, and provenance
+        id: import
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state/bundle
+          RESOLUTION: ${{ runner.temp }}/release-state/resolution.json
+          PREVIOUS_GRID: ${{ steps.pinned.outputs.path }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_ARGS=()
+          if [ -n "$PREVIOUS_GRID" ]; then
+            PREVIOUS_ARGS=(--previous-frontier-grid "$PREVIOUS_GRID")
+          fi
+          python3 .github/scripts/import-release-state.py \
+            --bundle "$BUNDLE" \
+            --resolution "$RESOLUTION" \
+            ${PREVIOUS_ARGS[@]+"${PREVIOUS_ARGS[@]}"} \
+            --result-out "$RUNNER_TEMP/release-state-import.json" \
+            --no-eos-floor
+          jq -r '
+            "has_changes=\(.has_changes)",
+            "height=\(.height)",
+            "block_hash=\(.block_hash)",
+            "generated_at=\(.generated_at)",
+            "meta_url=\(.meta_url)",
+            "meta_sha256=\(.meta_sha256)",
+            "frontier_grid_sha256=\(.frontier_grid_sha256)",
+            "frontier_grid_entries=\(.frontier_grid_entries)"
+          ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
+
+      - name: Pin the ready asset
+        if: steps.import.outputs.has_changes == 'true'
+        run: |
+          python3 .github/scripts/release_state.py pin \
+            --state "$RUNNER_TEMP/release-state" \
+            --import-result "$RUNNER_TEMP/release-state-import.json"
+
+      - name: Validate committed release state, including no-op imports
+        run: |
+          set -euo pipefail
+          .github/scripts/validate-checkpoints.sh \
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE=0 scripts/check-release-state.sh
+
+      - name: Re-prove the checkpoint/frontier pairing in cargo
+        if: steps.import.outputs.has_changes == 'true'
+        run: |
+          cargo test -p zakura-state --lib -- frontier sprout_change
+
+      - name: Restrict the generated diff to release-state files
+        if: steps.import.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          {
+            git diff --name-only HEAD
+            git ls-files --others --exclude-standard
+          } | sort -u > "$RUNNER_TEMP/actual-files"
+          sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
+          Cargo.lock
+          Cargo.toml
+          crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+          EOF
+          UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Import changed files outside the release-state allowlist:" >&2
+            echo "$UNEXPECTED" >&2
+            exit 1
+          fi
+
+          # The checkpoint diff must be append-only.
+          REMOVED=$(git diff --numstat HEAD -- \
+            crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -f2)
+          if [ "${REMOVED:-0}" != "0" ]; then
+            echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
+            exit 1
+          fi
+
+          git diff --stat HEAD
+
+      - name: Recheck freshness and integrity before opening a PR
+        run: python3 .github/scripts/release_state.py verify --committed --state "$RUNNER_TEMP/release-state"
+
+      - name: Create release GitHub App token
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && steps.import.outputs.has_changes == 'true' }}
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 #v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Choose the dated update branch
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && steps.import.outputs.has_changes == 'true' }}
+        id: update-branch
+        run: echo "name=release/checkpoint-update-$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the draft pull request
+        id: pull-request
+        if: ${{ !inputs.dry_run && github.ref == 'refs/heads/main' && steps.import.outputs.has_changes == 'true' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: ${{ steps.update-branch.outputs.name }}
+          base: main
+          title: "chore(chain): update Mainnet release state"
+          body: |
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. End-of-support changes belong to release preparation.
+
+            - Finalized height: `${{ steps.import.outputs.height }}`
+            - Finalized hash: `${{ steps.import.outputs.block_hash }}`
+            - Generated at: `${{ steps.import.outputs.generated_at }}`
+            - Bundle meta: `${{ steps.import.outputs.meta_url }}`
+            - Meta SHA-256: `${{ steps.import.outputs.meta_sha256 }}`
+            - Frontier grid: `${{ steps.selection.outputs.name }} ${{ steps.selection.outputs.version }}`, ${{ steps.import.outputs.frontier_grid_entries }} entries, SHA-256 `${{ steps.import.outputs.frontier_grid_sha256 }}`
+
+            The checkpoint diff is append-only over the committed list, the frontier grid extends the previously published one byte for byte, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
+          commit-message: "chore(chain): update Mainnet release state"
+          sign-commits: true
+          draft: always-true
+          delete-branch: true
+
+      - name: Add missing release labels once
+        if: ${{ !inputs.dry_run && steps.pull-request.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
+        run: |
+          set -euo pipefail
+          missing=$(gh pr view "$PR_NUMBER" --json labels \
+            --jq '["A-release", "A-release-state"] - [.labels[].name] | join(",")')
+          if [ -n "$missing" ]; then
+            gh pr edit "$PR_NUMBER" --add-label "$missing"
+          fi
+
+      - name: Upload non-publishing adoption evidence
+        if: inputs.dry_run
+        run: |
+          git diff HEAD > "$RUNNER_TEMP/adoption.diff"
+          git status --porcelain > "$RUNNER_TEMP/adoption-status.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        if: inputs.dry_run
+        with:
+          name: adoption-dry-run
+          path: |
+            ${{ runner.temp }}/adoption.diff
+            ${{ runner.temp }}/adoption-status.txt
+            ${{ runner.temp }}/release-state/ready.json
+          if-no-files-found: error

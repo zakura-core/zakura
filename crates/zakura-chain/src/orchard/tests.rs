@@ -5,3 +5,5 @@ mod proof_size;
 mod prop;
 mod tree;
 pub(crate) mod vectors;
+
+mod serde_flags;

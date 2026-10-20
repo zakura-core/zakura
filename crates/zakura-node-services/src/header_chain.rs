@@ -4,9 +4,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, Frontier, HeaderChainError, HeaderLocator,
-    HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId, TargetCompletion,
-    VctRepairContext,
+    AuxDelivery, BodyWorkOwner, CommittedStallReceipt, EngineSnapshot, Frontier, HeaderChainError,
+    HeaderLocator, HeaderSyncWorkOwner, HeaderWorkAuthority, InsertHeaders, SourceId,
+    TargetCompletion, VctRepairContext,
 };
 
 /// A boxed operation returned by [`Port`].
@@ -87,7 +87,7 @@ pub struct RetainedHeaderPath {
     adapter_id: u64,
     source: SourceId,
     session_id: u64,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
@@ -162,6 +162,45 @@ impl PartialEq for RetainedHeaderPath {
 
 impl Eq for RetainedHeaderPath {}
 
+/// A sticky notification for one occupied serving resource.
+///
+/// State registers the signal while it holds the capacity lock. A release remains
+/// observable even when the reactor receives the refusal after the release.
+#[derive(Clone, Debug)]
+pub struct ServingCapacitySignal(tokio::sync::watch::Sender<bool>);
+
+impl Default for ServingCapacitySignal {
+    fn default() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+}
+
+impl PartialEq for ServingCapacitySignal {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+}
+
+impl Eq for ServingCapacitySignal {}
+
+impl ServingCapacitySignal {
+    /// Record a confirmed release of this resource.
+    pub fn release(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Return whether state has released this resource.
+    pub fn is_released(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Wait for release, including a release before this call.
+    pub async fn released(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|released| *released).await;
+    }
+}
+
 /// Result of acquiring an immutable retained path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AcquirePathReply {
@@ -173,8 +212,21 @@ pub enum AcquirePathReply {
     NoLocatorIntersection,
     /// Pruning removed the required target history.
     HistoryPruned,
-    /// State cannot currently retain another path.
+    /// State cannot currently retain another path for a non-capacity reason.
     Busy,
+    /// An occupied resource refused the request.
+    CapacityBusy(ServingCapacitySignal),
+}
+
+/// Where a header hash sits relative to the selected header chain.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SelectedChainMembership {
+    /// The selected chain contains the header at this frontier.
+    Selected(Frontier),
+    /// The adapter retains the header off the selected chain.
+    NotSelected,
+    /// The adapter retains no header with this hash.
+    NotRetained,
 }
 
 /// A bounded read from an already acquired retained path.
@@ -387,6 +439,28 @@ pub enum ApplyHeaderTargetOutcome {
     ResourceStalled(CommittedStallReceipt),
 }
 
+/// Capacity owned by one locator read through its last non-cancellable operation.
+///
+/// Clones share one permit. Adapters must move a clone into accepted work before
+/// awaiting it, so dropping a timed-out caller cannot release that work's capacity.
+#[derive(Clone, Debug)]
+pub struct LocatorReadPermit(Arc<tokio::sync::OwnedSemaphorePermit>);
+
+impl LocatorReadPermit {
+    /// Wrap a permit acquired by the locator scheduler.
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self(Arc::new(permit))
+    }
+}
+
+impl PartialEq for LocatorReadPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LocatorReadPermit {}
+
 /// Header-chain operations that header-sync policy requires.
 ///
 /// Each operation returns one typed future for its request and reply.
@@ -394,8 +468,12 @@ pub enum ApplyHeaderTargetOutcome {
 /// An implementation translates its backing service protocol into this contract.
 pub trait Port: Send + Sync + 'static {
     /// Return a coherent locator for the current selected path.
+    ///
+    /// Retain `permit` in any accepted work that can outlive this future. A timeout
+    /// or cancellation must not release capacity while that work still executes.
     fn continuation_locator(
         &self,
+        permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>>;
 
     /// Resolve selected-path context for the auxiliary repair at `height`.
@@ -446,6 +524,26 @@ pub trait Port: Send + Sync + 'static {
         &self,
         target: PreparedHeaderTarget,
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply>;
+
+    /// Watch the selected header chain.
+    ///
+    /// The value is the latest committed engine snapshot, or `None` before the
+    /// first commit. It changes after each committed transition, so a change
+    /// wakes work that follows the selected tip. The default never changes,
+    /// for a port without durable header-chain state.
+    fn selected_chain(&self) -> tokio::sync::watch::Receiver<Option<EngineSnapshot>> {
+        tokio::sync::watch::channel(None).1
+    }
+
+    /// Report whether the selected chain contains the header `hash`.
+    ///
+    /// The answer comes from the latest committed selected chain, which is at
+    /// least as new as the latest value of [`Self::selected_chain`]. It costs
+    /// no ancestry walk and no retained-path lease.
+    fn selected_chain_contains(
+        &self,
+        hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>>;
 }
 
 impl std::fmt::Debug for dyn Port {
@@ -461,6 +559,7 @@ pub struct UnavailablePort;
 impl Port for UnavailablePort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(async { Err(PortError::Unavailable { source: None }) })
     }
@@ -519,6 +618,13 @@ impl Port for UnavailablePort {
             )))
         })
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(async { Ok(SelectedChainMembership::NotRetained) })
+    }
 }
 
 /// Inert port used by state-machine tests that drive completions explicitly.
@@ -529,6 +635,7 @@ pub struct InertHeaderChainPort;
 impl Port for InertHeaderChainPort {
     fn continuation_locator(
         &self,
+        _permit: LocatorReadPermit,
     ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
         Box::pin(std::future::pending())
     }
@@ -576,72 +683,18 @@ impl Port for InertHeaderChainPort {
     ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
         Box::pin(std::future::pending())
     }
+
+    fn selected_chain_contains(
+        &self,
+        _hash: block::Hash,
+    ) -> HeaderChainFuture<'_, Result<SelectedChainMembership, PortError>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Debug)]
-    struct MinimalMock;
-
-    impl Port for MinimalMock {
-        fn continuation_locator(
-            &self,
-        ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn vct_repair_context(
-            &self,
-            _owner: BodyWorkOwner,
-            _height: block::Height,
-        ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
-            Box::pin(async { Ok(VctRepairContextReply::Stale) })
-        }
-
-        fn acquire_header_path(
-            &self,
-            _request: AcquirePath,
-        ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-            Box::pin(async { Ok(AcquirePathReply::Busy) })
-        }
-
-        fn read_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-            _request: ReadPath,
-        ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-            Box::pin(async { Ok(ReadPathReply::Unavailable) })
-        }
-
-        fn release_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn prepare_header_target(
-            &self,
-            _request: PrepareHeaderTarget,
-        ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-
-        fn apply_header_target(
-            &self,
-            _target: PreparedHeaderTarget,
-        ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-    }
-
-    #[tokio::test]
-    async fn port_is_object_safe_and_mockable_without_state_services() {
-        let port: Arc<dyn Port> = Arc::new(MinimalMock);
-        assert!(port.continuation_locator().await.unwrap().is_none());
-    }
 
     #[test]
     fn retained_path_identity_requires_the_issuing_adapter_key() {

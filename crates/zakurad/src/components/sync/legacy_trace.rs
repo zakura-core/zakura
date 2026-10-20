@@ -138,7 +138,7 @@ impl LegacySyncTrace {
                 .iter()
                 .map(|(hash, state)| LegacyTaskTrace::new(*hash, state))
                 .collect();
-            tasks.sort_by_key(|task| task.height().map(u64::from).unwrap_or(u64::MAX));
+            tasks.sort_unstable_by_key(|task| task.height().map(u64::from).unwrap_or(u64::MAX));
 
             let fields = DiagnosticFields {
                 state_tip: snapshot.state_tip.map(|height| height.0),

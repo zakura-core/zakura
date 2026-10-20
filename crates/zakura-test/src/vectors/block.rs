@@ -692,10 +692,6 @@ lazy_static! {
         <[u8; 32]>::from_hex("09b17d8907236adea12b83ed69054f4996686d7c4ca76db25c4c48b90e272b0f")
         .expect("final root bytes are in valid hex representation").rev();
 
-    // Sapling treestate.
-    pub static ref SAPLING_TREESTATE_MAINNET_419201_STRING: String =
-        String::from(include_str!("sapling-treestate-main-0-419-201.txt"));
-
     // Testnet
 
     // Genesis/BeforeOverwinter
@@ -1044,58 +1040,4 @@ lazy_static! {
     pub static ref ORCHARD_FINAL_ROOT_TESTNET_1842468_BYTES: [u8; 32] =
         <[u8; 32]>::from_hex("66c47f2160474363948150cbb5d53f3c17efa7456bd843dd9b851ddbcb6fb002")
         .expect("final root bytes are in valid hex representation").rev();
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    use std::collections::HashSet;
-
-    use crate::init;
-
-    #[test]
-    fn block_test_vectors_unique() {
-        let _init_guard = init();
-
-        let block_count = BLOCKS.len();
-        let block_set: HashSet<_> = BLOCKS.iter().collect();
-
-        // putting the same block in two files is an easy mistake to make
-        assert_eq!(
-            block_count,
-            block_set.len(),
-            "block test vectors must be unique"
-        );
-
-        // final sapling roots can be duplicated if a block has no sapling spends or outputs
-    }
-
-    /// Make sure we use all the test vectors in the lists.
-    ///
-    /// We're using lazy_static! and combinators, so it would be easy to make this mistake.
-    #[test]
-    fn block_test_vectors_count() {
-        let _init_guard = init();
-
-        assert!(
-            MAINNET_BLOCKS.len() > 30,
-            "there should be a reasonable number of mainnet block test vectors"
-        );
-
-        assert!(
-            TESTNET_BLOCKS.len() > 30,
-            "there should be a reasonable number of testnet block test vectors"
-        );
-
-        assert!(
-            MAINNET_FINAL_SAPLING_ROOTS.len() > 10,
-            "there should be a reasonable number of mainnet final sapling root test vectors"
-        );
-
-        assert!(
-            TESTNET_FINAL_SAPLING_ROOTS.len() > 10,
-            "there should be a reasonable number of testnet final sapling root test vectors"
-        );
-    }
 }

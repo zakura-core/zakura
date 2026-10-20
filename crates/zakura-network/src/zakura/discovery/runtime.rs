@@ -2,8 +2,8 @@
 
 use std::net::SocketAddr;
 
-use iroh::SecretKey;
 use tokio::sync::watch;
+use zakura_quic::NodeSecretKey;
 
 use crate::zakura::{ZakuraHandshakeConfig, ZakuraPeerId};
 
@@ -34,7 +34,7 @@ pub(crate) fn effective_discovery_connection_headroom(bootstrap_peer_count: usiz
 /// negotiated network parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_discovery_handle(
-    secret_key: SecretKey,
+    secret_key: NodeSecretKey,
     direct_addrs: Vec<SocketAddr>,
     advertised_services: Vec<ZakuraServiceId>,
     handshake: &ZakuraHandshakeConfig,

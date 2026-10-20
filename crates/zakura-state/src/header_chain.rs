@@ -33,7 +33,7 @@ pub struct RetainedPathLease {
     pub session_id: u64,
     /// Exact retained target named by the request.
     pub target: Frontier,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: Frontier,
     /// Exact generation and branch that state observed during snapshot acquisition.
     pub scope: HeaderWorkAuthority,
@@ -52,8 +52,10 @@ pub enum RetainedPathLeaseOutcome {
     NoLocatorIntersection,
     /// The target path cannot reach retained history.
     HistoryPruned,
-    /// A per-peer or global lease resource bound refused the request.
+    /// State refused the request without a capacity notification.
     Busy,
+    /// A per-peer or global lease resource bound refused the request.
+    CapacityBusy(zakura_node_services::header_chain::ServingCapacitySignal),
 }
 
 /// One hash-keyed lease page, independent of the current selected projection.

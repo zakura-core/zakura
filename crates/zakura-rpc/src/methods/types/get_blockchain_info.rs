@@ -1,7 +1,7 @@
 //! Types used in `getblockchaininfo` RPC method.
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     value_balance::ValueBalance,
@@ -12,27 +12,31 @@ use zec::Zec;
 use super::*;
 
 /// A value pool's balance in Zec and Zatoshis
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct GetBlockchainInfoBalance {
     /// Name of the pool
     #[serde(skip_serializing_if = "String::is_empty", default)]
+    #[getset(get = "pub")]
     id: String,
     /// Total amount in the pool, in ZEC
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     chain_value: Zec<NonNegative>,
     /// Total amount in the pool, in zatoshis
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     chain_value_zat: Amount<NonNegative>,
     /// Whether the value pool balance is being monitored.
+    #[getset(get_copy = "pub")]
     monitored: bool,
     /// Change to the amount in the pool produced by this block, in ZEC
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     value_delta: Option<Zec<NegativeAllowed>>,
     /// Change to the amount in the pool produced by this block, in zatoshis
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     value_delta_zat: Option<Amount>,
 }
 

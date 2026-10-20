@@ -7,7 +7,7 @@ use tokio::time::timeout;
 /// Generous deadline for native peer connection/registration and convergence
 /// waits in Zakura tests.
 ///
-/// These tests dial real iroh/QUIC endpoints. Under CPU contention -- for
+/// These tests dial real QUIC endpoints. Under CPU contention -- for
 /// example the full `cargo nextest` suite running at `num-cpus` parallelism --
 /// a handshake, peer registration, or trace-convergence poll can take several
 /// seconds. A slow connect under load is not a correctness failure, so this

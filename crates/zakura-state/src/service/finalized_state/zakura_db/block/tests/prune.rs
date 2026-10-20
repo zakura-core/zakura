@@ -12,12 +12,9 @@ use std::{collections::HashMap, sync::Arc};
 use zakura_chain::{
     block::{Block, Height},
     parameters::Network::{self, Mainnet},
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transparent,
 };
-
-#[cfg(feature = "indexer")]
-use zakura_chain::serialization::ZcashSerialize;
 
 use crate::{
     config::StorageMode,
@@ -1020,7 +1017,6 @@ fn initial_online_prune_preserves_pre_boundary_history() {
             .is_some(),
         "preserved block and size below the pruning marker is still available"
     );
-    #[cfg(feature = "indexer")]
     assert_eq!(
         state
             .db
@@ -1046,7 +1042,6 @@ fn initial_online_prune_preserves_pre_boundary_history() {
         state.db.block_and_size(Height(prune_from).into()).is_none(),
         "pruned block and size at the online pruning boundary is unavailable"
     );
-    #[cfg(feature = "indexer")]
     assert!(
         state
             .db
@@ -1652,7 +1647,7 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
     let read_state = ReadStateService::new(
         &state,
         None,
-        Arc::new(std::sync::OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_state_receiver),
         vct_root_repair_receiver,
         HeaderChainSubscriptions {

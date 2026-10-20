@@ -32,6 +32,7 @@ use zakura_chain::{
 };
 
 use zakura_node_services::mempool;
+use zakura_node_services::task::spawn_erased;
 use zakura_state as zs;
 
 use crate::{
@@ -281,6 +282,24 @@ impl RouterError {
         }
     }
 
+    /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => source.is_auth_commitment_mismatch(),
+            RouterError::Block { source, .. } => source.is_auth_commitment_mismatch(),
+        }
+    }
+
+    /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => {
+                source.is_descendant_of_auth_commitment_mismatch()
+            }
+            RouterError::Block { source, .. } => source.is_descendant_of_auth_commitment_mismatch(),
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -422,10 +441,10 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -451,7 +470,7 @@ where
     let checkpoint_sync = config.checkpoint_sync;
     let checkpoint_network = network.clone();
 
-    let state_checkpoint_verify_handle = tokio::task::spawn(
+    let state_checkpoint_verify_handle = spawn_erased(
         // TODO: move this into an async function?
         async move {
             tracing::info!("starting state checkpoint validation");
@@ -582,10 +601,10 @@ pub async fn init<S, Mempool>(
     state_service: S,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -611,10 +630,10 @@ pub async fn init_with_read_state<S, R, Mempool>(
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -671,10 +690,10 @@ pub async fn init_test<S>(
     network: &Network,
     state_service: S,
 ) -> (
-    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
         transaction::Request,
+        futures::future::BoxFuture<'static, Result<transaction::Response, TransactionError>>,
     >,
     BackgroundTaskHandles,
     Height,
@@ -688,7 +707,10 @@ where
         network,
         state_service.clone(),
         oneshot::channel::<
-            Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+            Buffer<
+                mempool::Request,
+                futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+            >,
         >()
         .1,
     )

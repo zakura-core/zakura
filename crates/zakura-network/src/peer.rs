@@ -1,5 +1,6 @@
 //! Peer connection handling.
 
+pub(crate) mod block_gossip;
 mod client;
 mod connection;
 mod connector;

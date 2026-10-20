@@ -18,7 +18,7 @@
 //! ```
 //!
 //! This matters here specifically: all Zakura proof verification runs on the global rayon
-//! pool, whose size comes from `sync.parallel_cpu_threads`, and `tower-batch-control`
+//! pool, whose size comes from `sync.parallel_cpu_threads`, and the batch middleware
 //! sizes its batch queue from `rayon::current_num_threads()`. A node configured with one
 //! rayon thread verifies serially *and* loses cross-batch pipelining.
 
@@ -36,6 +36,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     future::Future,
+    hint::black_box,
     io::Cursor,
     pin::Pin,
     sync::{Arc, Once},
@@ -44,7 +45,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::sync::oneshot;
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
@@ -205,10 +206,13 @@ struct BenchmarkSummary {
     sample_seconds: Vec<f64>,
 }
 
-type BenchmarkMempool =
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+type BenchmarkMempool = Buffer<
+    mempool::Request,
+    futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+>;
 
-type TxVerifier = Buffer<BoxService<Request, tx::Response, TransactionError>, Request>;
+type TxVerifier =
+    Buffer<Request, futures::future::BoxFuture<'static, Result<tx::Response, TransactionError>>>;
 
 #[derive(Clone, Debug)]
 struct BenchmarkState;

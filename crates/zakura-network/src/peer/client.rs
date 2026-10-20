@@ -38,6 +38,11 @@ pub mod tests;
 
 /// The "client" duplex half of a peer connection.
 pub struct Client {
+    /// Tracks block writes for paced legacy advertisements.
+    pub(crate) block_uploads: super::block_gossip::BlockUploads,
+    /// Reads heartbeat RTT for this exact connection generation.
+    pub(crate) peer_registry_updater: Option<crate::peer_registry::PeerRegistryUpdater>,
+
     /// The metadata for the connected peer `service`.
     pub connection_info: Arc<ConnectionInfo>,
 

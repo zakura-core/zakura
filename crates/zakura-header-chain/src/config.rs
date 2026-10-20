@@ -36,6 +36,13 @@ impl NetworkPolicyDigest {
     }
 }
 
+/// Conservative encoded response allowance per header, including metadata and framing.
+/// The wire codec verifies that every supported schema fits this allowance.
+pub const BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER: u64 = 2_048;
+/// Encoded response ceiling guaranteed by the 4,000-header reserve cap.
+/// This ceiling documents the wire size bound; admission checks the header count.
+pub const MAX_BOUNDED_HEADER_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Exact v1 maximum number of retained non-finalized header nodes.
 pub const MAX_NON_FINALIZED_NODES_V1: usize = 65_536;
 /// Exact v1 maximum number of staged unknown targets across all peers.
@@ -665,8 +672,8 @@ mod tests {
         assert_eq!(
             NetworkPolicyDigest::for_network(&Network::new_default_testnet()).bytes(),
             [
-                142, 170, 84, 198, 97, 138, 9, 46, 120, 73, 23, 105, 58, 135, 75, 69, 51, 1, 2,
-                176, 60, 219, 147, 52, 105, 73, 48, 188, 172, 74, 57, 181,
+                169, 181, 233, 214, 155, 219, 207, 22, 234, 219, 209, 9, 175, 28, 7, 157, 185, 240,
+                147, 249, 200, 127, 6, 12, 151, 154, 107, 182, 241, 84, 100, 214,
             ],
         );
     }

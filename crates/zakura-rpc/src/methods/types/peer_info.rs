@@ -1,32 +1,37 @@
 //! An array of [`PeerInfo`] is the output of the `getpeerinfo` RPC method.
 
-use derive_getters::Getters;
+use getset::{CopyGetters, Getters};
 use zakura_network::{types::MetaAddr, ConnectedPeer, PeerSocketAddr};
 
 /// Item of the `getpeerinfo` response
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct PeerInfo {
     /// The IP address and port of the peer
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) addr: PeerSocketAddr,
 
     /// The peer's user agent string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) subver: Option<String>,
 
     /// The protocol version advertised by the peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) version: Option<u32>,
 
     /// Inbound (true) or Outbound (false)
+    #[getset(get_copy = "pub")]
     pub(crate) inbound: bool,
 
     /// The round-trip ping time in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) pingtime: Option<f64>,
 
     /// The wait time on a ping response in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) pingwait: Option<f64>,
 }
 

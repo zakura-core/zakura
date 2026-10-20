@@ -11,7 +11,7 @@ use std::{
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use zakura_chain::serialization::{
-    SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    SerializationError, ZcashDeserialize, ZcashReader, ZcashSerialize,
 };
 
 use crate::{protocol::external::types::PeerServices, PeerSocketAddr};
@@ -74,11 +74,11 @@ impl AddrInVersion {
 }
 
 impl ZcashSerialize for AddrInVersion {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         writer.write_u64::<LittleEndian>(self.untrusted_services.bits())?;
 
         let ipv6_addr = ipv6_mapped_ip_addr(self.addr.ip());
-        ipv6_addr.zcash_serialize(&mut writer)?;
+        ipv6_addr.zcash_serialize(writer)?;
         writer.write_u16::<BigEndian>(self.addr.port())?;
 
         Ok(())
@@ -86,11 +86,13 @@ impl ZcashSerialize for AddrInVersion {
 }
 
 impl ZcashDeserialize for AddrInVersion {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let untrusted_services =
             PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?);
 
-        let ipv6_addr = (&mut reader).zcash_deserialize_into()?;
+        let ipv6_addr = reader.read_value()?;
         let port = reader.read_u16::<BigEndian>()?;
 
         // `0` is the default unspecified value for these fields.

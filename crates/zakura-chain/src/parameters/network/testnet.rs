@@ -627,11 +627,54 @@ impl ConfiguredActivationHeights {
             zfuture,
         }
     }
+
+    /// Returns every configured activation height, in upgrade order.
+    fn heights(&self) -> Vec<u32> {
+        [
+            self.before_overwinter,
+            self.overwinter,
+            self.sapling,
+            self.blossom,
+            self.heartwood,
+            self.canopy,
+            self.nu5,
+            self.nu6,
+            self.nu6_1,
+            self.nu6_2,
+            self.nu6_3,
+            self.nu7,
+            #[cfg(zcash_unstable = "zfuture")]
+            self.zfuture,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Returns these activation heights, with any upgrade they omit taken from `base`.
+    fn or(self, base: Self) -> Self {
+        Self {
+            before_overwinter: self.before_overwinter.or(base.before_overwinter),
+            overwinter: self.overwinter.or(base.overwinter),
+            sapling: self.sapling.or(base.sapling),
+            blossom: self.blossom.or(base.blossom),
+            heartwood: self.heartwood.or(base.heartwood),
+            canopy: self.canopy.or(base.canopy),
+            nu5: self.nu5.or(base.nu5),
+            nu6: self.nu6.or(base.nu6),
+            nu6_1: self.nu6_1.or(base.nu6_1),
+            nu6_2: self.nu6_2.or(base.nu6_2),
+            nu6_3: self.nu6_3.or(base.nu6_3),
+            nu7: self.nu7.or(base.nu7),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: self.zfuture.or(base.zfuture),
+        }
+    }
 }
 
 /// Configurable checkpoints, either a path to a checkpoints file, a "default" keyword to indicate
 /// that Zebra should use the default Testnet checkpoints, or a list of block heights and hashes.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(untagged)]
 pub enum ConfiguredCheckpoints {
     /// A boolean indicating whether Zebra should use the default Testnet checkpoints.
@@ -640,6 +683,39 @@ pub enum ConfiguredCheckpoints {
     Path(std::path::PathBuf),
     /// Directly configured block heights and hashes to be used as Zebra's checkpoints.
     HeightsAndHashes(Vec<(block::Height, block::Hash)>),
+}
+
+impl<'de> serde::Deserialize<'de> for ConfiguredCheckpoints {
+    /// Dispatches on the value's type instead of buffering it like `#[serde(untagged)]`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CheckpointsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CheckpointsVisitor {
+            type Value = ConfiguredCheckpoints;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean, a checkpoints file path, or heights and hashes")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Default(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, path: &str) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Path(path.into()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(ConfiguredCheckpoints::HeightsAndHashes)
+            }
+        }
+
+        deserializer.deserialize_any(CheckpointsVisitor)
+    }
 }
 
 impl Default for ConfiguredCheckpoints {
@@ -904,6 +980,28 @@ impl ParametersBuilder {
         self.activation_heights.extend(activation_heights);
 
         Ok(self)
+    }
+
+    /// Overlays `overlay` on the activation heights already being built, then checks and
+    /// sets the result like [`Self::with_activation_heights`].
+    ///
+    /// Upgrades that `overlay` omits keep their current heights. Starting from
+    /// [`Parameters::build()`], a configured Testnet can therefore set only `NU7` and
+    /// inherit every public Testnet upgrade below it.
+    ///
+    /// Returns [`ParametersBuilderError::InvalidActivationHeight`] if an overlaid height
+    /// equals another upgrade's height, which would silently drop that upgrade.
+    pub fn with_activation_height_overlay(
+        self,
+        overlay: ConfiguredActivationHeights,
+    ) -> Result<Self, ParametersBuilderError> {
+        let current = ConfiguredActivationHeights::from(&self.activation_heights);
+        let combined = overlay.or(current);
+        let heights = combined.heights();
+        if heights.iter().collect::<HashSet<_>>().len() != heights.len() {
+            return Err(ParametersBuilderError::InvalidActivationHeight);
+        }
+        self.with_activation_heights(combined)
     }
 
     /// Sets the slow start interval to be used in the [`Parameters`] being built.

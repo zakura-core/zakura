@@ -70,7 +70,8 @@ impl From<U256> for SuffixWork {
     }
 }
 
-/// The only fork-selection score: exact suffix work, then raw internal tip hash.
+/// Header score: exact suffix work, then raw internal tip hash.
+/// Integrated selection preserves its selected tip before applying the hash tie.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ChainScore {
     /// Exact cumulative work after the shared comparison anchor.

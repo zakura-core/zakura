@@ -1021,6 +1021,17 @@ impl<'a> GraphOverlay<'a> {
         Ok(true)
     }
 
+    pub(crate) fn remove_auxiliary_evidence_delivery(
+        &mut self,
+        hash: block::Hash,
+        delivery_id: EvidenceId,
+    ) -> Result<(), GraphError> {
+        self.stage_header_node(hash)?
+            .aux_delivery_ids
+            .retain(|id| *id != delivery_id);
+        Ok(())
+    }
+
     pub(crate) fn rebase_work_coordinates_to_finalized_frontier(
         &mut self,
     ) -> Result<(), GraphError> {
@@ -1100,7 +1111,16 @@ impl<'a> GraphOverlay<'a> {
                     .suffix_after(anchor.work_coordinate())?,
                 tip.hash,
             );
-            if best.is_none_or(|(_, best_score)| score > best_score) {
+            let rank = |tip: Frontier, score: ChainScore| {
+                (
+                    score.suffix_work,
+                    Some(tip) == self.base_graph.preferred_header_tip,
+                    tip.hash.0,
+                )
+            };
+            if best
+                .is_none_or(|(best_tip, best_score)| rank(tip, score) > rank(best_tip, best_score))
+            {
                 best = Some((tip, score));
             }
         }

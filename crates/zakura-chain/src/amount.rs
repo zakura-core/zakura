@@ -5,6 +5,7 @@
 //! operations, which return values, arithmetic on [`Amount`]s returns
 //! [`Result`](std::result::Result)s.
 
+use crate::serialization::ZcashReader;
 use std::{
     cmp::Ordering,
     fmt,
@@ -627,14 +628,17 @@ pub trait Constraint {
 }
 
 impl ZcashSerialize for Amount<NegativeAllowed> {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_i64::<LittleEndian>(self.0)
     }
 }
 
 impl ZcashDeserialize for Amount<NegativeAllowed> {
-    fn zcash_deserialize<R: std::io::Read>(
-        mut reader: R,
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
     ) -> Result<Self, crate::serialization::SerializationError> {
         Ok(reader.read_i64::<LittleEndian>()?.try_into()?)
     }
@@ -642,7 +646,10 @@ impl ZcashDeserialize for Amount<NegativeAllowed> {
 
 impl ZcashSerialize for Amount<NonNegative> {
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         let amount = self
             .0
             .try_into()
@@ -653,8 +660,8 @@ impl ZcashSerialize for Amount<NonNegative> {
 }
 
 impl ZcashDeserialize for Amount<NonNegative> {
-    fn zcash_deserialize<R: std::io::Read>(
-        mut reader: R,
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
     ) -> Result<Self, crate::serialization::SerializationError> {
         Ok(reader.read_u64::<LittleEndian>()?.try_into()?)
     }

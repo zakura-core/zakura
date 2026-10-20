@@ -46,6 +46,22 @@ impl FindResponseStallTracker {
     pub(super) fn clear(&mut self, addr: PeerSocketAddr) {
         self.counts.remove(&addr);
     }
+
+    /// Keeps tracking only for peers that `is_live` accepts.
+    pub(super) fn retain(&mut self, is_live: impl Fn(&PeerSocketAddr) -> bool) {
+        self.counts.retain(|addr, _| is_live(addr));
+    }
+
+    /// Returns `true` if no peer has a pending stall count.
+    pub(super) fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    /// Returns the number of peers with a pending stall count.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.counts.len()
+    }
 }
 
 #[cfg(test)]

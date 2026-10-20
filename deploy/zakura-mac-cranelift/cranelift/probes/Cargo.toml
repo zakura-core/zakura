@@ -1,0 +1,11 @@
+[package]
+name = "cranelift-unwind-probe"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "sync", "macros"] }
+futures-util = { version = "=0.3.32", default-features = false, features = ["std", "async-await"] }
+[profile.release]
+panic = "unwind"
+
+[workspace]

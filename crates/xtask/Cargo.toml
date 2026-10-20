@@ -14,7 +14,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-openrpsee.workspace = true
+quote = "1"
+syn = { version = "2", features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile.workspace = true

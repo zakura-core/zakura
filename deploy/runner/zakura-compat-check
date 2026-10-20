@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Entry point for the zcashd-compat sync checker; see zakura_monitoring/compat.py."""
+
+import os
+import sys
+
+# Resolve symlinks so an installed `current/` link finds its own release, and
+# insert explicitly because `python3 -I` does not add the script directory.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from zakura_monitoring.compat import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

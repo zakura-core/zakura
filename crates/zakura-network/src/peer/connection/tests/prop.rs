@@ -1,12 +1,13 @@
 //! Randomised property tests for peer connection handling.
 
-use std::{collections::HashSet, env, mem, sync::Arc};
+use std::{env, mem, sync::Arc};
 
 use futures::{
     channel::{mpsc, oneshot},
     sink::SinkMapErr,
     SinkExt, StreamExt,
 };
+use indexmap::IndexSet;
 use proptest::{collection, prelude::*};
 use tracing::Span;
 
@@ -196,7 +197,7 @@ async fn send_block_request(
 ) -> oneshot::Receiver<Result<Response, SharedPeerError>> {
     let (response_sender, response_receiver) = oneshot::channel();
 
-    let request = Request::BlocksByHash(HashSet::from_iter([block]));
+    let request = Request::BlocksByHash(IndexSet::from_iter([block]));
     let client_request = ClientRequest {
         request,
         tx: response_sender,

@@ -4,7 +4,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use color_eyre::eyre::Report;
+use eyre::Report;
 use once_cell::sync::Lazy;
 use tower::{layer::Layer, timeout::TimeoutLayer};
 
@@ -367,7 +367,6 @@ async fn verify_checkpoint_test() -> Result<(), Report> {
 /// Test that checkpoint verifies work.
 ///
 /// Also tests the `chain::init` function.
-#[spandoc::spandoc]
 async fn verify_checkpoint(config: Config) -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -403,7 +402,6 @@ async fn verify_fail_no_coinbase_test() -> Result<(), Report> {
 ///
 /// BlockVerifierRouter uses the block height to decide between the CheckpointVerifier
 /// and SemanticBlockVerifier. This is the error case, where there is no height.
-#[spandoc::spandoc]
 async fn verify_fail_no_coinbase() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -428,7 +426,6 @@ async fn round_trip_checkpoint_test() -> Result<(), Report> {
 }
 
 /// Test that state updates work
-#[spandoc::spandoc]
 async fn round_trip_checkpoint() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -453,7 +450,6 @@ async fn verify_fail_add_block_checkpoint_test() -> Result<(), Report> {
 }
 
 /// Test that the state rejects duplicate block adds
-#[spandoc::spandoc]
 async fn verify_fail_add_block_checkpoint() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -530,10 +526,14 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 &network,
                 None,
                 boundary,
-                state.clone(),
+                crate::transaction::boxed_state(state.clone()),
             ),
             max_checkpoint_height: boundary,
-            block: SemanticBlockVerifier::new(&network, state.clone(), transaction),
+            block: SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state.clone()),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            ),
         };
         let mut router =
             TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(router);
@@ -582,7 +582,6 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         let request = if mined {
             Request::CommitMined {
                 block: candidate,
-                work_id: None,
                 admission: zs::BlockAdmission::pending(),
             }
         } else {
@@ -724,13 +723,17 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
             ],
             &Network::Mainnet,
             Some((checkpoint_height, checkpoint_hash)),
-            state,
+            crate::transaction::boxed_state(state),
         )
         .unwrap();
         let router = BlockVerifierRouter {
             checkpoint,
             max_checkpoint_height: checkpoint_height,
-            block: SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+            block: SemanticBlockVerifier::new(
+                &Network::Mainnet,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            ),
         };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
@@ -822,7 +825,7 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 ],
                 &Network::Mainnet,
                 None,
-                unknown_block_state,
+                crate::transaction::boxed_state(unknown_block_state),
             )
             .unwrap()
         };
@@ -837,11 +840,14 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
         );
 
         // Reference 2: the semantic verifier rejects the body on its Merkle root.
-        let semantic_error =
-            SemanticBlockVerifier::new(&Network::Mainnet, unknown_block_state, transaction)
-                .oneshot(Request::Commit(block.clone()))
-                .await
-                .unwrap_err();
+        let semantic_error = SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(unknown_block_state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(Request::Commit(block.clone()))
+        .await
+        .unwrap_err();
         assert_eq!(
             semantic_error.body_verification_class(),
             payload_mismatch,
@@ -855,8 +861,8 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 max_checkpoint_height,
                 block: SemanticBlockVerifier::new(
                     &Network::Mainnet,
-                    unknown_block_state,
-                    transaction,
+                    crate::transaction::boxed_state(unknown_block_state),
+                    crate::transaction::boxed_transaction_verifier(transaction),
                 ),
             };
             let error = router
@@ -914,13 +920,17 @@ async fn forged_height_across_upgrade_is_a_payload_mismatch() {
         ],
         &Network::Mainnet,
         Some((checkpoint_height, checkpoint_hash)),
-        state,
+        crate::transaction::boxed_state(state),
     )
     .unwrap();
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height: checkpoint_height,
-        block: SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+        block: SemanticBlockVerifier::new(
+            &Network::Mainnet,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        ),
     };
     let error = router
         .oneshot(Request::Commit(Arc::new(block)))

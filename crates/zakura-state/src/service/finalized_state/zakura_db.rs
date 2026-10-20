@@ -11,7 +11,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use crossbeam_channel::bounded;
+use crate::service::finalized_state::disk_format::upgrade::cancel_channel;
 use semver::Version;
 
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
@@ -32,7 +32,6 @@ use super::disk_format::upgrade::restorable_db_versions;
 
 pub mod block;
 pub mod chain;
-#[allow(dead_code)]
 pub(crate) mod commitment_roots_db;
 #[allow(dead_code)]
 pub mod highest_completed_checkpoint;
@@ -215,6 +214,14 @@ impl ZakuraDb {
             db: disk_db,
         };
 
+        // Reject stale address-query state before any upgrade can modify it. This also
+        // applies to read-only and offline utility opens, which skip format upgrades.
+        if config.pruning_config().is_none() && db.transparent_indexes_skipped_from().is_some() {
+            return Err(StateInitError::TransparentIndexesMissingInArchiveMode {
+                path: db.path().to_owned(),
+            });
+        }
+
         // The original Mainnet VCT fast path did not persist historical Sprout frontiers, so an
         // affected database silently rejects JoinSplits that spend a historical Sprout anchor.
         // The repair that used to fix this in place has been removed, so such a database can no
@@ -255,7 +262,7 @@ impl ZakuraDb {
 
         // No state service can commit while this synchronous startup operation is running.
         let initial_finalized_tip_height = self.finalized_tip_height();
-        let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+        let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
         format_change
             .run_format_change_or_check(self, initial_finalized_tip_height, &never_cancel_receiver)
             .map_err(|source| StateInitError::DatabaseFormatUpgrade {
@@ -423,7 +430,7 @@ impl ZakuraDb {
             if let Some(disk_version) = disk_version {
                 // We need to keep the cancel handle until the format check has finished,
                 // because dropping it cancels the format check.
-                let (_never_cancel_handle, never_cancel_receiver) = bounded(1);
+                let (_never_cancel_handle, never_cancel_receiver) = cancel_channel();
 
                 // We block here because the checks are quick and database validity is
                 // consensus-critical.
@@ -492,6 +499,44 @@ impl ZakuraDb {
     /// Returns the most recently cached disk space estimate.
     pub(crate) fn cached_size(&self) -> u64 {
         self.db.cached_size()
+    }
+}
+
+#[cfg(test)]
+impl ZakuraDb {
+    /// Returns every raw key and value in the column family named `cf_name`, in key order.
+    pub(crate) fn raw_column_family_entries_for_test(
+        &self,
+        cf_name: &str,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("tests only read column families opened from the running schema");
+
+        self.db
+            .raw_range_cf(&cf, &[], None)
+            .expect("reading a test database succeeds")
+    }
+
+    /// Writes a raw key and value to the column family named `cf_name`, bypassing every format
+    /// invariant. Tests use this to plant stale or corrupt entries.
+    pub(crate) fn insert_raw_entry_for_test(&self, cf_name: &str, key: &[u8], value: &[u8]) {
+        use super::disk_db::WriteDisk;
+        use super::RawBytes;
+
+        let cf = self
+            .db
+            .cf_handle(cf_name)
+            .expect("tests only write column families opened from the running schema");
+        let mut batch = super::DiskWriteBatch::new();
+        batch.zs_insert(
+            &cf,
+            RawBytes::new_raw_bytes(key.to_vec()),
+            RawBytes::new_raw_bytes(value.to_vec()),
+        );
+        self.write_batch(batch)
+            .expect("writing a test database succeeds");
     }
 }
 

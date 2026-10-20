@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fmt};
 
+use indexmap::IndexSet;
 use zakura_chain::{
     block,
     transaction::{UnminedTx, UnminedTxId},
@@ -9,7 +10,14 @@ use super::super::types::Nonce;
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
+use proptest::{arbitrary::any, collection::vec, strategy::Strategy};
+#[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
+    vec(any::<block::Hash>(), 0..100).prop_map(|hashes| hashes.into_iter().collect())
+}
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -50,6 +58,10 @@ impl From<PeerSocketAddr> for PeerSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Request {
+    /// Disconnect a legacy peer without changing its misbehavior score or ban status.
+    /// The peer set handles this request locally and returns [`super::Response::Nil`].
+    DisconnectPeer(PeerSocketAddr),
+
     /// Requests additional peers from the server.
     ///
     /// # Response
@@ -67,14 +79,9 @@ pub enum Request {
 
     /// Request block data by block hashes.
     ///
-    /// This uses a `HashSet` rather than a `Vec` for two reasons. First, it
-    /// automatically deduplicates the requested blocks. Second, the internal
-    /// protocol translator needs to maintain a `HashSet` anyways, in order to
-    /// keep track of which requested blocks have been received and when the
-    /// request is ready. Rather than force the internals to always convert into
-    /// a `HashSet`, we require the caller to pass one, so that if the caller
-    /// didn't start with a `Vec` but with, e.g., an iterator, they can collect
-    /// directly into a `HashSet` and save work.
+    /// The ordered set deduplicates block hashes while preserving request order.
+    /// Inbound services use that order when applying response limits, and
+    /// outbound services separately track pending responses in a `HashSet`.
     ///
     /// If this requests a recently-advertised block, the peer set will make a
     /// best-effort attempt to route the request to a peer that advertised the
@@ -86,7 +93,13 @@ pub enum Request {
     /// # Returns
     ///
     /// Returns [`Response::Blocks`](super::Response::Blocks).
-    BlocksByHash(HashSet<block::Hash>),
+    BlocksByHash(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_block_hashes()")
+        )]
+        IndexSet<block::Hash>,
+    ),
 
     /// Request block data by block hashes from a known advertising peer.
     ///
@@ -98,7 +111,11 @@ pub enum Request {
     /// Returns [`Response::Blocks`](super::Response::Blocks).
     BlocksByHashFrom {
         /// Requested block hashes.
-        hashes: HashSet<block::Hash>,
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_block_hashes()")
+        )]
+        hashes: IndexSet<block::Hash>,
         /// Peer that advertised the inventory.
         source: PeerSource,
     },
@@ -108,7 +125,8 @@ pub enum Request {
     /// v4 transactions use a legacy transaction ID, and
     /// v5 transactions use a witnessed transaction ID.
     ///
-    /// This uses a `HashSet` for the same reason as [`Request::BlocksByHash`].
+    /// The set deduplicates transaction IDs and supports pending-response
+    /// membership checks.
     ///
     /// If this requests a recently-advertised transaction, the peer set will
     /// make a best-effort attempt to route the request to a peer that advertised
@@ -234,9 +252,8 @@ pub enum Request {
     /// [`Request::BlocksByHash`] against the "inbound" service passed to
     /// [`init`](crate::init).
     ///
-    /// The peer set routes this request specially, sending it to *a fraction of*
-    /// the available peers. See [`number_of_peers_to_broadcast()`](crate::PeerSet::number_of_peers_to_broadcast)
-    /// for more details.
+    /// Legacy gossip progressively advertises to connected peers in random order.
+    /// A bounded number of advertisements await block uploads at once.
     ///
     /// The second field is the source peer that sent us this `inv`:
     /// `Some(source)` when the advertisement was relayed from a remote peer,
@@ -249,11 +266,16 @@ pub enum Request {
     /// Returns [`Response::Nil`](super::Response::Nil).
     AdvertiseBlock(block::Hash, Option<PeerSource>),
 
-    /// Advertise a block to all ready peers. This is equivalent to
-    /// [`Request::AdvertiseBlock`] except that the peer set will route
-    /// this request to all available ready peers. Used by the gossip task
-    /// to broadcast mined blocks to all ready peers.
+    /// Advertise a block to all connected peers without upload pacing.
+    /// The peer set queues delivery to busy peers.
+    /// Tip gossip uses [`Request::AdvertiseBlock`] or [`Request::AdvertiseMinedBlock`].
     AdvertiseBlockToAll(block::Hash),
+
+    /// Advertise a locally mined block, prioritizing measured heartbeat RTT.
+    /// Every fourth advertisement goes to a random remaining peer instead.
+    /// Legacy gossip holds a bounded number of slots through block uploads.
+    /// Native gossip uses its existing broadcast policy.
+    AdvertiseMinedBlock(block::Hash),
 
     /// Request the contents of this node's mempool.
     ///
@@ -266,6 +288,7 @@ pub enum Request {
 impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer".to_string(),
             Request::Peers => "Peers".to_string(),
             Request::Ping(_) => "Ping".to_string(),
 
@@ -298,6 +321,7 @@ impl fmt::Display for Request {
 
             Request::AdvertiseBlock(_, _) => "AdvertiseBlock".to_string(),
             Request::AdvertiseBlockToAll(_) => "AdvertiseBlockToAll".to_string(),
+            Request::AdvertiseMinedBlock(_) => "AdvertiseMinedBlock".to_string(),
             Request::MempoolTransactionIds => "MempoolTransactionIds".to_string(),
         })
     }
@@ -307,6 +331,7 @@ impl Request {
     /// Returns the Zebra internal request type as a string.
     pub fn command(&self) -> &'static str {
         match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer",
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
@@ -321,7 +346,9 @@ impl Request {
             Request::PushTransaction(_, _) => "PushTransaction",
             Request::AdvertiseTransactionIds(_, _) => "AdvertiseTransactionIds",
 
-            Request::AdvertiseBlock(_, _) | Request::AdvertiseBlockToAll(_) => "AdvertiseBlock",
+            Request::AdvertiseBlock(_, _)
+            | Request::AdvertiseBlockToAll(_)
+            | Request::AdvertiseMinedBlock(_) => "AdvertiseBlock",
             Request::MempoolTransactionIds => "MempoolTransactionIds",
         }
     }
@@ -344,7 +371,7 @@ impl Request {
             | Request::BlocksByHashFrom {
                 hashes: block_hashes,
                 ..
-            } => block_hashes.clone(),
+            } => block_hashes.iter().copied().collect(),
             _ => HashSet::new(),
         }
     }

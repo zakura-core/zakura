@@ -75,7 +75,7 @@ impl PeerRegistry {
             .values()
             .cloned()
             .collect();
-        connected_peers.sort_by(|left, right| {
+        connected_peers.sort_unstable_by(|left, right| {
             left.addr
                 .cmp(&right.addr)
                 .then(left.is_inbound.cmp(&right.is_inbound))
@@ -221,6 +221,16 @@ pub(crate) struct PeerRegistryUpdater {
 }
 
 impl PeerRegistryUpdater {
+    pub(crate) fn rtt(&self) -> Option<Duration> {
+        self.registry
+            .inner
+            .lock()
+            .expect("peer registry mutex is never poisoned")
+            .active_connections
+            .get(&self.key)
+            .and_then(|peer| peer.rtt)
+    }
+
     pub(crate) fn record_ping_sent(&self, now: Instant) {
         self.registry
             .update_connection(&self.key, |connected_peer| {

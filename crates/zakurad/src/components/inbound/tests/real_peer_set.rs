@@ -406,14 +406,18 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
     );
 
     let unknown_hash = block::Hash([0x11; 32]);
+    let second_unknown_hash = block::Hash([0x22; 32]);
     let unknown_response = inbound_service
         .clone()
-        .oneshot(Request::BlocksByHash(iter::once(unknown_hash).collect()))
+        .oneshot(Request::BlocksByHash(IndexSet::from([
+            unknown_hash,
+            second_unknown_hash,
+        ])))
         .await?;
     assert_eq!(
         unknown_response,
-        Response::Blocks(vec![Missing(unknown_hash)]),
-        "an unknown hash maps to missing inventory"
+        Response::Blocks(vec![Missing(unknown_hash), Missing(second_unknown_hash)]),
+        "unknown hashes map to missing inventory in request order"
     );
     assert!(
         !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
@@ -900,23 +904,29 @@ async fn setup(
 ) -> (
     // real services
     // connected peer which responds with isolated_peer_response
-    Buffer<zakura_network::Client, zakura_network::Request>,
+    Buffer<
+        zakura_network::Request,
+        <zakura_network::Client as tower::Service<zakura_network::Request>>::Future,
+    >,
     // inbound service
     LoadShed<
         Buffer<
-            BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
             zakura_network::Request,
+            futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
         >,
     >,
     // outbound peer set (only has the connected peer)
     Buffer<
-        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
         zakura_network::Request,
+        futures::future::BoxFuture<'static, Result<zakura_network::Response, BoxError>>,
     >,
-    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
     Buffer<
-        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
+        mempool::Request,
+        futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+    >,
+    Buffer<
         zakura_state::Request,
+        futures::future::BoxFuture<'static, Result<zakura_state::Response, BoxError>>,
     >,
     // mocked services
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion, RouterError>,
@@ -1030,8 +1040,8 @@ async fn setup(
         .service(BoxService::new(mock_tx_verifier.clone()));
 
     // Mempool
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let mempool_config = MempoolConfig::default();
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
@@ -1042,20 +1052,16 @@ async fn setup(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
+        misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Enable the mempool
     mempool_service.enable(&mut recent_syncs).await;
-    let mempool_service = ServiceBuilder::new()
-        .buffer(10)
-        .boxed()
-        // boxed() needs this extra tiny buffer
-        .buffer(1)
-        .service(mempool_service);
+    // BoxService needs this extra tiny buffer
+    let mempool_service = Buffer::new(BoxService::new(Buffer::new(mempool_service, 10)), 1);
 
     // Initialize the inbound service
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: peer_set.clone(),
@@ -1136,13 +1142,16 @@ async fn setup(
 }
 
 mod submitblock_test {
+    use std::time::Duration;
+
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
     use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
-    use crate::components::sync::PEER_GOSSIP_DELAY;
+    /// How long the test waits for the mined block broadcast log before failing.
+    const MINED_BLOCK_BROADCAST_DEADLINE: Duration = Duration::from_secs(7);
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
@@ -1224,9 +1233,8 @@ mod submitblock_test {
             .in_current_span(),
         );
 
-        // Wait for the exact event under test. The timeout is only a failure
-        // deadline; the mined-block channel bypasses the periodic gossip delay.
-        tokio::time::timeout(PEER_GOSSIP_DELAY, async {
+        // Wait for the exact event under test. The timeout is only a failure deadline.
+        tokio::time::timeout(MINED_BLOCK_BROADCAST_DEADLINE, async {
             loop {
                 let next_log = log_written.notified();
                 let sent_mined_block = {

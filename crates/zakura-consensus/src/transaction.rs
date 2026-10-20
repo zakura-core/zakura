@@ -16,9 +16,7 @@ use futures::{
 };
 use tokio::sync::oneshot;
 use tower::{
-    buffer::Buffer,
     timeout::{error::Elapsed, Timeout},
-    util::BoxService,
     Service, ServiceExt,
 };
 use tracing::Instrument;
@@ -144,21 +142,59 @@ where
     }
 }
 
-impl<ZS>
-    Verifier<
-        ZS,
-        Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
-    >
+/// The state service of verifiers built by [`Verifier::new_for_tests`].
+///
+/// Boxing every test's state service into one type compiles the verifier once for all tests,
+/// instead of once per mock service type.
+#[cfg(test)]
+pub(crate) type TestStateService =
+    tower::util::BoxCloneService<zs::Request, zs::Response, BoxError>;
+
+/// Boxes a test's state service as a [`TestStateService`], so tests that pass different mock
+/// services share one compiled copy of the verifier they build.
+#[cfg(test)]
+pub(crate) fn boxed_state<S>(state: S) -> TestStateService
 where
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    ZS::Future: Send + 'static,
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    TestStateService::new(state)
+}
+
+/// Boxes a test's transaction verifier, for the same reason as [`boxed_state`].
+#[cfg(test)]
+pub(crate) fn boxed_transaction_verifier<V>(
+    verifier: V,
+) -> tower::util::BoxCloneService<Request, Response, BoxError>
+where
+    V: Service<Request, Response = Response, Error = BoxError> + Send + Clone + 'static,
+    V::Future: Send + 'static,
+{
+    tower::util::BoxCloneService::new(verifier)
+}
+
+#[cfg(test)]
+impl
+    Verifier<
+        TestStateService,
+        tower::buffer::Buffer<
+            mempool::Request,
+            futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+        >,
+    >
 {
     /// Create a new transaction verifier with a closed channel receiver for mempool setup for tests.
-    #[cfg(test)]
-    pub fn new_for_tests(network: &Network, state: ZS) -> Self {
+    pub fn new_for_tests<ZS>(network: &Network, state: ZS) -> Self
+    where
+        ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+            + Send
+            + Clone
+            + 'static,
+        ZS::Future: Send + 'static,
+    {
         Self {
             network: network.clone(),
-            state: Timeout::new(state, UTXO_LOOKUP_TIMEOUT),
+            state: Timeout::new(TestStateService::new(state), UTXO_LOOKUP_TIMEOUT),
             mempool: None,
             script_verifier: script::Verifier,
             mempool_setup_rx: oneshot::channel().1,
@@ -672,7 +708,7 @@ where
                 miner_fee = Some(Self::miner_fee(tx.as_ref(), &spent_utxos)?);
             }
 
-            let sigops = tx.sigops().map_err(zakura_script::Error::from)?;
+            let sigops = tx.sigops();
 
             let rsp = match req {
                 Request::Block { .. } => Response::Block {
@@ -1490,8 +1526,11 @@ impl AsyncChecks {
 
     /// Wait until all checks in the set finish.
     ///
-    /// If any of the checks fail, this method immediately returns the error and cancels all other
-    /// checks by dropping them.
+    /// Returns the first error, once every check has finished. Dropping a check does not stop the
+    /// batch work its request already dispatched, so returning early would report completion
+    /// while that work is still running. A caller that bounds its compute on this response reads
+    /// completion literally, and the wait costs nothing extra: the batches are already queued, and
+    /// the batch verifiers flush them on their own latency bound at the latest.
     async fn check(
         mut self,
         block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
@@ -1508,6 +1547,7 @@ impl AsyncChecks {
 
         // Wait for all asynchronous checks to complete
         // successfully, or fail verification if they error.
+        let mut first_error = None;
         loop {
             tokio::select! {
                 biased;
@@ -1518,11 +1558,16 @@ impl AsyncChecks {
                             block_batch_flush.await;
                         }
 
-                        return Ok(());
+                        return match first_error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
                     };
 
                     tracing::trace!(?check, remaining = self.0.len());
-                    check?;
+                    if let Err(error) = check {
+                        first_error.get_or_insert(error);
+                    }
                 }
 
                 () = &mut block_batch_flush, if needs_block_batch_flush => {

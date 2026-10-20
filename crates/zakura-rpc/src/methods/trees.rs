@@ -1,7 +1,7 @@
 //! Types and functions for note commitment tree RPCs.
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use zakura_chain::{
     block::Hash,
     block::Height,
@@ -15,15 +15,18 @@ pub type SubtreeRpcData = NoteCommitmentSubtreeData<String>;
 ///
 /// Contains the shielded pool label, the index of the first subtree in the
 /// list, and a list of subtree roots and end heights.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetSubtreesByIndexResponse {
     /// The shielded pool to which the subtrees belong.
     //
     // TODO: consider an enum with a string conversion?
+    #[getset(get = "pub")]
     pub(crate) pool: String,
 
     /// The index of the first subtree.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) start_index: NoteCommitmentSubtreeIndex,
 
     /// A sequential list of complete subtrees, in `index` order.
@@ -33,6 +36,7 @@ pub struct GetSubtreesByIndexResponse {
     //
     // TODO: is this needed?
     //#[serde(skip_serializing_if = "Vec::is_empty")]
+    #[getset(get = "pub")]
     pub(crate) subtrees: Vec<SubtreeRpcData>,
 }
 
@@ -65,87 +69,46 @@ impl Default for GetSubtreesByIndexResponse {
 /// When Ironwood tree state is not available for the requested block, the
 /// `ironwood` field contains empty commitments, matching the Sapling and
 /// Orchard fields before their activation heights.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetTreestateResponse {
     /// The block hash corresponding to the treestate, hex-encoded.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: Hash,
 
     /// The block height corresponding to the treestate, numeric.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 
     /// Unix time when the block corresponding to the treestate was mined,
     /// numeric.
     ///
     /// UTC seconds since the Unix 1970-01-01 epoch.
+    #[getset(get_copy = "pub")]
     time: u32,
 
     /// A treestate containing a Sprout note commitment tree, hex-encoded. Zebra
     /// does not support returning it; but the field is here to enable parsing
     /// responses from other implementations.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     sprout: Option<Treestate>,
 
     /// A treestate containing a Sapling note commitment tree, hex-encoded.
+    #[getset(get = "pub")]
     sapling: Treestate,
 
     /// A treestate containing an Orchard note commitment tree, hex-encoded.
+    #[getset(get = "pub")]
     orchard: Treestate,
 
     /// A treestate containing an Ironwood note commitment tree, hex-encoded.
     /// Contains empty commitments unless Ironwood tree state is available.
     #[serde(default)]
+    #[getset(get = "pub")]
     ironwood: Treestate,
-}
-
-impl GetTreestateResponse {
-    /// Constructs [`Treestate`] from its constituent parts.
-    #[deprecated(note = "Use `new` instead.")]
-    pub fn from_parts(
-        hash: Hash,
-        height: Height,
-        time: u32,
-        sapling: Option<Vec<u8>>,
-        orchard: Option<Vec<u8>>,
-    ) -> Self {
-        let sapling = Treestate {
-            commitments: Commitments {
-                final_state: sapling,
-                final_root: None,
-            },
-        };
-        let orchard = Treestate {
-            commitments: Commitments {
-                final_state: orchard,
-                final_root: None,
-            },
-        };
-        Self {
-            hash,
-            height,
-            time,
-            sprout: None,
-            sapling,
-            orchard,
-            // This deprecated compatibility helper only accepts Sapling and
-            // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
-            ironwood: Default::default(),
-        }
-    }
-
-    /// Returns the contents of ['GetTreeState'].
-    #[deprecated(note = "Use getters instead.")]
-    pub fn into_parts(self) -> (Hash, Height, u32, Option<Vec<u8>>, Option<Vec<u8>>) {
-        (
-            self.hash,
-            self.height,
-            self.time,
-            self.sapling.commitments.final_state,
-            self.orchard.commitments.final_state,
-        )
-    }
 }
 
 impl Default for GetTreestateResponse {
@@ -169,15 +132,8 @@ impl Default for GetTreestateResponse {
 pub struct Treestate {
     /// Contains a shielded serialized note commitment tree,
     /// hex-encoded.
+    #[getset(get = "pub")]
     commitments: Commitments,
-}
-
-impl Treestate {
-    /// Returns a reference to the commitments.
-    #[deprecated(note = "Use `commitments()` instead.")]
-    pub fn inner(&self) -> &Commitments {
-        self.commitments()
-    }
 }
 
 impl Default for Treestate {
@@ -196,25 +152,26 @@ impl Default for Treestate {
 /// `finalRoot` and `finalState` are omitted when a specific tree state is not
 /// available.
 ///
-#[serde_with::serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Commitments {
     /// Shielded serialized note commitment tree root, hex-encoded.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "super::hex_serde::serialize_option",
+        deserialize_with = "super::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalRoot")]
+    #[getset(get = "pub")]
     final_root: Option<Vec<u8>>,
     /// Shielded serialized note commitment tree, hex-encoded.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "super::hex_serde::serialize_option",
+        deserialize_with = "super::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalState")]
+    #[getset(get = "pub")]
     final_state: Option<Vec<u8>>,
-}
-
-impl Commitments {
-    /// Returns a reference to the optional `final_state`.
-    #[deprecated(note = "Use `final_state()` instead.")]
-    pub fn inner(&self) -> &Option<Vec<u8>> {
-        &self.final_state
-    }
 }

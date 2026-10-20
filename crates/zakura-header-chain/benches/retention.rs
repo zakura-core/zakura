@@ -3,10 +3,11 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    hint::black_box,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use zakura_header_chain::RetentionBenchmarkFixture;
 
 struct CountingAllocator;

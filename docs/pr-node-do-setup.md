@@ -28,7 +28,11 @@ reaper within 24 hours.
 - Variables: `DO_SSH_KEY_FINGERPRINT`.
 - Optional variable overrides for the bake's snapshot sources:
   `ZAKURA_PR_NODE_TIP_LATEST_JSON`, `ZAKURA_PR_NODE_SANDBLAST_URL` /
-  `ZAKURA_PR_NODE_SANDBLAST_SHA256`, `ZAKURA_TESTNET_SNAPSHOTS_URL`.
+  `ZAKURA_PR_NODE_SANDBLAST_SHA256`, `ZAKURA_PR_NODE_TESTNET_LATEST_JSON`.
+  For Testnet, provide the full standard Testnet pruned `latest.json` URL;
+  the default is `https://zakura.valargroup.dev/testnet-pruned/latest.json`.
+  Replace any existing `ZAKURA_TESTNET_SNAPSHOTS_URL` override with the new
+  variable and manifest URL. The old catalog-base variable is no longer read.
 
 Run the bake workflow once before the first PR-node run.
 

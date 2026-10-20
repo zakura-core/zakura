@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::zakura::transport::SessionLayout;
+use zakura_node_services::task::erased;
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.
 ///
@@ -220,10 +221,15 @@ pub(super) fn spawn_service_session(
             bounded_stream_queue_depths(queue_depth, prepared.context.queue_depths);
         let (inbound_tx, inbound_rx) = mpsc::channel(inbound_depth);
         let (sender, outbound_rx) = worker_framed_channel(outbound_depth);
+        if prepared.context.messages.is_some() {
+            prepared.context.precheck.pause();
+        }
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,
-            recv: FramedRecv::new(inbound_rx).with_failure_cause(failure_cause.clone()),
+            recv: FramedRecv::new(inbound_rx)
+                .with_failure_cause(failure_cause.clone())
+                .with_precheck(prepared.context.precheck.clone()),
             send: sender.with_session_resources(prepared.context.session_resources.clone()),
         });
         let failure_cause = failure_cause.clone();
@@ -244,13 +250,13 @@ pub(super) fn spawn_service_session(
             .await;
         });
     }
-    workers.spawn(async move {
+    workers.spawn(erased(async move {
         let _cancel_on_exit = cancel.clone().drop_guard();
         while running.next().await.is_some() {
             cancel.cancel();
         }
         let _ = exits.send(exit);
-    });
+    }));
     admitted
 }
 
@@ -319,6 +325,7 @@ impl ZakuraProtocolHandler {
             limits.message_rate_per_second,
             RealClock,
         );
+        let cadence = cadence_scope(message_buckets, stream, bucket_kind);
         let context = StreamWorkerContext {
             conn: conn.clone(),
             peer_id,
@@ -326,13 +333,14 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits,
             inbound_frame_cap: prelude.max_frame_bytes,
-            message_payload_limits: stream.payload_limits,
-            message_types: stream.message_types,
+            messages: stream.messages,
             queue_depths: stream.queue_depths,
             write_policy: stream.write_policy,
             session_resources: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket,
+            cadence,
+            precheck: PrecheckSlot::default(),
             stream_token: connection_token.child_token(),
             connection_token,
             close_cause,

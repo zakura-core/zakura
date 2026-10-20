@@ -49,7 +49,7 @@ The installer can set up either standard Zakura or its
 You can run Zakura using our [Docker
 image](https://hub.docker.com/r/zakuracore/zakura/tags) or install it manually.
 The zcashd-compatible split-container mode uses the
-[zakuracore/zcashd:v1.1.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+[zakuracore/zcashd:v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
 
 This command will run our latest release and sync it to the tip:
 
@@ -85,8 +85,7 @@ compiler. Below are quick summaries for installing these dependencies.
    - **libclang**, which is a library that comes under various names, typically
      `libclang`, `libclang-dev`, `llvm`, or `llvm-dev`;
    - **clang** or another C++ compiler (`g++`, which is for all platforms, or
-     `Xcode`, which is for macOS);
-   - **[`protoc`](https://grpc.io/docs/protoc-installation/)** (optional).
+     `Xcode`, which is for macOS).
 
 </details>
 
@@ -99,12 +98,23 @@ compiler. Below are quick summaries for installing these dependencies.
 </summary>
 
 ```sh
-sudo pacman -S rust clang protobuf
+sudo pacman -S rust clang
 ```
 
 Note that the package `clang` includes `libclang` as well.
 
 </details>
+
+On Windows, set this environment variable in PowerShell before building or
+installing Zakura:
+
+```powershell
+$env:ROCKSDB_UNITY_CHUNK = "1"
+```
+
+This compiles each bundled RocksDB C++ source separately. The default build
+combines sources, which causes a name collision with the Windows `CreateFile`
+API. CI sets this variable through the shared build setup action.
 
 Once you have the dependencies in place, you can install Zakura with:
 
@@ -115,8 +125,22 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.5.0 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.6.1 zakura
 ```
+
+Native x86-64 builds automatically use Pasta field assembly when the build
+CPU supports BMI2 and ADX. This selection happens at build time, so a local
+binary may not run on an older CPU. To build a binary for redistribution, use:
+
+```sh
+cargo build --locked --release --package zakura --features portable
+```
+
+Official release binaries and Docker runtime images enable `portable` and do
+not require BMI2 or ADX for Pasta arithmetic. This feature does not override
+custom compiler flags such as `-C target-cpu=native`; avoid CPU-specific flags
+when building for other machines. Default local builds keep automatic assembly
+selection, including with `--release`.
 
 You can start Zakura by running
 

@@ -10,8 +10,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use zakura_chain::{
     block,
     serialization::{
-        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize,
-        ZcashDeserializeInto, ZcashSerialize,
+        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
+        ZcashSerialize,
     },
     transaction::{
         self,
@@ -57,17 +57,6 @@ pub enum InventoryHash {
 }
 
 impl InventoryHash {
-    /// Creates a new inventory hash from a legacy transaction ID.
-    ///
-    /// # Correctness
-    ///
-    /// This method must only be used for v1-v4 transaction IDs.
-    /// [`transaction::Hash`] does not uniquely identify unmined v5 transactions.
-    #[allow(dead_code)]
-    pub fn from_legacy_tx_id(legacy_tx_id: transaction::Hash) -> InventoryHash {
-        InventoryHash::Tx(legacy_tx_id)
-    }
-
     /// Returns the block hash for this inventory hash,
     /// if this inventory hash is a non-filtered block variant.
     pub fn block_hash(&self) -> Option<block::Hash> {
@@ -141,7 +130,7 @@ impl From<block::Hash> for InventoryHash {
 }
 
 impl ZcashSerialize for InventoryHash {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         writer.write_u32::<LittleEndian>(self.code())?;
         match self {
             // Zebra does not supply error codes
@@ -155,7 +144,9 @@ impl ZcashSerialize for InventoryHash {
 }
 
 impl ZcashDeserialize for InventoryHash {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let code = reader.read_u32::<LittleEndian>()?;
         match code {
             0 => {
@@ -164,19 +155,18 @@ impl ZcashDeserialize for InventoryHash {
                 Ok(InventoryHash::Error)
             }
 
-            1 => Ok(InventoryHash::Tx(reader.zcash_deserialize_into()?)),
-            2 => Ok(InventoryHash::Block(reader.zcash_deserialize_into()?)),
-            3 => Ok(InventoryHash::FilteredBlock(
-                reader.zcash_deserialize_into()?,
-            )),
-            5 => Ok(InventoryHash::Wtx(reader.zcash_deserialize_into()?)),
+            1 => Ok(InventoryHash::Tx(reader.read_value()?)),
+            2 => Ok(InventoryHash::Block(reader.read_value()?)),
+            3 => Ok(InventoryHash::FilteredBlock(reader.read_value()?)),
+            5 => Ok(InventoryHash::Wtx(reader.read_value()?)),
 
             _ => Err(SerializationError::Parse("invalid inventory code")),
         }
     }
 }
 
-/// The minimum serialized size of an [`InventoryHash`].
+/// The minimum serialized size of an [`InventoryHash`]: a 4-byte code and a
+/// 32-byte hash. `MSG_WTX` entries are 32 bytes longer.
 pub(crate) const MIN_INV_HASH_SIZE: usize = 36;
 
 /// The maximum number of inventory items in a network message received from a peer.
@@ -201,6 +191,11 @@ pub const MAX_INV_IN_RECEIVED_MESSAGE: u64 = 50_000;
 pub const MAX_TX_INV_IN_SENT_MESSAGE: u64 = 25_000;
 
 impl TrustedPreallocate for InventoryHash {
+    fn min_serialized_size() -> u64 {
+        // Lossless: the constant is 36, and usize is at most 64 bits.
+        MIN_INV_HASH_SIZE as u64
+    }
+
     fn max_allocation() -> u64 {
         // An Inventory hash takes at least 36 bytes, and we reserve at least one byte for the
         // Vector length so we can never receive more than ((MAX_PROTOCOL_MESSAGE_LEN - 1) / 36) in

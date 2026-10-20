@@ -1,0 +1,8 @@
+---
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
+expression: get_standard_fee
+---
+{
+  "standard_fee": 400,
+  "version": 0
+}

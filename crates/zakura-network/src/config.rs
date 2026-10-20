@@ -12,10 +12,12 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use iroh::SecretKey;
-use rand::{rngs::OsRng, RngCore};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, value::MapAccessDeserializer, IntoDeserializer, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use tokio::fs;
+use zakura_quic::NodeSecretKey;
 
 use tracing::Span;
 use zakura_chain::{
@@ -53,7 +55,7 @@ pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
-/// A sensitive iroh secret-key override for Zakura P2P node identity.
+/// A sensitive secret-key override for Zakura P2P node identity.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(transparent)]
 pub struct ZakuraNodeSecretKey(String);
@@ -61,7 +63,7 @@ pub struct ZakuraNodeSecretKey(String);
 impl ZakuraNodeSecretKey {
     /// Returns the secret-key override.
     ///
-    /// Callers should only expose this value to iroh identity construction or
+    /// Callers should only expose this value to node identity construction or
     /// controlled persistence paths.
     pub fn expose_secret(&self) -> &str {
         &self.0
@@ -86,8 +88,8 @@ impl serde::Serialize for ZakuraNodeSecretKey {
 /// An error that can occur while resolving the Zakura node secret key.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ZakuraSecretKeyError {
-    /// The configured `zakura_node_secret_key` is not a valid iroh secret key.
-    #[error("configured zakura_node_secret_key is not a valid iroh secret key")]
+    /// The configured `zakura_node_secret_key` is not a valid node secret key.
+    #[error("configured zakura_node_secret_key is not a valid node secret key")]
     InvalidConfigured,
 }
 
@@ -229,7 +231,7 @@ pub struct Config {
     /// # Defaults
     ///
     /// The default directory is platform dependent, based on
-    /// [`dirs::cache_dir()`](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
+    /// [`zakura_chain::common::default_cache_dir`]:
     ///
     /// |Platform | Value                                           | Example                              |
     /// | ------- | ----------------------------------------------- | ------------------------------------ |
@@ -265,10 +267,10 @@ pub struct Config {
     /// The default is `~/.zakura`.
     pub identity_dir: PathBuf,
 
-    /// An optional persistent iroh secret key for Zakura P2P identity.
+    /// An optional persistent secret key for Zakura P2P identity.
     ///
     /// This is reserved for Zakura endpoint construction. If unset, a future Zakura endpoint
-    /// implementation will generate an ed25519 iroh [`SecretKey`] on first use
+    /// implementation will generate an ed25519 [`NodeSecretKey`] on first use
     /// and persist it under [`identity_dir`](Self::identity_dir), outside Zakura's
     /// cache and state directories by default.
     ///
@@ -313,7 +315,7 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub crawl_new_peer_interval: Duration,
 
     /// The maximum number of legacy TCP peer connections Zakura will keep for a given IP address
@@ -671,6 +673,18 @@ impl Config {
             return Ok(());
         }
 
+        self.write_peer_cache(peer_list).await
+    }
+
+    /// Replaces the peer cache, including when all previous peers have been banned.
+    pub(crate) async fn write_peer_cache(
+        &self,
+        peer_list: HashSet<PeerSocketAddr>,
+    ) -> io::Result<()> {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
+            return Ok(());
+        };
+
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
             .take(MAX_PEER_DISK_CACHE_SIZE)
@@ -686,7 +700,7 @@ impl Config {
         //
         // Sort to destroy any peer order, which could leak peer connection times.
         // (Currently the HashSet argument does this as well.)
-        peer_list.sort();
+        peer_list.sort_unstable();
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
@@ -718,13 +732,13 @@ impl Config {
 
                 Ok(())
             }
-            Err(error) => Err(error.error),
+            Err(error) => Err(error),
         }
     }
 
-    /// Resolves the Zakura native iroh [`SecretKey`] for this node, persisting a
+    /// Resolves the Zakura native [`NodeSecretKey`] for this node, persisting a
     /// freshly generated key on first use so the node keeps a stable
-    /// [`EndpointId`](iroh::EndpointId) across restarts.
+    /// [`NodeId`](zakura_quic::NodeId) across restarts.
     ///
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
@@ -742,9 +756,9 @@ impl Config {
     /// The persisted key file is the node's long-term private identity. It is
     /// written outside the cache and state directories and restricted to owner
     /// read/write on Unix.
-    pub fn zakura_secret_key(&self) -> Result<SecretKey, ZakuraSecretKeyError> {
+    pub fn zakura_secret_key(&self) -> Result<NodeSecretKey, ZakuraSecretKeyError> {
         if let Some(secret) = &self.zakura_node_secret_key {
-            return SecretKey::from_str(secret.expose_secret())
+            return NodeSecretKey::from_str(secret.expose_secret())
                 .map_err(|_| ZakuraSecretKeyError::InvalidConfigured);
         }
 
@@ -800,9 +814,9 @@ impl Config {
 ///
 /// I/O failures are logged and downgraded to an ephemeral key for this run, so a
 /// read-only or full cache directory never prevents the node from starting.
-fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
+fn load_or_generate_zakura_secret_key(key_file: &Path) -> NodeSecretKey {
     match std::fs::read_to_string(key_file) {
-        Ok(contents) => match SecretKey::from_str(contents.trim()) {
+        Ok(contents) => match NodeSecretKey::from_str(contents.trim()) {
             Ok(secret_key) => return secret_key,
             Err(_) => warn!(
                 ?key_file,
@@ -817,17 +831,15 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
         ),
     }
 
-    let mut key_bytes = [0; 32];
-    OsRng.fill_bytes(&mut key_bytes);
-    let secret_key = SecretKey::from_bytes(&key_bytes);
+    let secret_key = NodeSecretKey::generate();
     persist_zakura_secret_key(key_file, &secret_key);
     secret_key
 }
 
 /// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts
 /// the file to owner-only access. Persistence failures are logged but not fatal.
-fn persist_zakura_secret_key(key_file: &Path, secret_key: &SecretKey) {
-    let encoded = hex::encode(secret_key.to_bytes());
+fn persist_zakura_secret_key(key_file: &Path, secret_key: &NodeSecretKey) {
+    let encoded = secret_key.to_hex();
 
     match atomic_write(key_file.to_path_buf(), encoded.as_bytes()) {
         Ok(Ok(path)) => {
@@ -964,6 +976,12 @@ struct DTestnetParameters {
     max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
+    /// If `true`, `activation_heights` overlays the public Testnet activation heights
+    /// instead of replacing them, so a configured Testnet sets only the upgrades it changes.
+    ///
+    /// Off by default: configured activation heights replace every default height above
+    /// genesis. Only configured Testnets accept it.
+    inherit_activation_heights: Option<bool>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     post_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
@@ -985,10 +1003,32 @@ struct DTestnetParameters {
     /// scheduled issuance and monetary pools. The cumulative schedule through the block
     /// before NU7 must then fit in `MAX_MONEY`. An explicit value overrides that derivation.
     initial_nsm_value_balance: Option<u64>,
+    /// The Regtest form's `params` table. Read here so `network` needs no buffering, and
+    /// rejected anywhere other than directly inside `network`.
+    #[serde(default, skip_serializing)]
+    params: Option<Box<DTestnetParameters>>,
+    /// The Regtest form's `regtest` flag, accepted alongside `params`.
+    #[serde(default, skip_serializing)]
+    regtest: Option<bool>,
+}
+
+impl DTestnetParameters {
+    /// Rejects the Regtest form's `params` and `regtest` keys where they don't belong.
+    fn reject_regtest_form_keys<E: de::Error>(&self) -> Result<(), E> {
+        match (&self.params, &self.regtest) {
+            (Some(_), _) => Err(E::custom(
+                "unknown field `params`: it is only valid directly inside `network`",
+            )),
+            (None, Some(_)) => Err(E::custom(
+                "unknown field `regtest`: it is only valid next to `network.params`",
+            )),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// Network configuration used during deserialization.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
@@ -999,6 +1039,47 @@ enum DNetwork {
         regtest: Option<bool>,
     },
     ConfiguredTestnet(Box<DTestnetParameters>),
+}
+
+impl<'de> Deserialize<'de> for DNetwork {
+    /// Dispatches on the value's shape instead of buffering it like `#[serde(untagged)]`, so the
+    /// network parameter types are only instantiated for the config's own deserializer.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DNetworkVisitor;
+
+        impl<'de> Visitor<'de> for DNetworkVisitor {
+            type Value = DNetwork;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a network kind or a table of network parameters")
+            }
+
+            fn visit_str<E: de::Error>(self, kind: &str) -> Result<DNetwork, E> {
+                NetworkKind::deserialize(kind.into_deserializer()).map(DNetwork::DefaultForKind)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DNetwork, A::Error> {
+                let mut table = DTestnetParameters::deserialize(MapAccessDeserializer::new(map))?;
+                match table.params.take() {
+                    // Like the former untagged variant, other parameters next to `params` are
+                    // ignored.
+                    Some(params) => {
+                        params.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredRegtest {
+                            params,
+                            regtest: table.regtest,
+                        })
+                    }
+                    None => {
+                        table.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredTestnet(Box::new(table)))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DNetworkVisitor)
+    }
 }
 
 impl Default for DNetwork {
@@ -1035,7 +1116,10 @@ struct DConfig {
     v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
-    #[serde(alias = "new_peer_interval", with = "humantime_serde")]
+    #[serde(
+        alias = "new_peer_interval",
+        with = "zakura_chain::serialization::serde_adapters::duration"
+    )]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
@@ -1077,6 +1161,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
+            inherit_activation_heights: None,
             pre_nu6_funding_streams: None,
             post_nu6_funding_streams: None,
             funding_streams: Some(params.funding_streams().iter().map(Into::into).collect()),
@@ -1107,6 +1192,8 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
                 },
             ),
+            params: None,
+            regtest: None,
         }
     }
 }
@@ -1212,6 +1299,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
+                params.reject_regtest_form_keys::<D::Error>()?;
                 build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
@@ -1305,6 +1393,19 @@ impl<'de> Deserialize<'de> for Config {
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;
+        if zakura.nat_traversal {
+            return Err(de::Error::custom(
+                crate::zakura::ZAKURA_NAT_TRAVERSAL_REMOVED,
+            ));
+        }
+        zakura.quic.validate().map_err(de::Error::custom)?;
+        if p2p_stack.resolve(&network).runs_zakura() {
+            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
+            // lowers a larger cap after tracing starts so its warning is logged.
+            zakura
+                .budgeted_max_connections()
+                .map_err(de::Error::custom)?;
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
@@ -1372,6 +1473,7 @@ where
         max_block_time_start_height,
         genesis_hash,
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1381,6 +1483,9 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         initial_nsm_value_balance,
+        // Deserialization only builds a configured Testnet from a table without these.
+        params: _,
+        regtest: _,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1427,11 +1532,15 @@ where
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
-    // Retain default Testnet activation heights unless an empty activation-height map is configured.
+    // Retain default Testnet activation heights unless an activation-height map is
+    // configured. A configured map replaces them, or overlays them when requested.
     if let Some(activation_heights) = activation_heights {
-        params_builder = params_builder
-            .with_activation_heights(activation_heights)
-            .map_err(de::Error::custom)?
+        params_builder = if inherit_activation_heights == Some(true) {
+            params_builder.with_activation_height_overlay(activation_heights)
+        } else {
+            params_builder.with_activation_heights(activation_heights)
+        }
+        .map_err(de::Error::custom)?
     }
 
     if let Some(halving_interval) = pre_blossom_halving_interval {
@@ -1515,6 +1624,7 @@ where
 {
     let DTestnetParameters {
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1525,6 +1635,13 @@ where
         initial_nsm_value_balance,
         ..
     } = params;
+
+    if inherit_activation_heights.is_some() {
+        return Err(de::Error::custom(
+            "inherit_activation_heights only applies to configured Testnets; \
+             Regtest activation heights have their own defaults",
+        ));
+    }
 
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 

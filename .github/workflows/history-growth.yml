@@ -11,7 +11,7 @@ name: History growth
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
 
   # Run when a PR is queued so the merge queue validates the merged result
   # against the latest `main`.
@@ -68,7 +68,6 @@ jobs:
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
-          crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | sort -u \
             > "${RUNNER_TEMP}/changed-files"

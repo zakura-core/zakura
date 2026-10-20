@@ -2,7 +2,8 @@
 
 > **Status: first draft.** This document describes focused tests for the
 > [design](peer-message-regulation.md) and [specification](../specs/peer-message-regulation.md).
-> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths.
+> The [GetBlocks plan](property-testing-block-sync-infrastructure.md) identifies the initial paths,
+> and the [header sync plan](property-testing-header-sync.md) covers header subscriptions.
 
 ## Scope and claim strength
 
@@ -31,11 +32,44 @@ Call production code at the boundary appropriate to the claim. Check:
 - bounded arbitrary payloads return a result without panicking.
 
 A payload cap is not an allocation bound. Check requested allocation and retained decoded state.
-Keep expected bounds reviewable against the specification without requiring a new declaration API.
+Keep expected bounds reviewable against the specification. A stream's message table states each
+row's payload bounds, and each codec item states its allocation bound.
 
-Adding a message requires updating its codec, handling, bounds, boundary cases, and applicable
-protocol tests. Reuse exhaustive production dispatch where available. Do not require a new
-reference-model arm for every wire variant.
+Adding a message requires a table row, a codec arm, its samples and domain violations, its
+handling, and applicable protocol tests. Reuse exhaustive production dispatch where available.
+Do not require a new reference-model arm for every wire variant.
+
+## Generated suites
+
+Four suites read the declarations, so each property is written once:
+
+| Suite | Input | Checks |
+| --- | --- | --- |
+| Item | one codec item | Tight length bounds against real encodings, round trips, exact reads, truncation, canonical decoding of arbitrary and mutated input, and the allocation bound |
+| Message | one message family | Closed coverage of its rows, tight row bounds, round trips, header and payload mutations, domain violations, and the allocation bound for every decode |
+| Frame | one layout | Each reader accepts its rows at both bounds and rejects short, flagged, other-role, sibling-stream, and undeclared frames from the header |
+| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses and pages beyond their credit, the request and subscription margins, sustained and mutually saturated exchanges and subscriptions, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, and `Close` progress while pages and execution are blocked |
+
+The stream conformance adapter only encodes a valid message for a row and names the exchange a
+message belongs to. For a subscription row it also encodes and reads updates and encodes and reads
+pages. The suite's harness serves, downloads, publishes, and subscribes through the tools, so it
+tests the tools and the transport together. The
+[suite's module docs](../../crates/zakura-network/src/zakura/testkit/stream_conformance/mod.rs) say
+which rows each property checks. A reactor that bypasses the tools gets no coverage from it.
+
+Tuples and lists of items are items, so the item suite checks composition once. A message whose
+payload composes checked items needs no bound test of its own. The test allocator measures heap
+use during each decode and fails when it is not installed.
+
+A family supplies deterministic samples that reach each row's minimum and maximum, a value
+strategy, and its domain violations. Random generation adds cases; it never decides whether a row
+gets tested.
+
+Each exchange, session, and subscription tool has its own properties, listed in its module doc
+with the test for each. Tools are tested alone with unit tests and an operation-sequence proptest
+that checks the tool's own counters after every step, with no reference model. The two subscription
+tools are also joined through two ordered queues: a proptest interleaves updates, pages, and
+terminal outcomes and checks that crossed messages never fault a conformant peer.
 
 ## Stateful checks
 
@@ -110,4 +144,5 @@ and load runs can execute on a schedule. Choose counts from measured runtime and
 coverage honestly.
 
 Start with existing codec and reservation tests. Add GetBlocks ownership and bidirectional cases,
-then subscription tests. Expand the harness only when a named property exposes a gap.
+then subscription tests from the [header sync plan](property-testing-header-sync.md). Expand the
+harness only when a named property exposes a gap.

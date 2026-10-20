@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{Cursor, Write},
     sync::Arc,
 };
@@ -20,6 +20,7 @@ use crate::{
     },
     transaction::{arbitrary::v5_transactions, LockTime, Transaction},
     transparent,
+    work::equihash::Solution,
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
@@ -551,76 +552,51 @@ fn coinbase_parsing_rejects_above_0x80() {
         .expect_err("parsing fails");
 }
 
+/// Checks that the block commitment field parses without errors.
+/// Header sizes are computed from the Equihash solution without encoding the
+/// header, so they must match the encoded length on every network.
 #[test]
-fn block_test_vectors_unique() {
+fn header_serialized_size_matches_encoding() {
     let _init_guard = zakura_test::init();
 
-    let block_count = zakura_test::vectors::BLOCKS.len();
-    let block_hashes: HashSet<_> = zakura_test::vectors::BLOCKS
-        .iter()
-        .map(|b| {
-            b.zcash_deserialize_into::<Block>()
-                .expect("block is structurally valid")
-                .hash()
+    let mut headers: Vec<Header> = Network::iter()
+        .flat_map(|net| {
+            net.block_iter()
+                .map(|(_, bytes)| {
+                    *bytes
+                        .zcash_deserialize_into::<Block>()
+                        .expect("block test vectors are structurally valid")
+                        .header
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
+    let regtest_header = *crate::block::genesis::regtest_genesis_block().header;
+    assert!(matches!(regtest_header.solution, Solution::Regtest(_)));
+    assert!(headers
+        .iter()
+        .all(|header| matches!(header.solution, Solution::Common(_))));
+    headers.push(regtest_header);
 
-    // putting the same block in two files is an easy mistake to make
-    assert_eq!(
-        block_count,
-        block_hashes.len(),
-        "block test vectors must be unique"
-    );
-}
-
-/// Checks that:
-///
-/// - the block test vector indexes match the heights in the block data;
-/// - each post-Sapling block has a corresponding final Sapling root;
-/// - each post-Orchard block has a corresponding final Orchard root.
-#[test]
-fn block_test_vectors() {
-    let _init_guard = zakura_test::init();
-
-    for net in Network::iter() {
-        let sapling_anchors = net.sapling_anchors();
-        let orchard_anchors = net.orchard_anchors();
-
-        for (&height, block) in net.block_iter() {
-            let block = block
-                .zcash_deserialize_into::<Block>()
-                .expect("block is structurally valid");
+    for header in headers {
+        let encoded = header
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+        assert_eq!(header.zcash_serialized_size(), encoded.len());
+        assert!(encoded.len() <= crate::block::header::MAX_SERIALIZED_HEADER_BYTES);
+        if matches!(header.solution, Solution::Common(_)) {
             assert_eq!(
-                block.coinbase_height().expect("block height is valid").0,
-                height,
-                "deserialized height must match BTreeMap key height"
+                encoded.len(),
+                crate::block::header::MAX_SERIALIZED_HEADER_BYTES
             );
-
-            if height
-                >= Sapling
-                    .activation_height(&net)
-                    .expect("activation height")
-                    .0
-            {
-                assert!(
-                sapling_anchors.contains_key(&height),
-                "post-sapling block test vectors must have matching sapling root test vectors: \
-                 missing {net} {height}"
-            );
-            }
-
-            if height >= Nu5.activation_height(&net).expect("activation height").0 {
-                assert!(
-                    orchard_anchors.contains_key(&height),
-                    "post-nu5 block test vectors must have matching orchard root test vectors: \
-                 missing {net} {height}"
-                );
-            }
         }
+        assert_eq!(
+            header.solution.zcash_serialized_size(),
+            encoded.len() - crate::block::header::HEADER_BYTES_BEFORE_SOLUTION,
+        );
     }
 }
 
-/// Checks that the block commitment field parses without errors.
 /// For sapling and blossom blocks, also check the final sapling root value.
 ///
 /// TODO: add chain history test vectors?

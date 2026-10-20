@@ -11,13 +11,13 @@
 
 ## Project Structure & Module Organization
 
-Zakura is a Rust workspace; the member crates live under `crates/` (except `deploy/zakura-watchdog`). Main crates include:
+Zakura is a Rust workspace; the member crates live under `crates/`. Main crates include:
 
 `crates/zakura-assets/` is a publish-only packaging crate and is deliberately excluded from the workspace because its payload is generated and not committed.
 
 - `crates/zakurad/` (node CLI/orchestration),
 - core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
-- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/tower-batch-control/`, `crates/tower-fallback/`, and `crates/xtask/`.
+- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, and `crates/xtask/`.
 
 Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/` and crate READMEs. CI and policy automation live in `.github/workflows/`.
 
@@ -70,7 +70,7 @@ Zakura is a Zcash full node implementation in Rust. It is a validator node — i
 ```text
 zakurad (CLI orchestration)
   ├── zakura-consensus (block/transaction verification)
-  │     └── zakura-script (script validation via FFI)
+  │     └── zakura-script (script validation in Rust)
   ├── zakura-state (finalized + non-finalized storage)
   ├── zakura-network (P2P, peer management)
   └── zakura-rpc (JSON-RPC + gRPC)
@@ -84,7 +84,7 @@ zakurad (CLI orchestration)
 - `zakura-chain` is **sync-only**: no async, no tokio, no Tower services
 - `zakura-node-services` defines service trait aliases used across crates
 - `zakurad` orchestrates all components but contains minimal logic
-- Utility crates: `tower-batch-control`, `tower-fallback`, `zakura-test`
+- Utility crates: `zakura-test`
 
 ### Per-Crate Concerns
 
@@ -95,7 +95,7 @@ zakurad (CLI orchestration)
 | `zakura-consensus` | Verification completeness, error handling, checkpoint vs semantic paths |
 | `zakura-state` | Read/write separation (`ReadRequest` vs `Request`), database migrations |
 | `zakura-rpc` | zcashd compatibility, error responses, timeout handling |
-| `zakura-script` | FFI safety, memory management, lifetime/ownership across boundaries |
+| `zakura-script` | Script execution, signature callbacks, consensus sigop accounting |
 
 ## Coding Style & Naming Conventions
 
@@ -103,6 +103,25 @@ zakurad (CLI orchestration)
 - Naming: `snake_case` for functions/modules/files, `CamelCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
 - Respect the workspace lint policy (`[workspace.lints]` in the root `Cargo.toml`) and the crate-level lint attributes at the top of each crate's `lib.rs`.
 - Keep dependencies flowing downward across crates; maintain `zakura-chain` as sync-only.
+
+## Readability
+
+These checks apply to code in every language. Run them against your own diff.
+
+- A reader learns what a function does from its name, signature, and doc comment, without reading its tests.
+- Production code never knows tests exist. It has no branches on fake types, callable identity, or test flags. Tests reach code through the boundaries production uses.
+- Each fact has one authoritative representation. Each trust boundary has one validation point.
+- Dependencies point one way. Each entry point shows the order of its steps.
+- A readability refactor keeps behavior. Timeouts, validation, and error paths stay.
+- When you finish, reread the diff as a reviewer who saw neither the tests nor the conversation. If you had to explain something in chat, make the code say it instead.
+
+Python adds three checks:
+
+- Real logic lives in importable modules, not in YAML or shell heredocs.
+- Each CLI entry point is `main(argv=None)`.
+- Importing a module does no work.
+
+For module decomposition in the core Rust crates, use the `core-rust-readability` skill.
 
 ## Code Patterns
 

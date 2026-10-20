@@ -14,10 +14,340 @@ use zakura_chain::{
     parameters::Network,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
 };
+use zakura_test::vectors::{
+    BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_GENESIS_BYTES,
+};
 
 use super::spawn_owned_block_range;
 
 const DEADLINE: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn block_ranges_preserve_equal_work_selection_until_a_stronger_fork_arrives() {
+    let _guard = zakura_test::init();
+    for header_runtime in [true, false] {
+        timeout(DEADLINE, assert_block_range_selection(header_runtime))
+            .await
+            .expect("the equal-work serving regression must finish");
+    }
+}
+
+async fn assert_block_range_selection(header_runtime: bool) {
+    use tower::ServiceExt;
+    use zakura_chain::chain_tip::ChainTip;
+
+    use crate::{
+        arbitrary::Prepare,
+        service::StateService,
+        tests::{setup::transaction_v4_from_coinbase, FakeChainHelper},
+        CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse,
+    };
+
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, mut read_state, tip, _change) =
+        StateService::new(config, &network, block::Height::MAX, 0)
+            .await
+            .unwrap();
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis.clone(), parent.clone()] {
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    Arc::make_mut(&mut template).transactions[0] =
+        Arc::new(transaction_v4_from_coinbase(&template.transactions[0]));
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(read_state.db.history_tree().hash().unwrap()).into();
+
+    let siblings = template.make_fake_siblings(3);
+    let (a, b, c) = (
+        siblings[2].clone(),
+        siblings[1].clone(),
+        siblings[0].clone(),
+    );
+    assert!(
+        a.hash().0 < b.hash().0,
+        "receipt and hash preference must disagree"
+    );
+    for (order, block) in [(1, a.clone()), (2, b.clone())] {
+        let mut prepared = block.prepare();
+        prepared.receipt_order = Some(order);
+        state
+            .queue_and_commit_to_non_finalized_state(prepared, None)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+    let selected = &a;
+    assert!(matches!(
+        read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
+        ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == selected.hash()
+    ));
+
+    let ReadResponse::Blocks(blocks) = read_state
+        .clone()
+        .oneshot(ReadRequest::BlocksByHeightRange {
+            start: block::Height(0),
+            count: 4,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected block range response");
+    };
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|(_, block, _)| block.hash())
+            .collect::<Vec<_>>(),
+        [genesis.hash(), parent.hash(), selected.hash()],
+        "serving and mining preserve the first selected equal-work body"
+    );
+    let owned = read_state
+        .read_owned_block_range(block::Height(2), 2, u32::MAX, (), |_| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        owned.blocks,
+        [(block::Height(2), selected.zcash_serialize_to_vec().unwrap())],
+        "a non-finalized block is served as its serialization"
+    );
+    assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+
+    let earlier_snapshot = read_state.block_range_snapshot().unwrap();
+    if header_runtime {
+        // An equal-work header without a body must not cancel the selected download.
+        insert_header_only(
+            &mut state,
+            &read_state,
+            block::Height(1),
+            parent.hash(),
+            std::slice::from_ref(&c.header),
+            1,
+        )
+        .await;
+        assert!(matches!(
+            read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
+            ReadResponse::BestHeaderTip(Some((block::Height(2), hash))) if hash == a.hash()
+        ));
+        let ReadResponse::Blocks(blocks) = read_state
+            .clone()
+            .oneshot(ReadRequest::BlocksByHeightRange {
+                start: block::Height(0),
+                count: 4,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected block range response");
+        };
+        assert_eq!(
+            blocks.len(),
+            3,
+            "an equal-work header must not remove the selected body from serving"
+        );
+        assert_eq!(blocks[1].1.hash(), parent.hash());
+        let owned = read_state
+            .read_owned_block_range(block::Height(2), 1, u32::MAX, (), |_| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            owned.blocks,
+            [(block::Height(2), a.zcash_serialize_to_vec().unwrap())]
+        );
+    }
+
+    // More work on B switches both downloads and mining to B.
+    let mut child = b.make_fake_child();
+    let commitment = read_state
+        .latest_non_finalized_state()
+        .find_chain(|chain| chain.contains_block_hash(b.hash()))
+        .unwrap()
+        .history_tree(b.hash().into())
+        .unwrap()
+        .hash()
+        .unwrap();
+    let merkle_root = child.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+    let mut prepared = child.clone().prepare();
+    prepared.receipt_order = Some(3);
+    state
+        .queue_and_commit_to_non_finalized_state(prepared, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let owned = read_state
+        .read_owned_block_range(block::Height(2), 3, u32::MAX, (), |_| false)
+        .await
+        .unwrap();
+    let b_bytes = b.zcash_serialize_to_vec().unwrap();
+    let child_bytes = child.zcash_serialize_to_vec().unwrap();
+    assert_eq!(
+        owned.blocks,
+        [
+            (block::Height(2), b_bytes.clone()),
+            (block::Height(3), child_bytes.clone())
+        ]
+    );
+    let one_byte_short = u32::try_from(b_bytes.len() + child_bytes.len() - 1).unwrap();
+    let owned = read_state
+        .read_owned_block_range(block::Height(2), 3, one_byte_short, (), |_| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        owned.blocks,
+        [(block::Height(2), b_bytes)],
+        "a non-finalized block that would cross the byte budget ends the prefix"
+    );
+    assert_eq!(tip.best_tip_hash(), Some(child.hash()));
+    assert_eq!(
+        earlier_snapshot
+            .block_and_size(&read_state.db, block::Height(2))
+            .unwrap()
+            .0
+            .hash(),
+        selected.hash(),
+        "an in-flight range keeps its original branch"
+    );
+    assert!(earlier_snapshot
+        .block_and_size(&read_state.db, block::Height(3))
+        .is_none());
+
+    if header_runtime {
+        // A stronger header-only fork takes the selection before any of its bodies arrive.
+        let mut c_child = c.make_fake_child();
+        Arc::make_mut(&mut Arc::make_mut(&mut c_child).header).time += chrono::Duration::seconds(1);
+        let mut c_grandchild = c_child.make_fake_child();
+        Arc::make_mut(&mut Arc::make_mut(&mut c_grandchild).header).time +=
+            chrono::Duration::seconds(1);
+        insert_header_only(
+            &mut state,
+            &read_state,
+            block::Height(2),
+            c.hash(),
+            &[c_child.header.clone(), c_grandchild.header.clone()],
+            2,
+        )
+        .await;
+        assert!(matches!(
+            read_state.clone().oneshot(ReadRequest::BestHeaderTip).await.unwrap(),
+            ReadResponse::BestHeaderTip(Some((block::Height(4), hash))) if hash == c_grandchild.hash()
+        ));
+        let ReadResponse::Blocks(blocks) = read_state
+            .clone()
+            .oneshot(ReadRequest::BlocksByHeightRange {
+                start: block::Height(0),
+                count: 5,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("unexpected block range response");
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|(_, block, _)| block.hash())
+                .collect::<Vec<_>>(),
+            [genesis.hash(), parent.hash()],
+            "a missing selected body must not be replaced by A, B, or B's child"
+        );
+        let owned = read_state
+            .read_owned_block_range(block::Height(2), 3, u32::MAX, (), |_| false)
+            .await
+            .unwrap();
+        assert!(owned.blocks.is_empty());
+        assert_eq!(
+            tip.best_tip_hash(),
+            Some(child.hash()),
+            "header-only work does not change the mining tip"
+        );
+    }
+}
+
+/// Commit `headers` as one header-only batch on top of the retained header `parent_hash`.
+async fn insert_header_only(
+    state: &mut crate::service::StateService,
+    read_state: &crate::service::ReadStateService,
+    parent_height: block::Height,
+    parent_hash: block::Hash,
+    headers: &[Arc<block::Header>],
+    request_id: u64,
+) {
+    use tower::{Service, ServiceExt};
+    use zakura_header_chain::{
+        Frontier, HeaderBatchInput, HeaderRules, HeaderWorkAuthority, InsertHeaders, SourceId,
+        SystemClock, TargetCompletion,
+    };
+
+    use crate::{Request, Response};
+
+    let target = headers
+        .last()
+        .expect("the batch has a target header")
+        .hash();
+    let reader = read_state
+        .header_chain_reader_receiver
+        .borrow()
+        .clone()
+        .unwrap();
+    let lease = reader.validation_context(parent_hash).unwrap().unwrap();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(headers),
+        lease.parent(),
+        &HeaderRules::for_validation_lease(&lease).unwrap(),
+        &SystemClock,
+    )
+    .unwrap();
+    let snapshot = read_state
+        .subscribe_header_chain_snapshots()
+        .borrow()
+        .clone()
+        .unwrap();
+    let insert = InsertHeaders {
+        owner: HeaderWorkAuthority::for_target(&snapshot, target)
+            .bind(1, std::num::NonZeroU64::new(request_id).unwrap())
+            .into(),
+        source: SourceId::from_digest([1; 32]),
+        parent_hash,
+        target_tip_hash: target,
+        completion: TargetCompletion::TargetComplete {
+            common_ancestor: Frontier::new(parent_height, parent_hash),
+        },
+        batch,
+        aux: Vec::new(),
+    };
+    let response = state
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::ApplyHeaderChainInsert {
+            prepared: crate::HeaderChainBodyEvidenceAuthority::new()
+                .from_registered_header_attempt(Box::new(insert)),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        Response::HeaderChainInsertApplied(zakura_header_chain::ApplyResult::Committed)
+    ));
+}
 
 #[derive(Debug)]
 struct DropSignal {
@@ -47,21 +377,12 @@ fn resources() -> (DropSignal, Arc<AtomicUsize>, oneshot::Receiver<()>) {
     )
 }
 
-fn genesis() -> Arc<block::Block> {
-    Arc::new(
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-            .zcash_deserialize_into()
-            .expect("the genesis fixture is a serialized block"),
-    )
-}
-
 #[tokio::test]
 async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let block = genesis();
-    let reads = Arc::new(AtomicUsize::new(0));
-    let worker_reads = reads.clone();
+    let budgets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker_budgets = budgets.clone();
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
@@ -70,24 +391,29 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
             5,
             resources,
             |_| false,
-            move |_| {
-                worker_reads.fetch_add(1, Ordering::SeqCst);
-                // Synthetic sizes isolate the response cap from fixture size.
-                Some((block.clone(), 2))
+            move || {
+                Ok(move |_, remaining| {
+                    worker_budgets.lock().unwrap().push(remaining);
+                    // Synthetic bytes isolate the response cap from fixture size.
+                    Some(vec![7; 2])
+                })
             },
         ),
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
     assert_eq!(
-        result
-            .blocks
-            .iter()
-            .map(|(height, _, _)| *height)
-            .collect::<Vec<_>>(),
-        [block::Height(1), block::Height(2)]
+        *budgets.lock().unwrap(),
+        [5, 3, 1],
+        "each lookup sees the budget left by the blocks before it"
+    );
+    assert_eq!(
+        result.blocks,
+        [
+            (block::Height(1), vec![7; 2]),
+            (block::Height(2), vec![7; 2])
+        ]
     );
     assert_eq!(result.resources.drops.load(Ordering::SeqCst), 0);
     let (blocks, resources) = result.into_parts();
@@ -109,7 +435,7 @@ async fn cancellation_before_the_first_lookup_skips_the_range() {
             10,
             resources,
             |_| true,
-            |_| panic!("cancelled work must not reach its first lookup"),
+            || Ok(|_, _| panic!("cancelled work must not reach its first lookup")),
         ),
     )
     .await
@@ -127,7 +453,6 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     let (resources, drops, _finished) = resources();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
-    let block = genesis();
     let result = timeout(
         DEADLINE,
         spawn_owned_block_range(
@@ -136,9 +461,11 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
             10,
             resources,
             move |_| cancelled.load(Ordering::SeqCst),
-            move |_| {
-                assert!(!worker_cancelled.swap(true, Ordering::SeqCst));
-                Some((block.clone(), 2))
+            move || {
+                Ok(move |_, _| {
+                    assert!(!worker_cancelled.swap(true, Ordering::SeqCst));
+                    Some(vec![7; 2])
+                })
             },
         ),
     )
@@ -182,17 +509,18 @@ fn blocked_read() -> (
     let (started_tx, started) = oneshot::channel();
     let mut started_tx = Some(started_tx);
     let (resume, blocked) = mpsc::sync_channel(1);
-    let block = genesis();
     let job = spawn_owned_block_range(
         block::Height(1),
         1,
         10,
         resources,
         |_| false,
-        move |_| {
-            started_tx.take().unwrap().send(()).unwrap();
-            blocked.recv_timeout(DEADLINE).unwrap();
-            Some((block.clone(), 2))
+        move || {
+            Ok(move |_, _| {
+                started_tx.take().unwrap().send(()).unwrap();
+                blocked.recv_timeout(DEADLINE).unwrap();
+                Some(vec![7; 2])
+            })
         },
     );
     (
@@ -240,7 +568,7 @@ async fn a_panicking_read_releases_resources_once() {
         10,
         resources,
         |_| false,
-        |_| panic!("injected database panic"),
+        || Ok(|_, _| panic!("injected database panic")),
     );
     let outcome = timeout(DEADLINE, AssertUnwindSafe(job).catch_unwind())
         .await
@@ -275,11 +603,10 @@ async fn the_state_api_returns_an_owned_empty_range() {
 async fn the_state_api_returns_committed_blocks_with_their_resources() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let block = genesis();
-    let size = block.zcash_serialized_size();
+    let bytes = BLOCK_MAINNET_GENESIS_BYTES.to_vec();
     let (_state, mut read_state, _tip, _change) = timeout(
         DEADLINE,
-        crate::populated_state([block.clone()], &Network::Mainnet),
+        crate::populated_state([fixture_block(&bytes)], &Network::Mainnet),
     )
     .await
     .unwrap();
@@ -288,7 +615,7 @@ async fn the_state_api_returns_committed_blocks_with_their_resources() {
         read_state.read_owned_block_range(
             block::Height(0),
             2,
-            u32::try_from(size).unwrap(),
+            u32::try_from(bytes.len()).unwrap(),
             resources,
             |_| false,
         ),
@@ -296,10 +623,86 @@ async fn the_state_api_returns_committed_blocks_with_their_resources() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result.blocks, [(block::Height(0), block, size)]);
+    assert_eq!(result.blocks, [(block::Height(0), bytes)]);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// Decodes a block fixture for committing it to a test state.
+fn fixture_block(bytes: &[u8]) -> Arc<block::Block> {
+    Arc::new(
+        bytes
+            .zcash_deserialize_into()
+            .expect("the fixture is a serialized block"),
+    )
+}
+
+#[tokio::test]
+async fn finalized_ranges_return_stored_bytes_and_stop_at_the_byte_budget() {
+    let _guard = zakura_test::init();
+    let stored = [
+        BLOCK_MAINNET_GENESIS_BYTES.to_vec(),
+        BLOCK_MAINNET_1_BYTES.to_vec(),
+        BLOCK_MAINNET_2_BYTES.to_vec(),
+    ];
+    let (_state, mut read_state, _tip, _change) = timeout(
+        DEADLINE,
+        crate::populated_state(
+            stored.iter().map(|bytes| fixture_block(bytes)),
+            &Network::Mainnet,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        read_state.latest_best_chain().is_none(),
+        "checkpoint commits leave every block finalized"
+    );
+    let expected: Vec<_> = stored
+        .iter()
+        .enumerate()
+        .map(|(height, bytes)| (block::Height(u32::try_from(height).unwrap()), bytes.clone()))
+        .collect();
+
+    let all = read_state
+        .read_owned_block_range(block::Height(0), 4, u32::MAX, (), |_| false)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.blocks, expected,
+        "stored bytes come back in height order"
+    );
+
+    let two = u32::try_from(stored[0].len() + stored[1].len()).unwrap();
+    for budget in [
+        two,
+        two + 1,
+        two + u32::try_from(stored[2].len()).unwrap() - 1,
+    ] {
+        let prefix = read_state
+            .read_owned_block_range(block::Height(0), 3, budget, (), |_| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            prefix.blocks,
+            expected[..2],
+            "budget {budget} ends the prefix before the block that does not fit"
+        );
+    }
+
+    // The finalized lookup itself rejects a block that does not fit before
+    // copying its stored parts into a response buffer.
+    let snapshot = read_state.block_range_snapshot().unwrap();
+    let size = stored[2].len();
+    assert_eq!(
+        snapshot.serialized_block_within(&read_state.db, block::Height(2), size),
+        Some(stored[2].clone())
+    );
+    assert_eq!(
+        snapshot.serialized_block_within(&read_state.db, block::Height(2), size - 1),
+        None
+    );
 }
 
 #[tokio::test]
@@ -313,7 +716,7 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
             .await
             .unwrap();
     let failure = BlockWriteTaskFailure::from(&HeaderChainAttachmentError::MissingGenesis);
-    read_state.block_write_failure.set(failure.clone()).unwrap();
+    read_state.block_write_failure.set(failure.clone());
     let error = timeout(
         DEADLINE,
         read_state.read_owned_block_range(block::Height(1), 1, 10, resources, |_| {
@@ -331,7 +734,7 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
 #[test]
 fn block_range_response_stops_before_crossing_its_byte_limit() {
     let sizes = [3usize, 2, 4];
-    let exact = super::collect_bounded_height_range(block::Height(10), 3, 5, |height| {
+    let exact = super::collect_bounded_height_range(block::Height(10), 3, 5, |height, _| {
         let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
         sizes.get(index).copied().map(|size| (index, size))
     });
@@ -341,20 +744,22 @@ fn block_range_response_stops_before_crossing_its_byte_limit() {
         "the exact-fit prefix is returned and the first over-limit block is excluded",
     );
 
-    let one_byte_short = super::collect_bounded_height_range(block::Height(10), 3, 4, |height| {
-        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
-        sizes.get(index).copied().map(|size| (index, size))
-    });
+    let one_byte_short =
+        super::collect_bounded_height_range(block::Height(10), 3, 4, |height, _| {
+            let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+            sizes.get(index).copied().map(|size| (index, size))
+        });
     assert_eq!(
         one_byte_short,
         vec![(block::Height(10), 0, 3)],
         "a prefix that would cross the cap by one byte stops before that block",
     );
 
-    let first_too_large = super::collect_bounded_height_range(block::Height(10), 3, 2, |height| {
-        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
-        sizes.get(index).copied().map(|size| (index, size))
-    });
+    let first_too_large =
+        super::collect_bounded_height_range(block::Height(10), 3, 2, |height, _| {
+            let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+            sizes.get(index).copied().map(|size| (index, size))
+        });
     assert!(
         first_too_large.is_empty(),
         "a first block larger than the response budget is not retained",
@@ -365,11 +770,38 @@ fn block_range_response_stops_before_crossing_its_byte_limit() {
 fn block_range_response_includes_a_maximum_size_first_block() {
     let maximum = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
     let cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
-    let result = super::collect_bounded_height_range(block::Height(10), 2, cap, |height| {
+    let result = super::collect_bounded_height_range(block::Height(10), 2, cap, |height, _| {
         Some((height, maximum))
     });
     assert_eq!(
         result,
         vec![(block::Height(10), block::Height(10), maximum)]
+    );
+}
+
+#[test]
+fn block_range_lookups_skip_materializing_a_block_that_does_not_fit() {
+    let sizes = [3usize, 2, 4];
+    let mut materialized = Vec::new();
+    let result =
+        super::collect_bounded_height_range(block::Height(10), 3, 6, |height, remaining| {
+            let size = *sizes.get(usize::try_from(height.0.checked_sub(10)?).ok()?)?;
+            if size > remaining {
+                return None;
+            }
+            materialized.push(height);
+            Some((height, size))
+        });
+    assert_eq!(
+        result,
+        vec![
+            (block::Height(10), block::Height(10), 3),
+            (block::Height(11), block::Height(11), 2)
+        ]
+    );
+    assert_eq!(
+        materialized,
+        [block::Height(10), block::Height(11)],
+        "the block past the budget is never materialized"
     );
 }

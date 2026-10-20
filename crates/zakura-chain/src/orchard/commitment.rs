@@ -1,5 +1,6 @@
 //! Note and value commitments.
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use group::{
@@ -213,14 +214,16 @@ impl TryFrom<[u8; 32]> for ValueCommitment {
 }
 
 impl ZcashSerialize for ValueCommitment {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&<[u8; 32]>::from(*self)[..])?;
         Ok(())
     }
 }
 
 impl ZcashDeserialize for ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Self::try_from(reader.read_32_bytes()?).map_err(SerializationError::Parse)
     }
 }

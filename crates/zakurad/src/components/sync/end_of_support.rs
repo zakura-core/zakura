@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use color_eyre::Report;
+use eyre::Report;
 
 use zakura_chain::{
     block::Height,
@@ -13,7 +13,10 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
+///
+/// Projected three days after the committed October 15, 2026 Mainnet
+/// release-state bundle at the Mainnet target spacing.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_520_728;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -21,22 +24,28 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
 /// every reachable tip height.
 pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
-/// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
-/// without halting.
+/// The maximum number of days after [`ESTIMATED_RELEASE_HEIGHT`] that a Zakura
+/// server will run without halting.
 ///
 /// Notes:
 ///
-/// - Zebra will exit with a panic if the current tip height is bigger than the
-///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 30 days
-///
-/// Note: v1.5.0 is planned for 2026-09-23, but its release-height floor is
-/// 3,494,121 (~2026-09-25). This window halts after height 3,528,681
-/// (~2026-10-25), about 32 days after the planned release.
+/// - Zakura will exit with a panic if the current tip height is bigger than
+///   [`ESTIMATED_RELEASE_HEIGHT`] plus this number of days at the target spacing.
+/// - The support window is capped by [`MAINNET_EOS_HEIGHT`].
 pub const EOS_PANIC_AFTER: u32 = 30;
 
-/// The number of days before the end of support where Zebra will display warnings.
+/// The nominal number of days after release before warnings start.
+///
+/// When the support height is capped, warnings still start three days before EOS.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
+
+/// The last Mainnet height supported by this release.
+///
+/// The next block projects to November 4, 2026 at 23:59:09 UTC using Mainnet
+/// height 3,490,665 at September 22, 2026 at 05:46:39 UTC and 75-second blocks.
+/// This fixes EOS at approximately November 5 even if release preparation
+/// advances [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows height, not time.
+const MAINNET_EOS_HEIGHT: Height = Height(3_541_074);
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";
@@ -103,7 +112,8 @@ pub async fn start(
 /// The node runs at this height and halts when the tip goes past it. This
 /// matches zcashd's `end_of_service.block_height` threshold semantics.
 pub fn end_of_support_height(network: &Network) -> Option<Height> {
-    (network == &Network::Mainnet).then(|| estimated_height_after_release(network, EOS_PANIC_AFTER))
+    (network == &Network::Mainnet)
+        .then(|| estimated_height_after_release(network, EOS_PANIC_AFTER).min(MAINNET_EOS_HEIGHT))
 }
 
 /// Returns the estimated height `days` after [`ESTIMATED_RELEASE_HEIGHT`] on
@@ -160,13 +170,15 @@ pub fn check(tip_height: Height, network: &Network) {
         info!("Release always valid outside Mainnet");
         return;
     };
-    let warn_height = estimated_height_after_release(network, EOS_WARN_AFTER);
+    let warning_blocks = (EOS_PANIC_AFTER - EOS_WARN_AFTER) * ESTIMATED_BLOCKS_PER_DAY;
+    let warn_height = Height(panic_height.0.saturating_sub(warning_blocks));
 
     if tip_height > panic_height {
         panic!(
-            "{EOS_PANIC_MESSAGE_HEADER} if the release date is older than {EOS_PANIC_AFTER} days. \
+            "{EOS_PANIC_MESSAGE_HEADER} past the last supported Mainnet height {}. \
             \nRelease name: {}, Estimated release height: {ESTIMATED_RELEASE_HEIGHT} \
             \nHint: Download and install the latest Zakura release from: https://github.com/zakura-core/zakura/releases/latest",
+            panic_height.0,
             release_version()
         );
     } else if tip_height > warn_height {
@@ -215,15 +227,13 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_end_of_support_height_counts_75_second_blocks() {
+    fn mainnet_end_of_support_is_capped_at_the_release_deadline() {
         let _init_guard = zakura_test::init();
         let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         assert_eq!(
             end_of_support_height(&Network::Mainnet),
-            Some(Height(
-                ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * post_blossom_blocks_per_day
-            )),
+            Some(MAINNET_EOS_HEIGHT),
         );
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),

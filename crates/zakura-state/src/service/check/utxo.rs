@@ -1,6 +1,6 @@
 //! Consensus rule checks for the finalized state.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use zakura_chain::{
     amount,
@@ -9,7 +9,10 @@ use zakura_chain::{
 
 use crate::{
     constants::MIN_TRANSPARENT_COINBASE_MATURITY,
-    service::{finalized_state::ZakuraDb, non_finalized_state::SpendingTransactionId},
+    service::{
+        finalized_state::ZakuraDb,
+        non_finalized_state::{CreatedUtxos, SharedMap, SpendingTransactionId},
+    },
     SemanticallyVerifiedBlock,
     ValidateContextError::{
         self, DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
@@ -41,11 +44,8 @@ use crate::{
 /// precedence over it.
 pub fn transparent_spend(
     semantically_verified: &SemanticallyVerifiedBlock,
-    non_finalized_chain_created_utxos: &HashMap<
-        transparent::OutPoint,
-        Arc<transparent::OrderedUtxo>,
-    >,
-    non_finalized_chain_spent_utxos: &HashMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain_created_utxos: &CreatedUtxos,
+    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
@@ -134,11 +134,8 @@ fn transparent_spend_chain_order(
     spend: transparent::OutPoint,
     spend_tx_index_in_block: usize,
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-    non_finalized_chain_created_utxos: &HashMap<
-        transparent::OutPoint,
-        Arc<transparent::OrderedUtxo>,
-    >,
-    non_finalized_chain_spent_utxos: &HashMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain_created_utxos: &CreatedUtxos,
+    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<transparent::OrderedUtxo, ValidateContextError> {
     if let Some(output) = block_new_outputs.get(&spend) {

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Publish a participant config and manifest derived from the running fork.
+
+Only consensus parameters and explicit public peers are exported. The node's
+mining address, identity, credentials, and operator paths are never published.
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deployer"))
+from deploy import render_toml_pair, toml_key  # noqa: E402
+
+
+def render_table(header, table):
+    """Render `[header]` with its sub-tables as headed sections, for people to read.
+
+    The published participant config keeps this layout, so its bytes and
+    `configSha256` stay stable across publications of the same parameters. Scalars
+    come before sub-tables, because every key after a TOML header belongs to it.
+    """
+    lines = [f"[{header}]"]
+    lines += [render_toml_pair(key, value) for key, value in table.items()
+              if not isinstance(value, dict)]
+    for key, value in table.items():
+        if isinstance(value, dict):
+            lines += render_table(f"{header}.{toml_key(key)}", value)
+    return lines
+
+
+# NU7's target spacing and difficulty-adjustment window, as published to participants.
+TARGET_SPACING_SECONDS = 25
+DAA_WINDOW_BLOCKS = 102
+
+
+def rpc(port, method):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/",
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}).encode(),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        result = json.load(response)
+    if result.get("error") is not None:
+        raise RuntimeError(f"{method}: {result['error']}")
+    return result["result"]
+
+
+def validate_snapshot(snapshot):
+    """Validate immutable seed metadata shared by the publisher and website."""
+    try:
+        if (not re.fullmatch(r"https://api\.nu7\.valargroup\.dev/snapshots/[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.zst", snapshot["url"])
+                or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])
+                or any(type(snapshot[key]) is not int or not 0 < snapshot[key] <= 2**53 - 1
+                       for key in ("height", "sizeBytes", "publishedAt"))
+                or snapshot["publishedAt"] > time.time() + 300
+                or snapshot["storageMode"] != "pruned"
+                or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", snapshot["dbVersion"])):
+            raise ValueError("invalid snapshot metadata")
+    except (KeyError, TypeError) as exc:
+        raise ValueError("incomplete snapshot metadata") from exc
+
+
+def manifest(config, info, revision, peers, seed, snapshot=None):
+    """Refuse mismatched live consensus before exporting a join configuration."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("revision must be a full source commit SHA")
+    if not peers or any(not re.fullmatch(r"[A-Za-z0-9.:-]+", peer) for peer in peers):
+        raise ValueError("explicit public peers are required")
+    parameters = config["network"]["network"]
+    if not isinstance(parameters, dict):
+        raise ValueError("publish a current, explicitly configured testnet")
+    activation = parameters["activation_heights"]["NU7"]
+    branch, upgrade = next((branch, upgrade) for branch, upgrade in info["upgrades"].items()
+                           if upgrade["name"] == "NU7")
+    if info.get("chain") != "test" or upgrade["activationheight"] != activation:
+        raise ValueError("live RPC and configured activation disagree")
+    if not re.fullmatch(r"[0-9a-f]{8}", branch):
+        raise ValueError("invalid consensus branch ID")
+    if not 0 <= seed["height"] < activation:
+        raise ValueError("seed must precede NU7 activation")
+    participant = {
+        "network": {
+            "listen_addr": "0.0.0.0:18233", "initial_testnet_peers": peers,
+            "p2p_stack": "legacy", "network": parameters,
+        },
+        "rpc": {"listen_addr": "127.0.0.1:18232", "enable_cookie_auth": False},
+        "state": {"cache_dir": "./nu7-state", "storage_mode": "pruned"},
+    }
+    rendered = "\n\n".join("\n".join(render_table(key, value))
+                            for key, value in participant.items()) + "\n"
+    result = {
+        "schemaVersion": 1, "nodeRevision": revision,
+        "network": {
+            "name": parameters["network_name"],
+            "magic": "".join(f"{byte:02x}" for byte in parameters["network_magic"]),
+            "activationHeight": activation, "branchId": branch,
+            "targetSpacingSeconds": TARGET_SPACING_SECONDS,
+            "daaWindowBlocks": DAA_WINDOW_BLOCKS,
+        },
+        "peers": peers, "seed": seed, "config": rendered,
+        "configSha256": hashlib.sha256(rendered.encode()).hexdigest(),
+    }
+    if snapshot is not None:
+        validate_snapshot(snapshot)
+        if snapshot["height"] != seed["height"]:
+            raise ValueError("bootstrap snapshot must match the recorded seed height")
+        result["snapshot"] = snapshot
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--peer", action="append", required=True)
+    parser.add_argument("--seed", type=Path, required=True)
+    parser.add_argument("--rpc-port", type=int, default=18232)
+    parser.add_argument("--snapshot", type=Path, help="snapshot metadata JSON")
+    parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    result = manifest(
+        tomllib.loads(args.config.read_text()), rpc(args.rpc_port, "getblockchaininfo"),
+        args.revision, args.peer, json.loads(args.seed.read_text()),
+        json.loads(args.snapshot.read_text()) if args.snapshot else None,
+    )
+    args.out.mkdir(parents=True, exist_ok=True)
+    # The manifest embeds the config so consumers fetch one coherent generation.
+    for filename, content in (("nu7-zakura.toml", result["config"]),
+                              ("network.json", json.dumps(result, indent=2) + "\n")):
+        temporary = args.out / (filename + ".tmp")
+        temporary.write_text(content)
+        temporary.replace(args.out / filename)
+
+
+if __name__ == "__main__":
+    main()

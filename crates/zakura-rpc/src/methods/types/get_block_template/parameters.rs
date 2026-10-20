@@ -1,16 +1,13 @@
 //! Parameter types for the `getblocktemplate` RPC.
 
-use derive_getters::Getters;
 use derive_new::new;
-use schemars::JsonSchema;
+use getset::Getters;
 
 use crate::methods::{hex_data::HexData, types::long_poll::LongPollId};
 
 /// Defines whether the RPC method should generate a block template or attempt to validate a block
 /// proposal.
-#[derive(
-    Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, JsonSchema,
-)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GetBlockTemplateRequestMode {
     /// Indicates a request for a block template.
@@ -22,7 +19,7 @@ pub enum GetBlockTemplateRequestMode {
 }
 
 /// Valid `capabilities` values that indicate client-side support.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GetBlockTemplateCapability {
     /// Long Polling support.
@@ -62,22 +59,14 @@ pub enum GetBlockTemplateCapability {
 /// The `data` field must be provided in `proposal` mode, and must be omitted in `template` mode.
 /// All other fields are optional.
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    serde::Deserialize,
-    serde::Serialize,
-    Default,
-    Getters,
-    new,
-    JsonSchema,
+    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default, Getters, new,
 )]
 pub struct GetBlockTemplateParameters {
     /// Defines whether the RPC method should generate a block template or attempt to
     /// validate block data, checking against all of the server's usual acceptance rules
     /// (excluding the check for a valid proof-of-work).
     #[serde(default)]
+    #[getset(get = "pub")]
     pub(crate) mode: GetBlockTemplateRequestMode,
 
     /// Must be omitted when `getblocktemplate` RPC is called in "template" mode (or when `mode` is omitted).
@@ -86,11 +75,13 @@ pub struct GetBlockTemplateParameters {
     /// Hex-encoded block data to be validated and checked against the server's usual acceptance rules
     /// (excluding the check for a valid proof-of-work).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) data: Option<HexData>,
 
     /// A list of client-side supported capability features
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[getset(get = "pub")]
     pub(crate) capabilities: Vec<GetBlockTemplateCapability>,
 
     /// An ID that delays the RPC response until the template changes.
@@ -98,12 +89,14 @@ pub struct GetBlockTemplateParameters {
     /// In Zebra, the ID represents the chain tip, max time, and mempool contents.
     #[serde(rename = "longpollid")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) long_poll_id: Option<LongPollId>,
 
     /// The workid for the block template.
     ///
     #[serde(rename = "workid")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) work_id: Option<String>,
 }
 

@@ -1,6 +1,6 @@
 //! Checks for nullifier uniqueness.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use tracing::trace;
 use zakura_chain::{ironwood, transaction::Transaction};
@@ -9,7 +9,7 @@ use crate::{
     error::DuplicateNullifierError,
     service::{
         finalized_state::ZakuraDb,
-        non_finalized_state::{Chain, SpendingTransactionId},
+        non_finalized_state::{Chain, SharedMap, SpendingTransactionId},
     },
     SemanticallyVerifiedBlock, ValidateContextError,
 };
@@ -183,7 +183,7 @@ pub(crate) fn tx_no_duplicates_in_chain(
 }
 
 fn add_to_non_finalized_chain_unique_with<'block, NullifierT, DuplicateNullifierErrorFn>(
-    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
+    chain_nullifiers: &mut SharedMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
     revealing_tx_id: SpendingTransactionId,
     duplicate_nullifier_error: DuplicateNullifierErrorFn,
@@ -235,7 +235,7 @@ where
 ///
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_to_non_finalized_chain_unique<'block, NullifierT>(
-    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
+    chain_nullifiers: &mut SharedMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
     revealing_tx_id: SpendingTransactionId,
 ) -> Result<(), ValidateContextError>
@@ -252,7 +252,7 @@ where
 
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
-    chain_nullifiers: &mut HashMap<ironwood::Nullifier, SpendingTransactionId>,
+    chain_nullifiers: &mut SharedMap<ironwood::Nullifier, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block ironwood::Nullifier>,
     revealing_tx_id: SpendingTransactionId,
 ) -> Result<(), ValidateContextError> {
@@ -288,10 +288,10 @@ pub(crate) fn add_ironwood_to_non_finalized_chain_unique<'block>(
 /// only shielded data that added this nullifier to this [`Chain`].
 #[tracing::instrument(skip(chain_nullifiers, shielded_data_nullifiers))]
 pub(crate) fn remove_from_non_finalized_chain<'block, NullifierT>(
-    chain_nullifiers: &mut HashMap<NullifierT, SpendingTransactionId>,
+    chain_nullifiers: &mut SharedMap<NullifierT, SpendingTransactionId>,
     shielded_data_nullifiers: impl IntoIterator<Item = &'block NullifierT>,
 ) where
-    NullifierT: std::fmt::Debug + Eq + std::hash::Hash + 'block,
+    NullifierT: Clone + std::fmt::Debug + Eq + std::hash::Hash + 'block,
 {
     for nullifier in shielded_data_nullifiers.into_iter() {
         trace!(?nullifier, "removing nullifier");

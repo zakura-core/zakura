@@ -1,0 +1,1314 @@
+---
+source: crates/zakura-rpc/src/server/tests/wire.rs
+expression: "transcript(addr, &cases, None).await"
+---
+=== 2.0 call
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== 2.0 call without params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== bitcoind 1.0 call
+POST content-type=Some("application/json")
+{"method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 63
+
+{"id":1,"result":{"standard_fee":400,"version":0},"error":null}
+
+=== lightwalletd 1.0 call
+POST content-type=Some("application/json")
+{"jsonrpc":"1.0","method":"getstandardfee","params":[],"id":"lwd"}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 83
+
+{"jsonrpc":"1.0","id":"lwd","result":{"standard_fee":400,"version":0},"error":null}
+
+=== 1.0 call without params
+POST content-type=Some("application/json")
+{"jsonrpc":"1.0","method":"getstandardfee","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== bitcoind call without params
+POST content-type=Some("application/json")
+{"method":"getstandardfee","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== unknown version
+POST content-type=Some("application/json")
+{"jsonrpc":"3.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== bitcoind error
+POST content-type=Some("application/json")
+{"method":"getblockcount","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 73
+
+{"id":1,"result":null,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== lightwalletd error
+POST content-type=Some("application/json")
+{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 89
+
+{"jsonrpc":"1.0","id":1,"result":null,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== string id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":"abc"}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 70
+
+{"jsonrpc":"2.0","id":"abc","result":{"standard_fee":400,"version":0}}
+
+=== escaped string id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":"a\"bc"}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 72
+
+{"jsonrpc":"2.0","id":"a\"bc","result":{"standard_fee":400,"version":0}}
+
+=== null id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":null}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== zero id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":0}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":0,"result":{"standard_fee":400,"version":0}}
+
+=== max id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":18446744073709551615}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 85
+
+{"jsonrpc":"2.0","id":18446744073709551615,"result":{"standard_fee":400,"version":0}}
+
+=== too large id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":18446744073709551616}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== negative id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":-1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== fractional id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1.5}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== exponent id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1e2}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== boolean id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":true}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== object id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":{}}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== array id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":[1]}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== notification
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[]}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== notification for unknown method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"nosuchmethod"}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== bitcoind notification
+POST content-type=Some("application/json")
+{"method":"getstandardfee","params":[]}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== unknown method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"nosuchmethod","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 77
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+
+=== empty method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 77
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+
+=== escaped method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== method case
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"GetStandardFee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 77
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+
+=== numeric method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":1,"params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== missing method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== unknown field
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1,"extra":true}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== duplicate field
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","method":"getblockcount","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== sync method
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== sync method with result
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"rpc.discover","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 48160
+
+<48160 bytes, FNV-1a e9a77c90c56c9f5a>
+
+=== extra params are ignored
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[1, 2],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== object params with no args
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":{},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== object params with unknown key
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":{"a":1},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== string params with no args
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":"x","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== null params with no args
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":null,"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== number params with no args
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":7,"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== positional param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":["tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 115
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":true,"address":"tmRGc4CD1UyUdbSJmTUzcB6oDqk4qUaHnnh","isscript":false}}
+
+=== invalid address
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":["abc"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== named param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{"address":"abc"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== named param with impl name
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{"raw_address":"abc"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== named param with extra key
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{"address":"abc","x":1},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== named param duplicated
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{"address":"abc","address":"def"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== missing param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== missing params member
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== null params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":null,"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== wrong param type
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":[1],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== null required param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":[null],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== extra positional param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":["abc", 2],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== string params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":"abc","id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== number params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":5,"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== empty named params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== spaced params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":[ "abc" , 1 ],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 51
+
+{"jsonrpc":"2.0","id":1,"result":{"isvalid":false}}
+
+=== bitcoind spaced empty params
+POST content-type=Some("application/json")
+{"method":"getblocksubsidy","params":[ ],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 73
+
+{"id":1,"result":null,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== 2.0 spaced empty params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[ ],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== unknown-version spaced empty params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[ ],"id":[]}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== optional param omitted
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== optional param null
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[null],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== optional param given
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[1],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 133
+
+{"jsonrpc":"2.0","id":1,"result":{"miner":6.25,"founders":0.0,"fundingstreamstotal":0.0,"lockboxtotal":0.0,"totalblocksubsidy":6.25}}
+
+=== optional param wrong type
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":["1"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== optional param negative
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":[-1],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== optional named params empty
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":{},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== optional named param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":{"height":1},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 133
+
+{"jsonrpc":"2.0","id":1,"result":{"miner":6.25,"founders":0.0,"fundingstreamstotal":0.0,"lockboxtotal":0.0,"totalblocksubsidy":6.25}}
+
+=== optional named param null
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblocksubsidy","params":{"height":null},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== method invalid params error
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"z_listunifiedreceivers","params":["abc"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 86
+
+{"jsonrpc":"2.0","id":1,"error":{"code":0,"message":"Address is not Bech32m encoded"}}
+
+=== two optional params
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":[1, "x"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== camelCase named param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getaddresstxids","params":{"request":{"addresses":[]}},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"No blocks in state"}}
+
+=== named param with wrong case
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"validateaddress","params":{"Address":"abc"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== lower camel case param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":{"numBlocks":"x"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== snake case param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":{"num_blocks":"x"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== param under unknown name and invalid param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":{"numblocks":"x","height":"y"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== param under two aliases
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":{"num_blocks":1,"numBlocks":2},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== underscore param by name
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"sendrawtransaction","params":{"raw_transaction_hex":"zz","_allow_high_fees":"bad"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== underscore param in snake case
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"sendrawtransaction","params":{"rawTransactionHex":"zz","allow_high_fees":"bad"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== underscore param in lower camel case
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"sendrawtransaction","params":{"raw_transaction_hex":"zz","allowHighFees":"bad"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== escaped param name
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getnetworksolps","params":{"num\u0042locks":"x"},"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== invalid second positional param
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblock","params":["1", "x"],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 71
+
+{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"Invalid params"}}
+
+=== positional params with trailing garbage
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getblock","params":["1", 1 x],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== unicode string id
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":"\u00e9t\u00e9"}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 72
+
+{"jsonrpc":"2.0","id":"été","result":{"standard_fee":400,"version":0}}
+
+=== batch
+POST content-type=Some("application/json")
+[{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1},{"jsonrpc":"2.0","method":"nosuchmethod","params":[],"id":2},{"jsonrpc":"2.0","method":"validateaddress","params":[],"id":3}]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 218
+
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}},{"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"Invalid params"}}]
+
+=== batch with notification and invalid entries
+POST content-type=Some("application/json")
+<240 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 463
+
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":6,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":"last","error":{"code":-1,"message":"No blocks in state"}}]
+
+=== empty batch
+POST content-type=Some("application/json")
+[]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 79
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== batch of notifications
+POST content-type=Some("application/json")
+[{"jsonrpc":"2.0","method":"getstandardfee"},{"jsonrpc":"2.0","method":"x"}]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 4
+
+null
+
+=== bitcoind batch
+POST content-type=Some("application/json")
+[{"method":"getstandardfee","params":[],"id":1}]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 78
+
+[{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}]
+
+=== batch of a number
+POST content-type=Some("application/json")
+[1]
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 81
+
+[{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}]
+
+=== largest batch
+POST content-type=Some("application/json")
+<63001 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 67001
+
+<67001 bytes, FNV-1a eec5e36e1cb32fdd>
+
+=== too large batch
+POST content-type=Some("application/json")
+<2003 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 131
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32010,"message":"The batch request was too large","data":"Exceeded max limit of 1000"}}
+
+=== empty body
+POST content-type=Some("application/json")
+
+---
+HTTP/1.1 400 Bad Request
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== whitespace body
+POST content-type=Some("application/json")
+  
+ 
+---
+HTTP/1.1 400 Bad Request
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== truncated object
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0"
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== truncated batch
+POST content-type=Some("application/json")
+[1,
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== not json
+POST content-type=Some("application/json")
+abc
+---
+HTTP/1.1 400 Bad Request
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== json string
+POST content-type=Some("application/json")
+"abc"
+---
+HTTP/1.1 400 Bad Request
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== json null
+POST content-type=Some("application/json")
+null
+---
+HTTP/1.1 400 Bad Request
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== leading whitespace
+POST content-type=Some("application/json")
+          {"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== long leading whitespace
+POST content-type=Some("application/json")
+<262 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== trailing data
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1} x
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== two objects
+POST content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== object without fields
+POST content-type=Some("application/json")
+{}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== invalid request with id
+POST content-type=Some("application/json")
+{"id":7}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 76
+
+{"jsonrpc":"2.0","id":7,"error":{"code":-32600,"message":"Invalid request"}}
+
+=== invalid request with string id
+POST content-type=Some("application/json")
+{"id":"x","method":5}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 78
+
+{"jsonrpc":"2.0","id":"x","error":{"code":-32600,"message":"Invalid request"}}
+
+=== invalid request with bad id
+POST content-type=Some("application/json")
+{"id":{},"method":5}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 75
+
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+
+=== GET
+GET content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 405 Method Not Allowed
+content-type: text/plain
+connection: close
+content-length: 50
+
+Used HTTP Method is not allowed. POST is required
+
+
+=== PUT
+PUT content-type=Some("application/json")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 405 Method Not Allowed
+content-type: text/plain
+connection: close
+content-length: 50
+
+Used HTTP Method is not allowed. POST is required
+
+
+=== OPTIONS
+OPTIONS content-type=Some("application/json")
+
+---
+HTTP/1.1 405 Method Not Allowed
+content-type: text/plain
+connection: close
+content-length: 50
+
+Used HTTP Method is not allowed. POST is required
+
+
+=== no content type
+POST content-type=None
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== text/plain
+POST content-type=Some("text/plain")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== text/plain charset
+POST content-type=Some("text/plain; charset=utf-8")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== application/json charset
+POST content-type=Some("application/json; charset=utf-8")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== application/json uppercase
+POST content-type=Some("Application/JSON")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== application/json-rpc
+POST content-type=Some("application/json-rpc")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== application/json with spaces
+POST content-type=Some("application/json ; charset=utf-8")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 415 Unsupported Media Type
+content-type: text/plain
+connection: close
+content-length: 81
+
+Supplied content type is not allowed. Content-Type: application/json is required
+
+
+=== form content type
+POST content-type=Some("application/x-www-form-urlencoded")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 415 Unsupported Media Type
+content-type: text/plain
+connection: close
+content-length: 81
+
+Supplied content type is not allowed. Content-Type: application/json is required
+
+
+=== xml content type
+POST content-type=Some("text/xml")
+{"jsonrpc":"2.0","method":"getstandardfee","params":[],"id":1}
+---
+HTTP/1.1 415 Unsupported Media Type
+content-type: text/plain
+connection: close
+content-length: 81
+
+Supplied content type is not allowed. Content-Type: application/json is required
+
+
+=== largest request
+POST content-type=Some("application/json")
+<4001024 bytes>
+---
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+connection: close
+content-length: 66
+
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+
+=== too large request
+POST content-type=Some("application/json")
+<4001025 bytes>
+---
+<connection closed>

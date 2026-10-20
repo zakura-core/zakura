@@ -4,7 +4,6 @@ use std::{collections::HashMap, ops::Deref};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use strum_macros::EnumIter;
 use zakura_chain::parameters::NetworkKind;
 use zcash_address::ZcashAddress;
 use zcash_transparent::coinbase::{MAX_COINBASE_HEIGHT_LEN, MAX_COINBASE_SCRIPT_LEN};
@@ -175,7 +174,7 @@ impl Serialize for ExtraCoinbaseData {
 }
 
 /// The desired address type for the `mining.miner_address` field in the config.
-#[derive(EnumIter, Eq, PartialEq, Default, Hash)]
+#[derive(Eq, PartialEq, Default, Hash)]
 pub enum MinerAddressType {
     /// A unified address, containing the components of all the other address types.
     Unified,

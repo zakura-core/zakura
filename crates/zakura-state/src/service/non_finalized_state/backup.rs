@@ -11,7 +11,7 @@ use hex::ToHex;
 use zakura_chain::{
     amount::{Amount, DeferredPoolBalanceChange},
     block::{self, Block, Height},
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 
 use crate::{
@@ -186,8 +186,7 @@ impl NonFinalizedBlockBackup {
 
         Ok(Self {
             block: Arc::new(
-                block_bytes
-                    .zcash_deserialize_into()
+                Block::zcash_deserialize_from_slice(&mut &block_bytes[..])
                     .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
             ),
             deferred_pool_balance_change: Amount::from_bytes(

@@ -1111,7 +1111,16 @@ impl<'a> GraphOverlay<'a> {
                     .suffix_after(anchor.work_coordinate())?,
                 tip.hash,
             );
-            if best.is_none_or(|(_, best_score)| score > best_score) {
+            let rank = |tip: Frontier, score: ChainScore| {
+                (
+                    score.suffix_work,
+                    Some(tip) == self.base_graph.preferred_header_tip,
+                    tip.hash.0,
+                )
+            };
+            if best
+                .is_none_or(|(best_tip, best_score)| rank(tip, score) > rank(best_tip, best_score))
+            {
                 best = Some((tip, score));
             }
         }

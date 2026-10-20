@@ -17,16 +17,26 @@
 //! stores the decoded message in peer-local state for the async runner to take
 //! and handle immediately after `Pipe::run_one`.
 
-use super::protocol::{DiscoveryMessage, MAX_DISCOVERY_MESSAGE_BYTES};
+use super::{
+    protocol::{
+        DiscoveryMessage, MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES, MSG_DISCOVERY_HELLO,
+        MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES,
+    },
+    wire::PEERS_MAX_BYTES,
+};
 use crate::zakura::{
-    Edge, Flow, Frame, Node, NodeKind, Pipe, PipeCx, PipeShape, SessionGuard, SinkReject,
-    ZakuraPeerId,
+    wire_codec::decode_frame, Edge, Flow, Frame, Node, NodeKind, Pipe, PipeCx, PipeShape,
+    SessionGuard, SinkReject, ZakuraPeerId,
 };
 
-/// Frame message type carrying a discovery payload (matches the native wire).
-pub(super) const DISCOVERY_FRAME_MESSAGE_TYPE: u16 = 1;
-
-const DISCOVERY_ALLOWED_FRAME_TYPES: &[u8] = &[1];
+/// The discovery discriminators, carried in the frame header.
+const DISCOVERY_ALLOWED_FRAME_TYPES: &[u8] = &[
+    MSG_DISCOVERY_HELLO,
+    MSG_DISCOVERY_GET_PEERS,
+    MSG_DISCOVERY_PEERS,
+    MSG_DISCOVERY_GET_SERVICES,
+    MSG_DISCOVERY_SERVICES,
+];
 
 /// Per-peer discovery local state.
 pub(super) struct DsLocal {
@@ -118,14 +128,14 @@ pub(super) fn discovery_pipe(peer_id: ZakuraPeerId) -> Pipe<DsLocal, DsEnv> {
         peer_id,
         DsLocal::new(),
         DsEnv,
-        // The transport already applies the connection-global count bucket.
-        // Discovery's service guard owns the stream-4 frame type boundary and
-        // the payload cap; protocol-message variants remain payload-level
-        // decode decisions because discovery uses one frame envelope type.
+        // The transport reader already checked each header against the
+        // stream's rows. For frames that arrive without a transport reader,
+        // the guard checks the type and the stream-wide cap, and
+        // `decode_frame` checks each row's bounds.
         SessionGuard::new(
             DISCOVERY_ALLOWED_FRAME_TYPES,
-            // `MAX_DISCOVERY_MESSAGE_BYTES` is 16 KiB, so it fits in `u32`.
-            MAX_DISCOVERY_MESSAGE_BYTES as u32,
+            // The largest row payload, `PEERS_MAX_BYTES`, fits in `u32`.
+            PEERS_MAX_BYTES as u32,
             None,
         ),
         run_inbound,
@@ -143,7 +153,7 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, DsLocal, DsEnv>, frame: Frame) -> 
 
     match &msg {
         DiscoveryMessage::Hello { .. }
-        | DiscoveryMessage::GetPeers { .. }
+        | DiscoveryMessage::GetPeers(_)
         | DiscoveryMessage::Peers { .. }
         | DiscoveryMessage::GetServices(_)
         | DiscoveryMessage::Services(_) => {
@@ -154,28 +164,16 @@ pub(super) fn run_inbound(cx: &mut PipeCx<'_, DsLocal, DsEnv>, frame: Frame) -> 
 }
 
 fn decode(frame: Frame) -> Flow<DiscoveryMessage> {
-    match decode_discovery_frame(&frame) {
+    match decode_frame::<DiscoveryMessage>(&frame) {
         Ok(msg) => Flow::Continue(msg),
         Err(error) => Flow::Reject(SinkReject::protocol(error)),
     }
 }
 
-/// Decodes a discovery message from a transport frame, rejecting a frame whose
-/// envelope is not a discovery payload.
-pub(super) fn decode_discovery_frame(frame: &Frame) -> Result<DiscoveryMessage, crate::BoxError> {
-    if frame.message_type != DISCOVERY_FRAME_MESSAGE_TYPE || frame.flags != 0 {
-        return Err(format!(
-            "unexpected discovery frame envelope (message_type={}, flags={})",
-            frame.message_type, frame.flags
-        )
-        .into());
-    }
-    DiscoveryMessage::decode(&frame.payload).map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zakura::{discovery::protocol::GetPeers, wire_codec::encode_frame};
 
     const MESSAGE_BRANCHES: [&str; 5] = ["Hello", "GetPeers", "Peers", "GetServices", "Services"];
 
@@ -188,66 +186,54 @@ mod tests {
     #[test]
     fn run_one_hands_off_decoded_message() {
         let mut pipe = discovery_pipe(peer());
-        let payload = DiscoveryMessage::GetPeers {
+        let frame = encode_frame(&DiscoveryMessage::GetPeers(GetPeers {
             limit: 8,
             wanted_services: Vec::new(),
             exclude_node_ids: Vec::new(),
-        }
-        .encode()
+        }))
         .expect("message encodes");
 
-        let flow = pipe.run_one(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
-            flags: 0,
-            payload,
-        });
+        let flow = pipe.run_one(frame);
 
         assert!(matches!(flow, Flow::Continue(())));
         assert!(
             matches!(
                 pipe.local_mut().take_decoded(),
-                Some(DiscoveryMessage::GetPeers { .. })
+                Some(DiscoveryMessage::GetPeers(_))
             ),
             "the decoded message is handed off to the async runner"
         );
     }
 
-    /// A `Peers` message whose relayed records all fail to decode is an empty sample,
-    /// not a protocol violation by the relaying peer.
+    /// A `Peers` message with a record that fails to decode is a protocol
+    /// violation, and nothing is handed off.
     #[test]
-    fn run_one_accepts_peers_with_only_undecodable_records() {
+    fn run_one_rejects_peers_with_an_undecodable_record() {
         let mut pipe = discovery_pipe(peer());
-        let mut payload = vec![super::super::protocol::MSG_DISCOVERY_PEERS];
         // One record: a 3-byte body that cannot hold a node id, then a 64-byte signature.
-        payload.extend_from_slice(&1u16.to_le_bytes());
+        let mut payload = 1u16.to_le_bytes().to_vec();
         payload.extend_from_slice(&3u32.to_le_bytes());
         payload.extend_from_slice(&[0xff; 3]);
         payload.extend_from_slice(&[0; 64]);
 
         let flow = pipe.run_one(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
+            message_type: u16::from(super::super::protocol::MSG_DISCOVERY_PEERS),
             flags: 0,
             payload,
         });
 
-        assert!(matches!(flow, Flow::Continue(())));
-        assert!(
-            matches!(
-                pipe.local_mut().take_decoded(),
-                Some(DiscoveryMessage::Peers { records }) if records.is_empty()
-            ),
-            "the empty sample is handed off like any other Peers message"
-        );
+        assert!(matches!(flow, Flow::Reject(SinkReject::Protocol(_))));
+        assert!(pipe.local_mut().take_decoded().is_none());
     }
 
-    /// A frame whose envelope type is not the discovery type is rejected by the
-    /// guard before decode, and nothing is handed off.
+    /// A frame whose type is not a discovery type is rejected by the guard
+    /// before decode, and nothing is handed off.
     #[test]
     fn run_one_rejects_non_discovery_frame_type() {
         let mut pipe = discovery_pipe(peer());
 
         let flow = pipe.run_one(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE + 1,
+            message_type: 6,
             flags: 0,
             payload: Vec::new(),
         });
@@ -263,7 +249,7 @@ mod tests {
         let mut pipe = discovery_pipe(peer());
 
         let flow = pipe.run_one(Frame {
-            message_type: DISCOVERY_FRAME_MESSAGE_TYPE,
+            message_type: u16::from(super::super::protocol::MSG_DISCOVERY_HELLO),
             flags: 1,
             payload: Vec::new(),
         });

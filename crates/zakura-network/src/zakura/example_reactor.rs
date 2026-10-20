@@ -13,14 +13,17 @@
 //! 2. **Layouts.** [`SINGLE`] carries every row on one stream. [`PAIRED`] moves
 //!    the request row to its own stream. Serving never waits in the reader, so
 //!    both layouts keep responses flowing; the pair remains a layout choice.
-//!    Both layouts carry the same rows, and a `const` check validates each one.
+//!    Both layouts carry the same rows. [`WATCH_ONLY`] keeps only `Status` and
+//!    the watch, as header sync version 9 keeps only `Status` and its
+//!    subscription, with no request row. A `const` check validates each layout.
 //! 3. **Codec.** [`ExampleMessage`] implements [`WireMessage`] as plain
-//!    `match`es from message type to payload item.
+//!    `match`es from message type to payload item. [`WatchMessage`] is the
+//!    family of `WATCH_ONLY`'s rows, on the same codec.
 //! 4. **Exchange.** `exchange` serves ranges through `Serve`, downloads them
 //!    through `Reservations`, and paces `Status` through `CadenceSender`. One
 //!    function bounds a range's response for both sides. It pushes watched
 //!    items through `Publications` and receives them through `Subscriptions`.
-//! 5. **Tests.** The generated suites run once for the message family and once
+//! 5. **Tests.** The generated suites run once for each message family and once
 //!    for each layout. The reactor writes no bound or header test of its own.
 
 use std::time::Duration;
@@ -224,8 +227,16 @@ pub(crate) const PAIRED: [Stream; 2] = [
     },
 ];
 
+/// `Status` and the watch alone. Its only exchange is a subscription.
+pub(crate) const WATCH_ONLY: [Stream; 1] = [Stream {
+    kind: 902,
+    messages: Some(WatchMessage::RULES),
+    ..EXAMPLE_STREAM
+}];
+
 const _: () = Stream::validate_layout(&SINGLE);
 const _: () = Stream::validate_layout(&PAIRED);
+const _: () = Stream::validate_layout(&WATCH_ONLY);
 
 /// A range of items: its first height and its item count.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -465,5 +476,39 @@ impl WireMessage for ExampleMessage {
             | message_type::RANGE_UNAVAILABLE => RangePayload::max_heap_bytes(payload_len),
             _ => 0,
         }
+    }
+}
+
+/// A message of [`WATCH_ONLY`]: `Status`, a watch update, a pushed item, or a
+/// watch's end. It reuses [`ExampleMessage`]'s codec and refuses every other
+/// row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WatchMessage(pub(crate) ExampleMessage);
+
+impl WireMessage for WatchMessage {
+    type Error = WireError;
+
+    const RULES: &'static [MessageRule] = &[STATUS, WATCH, PUSHED, WATCH_ENDED];
+
+    fn message_type(&self) -> u16 {
+        self.0.message_type()
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        self.0.encode_payload(out)
+    }
+
+    fn decode_payload(
+        message_type: u16,
+        reader: &mut BoundedReader<'_>,
+    ) -> Result<Self, WireError> {
+        if MessageRule::find(Self::RULES, message_type).is_none() {
+            return Err(WireError::UnknownMessageType(message_type));
+        }
+        ExampleMessage::decode_payload(message_type, reader).map(Self)
+    }
+
+    fn max_heap_bytes(message_type: u16, payload_len: usize) -> usize {
+        ExampleMessage::max_heap_bytes(message_type, payload_len)
     }
 }

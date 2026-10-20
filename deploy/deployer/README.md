@@ -12,9 +12,9 @@ rollback pattern generalized to a dynamic multi-node config.
 - Python 3.11+ (uses the stdlib `tomllib`; no third-party packages).
 - A working SSH key for every node's `ssh_string` (key-based auth; the tool runs
   ssh in `BatchMode`, so password prompts are not supported).
-- A local Rust toolchain + `protoc` to build `zakurad` (same as a normal workspace
-  build). Builds run on this host; the resulting binary is copied to every node,
-  so nodes must share the build host's architecture and a compatible glibc
+- A local Rust toolchain and the normal workspace build dependencies to build
+  `zakurad`. Builds run on this host; the resulting binary is copied to every
+  node, so nodes must share the build host's architecture and a compatible glibc
   (DigitalOcean Ubuntu x86_64 droplets do).
 
 ## Config
@@ -408,6 +408,11 @@ for new hosts.
   `[tracing] log_file` pointed at `log_file`.
 - Unit at `/etc/systemd/system/<service_name>.service` running
   `zakurad -c <config_path> start` with `Restart=always`.
+- Network sysctls from `deploy/sysctl/60-zakura-network.conf` at
+  `/etc/sysctl.d/60-zakura-network.conf`, loaded on every deploy. They raise
+  the UDP socket buffer caps so the 7 MiB buffers that zakurad's QUIC socket
+  requests are not clamped. zakurad picks them up at its next restart. The
+  release-state publisher skips this step.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).

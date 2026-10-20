@@ -5,6 +5,62 @@ use super::super::{
 use super::*;
 
 #[test]
+fn integrated_header_selection_preserves_the_first_selected_equal_work_tip() {
+    let (mut store, _) = TestStore::new(EngineMode::Integrated);
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = regtest_genesis_block().header.difficulty_threshold;
+    let a = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x31);
+    let b = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x32);
+    let first = if a.hash.0 < b.hash.0 { a } else { b };
+    synchronize_fixture(&mut store, first);
+    store.selected = path(&store.graph, first).unwrap();
+    store.metadata.frontiers.header_best = first;
+    store.metadata.header_best_score = store.graph.header_chain_score(first.hash).unwrap();
+    let engine = crate::HeaderChainEngine::from_test_state(
+        store.graph,
+        store.metadata,
+        store.selected,
+        store.verified,
+        store.aux,
+    )
+    .expect(
+        "hydration preserves the selected equal-work header rather than its hash-ranked sibling",
+    );
+    assert_eq!(engine.graph().select_best_header_chain().unwrap().0, first);
+    let overlay = crate::graph::GraphOverlay::new(engine.graph());
+    assert_eq!(overlay.select_best_header_chain().unwrap().0, first);
+    let other = if first == a { b } else { a };
+    let mut graph = engine.graph().clone();
+    graph
+        .add_eligibility_reason(
+            first.hash,
+            EligibilityReason::CheckpointConflict {
+                height: first.height,
+                expected: other.hash,
+            },
+        )
+        .unwrap();
+    assert_eq!(graph.select_best_header_chain().unwrap().0, other);
+    assert_eq!(
+        crate::graph::GraphOverlay::new(&graph)
+            .select_best_header_chain()
+            .unwrap()
+            .0,
+        other
+    );
+    let mut graph = engine.graph().clone();
+    let stronger = insert_verified_branch(&mut graph, other, 1, difficulty, 0x33);
+    assert_eq!(graph.select_best_header_chain().unwrap().0, stronger);
+    assert_eq!(
+        crate::graph::GraphOverlay::new(&graph)
+            .select_best_header_chain()
+            .unwrap()
+            .0,
+        stronger
+    );
+}
+
+#[test]
 fn malformed_full_state_paths_fail_with_exact_shape_errors() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

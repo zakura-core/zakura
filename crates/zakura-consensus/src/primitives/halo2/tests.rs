@@ -23,18 +23,18 @@ use std::{
     time::Duration,
 };
 
+use crate::primitives::batch_control::Batch;
+use crate::primitives::fallback::Fallback;
 use futures::future::join_all;
 use orchard::{
     builder::{Builder, BundleType},
     bundle::{Authorized, Bundle, BundleVersion, Flags, TxVersion},
     circuit::{OrchardCircuitVersion, ProvingKey},
-    keys::{FullViewingKey, Scope, SpendingKey},
+    keys::{Diversifier, FullViewingKey, Scope, SpendingKey},
     value::NoteValue,
     Anchor,
 };
 use tower::{Service, ServiceExt};
-use tower_batch_control::Batch;
-use tower_fallback::Fallback;
 use zakura_chain::{
     block::Block,
     parameters::NetworkUpgrade,
@@ -915,7 +915,8 @@ fn prove_shielding_bundle(pk: &ProvingKey) -> (Bundle<Authorized, ZatBalance>, S
     let mut rng = rand_10::rng();
 
     let sk = SpendingKey::from_bytes([7; 32]).expect("hard-coded test key bytes are valid");
-    let recipient = FullViewingKey::from(&sk).address_at(0u32, Scope::External);
+    let recipient =
+        FullViewingKey::from(&sk).address(Diversifier::from_bytes([0; 11]), Scope::External);
 
     let mut builder = Builder::new(
         BundleType::DEFAULT,

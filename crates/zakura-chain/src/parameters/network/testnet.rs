@@ -674,7 +674,7 @@ impl ConfiguredActivationHeights {
 
 /// Configurable checkpoints, either a path to a checkpoints file, a "default" keyword to indicate
 /// that Zebra should use the default Testnet checkpoints, or a list of block heights and hashes.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(untagged)]
 pub enum ConfiguredCheckpoints {
     /// A boolean indicating whether Zebra should use the default Testnet checkpoints.
@@ -683,6 +683,39 @@ pub enum ConfiguredCheckpoints {
     Path(std::path::PathBuf),
     /// Directly configured block heights and hashes to be used as Zebra's checkpoints.
     HeightsAndHashes(Vec<(block::Height, block::Hash)>),
+}
+
+impl<'de> serde::Deserialize<'de> for ConfiguredCheckpoints {
+    /// Dispatches on the value's type instead of buffering it like `#[serde(untagged)]`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CheckpointsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CheckpointsVisitor {
+            type Value = ConfiguredCheckpoints;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean, a checkpoints file path, or heights and hashes")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Default(value))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, path: &str) -> Result<Self::Value, E> {
+                Ok(ConfiguredCheckpoints::Path(path.into()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(ConfiguredCheckpoints::HeightsAndHashes)
+            }
+        }
+
+        deserializer.deserialize_any(CheckpointsVisitor)
+    }
 }
 
 impl Default for ConfiguredCheckpoints {

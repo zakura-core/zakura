@@ -1006,7 +1006,7 @@ fn advertisement(snapshot: &EngineSnapshot, session_id: u64, marker: u8) -> Adve
             suffix_cumulative_work: U256::from(u32::from(marker)),
             oldest_retained_height: block::Height(10),
             max_headers_per_response: 1_000,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: 1,
         },
@@ -1041,6 +1041,7 @@ fn request(
         common_ancestor: None,
         entries: Vec::new(),
         phase: HeaderTargetPhase::Receiving,
+        cursor: None,
         max_header_count: 1_000,
         tree_aux_schema: AuxSchema::None,
     }

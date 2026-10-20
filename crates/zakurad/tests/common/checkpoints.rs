@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 use tempfile::TempDir;
 
 use zakura_chain::{

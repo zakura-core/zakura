@@ -413,10 +413,11 @@ failure starts metadata repair immediately.
 
 The writer also runs a bounded sweep before waiting on a parked checkpoint block. Queued bodies
 cannot make this recovery pass yield. It examines the first boundary even if setup exhausts the
-time budget, then honors the budget before later heights. If authentication changes header state,
-the writer retries
-the parked block before waiting for more peer input. Without a state change it keeps waiting, so
-unchanged disputes do not cause a retry loop.
+time budget, then honors the budget before later heights. If either the committer records new
+failure evidence or the sweep changes header state, the writer retries the parked block before
+waiting for more peer input. A rejected delivery can expose a usable replacement even when the
+sweep cannot advance. Without a state change it keeps waiting, so unchanged disputes do not cause
+a retry loop.
 
 Three properties keep the committer authoritative:
 

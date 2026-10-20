@@ -270,12 +270,31 @@ async fn writer_keeps_bad_roots_pending_after_freezing() {
 /// A parked checkpoint must authenticate an available honest pair while more bodies are queued.
 #[tokio::test]
 async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
+    assert_writer_recovers_crossed_disputes(false).await;
+}
+
+/// Committed rejection evidence must retry the parked block even when the sweep cannot advance.
+#[tokio::test]
+async fn writer_recovers_crossed_disputes_without_following_metadata() {
+    assert_writer_recovers_crossed_disputes(true).await;
+}
+
+/// Recovers through the production loop with no further input after the crossed repair.
+async fn assert_writer_recovers_crossed_disputes(missing_following_metadata: bool) {
     let _init_guard = zakura_test::init();
     let mut fixture = Fixture::new();
     let blocked = Height(BODY_TIP + 2);
     let successor = Height(blocked.0 + 1);
-    fixture.insert_headers(None, Some((successor, Corruption::AuthDataRoot)));
-    let blocks = &fixture.chain[BODY_TIP as usize + 1..=successor.0 as usize];
+    fixture.insert_headers(
+        missing_following_metadata.then_some(Height(successor.0 + 1)),
+        Some((successor, Corruption::AuthDataRoot)),
+    );
+    let last = if missing_following_metadata {
+        blocked
+    } else {
+        successor
+    };
+    let blocks = &fixture.chain[BODY_TIP as usize + 1..=last.0 as usize];
     let (mut writer, responses) = RunningWriter::start_queued(&fixture, blocks);
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -314,8 +333,8 @@ async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
         ApplyResult::Committed
     ));
 
-    // No more peer input arrives. The parked block prevents an idle sweep, and the queued
-    // successor must also commit after recovery.
+    // No more peer input arrives. Missing H+2 metadata prevents the sweep from authenticating
+    // H+1, so the committer must reject its wrong row and retry H using the honest row.
     for (response, block) in responses.into_iter().zip(blocks) {
         let hash = tokio::time::timeout(Duration::from_secs(5), response)
             .await
@@ -324,6 +343,14 @@ async fn writer_recovers_crossed_disputes_without_an_idle_sweep() {
             .expect("the valid checkpoint block commits");
         assert_eq!(hash, block.hash());
     }
-    assert_eq!(fixture.finalized_state.vct_fast_count(), 3);
+    assert_eq!(
+        fixture.finalized_state.vct_fast_count(),
+        u64::from(last.0 - BODY_TIP)
+    );
+    if missing_following_metadata {
+        assert!(fixture
+            .authentications(successor)
+            .contains(&TestAuxStatus::Rejected));
+    }
     drop(writer);
 }

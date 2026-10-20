@@ -2748,6 +2748,7 @@ impl WriteBlockWorkerTask {
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
+                    let mut failure_evidence_committed = false;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),
                         error.vct_failure(),
@@ -2778,6 +2779,8 @@ impl WriteBlockWorkerTask {
                                     apply_result @ (ApplyResult::Committed
                                     | ApplyResult::NoChange(_)),
                                 )) => {
+                                    failure_evidence_committed =
+                                        matches!(apply_result, ApplyResult::Committed);
                                     let trigger = vct_failure_repair_trigger(&apply_result)
                                         .expect("committed or idempotent evidence has a trigger");
                                     attributed_failure_repair = failure_attribution
@@ -2841,11 +2844,13 @@ impl WriteBlockWorkerTask {
                             retry_cause,
                             ordered_block,
                         );
-                        if vct_authentication_sweeper.sweep_before_retry_wait(
+                        let sweep_changed = vct_authentication_sweeper.sweep_before_retry_wait(
                             finalized_state,
                             header_chain.as_ref(),
                             &mut vct_write_retry_manager,
-                        ) {
+                        );
+                        // Rejection can select a usable replacement before the sweep runs.
+                        if failure_evidence_committed || sweep_changed {
                             continue;
                         }
                         if let Some(exit) = wait_for_vct_retry(

@@ -1824,6 +1824,12 @@ pub enum ReadRequest {
     /// Returns the latest atomic committed header-engine snapshot after semantic handoff.
     HeaderChainSnapshot,
 
+    /// Read one retained header's body state and selected membership atomically.
+    HeaderChainBodyState {
+        /// Exact retained header to inspect.
+        hash: block::Hash,
+    },
+
     /// Returns the exact committed selected-header locator after semantic handoff.
     HeaderLocator {
         /// Retained by the blocking read even if its caller times out.
@@ -2173,6 +2179,7 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
+            ReadRequest::HeaderChainBodyState { .. } => "header_chain_body_state",
             ReadRequest::HeaderLocator { .. } => "header_locator",
             ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
             ReadRequest::VctRepairContext { .. } => "vct_repair_context",

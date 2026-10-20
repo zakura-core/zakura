@@ -166,9 +166,11 @@ impl TransitionInput {
             }
             Self::BodyEvidence { event, .. } => TransitionEvent::BodyEvidence(event.clone()),
             Self::BodySupplierDiscovered { event, .. } => {
-                TransitionEvent::BodySupplierDiscovered(*event)
+                TransitionEvent::BodySupplierDiscovered(event.clone())
             }
-            Self::OperatorBodyRetry { event, .. } => TransitionEvent::OperatorBodyRetry(*event),
+            Self::OperatorBodyRetry { event, .. } => {
+                TransitionEvent::OperatorBodyRetry(event.clone())
+            }
             Self::OperatorInvalidate { event, .. } => TransitionEvent::OperatorInvalidate(*event),
             Self::OperatorReconsider { event, .. } => TransitionEvent::OperatorReconsider(*event),
             Self::FullStateFinalized { event, .. } => {
@@ -466,7 +468,7 @@ mod tests {
             },
             InputCase {
                 name: "body supplier discovered",
-                event: TransitionEvent::BodySupplierDiscovered(supplier),
+                event: TransitionEvent::BodySupplierDiscovered(supplier.clone()),
                 input: TransitionInput::BodySupplierDiscovered {
                     expected_version: version,
                     event: supplier,
@@ -478,7 +480,7 @@ mod tests {
             },
             InputCase {
                 name: "operator body retry",
-                event: TransitionEvent::OperatorBodyRetry(retry),
+                event: TransitionEvent::OperatorBodyRetry(retry.clone()),
                 input: TransitionInput::OperatorBodyRetry {
                     expected_version: version,
                     event: retry,

@@ -1287,7 +1287,13 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         )
         .await;
     }
-    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(!registry.floor_has_preferred_unsaturated_server(
+        floor,
+        &slow.peer,
+        None,
+        false,
+        |_| true
+    ));
     assert!(futures::poll!(ranking.as_mut()).is_pending());
     deliver(
         &mut fast,
@@ -1297,7 +1303,13 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         },
     )
     .await;
-    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(registry.floor_has_preferred_unsaturated_server(
+        floor,
+        &slow.peer,
+        None,
+        false,
+        |_| true
+    ));
     assert!(futures::poll!(ranking.as_mut()).is_ready());
 }
 
@@ -1446,7 +1458,13 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
         }
     }
     assert_eq!(notifications, 1, "only the first stop is published");
-    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(!registry.floor_has_preferred_unsaturated_server(
+        floor,
+        &slow.peer,
+        None,
+        false,
+        |_| true
+    ));
 
     // The next admitted status publishes the reopened requester.
     let ranking = registry.subscribe_floor_ranking().notified();
@@ -1456,5 +1474,11 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     fast.flush_pending_status();
     assert!(fast.pending_status.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
-    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(registry.floor_has_preferred_unsaturated_server(
+        floor,
+        &slow.peer,
+        None,
+        false,
+        |_| true
+    ));
 }

@@ -723,14 +723,15 @@ fn mark_metadata_as_v2(metadata: &EngineMetadata) -> Vec<u8> {
 }
 
 fn mark_metadata_as_v3(metadata: &EngineMetadata) -> Vec<u8> {
-    let mut bytes = metadata.encode().expect("the metadata fixture encodes");
-    bytes[..4].copy_from_slice(&3_u32.to_be_bytes());
-    bytes
+    let mut metadata = metadata.clone();
+    metadata.disk_format = HeaderChainDiskVersion(3);
+    metadata.encode().expect("version-three metadata encodes")
 }
 
 fn mark_metadata_as_legacy_without_policy(metadata: &EngineMetadata, version: u32) -> Vec<u8> {
-    let mut bytes = metadata.encode().expect("the metadata fixture encodes");
-    bytes[..4].copy_from_slice(&version.to_be_bytes());
+    let mut metadata = metadata.clone();
+    metadata.disk_format = HeaderChainDiskVersion(version);
+    let mut bytes = metadata.encode().expect("legacy metadata encodes");
     // Version one and two wrote the network kind but no network policy digest.
     bytes.drain(6..38);
     bytes

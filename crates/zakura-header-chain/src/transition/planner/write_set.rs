@@ -110,13 +110,58 @@ pub(super) fn derive_plan(
         )),
     ))?;
     metadata.alarms.resource_stalled = retention.resource_stalled;
-    let selected_tip_node = graph
-        .view_header_node(selected_tip.hash)
-        .ok_or(GraphError::UnknownHeaderNode(selected_tip.hash))?;
-    metadata.alarms.header_best_body_unavailable = match &selected_tip_node.body_validation_state {
-        BodyValidationState::Unavailable(summary) if summary.alarmed => Some(*summary),
-        _ => None,
+    let previous_alarm = metadata.alarms.header_best_body_unavailable_at;
+    let selected_contains = |frontier: Frontier| {
+        selected
+            .binary_search_by_key(&frontier.height, |entry| entry.height)
+            .is_ok_and(|index| selected[index] == frontier)
     };
+    let previous_alarm_survives = previous_alarm.is_some_and(|frontier| {
+        selected_contains(frontier) && graph.view_header_node(frontier.hash).is_some_and(|node| {
+            matches!(&node.body_validation_state, BodyValidationState::Unavailable(summary) if summary.alarmed)
+        })
+    });
+    // A branch change or removal of the first alarm can reveal an unchanged later episode.
+    // Ordinary extensions examine only changed nodes and the newly selected suffix.
+    let rescan_selected = effect.invalidates_body_work()
+        || (previous_alarm.is_some() && !previous_alarm_survives)
+        || (previous_alarm.is_none() && metadata.alarms.header_best_body_unavailable.is_some());
+    let mut alarm = None;
+    let first_candidate = if rescan_selected {
+        0
+    } else {
+        selected.partition_point(|frontier| {
+            frontier.height <= snapshot_before_commit.frontiers.header_best.height
+        })
+    };
+    let candidates = selected[first_candidate..]
+        .iter()
+        .copied()
+        .chain(
+            put_nodes
+                .iter()
+                .map(|node| Frontier::new(node.height, node.hash)),
+        )
+        .chain(previous_alarm)
+        .filter(|frontier| selected_contains(*frontier));
+    for frontier in candidates {
+        let node = graph
+            .view_header_node(frontier.hash)
+            .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?;
+        if let BodyValidationState::Unavailable(summary) = &node.body_validation_state {
+            if summary.alarmed
+                && alarm.as_ref().is_none_or(
+                    |(earlier, _): &(Frontier, crate::BodyUnavailableSummary)| {
+                        frontier.height < earlier.height
+                    },
+                )
+            {
+                alarm = Some((frontier, summary.clone()));
+            }
+        }
+    }
+    metadata.alarms.header_best_body_unavailable_at = alarm.as_ref().map(|(frontier, _)| *frontier);
+    metadata.alarms.header_best_body_unavailable = alarm.map(|(_, summary)| summary);
     let alarm_changed = metadata.alarms != snapshot_before_commit.alarms;
     let changed = !put_nodes.is_empty()
         || !delete_nodes.is_empty()

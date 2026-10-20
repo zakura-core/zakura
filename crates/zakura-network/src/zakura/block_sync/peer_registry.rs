@@ -61,6 +61,8 @@ pub(super) struct Entry {
     pub(super) slots: SlotDiagnostics,
     /// Heights this peer may not re-take after a floor-watchdog cancellation.
     pub(super) floor_watchdog_avoid: BTreeMap<block::Height, Instant>,
+    /// Routine-local retry exclusions, mirrored for cross-peer floor ranking.
+    routine_retry_avoid: BTreeMap<block::Height, Instant>,
     /// Monotonic generation bumped each time a routine is (re)spawned for this
     /// peer. A cancelled routine's async `Drop` only clears outstanding when the
     /// generation still matches, so an old Drop racing a reset respawn cannot wipe
@@ -93,6 +95,7 @@ impl Entry {
             outstanding: BTreeMap::new(),
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
+            routine_retry_avoid: BTreeMap::new(),
             generation,
             conn_id: None,
             session_closed: false,
@@ -237,6 +240,7 @@ pub(super) struct PeerRegistry {
     floor_ranking_changed: Notify,
     session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
     body_retry_avoid: StdMutex<SupplierRetryState>,
+    body_retry_persisted: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
     body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
     /// Source of monotonically-increasing routine generations.
     next_generation: std::sync::atomic::AtomicU64,
@@ -255,6 +259,7 @@ impl PeerRegistry {
             floor_ranking_changed: Notify::new(),
             session_parks: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(SupplierRetryState::default()),
+            body_retry_persisted: StdMutex::new(HashMap::new()),
             body_retry_all: StdMutex::new(HashMap::new()),
             next_generation: std::sync::atomic::AtomicU64::new(1),
         }
@@ -338,6 +343,41 @@ impl PeerRegistry {
         }
     }
 
+    /// Replace durable retry gates without dropping newer process-local failures.
+    pub(super) fn set_persisted_body_retries(
+        &self,
+        scope: Option<zakura_header_chain::BodyWorkAuthority>,
+        episodes: impl IntoIterator<
+            Item = (
+                block::Hash,
+                Option<Vec<zakura_header_chain::SourceId>>,
+                Instant,
+            ),
+        >,
+    ) {
+        let mut all = self.body_retry_all_lock();
+        let mut sources = self
+            .body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned");
+        all.clear();
+        sources.clear();
+        let Some(scope) = scope else {
+            return;
+        };
+        for (hash, tried, until) in episodes {
+            let key = BodyRetryKey::new(scope, hash);
+            if let Some(tried) = tried {
+                for source in tried {
+                    sources.insert((source, key), until);
+                }
+            } else {
+                all.insert(key, until);
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn set_persisted_body_alarm(
         &self,
         alarm: Option<(zakura_header_chain::BodyWorkAuthority, block::Hash, Instant)>,
@@ -359,6 +399,10 @@ impl PeerRegistry {
             .entries
             .retain(|(_, candidate, _), _| *candidate != key);
         self.body_retry_all_lock().remove(&key);
+        self.body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned")
+            .retain(|(_, candidate), _| *candidate != key);
     }
 
     /// Retire old work while preserving alarms and incompatibility reports from newer work.
@@ -368,6 +412,12 @@ impl PeerRegistry {
     ) {
         let mut all_retries = self.body_retry_all_lock();
         let mut retries = self.body_retry_lock();
+        self.body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned")
+            .retain(|(_, key), _| {
+                current.is_some_and(|scope| key.body_work_epoch >= scope.body_work_epoch)
+            });
         retries.current = current;
         retries.entries =
             collect_supplier_retries(std::mem::take(&mut retries.entries).into_iter().filter_map(
@@ -444,6 +494,20 @@ impl PeerRegistry {
         now: Instant,
     ) -> bool {
         let source = zakura_header_chain::SourceId::from_digest(peer.digest());
+        if self
+            .body_retry_persisted
+            .lock()
+            .expect("persisted retry mutex is never poisoned")
+            .iter()
+            .any(|((candidate, key), until)| {
+                *candidate == source
+                    && key.hash == hash
+                    && key.body_work_epoch == scope.body_work_epoch
+                    && *until > now
+            })
+        {
+            return true;
+        }
         let all_retries = self.body_retry_all_lock();
         let retries = self.body_retry_lock();
         // Check each deadline instead of sweeping: this runs once per scheduled
@@ -490,7 +554,22 @@ impl PeerRegistry {
             .iter()
             .filter_map(|((candidate, _, _), until)| (*candidate == source).then_some(*until))
             .min();
-        all_deadline.into_iter().chain(source_deadline).min()
+        let persisted_deadline = {
+            let mut persisted = self
+                .body_retry_persisted
+                .lock()
+                .expect("persisted retry mutex is never poisoned");
+            persisted.retain(|_, until| *until > now);
+            persisted
+                .iter()
+                .filter_map(|((candidate, _), until)| (*candidate == source).then_some(*until))
+                .min()
+        };
+        all_deadline
+            .into_iter()
+            .chain(source_deadline)
+            .chain(persisted_deadline)
+            .min()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
@@ -868,6 +947,29 @@ impl PeerRegistry {
         }
     }
 
+    /// Publish bounded local retry exclusions before peers rank floor suppliers.
+    pub(super) fn publish_retry_avoid(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        retry_avoid: &BTreeMap<block::Height, Instant>,
+    ) {
+        let changed = {
+            let mut peers = self.lock();
+            let Some(entry) = peers.get_mut(peer) else {
+                return;
+            };
+            if entry.generation != generation || entry.routine_retry_avoid == *retry_avoid {
+                return;
+            }
+            entry.routine_retry_avoid.clone_from(retry_avoid);
+            true
+        };
+        if changed {
+            self.floor_ranking_changed.notify_waiters();
+        }
+    }
+
     /// Register before checking floor preference so an update cannot be missed
     /// between deferring to another peer and waiting for work.
     pub(super) fn subscribe_floor_ranking(&self) -> &Notify {
@@ -1054,7 +1156,7 @@ impl PeerRegistry {
     }
 
     /// Whether some peer other than `self_peer` is a preferred floor server for
-    /// `height`: servable for it, holding a free normal (non-bypass) slot, and a
+    /// `height`: servable for it, allowed to retry its body, holding a free normal slot, and a
     /// better floor server by RTprop. "Better" is strictly lower RTprop, or — when
     /// `allow_equal_score` — equal-or-lower.
     ///
@@ -1074,6 +1176,7 @@ impl PeerRegistry {
         self_peer: &ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
+        can_retry_body: impl Fn(&ZakuraPeerId) -> bool,
     ) -> bool {
         let peers = self.lock();
         // Rank registered peers from the same published snapshot. Mixing a fresh
@@ -1083,8 +1186,20 @@ impl PeerRegistry {
             .map(|entry| entry.slots.bbr_rtprop_ms)
             .unwrap_or(self_rtprop_ms)
             .unwrap_or(u64::MAX);
+        let now = Instant::now();
         peers.iter().any(|(peer, entry)| {
-            if peer == self_peer || !entry.can_serve_with_room(height) {
+            if peer == self_peer
+                || !entry.can_serve_with_room(height)
+                || entry
+                    .floor_watchdog_avoid
+                    .get(&height)
+                    .is_some_and(|until| *until > now)
+                || entry
+                    .routine_retry_avoid
+                    .get(&height)
+                    .is_some_and(|until| *until > now)
+                || !can_retry_body(peer)
+            {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
@@ -1141,6 +1256,18 @@ impl PeerRegistry {
         if let Some(entry) = peers.get_mut(peer) {
             entry.floor_watchdog_avoid.insert(height, until);
         }
+        drop(peers);
+        self.floor_ranking_changed.notify_waiters();
+    }
+
+    /// Withdraw a provisional floor exclusion that settlement decided not to charge.
+    pub(super) fn clear_floor_avoid(&self, peer: &ZakuraPeerId, height: block::Height) {
+        let mut peers = self.lock();
+        if let Some(entry) = peers.get_mut(peer) {
+            entry.floor_watchdog_avoid.remove(&height);
+        }
+        drop(peers);
+        self.floor_ranking_changed.notify_waiters();
     }
 
     /// Whether the floor watchdog still hard-excludes this peer from `height`.
@@ -1270,6 +1397,34 @@ mod floor_bias_tests {
     }
 
     #[test]
+    fn restored_prealarm_gates_exact_tried_supplier_and_preserves_new_local_failure() {
+        let reg = PeerRegistry::new();
+        let scope = super::super::test_work_scope();
+        let (failed, alternate) = (peer(1), peer(2));
+        let hash = block::Hash([8; 32]);
+        let other = block::Hash([9; 32]);
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(60);
+        let failed_source = zakura_header_chain::SourceId::from_digest(failed.digest());
+        let alternate_source = zakura_header_chain::SourceId::from_digest(alternate.digest());
+        reg.set_persisted_body_retries(
+            Some(scope),
+            [
+                (hash, Some(vec![failed_source]), until),
+                (other, None, until),
+            ],
+        );
+        assert!(reg.is_body_retry_avoided(&failed, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&alternate, scope, hash, now));
+        assert!(reg.is_body_retry_avoided(&alternate, scope, other, now));
+        reg.defer_body_retry([alternate_source], scope, hash, until);
+        reg.set_persisted_body_retries(Some(scope), [(hash, Some(vec![failed_source]), until)]);
+        assert!(reg.is_body_retry_avoided(&alternate, scope, hash, now));
+        assert!(!reg.is_body_retry_avoided(&alternate, scope, other, now));
+        assert_eq!(reg.next_body_retry_deadline(&failed, now), Some(until));
+    }
+
+    #[test]
     fn body_retry_backoff_is_exact_and_supplier_local() {
         let config = super::super::ZakuraBlockSyncConfig::default();
         let reg = PeerRegistry::new();
@@ -1312,10 +1467,7 @@ mod floor_bias_tests {
             until,
         );
         reg.retain_body_retry_scope(Some(zakura_header_chain::BodyWorkAuthority {
-            header: zakura_header_chain::HeaderWorkAuthority {
-                header_generation: zakura_header_chain::HeaderGeneration::new(10),
-                ..scope.header
-            },
+            body_work_epoch: scope.body_work_epoch.checked_next().unwrap(),
             ..scope
         }));
         assert!(!reg.is_body_retry_avoided(&failed, scope, hash, now));
@@ -1634,7 +1786,61 @@ mod floor_bias_tests {
     }
 
     #[test]
-    fn refreshing_the_retry_scope_rekeys_both_maps_without_a_suppression_gap() {
+    fn availability_regression_deferral_survives_compatible_authorities_before_refresh() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let peer = peer(1);
+        register(&reg, &config, &peer, 1, 1, 1);
+        let scope = super::super::test_work_scope();
+        let refreshed = zakura_header_chain::BodyWorkAuthority {
+            header: zakura_header_chain::HeaderWorkAuthority {
+                header_generation: zakura_header_chain::HeaderGeneration::new(10),
+                branch: zakura_header_chain::BranchId::new(
+                    scope.branch.anchor_hash,
+                    block::Hash([7; 32]),
+                ),
+            },
+            ..scope
+        };
+        let invalidated = zakura_header_chain::BodyWorkAuthority {
+            body_work_epoch: refreshed.body_work_epoch.checked_next().unwrap(),
+            ..refreshed
+        };
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        let until = now + std::time::Duration::from_secs(60);
+        for all_suppliers in [false, true] {
+            reg.retain_body_retry_scope(Some(scope));
+            reg.clear_body_retry(scope, hash);
+            if all_suppliers {
+                reg.set_persisted_body_alarm(Some((scope, hash, until)));
+            } else {
+                reg.defer_body_retry(
+                    [zakura_header_chain::SourceId::from_digest(peer.digest())],
+                    scope,
+                    hash,
+                    until,
+                );
+            }
+            assert!(reg.is_body_retry_avoided(&peer, scope, hash, now));
+            assert!(
+                reg.is_body_retry_avoided(&peer, refreshed, hash, now),
+                "compatible queued work must stay deferred before the sequencer refresh"
+            );
+            reg.refresh_body_retry_scope(refreshed);
+            assert!(
+                reg.is_body_retry_avoided(&peer, scope, hash, now),
+                "work already taken under the previous authority must remain deferred"
+            );
+            assert!(reg.is_body_retry_avoided(&peer, refreshed, hash, now));
+            assert!(!reg.is_body_retry_avoided(&peer, invalidated, hash, now));
+            reg.retain_body_retry_scope(Some(invalidated));
+            assert!(!reg.is_body_retry_avoided(&peer, scope, hash, now));
+        }
+    }
+
+    #[test]
+    fn compatible_retry_authorities_share_both_maps_without_a_suppression_gap() {
         let config = super::super::ZakuraBlockSyncConfig::default();
         let reg = std::sync::Arc::new(PeerRegistry::new());
         let peer = peer(1);
@@ -1654,6 +1860,7 @@ mod floor_bias_tests {
             ..scope
         };
 
+        reg.retain_body_retry_scope(Some(scope));
         reg.defer_body_retry(
             [zakura_header_chain::SourceId::from_digest([1; 32])],
             scope,
@@ -1669,16 +1876,12 @@ mod floor_bias_tests {
         );
         assert!(
             reg.is_body_retry_avoided(&peer, scope, hash, now),
-            "a pre-refresh work snapshot must still observe the cooldown"
+            "work already taken under the compatible authority remains deferred"
         );
         assert_eq!(reg.next_body_retry_deadline(&peer, now), Some(until));
 
-        // A routine reads the suppression maps while the sequencer rekeys them
-        // between two same-epoch authorities. The rewrite holds both guards, so
-        // the reader observes the complete map at one authority and never a
-        // window in which the deadline has vanished. Each map carries the
-        // deadline alone in its own phase, so neither can mask a gap in the other.
-        // Exercise production lookups with work snapshots on either side of a refresh.
+        // Check both actual production lookups while the compatible scope is retained.
+        // A hash-only inspection would miss a deadline stranded under another authority.
         for phase in ["per supplier", "all suppliers"] {
             reg.clear_body_retry(refreshed, hash);
             reg.refresh_body_retry_scope(scope);
@@ -1704,8 +1907,7 @@ mod floor_bias_tests {
                         assert!(
                             reg.is_body_retry_avoided(&peer, scope, hash, now)
                                 && reg.is_body_retry_avoided(&peer, refreshed, hash, now),
-                            "a concurrent rekey must never expose an unsuppressed body \
-                             through the {phase} map"
+                            "compatible authorities stay suppressed through the {phase} map"
                         );
                     }
                 }
@@ -1836,13 +2038,46 @@ mod floor_bias_tests {
         register_with_rtprop(&reg, &config, &b, 0, 1000, 3, Some(50));
         // In the bypass region (include_equal) A defers — B can take the floor through
         // its normal capacity, so A keeps its scarce bypass slot…
-        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, Some(50), true));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            Some(50),
+            true,
+            |_| true
+        ));
         // …but B itself has no other unsaturated server (A is saturated), so B bypasses.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            true
+            true,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn watchdog_excluded_peer_cannot_suppress_an_available_floor_supplier() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (slow, fast) = (peer(1), peer(2));
+        let height = block::Height(100);
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        reg.avoid_floor_height_until(&fast, height, Instant::now() + Duration::from_secs(60));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            height,
+            &slow,
+            Some(120),
+            false,
+            |_| true,
+        ));
+        reg.clear_floor_avoid(&fast, height);
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            height,
+            &slow,
+            Some(120),
+            false,
+            |_| true,
         ));
     }
 
@@ -1857,7 +2092,8 @@ mod floor_bias_tests {
             block::Height(100),
             &slow,
             Some(120),
-            false
+            false,
+            |_| true
         ));
 
         // The fast peer opens a new session and has not sent `Status` on it yet.
@@ -1872,7 +2108,8 @@ mod floor_bias_tests {
             block::Height(100),
             &slow,
             Some(120),
-            false
+            false,
+            |_| true
         ));
     }
 
@@ -1972,14 +2209,55 @@ mod floor_bias_tests {
             block::Height(100),
             &slow,
             Some(120),
-            false
+            false,
+            |_| true
         ));
         // …and the fastest carrier never defers, so the floor always lands somewhere.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &fast,
             Some(40),
-            false
+            false,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn a_deferred_fast_supplier_does_not_block_an_honest_floor_server() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (slow, fast) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        reg.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(fast.digest())],
+            scope,
+            hash,
+            now + Duration::from_secs(30),
+        );
+
+        for (requested, preferred) in [(hash, false), (block::Hash([9; 32]), true)] {
+            assert_eq!(
+                reg.floor_has_preferred_unsaturated_server(
+                    block::Height(100),
+                    &slow,
+                    Some(120),
+                    false,
+                    |peer| !reg.is_body_retry_avoided(peer, scope, requested, now),
+                ),
+                preferred
+            );
+        }
+        reg.clear_body_retry(scope, hash);
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false,
+            |peer| !reg.is_body_retry_avoided(peer, scope, hash, now),
         ));
     }
 
@@ -1997,13 +2275,15 @@ mod floor_bias_tests {
             block::Height(100),
             &a,
             Some(50),
-            false
+            false,
+            |_| true
         ));
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            false
+            false,
+            |_| true
         ));
     }
 
@@ -2021,9 +2301,16 @@ mod floor_bias_tests {
             block::Height(100),
             &fast,
             None,
-            false
+            false,
+            |_| true
         ));
-        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &slow, None, false));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            None,
+            false,
+            |_| true
+        ));
 
         // Refreshing either cached score must leave an eligible normal carrier.
         for expired_peer in [&fast, &slow] {
@@ -2033,7 +2320,13 @@ mod floor_bias_tests {
                 .slots
                 .bbr_rtprop_ms = None;
             assert!([&fast, &slow].into_iter().any(|peer| {
-                !reg.floor_has_preferred_unsaturated_server(block::Height(100), peer, None, false)
+                !reg.floor_has_preferred_unsaturated_server(
+                    block::Height(100),
+                    peer,
+                    None,
+                    false,
+                    |_| true,
+                )
             }));
         }
     }
@@ -2138,7 +2431,8 @@ mod floor_bias_tests {
             block::Height(100),
             &fast,
             Some(40),
-            true
+            true,
+            |_| true
         ));
     }
 
@@ -2149,7 +2443,13 @@ mod floor_bias_tests {
         let (a, b) = (peer(1), peer(2));
         register(&reg, &config, &a, 0, 1000, 0);
         register(&reg, &config, &b, 0, 1000, 0);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            |_| true
+        ));
     }
 
     #[test]
@@ -2161,7 +2461,13 @@ mod floor_bias_tests {
         // B has a free slot but only serves heights 500..=1000 — it cannot take a floor
         // request at height 100, so A must still bypass.
         register(&reg, &config, &b, 500, 1000, 3);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            |_| true
+        ));
     }
 
     #[test]

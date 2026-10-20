@@ -539,6 +539,9 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
     let clock = ManualClock(now);
     let selected = store.metadata.frontiers.header_best;
     let old = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now - chrono::Duration::minutes(12),
         attempts: 10,
         suppliers: 2,
@@ -548,10 +551,13 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
     };
     store
         .graph
-        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old.clone()))
         .expect("the selected fixture body exists");
-    store.metadata.alarms.header_best_body_unavailable = Some(old);
+    store.metadata.alarms.header_best_body_unavailable = Some(old.clone());
     let fresh = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now,
         attempts: 0,
         suppliers: old.suppliers,
@@ -564,7 +570,7 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
         event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
             hash: selected.hash,
             evidence: EvidenceId::from_digest([0xc3; 32]),
-            availability: fresh,
+            availability: fresh.clone(),
         }),
     };
 
@@ -589,7 +595,10 @@ fn operator_body_retry_restarts_the_selected_alarm_with_the_same_suppliers() {
             .header_node(selected.hash)
             .expect("the selected node remains retained")
             .body_validation_state,
-        BodyValidationState::Unavailable(fresh)
+        BodyValidationState::Unavailable(crate::BodyUnavailableSummary {
+            episode_id: Some(EvidenceId::from_digest([0xc3; 32])),
+            ..fresh.clone()
+        })
     );
     assert_eq!(
         plan.change_set.metadata.alarms.header_best_body_unavailable,
@@ -616,6 +625,9 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     let clock = ManualClock(now);
     let selected = store.metadata.frontiers.header_best;
     let old = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         attempts: 10,
         suppliers: 2,
         supplier_set_digest: [0x41; 32],
@@ -624,10 +636,13 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     };
     store
         .graph
-        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old))
+        .set_body_validation_state(selected.hash, BodyValidationState::Unavailable(old.clone()))
         .expect("the selected fixture body exists");
-    store.metadata.alarms.header_best_body_unavailable = Some(old);
+    store.metadata.alarms.header_best_body_unavailable = Some(old.clone());
     let fresh = crate::BodyUnavailableSummary {
+        supplier_ids: None,
+        tried_supplier_ids: None,
+        episode_id: None,
         started_at: now,
         attempts: 0,
         suppliers: 2,
@@ -635,7 +650,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
         alarmed: false,
         next_probe_at: now,
     };
-    let apply = |hash, availability| {
+    let apply = |hash, availability: crate::BodyUnavailableSummary| {
         apply_transition(
             &store,
             TransitionRequest {
@@ -643,7 +658,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
                 event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
                     hash,
                     evidence: EvidenceId::from_digest([0xc4; 32]),
-                    availability,
+                    availability: availability.clone(),
                 }),
             },
             &context(&config, &clock, Some(&Authority)),
@@ -651,7 +666,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
     };
 
     assert!(matches!(
-        apply(block::Hash([0x42; 32]), fresh),
+        apply(block::Hash([0x42; 32]), fresh.clone()),
         Err(TransitionFailure::InvalidEvidence(
             InvalidTransitionEvidence::Body(BodyViolation::InvalidOperatorRetryEpisode)
         ))
@@ -660,8 +675,11 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
         apply(
             selected.hash,
             crate::BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 1,
-                ..fresh
+                ..fresh.clone()
             }
         ),
         Err(TransitionFailure::InvalidEvidence(
@@ -679,7 +697,7 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
             event: TransitionEvent::OperatorBodyRetry(crate::OperatorBodyRetry {
                 hash: selected.hash,
                 evidence: EvidenceId::from_digest([0xc4; 32]),
-                availability: fresh,
+                availability: fresh.clone(),
             }),
         },
         &context(&config, &clock, Some(&Authority)),

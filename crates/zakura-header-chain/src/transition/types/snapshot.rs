@@ -17,10 +17,10 @@ pub struct HeaderChainDiskVersion(pub u32);
 impl HeaderChainDiskVersion {
     /// Current durable header-chain schema version.
     ///
-    /// Version five retains the validation context for the widest averaging window, so a
-    /// release that reads only the version-four context rejects the format instead of
-    /// failing on the row count.
-    pub const CURRENT: Self = Self(5);
+    /// Version six persists bounded supplier identities, retry history, reset identity,
+    /// and the exact selected-path alarm frontier. Legacy version-five rows remain
+    /// readable and are upgraded lazily without discarding their retry episode.
+    pub const CURRENT: Self = Self(6);
 }
 
 /// Persistent externally visible engine alarms.
@@ -30,6 +30,8 @@ pub struct AlarmSet {
     pub resource_stalled: bool,
     /// The selected branch has exhausted its current body suppliers/retry episode.
     pub header_best_body_unavailable: Option<BodyUnavailableSummary>,
+    /// Exact first selected-path header whose current availability episode is alarmed.
+    pub header_best_body_unavailable_at: Option<Frontier>,
     /// Deterministic body validation refuted an imported headers-only trust pin.
     pub migrated_pin_refuted: Option<Frontier>,
 }
@@ -69,6 +71,9 @@ pub struct BodySizeHintBatch {
 pub struct CommittedHeaderChainView {
     /// Exact durable header-chain snapshot.
     pub snapshot: EngineSnapshot,
+    /// Current retained selected-path availability episodes, including episodes below the alarm threshold.
+    pub body_unavailable:
+        std::sync::Arc<std::collections::HashMap<block::Hash, (Frontier, BodyUnavailableSummary)>>,
     /// Process-local selected-lineage epoch.
     pub body_work_epoch: BodyWorkEpoch,
     /// Process-local correction revision. Consumers refresh queued estimates when it changes.
@@ -81,13 +86,32 @@ pub struct CommittedHeaderChainView {
 
 impl CommittedHeaderChainView {
     /// Construct a committed view at one body-work epoch.
-    pub const fn new(snapshot: EngineSnapshot, body_work_epoch: BodyWorkEpoch) -> Self {
+    pub fn new(snapshot: EngineSnapshot, body_work_epoch: BodyWorkEpoch) -> Self {
         Self {
             snapshot,
+            body_unavailable: std::sync::Arc::new(std::collections::HashMap::new()),
             body_work_epoch,
             body_size_hint_revision: 0,
             body_size_hint_batches: None,
         }
+    }
+    /// Return the current episode for an exact selected hash, including pre-alarm episodes.
+    /// Legacy/manual views without the derived map can expose their persisted alarm instead;
+    /// before exact alarm frontiers were recorded, that alarm only described the selected tip.
+    pub fn body_unavailable_for(&self, hash: block::Hash) -> Option<&BodyUnavailableSummary> {
+        self.body_unavailable
+            .get(&hash)
+            .map(|(_, summary)| summary)
+            .or_else(|| {
+                let alarm_at = self
+                    .snapshot
+                    .alarms
+                    .header_best_body_unavailable_at
+                    .unwrap_or(self.snapshot.frontiers.header_best);
+                (alarm_at.hash == hash)
+                    .then_some(self.snapshot.alarms.header_best_body_unavailable.as_ref())
+                    .flatten()
+            })
     }
 }
 

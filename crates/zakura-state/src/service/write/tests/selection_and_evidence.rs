@@ -227,6 +227,9 @@ fn production_body_unavailability_writer_authenticates_exact_evidence() {
             evidence: EvidenceId::from_digest([0x72; 32]),
             kind: TransientBodyFailureKind::Storage,
             availability: BodyUnavailableSummary {
+                supplier_ids: None,
+                tried_supplier_ids: None,
+                episode_id: None,
                 attempts: 1,
                 suppliers: 1,
                 alarmed: false,

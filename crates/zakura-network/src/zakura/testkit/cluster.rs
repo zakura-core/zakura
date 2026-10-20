@@ -137,7 +137,7 @@ mod tests {
         zakura::trace::block_sync_trace as bs_trace,
         zakura::{
             block_sync::{
-                MAX_BS_FRAME_BYTES, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+                MAX_BS_FRAME_BYTES, MSG_BS_BLOCK, MSG_BS_STATUS, ZAKURA_CAP_BLOCK_SYNC_REGULATED,
                 ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC,
             },
             BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta,
@@ -1229,6 +1229,7 @@ mod tests {
         hostile
             .send_frame_header_with_declared_payload_len(
                 ZAKURA_STREAM_BLOCK_SYNC,
+                MSG_BS_STATUS.into(),
                 MAX_BS_FRAME_BYTES,
             )
             .await?;
@@ -1263,11 +1264,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_stream6_declared_payload_above_old_cap_is_not_raw_oversize(
-    ) -> Result<(), BoxError> {
+    async fn native_stream6_max_block_frame_is_not_raw_oversize() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "native_stream6_declared_payload_above_old_cap_is_not_raw_oversize",
+            "native_stream6_max_block_frame_is_not_raw_oversize",
             false,
         )?;
         let mut cluster = ZakuraTestCluster::new();
@@ -1287,18 +1287,24 @@ mod tests {
         })
         .await?;
 
-        let old_max_bs_message_bytes =
+        // Before per-message rules, stream 6 capped a whole frame at the block size plus one
+        // envelope byte, so a maximum-size `Block` frame was dropped at the transport gate.
+        let old_max_bs_frame_bytes =
             u32::try_from(block::MAX_BLOCK_BYTES).expect("max block bytes fits in u32") + 1;
-        let regression_payload_len = old_max_bs_message_bytes + 1;
+        let max_block_payload_len = old_max_bs_frame_bytes;
+        let max_block_frame_len =
+            max_block_payload_len + u32::try_from(FRAME_HEADER_BYTES).expect("header fits u32");
         assert!(
-            regression_payload_len < MAX_BS_FRAME_BYTES,
-            "test payload must exceed the old stream-6 cap but fit the new one"
+            old_max_bs_frame_bytes < max_block_frame_len
+                && max_block_frame_len <= MAX_BS_FRAME_BYTES,
+            "a maximum-size Block frame must exceed the old stream-6 cap but fit the new one"
         );
 
         hostile
             .send_frame_header_with_declared_payload_len(
                 ZAKURA_STREAM_BLOCK_SYNC,
-                regression_payload_len,
+                MSG_BS_BLOCK.into(),
+                max_block_payload_len,
             )
             .await?;
 
@@ -1322,8 +1328,8 @@ mod tests {
             });
         assert!(
             !raw_oversize,
-            "payloads above the old stream-6 cap but below the new cap must reach \
-             the stream payload reader instead of being dropped as raw frame.oversize"
+            "a maximum-size Block frame must reach the stream payload reader instead of \
+             being dropped as raw frame.oversize"
         );
 
         hostile.shutdown().await;

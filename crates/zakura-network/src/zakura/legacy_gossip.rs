@@ -164,6 +164,8 @@ pub(crate) fn frame_payload_bounds(
 }
 
 const LEGACY_GOSSIP_INBOUND_QUEUE: usize = 256;
+const LEGACY_GOSSIP_OUTBOUND_BYTES: usize = 32 * 1024 * 1024;
+const LEGACY_GOSSIP_PEER_OUTBOUND_BYTES: usize = 4 * 1024 * 1024;
 const LEGACY_REQUEST_IN_FLIGHT_LIMIT: usize = 64;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1497,14 +1499,27 @@ struct LegacyGossipOutboundState {
     churn: HashMap<ZakuraPeerId, GossipSessionChurn>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct LegacyGossipOutbound {
     state: Arc<StdMutex<LegacyGossipOutboundState>>,
     latest_block: Arc<StdMutex<Option<block::Hash>>>,
+    node_bytes: Arc<Semaphore>,
+}
+
+impl Default for LegacyGossipOutbound {
+    /// Share one outgoing gossip byte allowance across every registered session.
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            latest_block: Default::default(),
+            node_bytes: Arc::new(Semaphore::new(LEGACY_GOSSIP_OUTBOUND_BYTES)),
+        }
+    }
 }
 
 impl LegacyGossipOutbound {
-    fn insert(&self, session: LegacyGossipPeerSession) -> bool {
+    fn insert(&self, mut session: LegacyGossipPeerSession) -> bool {
+        session.node_bytes = self.node_bytes.clone();
         let mut state = self
             .state
             .lock()
@@ -1748,6 +1763,8 @@ pub struct LegacyGossipPeerSession {
     conn_id: ZakuraConnId,
     session_id: u64,
     send: FramedSend,
+    peer_bytes: Arc<Semaphore>,
+    node_bytes: Arc<Semaphore>,
 }
 
 impl LegacyGossipPeerSession {
@@ -1762,6 +1779,8 @@ impl LegacyGossipPeerSession {
             conn_id,
             session_id,
             send,
+            peer_bytes: Arc::new(Semaphore::new(LEGACY_GOSSIP_PEER_OUTBOUND_BYTES)),
+            node_bytes: Arc::new(Semaphore::new(LEGACY_GOSSIP_OUTBOUND_BYTES)),
         }
     }
 
@@ -1792,14 +1811,45 @@ impl LegacyGossipPeerSession {
     }
 
     fn try_send_gossip_frame(&self, frame: LegacyGossipFrame) -> Result<(), OrderedSendError> {
+        let slot = self
+            .send
+            .try_reserve_guarded()
+            .map_err(|error| match error {
+                super::transport::GuardedReserveError::Closed => OrderedSendError::Closed,
+                _ => OrderedSendError::Full,
+            })?;
+        let wire_bytes = match &frame {
+            LegacyGossipFrame::AdvertiseBlock(_) => 32,
+            LegacyGossipFrame::AdvertiseTransactionIds(ids) => {
+                ids.iter().fold(9usize, |bytes, id| {
+                    bytes.saturating_add(match id {
+                        UnminedTxId::Legacy(_) => 36,
+                        UnminedTxId::Witnessed(_) => 68,
+                    })
+                })
+            }
+        };
+        // Cover payload Vec growth plus the transport's encoded copy during writing.
+        let charge = u32::try_from(wire_bytes.saturating_mul(3).saturating_add(128))
+            .map_err(|_| OrderedSendError::Full)?;
+        let peer = self
+            .peer_bytes
+            .clone()
+            .try_acquire_many_owned(charge)
+            .map_err(|_| OrderedSendError::Full)?;
+        let node = self
+            .node_bytes
+            .clone()
+            .try_acquire_many_owned(charge)
+            .map_err(|_| OrderedSendError::Full)?;
         let frame = frame
             .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        match self.send.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
-            Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
-        }
+        slot.send(
+            frame,
+            super::transport::FrameGuard::new(Arc::new((peer, node))),
+        );
+        Ok(())
     }
 }
 
@@ -2807,7 +2857,8 @@ impl ZakuraService for LegacyGossipSink {
         let peer_id = peer.id.clone();
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
-        let session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, session_id, send);
+        let mut session = LegacyGossipPeerSession::new(peer_id.clone(), conn_id, session_id, send);
+        session.node_bytes = outbound.node_bytes.clone();
 
         if !outbound.insert(session.clone()) {
             return;
@@ -7827,5 +7878,45 @@ mod tests {
         assert!(frames
             .iter()
             .all(|frame| frame.payload.capacity() == RESPONSE_CHUNK_HEADER_BYTES + 1));
+    }
+    /// Fanout shares a byte allowance across peers and retains it through blocked writes.
+    #[tokio::test]
+    async fn gossip_fanout_bytes_remain_charged_through_write() -> Result<(), BoxError> {
+        let outbound = LegacyGossipOutbound::default();
+        let ids = vec![legacy_tx_id(1); usize::try_from(MAX_TX_INV_IN_SENT_MESSAGE)?];
+        let mut receivers = Vec::new();
+        let mut admitted = 0;
+        for index in 0..32u8 {
+            let (send, recv) = super::super::transport::worker_framed_channel(256);
+            let mut session =
+                LegacyGossipPeerSession::new(ZakuraPeerId::new(vec![index; 32])?, 0, 0, send);
+            session.node_bytes = outbound.node_bytes.clone();
+            if session
+                .try_send_advertise_transaction_ids(ids.clone())
+                .is_ok()
+            {
+                admitted += 1;
+            }
+            assert!(matches!(
+                session.try_send_advertise_transaction_ids(ids.clone()),
+                Err(OrderedSendError::Full)
+            ));
+            receivers.push(recv);
+        }
+        assert!(admitted > 0 && admitted < receivers.len());
+        let available = outbound.node_bytes.available_permits();
+        let queued = receivers[0].recv().await.unwrap();
+        let mut write =
+            Box::pin(queued.write_with(|_| std::future::pending::<Result<(), BoxError>>()));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        assert_eq!(outbound.node_bytes.available_permits(), available);
+        drop(write);
+        assert!(outbound.node_bytes.available_permits() > available);
+        drop(receivers);
+        assert_eq!(
+            outbound.node_bytes.available_permits(),
+            LEGACY_GOSSIP_OUTBOUND_BYTES
+        );
+        Ok(())
     }
 }

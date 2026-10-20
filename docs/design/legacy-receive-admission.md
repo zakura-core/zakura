@@ -16,6 +16,8 @@ Responder encoding also stops at 8,192 frames per response. Chunk iteration allo
 
 Requesters use the same 8,192-frame local ceiling rather than assuming eight chunks per item. A legal full block can therefore cross smaller negotiated frames. Exhausting the framing allowance resets the exchange without marking conforming chunks as unsolicited.
 
+Outgoing gossip reserves 4 MiB per session and 32 MiB node-wide before encoding. The reservation covers payload-vector growth and the transport encoding copy, and remains held while queued or writing. Slow recipients cause best-effort gossip drops at capacity rather than multiplying the per-peer frame queue into gigabytes.
+
 ## Validation
 
 The partial-payload test uses actual QUIC connections with default flow-control windows. Eight identities each hold eight almost-complete 1 MiB transaction frames. A ninth stream per identity and a ninth identity are refused without cancelling their connections. A separate Ping/Pong exchange progresses while all 64 inbound slots are occupied. Cancellation releases the slots.

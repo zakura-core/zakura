@@ -882,3 +882,63 @@ async fn zip234_rejection_releases_parent_waits_and_allows_retry() -> Result<(),
     assert_eq!(timeout(STRANDED_AFTER, descendant).await??, hash2);
     Ok(())
 }
+
+/// A child that fails while its honest parent waits for parent info must not release the parent.
+///
+/// After a recovery reset, the state still reports the rejected copy of the parent until the
+/// honest copy reaches it, so the child of the honest parent can fail first.
+#[tokio::test(flavor = "multi_thread")]
+async fn zip234_child_failure_keeps_its_waiting_parent() -> Result<(), Report> {
+    use zakura_chain::{block_info::BlockInfo, serialization::ZcashDeserializeInto};
+
+    let _init_guard = zakura_test::init();
+    let (network, block0, block1) = super::zip234_crossing_fixture()?;
+    let block2 = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .as_slice()
+        .zcash_deserialize_into::<Arc<Block>>()?;
+    let hash0 = block0.hash();
+    let hash1 = block1.hash();
+    let hash2 = block2.hash();
+    let child_failed = Arc::new(tokio::sync::Notify::new());
+    let state = tower::service_fn(move |request| {
+        let child_failed = child_failed.clone();
+        async move {
+            match request {
+                zs::Request::AwaitBlockInfo(hash) if hash == hash0 => {
+                    // Answer after the child's failure reaches the verifier.
+                    child_failed.notified().await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(zs::Response::BlockInfo(Some(BlockInfo::default())))
+                }
+                zs::Request::AwaitBlockInfo(hash) => {
+                    child_failed.notify_one();
+                    Err(zs::AwaitBlockInfoError::Rejected { hash }.into())
+                }
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    Ok(zs::Response::Committed(block.hash))
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(Some((block::Height(0), hash0)))),
+                zs::Request::CheckCheckpointHandoff => Ok(zs::Response::CheckpointHandoffChecked),
+                _ => unreachable!("the verifier only uses checkpoint requests"),
+            }
+        }
+    });
+    let mut verifier = CheckpointVerifier::from_list(
+        [(block::Height(0), hash0), (block::Height(2), hash2)],
+        &network,
+        Some((block::Height(0), hash0)),
+        crate::transaction::boxed_state(state),
+    )?;
+    let parent = submit(&mut verifier, block1).await;
+    let child = submit(&mut verifier, block2).await;
+
+    let error = timeout(STRANDED_AFTER, child)
+        .await?
+        .expect_err("the child saw a rejected parent");
+    assert!(
+        error.is_descendant_of_auth_commitment_mismatch(),
+        "{error:?}"
+    );
+    assert_eq!(timeout(STRANDED_AFTER, parent).await??, hash1);
+    Ok(())
+}

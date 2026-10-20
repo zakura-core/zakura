@@ -3078,6 +3078,12 @@ who = "Alfredo Garcia <alfredo@zfnd.org>"
 criteria = "safe-to-deploy"
 delta = "0.103.10 -> 0.103.12"
 
+[[audits.rustls-webpki]]
+who = "Claude Fable 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.103.15 -> 0.103.16"
+notes = "The only functional change adds an explicit SPKI distrust list to path building: ChainOptions gains a distrusted_spkis slice checked by byte equality against each candidate path head and trust anchor, rejecting matches with the new CertDistrusted error, and EndEntityCert::verify_for_usage wires in the built-in list of the eight eMudhra emSign G3 intermediate keys whose compromise was published in October 2026. The check is fail-closed: it can only reject chains that previously verified, never accept new ones, so even wrong blocklist contents could not grant trust. New tests cover distrusting the root, an intermediate, the leaf, and a cross-signed reissue of the same key. No unsafe code, no build script, and no dependency changes."
+
 [[audits.rustversion]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -4188,6 +4194,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.8"
 notes = "Reviewed all packaged source, manifest, generator and verification tests, and 118 static Mozilla trust anchors. Each embedded PEM hash matches its declared fingerprint and the webpki-root-certs DER corpus; every encoded subject and SubjectPublicKeyInfo also matches the corresponding certificate DER. Unsafe code is forbidden, there is no build script or runtime ambient capability, and the library target passed."
+
+[[audits.webpki-roots]]
+who = "Claude Fable 5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.8 -> 1.0.10"
+notes = "Data-only Mozilla root store update, now 120 anchors: 1.0.9 adds the Telia EC and RSA TLS Root CA v3 and SECOM TLS ECC and RSA Root CA 2024 anchors and removes Atos TrustedRoot 2011; 1.0.10 removes the emSign ECC Root CA - G3 anchor after the October 2026 eMudhra intermediate CA compromise. An independent script confirmed that every embedded subject and SubjectPublicKeyInfo in both versions matches the certificate in its adjacent PEM comment, and no code outside the anchor data changed apart from raising the Rust version to 1.71. Unsafe code is still forbidden and there is no build script or runtime ambient capability."
 
 [[audits.which]]
 who = "OpenAI Codex <noreply@openai.com>"

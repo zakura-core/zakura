@@ -23,6 +23,13 @@
 //! requester's bookkeeping has a node-wide bound. A full pool makes the node
 //! wait before its next request; it never acts against a peer.
 //!
+//! The live reservations of each request type also owe the peer a total:
+//! each one's frames left plus its ending, and its bytes left. A reader that
+//! queues frames before the handler claims them charges each against its
+//! request type's total with [`Reservations::admit`], so the queue never holds
+//! more answers to a request type than this node requested. A frame past it is
+//! a violation that no conformant responder can cause.
+//!
 //! [`Reservations::reserve_fenced`] makes a reservation own its request's
 //! [`Exchange`]. The ending's claim ends the exchange. Dropping the map at the
 //! session's end drops the rest, and a started one closes the connection.
@@ -37,6 +44,8 @@
 //! | No time passing removes a reservation | `no_time_passing_removes_a_reservation` |
 //! | Reserving is local and bounded | `reserving_is_local_and_bounded` |
 //! | The precheck needs a live reservation with room | `the_precheck_needs_a_live_reservation_with_room` |
+//! | Queued frames never exceed what the live reservations owe | `queued_frames_never_exceed_what_the_live_reservations_owe` |
+//! | One request type's debt never admits another's answers | `one_request_type_never_admits_answers_owed_to_another` |
 //! | A refused precheck allocates no decoded body | `a_refused_precheck_allocates_no_decoded_body` |
 //! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
 //! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
@@ -161,9 +170,29 @@ pub(crate) enum ClaimRefused {
         /// Payload bytes the reservation allows.
         bytes: u64,
     },
+    /// Queued frames exceed what the live reservations still owe.
+    #[error("queued responses exceed the {frames} frames and {bytes} bytes still owed")]
+    OverOwed {
+        /// Frames, endings included, the live reservations still owe.
+        frames: u64,
+        /// Payload bytes the live reservations still owe.
+        bytes: u64,
+    },
 }
 
 impl ClaimRefused {
+    /// The transport reader's rejection for a refused header.
+    pub(crate) fn frame_rejection(self) -> FrameRejection {
+        match self {
+            Self::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
+            Self::OverOwed { frames, bytes } => FrameRejection::AboveOwed { frames, bytes },
+            Self::Unsolicited { .. }
+            | Self::WrongRequest { .. }
+            | Self::WrongRole { .. }
+            | Self::OverFrames { .. } => FrameRejection::Unsolicited,
+        }
+    }
+
     /// Stable metric and trace label.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -172,6 +201,7 @@ impl ClaimRefused {
             Self::WrongRole { .. } => "wrong_role",
             Self::OverFrames { .. } => "over_frames",
             Self::OverBytes { .. } => "over_bytes",
+            Self::OverOwed { .. } => "over_owed",
         }
     }
 }
@@ -211,6 +241,33 @@ impl Reservation {
     fn remaining_bytes(&self) -> u64 {
         self.cap.bytes - self.bytes
     }
+
+    /// The frames left, its ending included, and the bytes left.
+    fn owed(&self) -> Load {
+        Load {
+            frames: u64::from(self.cap.frames - self.frames) + 1,
+            bytes: self.remaining_bytes(),
+        }
+    }
+}
+
+/// Response frames and payload bytes.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct Load {
+    frames: u64,
+    bytes: u64,
+}
+
+impl Load {
+    fn add(&mut self, other: Self) {
+        self.frames += other.frames;
+        self.bytes += other.bytes;
+    }
+
+    fn sub(&mut self, other: Self) {
+        self.frames -= other.frames;
+        self.bytes -= other.bytes;
+    }
 }
 
 /// Live response reservations for one session, keyed by `K`.
@@ -219,9 +276,38 @@ pub(crate) struct Reservations<K> {
     rules: &'static [MessageRule],
     cap: usize,
     live: HashMap<K, Reservation>,
-    /// Remaining payload bytes of the live reservations, as a multiset per
-    /// request type, so the precheck finds the largest in `O(log n)`.
-    remaining: HashMap<u16, BTreeMap<u64, usize>>,
+    /// The live reservations of each request type. A family has few request
+    /// types, so a row stays once created.
+    rows: HashMap<u16, Row>,
+}
+
+/// The live reservations of one request type.
+#[derive(Debug, Default)]
+struct Row {
+    /// Remaining payload bytes of each live reservation, as a multiset, so
+    /// the precheck finds the largest in `O(log n)`.
+    remaining: BTreeMap<u64, usize>,
+    /// What the live reservations still owe, summed.
+    owed: Load,
+    /// Frames a reader admitted that the handler has not yet taken.
+    queued: Load,
+}
+
+impl Row {
+    fn track(&mut self, remaining: u64) {
+        *self.remaining.entry(remaining).or_default() += 1;
+    }
+
+    fn untrack(&mut self, remaining: u64) {
+        let count = self
+            .remaining
+            .get_mut(&remaining)
+            .expect("every live reservation is tracked under its remaining bytes");
+        *count -= 1;
+        if *count == 0 {
+            self.remaining.remove(&remaining);
+        }
+    }
 }
 
 impl<K: Eq + Hash> Reservations<K> {
@@ -235,7 +321,7 @@ impl<K: Eq + Hash> Reservations<K> {
             rules,
             cap,
             live: HashMap::new(),
-            remaining: HashMap::new(),
+            rows: HashMap::new(),
         }
     }
 
@@ -304,7 +390,9 @@ impl<K: Eq + Hash> Reservations<K> {
             _entry: entry,
             exchange,
         };
-        self.track(request_type, reservation.remaining_bytes());
+        let row = self.rows.entry(request_type).or_default();
+        row.track(reservation.remaining_bytes());
+        row.owed.add(reservation.owed());
         self.live.insert(key, reservation);
         Ok(())
     }
@@ -317,7 +405,10 @@ impl<K: Eq + Hash> Reservations<K> {
         let Some(reservation) = self.live.remove(key) else {
             return false;
         };
-        self.untrack(reservation.request, reservation.remaining_bytes());
+        shrink_after_peak(&mut self.live);
+        let row = self.row(reservation.request);
+        row.untrack(reservation.remaining_bytes());
+        row.owed.sub(reservation.owed());
         true
     }
 
@@ -340,15 +431,24 @@ impl<K: Eq + Hash> Reservations<K> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<(), ClaimRefused> {
-        let Some(MessageRole::Response { request, .. }) =
-            MessageRule::find(self.rules, message_type).map(|row| row.role)
-        else {
-            return Err(ClaimRefused::WrongRole { message_type });
-        };
+        self.prechecked_request(message_type, payload_len)
+            .map(|_| ())
+    }
+
+    /// Check a response header as [`Self::precheck`] does, and return the
+    /// request type it answers.
+    fn prechecked_request(
+        &self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<u16, ClaimRefused> {
+        let request = self
+            .request_of(message_type)
+            .ok_or(ClaimRefused::WrongRole { message_type })?;
         let Some((&largest, _)) = self
-            .remaining
+            .rows
             .get(&request)
-            .and_then(|remaining| remaining.last_key_value())
+            .and_then(|row| row.remaining.last_key_value())
         else {
             return Err(ClaimRefused::Unsolicited { message_type });
         };
@@ -356,7 +456,78 @@ impl<K: Eq + Hash> Reservations<K> {
         if payload_len as u64 > largest {
             return Err(ClaimRefused::OverBytes { bytes: largest });
         }
+        Ok(request)
+    }
+
+    /// The request type that a `message_type` response answers.
+    fn request_of(&self, message_type: u16) -> Option<u16> {
+        match MessageRule::find(self.rules, message_type)?.role {
+            MessageRole::Response { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// The live reservations of `request`, which has one.
+    fn row(&mut self, request: u16) -> &mut Row {
+        self.rows
+            .get_mut(&request)
+            .expect("every live reservation's request type has a row")
+    }
+
+    /// Check a response header as [`Self::precheck`] does, and charge it to
+    /// the queue until [`Self::take_admitted`] releases it.
+    ///
+    /// The queue holds at most what the live reservations of the answered
+    /// request type still owe, so a reader that admits frames ahead of the
+    /// handler never buffers more answers to a request type than this node
+    /// requested. A conformant responder sends at most that.
+    pub(crate) fn admit(
+        &mut self,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(), ClaimRefused> {
+        let request = self.prechecked_request(message_type, payload_len)?;
+        let row = self.row(request);
+        // Widening usize to u64 is lossless on supported targets.
+        let frame = Load {
+            frames: 1,
+            bytes: payload_len as u64,
+        };
+        if row.queued.frames + frame.frames > row.owed.frames
+            || row.queued.bytes + frame.bytes > row.owed.bytes
+        {
+            metrics::counter!("zakura.p2p.reservation.refused", "reason" => "over_owed")
+                .increment(1);
+            return Err(ClaimRefused::OverOwed {
+                frames: row.owed.frames,
+                bytes: row.owed.bytes,
+            });
+        }
+        row.queued.add(frame);
         Ok(())
+    }
+
+    /// Release an admitted `message_type` frame when the handler takes it,
+    /// before its claim.
+    pub(crate) fn take_admitted(&mut self, message_type: u16, payload_len: usize) {
+        let row = self
+            .request_of(message_type)
+            .and_then(|request| self.rows.get_mut(&request));
+        // Widening usize to u64 is lossless on supported targets.
+        let frame = Load {
+            frames: 1,
+            bytes: payload_len as u64,
+        };
+        debug_assert!(
+            row.as_ref().is_some_and(|row| {
+                row.queued.frames >= frame.frames && row.queued.bytes >= frame.bytes
+            }),
+            "only an admitted frame is taken"
+        );
+        if let Some(row) = row {
+            row.queued.frames = row.queued.frames.saturating_sub(frame.frames);
+            row.queued.bytes = row.queued.bytes.saturating_sub(frame.bytes);
+        }
     }
 
     /// Charge a frame that does not end the exchange, before decode.
@@ -368,8 +539,9 @@ impl<K: Eq + Hash> Reservations<K> {
     ) -> Result<Claimed, ClaimRefused> {
         let (request, before, after, abandoned) =
             self.charge(key, message_type, payload_len, false)?;
-        self.untrack(request, before);
-        self.track(request, after);
+        let row = self.row(request);
+        row.untrack(before);
+        row.track(after);
         Ok(Claimed { abandoned })
     }
 
@@ -381,11 +553,12 @@ impl<K: Eq + Hash> Reservations<K> {
         payload_len: usize,
     ) -> Result<Ended, ClaimRefused> {
         let (request, before, _, _) = self.charge(key, message_type, payload_len, true)?;
-        self.untrack(request, before);
+        self.row(request).untrack(before);
         let mut reservation = self
             .live
             .remove(key)
             .expect("charge found this reservation and nothing removed it since");
+        shrink_after_peak(&mut self.live);
         if let Some(exchange) = &mut reservation.exchange {
             exchange.end();
         }
@@ -421,7 +594,7 @@ impl<K: Eq + Hash> Reservations<K> {
         let reservation = self
             .live
             .get_mut(key)
-            .ok_or(refused(ClaimRefused::Unsolicited { message_type }))?;
+            .ok_or_else(|| refused(ClaimRefused::Unsolicited { message_type }))?;
         if request != reservation.request {
             return Err(refused(ClaimRefused::WrongRequest { message_type }));
         }
@@ -441,44 +614,27 @@ impl<K: Eq + Hash> Reservations<K> {
                 bytes: reservation.cap.bytes,
             }));
         }
+        let owed_before = reservation.owed();
         reservation.bytes += len;
         if !ends {
             reservation.frames += 1;
         }
-        if reservation.abandoned {
+        // An ending removes the reservation, so only a frame still owes.
+        let owed_after = (!ends).then(|| reservation.owed());
+        let abandoned = reservation.abandoned;
+        let row = self.row(request);
+        row.owed.sub(owed_before);
+        if let Some(owed_after) = owed_after {
+            row.owed.add(owed_after);
+        }
+        if abandoned {
             metrics::counter!(
                 "zakura.p2p.reservation.unwanted",
                 "message_type" => message_type.to_string(),
             )
             .increment(1);
         }
-        Ok((request, before, before - len, reservation.abandoned))
-    }
-
-    fn track(&mut self, request: u16, remaining: u64) {
-        *self
-            .remaining
-            .entry(request)
-            .or_default()
-            .entry(remaining)
-            .or_default() += 1;
-    }
-
-    fn untrack(&mut self, request: u16, remaining: u64) {
-        let by_request = self
-            .remaining
-            .get_mut(&request)
-            .expect("every live reservation is tracked under its request type");
-        let count = by_request
-            .get_mut(&remaining)
-            .expect("every live reservation is tracked under its remaining bytes");
-        *count -= 1;
-        if *count == 0 {
-            by_request.remove(&remaining);
-        }
-        if by_request.is_empty() {
-            self.remaining.remove(&request);
-        }
+        Ok((request, before, before - len, abandoned))
     }
 
     /// Live reservations.
@@ -529,10 +685,7 @@ impl<K: Eq + Hash + std::fmt::Debug + Send + 'static> ResponsePrecheck for Share
     fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
         self.lock()
             .precheck(message_type, payload_len)
-            .map_err(|refused| match refused {
-                ClaimRefused::OverBytes { bytes } => FrameRejection::AboveReservation { bytes },
-                _ => FrameRejection::Unsolicited,
-            })
+            .map_err(ClaimRefused::frame_rejection)
     }
 }
 
@@ -620,5 +773,14 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+}
+
+/// Return a drained map's peak capacity, so the pool, not each session's
+/// busiest moment, bounds retained bookkeeping. Halving at a quarter keeps
+/// removals amortized O(1).
+pub(crate) fn shrink_after_peak<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 4 * map.len().max(16) {
+        map.shrink_to(2 * map.len());
     }
 }

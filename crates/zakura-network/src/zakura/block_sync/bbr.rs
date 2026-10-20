@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use super::{
     config::{CwndUnit, ZakuraBlockSyncConfig},
@@ -24,12 +27,21 @@ const BBR_RELIABILITY_EWMA_ALPHA: f64 = 0.1;
 /// **and re-filtered at read time against the caller's `now`**, so a min/max never
 /// reflects a sample past the horizon even during a quiet (no-completion) period — a peer
 /// that went fast then stopped completing must not keep a stale-low RTprop / stale-high
-/// BtlBw. Existence checks are O(1) so the fill loop can test cold-start state without
-/// scanning the whole window.
+/// BtlBw.
+///
+/// Each filter keeps only the samples that can still become its extremum: a sample is
+/// dropped once a newer sample is at least as extreme, because the newer sample outlives
+/// it. Both candidate lists stay in time order with monotone values, so the oldest fresh
+/// candidate is the extremum. A peer delivers thousands of samples per horizon, and the
+/// routine reads the filters on every delivery, so neither insert nor read scans the
+/// window.
 #[derive(Clone, Debug)]
 struct WindowedSamples {
     horizon: Duration,
-    samples: Vec<(Instant, f64)>,
+    /// Candidates for `min`, with values increasing from front to back.
+    minima: VecDeque<(Instant, f64)>,
+    /// Candidates for `max`, with values decreasing from front to back.
+    maxima: VecDeque<(Instant, f64)>,
     newest_at: Option<Instant>,
 }
 
@@ -37,14 +49,27 @@ impl WindowedSamples {
     fn new(horizon: Duration) -> Self {
         Self {
             horizon,
-            samples: Vec::new(),
+            minima: VecDeque::new(),
+            maxima: VecDeque::new(),
             newest_at: None,
         }
     }
 
     fn observe(&mut self, now: Instant, value: f64) {
-        self.samples.push((now, value));
-        self.newest_at = Some(self.newest_at.map_or(now, |newest| newest.max(now)));
+        // Callers pass a monotonic clock. Clamping keeps the candidate lists in time
+        // order if a caller ever passes an older `now`.
+        let at = self.newest_at.map_or(now, |newest| newest.max(now));
+        self.newest_at = Some(at);
+        if !value.is_nan() {
+            while self.minima.back().is_some_and(|(_, back)| *back >= value) {
+                self.minima.pop_back();
+            }
+            self.minima.push_back((at, value));
+            while self.maxima.back().is_some_and(|(_, back)| *back <= value) {
+                self.maxima.pop_back();
+            }
+            self.maxima.push_back((at, value));
+        }
         self.prune(now);
     }
 
@@ -52,7 +77,11 @@ impl WindowedSamples {
     /// filter again so a stale extremum is never returned during a quiet bad period.
     fn prune(&mut self, now: Instant) {
         if let Some(cutoff) = now.checked_sub(self.horizon) {
-            self.samples.retain(|(at, _)| *at >= cutoff);
+            for candidates in [&mut self.minima, &mut self.maxima] {
+                while candidates.front().is_some_and(|(at, _)| *at < cutoff) {
+                    candidates.pop_front();
+                }
+            }
         }
     }
 
@@ -60,19 +89,17 @@ impl WindowedSamples {
     /// rather than trusting the last prune, so a quiet-period read cannot return an
     /// aged-out sample.
     fn min(&self, now: Instant) -> Option<f64> {
-        self.fresh_values(now).reduce(f64::min)
+        self.oldest_fresh(&self.minima, now)
     }
 
     /// The windowed maximum over samples no older than `now - horizon`. See [`Self::min`].
     fn max(&self, now: Instant) -> Option<f64> {
-        self.fresh_values(now).reduce(f64::max)
+        self.oldest_fresh(&self.maxima, now)
     }
 
     /// Whether this window has at least one sample no older than `now - horizon`.
     ///
-    /// `min` and `max` need the full scan to calculate an extremum, but the cold-start
-    /// gate only needs existence. Track the newest sample so that gate stays O(1) in the
-    /// peer fill loop.
+    /// The cold-start gate only needs existence, so it reads the newest sample time.
     fn has_fresh_sample(&self, now: Instant) -> bool {
         let Some(newest_at) = self.newest_at else {
             return false;
@@ -81,12 +108,11 @@ impl WindowedSamples {
             .is_none_or(|cutoff| newest_at >= cutoff)
     }
 
-    fn fresh_values(&self, now: Instant) -> impl Iterator<Item = f64> + '_ {
-        let cutoff = now.checked_sub(self.horizon);
-        self.samples
-            .iter()
-            .filter(move |(at, _)| cutoff.is_none_or(|c| *at >= c))
-            .map(|(_, value)| *value)
+    fn oldest_fresh(&self, candidates: &VecDeque<(Instant, f64)>, now: Instant) -> Option<f64> {
+        let first_fresh = now.checked_sub(self.horizon).map_or(0, |cutoff| {
+            candidates.partition_point(|(at, _)| *at < cutoff)
+        });
+        candidates.get(first_fresh).map(|(_, value)| *value)
     }
 }
 
@@ -957,6 +983,39 @@ mod bbr_tests {
     }
 
     #[test]
+    fn windowed_samples_match_a_linear_scan() {
+        // The candidate lists must return the same extremum as scanning every sample
+        // in the horizon, for reads at the insert time and during quiet periods.
+        let horizon = Duration::from_millis(500);
+        let mut window = WindowedSamples::new(horizon);
+        let mut all: Vec<(Instant, f64)> = Vec::new();
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed >> 33
+        };
+        for _ in 0..5_000 {
+            now += Duration::from_millis(next() % 40);
+            let value = (next() % 1_000) as f64;
+            window.observe(now, value);
+            all.push((now, value));
+            let read_at = now + Duration::from_millis(next() % 700);
+            for at in [now, read_at] {
+                let cutoff = at.checked_sub(horizon);
+                let fresh = || {
+                    all.iter()
+                        .filter(move |(sampled, _)| cutoff.is_none_or(|c| *sampled >= c))
+                        .map(|(_, value)| *value)
+                };
+                assert_eq!(window.min(at), fresh().reduce(f64::min));
+                assert_eq!(window.max(at), fresh().reduce(f64::max));
+            }
+        }
+    }
+
+    #[test]
     fn windowed_estimators_drop_stale_samples_at_read_time() {
         // Finding #2: min/max filters are evaluated against the caller's `now`, so once
         // every sample has aged past the 10 s horizon the estimators read `None` even
@@ -1031,7 +1090,6 @@ mod bbr_tests {
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
-                charged_for_liveness: true,
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: block::Height(0),
@@ -1138,7 +1196,6 @@ mod bbr_tests {
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
-                charged_for_liveness: true,
                 request: BlockRangeRequest {
                     owner: super::super::test_work_owner(),
                     start_height: height,
@@ -1330,7 +1387,13 @@ mod bbr_tests {
         );
 
         // Drain the byte queue to the floor (4 KB <= 8 KB): the hold timer starts now...
-        window.outstanding.truncate(1);
+        while window.outstanding.len() > 1 {
+            let last = window
+                .outstanding
+                .last_key()
+                .expect("the window is not empty");
+            window.outstanding.remove(last);
+        }
         let t4 = t3 + Duration::from_millis(10);
         deliver(&mut window, t4);
         assert_eq!(

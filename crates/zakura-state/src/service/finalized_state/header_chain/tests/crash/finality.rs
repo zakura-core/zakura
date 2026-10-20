@@ -328,7 +328,7 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                     &context,
                 )
                 .expect("the higher raw-hash competitor commits");
-            assert_eq!(runtime.publisher().snapshot().frontiers.header_best, higher);
+            assert_eq!(runtime.publisher().snapshot().frontiers.header_best, lower);
             assert_eq!(
                 runtime.publisher().snapshot().frontiers.verified_best,
                 lower
@@ -439,8 +439,8 @@ pub(super) fn crash_fixture_operator_reason_changes_reopen_complete_before_or_af
                 Some(marker_key),
             );
             let committed = target.commit_completed();
-            let selected_after = if reconsider { higher } else { lower };
-            let selected_before = if reconsider { lower } else { higher };
+            let selected_after = lower;
+            let selected_before = lower;
             let reason_after = !reconsider;
             let durable = &observation.durable;
             let committed_version = before

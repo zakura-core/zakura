@@ -150,13 +150,7 @@ impl PartialEq for BlockAdmission {
 }
 
 impl Eq for BlockAdmission {}
-use crate::{
-    error::{
-        CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, PreciousError,
-        ReconsiderError,
-    },
-    CommitSemanticallyVerifiedError,
-};
+use crate::{error::LayeredStateError, CommitSemanticallyVerifiedError};
 
 /// Identify a spend by a transparent outpoint or revealed nullifier.
 ///
@@ -1029,94 +1023,6 @@ impl MappedRequest for CommitSemanticallyVerifiedBlockRequest {
     }
 }
 
-/// Commit a checkpointed block to the state
-///
-/// See the [`crate`] documentation and [`Request::CommitCheckpointVerifiedBlock`] for details.
-#[allow(dead_code)]
-pub struct CommitCheckpointVerifiedBlockRequest(pub CheckpointVerifiedBlock);
-
-impl MappedRequest for CommitCheckpointVerifiedBlockRequest {
-    type MappedResponse = block::Hash;
-    type Error = CommitCheckpointVerifiedError;
-
-    fn map_request(self) -> Request {
-        Request::CommitCheckpointVerifiedBlock(self.0)
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::Committed(hash) => hash,
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
-/// Request to invalidate a block in the state.
-///
-/// See the [`crate`] documentation and [`Request::InvalidateBlock`] for details.
-#[allow(dead_code)]
-pub struct InvalidateBlockRequest(pub block::Hash);
-
-impl MappedRequest for InvalidateBlockRequest {
-    type MappedResponse = block::Hash;
-    type Error = InvalidateError;
-
-    fn map_request(self) -> Request {
-        Request::InvalidateBlock(self.0)
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::Invalidated(hash) => hash,
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
-/// Request to prefer a block over other chain tips with the same work.
-///
-/// See the [`crate`] documentation and [`Request::PreciousBlock`] for details.
-#[allow(dead_code)]
-pub struct PreciousBlockRequest(pub block::Hash);
-
-impl MappedRequest for PreciousBlockRequest {
-    type MappedResponse = ();
-    type Error = PreciousError;
-
-    fn map_request(self) -> Request {
-        Request::PreciousBlock(self.0)
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::Precious => (),
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
-/// Request to reconsider a previously invalidated block and re-commit it to the state.
-///
-/// See the [`crate`] documentation and [`Request::ReconsiderBlock`] for details.
-#[allow(dead_code)]
-pub struct ReconsiderBlockRequest(pub block::Hash);
-
-impl MappedRequest for ReconsiderBlockRequest {
-    type MappedResponse = Vec<block::Hash>;
-    type Error = ReconsiderError;
-
-    fn map_request(self) -> Request {
-        Request::ReconsiderBlock(self.0)
-    }
-
-    fn map_response(response: Response) -> Self::MappedResponse {
-        match response {
-            Response::Reconsidered(hashes) => hashes,
-            _ => unreachable!("wrong response variant for request"),
-        }
-    }
-}
-
 /// The verifier or registered scheduler adapter seals one body-evidence event.
 /// The serialized state writer then receives the sealed event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1410,14 +1316,6 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
-    /// Computes the depth in the current best chain of the block identified by the given hash.
-    ///
-    /// Returns
-    ///
-    /// * [`Response::Depth(Some(depth))`](Response::Depth) if the block is in the best chain;
-    /// * [`Response::Depth(None)`](Response::Depth) otherwise.
-    Depth(block::Hash),
-
     /// Returns [`Response::Tip(Option<(Height, block::Hash)>)`](Response::Tip)
     /// with the current best chain tip.
     Tip,
@@ -1439,14 +1337,6 @@ pub enum Request {
     ///
     /// If the state is empty, the block locator is also empty.
     BlockLocator,
-
-    /// Looks up a transaction by hash in the current best chain.
-    ///
-    /// Returns
-    ///
-    /// * [`Response::Transaction(Some(Arc<Transaction>))`](Response::Transaction) if the transaction is in the best chain;
-    /// * [`Response::Transaction(None)`](Response::Transaction) otherwise.
-    Transaction(transaction::Hash),
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -1673,11 +1563,9 @@ impl Request {
             }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
-            Request::Depth(_) => "depth",
             Request::Tip => "tip",
             Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
-            Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
@@ -1930,7 +1818,10 @@ pub enum ReadRequest {
     HeaderChainSnapshot,
 
     /// Returns the exact committed selected-header locator after semantic handoff.
-    HeaderLocator,
+    HeaderLocator {
+        /// Retained by the blocking read even if its caller times out.
+        permit: zakura_node_services::header_chain::LocatorReadPermit,
+    },
 
     /// Return the exact immutable branch context for preparing children of `parent_hash`.
     HeaderValidationLease {
@@ -1986,6 +1877,15 @@ pub enum ReadRequest {
         lease_id: u64,
         /// Exact generation and branch that the lease fixes.
         scope: zakura_header_chain::HeaderWorkAuthority,
+    },
+
+    /// Report whether the committed selected header chain contains `hash`, without an ancestry
+    /// walk or a retained-path lease.
+    ///
+    /// Returns [`ReadResponse::SelectedChainMembership`].
+    SelectedChainMembership {
+        /// Header hash to look up.
+        hash: block::Hash,
     },
 
     /// Returns [`ReadResponse::BlockRoots(Vec<BlockCommitmentRoots>)`](ReadResponse::BlockRoots)
@@ -2265,12 +2165,13 @@ impl ReadRequest {
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
             ReadRequest::FindBlockHeaders { .. } => "find_block_headers",
             ReadRequest::HeaderChainSnapshot => "header_chain_snapshot",
-            ReadRequest::HeaderLocator => "header_locator",
+            ReadRequest::HeaderLocator { .. } => "header_locator",
             ReadRequest::HeaderValidationLease { .. } => "header_validation_lease",
             ReadRequest::VctRepairContext { .. } => "vct_repair_context",
             ReadRequest::AcquireRetainedHeaderPath { .. } => "acquire_retained_header_path",
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
+            ReadRequest::SelectedChainMembership { .. } => "selected_chain_membership",
             ReadRequest::BlockRoots { .. } => "block_roots",
             ReadRequest::BlockSizesByHash { .. } => "block_sizes_by_hash",
             ReadRequest::BestHeaderTip => "best_header_tip",
@@ -2327,7 +2228,6 @@ impl TryFrom<Request> for ReadRequest {
     fn try_from(request: Request) -> Result<ReadRequest, Self::Error> {
         match request {
             Request::Tip => Ok(ReadRequest::Tip),
-            Request::Depth(hash) => Ok(ReadRequest::Depth(hash)),
             Request::BestChainNextMedianTimePast => Ok(ReadRequest::BestChainNextMedianTimePast),
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
@@ -2337,7 +2237,6 @@ impl TryFrom<Request> for ReadRequest {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
-            Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
             Request::CheckParentInputs { parent, outpoints } => {
                 Ok(ReadRequest::CheckParentInputs { parent, outpoints })
             }
@@ -2423,5 +2322,55 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod locator_capacity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_locator_keeps_permit_after_caller_drop_until_exit_or_panic() {
+        for panic in [false, true] {
+            let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let request = ReadRequest::HeaderLocator {
+                permit: zakura_node_services::header_chain::LocatorReadPermit::new(
+                    capacity.clone().try_acquire_owned().unwrap(),
+                ),
+            };
+            let (started, started_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let result = TimedSpan::new(
+                CodeTimer::start_desc("locator_capacity_test"),
+                tracing::Span::none(),
+            )
+            .spawn_blocking(move || {
+                let ReadRequest::HeaderLocator { permit: _permit } = request else {
+                    unreachable!();
+                };
+                started.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                assert!(!panic, "test accepted locator panic");
+                Ok(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(result);
+            assert_eq!(capacity.available_permits(), 0);
+            release.send(()).unwrap();
+            let permit = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                capacity.clone().acquire_owned(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(permit);
+            assert_eq!(capacity.available_permits(), 1);
+        }
     }
 }

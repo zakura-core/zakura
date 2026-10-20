@@ -19,6 +19,7 @@ use zakura_chain::{
     sprout::{self},
     transparent,
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants::{MAX_INVALIDATED_BLOCKS, MAX_NON_FINALIZED_CHAIN_FORKS},
@@ -32,6 +33,7 @@ mod address_transfers;
 mod backup;
 mod chain;
 mod created_utxos;
+mod shared_map;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -41,8 +43,11 @@ mod tests;
 
 pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
+#[cfg(feature = "internal-bench")]
+pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
 pub(crate) use chain::{Chain, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
+pub(crate) use shared_map::SharedMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextualMetrics {
@@ -242,7 +247,7 @@ impl NonFinalizedState {
         let (non_finalized_state, sender, receiver) = with_watch_channel(non_finalized_state);
 
         if !skip_backup_task {
-            tokio::spawn(backup::run_backup_task(receiver.clone(), backup_dir_path));
+            spawn_erased(backup::run_backup_task(receiver.clone(), backup_dir_path));
         }
 
         if !non_finalized_state.is_chain_set_empty() {
@@ -1063,8 +1068,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `sprout_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_sprout_nullifier(&self, sprout_nullifier: &sprout::Nullifier) -> bool {
         self.best_chain()
             .map(|best_chain| best_chain.sprout_nullifiers.contains_key(sprout_nullifier))
@@ -1072,8 +1076,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `sapling_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_sapling_nullifier(
         &self,
         sapling_nullifier: &zakura_chain::sapling::Nullifier,
@@ -1088,8 +1091,7 @@ impl NonFinalizedState {
     }
 
     /// Returns `true` if the best chain contains `orchard_nullifier`.
-    #[cfg(any(test, feature = "proptest-impl"))]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn best_contains_orchard_nullifier(
         &self,
         orchard_nullifier: &zakura_chain::orchard::Nullifier,

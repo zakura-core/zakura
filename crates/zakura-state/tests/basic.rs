@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use color_eyre::eyre::Report;
+use eyre::Report;
 use once_cell::sync::Lazy;
 use tracing::Instrument;
 

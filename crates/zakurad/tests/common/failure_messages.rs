@@ -23,7 +23,7 @@ pub const PROCESS_FAILURE_MESSAGES: &[&str] = &[
 /// So when we see them in the logs, we make the test fail.
 pub const ZAKURA_FAILURE_MESSAGES: &[&str] = &[
     // Rust-specific panics
-    "The application panicked",
+    "panicked at",
     // RPC port errors
     "Address already in use",
     // TODO: disable if this actually happens during test zakurad shutdown
@@ -51,7 +51,7 @@ pub const ZAKURA_FAILURE_MESSAGES: &[&str] = &[
 #[cfg(feature = "zakura-checkpoints")]
 pub const ZAKURA_CHECKPOINTS_FAILURE_MESSAGES: &[&str] = &[
     // Rust-specific panics
-    "The application panicked",
+    "panicked at",
     // RPC port errors
     "Address already in use",
     // RPC argument errors: parsing and data

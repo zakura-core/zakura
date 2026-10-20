@@ -112,10 +112,10 @@ fn operator_invalidation_promotes_alternate_and_preserves_nested_reasons() {
         operator_reconsider(&store, winner.hash, second_id, 0x34),
         &context(&config, &clock, Some(&Authority)),
     )
-    .expect("removing the final operator reason restores both frontiers");
+    .expect("reconsider restores eligibility without replacing an equal-work selected header");
     assert_eq!(
         reconsider_second.change_set.metadata.frontiers.header_best,
-        winner
+        loser
     );
     assert_eq!(
         reconsider_second
@@ -834,7 +834,10 @@ fn operator_reconsider_respects_full_state_receipt_preference() {
         retention_references: &[],
     };
     let plan = apply_transition(&store, request.clone(), &ctx).unwrap();
-    assert_eq!(plan.change_set.metadata.frontiers.header_best, hash_winner);
+    assert_eq!(
+        plan.change_set.metadata.frontiers.header_best,
+        first_received
+    );
     assert_eq!(
         plan.change_set.metadata.frontiers.verified_best,
         first_received

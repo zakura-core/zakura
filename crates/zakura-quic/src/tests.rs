@@ -3,7 +3,10 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -76,6 +79,9 @@ fn loopback() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
+        max_closing_connections: 1024,
     }
 }
 
@@ -83,6 +89,9 @@ fn wildcard() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
         max_bidi_streams: 64,
+        max_connections: 1024,
+        dial_reserve: 0,
+        max_closing_connections: 1024,
     }
 }
 
@@ -1967,6 +1976,496 @@ async fn a_header_read_takes_only_the_header_from_quinn() {
             "{delivered}"
         );
         assert!(recv.read_chunk(usize::MAX).await.unwrap().is_some());
+    })
+    .await
+    .unwrap();
+}
+
+/// Takes the first stream's data and then rejects the connection, the way
+/// Zakura closes a peer that fails its control handshake.
+struct ChurnAcceptor;
+
+impl Acceptor for ChurnAcceptor {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let _ = tokio::time::timeout(Duration::from_millis(50), conn.accept_bi()).await;
+            conn.close(VarInt::from_u32(0), b"control handshake");
+        })
+    }
+}
+
+/// ADM-12, ADM-13: peers that fill a stream, get rejected and reconnect at
+/// once never make the endpoint hold more live connections than its inbound
+/// cap or more closed ones than its closing allowance, and every slot comes
+/// back once they stop.
+#[tokio::test]
+async fn churned_connections_stay_within_both_allowances() {
+    const CAP: usize = 6;
+    const RESERVE: usize = 2;
+    const CLOSING: usize = 3;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: CAP,
+            dial_reserve: RESERVE,
+            max_closing_connections: CLOSING,
+            ..loopback()
+        };
+        let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+        server.serve(ChurnAcceptor).unwrap();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let peaks = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let sampler = {
+            let (server, stop, peaks) = (server.clone(), stop.clone(), peaks.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    peaks
+                        .0
+                        .fetch_max(server.connection_count(), Ordering::Relaxed);
+                    peaks
+                        .1
+                        .fetch_max(server.closing_connection_count(), Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let mut churners = Vec::new();
+        for _ in 0..12 {
+            let addr = addr.clone();
+            churners.push(tokio::spawn(async move {
+                let client = client();
+                for _ in 0..8 {
+                    if let Ok(conn) = client.connect(addr.clone(), &[ALPN]).await {
+                        if let Ok((mut send, _recv)) = conn.open_bi().await {
+                            let _ = send.write_all(&[7; 256 * 1024]).await;
+                        }
+                        conn.closed().await;
+                    }
+                }
+            }));
+        }
+        for churner in churners {
+            churner.await.unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        // Inbound attempts stop short of the dial reserve.
+        let peak_live = peaks.0.load(Ordering::Relaxed);
+        assert!((1..=CAP - RESERVE).contains(&peak_live), "{peak_live}");
+        assert!(peaks.1.load(Ordering::Relaxed) <= CLOSING);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.connection_count() + server.closing_connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every slot frees once its connection drains");
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: inbound connections can't take the dial reserve, and a dial at the
+/// cap fails locally.
+#[tokio::test]
+async fn the_dial_reserve_keeps_dials_open_while_inbound_is_full() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 2,
+            dial_reserve: 1,
+            ..loopback()
+        };
+        let mut node = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let first = client();
+        let _held = first.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 1);
+
+        let second = client();
+        assert!(matches!(
+            second.connect(node.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+
+        let peer = server();
+        assert!(node.endpoint.has_dial_capacity());
+        let _dialed = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 2);
+        assert!(!node.endpoint.has_dial_capacity());
+        assert!(matches!(
+            node.endpoint.connect(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: a dial claims a slot for every address before its first attempt,
+/// so with room for fewer right now it fails before the peer sees anything. A
+/// cap hit partway would mix a local limit with the peer's real results.
+#[tokio::test]
+async fn a_dial_without_a_slot_for_every_address_contacts_no_one() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let other = server();
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+
+        // Two slots, one held by a connection to another peer.
+        let two_slots = QuicBindConfig {
+            max_connections: 2,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &two_slots, &test_config()).unwrap();
+        let held = client.connect(other.addr(), &[ALPN]).await.unwrap();
+        assert!(matches!(
+            client.connect(addr.clone(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(client.connection_count(), 1);
+        // The first address would have answered at once; give it time to show.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(server.seen.lock().unwrap().is_empty());
+
+        // Once the slot frees, the same dial connects.
+        drop(held);
+        while client.connection_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-12: an endpoint with no connection slot could neither dial nor
+/// accept, so `bind` refuses it.
+#[tokio::test]
+async fn bind_refuses_a_zero_connection_cap() {
+    let bind = QuicBindConfig {
+        max_connections: 0,
+        ..loopback()
+    };
+    assert!(matches!(
+        QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()),
+        Err(crate::BindError::NoConnectionSlots)
+    ));
+}
+
+/// ADM-12: a dial tries at most as many addresses as the table can ever
+/// hold, so a record with more addresses than slots still dials instead of
+/// failing with `ConnectionLimit` forever.
+#[tokio::test]
+async fn a_dial_tries_no_more_addresses_than_the_table_holds() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = NodeAddr::with_addrs(
+            server.endpoint.local_id(),
+            vec![
+                server.endpoint.local_addrs()[0],
+                silent.local_addr().unwrap(),
+            ],
+        );
+        let one_slot = QuicBindConfig {
+            max_connections: 1,
+            ..loopback()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &one_slot, &test_config()).unwrap();
+        client.connect(addr, &[ALPN]).await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A UDP relay that delays every datagram by `delay` in each direction.
+struct DelayRelay {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelayRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts a relay to `server` that adds `delay` each way.
+async fn delay_relay(server: SocketAddr, delay: Duration) -> DelayRelay {
+    let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut client = None;
+        let (mut up, mut down) = (vec![0; 65_536], vec![0; 65_536]);
+        loop {
+            let (data, to, socket) = tokio::select! {
+                Ok((len, from)) = front.recv_from(&mut up) => {
+                    client = Some(from);
+                    (up[..len].to_vec(), server, back.clone())
+                }
+                Ok((len, _)) = back.recv_from(&mut down) => {
+                    let Some(client) = client else { continue };
+                    (down[..len].to_vec(), client, front.clone())
+                }
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = socket.send_to(&data, to).await;
+            });
+        }
+    });
+    DelayRelay { addr, task }
+}
+
+/// Connects to `server` through a relay that makes three PTOs last longer
+/// than `bound`, so a closed connection visibly stays in its table, and
+/// returns the server's side of the connection.
+async fn slow_closing_conn(
+    server: &mut Server,
+    client: &QuicEndpoint,
+    bound: Duration,
+) -> (DelayRelay, Conn, Conn) {
+    let relay = delay_relay(server.endpoint.local_addrs()[0], Duration::from_millis(750)).await;
+    let via_relay = NodeAddr::with_addrs(server.endpoint.local_id(), vec![relay.addr]);
+    let conn = client.connect(via_relay, &[ALPN]).await.unwrap();
+    let inbound = server.handled.recv().await.unwrap();
+    let rtt = inbound.stats().await.unwrap().connection.path.rtt;
+    assert!(rtt * 3 > bound, "{rtt:?}");
+    (relay, conn, inbound)
+}
+
+/// ADM-13: a closed connection still draining moves to the closing allowance,
+/// so a new inbound peer gets the live slot it held.
+#[tokio::test]
+async fn a_draining_connection_does_not_block_inbound() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 1,
+            max_closing_connections: 4,
+            ..loopback()
+        };
+        let mut server = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let slow = client();
+        let (_relay, _conn, inbound) =
+            slow_closing_conn(&mut server, &slow, Duration::from_secs(4)).await;
+        assert_eq!(server.endpoint.connection_count(), 1);
+
+        inbound.close(VarInt::from_u32(0), b"done");
+        while server.endpoint.closing_connection_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.endpoint.connection_count(), 0);
+
+        let fresh = client();
+        fresh.connect(server.addr(), &[ALPN]).await.unwrap();
+        // The first connection is still draining.
+        assert_eq!(server.endpoint.closing_connection_count(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-13: when the closing allowance is full, a connection that closes drops
+/// its state at once instead of draining.
+#[tokio::test]
+async fn a_full_closing_allowance_drops_state_at_once() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_closing_connections: 0,
+            ..loopback()
+        };
+        let mut server = server_with(&test_config(), &bind, &[ALPN], |_| Admit::Accept);
+        let slow = client();
+        let bound = Duration::from_secs(1);
+        let (_relay, _conn, inbound) = slow_closing_conn(&mut server, &slow, bound).await;
+
+        inbound.close(VarInt::from_u32(0), b"done");
+        tokio::time::timeout(bound, async {
+            while server.endpoint.connection_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connection skips its drain");
+        assert_eq!(server.endpoint.closing_connection_count(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+/// Silent multi-address discovery attempts leave a live slot for an inbound
+/// peer, while maintained dials can still use the transport's dial reserve.
+#[tokio::test]
+async fn discovery_dials_leave_room_for_an_inbound_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let bind = QuicBindConfig {
+            max_connections: 6,
+            dial_reserve: 2,
+            ..loopback()
+        };
+        let mut config = test_config();
+        config.handshake_timeout_secs = Some(10);
+        let mut node = server_with(&config, &bind, &[ALPN], |_| Admit::Accept);
+        let peer = server();
+        let _maintained = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+
+        let silent: Vec<_> = (0..2)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let target = NodeAddr::with_addrs(
+            NodeSecretKey::generate().public(),
+            silent.iter().map(|socket| socket.local_addr().unwrap()),
+        );
+        let quic = node.endpoint.clone();
+        let discovery = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+        while node.endpoint.connection_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!node.endpoint.has_discovery_capacity());
+        assert!(node.endpoint.has_dial_capacity());
+        assert!(matches!(
+            node.endpoint.connect_discovery(peer.addr(), &[ALPN]).await,
+            Err(ConnectError::ConnectionLimit)
+        ));
+        assert_eq!(node.endpoint.connection_count(), 3);
+
+        let inbound = client();
+        let _accepted = inbound.connect(node.addr(), &[ALPN]).await.unwrap();
+        node.handled.recv().await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 4);
+
+        let _reserved = node.endpoint.connect(peer.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(node.endpoint.connection_count(), 5);
+        discovery.abort();
+        let _ = discovery.await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Discovery caps its address list to its own ceiling, and a ceiling with no
+/// room returns a local limit without contacting the peer or panicking.
+#[tokio::test]
+async fn discovery_handles_small_connection_limits() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for (cap, reserve, can_discover) in [(1, 0, false), (2, 1, false), (3, 1, true)] {
+            let bind = QuicBindConfig {
+                max_connections: cap,
+                dial_reserve: reserve,
+                ..loopback()
+            };
+            let node =
+                QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+            let peer = server();
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let target = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                vec![peer.endpoint.local_addrs()[0], silent.local_addr().unwrap()],
+            );
+            assert_eq!(node.has_discovery_capacity(), can_discover);
+            let result = node.connect_discovery(target, &[ALPN]).await;
+            if can_discover {
+                let held = result.unwrap();
+                assert_eq!(node.connection_count(), 1);
+                assert!(!node.has_discovery_capacity());
+                drop(held);
+            } else {
+                assert!(matches!(result, Err(ConnectError::ConnectionLimit)));
+                assert_eq!(node.connection_count(), 0);
+                assert!(peer.seen.lock().unwrap().is_empty());
+                // A discovery ceiling of zero doesn't disable maintained dials.
+                node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Cancelling discovery returns unused reservations and drains started
+/// attempts, both before and after the staggered second attempt starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_discovery_dials_restore_every_slot() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        for started in [1, 2] {
+            let bind = QuicBindConfig {
+                max_connections: 5,
+                dial_reserve: 1,
+                max_closing_connections: 5,
+                ..loopback()
+            };
+            let config = QuicConfig {
+                dial_stagger_ms: if started == 1 { 5000 } else { 25 },
+                handshake_timeout_secs: Some(10),
+                ..test_config()
+            };
+            let node = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &config).unwrap();
+            let peer = server();
+            let retained = node.connect(peer.addr(), &[ALPN]).await.unwrap();
+            let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target = NodeAddr::with_addrs(
+                NodeSecretKey::generate().public(),
+                [first.local_addr().unwrap(), second.local_addr().unwrap()],
+            );
+            let quic = node.clone();
+            let dial = tokio::spawn(async move { quic.connect_discovery(target, &[ALPN]).await });
+            let mut packet = [0; 65_536];
+            first.recv_from(&mut packet).await.unwrap();
+            if started == 2 {
+                second.recv_from(&mut packet).await.unwrap();
+            }
+            // Both addresses reserve slots before either sends an Initial.
+            assert_eq!(node.connection_count(), 3);
+            assert!(!node.has_discovery_capacity());
+            dial.abort();
+            assert!(dial.await.unwrap_err().is_cancelled());
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while node.connection_count() != 1 || node.closing_connection_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled attempts release every slot while the retained peer stays live");
+            assert!(node.has_discovery_capacity());
+            assert!(retained.stats().await.is_some());
+            if started == 1 {
+                assert!(matches!(
+                    second.try_recv_from(&mut packet),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+
+            // This dial needs both refunded slots, even though its first
+            // address answers before the second address needs to finish.
+            let replacement = NodeAddr::with_addrs(
+                peer.endpoint.local_id(),
+                [peer.endpoint.local_addrs()[0], second.local_addr().unwrap()],
+            );
+            let _connected = node.connect_discovery(replacement, &[ALPN]).await.unwrap();
+        }
     })
     .await
     .unwrap();

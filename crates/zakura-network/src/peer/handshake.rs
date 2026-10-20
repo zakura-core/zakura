@@ -16,7 +16,7 @@ use std::{
 use chrono::{TimeZone, Utc};
 use futures::{channel::oneshot, future, pin_mut, FutureExt, SinkExt, StreamExt};
 use indexmap::IndexSet;
-use rand::{rngs::OsRng, RngCore};
+use rand_10::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::broadcast,
@@ -35,6 +35,7 @@ use zakura_chain::{
     parameters::Network,
     serialization::{DateTime32, SerializationError},
 };
+use zakura_node_services::task::spawn_erased;
 
 use crate::{
     constants,
@@ -1219,7 +1220,7 @@ where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut upgrade_nonce);
 
     let init = P2pV2UpgradeInit {
         magic: PRELUDE_MAGIC,
@@ -1341,7 +1342,7 @@ where
     };
 
     let mut responder_upgrade_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut responder_upgrade_nonce);
+    rand_10::rng().fill_bytes(&mut responder_upgrade_nonce);
 
     let accept = P2pV2UpgradeAccept {
         magic: PRELUDE_MAGIC,
@@ -1590,6 +1591,7 @@ where
                 minimum_peer_version,
                 is_protected_peer,
             )
+            .boxed()
             .await
             {
                 Ok(info) => {
@@ -1646,6 +1648,7 @@ where
                     peer_registry.as_ref(),
                     &address_book_updater,
                 )
+                .boxed()
                 .await
                 {
                     Ok(
@@ -1886,7 +1889,7 @@ where
         let fut = timeout(constants::HANDSHAKE_TIMEOUT, fut);
 
         // Spawn a new task to drive this handshake, forwarding panics to the calling task.
-        tokio::spawn(fut.instrument(negotiator_span))
+        spawn_erased(fut.instrument(negotiator_span))
             .map(
                 |join_result: Result<
                     Result<Result<Client, HandshakeError>, error::Elapsed>,

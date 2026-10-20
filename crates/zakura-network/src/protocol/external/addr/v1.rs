@@ -95,12 +95,12 @@ impl From<AddrV1> for MetaAddr {
 }
 
 impl ZcashSerialize for AddrV1 {
-    fn zcash_serialize<W: Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
-        self.untrusted_last_seen.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: Write + ?Sized>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        self.untrusted_last_seen.zcash_serialize(writer)?;
         writer.write_u64::<LittleEndian>(self.untrusted_services.bits())?;
 
         let ipv6_addr = ipv6_mapped_ip_addr(self.addr.ip());
-        ipv6_addr.zcash_serialize(&mut writer)?;
+        ipv6_addr.zcash_serialize(writer)?;
         writer.write_u16::<BigEndian>(self.addr.port())?;
 
         Ok(())

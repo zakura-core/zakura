@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "10.0.0-rc0"
+version = "10.0.0-rc1"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -23,6 +23,18 @@ readme = "../../README.md"
 keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "network-programming"]
+
+# Test-only sources are over a third of the crate and only compile under
+# `cfg(test)`. These two `tests` modules also build under `proptest-impl`.
+exclude = [
+    "tests/",
+    "proptest-regressions/",
+    "src/**/tests/",
+    "src/**/tests.rs",
+    "src/**/*_tests.rs",
+    "!src/peer/client/tests.rs",
+    "!src/peer/minimum_peer_version/tests.rs",
+]
 
 [features]
 default = []
@@ -55,21 +67,19 @@ indexmap = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pin-project = { workspace = true }
-rand = { workspace = true }
+rand_10 = { workspace = true }
 rayon = { workspace = true }
-schemars = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 futures = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "tracing", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["sync", "time"] }
 tokio-util = { workspace = true, features = ["codec", "rt"] }
 tower = { workspace = true, features = ["retry", "discover", "load", "load-shed", "timeout", "util", "buffer"] }
 
 metrics = { workspace = true }
-tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
 
@@ -78,7 +88,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "2.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0-rc0" }
 zakura-quic = { path = "../zakura-quic", version = "0.1.0" }
@@ -92,12 +102,12 @@ curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-toml = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+toml = { workspace = true, features = ["display"] }
 tracing-subscriber = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0-rc0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0-rc0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.0", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }
 
 [lints]
@@ -113,5 +123,10 @@ harness = false
 
 [[bench]]
 name = "address_book"
+harness = false
+required-features = ["internal-bench"]
+
+[[bench]]
+name = "supervised_spawn"
 harness = false
 required-features = ["internal-bench"]

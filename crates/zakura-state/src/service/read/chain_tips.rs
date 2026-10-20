@@ -263,7 +263,7 @@ pub fn chain_tips(
 
     // zcashd sorts tips by descending height. Ties are broken by hash so that
     // repeated calls on an unchanged state return an identical list.
-    tips.sort_by(|a, b| {
+    tips.sort_unstable_by(|a, b| {
         b.height
             .cmp(&a.height)
             .then_with(|| a.hash.0.cmp(&b.hash.0))

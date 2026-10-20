@@ -197,7 +197,7 @@ jobs:
 
       # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
       # track new stable rustdoc formats; pin only if a regression forces it.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 #v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
         with:
           tool: cargo-semver-checks
 
@@ -239,7 +239,7 @@ jobs:
     env:
       # rustdoc on nightly 2026-09-07 and later hits a next-trait-solver ICE
       # ("did not expect successful goal when collecting ambiguity errors",
-      # rust-lang/rust#124834) on the tower-batch-control `Service` impls in
+      # rust-lang/rust#124834) on `Service` impls in
       # zakura-consensus, zakura-network, and zakura-state. Pin the last good
       # nightly, and drop the pin once a current nightly documents these
       # crates again. cargo-public-api has no toolchain option, so the rustup
@@ -259,7 +259,7 @@ jobs:
           toolchain: stable
           cache: false
 
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 #v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
         with:
           tool: cargo-public-api
 
@@ -310,7 +310,7 @@ jobs:
             semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
             semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
 
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 #v2.87.22
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad #v2.87.26
         with:
           tool: cargo-semver-checks
 

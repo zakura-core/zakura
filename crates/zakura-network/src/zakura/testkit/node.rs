@@ -225,8 +225,11 @@ pub struct ZakuraTestNodeBuilder {
     header_sync: Option<TestHeaderSyncStartup>,
     header_sync_config: ZakuraHeaderSyncConfig,
     header_sync_request_timeout: Option<Duration>,
+    /// The port header-sync publishers read pages from.
+    header_sync_port: Option<Arc<dyn zakura_node_services::header_chain::Port>>,
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
+    block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
 }
 
 #[derive(Clone, Debug)]
@@ -280,8 +283,10 @@ impl ZakuraTestNodeBuilder {
             header_sync: None,
             header_sync_config: ZakuraHeaderSyncConfig::default(),
             header_sync_request_timeout: None,
+            header_sync_port: None,
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
+            block_range_source: None,
         }
     }
 
@@ -375,6 +380,17 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Serve header-sync pages from `port`, keeping the external action
+    /// driver for everything else.
+    #[cfg(test)]
+    pub(crate) fn header_sync_port(
+        mut self,
+        port: Arc<dyn zakura_node_services::header_chain::Port>,
+    ) -> Self {
+        self.header_sync_port = Some(port);
+        self
+    }
+
     /// Restrict the capability mask advertised by this test node.
     pub fn supported_capabilities(mut self, supported_capabilities: u64) -> Self {
         self.supported_capabilities = Some(supported_capabilities);
@@ -384,6 +400,12 @@ impl ZakuraTestNodeBuilder {
     /// Override the block-sync config used with [`Self::header_sync_driver`].
     pub fn block_sync_config(mut self, config: ZakuraBlockSyncConfig) -> Self {
         self.block_sync_config = config;
+        self
+    }
+
+    /// Enable production GetBlocks regulation with a test-owned block source.
+    pub fn block_range_source(mut self, source: Arc<dyn crate::zakura::BlockRangeSource>) -> Self {
+        self.block_range_source = Some(source);
         self
     }
 
@@ -447,6 +469,9 @@ impl ZakuraTestNodeBuilder {
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
             }
+            if let Some(port) = self.header_sync_port {
+                startup.header_chain_port = port;
+            }
             startup.status_refresh_interval = Duration::from_millis(200);
             if let Some(state_driver) = state_driver {
                 startup.committed_snapshots = Some(state_driver.committed_snapshots);
@@ -501,6 +526,9 @@ impl ZakuraTestNodeBuilder {
                 handle.subscribe_tip(),
                 self.block_sync_config.clone(),
             );
+            if let Some(source) = self.block_range_source {
+                startup = startup.with_range_source(source);
+            }
             let shutdown = header_sync_actions
                 .as_ref()
                 .expect("header sync actions were just initialized")
@@ -508,7 +536,7 @@ impl ZakuraTestNodeBuilder {
                 .clone();
             startup.shutdown = shutdown;
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
-            let (block_handle, actions, task) = spawn_block_sync_reactor(startup);
+            let (block_handle, actions, task) = spawn_block_sync_reactor(startup)?;
             header_sync_tasks.push(task);
             block_sync_actions = Some(actions);
             block_sync_handle = Some(block_handle.clone());
@@ -524,9 +552,14 @@ impl ZakuraTestNodeBuilder {
                 discovery.clone(),
                 header_sync.clone(),
                 block_sync_handle.clone(),
+                ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
+                self.limits.max_connections,
             ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone()))
+            Arc::new(DiscoveryService::with_max_connections(
+                discovery.clone(),
+                self.limits.max_connections,
+            ))
         };
         let registry = service_registry(
             &supervisor,
@@ -779,6 +812,7 @@ mod tests {
                     peer_addr,
                     &limits,
                     Some(admitted_ip_tx),
+                    crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
             });

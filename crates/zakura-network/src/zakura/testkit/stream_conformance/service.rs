@@ -2,15 +2,17 @@
 //!
 //! It reserves sessions through `SessionCapacity` and keeps them in a
 //! `SessionTable`. It serves each request row through `Serve`, answering with
-//! the adapter's messages. It downloads through fenced `Reservations`, with
-//! the reader precheck attached to every member that carries responses. It
+//! the adapter's messages. It downloads through fenced `Reservations`. It
 //! publishes each subscription row through `Publications`, pushing pages
-//! with the capacity `ServeCapacity::push` grants.
+//! with the capacity `ServeCapacity::push` grants, and subscribes through
+//! fenced `Subscriptions`. One `PrecheckByRequest` over the reservations and
+//! the subscriptions is the reader precheck of every member that carries
+//! responses.
 
 use std::{
     marker::PhantomData,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, PoisonError,
     },
     time::Duration,
@@ -26,13 +28,14 @@ use super::{
 use crate::{
     zakura::{
         regulation::{
-            sizing, Applied, Current, Produce, Publications, Push, Replacement, ReservationPool,
-            Reservations, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
-            SessionCapacity, SessionKey, SessionTable, SharedReservations, SinkError, SinkProgress,
-            SubscriptionLimits, WorkLease, WriterFence,
+            sizing, Applied, Current, PrecheckByRequest, Produce, Publications, Push, Replacement,
+            ReservationPool, Reservations, Responded, ResponseCap, ResponsePrecheck, ResponseSink,
+            Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey, SessionTable,
+            SharedReservations, SharedSubscriptions, SinkError, SinkProgress, SubscribeRefused,
+            Subscriptions, Update, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
-        CloseCause, Frame, FramedRecv, FramedSend, MessageRole, Peer, Service,
+        CloseCause, Credit, Frame, FramedRecv, FramedSend, MessageRole, MessageRule, Peer, Service,
         ServicePeerDirection, ServicePeerLimits, SessionDemand, SessionFull, SessionOpening,
         SessionPolicy, SessionResources, Stream, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
     },
@@ -86,6 +89,12 @@ pub(crate) struct LayoutSession<A: StreamConformance> {
     serve: Vec<Serve<EchoProduce<A>>>,
     /// The peer's subscriptions, per subscription row in the plan's order.
     publishers: Vec<Publisher>,
+    /// This node's subscriptions on the peer, per subscription row in the
+    /// plan's order.
+    subscriptions: Vec<SharedSubscriptions<u32, u32>>,
+    next_key: AtomicU32,
+    /// Pages this session accepted, on every subscription row.
+    pub(crate) pages: watch::Sender<u64>,
     pub(crate) fence: WriterFence,
     /// The session's token: cancelling it retires every member.
     pub(crate) cancel: CancellationToken,
@@ -94,6 +103,10 @@ pub(crate) struct LayoutSession<A: StreamConformance> {
     pub(crate) close_cause: CloseCause,
     /// Every exchange this session ended, in order.
     pub(crate) ended: watch::Sender<Vec<ExchangeKey>>,
+    /// Every subscription of this node's that ended, as its subscription row
+    /// and key, in order. Kept apart from `ended`, so a download counts its
+    /// endings without scanning.
+    pub(crate) subscriptions_ended: watch::Sender<Vec<(u16, u32)>>,
 }
 
 /// One subscription row's publications on a session, shared with the task
@@ -151,6 +164,104 @@ impl<A: StreamConformance> LayoutSession<A> {
         self.serve[index].open()
     }
 
+    /// Live or closing subscriptions the peer holds on `subscription_type`,
+    /// and the `Open`s the publisher counted over the row's limit.
+    pub(crate) fn publishing(
+        &self,
+        shared: &LayoutShared<A>,
+        subscription_type: u16,
+    ) -> (usize, u64) {
+        let index = shared.subscription_index(subscription_type);
+        let publications = self.publishers[index].lock();
+        (publications.keys().count(), publications.over_limit_count())
+    }
+
+    /// A key this session has not opened a subscription with.
+    pub(crate) fn next_key(&self) -> u32 {
+        self.next_key.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Pages subscription `key` of `subscription_type` received, and the
+    /// credit to grant now. `None` once the subscription ended.
+    ///
+    /// The handler accepts each page as it arrives, and cursors start at 0,
+    /// so the receive cursor counts the pages. A grant is due once half of
+    /// either unit of the window is free, or once the unspent credit cannot
+    /// cover a largest page. The second holds whenever the publisher waits
+    /// for credit, so renewal never stalls.
+    pub(crate) fn subscription_progress(
+        &self,
+        shared: &LayoutShared<A>,
+        subscription_type: u16,
+        key: u32,
+    ) -> Option<(u32, Option<Credit>)> {
+        let index = shared.subscription_index(subscription_type);
+        let plan = shared.plan.subscriptions[index];
+        let window = plan.limits.credit;
+        let subscriptions = self.subscriptions[index].lock();
+        let received = *subscriptions.received(&key)?;
+        let room = subscriptions.grantable(&key)?;
+        let unspent = subscriptions.credit(&key)?.unspent();
+        // Widening usize to u64 is lossless on supported targets.
+        let largest = plan.page.payload.max() as u64;
+        let starved = unspent.objects == 0 || unspent.bytes < largest;
+        let half_free = |free: u32, limit: u32| 2 * u64::from(free) >= u64::from(limit);
+        let free = room.objects != 0 || room.bytes != 0;
+        let due = free
+            && (starved
+                || half_free(room.objects, window.objects)
+                || half_free(room.bytes, window.bytes));
+        Some((received, due.then_some(room)))
+    }
+
+    /// Admit a page or the ending of a subscription on `subscription_type`.
+    /// A page must follow the subscription's previous page, and the handler
+    /// accepts it at once.
+    fn subscribed(
+        &self,
+        shared: &LayoutShared<A>,
+        subscription_type: u16,
+        frame: &Frame,
+        ends_exchange: bool,
+    ) -> Result<(), String> {
+        let len = frame.payload.len();
+        let subscriptions = &self.subscriptions[shared.subscription_index(subscription_type)];
+        // The reader ran the same check before it read the payload.
+        subscriptions
+            .lock()
+            .precheck(frame.message_type, len)
+            .map_err(|fault| fault.to_string())?;
+        let message = decode::<A>(frame)?;
+        if ends_exchange {
+            let key = A::exchange(&message);
+            subscriptions
+                .lock()
+                .claim_end(&key)
+                .map_err(|fault| fault.to_string())?;
+            self.subscriptions_ended
+                .send_modify(|ended| ended.push((subscription_type, key)));
+            return Ok(());
+        }
+        let (key, cursor) = A::read_page(&message)
+            .ok_or_else(|| format!("row {} carried no page", frame.message_type))?;
+        let mut subscriptions = subscriptions.lock();
+        let received = *subscriptions
+            .received(&key)
+            .ok_or_else(|| format!("a page for subscription {key}, which is not live"))?;
+        if received.checked_add(1) != Some(cursor) {
+            return Err(format!("page {cursor} does not follow page {received}"));
+        }
+        subscriptions
+            .claim_page(&key, 1, len, cursor)
+            .map_err(|fault| fault.to_string())?;
+        subscriptions
+            .accept(&key, &cursor)
+            .map_err(|refused| refused.to_string())?;
+        drop(subscriptions);
+        self.pages.send_modify(|pages| *pages += 1);
+        Ok(())
+    }
+
     /// Handle one inbound frame. An error is a violation that disconnects
     /// the peer.
     fn handle(&self, shared: &LayoutShared<A>, frame: &Frame) -> Result<(), String> {
@@ -159,6 +270,13 @@ impl<A: StreamConformance> LayoutSession<A> {
             .row(frame.message_type)
             .ok_or_else(|| format!("no row for message type {}", frame.message_type))?;
         shared.handled.fetch_add(1, Ordering::Relaxed);
+        if let Some((_, handled)) = shared
+            .handled_rows
+            .iter()
+            .find(|(handled, _)| *handled == row.message_type)
+        {
+            handled.fetch_add(1, Ordering::Relaxed);
+        }
         let len = frame.payload.len();
         match row.role {
             MessageRole::Request { .. } => {
@@ -167,6 +285,12 @@ impl<A: StreamConformance> LayoutSession<A> {
                 self.serve[index]
                     .admit(A::exchange(&message))
                     .map_err(|violation| violation.to_string())
+            }
+            MessageRole::Response {
+                request,
+                ends_exchange,
+            } if shared.subscribes(request) => {
+                self.subscribed(shared, request, frame, ends_exchange)
             }
             MessageRole::Response {
                 request,
@@ -230,6 +354,8 @@ pub(crate) struct LayoutShared<A: StreamConformance> {
     pub(crate) pool: ReservationPool,
     /// Frames that reached this node's handler.
     pub(crate) handled: AtomicU64,
+    /// Frames that reached this node's handler, per row of the layout.
+    handled_rows: Vec<(u16, AtomicU64)>,
     /// Violations this node disconnected a peer for.
     pub(crate) violations: Mutex<Vec<String>>,
     /// While true, session tasks stop reading.
@@ -245,12 +371,28 @@ impl<A: StreamConformance> LayoutShared<A> {
             .expect("the plan lists every request row of the layout")
     }
 
+    /// Whether `row_type` is one of the layout's subscription rows.
+    fn subscribes(&self, row_type: u16) -> bool {
+        self.plan
+            .subscriptions
+            .iter()
+            .any(|plan| plan.row.message_type == row_type)
+    }
+
     fn subscription_index(&self, subscription_type: u16) -> usize {
         self.plan
             .subscriptions
             .iter()
             .position(|plan| plan.row.message_type == subscription_type)
             .expect("the plan lists every subscription row of the layout")
+    }
+
+    /// Frames of `message_type` that reached this node's handler.
+    pub(crate) fn handled_of(&self, message_type: u16) -> u64 {
+        self.handled_rows
+            .iter()
+            .find(|(row, _)| *row == message_type)
+            .map_or(0, |(_, handled)| handled.load(Ordering::Relaxed))
     }
 
     /// The violations this node disconnected a peer for.
@@ -321,6 +463,11 @@ impl<A: StreamConformance> LayoutService<A> {
                 published_ended: AtomicU64::new(0),
                 pool,
                 handled: AtomicU64::new(0),
+                handled_rows: layout
+                    .iter()
+                    .flat_map(|member| member.messages.into_iter().flatten())
+                    .map(|row| (row.message_type, AtomicU64::new(0)))
+                    .collect(),
                 violations: Mutex::new(Vec::new()),
                 paused: watch::channel(false).0,
             }),
@@ -354,6 +501,78 @@ impl<A: StreamConformance> LayoutService<A> {
         }
         Ok(())
     }
+
+    /// Open subscription `key` of `subscription_type` with `peer`, granting
+    /// `credit` from cursor 0, then write its `Open` under the session's
+    /// fence. Its ending ends the exchange; until then, retiring the session
+    /// closes the connection.
+    pub(crate) async fn subscribe(
+        &self,
+        peer: &ZakuraPeerId,
+        subscription_type: u16,
+        key: u32,
+        credit: Credit,
+    ) -> Result<(), BoxError> {
+        let shared = &self.shared;
+        let (_, session) = shared.table.get(peer).ok_or("the peer has no session")?;
+        let index = shared.subscription_index(subscription_type);
+        let plan = shared.plan.subscriptions[index];
+        let opened = session.fence.open().ok_or("the session's fence retired")?;
+        let writer = opened.writer();
+        let update = session.subscriptions[index]
+            .lock()
+            .open_fenced(key, credit, 0, opened)?;
+        let sent = match encode_update::<A>(plan.row, UpdateOp::Open, key, &update) {
+            Ok(frame) => session.sends[plan.stream]
+                .send_fenced(frame, &writer)
+                .await
+                .map_err(BoxError::from),
+            Err(error) => Err(error),
+        };
+        if sent.is_err() {
+            session.subscriptions[index].lock().retract(&key);
+        }
+        sent
+    }
+
+    /// Record an `op` update of subscription `key` with `record`, such as
+    /// `Subscriptions::grant` or `Subscriptions::close`, then write it on the
+    /// subscription row's member. After a `Close`, pages within the credit may
+    /// still arrive before the ending.
+    pub(crate) async fn update(
+        &self,
+        peer: &ZakuraPeerId,
+        subscription_type: u16,
+        key: u32,
+        op: UpdateOp,
+        record: impl FnOnce(&mut Subscriptions<u32, u32>) -> Result<Update<u32>, SubscribeRefused>,
+    ) -> Result<(), BoxError> {
+        let shared = &self.shared;
+        let (_, session) = shared.table.get(peer).ok_or("the peer has no session")?;
+        let index = shared.subscription_index(subscription_type);
+        let plan = shared.plan.subscriptions[index];
+        let update = record(&mut session.subscriptions[index].lock())?;
+        let frame = encode_update::<A>(plan.row, op, key, &update)?;
+        session.sends[plan.stream].send(frame).await?;
+        Ok(())
+    }
+}
+
+/// Encode `update` of subscription `key` as an `op` update on `row`.
+pub(crate) fn encode_update<A: StreamConformance>(
+    row: &MessageRule,
+    op: UpdateOp,
+    key: u32,
+    update: &Update<u32>,
+) -> Result<Frame, BoxError> {
+    let update = SubscriptionUpdate {
+        op,
+        key,
+        sequence: update.sequence,
+        acknowledged: update.acknowledged,
+        added: update.added,
+    };
+    encode_frame(&A::update(row, update)).map_err(|error| error.to_string().into())
 }
 
 impl<A: StreamConformance> Service for LayoutService<A> {
@@ -421,9 +640,39 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .map(|plan| usize::try_from(plan.max_in_flight).expect("a small limit fits usize"))
             .sum();
         let reservations = SharedReservations::new(Reservations::new(A::Message::RULES, window));
+        let subscriptions: Vec<_> = shared
+            .plan
+            .subscriptions
+            .iter()
+            .map(|plan| {
+                SharedSubscriptions::new(Subscriptions::new(plan.limits, A::Message::RULES))
+            })
+            .collect();
+        let prechecks = shared
+            .plan
+            .requests
+            .iter()
+            .map(|plan| {
+                let precheck: Arc<dyn ResponsePrecheck> = Arc::new(reservations.clone());
+                (plan.row.message_type, precheck)
+            })
+            .chain(shared.plan.subscriptions.iter().zip(&subscriptions).map(
+                |(plan, subscriptions)| {
+                    let precheck: Arc<dyn ResponsePrecheck> = Arc::new(subscriptions.clone());
+                    (plan.row.message_type, precheck)
+                },
+            ))
+            .collect();
+        let precheck: Arc<dyn ResponsePrecheck> =
+            Arc::new(PrecheckByRequest::new(A::Message::RULES, prechecks));
+        let mut attached = Vec::new();
         for &(_, stream) in &shared.plan.responses {
-            // Several response rows may share a member; the first attach wins.
-            recvs[stream].attach_precheck(Arc::new(reservations.clone()));
+            // Several response rows may share a member, which takes one check.
+            if !attached.contains(&stream) {
+                attached.push(stream);
+                let attached = recvs[stream].attach_precheck(precheck.clone());
+                debug_assert!(attached, "a fresh transport member takes a precheck");
+            }
         }
         let serve = shared
             .plan
@@ -451,10 +700,8 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             .iter()
             .zip(&shared.pushing)
             .map(|(plan, capacity)| {
-                let limits = SubscriptionLimits::from_rule(plan.row)
-                    .expect("the plan lists subscription rows");
                 let publisher = Publisher {
-                    publications: Arc::new(Mutex::new(Publications::new(limits))),
+                    publications: Arc::new(Mutex::new(Publications::new(plan.limits))),
                     wake: Arc::new(Notify::new()),
                 };
                 tokio::spawn(publish(
@@ -480,11 +727,15 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             reservations,
             serve,
             publishers,
+            subscriptions,
+            next_key: AtomicU32::new(0),
+            pages: watch::channel(0).0,
             fence: fence.clone(),
             cancel: cancel.clone(),
             connection: peer.cancel_token(),
             close_cause: peer.close_cause(),
             ended: watch::channel(Vec::new()).0,
+            subscriptions_ended: watch::channel(Vec::new()).0,
         });
         let current = Current {
             key,

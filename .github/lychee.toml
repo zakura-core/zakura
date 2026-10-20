@@ -16,6 +16,8 @@ exclude = [
     # Rate-limited or auth-required
     "^https://crates\\.io/crates/",
     # GitHub pages requiring authentication
+    # Crate reservations are tracked in this private repository.
+    "^https://github\\.com/zakura-core/reserved/?$",
     "^https://github.com/.*/settings",
     "^https://github.com/organizations/.*/settings",
     # GitHub old run IDs (change frequently)

@@ -44,6 +44,8 @@ pub(crate) struct InvariantReport {
     pub(crate) protocol_rejects: usize,
     /// Block-sync service sessions locally parked by no-progress liveness.
     pub(crate) session_parks: usize,
+    /// Block-sync sessions closed because a peer withheld a range's ending.
+    pub(crate) ending_timeouts: usize,
     /// Total `block_get_blocks_sent` requests issued over the run. Exceeds the chain
     /// length when blocks are re-requested (a peer dropped/withheld a height), so it is
     /// the non-vacuous signal that a timeout/re-request scenario actually re-requested.
@@ -144,6 +146,9 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .table("block_sync")
         .count("block_peer_protocol_reject");
     let session_parks = reader.table("block_sync").count("block_peer_parked");
+    let ending_timeouts = reader
+        .table("block_sync")
+        .count("block_peer_ending_timeout");
     let total_requests = reader.table("block_sync").count("block_get_blocks_sent");
     let max_requests_without_block_progress = max_requests_without_block_progress(reader);
     let max_unproven_requests_without_block_progress =
@@ -216,6 +221,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         final_budget_reserved,
         protocol_rejects,
         session_parks,
+        ending_timeouts,
         total_requests,
         max_requests_without_block_progress,
         max_unproven_requests_without_block_progress,

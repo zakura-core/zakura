@@ -1,6 +1,6 @@
 //! Main entry point for zakurad
 
-use zakurad::application::{boot, APPLICATION};
+use zakurad::application::boot;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const GLIBC_MALLOC_ARENA_MAX: i32 = 16;
@@ -38,5 +38,5 @@ fn main() {
             std::env::set_var("RUST_LIB_BACKTRACE", "0");
         }
     }
-    boot(&APPLICATION);
+    boot();
 }

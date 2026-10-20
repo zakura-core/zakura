@@ -8,11 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::future::BoxFuture;
 use tokio::{sync::watch, task::JoinHandle};
 use zakura_chain::{
     block,
     serialization::{ZcashDeserializeInto, ZcashSerialize},
-    transaction::Transaction,
+    transaction::{LockTime, Transaction},
     transparent,
 };
 use zakura_jsonl_trace::{JsonlTraceConfig, JsonlTraceGuard, JsonlTracer};
@@ -21,9 +22,9 @@ use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_GENESIS_BYTES};
 use super::{await_until, ZakuraTestCluster, ZakuraTestNode};
 use crate::{
     zakura::{
-        BlockApplyResult, BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent,
-        BlockSyncFrontiers, FullStateFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig,
-        ZakuraLocalLimits,
+        BlockApplyResult, BlockRangeRead, BlockRangeReadResult, BlockRangeSource,
+        BlockSizeEstimate, BlockSyncAction, BlockSyncBlockMeta, BlockSyncEvent, BlockSyncFrontiers,
+        FullStateFrontiers, ServicePeerLimits, ZakuraBlockSyncConfig, ZakuraLocalLimits,
     },
     BoxError, Config,
 };
@@ -420,7 +421,6 @@ impl HarnessConfig {
 
     fn block_sync_config(&self) -> ZakuraBlockSyncConfig {
         ZakuraBlockSyncConfig {
-            max_blocks_per_response: self.max_blocks_per_response,
             max_inflight_requests: u32::from(self.max_inflight),
             max_inflight_block_bytes: u64::MAX,
             max_submitted_block_applies: usize::from(self.max_inflight)
@@ -494,11 +494,63 @@ impl HarnessTrace {
     }
 }
 
+/// Serves corpus blocks up to `servable_high` and records each response.
+struct CorpusBlockSource {
+    corpus: SyntheticBlockCorpus,
+    servable_high: block::Height,
+    stats: ThroughputStats,
+}
+
+impl std::fmt::Debug for CorpusBlockSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CorpusBlockSource")
+            .field("servable_high", &self.servable_high)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BlockRangeSource for CorpusBlockSource {
+    fn read(
+        &self,
+        request: BlockRangeRead,
+    ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
+        let mut blocks = Vec::new();
+        let mut response_bytes = 0usize;
+        if request.lease.try_start() {
+            let max_body_bytes = usize::try_from(request.max_body_bytes).expect("u32 fits usize");
+            for (height, block, size) in
+                self.corpus
+                    .blocks_in_range(request.start_height, request.count, self.servable_high)
+            {
+                let Some(total) = response_bytes
+                    .checked_add(size)
+                    .filter(|total| *total <= max_body_bytes)
+                else {
+                    break;
+                };
+                response_bytes = total;
+                let bytes = block
+                    .zcash_serialize_to_vec()
+                    .expect("test block serializes");
+                blocks.push((height, bytes));
+            }
+            self.stats.record_request(blocks.len(), response_bytes);
+        }
+        Box::pin(async move {
+            Ok(BlockRangeReadResult {
+                blocks,
+                lease: request.lease,
+            })
+        })
+    }
+}
+
 async fn spawn_mock_node(
     cluster: &mut ZakuraTestCluster,
     seed: u64,
     initial_frontiers: BlockSyncFrontiers,
     corpus: &SyntheticBlockCorpus,
+    source: CorpusBlockSource,
     config: &HarnessConfig,
     trace: &mut HarnessTrace,
 ) -> Result<usize, BoxError> {
@@ -517,7 +569,8 @@ async fn spawn_mock_node(
             },
             Some((corpus.target_height(), corpus.tip_hash())),
         )
-        .block_sync_config(config.block_sync_config());
+        .block_sync_config(config.block_sync_config())
+        .block_range_source(Arc::new(source));
 
     cluster.spawn_node_with_builder(builder).await
 }
@@ -535,7 +588,6 @@ async fn drive_mock_block_sync_actions(
     node: &ZakuraTestNode,
     corpus: SyntheticBlockCorpus,
     apply: Option<MockApplyFrontier>,
-    servable_high: block::Height,
     stats: ThroughputStats,
     mut needed_blocks_gate: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
@@ -599,21 +651,6 @@ async fn drive_mock_block_sync_actions(
                                 },
                             ),
                             blocks: metas,
-                        })
-                        .await;
-                }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    let blocks = corpus.blocks_in_range(start, count, servable_high);
-                    let response_bytes = blocks
-                        .iter()
-                        .fold(0usize, |sum, (_, _, size)| sum.saturating_add(*size));
-                    stats.record_request(blocks.len(), response_bytes);
-                    let _ = handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
                         })
                         .await;
                 }
@@ -748,9 +785,24 @@ fn synthetic_block_at_height(
         _ => panic!("template block must start with a coinbase input"),
     }
 
+    // Each copy gets its own lock time, which keeps the serialized size but
+    // makes every transaction id unique, as a real block's must be.
     block.transactions.clear();
-    for _ in 0..tx_count {
-        block.transactions.push(coinbase.clone());
+    for index in 0..tx_count {
+        let mut transaction = coinbase.clone();
+        let lock_time = match Arc::make_mut(&mut transaction) {
+            Transaction::V1 { lock_time, .. }
+            | Transaction::V2 { lock_time, .. }
+            | Transaction::V3 { lock_time, .. }
+            | Transaction::V4 { lock_time, .. }
+            | Transaction::V5 { lock_time, .. }
+            | Transaction::V6 { lock_time, .. } => lock_time,
+        };
+        *lock_time = LockTime::Height(block::Height(
+            u32::try_from(index)
+                .expect("synthetic blocks hold far fewer than u32::MAX transactions"),
+        ));
+        block.transactions.push(transaction);
     }
 
     let merkle_root = block.transactions.iter().collect::<block::merkle::Root>();
@@ -1025,6 +1077,11 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
             seed,
             seed_frontiers,
             &corpus,
+            CorpusBlockSource {
+                corpus: corpus.clone(),
+                servable_high: corpus.target_height(),
+                stats: stats.clone(),
+            },
             &config,
             &mut trace,
         )
@@ -1035,7 +1092,6 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
                 cluster.node(index),
                 corpus.clone(),
                 None,
-                corpus.target_height(),
                 stats.clone(),
                 None,
             )
@@ -1057,6 +1113,11 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
         leecher_seed,
         leecher_frontiers,
         &corpus,
+        CorpusBlockSource {
+            corpus: corpus.clone(),
+            servable_high: block::Height(0),
+            stats: stats.clone(),
+        },
         &config,
         &mut trace,
     )
@@ -1067,7 +1128,6 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
             cluster.node(leecher_index),
             corpus.clone(),
             Some(apply),
-            block::Height(0),
             stats.clone(),
             Some(needed_blocks_gate_rx),
         )

@@ -25,7 +25,7 @@ use crate::zakura::{
         ServeEnd, ServeLimits, SinkProgress, WorkLease,
     },
     BlockSyncHandle, CloseCause, FramedSend, HeaderSyncHandle, MessageRole, MessageRule,
-    ZakuraPeerId, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+    ZakuraPeerId,
 };
 
 /// Node-wide `produce` steps for one discovery request row. Each step reads
@@ -39,22 +39,22 @@ const PEER_EXECUTION: usize = 1;
 /// unsent. A peer that stops reading makes its next request wait, and
 /// requests past the commitment margin then close the connection.
 const PEER_OUTPUT_RESPONSES: usize = 2;
-/// Unsent answers the node may hold on a row: every connection's share at
-/// the default connection limit.
-const NODE_OUTPUT_RESPONSES: usize = PEER_OUTPUT_RESPONSES * DEFAULT_ZAKURA_MAX_CONNECTIONS;
-
 /// The serving limits of a discovery request row whose largest response is
-/// `largest` payload bytes.
-fn serving_limits(largest: ResponseCap) -> ServeLimits {
+/// `largest` payload bytes, on a node that admits `max_connections`.
+///
+/// The node may hold every connection's share of unsent answers, so the pool
+/// follows the effective connection cap rather than a compile-time default.
+fn serving_limits(largest: ResponseCap, max_connections: usize) -> ServeLimits {
     let largest = largest.output_bytes();
+    let node_output_responses = PEER_OUTPUT_RESPONSES.saturating_mul(max_connections.max(1));
     // Widening usize to u64 is lossless on supported targets.
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
         peer_output_responses: PEER_OUTPUT_RESPONSES,
-        node_output_responses: NODE_OUTPUT_RESPONSES,
+        node_output_responses,
         peer_output_bytes: PEER_OUTPUT_RESPONSES as u64 * largest,
-        node_output_bytes: NODE_OUTPUT_RESPONSES as u64 * largest,
+        node_output_bytes: (node_output_responses as u64).saturating_mul(largest),
     }
 }
 
@@ -82,9 +82,10 @@ pub(super) struct Serving {
 }
 
 impl ServingCapacity {
-    pub(super) fn new() -> Self {
+    /// Builds the node-wide capacity for a node that admits `max_connections`.
+    pub(super) fn new(max_connections: usize) -> Self {
         let row = |row, largest| {
-            ServeCapacity::new("discovery", row, serving_limits(largest))
+            ServeCapacity::new("discovery", row, serving_limits(largest, max_connections))
                 .expect("the discovery serving limits are nonzero and fit their budgets")
         };
         Self {
@@ -278,5 +279,28 @@ impl Produce for ServiceReporter {
     /// A `Services` with no summaries is a legal answer to any `GetServices`.
     fn local_failure(&self, _query: &GetServices, _sent: SinkProgress) -> DiscoveryMessage {
         DiscoveryMessage::Services(self.handle.local_services_response(Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_node_pool_follows_the_effective_connection_cap() {
+        for max_connections in [1, 124, 256] {
+            for largest in [LARGEST_PEERS, LARGEST_SERVICES] {
+                let limits = serving_limits(largest, max_connections);
+                assert_eq!(
+                    limits.node_output_responses,
+                    PEER_OUTPUT_RESPONSES * max_connections
+                );
+                // Every test cap is at most 256, so the cast to u64 is lossless.
+                assert_eq!(
+                    limits.node_output_bytes,
+                    limits.peer_output_bytes * max_connections as u64
+                );
+            }
+        }
     }
 }

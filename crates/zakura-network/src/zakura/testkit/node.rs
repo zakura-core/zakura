@@ -553,9 +553,13 @@ impl ZakuraTestNodeBuilder {
                 header_sync.clone(),
                 block_sync_handle.clone(),
                 ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
+                self.limits.max_connections,
             ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone()))
+            Arc::new(DiscoveryService::with_max_connections(
+                discovery.clone(),
+                self.limits.max_connections,
+            ))
         };
         let registry = service_registry(
             &supervisor,
@@ -808,6 +812,7 @@ mod tests {
                     peer_addr,
                     &limits,
                     Some(admitted_ip_tx),
+                    crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
             });

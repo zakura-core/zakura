@@ -1,6 +1,6 @@
 use super::{
-    config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, trace::*,
-    wire::*, *,
+    config::*, events::*, peer_registry::*, regulated::status_sender::StatusSend, sequencer::*,
+    sequencer_task::*, state::*, trace::*, wire::*, *,
 };
 use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
@@ -832,7 +832,7 @@ impl BlockSyncReactor {
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
         // routine nor holds a per-peer inbound channel.
-        let peer_state = PeerBlockState::new(session, &self.startup.config);
+        let peer_state = PeerBlockState::new(session);
         self.state.peers.insert(peer.clone(), peer_state);
         set_block_reactor_active_connection_gauge(self.state.peers.len());
 
@@ -1861,24 +1861,30 @@ impl BlockSyncReactor {
         let sent = session.wire_status(status);
         let msg = BlockSyncMessage::Status(sent);
         let started = Instant::now();
-        let result = session.try_send_status(status);
-        match &result {
-            Ok(()) => peer_state.status_delivery.queued(status, now),
-            Err(OrderedSendError::Full) => {
-                peer_state.status_delivery.queue_full(now);
-                if let Some(deadline) = session.status_next_due() {
-                    peer_state.status_delivery.defer_until(deadline);
-                }
-            }
-            Err(_) => {}
-        }
-        match result {
-            Ok(()) => {
+        let error = match session.offer_status(status) {
+            Ok(StatusSend::Queued) => {
+                peer_state.status_delivery.queued(status);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
-                true
+                return true;
             }
-            Err(OrderedSendError::Full) => {
+            // The connection's cadence allows the next Status later.
+            // Legal pacing is not queue pressure.
+            Ok(StatusSend::Deferred(at)) => {
+                peer_state.status_delivery.deferred_until(at);
+                self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
+                return false;
+            }
+            // The previous Status frame is still waiting for its transport
+            // write. The queue may have free slots, so this is not a queue failure.
+            Ok(StatusSend::Unwritten) => {
+                peer_state.status_delivery.queue_full(now);
+                tracing::debug!(?peer, "previous Zakura block-sync Status is unwritten");
+                self.trace_message_sent(peer, &msg, "unwritten", started.elapsed());
+                return false;
+            }
+            Ok(StatusSend::QueueFull) => {
+                peer_state.status_delivery.queue_full(now);
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
                 self.trace_queue_send_failed(
@@ -1889,24 +1895,23 @@ impl BlockSyncReactor {
                     session.outbound_max_capacity(),
                     Some(reason),
                 );
-                false
+                return false;
             }
-            Err(error) => {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
-                self.trace_status_send_failed(peer, reason);
-                self.trace_message_sent(peer, &msg, "error", started.elapsed());
-                self.trace_queue_send_failed(
-                    peer,
-                    &msg,
-                    &error,
-                    session.outbound_capacity(),
-                    session.outbound_max_capacity(),
-                    Some(reason),
-                );
-                session.cancel_token().cancel();
-                false
-            }
-        }
+            Err(error) => error,
+        };
+        tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
+        self.trace_status_send_failed(peer, reason);
+        self.trace_message_sent(peer, &msg, "error", started.elapsed());
+        self.trace_queue_send_failed(
+            peer,
+            &msg,
+            &error,
+            session.outbound_capacity(),
+            session.outbound_max_capacity(),
+            Some(reason),
+        );
+        session.cancel_token().cancel();
+        false
     }
 
     fn flush_status_refresh(&mut self) {

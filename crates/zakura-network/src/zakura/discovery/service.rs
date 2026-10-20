@@ -25,8 +25,8 @@ use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, Peer, PeerStreamSession,
     Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SessionDemand, SessionOpening,
-    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES,
-    ZAKURA_CAP_DISCOVERY,
+    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace,
+    DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 use crate::BoxError;
 
@@ -240,27 +240,36 @@ impl SessionSlot {
 }
 
 impl DiscoveryService {
-    /// Builds a discovery service driven by `handle`.
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for the default connection cap.
     pub fn new(handle: ZakuraDiscoveryHandle) -> Self {
+        Self::with_max_connections(handle, DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    }
+
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for a node that admits `max_connections`.
+    pub fn with_max_connections(handle: ZakuraDiscoveryHandle, max_connections: usize) -> Self {
         Self {
             handle,
             header_sync: None,
             block_sync: None,
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
-            serving: ServingCapacity::new(),
+            serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
             trace: ZakuraTrace::default(),
         }
     }
 
     /// Builds a discovery service with header-sync and block-sync summary
-    /// providers, which writes its violations to `trace`.
+    /// providers, which writes its violations to `trace` and sizes its serving
+    /// pools for `max_connections`.
     pub(crate) fn with_sync_services(
         handle: ZakuraDiscoveryHandle,
         header_sync: HeaderSyncHandle,
         block_sync: Option<BlockSyncHandle>,
         trace: ZakuraTrace,
+        max_connections: usize,
     ) -> Self {
         Self {
             handle,
@@ -268,7 +277,7 @@ impl DiscoveryService {
             block_sync,
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
-            serving: ServingCapacity::new(),
+            serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
             trace,
         }
@@ -1362,6 +1371,7 @@ mod tests {
             header_sync,
             Some(block_sync.clone()),
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let peer_node_id = NodeSecretKey::from_bytes(&[25u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -1723,6 +1733,7 @@ mod tests {
             header_sync.clone(),
             None,
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let peer_secret = NodeSecretKey::from_bytes(&[43u8; 32]);
         let peer_node_id = peer_secret.public();
@@ -1848,7 +1859,7 @@ mod tests {
     ) -> (DiscoverySink, FramedRecv) {
         let (send, recv) = framed_channel(capacity);
         let cancel = CancellationToken::new();
-        let serving = ServingCapacity::new().session(
+        let serving = ServingCapacity::new(DEFAULT_ZAKURA_MAX_CONNECTIONS).session(
             PeerSampler {
                 handle: handle.clone(),
                 requester: peer_node_id,
@@ -3452,6 +3463,7 @@ mod tests {
             header_sync.clone(),
             None,
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let header_service = Arc::new(HeaderSyncService::new(header_sync.clone()));
         service.set_connection_owners(vec![header_service.clone()]);

@@ -6,12 +6,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    io::{self, Cursor, Read, Write},
+    io,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::WriteBytesExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{

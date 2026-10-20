@@ -100,6 +100,7 @@ pub(crate) async fn native_discovery_dial(
         node_addr,
         limits,
         Some(admitted_ip),
+        crate::zakura::handler::NativeDialKind::Discovery,
     )
     .await
 }
@@ -119,8 +120,48 @@ pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::{BoxError, Config};
 
     use crate::zakura::{DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS};
+
+    /// The discovery caller uses the lower transport ceiling and reports a
+    /// local limit when a small configuration has room only for inbound peers.
+    #[tokio::test]
+    async fn discovery_dial_uses_the_inbound_preserving_limit() -> Result<(), BoxError> {
+        use crate::zakura::testkit::ZakuraTestNode;
+        use crate::zakura::ZakuraLocalLimits;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let limits = ZakuraLocalLimits {
+                max_connections: 1,
+                max_pending_handshakes: 1,
+                ..ZakuraLocalLimits::from_config(&Config::default())
+            };
+            let node = ZakuraTestNode::builder(151_508)
+                .limits(limits.clone())
+                .spawn()
+                .await?;
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let target = NodeAddr::with_addrs(
+                zakura_quic::NodeSecretKey::generate().public(),
+                [silent.local_addr()?],
+            );
+            let endpoint = node.endpoint();
+            assert!(!endpoint.has_discovery_admission_capacity());
+            let (admitted_ip, _rx) = tokio::sync::oneshot::channel();
+            let result = tokio::time::timeout(
+                Duration::from_millis(200),
+                native_discovery_dial(&endpoint, target, &limits, admitted_ip),
+            )
+            .await?;
+            assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));
+            node.shutdown().await;
+            Ok::<_, BoxError>(())
+        })
+        .await?
+    }
 
     #[test]
     fn bootstrap_peer_requires_node_id_and_direct_address() {

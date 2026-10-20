@@ -18,8 +18,9 @@ use crate::{
         INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     zakura::{
-        DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config, P2pStack,
 };
@@ -844,6 +845,125 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
+}
+
+#[test]
+fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
+    let _init_guard = zakura_test::init();
+
+    // A config generated before the budget existed keeps loading. The endpoint
+    // lowers its cap to what the default budget admits.
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.zakura.max_connections, 256);
+    assert_eq!(
+        config.zakura.budgeted_max_connections(),
+        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    );
+    assert_eq!(
+        ZakuraLocalLimits::from_config(&config).max_connections,
+        DEFAULT_ZAKURA_MAX_CONNECTIONS
+    );
+
+    let config: Config = toml::from_str(
+        r#"
+        [zakura]
+        max_connections = 256
+        peer_memory_budget_bytes = 19595788288
+        "#,
+    )
+    .unwrap();
+    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
+    // admitted and 32 of headroom.
+    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+
+    // The transport holds the admitted connections and the headroom, half of
+    // it kept for dials (zakura-quic ADM-12), and two closing connections per
+    // live slot (ADM-13).
+    let bind = ZakuraLocalLimits::from_config(&config).quic_bind_config(Vec::new());
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (288, 16, 576)
+    );
+    let bind = ZakuraLocalLimits::from_config(&Config::default()).quic_bind_config(Vec::new());
+    assert_eq!(
+        (
+            bind.max_connections,
+            bind.dial_reserve,
+            bind.max_closing_connections
+        ),
+        (124, 16, 248)
+    );
+
+    // A 1 GiB receive window leaves the default budget room for 7 QUIC
+    // connections, less than its headroom alone.
+    let error = toml::from_str::<Config>(
+        r#"
+        p2p_stack = "dual"
+
+        [zakura.quic]
+        receive_window_bytes = 1073741824
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("[network.zakura] peer_memory_budget_bytes"),
+        "{error}"
+    );
+    assert!(error.contains("receive_window_bytes"), "{error}");
+}
+
+/// An unused QUIC budget cannot reject legacy startup, but every resolved
+/// stack that runs v2 must enforce it before the endpoint starts.
+#[test]
+fn zakura_peer_memory_budget_only_rejects_v2_stacks() {
+    let _init_guard = zakura_test::init();
+
+    for network in ["Mainnet", "Testnet"] {
+        for stack in [
+            None,
+            Some("default"),
+            Some("legacy"),
+            Some("zakura"),
+            Some("dual"),
+        ] {
+            let stack_config = stack
+                .map(|stack| format!("p2p_stack = \"{stack}\"\n"))
+                .unwrap_or_default();
+            let source = format!(
+                "network = \"{network}\"\n{stack_config}\n[zakura]\npeer_memory_budget_bytes = 1\n"
+            );
+            let result = toml::from_str::<Config>(&source);
+            let runs_v2 = match stack {
+                None | Some("default") => network == "Testnet",
+                Some("legacy") => false,
+                Some("zakura" | "dual") => true,
+                _ => unreachable!("the test only supplies supported stack names"),
+            };
+            if runs_v2 {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("peer_memory_budget_bytes"),
+                    "{source}: {error}"
+                );
+            } else {
+                let config = result.unwrap_or_else(|error| panic!("{source}: {error}"));
+                assert!(!config.v2_p2p());
+                assert!(config.legacy_p2p());
+                assert_eq!(config.zakura.peer_memory_budget_bytes, 1);
+            }
+        }
+    }
 }
 
 #[test]

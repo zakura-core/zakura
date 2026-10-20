@@ -105,6 +105,17 @@ Note that the package `clang` includes `libclang` as well.
 
 </details>
 
+On Windows, set this environment variable in PowerShell before building or
+installing Zakura:
+
+```powershell
+$env:ROCKSDB_UNITY_CHUNK = "1"
+```
+
+This compiles each bundled RocksDB C++ source separately. The default build
+combines sources, which causes a name collision with the Windows `CreateFile`
+API. CI sets this variable through the shared build setup action.
+
 Once you have the dependencies in place, you can install Zakura with:
 
 ```sh

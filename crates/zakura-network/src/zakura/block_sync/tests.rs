@@ -34,6 +34,7 @@ use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
     trace::BlockBodySource,
+    wire_codec::WireError,
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
@@ -2052,7 +2053,7 @@ fn codec_rejects_malformed_discriminator_and_truncated_payload() {
 
     assert!(matches!(
         BlockSyncMessage::decode(&[MSG_BS_GET_BLOCKS, 1, 0]),
-        Err(BlockSyncWireError::Io(_))
+        Err(BlockSyncWireError::Wire(WireError::Truncated(_)))
     ));
 }
 
@@ -2096,7 +2097,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: 0,
         }
         .encode(),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_get_blocks = vec![MSG_BS_GET_BLOCKS];
@@ -2104,7 +2105,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_get_blocks.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_get_blocks),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     let mut zero_count_range_unavailable = vec![MSG_BS_RANGE_UNAVAILABLE];
@@ -2112,7 +2113,7 @@ fn codec_rejects_count_and_returned_over_cap() {
     zero_count_range_unavailable.extend_from_slice(&0u32.to_le_bytes());
     assert!(matches!(
         BlockSyncMessage::decode(&zero_count_range_unavailable),
-        Err(BlockSyncWireError::ZeroBlockCount)
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2121,7 +2122,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2130,7 +2131,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             returned: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 
     assert!(matches!(
@@ -2139,7 +2140,7 @@ fn codec_rejects_count_and_returned_over_cap() {
             count: over_cap,
         }
         .encode(),
-        Err(BlockSyncWireError::BlockCountLimit { .. })
+        Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
     ));
 }
 
@@ -2182,28 +2183,73 @@ fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
     ));
 }
 
+/// The public decoder shares the regulated Status checks instead of clamping
+/// limits that a regulated peer would be disconnected for sending.
 #[test]
-fn status_decode_clamps_peer_capacity_advertisements() {
-    let mut payload = Vec::new();
-    payload.push(MSG_BS_STATUS);
-    payload.extend_from_slice(&block::Height(1).0.to_le_bytes());
-    payload.extend_from_slice(&block::Height(2).0.to_le_bytes());
-    block::Hash([9; 32])
-        .zcash_serialize(&mut payload)
-        .expect("hash serializes");
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
-    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+fn status_decode_rejects_limits_outside_the_protocol_bounds() {
+    let valid = BlockSyncMessage::Status(status())
+        .encode()
+        .expect("message encodes");
+    assert_eq!(valid.len(), 53);
+    // Tag, two heights, and the tip hash precede the three limits.
+    for (offset, max) in [
+        (41, MAX_BS_BLOCKS_PER_REQUEST),
+        (45, MAX_BS_INFLIGHT_REQUESTS),
+        (49, MAX_BS_RESPONSE_BYTES),
+    ] {
+        for value in [0, max + 1, u32::MAX] {
+            let mut payload = valid.clone();
+            payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                matches!(
+                    BlockSyncMessage::decode(&payload),
+                    Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
+                ),
+                "limit at byte {offset} accepted {value}"
+            );
+        }
+        let mut payload = valid.clone();
+        payload[offset..offset + 4].copy_from_slice(&max.to_le_bytes());
+        assert!(BlockSyncMessage::decode(&payload).is_ok());
+    }
+}
 
-    let BlockSyncMessage::Status(status) =
-        BlockSyncMessage::decode(&payload).expect("status decodes")
-    else {
-        panic!("expected status message");
-    };
-
-    assert_eq!(status.max_blocks_per_response, MAX_BS_BLOCKS_PER_REQUEST);
-    assert_eq!(status.max_inflight_requests, MAX_BS_INFLIGHT_REQUESTS);
-    assert_eq!(status.max_response_bytes, MAX_BS_RESPONSE_BYTES);
+/// The public encoder rejects the Status values the decoder rejects, instead of
+/// clamping them into a different advertisement.
+#[test]
+fn status_encode_rejects_what_the_decoder_rejects() {
+    let invalid = [
+        BlockSyncStatus {
+            max_blocks_per_response: 0,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST + 1,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_inflight_requests: 0,
+            ..status()
+        },
+        BlockSyncStatus {
+            max_response_bytes: MAX_BS_RESPONSE_BYTES + 1,
+            ..status()
+        },
+        BlockSyncStatus {
+            servable_low: block::Height(2),
+            servable_high: block::Height(1),
+            ..status()
+        },
+    ];
+    for status in invalid {
+        assert!(
+            matches!(
+                BlockSyncMessage::Status(status).encode(),
+                Err(BlockSyncWireError::Wire(WireError::OutOfRange(_)))
+            ),
+            "encoded {status:?}"
+        );
+    }
 }
 
 #[test]
@@ -11993,6 +12039,78 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
     reactor_task.abort();
 }
 
+/// A Status the connection's cadence defers is legal pacing. The reactor waits
+/// for the cadence instant instead of retrying a full queue every 100 ms.
+#[tokio::test]
+async fn reactor_waits_for_a_deferred_status_without_reporting_queue_pressure() {
+    let mut capture = TraceCapture::for_test(
+        "reactor_waits_for_a_deferred_status_without_reporting_queue_pressure",
+    )
+    .expect("trace capture initializes");
+    let mut config = immediate_body_download_config();
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(startup).expect("valid block-sync config");
+    let service = BlockSyncService::new_with_handle_for_test(config, handle);
+    let (_inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer(66),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC_REGULATED,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+
+    // The peer never sends its Status, so our Status stays due after the
+    // first one queues. The next attempt falls inside the 30 s cadence.
+    wait_for_outbound_status(&mut outbound_rx).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), outbound_rx.recv())
+            .await
+            .is_err(),
+        "the cadence holds the second Status"
+    );
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    let status_results: Vec<_> = reader
+        .table("block_sync")
+        .rows()
+        .into_iter()
+        .filter(|row| {
+            row.get("event").and_then(|event| event.as_str()) == Some(bs_trace::BLOCK_MESSAGE_SENT)
+                && row.get("kind").and_then(|kind| kind.as_str()) == Some("status")
+        })
+        .filter_map(|row| row.get("result").and_then(|result| result.as_str()))
+        .collect();
+    assert_eq!(status_results, ["queued", "deferred"]);
+    assert!(
+        !reader
+            .rows()
+            .into_iter()
+            .any(|row| row.get("event").and_then(|event| event.as_str())
+                == Some("queue_send_failed")),
+        "a cadence deferral is not a queue failure"
+    );
+
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
     let blocks = mainnet_blocks_1_to_3();
@@ -13309,7 +13427,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 /// — the honest peer is still offered the range and makes progress.
 ///
 /// The audit flagged the unpenalized retry path as a possible wedge (two peers
-/// re-occupying the whole fanout). Verified here that it is not: `handle_range_unavailable`
+/// re-occupying the whole fanout). Verified here that it is not: `handle_ending`
 /// reschedules immediately after each response, and with one in-flight request per
 /// peer the other misbehaving peer is still busy holding its stale request when the
 /// first frees its slot, so the honest peer claims the freed companion slot. The

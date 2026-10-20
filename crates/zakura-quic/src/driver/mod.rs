@@ -45,6 +45,10 @@ pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
 /// datagrams also bounds memory when a peer sends 64 KiB datagrams.
 pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Datagram bytes the endpoint queues for a closed connection (ADM-13). A
+/// closed connection only answers with CONNECTION_CLOSE, so it needs little.
+pub(crate) const CLOSING_QUEUE_BYTES: usize = 64 * 1024;
+
 /// The datagram bytes one socket may queue across all its connections
 /// (SPEC §6a), so many lagging connection tasks can't add up to
 /// `CONNECTION_QUEUE_BYTES` each.

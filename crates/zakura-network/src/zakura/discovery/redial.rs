@@ -97,6 +97,12 @@ enum DialResult {
     /// The peer speaks another ALPN; wait at least
     /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
     AlpnMismatch,
+    /// This node hit one of its own limits before sending the peer anything
+    /// (`ZakuraHandlerError::is_pre_dial_limit`). Retry after the initial
+    /// backoff without counting an attempt or growing the backoff, so a full
+    /// node doesn't give up on the peer. A limit hit after the handshake
+    /// counts as a failure, so it can't redial the peer forever.
+    LocalLimit,
 }
 
 /// Maintain a Zakura connection to `node_addr`, re-dialing with bounded backoff.
@@ -137,6 +143,10 @@ pub(crate) async fn native_dial_supervised(
                         "Zakura peer speaks another protocol version; backing off"
                     );
                     DialResult::AlpnMismatch
+                }
+                Err(error) if error.is_pre_dial_limit() => {
+                    tracing::debug!(?error, "Zakura native dial hit a local limit; will retry");
+                    DialResult::LocalLimit
                 }
                 Err(error) => {
                     tracing::debug!(?error, "Zakura native dial failed; will retry");
@@ -260,6 +270,13 @@ async fn run_dial_supervisor<F>(
                 failures = 0;
                 continue;
             }
+            DialResult::LocalLimit => {
+                if !sleep_unless_registered(&mut registered, &peer_id, policy.initial_backoff).await
+                {
+                    return;
+                }
+                continue;
+            }
             DialResult::Failed | DialResult::AlpnMismatch => {}
         }
 
@@ -277,22 +294,35 @@ async fn run_dial_supervisor<F>(
         } else {
             backoff
         };
-        let sleep = tokio::time::sleep(wait);
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                changed = registered.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    if registered.borrow().iter().any(|id| id == &peer_id) {
-                        break;
-                    }
-                }
-                _ = &mut sleep => break,
-            }
+        if !sleep_unless_registered(&mut registered, &peer_id, wait).await {
+            return;
         }
         backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+    }
+}
+
+/// Sleeps for `wait`, waking early if `peer_id` registers from another
+/// connection. Ignores unrelated peer-set changes. Returns `false` when the
+/// registration watch closes (node shutdown).
+async fn sleep_unless_registered(
+    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    peer_id: &ZakuraPeerId,
+    wait: Duration,
+) -> bool {
+    let sleep = tokio::time::sleep(wait);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            changed = registered.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                if registered.borrow().iter().any(|id| id == peer_id) {
+                    return true;
+                }
+            }
+            _ = &mut sleep => return true,
+        }
     }
 }
 
@@ -649,6 +679,43 @@ mod tests {
     /// A peer on another ALPN is redialed no sooner than
     /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`], however short the policy's backoff
     /// (zakura-quic DIAL-5).
+    /// A dial that hits this node's own limit retries after the initial
+    /// backoff without using up an attempt or growing the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_retries_local_limits_without_counting_them() {
+        const LOCAL_LIMITS: usize = 10;
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dial = {
+            let calls = calls.clone();
+            move || {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let result = if call < LOCAL_LIMITS {
+                    DialResult::LocalLimit
+                } else {
+                    DialResult::Failed
+                };
+                Box::pin(async move { result }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+            }
+        };
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 2),
+            dial,
+        ));
+
+        // One retry per initial backoff: the backoff never grew.
+        tokio::time::sleep(Duration::from_millis(9_500)).await;
+        assert_eq!(dial_count(&calls), LOCAL_LIMITS);
+        // The local limits used up none of the two attempts.
+        tokio::time::timeout(Duration::from_secs(60), supervisor)
+            .await
+            .expect("the dial stops after its two counted attempts")
+            .unwrap();
+        assert_eq!(dial_count(&calls), LOCAL_LIMITS + 2);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dial_supervisor_backs_off_ten_minutes_after_alpn_mismatch() {
         let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());

@@ -7,17 +7,18 @@ use std::{
 use zakura_chain::{block, serialization::ZcashDeserialize};
 
 use super::{
-    requester::{Requester, ResponseError},
-    wire::{Message, Range, RULES},
+    requester::{CompletedRange, Requester, ResponseError},
+    wire::{decode_control, Control, Range, RULES},
 };
 use crate::zakura::{
-    block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncMessage},
+    block_sync::{
+        config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncStatus, MSG_BS_BLOCK,
+    },
     regulation::{
         ClaimRefused, Exchange, ExchangeWriter, PoolEntry, ReservationPool, ResponsePrecheck,
         WriterFence,
     },
     transport::FrameWriteClaim,
-    wire_codec::decode_frame,
     Frame, FrameRejection, FramedRecv, FramedSend, MessageRule, SinkReject,
 };
 
@@ -88,9 +89,15 @@ impl ResponsePrecheck for Shared {
     }
 }
 
+/// A frame that passed its checks, carrying the values that its handler uses.
 pub(crate) enum Authorization {
-    Control,
+    Status(BlockSyncStatus),
+    GetBlocks(Range),
+    /// The claimed body's height. Its transactions are still undecoded.
     Block(block::Height),
+    /// The ending already consumed its reservation.
+    Ended(CompletedRange),
+    /// A local incompatibility, not a protocol fault.
     IncompatibleHeader,
 }
 
@@ -210,6 +217,7 @@ impl LiveRequester {
 
     /// Authorize the exact header before decoding the block's transactions.
     /// Endings are small and must validate before their reservation is removed.
+    /// Control frames are decoded here, once.
     pub(crate) fn authorize(&self, frame: &Frame) -> Result<Authorization, SinkReject> {
         if self.transport_admits && (3..=5).contains(&frame.message_type) {
             self.shared
@@ -225,7 +233,7 @@ impl LiveRequester {
         {
             return Err(SinkReject::protocol("invalid GetBlocks frame envelope"));
         }
-        if frame.message_type == 3 {
+        if frame.message_type == u16::from(MSG_BS_BLOCK) {
             self.shared
                 .lock()
                 .precheck(frame.message_type, frame.payload.len())
@@ -245,22 +253,18 @@ impl LiveRequester {
                 Err(error) => Err(SinkReject::protocol(error)),
             };
         }
-        let message: Message = decode_frame(frame).map_err(SinkReject::protocol)?;
-        if matches!(frame.message_type, 4 | 5) {
-            self.shared
-                .lock()
-                .finish(&message)
-                .map_err(SinkReject::protocol)?;
-        }
-        Ok(Authorization::Control)
-    }
-
-    pub(crate) fn ending_start(message: &BlockSyncMessage) -> Option<block::Height> {
-        match message {
-            BlockSyncMessage::BlocksDone { start_height, .. }
-            | BlockSyncMessage::RangeUnavailable { start_height, .. } => Some(*start_height),
-            _ => None,
-        }
+        Ok(
+            match decode_control(&frame.payload).map_err(SinkReject::protocol)? {
+                Control::Status(status) => Authorization::Status(status),
+                Control::GetBlocks(range) => Authorization::GetBlocks(range),
+                Control::End(ending) => Authorization::Ended(
+                    self.shared
+                        .lock()
+                        .finish(ending)
+                        .map_err(SinkReject::protocol)?,
+                ),
+            },
+        )
     }
 }
 
@@ -345,7 +349,7 @@ mod tests {
         };
         assert!(matches!(
             requester.authorize(&ending),
-            Ok(Authorization::Control)
+            Ok(Authorization::Ended(_))
         ));
         assert_eq!(pool.held(), 0);
         assert_eq!(reader.check(4, 9), Err(FrameRejection::Unsolicited));

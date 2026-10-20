@@ -138,7 +138,9 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                 let mut issued = [0_u32; PEERS];
                 let mut fill = |peer: usize, session: &mut ServingSession| {
                     for _ in 0..WINDOW {
-                        session.admit(Height(base(peer) + issued[peer]), 1).unwrap();
+                        session
+                            .admit(Range::new(Height(base(peer) + issued[peer]), 1).unwrap())
+                            .unwrap();
                         issued[peer] += 1;
                     }
                 };
@@ -193,7 +195,10 @@ fn concurrent_sessions_share_bounded_capacity_without_refill_waits() {
                                     completed[peer] += 1;
                                     if issued[peer] < TOTAL {
                                         session
-                                            .admit(Height(base(peer) + issued[peer]), 1)
+                                            .admit(
+                                                Range::new(Height(base(peer) + issued[peer]), 1)
+                                                    .unwrap(),
+                                            )
                                             .unwrap();
                                         issued[peer] += 1;
                                     }
@@ -407,7 +412,9 @@ async fn maximum_sessions_continuous_serving_probe() {
     let (_, admission) = zakura_test::allocations::measure(|| {
         for (peer, (session, _)) in sessions.iter_mut().enumerate() {
             for _ in 0..window {
-                session.admit(start(peer, issued[peer]), blocks).unwrap();
+                session
+                    .admit(Range::new(start(peer, issued[peer]), blocks).unwrap())
+                    .unwrap();
                 issued[peer] += 1;
             }
         }
@@ -430,7 +437,9 @@ async fn maximum_sessions_continuous_serving_probe() {
                     if (issued[peer] + 1) * blocks >= STRIDE {
                         issued[peer] = 0;
                     }
-                    session.admit(start(peer, issued[peer]), blocks).unwrap();
+                    session
+                        .admit(Range::new(start(peer, issued[peer]), blocks).unwrap())
+                        .unwrap();
                     issued[peer] += 1;
                 }
             }

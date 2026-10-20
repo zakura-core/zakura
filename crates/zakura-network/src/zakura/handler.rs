@@ -4141,9 +4141,9 @@ async fn spawn_zakura_endpoint_inner(
         .zakura
         .trace_dir
         .clone()
-        .map(zakura_jsonl_trace::JsonlTracer::spawn)
-        .unwrap_or_else(zakura_jsonl_trace::JsonlTracer::noop);
-    let trace = ZakuraTrace::new(tracer, zakura_jsonl_trace::node_id());
+        .map(crate::jsonl_trace::JsonlTracer::spawn)
+        .unwrap_or_else(crate::jsonl_trace::JsonlTracer::noop);
+    let trace = ZakuraTrace::new(tracer, crate::jsonl_trace::node_id());
     let handshake_config = ZakuraHandshakeConfig::for_network_with_dev_cohort(
         &config.network,
         config.zakura.dev_network.as_deref(),

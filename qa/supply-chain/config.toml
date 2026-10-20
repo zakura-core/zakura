@@ -40,9 +40,6 @@ audit-as-crates-io = false
 [policy.zakura-header-chain]
 audit-as-crates-io = false
 
-[policy.zakura-jsonl-trace]
-audit-as-crates-io = false
-
 [policy.zakura-mmr-tree]
 audit-as-crates-io = false
 

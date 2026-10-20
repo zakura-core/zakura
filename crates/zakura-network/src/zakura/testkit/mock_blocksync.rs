@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::jsonl_trace::{JsonlTraceConfig, JsonlTraceGuard, JsonlTracer};
 use futures::future::BoxFuture;
 use tokio::{sync::watch, task::JoinHandle};
 use zakura_chain::{
@@ -16,7 +17,6 @@ use zakura_chain::{
     transaction::{LockTime, Transaction},
     transparent,
 };
-use zakura_jsonl_trace::{JsonlTraceConfig, JsonlTraceGuard, JsonlTracer};
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_GENESIS_BYTES};
 
 use super::{await_until, ZakuraTestCluster, ZakuraTestNode};

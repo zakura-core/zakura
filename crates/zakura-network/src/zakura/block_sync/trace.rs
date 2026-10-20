@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
+use crate::jsonl_trace::JsonlTraceEvent;
 use serde::Serialize;
 use zakura_chain::block;
-use zakura_jsonl_trace::JsonlTraceEvent;
 
 use super::{
     events::{BlockApplyResult, BlockSyncAction, BlockSyncEvent, BlockSyncMisbehavior},
@@ -320,7 +320,7 @@ impl BlockTraceEvent {
 }
 
 impl JsonlTraceEvent for BlockTraceEvent {
-    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+    const TABLE: crate::jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
 }
 
 /// A typed queue-send failure originating in block sync.
@@ -383,7 +383,7 @@ impl QueueSendFailedEvent {
 }
 
 impl JsonlTraceEvent for QueueSendFailedEvent {
-    const TABLE: zakura_jsonl_trace::JsonlTraceTable = QUEUE_SEND_TABLE;
+    const TABLE: crate::jsonl_trace::JsonlTraceTable = QUEUE_SEND_TABLE;
 }
 
 #[derive(Default, Serialize)]
@@ -566,7 +566,7 @@ impl BlockEventReceived {
 }
 
 impl JsonlTraceEvent for BlockEventReceived {
-    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+    const TABLE: crate::jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
 }
 
 #[derive(Serialize)]
@@ -641,7 +641,7 @@ impl BlockActionDispatched {
 }
 
 impl JsonlTraceEvent for BlockActionDispatched {
-    const TABLE: zakura_jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
+    const TABLE: crate::jsonl_trace::JsonlTraceTable = BLOCK_SYNC_TABLE;
 }
 
 pub(super) fn block_sync_message_label(message: &BlockSyncMessage) -> &'static str {

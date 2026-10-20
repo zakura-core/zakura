@@ -154,7 +154,6 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
-    --mount=type=bind,source=crates/zakura-jsonl-trace,target=crates/zakura-jsonl-trace \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
     --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \

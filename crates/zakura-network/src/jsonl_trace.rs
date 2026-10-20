@@ -1,4 +1,8 @@
-//! Shared non-blocking JSONL tracing support for Zebra components.
+//! Non-blocking JSONL trace files for Zakura's diagnostic events.
+//!
+//! Enabled by `[network.zakura] trace_dir`. Events go through a bounded channel
+//! to a background writer, and are dropped rather than blocking the node when
+//! the channel is full.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -116,8 +120,8 @@ pub fn saturating_micros(value: Duration) -> u64 {
 #[macro_export]
 macro_rules! impl_jsonl_trace_event {
     ($event:ty, $table:expr) => {
-        impl $crate::JsonlTraceEvent for $event {
-            const TABLE: $crate::JsonlTraceTable = $table;
+        impl $crate::jsonl_trace::JsonlTraceEvent for $event {
+            const TABLE: $crate::jsonl_trace::JsonlTraceTable = $table;
         }
     };
 }

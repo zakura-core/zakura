@@ -23,8 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::jsonl_trace::{JsonlTraceGuard, JsonlTracer};
 use zakura_chain::block::{self, Block};
-use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
 use zakura_rt::{
     sync::{
         atomic::{AtomicU64, Ordering},

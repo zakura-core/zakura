@@ -2,12 +2,12 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
+use crate::jsonl_trace::JsonlTracer;
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use zakura_jsonl_trace::JsonlTracer;
 use zakura_quic::{NodeAddr, NodeId, QuicConfig};
 
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};

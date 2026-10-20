@@ -34,7 +34,7 @@ impl LegacyRequestStart {
     }
 }
 
-zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyRequestStart, LEGACY_REQUEST_TABLE);
+crate::impl_jsonl_trace_event!(LegacyRequestStart, LEGACY_REQUEST_TABLE);
 
 #[derive(Debug, Serialize)]
 pub(super) struct LegacyRequestResponse {
@@ -68,7 +68,7 @@ impl LegacyRequestResponse {
     }
 }
 
-zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyRequestResponse, LEGACY_REQUEST_TABLE);
+crate::impl_jsonl_trace_event!(LegacyRequestResponse, LEGACY_REQUEST_TABLE);
 
 #[derive(Debug, Serialize)]
 pub(super) struct LegacyRequestError {
@@ -97,7 +97,7 @@ impl LegacyRequestError {
     }
 }
 
-zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyRequestError, LEGACY_REQUEST_TABLE);
+crate::impl_jsonl_trace_event!(LegacyRequestError, LEGACY_REQUEST_TABLE);
 
 fn response_summary(response: &Response) -> (&'static str, u64, u64) {
     match response {

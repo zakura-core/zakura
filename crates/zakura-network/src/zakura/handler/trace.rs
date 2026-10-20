@@ -1,5 +1,5 @@
+use crate::jsonl_trace::{JsonlTraceEvent, JsonlTraceTable};
 use serde::{Serialize, Serializer};
-use zakura_jsonl_trace::{JsonlTraceEvent, JsonlTraceTable};
 
 use crate::zakura::{
     trace::{peer_label, CONN_TABLE, HANDSHAKE_TABLE, RATELIMIT_TABLE, STREAM_TABLE},

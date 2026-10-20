@@ -2900,7 +2900,6 @@ dependencies = [
  "zakura-chain",
  "zakura-consensus",
  "zakura-header-chain",
- "zakura-jsonl-trace",
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
@@ -3136,18 +3135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zakura-jsonl-trace"
-version = "1.2.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "zakura-jubjub"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3221,7 +3208,6 @@ dependencies = [
  "tracing-subscriber",
  "zakura-chain",
  "zakura-header-chain",
- "zakura-jsonl-trace",
  "zakura-node-services",
  "zakura-quic",
  "zakura-rt",

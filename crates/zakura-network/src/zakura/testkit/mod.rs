@@ -17,6 +17,7 @@ mod trace_capture;
 mod trace_reader;
 mod wait;
 
+pub use crate::jsonl_trace::JsonlTracer;
 pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
@@ -27,4 +28,3 @@ pub use recorder::{InboundRecorder, RecordedInbound};
 pub use trace_capture::TraceCapture;
 pub use trace_reader::{TraceQuery, TraceReader, TraceValue};
 pub use wait::{await_until, WaitError, TEST_NET_TIMEOUT};
-pub use zakura_jsonl_trace::JsonlTracer;

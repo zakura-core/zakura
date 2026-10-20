@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use zakura_chain::block;
-use zakura_jsonl_trace::{saturating_count, saturating_millis, JsonlTraceEvent};
+use zakura_network::jsonl_trace::{saturating_count, saturating_millis, JsonlTraceEvent};
 use zakura_network::zakura::{
     commit_state_trace as event, zakura_trace_peer_label, BlockApplyResult, BlockApplyToken,
     BlockSyncAction, BlockSyncMisbehavior, ZakuraTrace, COMMIT_STATE_TABLE,
@@ -23,7 +23,7 @@ struct DriverEvent<F> {
 }
 
 impl<F: Serialize> JsonlTraceEvent for DriverEvent<F> {
-    const TABLE: zakura_jsonl_trace::JsonlTraceTable = COMMIT_STATE_TABLE;
+    const TABLE: zakura_network::jsonl_trace::JsonlTraceTable = COMMIT_STATE_TABLE;
 }
 
 #[derive(Serialize)]

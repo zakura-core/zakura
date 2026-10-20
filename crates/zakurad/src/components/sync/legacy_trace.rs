@@ -8,7 +8,7 @@ use std::{
 
 use serde::Serialize;
 use zakura_chain::block::{self, Height};
-use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
+use zakura_network::jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
 use zakura_network::PeerSocketAddr;
 
 const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_sync", "legacy_sync.jsonl");
@@ -49,7 +49,7 @@ impl LegacySyncTrace {
             .map(JsonlTracer::spawn)
             .unwrap_or_else(JsonlTracer::noop);
         Self {
-            emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
+            emitter: JsonlEventEmitter::new(tracer, zakura_network::jsonl_trace::node_id()),
             expose_peer_addresses,
         }
     }
@@ -253,7 +253,7 @@ enum LegacyEvent {
         peer: Option<String>,
     },
 }
-zakura_jsonl_trace::impl_jsonl_trace_event!(LegacyEvent, TABLE);
+zakura_network::impl_jsonl_trace_event!(LegacyEvent, TABLE);
 
 #[derive(Debug, Serialize)]
 struct DiagnosticFields {
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(event["node"], "test-node");
         assert_eq!(
             event["process_trace_id"],
-            zakura_jsonl_trace::process_trace_id()
+            zakura_network::jsonl_trace::process_trace_id()
         );
     }
 

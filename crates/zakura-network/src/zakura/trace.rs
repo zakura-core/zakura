@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
+use crate::jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 use blake2b_simd::Params as Blake2bParams;
 use serde_json::{Map, Number, Value};
-use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
@@ -22,7 +22,7 @@ pub(crate) use first_block_source::BlockBodySource;
 use first_block_source::FirstBlockSourceTracker;
 
 /// A Zakura JSONL trace table.
-pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
+pub type ZakuraTraceTable = crate::jsonl_trace::JsonlTraceTable;
 
 /// Legacy upgrade and control-handshake transitions.
 pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("handshake", "handshake.jsonl");
@@ -488,7 +488,7 @@ impl ZakuraTrace {
 
     /// Create a no-op trace emitter.
     pub fn noop() -> Self {
-        Self::new(JsonlTracer::noop(), zakura_jsonl_trace::node_id())
+        Self::new(JsonlTracer::noop(), crate::jsonl_trace::node_id())
     }
 
     /// Create a trace emitter with an explicit node label.

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use zakura_jsonl_trace::{JsonlTraceConfig, JsonlTraceGuard, JsonlTracer};
+use crate::jsonl_trace::{JsonlTraceConfig, JsonlTraceGuard, JsonlTracer};
 
 use super::TraceReader;
 

@@ -31,7 +31,7 @@ impl DiscoveryDialResultEvent {
     }
 }
 
-zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryDialResultEvent, DISCOVERY_TABLE);
+crate::impl_jsonl_trace_event!(DiscoveryDialResultEvent, DISCOVERY_TABLE);
 
 /// The discovery reader stage that rejected a peer's frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,7 +87,7 @@ impl DiscoveryViolationEvent {
     }
 }
 
-zakura_jsonl_trace::impl_jsonl_trace_event!(DiscoveryViolationEvent, DISCOVERY_TABLE);
+crate::impl_jsonl_trace_event!(DiscoveryViolationEvent, DISCOVERY_TABLE);
 
 #[cfg(test)]
 mod tests {

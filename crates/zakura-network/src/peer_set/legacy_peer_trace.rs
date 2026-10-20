@@ -15,14 +15,14 @@ use std::{
     time::Duration,
 };
 
+use crate::jsonl_trace::{
+    saturating_count, saturating_millis, JsonlDisplay, JsonlEventEmitter, JsonlTraceEvent,
+    JsonlTraceTable, JsonlTracer,
+};
 use serde::Serialize;
 #[cfg(test)]
 use serde_json::Value;
 use zakura_chain::block::{self, Height};
-use zakura_jsonl_trace::{
-    saturating_count, saturating_millis, JsonlDisplay, JsonlEventEmitter, JsonlTraceEvent,
-    JsonlTraceTable, JsonlTracer,
-};
 
 use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedPeerError};
 
@@ -136,7 +136,7 @@ impl LegacyPeerTrace {
             .unwrap_or_else(JsonlTracer::noop);
 
         Self {
-            emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
+            emitter: JsonlEventEmitter::new(tracer, crate::jsonl_trace::node_id()),
             next_request_id: Arc::new(AtomicU64::new(1)),
         }
     }

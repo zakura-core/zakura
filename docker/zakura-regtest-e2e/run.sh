@@ -174,7 +174,7 @@ PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-${DEFAULT_PROPAGATE_TIMEOUT}}"
 # READY_TIMEOUT used for the (fast) startup assertions is too tight here. This
 # ceiling only matters on failure: the waits exit as soon as catch-up starts.
 CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
-# The Zakura JSONL trace writer (zakura-jsonl-trace) only flushes to disk every
+# The Zakura JSONL trace writer (`zakura_network::jsonl_trace`) only flushes to disk every
 # DEFAULT_FILE_FLUSH_INTERVAL (~17s) or after DEFAULT_BUFFER_FLUSH_BYTES (256
 # KiB), and production zakurad uses JsonlTracer::spawn (no guard / no shutdown
 # flush), so stopping the nodes does not flush the tail. The oracle reads the
@@ -293,7 +293,7 @@ assert_trace_layout() {
 }
 
 # Wait until each node's traces are fully flushed to disk before the oracle reads
-# them. The writer (zakura-jsonl-trace) flushes on a ~17s timer / 256 KiB, and
+# them. The writer (`zakura_network::jsonl_trace`) flushes on a ~17s timer / 256 KiB, and
 # production zakurad never flushes on shutdown, so a trace read right after the
 # final commits has a buffered tail. We require two things to be on disk:
 #   1. commit_state.jsonl: every commit_start has a matching commit_finish

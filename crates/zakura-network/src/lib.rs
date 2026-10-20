@@ -156,6 +156,7 @@ static ALLOCATOR: zakura_test::allocations::TrackingAllocator =
 pub mod address_book_peers;
 pub mod config;
 pub mod constants;
+pub mod jsonl_trace;
 
 mod address_book;
 mod address_book_updater;

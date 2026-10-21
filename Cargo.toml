@@ -50,7 +50,7 @@ incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 orchard = { version = "=4.0.0", package = "zakura-orchard", default-features = false, features = ["backend-halo2", "circuit", "multicore", "std"] }
 sapling-crypto = { version = "=4.0.0", package = "zakura-sapling-crypto", default-features = false, features = ["circuit", "multicore"] }
 zcash_address = { version = "=4.0.0", package = "zakura-address", default-features = false, features = ["std"] }
-zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.0.1" }
+zakura-mmr-tree = { path = "crates/zakura-mmr-tree", version = "0.1.0-rc2" }
 zcash_primitives = { version = "=4.0.0", package = "zakura-primitives", default-features = false, features = ["std", "circuits", "multicore", "backend-halo2"] }
 zcash_transparent = { version = "=4.0.0", package = "zakura-transparent", default-features = false, features = ["std"] }
 zcash_protocol = { version = "=4.0.0", package = "zakura-protocol", default-features = false, features = ["std"] }

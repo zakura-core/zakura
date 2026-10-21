@@ -111,6 +111,8 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::get_block_template::prepared_candidates::ResolvePreparedCandidateError;
+#[cfg(zcash_unstable = "nutachyon")]
+pub use types::tachyon::{GetTachyonBlockResponse, TachyonStampData};
 
 use types::{
     chain_tips::{self, GetChainTipsResponse},
@@ -218,6 +220,8 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
+    #[cfg(zcash_unstable = "nutachyon")]
+    ("gettachyonblock", RpcAccess::Unauthenticated),
     ("getblockheader", RpcAccess::Unauthenticated),
     ("getbestblockhash", RpcAccess::Unauthenticated),
     ("getbestblockheightandhash", RpcAccess::Unauthenticated),
@@ -308,6 +312,24 @@ mod tests;
 server::jsonrpc::rpc_trait! {
 /// RPC method signatures.
 pub trait RpcServer {
+    #[cfg(zcash_unstable = "nutachyon")]
+    /// Returns one best-chain block's public Tachyon proof-update inputs.
+    ///
+    /// Includes ordered proof-stamp commitments and tachygrams, anchors before
+    /// and after the block, and any epoch-entry anchor. Empty blocks return an
+    /// empty stamp list. Missing or pruned data returns an error.
+    ///
+    /// Clients must check block-hash continuity and roll back after a reorg.
+    /// This method is available only in NuTachyon builds and performs no proving.
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `hash_or_height`: (string, required) Best-chain block hash or height.
+    #[method(name = "gettachyonblock")]
+    async fn get_tachyon_block(&self, hash_or_height: String) -> Result<GetTachyonBlockResponse>;
+
     /// Returns software information from the RPC server, as a
     /// [`GetInfoResponse`] JSON struct.
     ///
@@ -2012,6 +2034,36 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
+    #[cfg(zcash_unstable = "nutachyon")]
+    async fn get_tachyon_block(&self, hash_or_height: String) -> Result<GetTachyonBlockResponse> {
+        let hash_or_height =
+            HashOrHeight::new(&hash_or_height, self.latest_chain_tip.best_tip_height())
+                .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let response = call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::TachyonBlock(hash_or_height),
+            )
+            .await?;
+            let zakura_state::ReadResponse::TachyonBlock(data) = response else {
+                unreachable!("state responds to TachyonBlock with TachyonBlock");
+            };
+            let data = data.ok_or_error(
+                server::error::LegacyCode::InvalidParameter,
+                "the requested block is not in the best chain",
+            )?;
+
+            // Transaction hashing and anchor reconstruction must not occupy an async worker.
+            tokio::task::spawn_blocking(move || GetTachyonBlockResponse::from_state(data))
+                .await
+                .map_misc_error()?
+                .map_misc_error()
+        })
+        .await
+        .map_misc_error()?
+    }
+
     async fn get_info(&self) -> Result<GetInfoResponse> {
         let version = GetInfoResponse::version_from_string(&self.build_version)
             .expect("invalid version string");

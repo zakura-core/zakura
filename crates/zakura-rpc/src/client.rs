@@ -9,6 +9,9 @@
 
 pub use zakura_chain;
 
+#[cfg(zcash_unstable = "nutachyon")]
+pub use crate::methods::{GetTachyonBlockResponse, TachyonStampData};
+
 pub use crate::methods::{
     hex_data::HexData,
     trees::{

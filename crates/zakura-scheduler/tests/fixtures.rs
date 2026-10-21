@@ -495,3 +495,31 @@ fn wake_while_suspended_mid_poll_is_kept() {
     s.run(a.task());
     assert_eq!(s.status(), Status::Quiescent);
 }
+
+#[test]
+fn spawn_past_the_task_limit_panics_only_the_spawner() {
+    let config = SchedulerConfig {
+        max_tasks: 2,
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let receiver = s.spawn_root("receiver", async move {
+        let _ = rx.await;
+    });
+    let spawner = s.spawn_root("spawner", async move {
+        // The rejected child owns the sender. Dropping it wakes the receiver.
+        hooks::spawn("child", async move {
+            let _tx = tx;
+        });
+    });
+    s.run(receiver.task());
+    let outcome = s.run(spawner.task());
+    assert!(
+        matches!(&outcome, zakura_scheduler::RunOutcome::Panicked(msg) if msg.contains("max_tasks")),
+        "{outcome:?}"
+    );
+    // The receiver saw the sender drop and can finish.
+    s.run(receiver.task());
+    assert_eq!(s.status(), Status::Quiescent);
+}

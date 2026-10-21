@@ -98,13 +98,19 @@ impl RunState {
     }
 
     /// Queues a task. It becomes ready once the current step returns.
-    pub(crate) fn queue_spawn(&mut self, label: &'static str, task: BoxTask) -> TaskId {
+    ///
+    /// Past the task limit, hands the future back unqueued. The caller must
+    /// drop it after releasing the run-state borrow, because its destructor
+    /// may wake other tasks.
+    pub(crate) fn queue_spawn(
+        &mut self,
+        label: &'static str,
+        task: BoxTask,
+    ) -> Result<TaskId, BoxTask> {
         let len = u32::try_from(self.tasks.len()).unwrap_or(u32::MAX);
-        assert!(
-            len < self.max_tasks,
-            "run spawned more than max_tasks ({}) tasks",
-            self.max_tasks
-        );
+        if len >= self.max_tasks {
+            return Err(task);
+        }
         let id = TaskId(len);
         let parent = self.current;
         let ordinal = match parent {
@@ -135,7 +141,15 @@ impl RunState {
             child_counts: BTreeMap::new(),
         });
         self.spawn_queue.push((id, task));
-        id
+        Ok(id)
+    }
+
+    /// Panics for a spawn past the task limit, after dropping the rejected
+    /// future outside the run-state borrow.
+    pub(crate) fn reject_spawn(rejected: BoxTask) -> ! {
+        let limit = with_run(|s| s.max_tasks).unwrap_or(0);
+        drop(rejected);
+        panic!("run spawned more than max_tasks ({limit}) tasks");
     }
 
     /// Allocates the next object identity for the current task.
@@ -319,13 +333,14 @@ impl Scheduler {
         label: &'static str,
         task: impl Future<Output = ()> + 'static,
     ) -> crate::JoinHandle {
-        let id = self.state(|s| {
+        let queued = self.state(|s| {
             assert!(
                 s.current.is_none(),
                 "spawn_root is for setup code. Tasks spawn through hooks::spawn"
             );
             s.queue_spawn(label, Box::pin(task))
         });
+        let id = queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected));
         self.admit();
         crate::JoinHandle::new(id)
     }

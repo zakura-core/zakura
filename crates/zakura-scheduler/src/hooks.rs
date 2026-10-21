@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    scheduler::{with_run, TaskYielder, Yield},
+    scheduler::{with_run, RunState, TaskYielder, Yield},
     ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
@@ -90,8 +90,9 @@ pub fn unpark_all(wait: ObjectId) {
 ///
 /// Outside a run, or past the run's task limit.
 pub fn spawn(label: &'static str, task: impl Future<Output = ()> + 'static) -> JoinHandle {
-    let id = with_run(|s| s.queue_spawn(label, Box::pin(task)))
+    let queued = with_run(|s| s.queue_spawn(label, Box::pin(task)))
         .expect("zakura-rt checks in_run before spawning on the scheduler");
+    let id = queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected));
     JoinHandle::new(id)
 }
 
@@ -207,13 +208,12 @@ impl Future for JoinHandle {
     type Output = TaskExit;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TaskExit> {
+        // Clone outside the borrow, since cloning a waker can run arbitrary code.
+        let waker = cx.waker().clone();
         with_run(|s| match s.done.get(&self.task) {
             Some(exit) => Poll::Ready(*exit),
             None => {
-                s.join_wakers
-                    .entry(self.task)
-                    .or_default()
-                    .push(cx.waker().clone());
+                s.join_wakers.entry(self.task).or_default().push(waker);
                 Poll::Pending
             }
         })

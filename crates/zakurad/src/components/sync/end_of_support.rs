@@ -42,12 +42,13 @@ pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// The last Mainnet height supported by this release.
 ///
-/// The next block projects to December 4, 2026 at 23:59:59 UTC using Mainnet
-/// height 3,490,665 at September 22, 2026 at 05:46:39 UTC, 75-second blocks
-/// through height 3,543,404, and 25-second blocks from the ZIP 259 NU7
-/// activation at height 3,543,405. This fixes EOS at approximately December 5
-/// even if release preparation advances [`ESTIMATED_RELEASE_HEIGHT`].
-/// Enforcement follows height, not time.
+/// The next block projects to December 3, 2026 at 20:43:17 UTC using Mainnet
+/// height 3,490,665 at its block timestamp, September 21, 2026 at 02:29:57
+/// UTC, 75-second blocks through height 3,543,404, and 25-second blocks from
+/// the ZIP 259 NU7 activation at height 3,543,405. This fixes EOS at
+/// approximately December 4, before the December 5 deadline, even if release
+/// preparation advances [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows
+/// height, not time.
 ///
 /// Earlier releases deliberately halted before the expected NU7 activation.
 /// This release follows the activation, so its support window extends about

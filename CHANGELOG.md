@@ -361,7 +361,7 @@ independently.
   schedules reissuance at height 8,939,664
   ([#1588](https://github.com/zakura-core/zakura/pull/1588)).
 - Extended this release's Mainnet end of support to height 3,640,098, with the
-  first unsupported block estimated at December 5, 2026 UTC, superseding the
+  first unsupported block estimated at December 4, 2026 UTC, superseding the
   November 5 end of support set in the release candidates
   ([#1460](https://github.com/zakura-core/zakura/pull/1460)). Unlike earlier
   releases, which deliberately halted before the expected NU7 activation,

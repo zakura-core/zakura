@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-quic"
-version = "1.0.0-rc2"
+version = "0.1.0-rc0"
 dependencies = [
  "bytes",
  "curve25519-dalek",

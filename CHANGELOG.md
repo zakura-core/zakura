@@ -73,10 +73,9 @@ independently.
   `zcash_deserialize_from`. Nested decoders are no longer compiled once per
   nesting depth, shrinking the `zakurad` binary by about 1.5 MB
   ([#1496](https://github.com/zakura-core/zakura/pull/1496)).
-- Updated Common cryptography dependencies to `4.0.0-rc0` and selected node-only
-  features so block validation and coinbase construction no longer pull in
-  wallet key-derivation dependencies
-  ([#1500](https://github.com/zakura-core/zakura/pull/1500)).
+- Selected node-only features of the Common cryptography dependencies so block
+  validation and coinbase construction no longer pull in wallet key-derivation
+  dependencies ([#1500](https://github.com/zakura-core/zakura/pull/1500)).
 - A config section written as a TOML array, such as `rpc = []`, is now rejected
   with the field path instead of loading as that section's defaults
   ([#1501](https://github.com/zakura-core/zakura/pull/1501)).
@@ -89,10 +88,6 @@ independently.
 - Reduced the size of release `zakurad` binaries by about 5% by compiling
   them with fewer codegen units
   ([#1520](https://github.com/zakura-core/zakura/pull/1520)).
-- Disabled OpenTelemetry trace export in default node builds and release binaries. To
-  export traces, build with `--features opentelemetry` and set
-  `tracing.opentelemetry_endpoint` or `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime
-  ([#1524](https://github.com/zakura-core/zakura/pull/1524)).
 - `zakura-chain`: `ZcashSerialize::zcash_serialize` and the
   `zcash_serialize_*` helpers now take `writer: &mut W` with
   `W: io::Write + ?Sized`, and implementations pass that writer to nested
@@ -114,15 +109,6 @@ independently.
   database format is unaffected. Crates that use `rocksdb` 0.24 types alongside
   `zakura-state` now need `zakura-rocksdb` instead
   ([#1558](https://github.com/zakura-core/zakura/pull/1558)).
-- `zakurad` builds RocksDB without the features Zakura does not use: SST file
-  ingestion, column family import, remote compaction, tracing, encrypted file
-  systems, the plain and cuckoo table formats, and TTL databases. This shortens
-  the RocksDB compile and shrinks the binary. Crates that use the `rocksdb`
-  dependency alongside `zakura-state` get the same reduced build
-  ([#1562](https://github.com/zakura-core/zakura/pull/1562)).
-- Updated the shared cryptography dependencies to Common `4.0.0-rc3` so node
-  library consumers can resolve them alongside the current wallet libraries
-  ([#1578](https://github.com/zakura-core/zakura/pull/1578)).
 - Schedule NU7 on Mainnet at the ZIP 259 block height 3,543,405 and update the
   Zakura Common libraries to the final `4.0.0` release. ZIP 218 moves the
   Mainnet third halving to height 6,132,390, and the existing NSM calculation
@@ -144,13 +130,13 @@ independently.
   such as `400days 4h`
   ([#1486](https://github.com/zakura-core/zakura/pull/1486)).
 - Removed OpenTelemetry trace export and the optional `opentelemetry` build
-  feature, superseding the opt-in build described for
-  [#1524](https://github.com/zakura-core/zakura/pull/1524). Existing
+  feature. Existing
   `tracing.opentelemetry_endpoint`, `tracing.opentelemetry_service_name`, and
   `tracing.opentelemetry_sample_percent` settings are accepted and ignored, and
   the `OTEL_*` environment variables are no longer read. The Docker
   observability stack no longer includes Jaeger
-  ([#1531](https://github.com/zakura-core/zakura/pull/1531)).
+  ([#1524](https://github.com/zakura-core/zakura/pull/1524),
+  [#1531](https://github.com/zakura-core/zakura/pull/1531)).
 - Removed systemd-journald logging. The `journald` build feature is still
   accepted but does nothing, and existing `tracing.use_journald` settings are
   accepted and ignored. Generated configs no longer include `use_journald`
@@ -201,11 +187,6 @@ independently.
   their wire size can no longer fill the 401-block window with decoded bodies.
   Checkpoint ranges keep the full window
   ([#1514](https://github.com/zakura-core/zakura/pull/1514)).
-- Fixed the release `zakurad` build failing to link with GCC 16 by compiling
-  the complete RocksDB again. This reverts the trimmed RocksDB build from
-  #1562, which left a reference into the skipped transaction code. RocksDB
-  itself and the on-disk database format are unchanged
-  ([#1583](https://github.com/zakura-core/zakura/pull/1583)).
 
 ### Security
 

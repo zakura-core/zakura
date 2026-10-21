@@ -14,7 +14,7 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected three days after the committed October 15, 2026 Mainnet
+/// Projected three days after the committed October 19, 2026 Mainnet
 /// release-state bundle at the Mainnet target spacing.
 pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
 

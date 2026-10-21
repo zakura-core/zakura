@@ -7,7 +7,7 @@ mod support;
 use std::{
     future::{poll_fn, Future},
     pin::pin,
-    sync::Arc,
+    sync::{Arc, TryLockError},
     task::Poll,
     time::Duration,
 };
@@ -15,7 +15,10 @@ use std::{
 use support::run;
 use zakura_rt::{
     sim::Op,
-    sync::{mpsc, oneshot, watch, CancellationToken, Notify, Semaphore},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        counter, mpsc, oneshot, watch, CancellationToken, Mutex, Notify, PoisonError, Semaphore,
+    },
     task, time,
 };
 
@@ -185,4 +188,68 @@ fn cancellation_points_and_drop_guard() {
         3,
         "the first poll and two reads"
     );
+}
+
+#[test]
+fn mutex_points_at_lock_and_after_release() {
+    let (value, report) = run(async {
+        let mutex = Mutex::new(1);
+        *mutex.lock().unwrap() += 1;
+        let held = mutex.lock().unwrap();
+        let contended = matches!(mutex.try_lock(), Err(TryLockError::WouldBlock));
+        drop(held);
+        let value = *mutex.lock().unwrap();
+        (value, contended)
+    });
+    assert_eq!(value, (2, true));
+    assert_eq!(report.count(Op::Lock), 4, "three locks and a try_lock");
+    assert_eq!(report.count(Op::Release), 3, "one per guard dropped");
+}
+
+#[test]
+fn mutex_poisoning_matches_std() {
+    let (recovered, _) = run(async {
+        let mutex = Arc::new(Mutex::new(5));
+        let holder = Arc::clone(&mutex);
+        let panicked = task::spawn(async move {
+            let _guard = holder.lock().unwrap();
+            panic!("poison");
+        })
+        .await;
+        assert!(panicked.unwrap_err().is_panic());
+        assert!(mutex.is_poisoned());
+        let value = *mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        value
+    });
+    assert_eq!(recovered, 5);
+}
+
+#[test]
+fn mutex_outside_a_run_is_std() {
+    let mutex = Mutex::new(vec![1]);
+    mutex.lock().unwrap().push(2);
+    assert!(mutex.try_lock().is_ok());
+    assert_eq!(mutex.into_inner().unwrap(), [1, 2]);
+}
+
+#[test]
+fn coordination_atomics_point_and_counters_do_not() {
+    let (values, report) = run(async {
+        let flag = AtomicBool::new(false);
+        let count = AtomicU64::new(0);
+        flag.store(true, Ordering::Release);
+        count.fetch_add(2, Ordering::Relaxed);
+        let swapped = count.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire);
+        let metric = counter::AtomicU64::new(0);
+        metric.fetch_add(1, Ordering::Relaxed);
+        (
+            flag.load(Ordering::Acquire),
+            swapped,
+            count.load(Ordering::Relaxed),
+        )
+    });
+    assert_eq!(values, (true, Ok(2), 3));
+    assert_eq!(report.count(Op::AtomicStore), 1);
+    assert_eq!(report.count(Op::AtomicRmw), 2, "the counter adds no point");
+    assert_eq!(report.count(Op::AtomicLoad), 2);
 }

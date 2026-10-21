@@ -11,6 +11,14 @@ independently.
 
 ## [Unreleased]
 
+## [1.7.0-rc3] - 2026-10-21
+
+### Changed
+
+- Updated the managed zcashd sidecar to v1.3.0-rc1, which schedules Mainnet
+  NU7 at height 3,543,405 to match Zakura
+  ([#1596](https://github.com/zakura-core/zakura/pull/1596)).
+
 ## [1.7.0-rc2] - 2026-10-21
 
 ### Added

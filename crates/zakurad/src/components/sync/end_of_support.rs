@@ -14,9 +14,9 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected three days after the committed October 19, 2026 Mainnet
-/// release-state bundle at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
+/// Projected three days after the committed Mainnet release-state checkpoint
+/// at the Mainnet target spacing.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_527_516;
 
 /// The estimated number of blocks per day after Blossom.
 ///

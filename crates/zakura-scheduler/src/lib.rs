@@ -144,6 +144,34 @@ pub enum Op {
     Abort,
     /// A `watch` read or write.
     Watch,
+    /// A random draw from `rng()`.
+    Draw,
+}
+
+/// What a random choice is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum DrawKind {
+    /// A value from `zakura_rt::rand::rng()`.
+    Rng,
+    /// The first branch an unbiased `select!` polls.
+    Select,
+    /// The run's hash seed, drawn once by the first hashed collection.
+    HashSeed,
+}
+
+/// A random choice the run asks its draw source for. See
+/// [`Scheduler::set_draws`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Draw {
+    /// What the draw is for.
+    pub kind: DrawKind,
+    /// Where production code asked for it.
+    pub site: &'static Location<'static>,
+    /// The task that asked, or `None` for setup code.
+    pub task: Option<TaskId>,
+    /// The answer must be below this, or any `u64` when it's 0.
+    pub bound: u64,
 }
 
 impl Op {
@@ -170,6 +198,7 @@ impl Op {
             Op::Yield => "yield",
             Op::Abort => "abort",
             Op::Watch => "watch",
+            Op::Draw => "draw",
         }
     }
 }

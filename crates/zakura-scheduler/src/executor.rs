@@ -16,7 +16,7 @@ use zakura_rt::sim as rt;
 use crate::{
     hooks::{self, JoinHandle},
     scheduler::with_run,
-    ObjectId, Op, Point, SimInstant, TaskExit, TaskId, TimerId,
+    DrawKind, ObjectId, Op, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
 /// The executor every run installs. It holds no state, since the run's state
@@ -105,6 +105,16 @@ impl rt::Executor for SchedulerExecutor {
     fn set_external_wait(&self, waiting: bool) {
         hooks::set_external_wait(waiting);
     }
+
+    fn draw(&self, site: rt::DrawSite, bound: u64) -> u64 {
+        let kind = match site.kind {
+            rt::DrawKind::Rng => DrawKind::Rng,
+            rt::DrawKind::Select => DrawKind::Select,
+            rt::DrawKind::HashSeed => DrawKind::HashSeed,
+            other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
+        };
+        hooks::draw(kind, site.site, bound)
+    }
 }
 
 /// The scheduler's operation for a `zakura-rt` one.
@@ -129,6 +139,7 @@ fn op_from_rt(op: rt::Op) -> Op {
         rt::Op::Select => Op::Select,
         rt::Op::Yield => Op::Yield,
         rt::Op::Watch => Op::Watch,
+        rt::Op::Draw => Op::Draw,
         other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
     }
 }

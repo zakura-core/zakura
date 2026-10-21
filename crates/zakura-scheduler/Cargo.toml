@@ -23,5 +23,8 @@ zakura-rt = { path = "../zakura-rt" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync"] }
 
+[target.'cfg(zakura_sim)'.dev-dependencies]
+rand_10 = { workspace = true }
+
 [lints]
 workspace = true

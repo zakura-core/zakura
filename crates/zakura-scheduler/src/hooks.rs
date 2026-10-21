@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     scheduler::{with_run, BoxTask, RunState, TaskYielder, Yield},
-    ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
+    Draw, DrawKind, ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
 /// True while this thread runs a simulation.
@@ -164,6 +164,39 @@ pub fn set_external_wait(waiting: bool) {
             }
         }
     });
+}
+
+/// Asks the run's draw source for a random choice: a value below `bound`, or
+/// any `u64` when `bound` is 0. Not a preemption point. Returns 0 outside a
+/// run or without a source.
+pub fn draw(kind: DrawKind, site: &'static std::panic::Location<'static>, bound: u64) -> u64 {
+    let Some((source, task)) = with_run(|s| (s.draws.take(), s.current)) else {
+        return 0;
+    };
+    let Some(mut source) = source else {
+        return 0;
+    };
+    // Called outside the borrow, since the source is the caller's code.
+    let value = source(&Draw {
+        kind,
+        site,
+        task,
+        bound,
+    });
+    // Keep a source the caller set during the draw. Drop the loser outside
+    // the borrow.
+    let replaced = with_run(|s| match s.draws {
+        None => {
+            s.draws = Some(source);
+            None
+        }
+        Some(_) => Some(source),
+    });
+    drop(replaced);
+    match bound {
+        0 => value,
+        bound => value % bound,
+    }
 }
 
 /// Suspends the current coroutine.

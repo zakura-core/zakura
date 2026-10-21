@@ -7,6 +7,7 @@ mod support;
 use std::{
     cell::{Cell, RefCell},
     future::pending,
+    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -342,4 +343,71 @@ fn rt_mutex_held_across_await_starves_one_worker() {
     };
     assert!(first_violation(1, FIND, held_across_await).is_some());
     assert_eq!(first_violation(2, CLEAN, held_across_await), None);
+}
+
+/// Runs one task that draws an `rng()` value and builds a map, with `seed`
+/// answering every draw. Returns the draws seen, the value, and key order.
+fn drawing_run(seed: u64) -> (Vec<zakura_scheduler::Draw>, u64, Vec<u32>) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let out = Rc::new(RefCell::new(None));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let log = seen.clone();
+    sched.set_draws(move |draw| {
+        log.borrow_mut().push(*draw);
+        seed
+    });
+    let result = out.clone();
+    let root = sched.spawn_root("root", async move {
+        use rand_10::Rng;
+        let value = zakura_rt::rand::rng().next_u64();
+        let map: zakura_rt::collections::HashMap<u32, ()> = (0..32).map(|k| (k, ())).collect();
+        *result.borrow_mut() = Some((value, map.keys().copied().collect()));
+    });
+    while sched.status() == Status::Running {
+        sched.run(root.task());
+    }
+    sched.shutdown();
+    let (value, order) = out.borrow_mut().take().unwrap();
+    let draws = seen.borrow().clone();
+    (draws, value, order)
+}
+
+#[test]
+fn draws_reach_the_scheduler_draw_source() {
+    let (draws, value, order) = drawing_run(7);
+    assert_eq!(value, 7);
+    let kinds: Vec<_> = draws.iter().map(|d| (d.kind, d.bound)).collect();
+    assert_eq!(
+        kinds,
+        [
+            (zakura_scheduler::DrawKind::Rng, 0),
+            (zakura_scheduler::DrawKind::HashSeed, 0)
+        ]
+    );
+    assert!(
+        draws.iter().all(|d| d.task.is_some()),
+        "both came from the task"
+    );
+    assert!(draws[0].site.file().ends_with("rt.rs"));
+
+    assert_eq!(order, drawing_run(7).2, "one seed, one order");
+    assert!(
+        (0..8).any(|seed| drawing_run(seed).2 != order),
+        "the seed changes iteration order"
+    );
+}
+
+#[test]
+fn select_point_reports_the_callers_site() {
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let root = sched.spawn_root("root", async {
+        zakura_rt::select! {
+            () = std::future::ready(()) => {},
+        }
+    });
+    sched.run(root.task());
+    let at = sched.ready()[0].at;
+    assert_eq!(at.op, zakura_scheduler::Op::Select);
+    let site = at.site.expect("a select point has a site");
+    assert!(site.file().ends_with("tests/rt.rs"), "{site}");
 }

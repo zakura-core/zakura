@@ -16,11 +16,14 @@ use std::{
 use corosensei::{stack::DefaultStack, Coroutine, CoroutineResult, Yielder};
 
 use crate::{
-    At, CleanupReport, ObjectId, Op, ReadyTask, RunOutcome, SchedulerConfig, SimInstant, Status,
-    TaskExit, TaskId, TimerId,
+    At, CleanupReport, Draw, ObjectId, Op, ReadyTask, RunOutcome, SchedulerConfig, SimInstant,
+    Status, TaskExit, TaskId, TimerId,
 };
 
 pub(crate) type BoxTask = Pin<Box<dyn Future<Output = ()>>>;
+
+/// Answers a run's random draws. See [`Scheduler::set_draws`].
+pub(crate) type DrawSource = Box<dyn FnMut(&Draw) -> u64>;
 
 /// What the scheduler asks a coroutine to do when it resumes it.
 #[derive(Clone, Copy)]
@@ -80,6 +83,8 @@ pub(crate) struct RunState {
     object_counts: BTreeMap<Option<TaskId>, u32>,
     root_counts: BTreeMap<&'static str, u32>,
     pub(crate) shutting_down: bool,
+    /// Answers random draws. Taken out while it runs.
+    pub(crate) draws: Option<DrawSource>,
     /// Panic payloads of tasks that panicked, until a joiner takes them.
     #[cfg(zakura_sim)]
     pub(crate) panics: BTreeMap<TaskId, Box<dyn std::any::Any + Send>>,
@@ -340,6 +345,7 @@ impl Scheduler {
                 object_counts: BTreeMap::new(),
                 root_counts: BTreeMap::new(),
                 shutting_down: false,
+                draws: None,
                 #[cfg(zakura_sim)]
                 panics: BTreeMap::new(),
             });
@@ -370,6 +376,16 @@ impl Scheduler {
         let id = queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected));
         self.admit();
         crate::JoinHandle::new(id)
+    }
+
+    /// Sets what answers the run's random draws: `rng()` values, unbiased
+    /// `select!` starts, and the hash seed. `zakura-sim` passes its `Plan`.
+    /// Without a source every draw is 0, the same default the `Plan` uses
+    /// once its bytes run out.
+    pub fn set_draws(&mut self, draws: impl FnMut(&Draw) -> u64 + 'static) {
+        let old = self.state(|s| s.draws.replace(Box::new(draws)));
+        // Dropped outside the borrow, since a closure's drop can run any code.
+        drop(old);
     }
 
     /// The task's stable identity: its spawn path, such as

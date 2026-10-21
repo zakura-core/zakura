@@ -20,7 +20,9 @@ use std::{
     time::Duration,
 };
 
-use zakura_rt::sim::{self, BoxTask, Executor, ObjectId, Op, Point, TaskExit, TaskId, TimerId};
+use zakura_rt::sim::{
+    self, BoxTask, DrawKind, DrawSite, Executor, ObjectId, Op, Point, TaskExit, TaskId, TimerId,
+};
 
 /// What a finished run left behind.
 pub struct Report {
@@ -30,6 +32,8 @@ pub struct Report {
     pub now: Duration,
     /// Timers still registered when the run went idle.
     pub timers: usize,
+    /// Each random draw's kind and bound, in order.
+    pub draws: Vec<(DrawKind, u64)>,
 }
 
 impl Report {
@@ -71,6 +75,7 @@ where
             points: mem::take(&mut s.points),
             now: s.now,
             timers: s.timers.len(),
+            draws: mem::take(&mut s.draws),
         };
         (report, s.tasks[index(root)].exit.take())
     });
@@ -104,6 +109,7 @@ struct State {
     next_object: u32,
     current: Option<TaskId>,
     points: Vec<(Option<u64>, Op)>,
+    draws: Vec<(DrawKind, u64)>,
 }
 
 #[derive(Default)]
@@ -327,4 +333,17 @@ impl Executor for TestExecutor {
     }
 
     fn set_external_wait(&self, _waiting: bool) {}
+
+    /// Answers with how many draws came before, so tests can predict values.
+    fn draw(&self, site: DrawSite, bound: u64) -> u64 {
+        with(|s| {
+            let n = u64::try_from(s.draws.len()).expect("draw count fits in u64");
+            s.draws.push((site.kind, bound));
+            if bound == 0 {
+                n
+            } else {
+                n % bound
+            }
+        })
+    }
 }

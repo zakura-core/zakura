@@ -13,10 +13,43 @@
 //! modules under `src/sim/` and adds [`sim`], the interface the simulator's
 //! scheduler implements. Names it doesn't cover yet stay re-exports.
 
+#[cfg(not(zakura_sim))]
 pub use tokio::{pin, select};
 
 #[cfg(zakura_sim)]
+pub use tokio::pin;
+
+#[cfg(zakura_sim)]
 pub mod sim;
+
+/// `tokio::select!`, simulator build.
+///
+/// It expands to tokio's own macro, so branches, `if` guards, `else` and
+/// `biased;` behave exactly as in production. Each poll is a preemption
+/// point, and an unbiased select takes its first branch from the run's
+/// `Plan` instead of tokio's thread RNG.
+#[cfg(zakura_sim)]
+#[macro_export]
+macro_rules! select {
+    ($(biased;)? else => $else:expr $(,)? ) => {{
+        $else
+    }};
+    (biased; $p:pat = $($t:tt)* ) => {
+        // `BRANCHES` is the const tokio's expansion defines. Its rule for an
+        // unbiased select names it the same way.
+        $crate::sim::__tokio::select!(
+            @{ start={ $crate::sim::select_start(BRANCHES, true) }; () } $p = $($t)*
+        )
+    };
+    ( $p:pat = $($t:tt)* ) => {
+        $crate::sim::__tokio::select!(
+            @{ start={ $crate::sim::select_start(BRANCHES, false) }; () } $p = $($t)*
+        )
+    };
+    () => {
+        compile_error!("select! requires at least one branch.")
+    };
+}
 
 #[cfg(zakura_sim)]
 #[path = "sim/task.rs"]
@@ -29,6 +62,14 @@ pub mod time;
 #[cfg(zakura_sim)]
 #[path = "sim/sync/mod.rs"]
 pub mod sync;
+
+#[cfg(zakura_sim)]
+#[path = "sim/collections.rs"]
+pub mod collections;
+
+#[cfg(zakura_sim)]
+#[path = "sim/rand.rs"]
+pub mod rand;
 
 /// Tasks.
 #[cfg(not(zakura_sim))]
@@ -71,6 +112,7 @@ pub mod sync {
 }
 
 /// Hashed collections, whose iteration order depends on a random seed.
+#[cfg(not(zakura_sim))]
 pub mod collections {
     pub use std::collections::{hash_map, HashMap, HashSet};
 }
@@ -84,6 +126,7 @@ pub mod stream {
 ///
 /// Only the thread RNG lives here. Code keeps importing the RNG traits from
 /// `rand`.
+#[cfg(not(zakura_sim))]
 pub mod rand {
     pub use rand_10::rng;
 }

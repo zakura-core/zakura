@@ -68,6 +68,10 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     InvalidHalvingInterval,
 
+    #[error("NU7 halving interval must produce a positive reissuance fraction")]
+    #[non_exhaustive]
+    InvalidReissuanceFraction,
+
     #[error(
         "cannot derive the NSM seed at {seed_height:?}, because its scheduled issuance is invalid: {source}"
     )]

@@ -2027,16 +2027,33 @@ fn zip234_parent_pools(
 /// the parent's chain value pools.
 #[tokio::test]
 async fn zip234_block_verification_checks_the_reissuance_bonus() {
+    check_zip234_block_verification(zip234_test_network(Height(3)), 1_375).await;
+}
+
+#[tokio::test]
+async fn zip234_custom_interval_block_verification() {
+    let network = zip234_test_network_builder()
+        .with_halving_interval(144)
+        .unwrap()
+        .with_test_nsm_reissuance_height(Height(3))
+        .to_network()
+        .unwrap();
+    check_zip234_block_verification(network, 8_022_777).await;
+}
+
+async fn check_zip234_block_verification(network: Network, numerator: i128) {
     use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
 
     let _init_guard = zakura_test::init();
 
     let start = Height(3);
-    let network = zip234_test_network(start);
+    let bonus = |balance: i64| {
+        i64::try_from((i128::from(balance) * numerator + 9_999_999_999) / 10_000_000_000).unwrap()
+    };
     let parent = start.previous().expect("the start is above genesis");
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
     let with_bonus = (halving_subsidy
-        + Amount::try_from(zip234_test_bonus()).expect("valid bonus"))
+        + Amount::try_from(bonus(ZIP234_TEST_DEFICIT)).expect("valid bonus"))
     .expect("valid subsidy");
 
     let verify =
@@ -2075,11 +2092,10 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         };
 
     // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
-    let numerator = 1_375i128;
     // The largest deficit that still rounds up to a one-zatoshi bonus.
     let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
     for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
-        let bonus = zip234_bonus(deficit);
+        let bonus = bonus(deficit);
         let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
             .await
@@ -2101,6 +2117,18 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
             ),
             "deficit {deficit}: {result:?}"
         );
+    }
+
+    if numerator != 1_375 {
+        let old_claim = (halving_subsidy + Amount::try_from(zip234_test_bonus()).unwrap()).unwrap();
+        assert!(matches!(
+            verify(ZIP234_TEST_DEFICIT, old_claim).await,
+            Err(VerifyBlockError::Block {
+                source: BlockError::Transaction(TransactionError::Subsidy(
+                    SubsidyError::InvalidMinerFees
+                )),
+            }),
+        ));
     }
 
     // The coinbase claims the halving subsidy plus the reissuance bonus.

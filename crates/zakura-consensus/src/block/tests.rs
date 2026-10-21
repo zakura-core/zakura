@@ -1984,14 +1984,14 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 /// A balance that pays a nonzero ZIP 234 bonus.
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
-/// Restates the fixed NU7 ceiling payout independently of `block_subsidy`.
+/// Restates the default-interval NU7 ceiling payout independently of `block_subsidy`.
 fn zip234_bonus(balance: i64) -> i64 {
     let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
 
     i64::try_from(bonus).expect("the bonus fits in i64")
 }
 
-/// The fixed NU7 ceiling payout for [`ZIP234_TEST_DEFICIT`].
+/// The default-interval NU7 ceiling payout for [`ZIP234_TEST_DEFICIT`].
 fn zip234_test_bonus() -> i64 {
     zip234_bonus(ZIP234_TEST_DEFICIT)
 }

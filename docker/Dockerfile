@@ -158,6 +158,7 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
     --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \
+    --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \

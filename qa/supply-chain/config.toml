@@ -136,11 +136,6 @@ notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pen
 version = "0.15.11"
 criteria = "safe-to-deploy"
 
-[[exemptions.corosensei]]
-version = "0.3.4"
-criteria = "safe-to-run"
-notes = "Coroutine library for zakura-scheduler, the P2P simulator's test-only scheduler. lint.yml checks it never reaches zakurad. Exact-version exemption pending a review of the x86_64 and aarch64 context-switch and stack code. This exemption is not an audit certification."
-
 [[exemptions.criterion]]
 version = "0.8.2"
 criteria = "safe-to-run"

@@ -26,6 +26,10 @@ pub mod task;
 #[path = "sim/time.rs"]
 pub mod time;
 
+#[cfg(zakura_sim)]
+#[path = "sim/sync/mod.rs"]
+pub mod sync;
+
 /// Tasks.
 #[cfg(not(zakura_sim))]
 pub mod task {
@@ -49,6 +53,7 @@ pub mod time {
 /// Synchronization.
 ///
 /// `Mutex` is the std mutex. Tokio's mutex is `AsyncMutex`.
+#[cfg(not(zakura_sim))]
 pub mod sync {
     pub use std::sync::{atomic, Mutex, MutexGuard, PoisonError};
     pub use tokio::sync::{

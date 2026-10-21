@@ -258,7 +258,8 @@ pub enum Status {
     /// marked external with [`hooks::set_external_wait`].
     WaitingOnExternal,
     /// A task is ready, but every worker is held by a parked task, and no
-    /// lock cycle explains it. More workers would let the run continue.
+    /// parked tasks wait on each other in a cycle. More workers would let the
+    /// run continue.
     WorkerStarved,
     /// No task can ever run again.
     Deadlock,

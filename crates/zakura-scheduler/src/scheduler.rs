@@ -184,15 +184,27 @@ impl RunState {
             .filter(move |t| free || self.mid_poll.contains(t))
     }
 
-    /// True if every parked task waits on an object held by another parked
-    /// task, so no number of extra workers would let any of them move.
+    /// True if some parked tasks wait on each other in a cycle, so no number
+    /// of extra workers would let them move. Other parked tasks don't matter.
     fn lock_cycle(&self) -> bool {
-        let parked: BTreeSet<TaskId> = self.parked.values().flatten().copied().collect();
-        !parked.is_empty()
-            && self
-                .parked
-                .keys()
-                .all(|obj| self.holders.get(obj).is_some_and(|h| parked.contains(h)))
+        // Each parked task waits on the holder of the object it parked on.
+        let waits_on: BTreeMap<TaskId, TaskId> = self
+            .parked
+            .iter()
+            .filter_map(|(obj, tasks)| Some((tasks, *self.holders.get(obj)?)))
+            .flat_map(|(tasks, holder)| tasks.iter().map(move |t| (*t, holder)))
+            .collect();
+        waits_on.keys().any(|&start| {
+            let mut seen = BTreeSet::new();
+            let mut task = start;
+            while let Some(&holder) = waits_on.get(&task) {
+                if !seen.insert(task) {
+                    return true;
+                }
+                task = holder;
+            }
+            false
+        })
     }
 }
 

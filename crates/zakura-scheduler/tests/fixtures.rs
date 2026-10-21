@@ -523,3 +523,55 @@ fn spawn_past_the_task_limit_panics_only_the_spawner() {
     s.run(receiver.task());
     assert_eq!(s.status(), Status::Quiescent);
 }
+
+#[test]
+fn lock_cycle_is_deadlock_even_with_other_parked_tasks() {
+    // Three workers: an AB/BA pair plus `waiter`, parked on a lock that the
+    // ready `holder` owns. The pair can never move, so this is a deadlock even
+    // though `waiter`'s lock holder isn't parked.
+    let config = SchedulerConfig {
+        workers: 3,
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    let a = shared(Mutex::new(()));
+    let b = shared(Mutex::new(()));
+    let m = shared(Mutex::new(()));
+    let (a2, b2, m2) = (a.clone(), b.clone(), m.clone());
+    let ab = s.spawn_root("ab", async move {
+        let _x = a.lock();
+        let _y = b.lock();
+    });
+    let ba = s.spawn_root("ba", async move {
+        let _x = b2.lock();
+        let _y = a2.lock();
+    });
+    let holder = s.spawn_root("holder", async move {
+        let _g = m.lock();
+        sleep(10).await;
+    });
+    let waiter = s.spawn_root("waiter", async move {
+        let _g = m2.lock();
+    });
+    use zakura_scheduler::RunOutcome::{Parked, Reached, Waiting};
+    for (task, want_parked) in [
+        (ab, false),
+        (ab, false),
+        (ba, false),
+        (ba, false),
+        (ab, true),
+        (ba, true),
+    ] {
+        let out = s.run(task.task());
+        assert_eq!(matches!(out, Parked(_)), want_parked, "{out:?}");
+    }
+    assert!(matches!(s.run(holder.task()), Reached(_))); // before lock
+    assert!(matches!(s.run(holder.task()), Reached(_))); // before sleep
+    assert_eq!(s.run(holder.task()), Waiting); // lock held across the sleep
+    assert!(matches!(s.run(waiter.task()), Reached(_)));
+    assert!(matches!(s.run(waiter.task()), Parked(_)));
+    let deadline = s.next_deadline().expect("holder's sleep is pending");
+    s.advance_to(deadline);
+    // `holder` is ready, but all three workers are held by parked tasks.
+    assert_eq!(s.status(), Status::Deadlock);
+}

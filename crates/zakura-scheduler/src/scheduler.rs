@@ -60,7 +60,9 @@ pub(crate) struct RunState {
     max_tasks: u32,
     pub(crate) tasks: Vec<TaskMeta>,
     pub(crate) current: Option<TaskId>,
-    woken_current: bool,
+    /// Tasks woken during their current poll. The poll may span several
+    /// resumes, so a wake must survive until the poll returns `Pending`.
+    woken: BTreeSet<TaskId>,
     pub(crate) ready: BTreeSet<TaskId>,
     pub(crate) waiting: BTreeSet<TaskId>,
     pub(crate) external: BTreeSet<TaskId>,
@@ -245,10 +247,11 @@ impl Wake for TaskWaker {
             if s.gen != self.gen {
                 return;
             }
-            if s.current == Some(self.task) {
-                s.woken_current = true;
-            } else if s.waiting.remove(&self.task) {
+            if s.waiting.remove(&self.task) {
                 s.ready.insert(self.task);
+            } else if s.mid_poll.contains(&self.task) {
+                // Running, or suspended mid-poll at a point or a park.
+                s.woken.insert(self.task);
             }
         });
     }
@@ -283,7 +286,7 @@ impl Scheduler {
                 max_tasks: config.max_tasks,
                 tasks: Vec::new(),
                 current: None,
-                woken_current: false,
+                woken: BTreeSet::new(),
                 ready: BTreeSet::new(),
                 waiting: BTreeSet::new(),
                 external: BTreeSet::new(),
@@ -359,7 +362,6 @@ impl Scheduler {
                 "run({task:?}) on a task that isn't ready"
             );
             s.current = Some(task);
-            s.woken_current = false;
             s.ready.remove(&task);
             let starts_poll = s.mid_poll.insert(task);
             if starts_poll && s.cancel_requested.contains(&task) {
@@ -372,10 +374,7 @@ impl Scheduler {
             .as_mut()
             .expect("a ready task's coroutine is live until it finishes");
         let resumed = catch_unwind(AssertUnwindSafe(|| co.resume(cmd)));
-        let woken = self.state(|s| {
-            s.current = None;
-            s.woken_current
-        });
+        self.state(|s| s.current = None);
 
         let (outcome, exit) = match resumed {
             Ok(CoroutineResult::Yield(Yield::Preempt)) => {
@@ -390,7 +389,7 @@ impl Scheduler {
                     s.mid_poll.remove(&task);
                     s.advance_point(task, Op::Poll, None);
                     // A wake during the poll, or an abort, makes it ready again.
-                    if woken || s.cancel_requested.contains(&task) {
+                    if s.woken.remove(&task) || s.cancel_requested.contains(&task) {
                         s.ready.insert(task);
                     } else {
                         s.waiting.insert(task);
@@ -425,6 +424,7 @@ impl Scheduler {
             return_stack(co.into_stack());
             let joiners = self.state(|s| {
                 s.mid_poll.remove(&task);
+                s.woken.remove(&task);
                 s.cancel_requested.remove(&task);
                 s.external.remove(&task);
                 s.done.insert(task, exit);

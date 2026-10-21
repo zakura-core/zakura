@@ -441,3 +441,57 @@ fn hooks_do_nothing_outside_a_run() {
     // Returns at once instead of suspending.
     hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Lock));
 }
+
+/// A future that, on its first poll, runs `before_point`, reaches a
+/// preemption point, and returns `Pending`. Its second poll is `Ready`.
+fn pending_after_point(
+    before_point: impl Fn(&Waker) + 'static,
+) -> impl std::future::Future<Output = ()> {
+    let mut polled = false;
+    poll_fn(move |cx| {
+        if polled {
+            return Poll::Ready(());
+        }
+        polled = true;
+        before_point(cx.waker());
+        hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Yield));
+        Poll::Pending
+    })
+}
+
+#[test]
+fn self_wake_survives_a_preemption_point() {
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let h = s.spawn_root("waker", pending_after_point(|w| w.wake_by_ref()));
+    s.run(h.task());
+    s.run(h.task());
+    // The wake came earlier in the same poll, so the task must poll again.
+    assert_eq!(s.status(), Status::Running);
+    s.run(h.task());
+    assert_eq!(s.status(), Status::Quiescent);
+}
+
+#[test]
+fn wake_while_suspended_mid_poll_is_kept() {
+    let slot: Rc<RefCell<Option<Waker>>> = shared(RefCell::new(None));
+    let (put, take) = (slot.clone(), slot.clone());
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let a = s.spawn_root(
+        "sleeper",
+        pending_after_point(move |w| {
+            *put.borrow_mut() = Some(w.clone());
+        }),
+    );
+    let b = s.spawn_root("waker", async move {
+        take.borrow_mut()
+            .take()
+            .expect("the sleeper stored its waker")
+            .wake();
+    });
+    s.run(a.task()); // stops at the point, mid-poll, waker stored
+    s.run(b.task()); // wakes the sleeper while it's suspended mid-poll
+    s.run(a.task()); // the sleeper's poll returns Pending
+    assert_eq!(s.status(), Status::Running);
+    s.run(a.task());
+    assert_eq!(s.status(), Status::Quiescent);
+}

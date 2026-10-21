@@ -22,13 +22,6 @@ user-id = 5946
 user-login = "jrmuizel"
 user-name = "Jeff Muizelaar"
 
-[[publisher.corosensei]]
-version = "0.3.4"
-when = "2026-05-24"
-user-id = 2915
-user-login = "Amanieu"
-user-name = "Amanieu d'Antras"
-
 [[publisher.syn]]
 version = "1.0.109"
 when = "2023-02-24"

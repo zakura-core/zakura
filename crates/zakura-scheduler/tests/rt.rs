@@ -17,7 +17,10 @@ use std::{
 use support::*;
 use zakura_rt::{
     sim,
-    sync::{Notify, Semaphore},
+    sync::{
+        atomic::{AtomicU64 as RtAtomicU64, Ordering as RtOrdering},
+        Mutex as RtMutex, Notify, Semaphore,
+    },
     task::{self, JoinSet},
     time::{self, Instant},
 };
@@ -389,4 +392,98 @@ fn back_to_back_release(s: &mut Scheduler) -> Check {
 #[test]
 fn release_points_split_back_to_back_drops() {
     assert!(first_violation(2, FIND, back_to_back_release).is_some());
+}
+
+/// Two tasks load and then store one `zakura-rt` atomic.
+fn rt_lost_update(s: &mut Scheduler) -> Check {
+    let counter = Arc::new(RtAtomicU64::new(0));
+    for label in ["inc_a", "inc_b"] {
+        let counter = counter.clone();
+        s.spawn_root(label, async move {
+            let v = counter.load(RtOrdering::SeqCst);
+            counter.store(v + 1, RtOrdering::SeqCst);
+        });
+    }
+    Box::new(move |_| {
+        let v = counter.load(RtOrdering::SeqCst);
+        (v != 2).then(|| format!("counter = {v}"))
+    })
+}
+
+#[test]
+fn rt_atomics_find_the_lost_update() {
+    assert!(first_violation(2, FIND, rt_lost_update).is_some());
+    assert_eq!(first_violation(1, FIND, rt_lost_update), None);
+}
+
+/// Checks capacity under one lock, then reserves under a second lock.
+fn rt_snapshot_reserve(fixed: bool) -> impl Fn(&mut Scheduler) -> Check {
+    move |s| {
+        let available = Arc::new(RtMutex::new(1i64));
+        for label in ["res_a", "res_b"] {
+            let available = available.clone();
+            s.spawn_root(label, async move {
+                if fixed {
+                    let mut guard = available.lock().unwrap();
+                    if *guard >= 1 {
+                        *guard -= 1;
+                    }
+                } else {
+                    let ok = *available.lock().unwrap() >= 1;
+                    if ok {
+                        *available.lock().unwrap() -= 1;
+                    }
+                }
+            });
+        }
+        Box::new(move |r| {
+            let v = *available.lock().unwrap();
+            (v < 0 || r.status != Status::Quiescent).then(|| format!("{v}, {:?}", r.status))
+        })
+    }
+}
+
+#[test]
+fn rt_mutex_parks_contended_tasks() {
+    assert!(first_violation(2, FIND, rt_snapshot_reserve(false)).is_some());
+    assert_eq!(first_violation(2, CLEAN, rt_snapshot_reserve(true)), None);
+}
+
+/// Two tasks take two `zakura-rt` mutexes in opposite orders.
+fn rt_ab_ba(s: &mut Scheduler) -> Check {
+    let a = Arc::new(RtMutex::new(()));
+    let b = Arc::new(RtMutex::new(()));
+    for (label, first, second) in [("ab", a.clone(), b.clone()), ("ba", b, a)] {
+        s.spawn_root(label, async move {
+            let _first = first.lock().unwrap();
+            let _second = second.lock().unwrap();
+        });
+    }
+    Box::new(|r| (r.status == Status::Deadlock).then(|| "deadlock".to_owned()))
+}
+
+#[test]
+fn rt_mutex_reports_a_lock_cycle_as_deadlock() {
+    assert!(first_violation(2, FIND, rt_ab_ba).is_some());
+}
+
+#[test]
+fn rt_mutex_held_across_await_starves_one_worker() {
+    let held_across_await = |s: &mut Scheduler| -> Check {
+        let lock = Arc::new(RtMutex::new(()));
+        let held = lock.clone();
+        s.spawn_root("holder", async move {
+            #[allow(clippy::await_holding_lock)]
+            {
+                let _guard = held.lock().unwrap();
+                time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        s.spawn_root("waiter", async move {
+            drop(lock.lock().unwrap());
+        });
+        Box::new(|r| (r.status == Status::WorkerStarved).then(|| "starved".to_owned()))
+    };
+    assert!(first_violation(1, FIND, held_across_await).is_some());
+    assert_eq!(first_violation(2, CLEAN, held_across_await), None);
 }

@@ -61,6 +61,13 @@ pub mod sync {
         OwnedSemaphorePermit, Semaphore,
     };
     pub use tokio_util::sync::CancellationToken;
+
+    /// Metrics-only atomics: plain std atomics, with no preemption points, in
+    /// both builds. Use [`atomic`] for anything another task reads to decide
+    /// what to do.
+    pub mod counter {
+        pub use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    }
 }
 
 /// Hashed collections, whose iteration order depends on a random seed.

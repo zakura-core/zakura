@@ -75,6 +75,12 @@ zcash_protocol.workspace = true
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon.workspace = true
+
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
+
 [dev-dependencies]
 eyre = { workspace = true }
 ed25519-zebra = { workspace = true }

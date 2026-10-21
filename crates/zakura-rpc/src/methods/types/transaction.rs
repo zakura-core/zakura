@@ -287,6 +287,20 @@ impl CoinbasePlan {
             + SIGNATURE_BYTES
             + SIGNATURE_BYTES;
         let (fixed_fields_bytes, shielded_bytes) = match version {
+            #[cfg(zcash_unstable = "nutachyon")]
+            TxVersion::V7 => {
+                let sapling = compact_size_bytes(0) + compact_size_bytes(0);
+                let orchard = compact_size_bytes(0);
+                let ironwood = match self.miner_reward_address {
+                    MinerRewardAddress::Ironwood(_) => orchard_bundle_bytes,
+                    _ => compact_size_bytes(0),
+                };
+                // V7 adds ZIP-233 and the NoBundle marker for its empty Tachyon bundle.
+                (
+                    V5_AND_V6_FIXED_FIELDS_BYTES + 8,
+                    sapling + orchard + ironwood + 1,
+                )
+            }
             TxVersion::V6 => {
                 let sapling = compact_size_bytes(0) + compact_size_bytes(0);
                 let orchard = compact_size_bytes(0);

@@ -118,6 +118,9 @@ proptest-derive = { workspace = true, optional = true }
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0", optional = true }
 bounded-vec = { version = "0.9.0", features = ["serde"] }
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
@@ -139,6 +142,9 @@ rand_core_10 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 
 zakura-test = { path = "../zakura-test/", version = "3.0.0-rc0" }
+
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
 
 [[bench]]
 name = "block"

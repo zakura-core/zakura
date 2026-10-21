@@ -6,35 +6,54 @@
 //! hashed collections, and the thread RNG. Code gated by a test-only `cfg` is
 //! skipped. Clippy's `disallowed_types` can't do this job while `zakura-rt`
 //! only re-exports, because a re-export resolves to the same item.
+//!
+//! The suggested replacements come from the `pub use` items in `zakura-rt`'s
+//! `lib.rs`, so the crate stays the one list of runtime names.
+//!
+//! The check does not yet cover `std::time::{Instant, SystemTime}`,
+//! `std::thread`, or the timer adapters in `tokio_stream`.
 
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
 };
 
-use proc_macro2::{Spacing, TokenStream, TokenTree};
+use proc_macro2::{Spacing, Span, TokenStream, TokenTree};
 use syn::{
+    punctuated::Punctuated,
     spanned::Spanned,
     visit::{self, Visit},
-    Attribute, Item, UseTree,
+    Attribute, Item, Meta, Token, UseTree,
 };
 
 use crate::BoxError;
 
 const ROOT_MODULE: &str = "crates/zakura-network/src/zakura.rs";
 
+const RT_LIB: &str = "crates/zakura-rt/src/lib.rs";
+
 /// Modules under `zakura` that are not v2 production code.
 const EXCLUDED_MODULES: [&str; 2] = ["legacy_gossip", "testkit"];
 
+/// Other spellings of the paths `zakura-rt` re-exports, rewritten in order.
+const ALIASES: [(&str, &str); 3] = [
+    ("core", "std"),
+    ("tokio::spawn", "tokio::task::spawn"),
+    (
+        "std::hash::RandomState",
+        "std::collections::hash_map::RandomState",
+    ),
+];
+
 /// `rand` functions that draw from the thread RNG.
 const THREAD_RNG_FUNCTIONS: [&str; 7] = [
-    "rng",
     "random",
     "random_range",
     "random_bool",
     "random_ratio",
     "random_iter",
     "fill",
+    "make_rng",
 ];
 
 /// Direct runtime paths the v2 code may keep, with the reason for each.
@@ -44,52 +63,91 @@ const ALLOWED: [(&str, &str, &str); 1] = [(
     "runtime introspection, which the simulator build will define",
 )];
 
+const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
+
+const MODULE_IMPORT: &str = "zakura_rt names, imported by item";
+
 pub fn check(repo_root: &Path) -> Result<(), BoxError> {
-    let mut violations = Vec::new();
-    let mut files = 0;
+    let rules = Rules::load(repo_root)?;
+    let mut findings = Findings::default();
     check_file(
         repo_root,
+        &rules,
         &repo_root.join(ROOT_MODULE),
         true,
-        &mut files,
-        &mut violations,
+        &mut findings,
     )?;
 
-    if violations.is_empty() {
-        println!("{files} v2 P2P files import runtime names through zakura-rt");
+    for (used, (file, prefix, _)) in findings.allowances_used.iter().zip(ALLOWED) {
+        if !used {
+            findings.violations.push(Violation {
+                location: file.to_owned(),
+                path: prefix.to_owned(),
+                replacement: "nothing: no code uses this allowlist entry, so remove it".to_owned(),
+            });
+        }
+    }
+
+    if findings.violations.is_empty() {
+        println!(
+            "{} v2 P2P files import runtime names through zakura-rt",
+            findings.files
+        );
         return Ok(());
     }
 
-    for violation in &violations {
+    for violation in &findings.violations {
         eprintln!("{violation}");
     }
     Err(format!(
         "{} runtime paths bypass zakura-rt; import them from zakura_rt, \
          or add an allowlist entry with a reason in crates/xtask/src/rt_imports.rs",
-        violations.len()
+        findings.violations.len()
     )
     .into())
 }
 
-fn check_file(
-    repo_root: &Path,
-    path: &Path,
-    is_root: bool,
-    files: &mut usize,
-    violations: &mut Vec<Violation>,
-) -> Result<(), BoxError> {
-    let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let file = syn::parse_file(&source).map_err(|e| format!("{}: {e}", path.display()))?;
-    *files += 1;
+#[derive(Default)]
+struct Findings {
+    files: usize,
+    violations: Vec<Violation>,
+    allowances_used: [bool; ALLOWED.len()],
+}
 
-    let relative = path
-        .strip_prefix(repo_root)
+fn parse_file(repo_root: &Path, path: &Path) -> Result<syn::File, BoxError> {
+    let relative = relative_path(repo_root, path);
+    let source = fs::read_to_string(path).map_err(|e| format!("{relative}: {e}"))?;
+    syn::parse_file(&source).map_err(|e| {
+        let start = e.span().start();
+        format!("{relative}:{}:{}: {e}", start.line, start.column + 1).into()
+    })
+}
+
+fn relative_path(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
         .unwrap_or(path)
         .to_string_lossy()
-        .into_owned();
+        .into_owned()
+}
+
+fn check_file(
+    repo_root: &Path,
+    rules: &Rules,
+    path: &Path,
+    is_root: bool,
+    findings: &mut Findings,
+) -> Result<(), BoxError> {
+    let file = parse_file(repo_root, path)?;
+    if is_test_only(&file.attrs) {
+        return Ok(());
+    }
+    findings.files += 1;
+
+    let relative = relative_path(repo_root, path);
     let mut visitor = PathVisitor {
         file: &relative,
-        violations,
+        rules,
+        findings,
     };
     for item in &file.items {
         visitor.visit_item(item);
@@ -97,28 +155,22 @@ fn check_file(
 
     // `foo.rs` and `foo/mod.rs` both keep their child modules in `foo/`.
     let child_dir = if path.file_name().is_some_and(|name| name == "mod.rs") {
-        path.parent().map(Path::to_path_buf)
+        path.parent()
+            .ok_or_else(|| format!("{relative} has no parent directory"))?
+            .to_path_buf()
     } else {
-        Some(path.with_extension(""))
-    }
-    .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    check_child_modules(
-        repo_root,
-        &child_dir,
-        &file.items,
-        is_root,
-        files,
-        violations,
-    )
+        path.with_extension("")
+    };
+    check_child_modules(repo_root, rules, &child_dir, &file.items, is_root, findings)
 }
 
 fn check_child_modules(
     repo_root: &Path,
+    rules: &Rules,
     dir: &Path,
     items: &[Item],
     is_root: bool,
-    files: &mut usize,
-    violations: &mut Vec<Violation>,
+    findings: &mut Findings,
 ) -> Result<(), BoxError> {
     for item in items {
         let Item::Mod(module) = item else { continue };
@@ -126,66 +178,234 @@ fn check_child_modules(
         if is_test_only(&module.attrs) || (is_root && EXCLUDED_MODULES.contains(&name.as_str())) {
             continue;
         }
+        if module.attrs.iter().any(|attr| attr.path().is_ident("path")) {
+            return Err(format!(
+                "module `{name}` in {} sets #[path], which the check can't follow",
+                relative_path(repo_root, dir)
+            )
+            .into());
+        }
         match &module.content {
             // The visitor already walked the inline module's items.
             Some((_, items)) => {
-                check_child_modules(repo_root, &dir.join(&name), items, false, files, violations)?
+                check_child_modules(repo_root, rules, &dir.join(&name), items, false, findings)?
             }
             None => {
-                let path = module_file(dir, &name)?;
-                check_file(repo_root, &path, false, files, violations)?;
+                let path = module_file(repo_root, dir, &name)?;
+                check_file(repo_root, rules, &path, false, findings)?;
             }
         }
     }
     Ok(())
 }
 
-fn module_file(dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
+fn module_file(repo_root: &Path, dir: &Path, name: &str) -> Result<PathBuf, BoxError> {
     [
         dir.join(format!("{name}.rs")),
         dir.join(name).join("mod.rs"),
     ]
     .into_iter()
     .find(|path| path.is_file())
-    .ok_or_else(|| format!("no file for module `{name}` in {}", dir.display()).into())
+    .ok_or_else(|| {
+        format!(
+            "no file for module `{name}` in {}",
+            relative_path(repo_root, dir)
+        )
+        .into()
+    })
 }
 
-/// Whether the attributes include `#[cfg(test)]` or `#[cfg(all(test, ..))]`.
+/// Whether a `cfg` attribute compiles the item only in tests.
 fn is_test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        let Ok(tokens) = attr.meta.require_list().map(|list| list.tokens.to_string()) else {
-            return false;
-        };
-        let tokens = tokens.replace(' ', "");
-        tokens == "test" || tokens.starts_with("all(test,")
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<Meta>()
+                .is_ok_and(|predicate| implies_test(&predicate))
     })
+}
+
+/// Whether the `cfg` predicate holds only when `test` holds.
+fn implies_test(predicate: &Meta) -> bool {
+    match predicate {
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            .is_ok_and(|predicates| predicates.iter().any(implies_test)),
+        _ => false,
+    }
+}
+
+/// The runtime paths `zakura-rt` re-exports, and the names it gives them.
+struct Rules {
+    reexports: Vec<Reexport>,
+}
+
+struct Reexport {
+    source: Vec<String>,
+    name: Vec<String>,
+}
+
+impl Rules {
+    fn load(repo_root: &Path) -> Result<Self, BoxError> {
+        let file = parse_file(repo_root, &repo_root.join(RT_LIB))?;
+        let mut reexports = Vec::new();
+        collect_reexports(&file.items, &mut Vec::new(), &mut reexports);
+        Ok(Self { reexports })
+    }
+
+    /// The `zakura_rt` name to use instead of `segments`, if `segments` is a
+    /// runtime path the v2 code must not name directly.
+    fn replacement(&self, segments: &[String]) -> Option<String> {
+        let path = resolve_aliases(segments);
+        if let Some(reexport) = self
+            .reexports
+            .iter()
+            .find(|reexport| path.starts_with(&reexport.source))
+        {
+            let name = reexport
+                .name
+                .iter()
+                .chain(&path[reexport.source.len()..])
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("::");
+            return Some(format!("zakura_rt::{name}"));
+        }
+        // A module import would let the code name re-exported items through it.
+        if self.reexports.iter().any(|reexport| {
+            reexport.source.len() > path.len() && reexport.source.starts_with(&path)
+        }) {
+            return Some(MODULE_IMPORT.to_owned());
+        }
+        let path: Vec<&str> = path.iter().map(String::as_str).collect();
+        match path.as_slice() {
+            ["rand_10", name] if THREAD_RNG_FUNCTIONS.contains(name) => {
+                Some("zakura_rt::rand::rng".to_owned())
+            }
+            ["rand_10", "rngs", "ThreadRng" | "SysRng", ..]
+            | ["tokio", ..]
+            | ["tokio_util", "sync" | "task", ..] => Some(MISSING_NAME.to_owned()),
+            _ => None,
+        }
+    }
+}
+
+fn collect_reexports(items: &[Item], module: &mut Vec<String>, reexports: &mut Vec<Reexport>) {
+    for item in items {
+        match item {
+            Item::Use(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                for leaf in use_leaves(&item.tree) {
+                    if let Some(name) = leaf.name {
+                        reexports.push(Reexport {
+                            source: leaf.path,
+                            name: module.iter().cloned().chain([name]).collect(),
+                        });
+                    }
+                }
+            }
+            Item::Mod(item) => {
+                if let Some((_, items)) = &item.content {
+                    module.push(item.ident.to_string());
+                    collect_reexports(items, module, reexports);
+                    module.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resolve_aliases(segments: &[String]) -> Vec<String> {
+    let mut path = segments.to_vec();
+    for (alias, target) in ALIASES {
+        if starts_with(&path, alias) {
+            path.splice(
+                ..alias.split("::").count(),
+                target.split("::").map(str::to_owned),
+            );
+        }
+    }
+    path
+}
+
+/// Whether `path` starts with the whole segments of `prefix`, like `a::b`.
+fn starts_with(path: &[String], prefix: &str) -> bool {
+    let prefix: Vec<&str> = prefix.split("::").collect();
+    path.len() >= prefix.len() && path.iter().zip(prefix).all(|(a, b)| a == b)
+}
+
+/// One leaf of a `use` tree.
+struct UseLeaf {
+    /// The full path the leaf imports.
+    path: Vec<String>,
+    /// The name the leaf binds, or `None` for a glob.
+    name: Option<String>,
+    span: Span,
+}
+
+fn use_leaves(tree: &UseTree) -> Vec<UseLeaf> {
+    fn walk(tree: &UseTree, prefix: &mut Vec<String>, leaves: &mut Vec<UseLeaf>) {
+        let mut leaf = |path: Vec<String>, name: Option<String>, span| {
+            leaves.push(UseLeaf { path, name, span });
+        };
+        match tree {
+            UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                walk(&path.tree, prefix, leaves);
+                prefix.pop();
+            }
+            UseTree::Name(name) if name.ident == "self" => {
+                leaf(prefix.clone(), prefix.last().cloned(), name.span());
+            }
+            UseTree::Name(name) => {
+                let path = prefix.iter().cloned().chain([name.ident.to_string()]);
+                leaf(path.collect(), Some(name.ident.to_string()), name.span());
+            }
+            UseTree::Rename(rename) => {
+                let mut path = prefix.clone();
+                if rename.ident != "self" {
+                    path.push(rename.ident.to_string());
+                }
+                leaf(path, Some(rename.rename.to_string()), rename.span());
+            }
+            UseTree::Glob(glob) => leaf(prefix.clone(), None, glob.span()),
+            UseTree::Group(group) => {
+                for tree in &group.items {
+                    walk(tree, prefix, leaves);
+                }
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    walk(tree, &mut Vec::new(), &mut leaves);
+    leaves
 }
 
 struct PathVisitor<'a> {
     file: &'a str,
-    violations: &'a mut Vec<Violation>,
+    rules: &'a Rules,
+    findings: &'a mut Findings,
 }
 
 impl PathVisitor<'_> {
-    fn check(&mut self, segments: &[String], span: proc_macro2::Span) {
-        let Some(replacement) = replacement(segments) else {
+    fn check(&mut self, segments: &[String], span: Span) {
+        let Some(replacement) = self.rules.replacement(segments) else {
             return;
         };
-        let path = segments.join("::");
-        let allowed = ALLOWED
+        let allowance = ALLOWED
             .iter()
-            .any(|(file, prefix, _)| *file == self.file && path.starts_with(prefix));
-        if !allowed {
-            let start = span.start();
-            self.violations.push(Violation {
-                location: format!("{}:{}:{}", self.file, start.line, start.column + 1),
-                path,
-                replacement,
-            });
+            .position(|(file, prefix, _)| *file == self.file && starts_with(segments, prefix));
+        if let Some(allowance) = allowance {
+            self.findings.allowances_used[allowance] = true;
+            return;
         }
+        let start = span.start();
+        self.findings.violations.push(Violation {
+            location: format!("{}:{}:{}", self.file, start.line, start.column + 1),
+            path: segments.join("::"),
+            replacement,
+        });
     }
 
     /// Checks `a::b::c` paths inside macro arguments, which syn leaves as tokens.
@@ -198,7 +418,7 @@ impl PathVisitor<'_> {
                     self.check_tokens(group.stream());
                     i += 1;
                 }
-                TokenTree::Ident(ident) if !follows_path_separator(&tokens, i) => {
+                TokenTree::Ident(ident) if !continues_path(&tokens, i) => {
                     let mut segments = vec![ident.to_string()];
                     let mut next = i + 1;
                     while let (Some(TokenTree::Ident(segment)), true) =
@@ -288,21 +508,21 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &'ast syn::Expr) {
-        let test_only = match expr {
-            syn::Expr::Block(expr) => is_test_only(&expr.attrs),
-            syn::Expr::Call(expr) => is_test_only(&expr.attrs),
-            syn::Expr::MethodCall(expr) => is_test_only(&expr.attrs),
-            syn::Expr::Macro(expr) => is_test_only(&expr.attrs),
-            _ => false,
-        };
-        if !test_only {
+        if !expr_attrs(expr).is_some_and(is_test_only) {
             visit::visit_expr(self, expr);
         }
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        let mut prefix = Vec::new();
-        self.visit_use_leaves(&item.tree, &mut prefix);
+        for leaf in use_leaves(&item.tree) {
+            self.check(&leaf.path, leaf.span);
+        }
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        if item.rename.is_some() {
+            self.check(&[item.ident.to_string()], item.span());
+        }
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -311,42 +531,17 @@ impl<'ast> Visit<'ast> for PathVisitor<'_> {
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect();
-        self.check(&segments, path.span());
+        // A one-segment path names a local item or binding, like a `core`
+        // variable, not a crate.
+        if segments.len() > 1 || path.leading_colon.is_some() {
+            self.check(&segments, path.span());
+        }
         visit::visit_path(self, path);
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.visit_path(&mac.path);
         self.check_tokens(mac.tokens.clone());
-    }
-}
-
-impl PathVisitor<'_> {
-    fn visit_use_leaves(&mut self, tree: &UseTree, prefix: &mut Vec<String>) {
-        match tree {
-            UseTree::Path(path) => {
-                prefix.push(path.ident.to_string());
-                self.visit_use_leaves(&path.tree, prefix);
-                prefix.pop();
-            }
-            UseTree::Name(name) if name.ident == "self" => self.check(prefix, name.span()),
-            UseTree::Name(name) => {
-                prefix.push(name.ident.to_string());
-                self.check(prefix, name.span());
-                prefix.pop();
-            }
-            UseTree::Rename(rename) => {
-                prefix.push(rename.ident.to_string());
-                self.check(prefix, rename.span());
-                prefix.pop();
-            }
-            UseTree::Glob(glob) => self.check(prefix, glob.span()),
-            UseTree::Group(group) => {
-                for tree in &group.items {
-                    self.visit_use_leaves(tree, prefix);
-                }
-            }
-        }
     }
 }
 
@@ -371,6 +566,27 @@ fn item_attrs(item: &Item) -> Option<&[Attribute]> {
     })
 }
 
+/// The attributes of expressions that can stand as a statement.
+fn expr_attrs(expr: &syn::Expr) -> Option<&[Attribute]> {
+    Some(match expr {
+        syn::Expr::Assign(expr) => &expr.attrs,
+        syn::Expr::Async(expr) => &expr.attrs,
+        syn::Expr::Await(expr) => &expr.attrs,
+        syn::Expr::Block(expr) => &expr.attrs,
+        syn::Expr::Call(expr) => &expr.attrs,
+        syn::Expr::ForLoop(expr) => &expr.attrs,
+        syn::Expr::If(expr) => &expr.attrs,
+        syn::Expr::Loop(expr) => &expr.attrs,
+        syn::Expr::Macro(expr) => &expr.attrs,
+        syn::Expr::Match(expr) => &expr.attrs,
+        syn::Expr::MethodCall(expr) => &expr.attrs,
+        syn::Expr::Try(expr) => &expr.attrs,
+        syn::Expr::Unsafe(expr) => &expr.attrs,
+        syn::Expr::While(expr) => &expr.attrs,
+        _ => return None,
+    })
+}
+
 fn is_path_separator(tokens: &[TokenTree], i: usize) -> bool {
     matches!(
         (tokens.get(i), tokens.get(i + 1)),
@@ -379,37 +595,16 @@ fn is_path_separator(tokens: &[TokenTree], i: usize) -> bool {
     )
 }
 
-fn follows_path_separator(tokens: &[TokenTree], i: usize) -> bool {
-    i >= 2 && is_path_separator(tokens, i - 2)
-}
-
-/// The `zakura_rt` name to use instead of `segments`, if `segments` is a
-/// runtime path the v2 code must not name directly.
-fn replacement(segments: &[String]) -> Option<String> {
-    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let rt = |path: &str| Some(format!("zakura_rt::{path}"));
-    match segments.as_slice() {
-        ["tokio", "sync", "Mutex", ..] => rt("sync::AsyncMutex"),
-        ["tokio", "spawn", ..] => rt("task::spawn"),
-        ["tokio", "sync" | "time" | "task", ..] => rt(&segments[1..].join("::")),
-        ["tokio", name @ ("select" | "pin")] => rt(name),
-        ["tokio", ..] => Some("a zakura_rt name (add one if it's missing)".to_owned()),
-        ["tokio_util", "sync" | "task", ..] => rt(&segments[1..].join("::")),
-        ["tokio_stream", "StreamMap", ..] => rt("stream::StreamMap"),
-        ["rand_10", name] if THREAD_RNG_FUNCTIONS.contains(name) => rt("rand::rng"),
-        ["std" | "core", "sync", "atomic", ..] => rt(&segments[1..].join("::")),
-        ["std", "sync", "Mutex" | "MutexGuard" | "PoisonError" | "TryLockError", ..] => {
-            rt(&segments[1..].join("::"))
+/// Whether the ident at `i` continues a path, as `b` does in `a::b`. In
+/// `::b` or `, ::b`, it starts one.
+fn continues_path(tokens: &[TokenTree], i: usize) -> bool {
+    i >= 3
+        && is_path_separator(tokens, i - 2)
+        && match &tokens[i - 3] {
+            TokenTree::Ident(_) => true,
+            TokenTree::Punct(punct) => punct.as_char() == '>',
+            _ => false,
         }
-        ["std", "collections", "HashMap" | "HashSet" | "hash_map" | "hash_set", ..] => {
-            rt(&segments[1..].join("::"))
-        }
-        // A module import would let the code name the items above through it.
-        ["std" | "core", "sync"] | ["std", "collections"] => {
-            Some("zakura_rt names, imported by item".to_owned())
-        }
-        _ => None,
-    }
 }
 
 struct Violation {
@@ -425,5 +620,120 @@ impl fmt::Display for Violation {
             "{}: `{}` bypasses zakura-rt; use {}",
             self.location, self.path, self.replacement
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each violation in `source` as `path -> replacement`.
+    fn violations(source: &str) -> Vec<String> {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        let rules = Rules::load(&repo_root).expect("zakura-rt's lib.rs parses");
+        let file = syn::parse_file(source).expect("the fixture parses");
+        let mut findings = Findings::default();
+        let mut visitor = PathVisitor {
+            file: "fixture.rs",
+            rules: &rules,
+            findings: &mut findings,
+        };
+        for item in &file.items {
+            visitor.visit_item(item);
+        }
+        findings
+            .violations
+            .iter()
+            .map(|violation| format!("{} -> {}", violation.path, violation.replacement))
+            .collect()
+    }
+
+    #[test]
+    fn suggestions_name_the_zakura_rt_reexport() {
+        let source = "
+            use tokio::sync::{mpsc, Mutex, MutexGuard};
+            use core::sync::atomic::Ordering;
+            fn f() {
+                tokio::spawn(async {});
+                let _ = std::hash::RandomState::new();
+                let _ = rand_10::random::<u8>();
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "tokio::sync::mpsc -> zakura_rt::sync::mpsc",
+                "tokio::sync::Mutex -> zakura_rt::sync::AsyncMutex",
+                "tokio::sync::MutexGuard -> a zakura_rt name (add one if it's missing)",
+                "core::sync::atomic::Ordering -> zakura_rt::sync::atomic::Ordering",
+                "tokio::spawn -> zakura_rt::task::spawn",
+                "std::hash::RandomState::new -> zakura_rt::collections::hash_map::RandomState::new",
+                "rand_10::random -> zakura_rt::rand::rng",
+            ]
+        );
+    }
+
+    #[test]
+    fn module_imports_renames_and_globs_are_flagged() {
+        let source = "
+            use std::sync;
+            use std::{self as s};
+            use rand_10::*;
+            extern crate tokio as tk;
+            use std::{collections::BTreeMap, sync::Arc};
+            use tokio_util::codec::Framed;
+            fn f(core: Core) -> u8 { core.0 }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::sync -> zakura_rt names, imported by item",
+                "std -> zakura_rt names, imported by item",
+                "rand_10 -> zakura_rt names, imported by item",
+                "tokio -> zakura_rt names, imported by item",
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_arguments_are_checked() {
+        let source = "
+            async fn f(d: Duration) {
+                tokio::select! { _ = ::tokio::time::sleep(d) => {} }
+                info!(\"{:?}\", crate::tokio::spawn);
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "tokio::select -> zakura_rt::select",
+                "tokio::time::sleep -> zakura_rt::time::sleep",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_test_only_code_is_skipped() {
+        let source = "
+            #[cfg(test)]
+            fn a() { tokio::spawn(x); }
+            #[cfg(all(feature = \"x\", test))]
+            fn b() { tokio::spawn(x); }
+            #[cfg(any(test, feature = \"x\"))]
+            fn c() { tokio::task::spawn(x); }
+            #[cfg(not(test))]
+            fn d() { tokio::task::yield_now(); }
+            async fn e() {
+                #[cfg(test)]
+                tokio::task::yield_now().await;
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "tokio::task::spawn -> zakura_rt::task::spawn",
+                "tokio::task::yield_now -> zakura_rt::task::yield_now",
+            ]
+        );
     }
 }

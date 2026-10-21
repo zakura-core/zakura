@@ -13,8 +13,11 @@ use zakura_chain::transparent;
 // mempool transactions *before* script verification (`check::mempool_standard_input_scripts`).
 // They are re-exported here for the storage-time policy checks, so the two paths can't drift apart.
 pub(super) use zakura_consensus::transaction::check::{
-    are_inputs_standard, standard_script_kind, MAX_STANDARD_SCRIPTSIG_SIZE,
+    standard_script_kind, MAX_STANDARD_SCRIPTSIG_SIZE,
 };
+
+#[cfg(test)]
+pub(super) use zakura_consensus::transaction::check::are_inputs_standard;
 
 /// Maximum number of signature operations allowed per standard transaction (zcashd `MAX_STANDARD_TX_SIGOPS`).
 /// <https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.h#L22>

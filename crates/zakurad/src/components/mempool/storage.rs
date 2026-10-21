@@ -315,14 +315,25 @@ impl Storage {
         let transaction = tx.transaction.transaction().as_ref();
         let spent_outputs = &tx.spent_outputs;
 
-        for input in transaction.inputs() {
+        for (input_index, input) in transaction.inputs().iter().enumerate() {
             let unlock_script = match input {
                 transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
                 transparent::Input::Coinbase { .. } => continue,
             };
 
             // Rule: scriptSig size must be within the standard limit.
-            if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
+            // This transaction has already passed contextual consensus verification.
+            #[cfg(feature = "experimental-wots")]
+            let allowed = spent_outputs
+                .get(input_index)
+                .is_some_and(|output| zakura_script::wots::standard_input(input, output));
+            #[cfg(not(feature = "experimental-wots"))]
+            let allowed = {
+                let _ = input_index;
+                false
+            };
+            if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE && !allowed
+            {
                 return self
                     .reject_non_standard(tx, NonStandardTransactionError::ScriptSigTooLarge);
             }
@@ -349,7 +360,11 @@ impl Storage {
 
             // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
             // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-            if !policy::are_inputs_standard(transaction, spent_outputs) {
+            if !zakura_consensus::transaction::check::are_inputs_standard_with_wots(
+                transaction,
+                spent_outputs,
+                cfg!(feature = "experimental-wots"),
+            ) {
                 return self
                     .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
             }

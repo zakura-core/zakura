@@ -618,7 +618,11 @@ where
                 // scriptSigs, and high-sigop P2SH redeem scripts) *before*
                 // doing expensive script verification, to avoid DoS attacks on
                 // the script interpreter.
-                check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
+                #[cfg(feature = "experimental-wots")]
+                let experimental = zakura_script::wots::active(&network, req.height());
+                #[cfg(not(feature = "experimental-wots"))]
+                let experimental = false;
+                check::mempool_standard_input_scripts_with_wots(tx.as_ref(), &spent_outputs, experimental)?;
             }
 
             let mempool_transaction = req.mempool_transaction();
@@ -636,7 +640,12 @@ where
 
             let nu = req.upgrade(&network);
             let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+                {
+                    let cached = CachedFfiTransaction::new(tx.clone(), Arc::new(spent_outputs), nu).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?;
+                    #[cfg(feature = "experimental-wots")]
+                    let cached = cached.with_wots_context(&network, req.height());
+                    Arc::new(cached)
+                };
 
             tracing::trace!(?tx_id, "got state UTXOs");
 

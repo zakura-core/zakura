@@ -91,7 +91,7 @@ impl<S: Source + ?Sized> Produce for Server<S> {
         // Copying up to the response cap into frames can still take a while.
         // Await the actual job, even after session cancellation, and keep the
         // source's lease with its retained blocks.
-        tokio::task::spawn_blocking(move || {
+        zakura_rt::task::spawn_blocking(move || {
             encode_response(requested, read_range.count(), max_body_bytes, result, sink)
         })
         .await

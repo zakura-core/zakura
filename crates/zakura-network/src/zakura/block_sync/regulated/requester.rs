@@ -1,9 +1,10 @@
 //! Exact GetBlocks identity and ending checks around shared reservations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
+use zakura_rt::collections::HashMap;
 
 use thiserror::Error;
 use zakura_chain::block::{Hash, Height};
@@ -227,7 +228,7 @@ impl Requester {
 
     /// A scheduler timeout changes local interest, never the peer's authority.
     pub(super) fn abandon(&mut self, start: Height) {
-        let now = tokio::time::Instant::now().into_std() - self.read_paused;
+        let now = zakura_rt::time::Instant::now().into_std() - self.read_paused;
         self.reservations.abandon(&start);
         if let Some(pending) = self.ranges.get_mut(&start) {
             let at = *pending.retirement_started_at.get_or_insert(now);
@@ -260,7 +261,7 @@ impl Requester {
         hash: Hash,
         payload_len: usize,
     ) -> Result<(Height, Claimed), ResponseError> {
-        let now = tokio::time::Instant::now().into_std() - self.read_paused;
+        let now = zakura_rt::time::Instant::now().into_std() - self.read_paused;
         let start = *self.next.get(&hash).ok_or(ResponseError::Identity)?;
         let pending = self
             .ranges

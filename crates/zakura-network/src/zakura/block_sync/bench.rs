@@ -19,19 +19,19 @@
 
 use std::{
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
 use zakura_chain::block::{self, Block};
 use zakura_jsonl_trace::{JsonlTraceGuard, JsonlTracer};
+use zakura_rt::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, watch,
+    },
+    task::JoinHandle,
+};
 
 use crate::zakura::{
     trace::block_sync_trace as bs_trace, transport::ByteBudget, ZakuraPeerId, ZakuraTrace,
@@ -205,7 +205,7 @@ pub fn spawn_bench_sequencer(
         BENCH_ACTION_SEND_TIMEOUT,
         trace.clone(),
     );
-    let join = tokio::spawn(task.run());
+    let join = zakura_rt::task::spawn(task.run());
 
     BenchSequencerHandle {
         feeder: BenchBodyFeeder {

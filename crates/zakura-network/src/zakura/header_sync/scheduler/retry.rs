@@ -1,6 +1,7 @@
 //! Branch-owned body-availability retry episodes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use zakura_rt::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_header_chain::{

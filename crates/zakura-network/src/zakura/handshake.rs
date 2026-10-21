@@ -2,10 +2,10 @@
 
 use std::{
     cmp::min,
-    collections::HashMap,
     io::{self, Cursor, Read, Write},
     time::{Duration, Instant},
 };
+use zakura_rt::collections::HashMap;
 
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};

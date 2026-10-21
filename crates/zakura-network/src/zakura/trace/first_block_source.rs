@@ -1,8 +1,5 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{collections::VecDeque, fmt, sync::Arc};
+use zakura_rt::{collections::HashMap, sync::Mutex};
 
 use zakura_chain::block;
 

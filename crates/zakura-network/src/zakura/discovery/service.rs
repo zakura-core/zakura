@@ -7,19 +7,17 @@
 //! travels in one transport frame whose type is the message's discriminator;
 //! `wire` defines the payloads and their bounds.
 
-use std::{
+use std::{sync::Arc, time::Duration};
+
+use zakura_node_services::task::spawn_erased;
+use zakura_quic::NodeId;
+use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
+        CancellationToken, Mutex as StdMutex, Notify,
     },
-    time::Duration,
 };
-
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
-use zakura_node_services::task::spawn_erased;
-use zakura_quic::NodeId;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
@@ -669,11 +667,11 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 // Closing drops every unwritten answer, and the peer's
                 // exchange would end without it.
                 let cancel = source.session.cancel_token();
-                tokio::select! {
+                zakura_rt::select! {
                     biased;
                     _ = cancel.cancelled() => {}
                     () = answers.wait() => {}
-                    () = tokio::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE) => {}
+                    () = zakura_rt::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE) => {}
                 }
                 handle.mark_short_lived_exchange(&peer_node_id).await;
                 // A retired session is never charged, so a timed-out
@@ -729,7 +727,7 @@ async fn run_discovery_pipe(
     // A cancelled session drops its pending work, including a wait for a
     // verification slot, so it neither holds the slot queue nor imports after
     // its session ends.
-    tokio::select! {
+    zakura_rt::select! {
         biased;
         _ = cancel.cancelled() => Ok(()),
         read = read_discovery_messages(pipe, recv, &sink) => read,
@@ -897,11 +895,11 @@ impl DiscoverySource {
             return InitialExchange::Ended;
         }
         let cancel = self.session.cancel_token();
-        let outcome = tokio::select! {
+        let outcome = zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => InitialExchange::Ended,
             _ = self.progress.wait_complete() => InitialExchange::Complete,
-            _ = tokio::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => InitialExchange::TimedOut,
+            _ = zakura_rt::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => InitialExchange::TimedOut,
         };
         if outcome == InitialExchange::Ended
             || !self
@@ -917,10 +915,10 @@ impl DiscoverySource {
     /// Exchanges again once the rows' send interval has passed.
     async fn refresh_after_interval(&mut self) -> Result<(), ()> {
         let cancel = self.session.cancel_token();
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => Err(()),
-            _ = tokio::time::sleep(SEND_INTERVAL) => self.exchange().await,
+            _ = zakura_rt::time::sleep(SEND_INTERVAL) => self.exchange().await,
         }
     }
 

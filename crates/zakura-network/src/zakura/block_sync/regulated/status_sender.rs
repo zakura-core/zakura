@@ -6,10 +6,8 @@ use crate::zakura::{
     regulation::{CadenceSendError, CadenceSender, RowSend},
     FramedSend, OrderedSendError,
 };
-use std::{
-    sync::{Mutex, PoisonError},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+use zakura_rt::sync::{Mutex, PoisonError};
 
 /// What one attempt did with the latest local Status.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

@@ -1,6 +1,7 @@
 //! Bounded protocol-model replay used by the header-pursuit fuzz target.
 
-use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, sync::Arc};
+use zakura_rt::collections::HashMap;
 
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},

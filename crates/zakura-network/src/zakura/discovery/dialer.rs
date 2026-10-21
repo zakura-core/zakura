@@ -1,6 +1,7 @@
 //! Bootstrap and candidate dial entry points for native discovery.
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, str::FromStr};
+use zakura_rt::collections::HashMap;
 
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
@@ -20,7 +21,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<zakura_rt::task::JoinHandle<()>> {
     if bootstrap_peers.is_empty() {
         return Vec::new();
     }
@@ -93,7 +94,7 @@ pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
-    admitted_ip: tokio::sync::oneshot::Sender<std::net::IpAddr>,
+    admitted_ip: zakura_rt::sync::oneshot::Sender<std::net::IpAddr>,
 ) -> Result<(), ZakuraHandlerError> {
     crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip(
         endpoint,

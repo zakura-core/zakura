@@ -1,9 +1,7 @@
 //! Registry for Zakura protocol services and their declared streams.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
+use zakura_rt::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 

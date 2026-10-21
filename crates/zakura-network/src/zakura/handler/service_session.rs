@@ -214,7 +214,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
-    let application_drain = Arc::new(tokio::sync::Barrier::new(streams.len()));
+    let application_drain = Arc::new(zakura_rt::sync::Barrier::new(streams.len()));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =

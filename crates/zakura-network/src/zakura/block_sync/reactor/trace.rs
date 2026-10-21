@@ -97,10 +97,10 @@ impl BlockSyncReactor {
             row.budget_reserved = Some(self.state.budget.reserved());
             let sequencer_input_queued_bytes = self
                 .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(zakura_rt::sync::atomic::Ordering::Relaxed);
             let sequencer_input_decoded_attributed_memory_bytes = self
                 .sequencer_input_decoded_attributed_memory_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
+                .load(zakura_rt::sync::atomic::Ordering::Relaxed);
             let sequencer_input_max_capacity = self.sequencer_input.max_capacity();
             let sequencer_input_capacity = self.sequencer_input.capacity();
             let sequencer_input_queued_blocks =

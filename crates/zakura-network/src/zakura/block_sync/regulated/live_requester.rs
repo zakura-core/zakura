@@ -1,10 +1,11 @@
 //! Production request authorization, kept separate from the download scheduler.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use zakura_chain::{block, serialization::ZcashDeserialize};
+use zakura_rt::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::{
     requester::{CompletedRange, Requester, ResponseError},
@@ -112,7 +113,7 @@ pub(crate) struct LiveRequester {
 /// One local wait in the session reader. These waits must not overlap.
 pub(crate) struct ReadPause {
     shared: Arc<Shared>,
-    started: tokio::time::Instant,
+    started: zakura_rt::time::Instant,
 }
 
 impl Drop for ReadPause {
@@ -126,7 +127,7 @@ impl LiveRequester {
     pub(crate) fn pause_reading(&self) -> ReadPause {
         ReadPause {
             shared: self.shared.clone(),
-            started: tokio::time::Instant::now(),
+            started: zakura_rt::time::Instant::now(),
         }
     }
 

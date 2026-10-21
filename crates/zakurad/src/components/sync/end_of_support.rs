@@ -18,10 +18,10 @@ use crate::application::release_version;
 /// release-state bundle at the Mainnet target spacing.
 pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
 
-/// The estimated number of blocks per day after Blossom.
+/// The estimated number of blocks per day at the post-Blossom target spacing.
 ///
-/// All Zakura releases ship after Blossom, so this matches the spacing seen at
-/// every reachable tip height.
+/// From the ZIP 259 NU7 activation, blocks arrive three times as often; use
+/// [`NetworkUpgrade::target_spacing_for_height`] at heights past activation.
 pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
 /// The maximum number of days after [`ESTIMATED_RELEASE_HEIGHT`] that a Zakura
@@ -31,8 +31,9 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zakura will exit with a panic if the current tip height is bigger than
 ///   [`ESTIMATED_RELEASE_HEIGHT`] plus this number of days at the target spacing.
-/// - The support window is capped by [`MAINNET_EOS_HEIGHT`].
-pub const EOS_PANIC_AFTER: u32 = 30;
+/// - The support window is capped by [`MAINNET_EOS_HEIGHT`]. This window
+///   deliberately overshoots the cap, so the cap fixes the halt date.
+pub const EOS_PANIC_AFTER: u32 = 45;
 
 /// The nominal number of days after release before warnings start.
 ///
@@ -41,11 +42,17 @@ pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// The last Mainnet height supported by this release.
 ///
-/// The next block projects to November 4, 2026 at 23:59:09 UTC using Mainnet
-/// height 3,490,665 at September 22, 2026 at 05:46:39 UTC and 75-second blocks.
-/// This fixes EOS at approximately November 5 even if release preparation
-/// advances [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows height, not time.
-const MAINNET_EOS_HEIGHT: Height = Height(3_541_074);
+/// The next block projects to December 4, 2026 at 23:59:59 UTC using Mainnet
+/// height 3,490,665 at September 22, 2026 at 05:46:39 UTC, 75-second blocks
+/// through height 3,543,404, and 25-second blocks from the ZIP 259 NU7
+/// activation at height 3,543,405. This fixes EOS at approximately December 5
+/// even if release preparation advances [`ESTIMATED_RELEASE_HEIGHT`].
+/// Enforcement follows height, not time.
+///
+/// Earlier releases deliberately halted before the expected NU7 activation.
+/// This release follows the activation, so its support window extends about
+/// four weeks past it.
+const MAINNET_EOS_HEIGHT: Height = Height(3_640_098);
 
 /// A string which is part of the panic that will be displayed if Zebra halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";
@@ -170,7 +177,14 @@ pub fn check(tip_height: Height, network: &Network) {
         info!("Release always valid outside Mainnet");
         return;
     };
-    let warning_blocks = (EOS_PANIC_AFTER - EOS_WARN_AFTER) * ESTIMATED_BLOCKS_PER_DAY;
+    // Convert the warning lead to blocks at the halt height's target spacing,
+    // so it covers the same days across target-spacing changes like ZIP 259.
+    let blocks_per_day = u32::try_from(
+        24 * 60 * 60
+            / NetworkUpgrade::target_spacing_for_height(network, panic_height).num_seconds(),
+    )
+    .expect("target spacings are positive and shorter than a day");
+    let warning_blocks = (EOS_PANIC_AFTER - EOS_WARN_AFTER) * blocks_per_day;
     let warn_height = Height(panic_height.0.saturating_sub(warning_blocks));
 
     if tip_height > panic_height {
@@ -234,13 +248,13 @@ mod tests {
             end_of_support_height(&Network::Mainnet),
             Some(MAINNET_EOS_HEIGHT),
         );
-        // 27 days of estimated blocks cross the ZIP 259 NU7 activation:
+        // 42 days of estimated blocks cross the ZIP 259 NU7 activation:
         // 18,288 blocks at 75 seconds reach the block before activation
-        // (3,543,404) in 1,371,600 seconds, and the remaining 961,200
-        // seconds add 38,448 blocks at 25 seconds.
+        // (3,543,404) in 1,371,600 seconds, and the remaining 2,257,200
+        // seconds add 90,288 blocks at 25 seconds.
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
-            Height(3_581_852),
+            Height(3_633_692),
         );
     }
 

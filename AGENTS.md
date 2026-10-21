@@ -160,6 +160,7 @@ S::Future: Send + 'static,
 - All external waits need timeouts (network, state, channels)
 - Prefer `tokio::sync::watch` over `Mutex` for shared async state
 - Prefer freshness tracking ("time since last change") to detect stalls
+- The v2 P2P code (`crates/zakura-network/src/zakura/`, except `legacy_gossip` and `testkit`) takes tasks, time, sync primitives, hashed collections and the thread RNG from `zakura_rt`, not from `tokio`, `std` or `rand`. `cargo xtask check-rt-imports` enforces this.
 
 ### Security
 

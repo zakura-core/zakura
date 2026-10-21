@@ -131,14 +131,14 @@ independently.
   including their ASCII Punycode spellings
   ([#1319](https://github.com/zakura-core/zakura/pull/1319)).
 - `zcashd_source = "embedded"` now downloads the standalone `zcashd`
-  executable that the `valargroup/zcashd` v1.2.0 release publishes, instead of
-  extracting it from the release archive. Zakura verifies its SHA256 before
+  executable that the embedded `valargroup/zcashd` release publishes, instead
+  of extracting it from the release archive. Zakura verifies its SHA256 before
   making it executable and installing it, and requires HTTPS on every redirect.
   Zakura now hashes a cached executable before reusing it and downloads it
-  again if its contents differ. A matching cached v1.2.0 executable is reused
-  without network access. The release-specific cache path causes existing
-  v1.1.0 installations to download v1.2.0 on first use. Legacy `zcashd.sha256`
-  files are ignored
+  again if its contents differ. A matching cached executable is reused without
+  network access. The release-specific cache path causes existing
+  installations to download the embedded release on first use. Legacy
+  `zcashd.sha256` files are ignored
   ([#1326](https://github.com/zakura-core/zakura/pull/1326)).
 - The embedded zcashd compatibility manifest now uses schema version 2. This
   is a source-incompatible change to the `zakura` library's public Rust API:
@@ -155,9 +155,12 @@ independently.
   `ZCASHD_COMPAT_ARCHIVE_PATH` and `ZCASHD_COMPAT_EXTRACT_DIR`
   ([#1326](https://github.com/zakura-core/zakura/pull/1326)).
 - Update the embedded zcashd-compat binary and default split-container image to
-  valargroup/zcashd v1.2.0, which supports NU7. Older sidecars stop following
-  the chain when NU7 activates
-  ([#1327](https://github.com/zakura-core/zakura/pull/1327)).
+  valargroup/zcashd v1.3.0, which supports NU7 and schedules Mainnet NU7 at
+  height 3,543,405 to match Zakura. Older sidecars stop following the chain
+  when NU7 activates
+  ([#1327](https://github.com/zakura-core/zakura/pull/1327),
+  [#1596](https://github.com/zakura-core/zakura/pull/1596),
+  [#1600](https://github.com/zakura-core/zakura/pull/1600)).
 - Reduced mined-block propagation latency by letting legacy and dual-P2P peers
   pull an admitted block while contextual commit continues. Native P2P v2 still
   uses inventory and pull; Zakura does not push full blocks
@@ -210,11 +213,6 @@ independently.
   handle the new enum variants. Bumped `zakura-node-services` to 5.0.0,
   `zakura-network` to 10.0.0, and `zakura-state` to 11.0.0, with dependent
   crate updates to keep the published dependency graph consistent.
-- Set this release's Mainnet end of support to height 3,541,074, with the
-  first unsupported block estimated at November 5, 2026 UTC. Warnings begin
-  three days before the halt
-  ([#1460](https://github.com/zakura-core/zakura/pull/1460)).
-
 - Replaced the Iroh library under the native Zakura P2P stack with the
   Zakura-owned `zakura-quic` transport, built on upstream `quinn-proto`. Node
   IDs, key files and bootstrap entries stay the same. The native protocol
@@ -362,9 +360,6 @@ independently.
   Mainnet third halving to height 6,132,390, and the existing NSM calculation
   schedules reissuance at height 8,939,664
   ([#1588](https://github.com/zakura-core/zakura/pull/1588)).
-- Updated the managed zcashd sidecar to v1.3.0-rc1, which schedules Mainnet
-  NU7 at height 3,543,405 to match Zakura
-  ([#1596](https://github.com/zakura-core/zakura/pull/1596)).
 - Extended this release's Mainnet end of support to height 3,640,098, with the
   first unsupported block estimated at December 5, 2026 UTC, superseding the
   November 5 end of support set in the release candidates
@@ -373,9 +368,6 @@ independently.
   support now extends past the Mainnet NU7 activation at height 3,543,405,
   which this release follows. Warnings still begin three days before the halt
   ([#1599](https://github.com/zakura-core/zakura/pull/1599)).
-- Updated the managed zcashd sidecar to the stable v1.3.0 release, which
-  schedules Mainnet NU7 at height 3,543,405 to match Zakura
-  ([#1600](https://github.com/zakura-core/zakura/pull/1600)).
 
 ### Deprecated
 

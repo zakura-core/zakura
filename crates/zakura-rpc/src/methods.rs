@@ -143,6 +143,14 @@ use types::{
     z_validate_address::ZValidateAddressResponse,
 };
 
+/// Value pool balances returned by the blockchain RPCs.
+#[cfg(not(zcash_unstable = "nutachyon"))]
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
+
+/// Value pool balances returned by the blockchain RPCs.
+#[cfg(zcash_unstable = "nutachyon")]
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 7];
+
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
 async fn call_service<S, Request>(service: S, request: Request) -> Result<S::Response>
@@ -4701,9 +4709,6 @@ pub struct EndOfService {
     estimated_time: i64,
 }
 
-/// Type alias for the array of `GetBlockchainInfoBalance` objects
-pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
-
 fn deserialize_blockchain_value_pool_balances<'de, D>(
     deserializer: D,
 ) -> std::result::Result<BlockchainValuePoolBalances, D::Error>
@@ -4731,20 +4736,40 @@ fn blockchain_value_pool_balances_from_vec<E>(
 where
     E: serde::de::Error,
 {
+    let missing_pool_delta = value_pools
+        .iter()
+        .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
+        .then(Amount::zero);
+
     match value_pools.len() {
         5 => {
-            let ironwood_delta = value_pools
-                .iter()
-                .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
-                .then(Amount::zero);
-
             value_pools.push(GetBlockchainInfoBalance::ironwood(
                 Amount::zero(),
-                ironwood_delta,
+                missing_pool_delta,
+            ));
+            #[cfg(zcash_unstable = "nutachyon")]
+            value_pools.push(GetBlockchainInfoBalance::tachyon(
+                Amount::zero(),
+                missing_pool_delta,
             ));
         }
-        6 => {}
-        len => return Err(E::invalid_length(len, &"five or six value pool balances")),
+        6 => {
+            #[cfg(zcash_unstable = "nutachyon")]
+            value_pools.push(GetBlockchainInfoBalance::tachyon(
+                Amount::zero(),
+                missing_pool_delta,
+            ));
+        }
+        #[cfg(zcash_unstable = "nutachyon")]
+        7 => {}
+        len => {
+            #[cfg(not(zcash_unstable = "nutachyon"))]
+            let expected = &"five or six value pool balances";
+            #[cfg(zcash_unstable = "nutachyon")]
+            let expected = &"five, six, or seven value pool balances";
+
+            return Err(E::invalid_length(len, expected));
+        }
     }
 
     value_pools

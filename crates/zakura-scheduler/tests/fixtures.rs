@@ -575,3 +575,47 @@ fn lock_cycle_is_deadlock_even_with_other_parked_tasks() {
     // `holder` is ready, but all three workers are held by parked tasks.
     assert_eq!(s.status(), Status::Deadlock);
 }
+
+#[test]
+fn repeated_join_polls_register_one_waker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    struct Counter(Arc<AtomicUsize>);
+    impl std::task::Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let target = s.spawn_root("target", async { sleep(10).await });
+    let w = wakes.clone();
+    let joiner = s.spawn_root(
+        "joiner",
+        poll_fn(move |_| {
+            // The same waker polls the handle many times, as a select loop would.
+            let waker = Waker::from(Arc::new(Counter(w.clone())));
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut handle = target;
+            for _ in 0..100 {
+                assert!(
+                    std::future::Future::poll(std::pin::Pin::new(&mut handle), &mut cx)
+                        .is_pending()
+                );
+            }
+            Poll::Ready(())
+        }),
+    );
+    s.run(joiner.task());
+    while s.status() == Status::Running || s.status() == Status::WaitingOnTime {
+        if s.status() == Status::WaitingOnTime {
+            let d = s.next_deadline().expect("a timer is pending");
+            s.advance_to(d);
+        } else {
+            let t = s.ready()[0].task;
+            s.run(t);
+        }
+    }
+    assert_eq!(s.status(), Status::Quiescent);
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+}

@@ -210,13 +210,23 @@ impl Future for JoinHandle {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TaskExit> {
         // Clone outside the borrow, since cloning a waker can run arbitrary code.
         let waker = cx.waker().clone();
-        with_run(|s| match s.done.get(&self.task) {
-            Some(exit) => Poll::Ready(*exit),
+        let (poll, unused) = with_run(|s| match s.done.get(&self.task) {
+            Some(exit) => (Poll::Ready(*exit), Some(waker)),
             None => {
-                s.join_wakers.entry(self.task).or_default().push(waker);
-                Poll::Pending
+                // A repeat poll from the same waiter, as in a `select!` loop,
+                // must not grow the list.
+                let wakers = s.join_wakers.entry(self.task).or_default();
+                if wakers.iter().any(|w| w.will_wake(&waker)) {
+                    (Poll::Pending, Some(waker))
+                } else {
+                    wakers.push(waker);
+                    (Poll::Pending, None)
+                }
             }
         })
-        .expect("a JoinHandle is only polled inside the run that spawned it")
+        .expect("a JoinHandle is only polled inside the run that spawned it");
+        // Drop outside the borrow too, for the same reason.
+        drop(unused);
+        poll
     }
 }

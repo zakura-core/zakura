@@ -10,9 +10,6 @@ use zakura_chain::{
 
 use crate::constants;
 
-#[cfg(test)]
-use crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION;
-
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -166,6 +163,7 @@ impl Default for Nonce {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION;
 
     #[test]
     fn version_extremes_mainnet() {

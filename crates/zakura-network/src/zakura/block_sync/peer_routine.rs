@@ -22,7 +22,12 @@
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
 use zakura_rt::{
-    sync::{futures::Notified, mpsc, watch, CancellationToken},
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        futures::Notified,
+        mpsc, watch, CancellationToken, Mutex,
+    },
     time,
 };
 
@@ -218,12 +223,7 @@ fn transactions_match_header(block: &block::Block) -> bool {
         .map(|transaction| transaction.hash())
         .collect();
     let root: block::merkle::Root = hashes.iter().copied().collect();
-    root == block.header.merkle_root
-        && hashes
-            .iter()
-            .collect::<zakura_rt::collections::HashSet<_>>()
-            .len()
-            == hashes.len()
+    root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
 
 fn header_hash_payload_mismatch(
@@ -351,10 +351,10 @@ pub(super) struct PeerRoutine {
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
-    received_throughput: Arc<zakura_rt::sync::Mutex<ThroughputMeter>>,
+    received_throughput: Arc<Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
-    sequencer_input_bytes: Arc<zakura_rt::sync::atomic::AtomicU64>,
-    sequencer_input_decoded_attributed_memory_bytes: Arc<zakura_rt::sync::atomic::AtomicU64>,
+    sequencer_input_bytes: Arc<AtomicU64>,
+    sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -397,10 +397,10 @@ impl PeerRoutine {
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
-        received_throughput: Arc<zakura_rt::sync::Mutex<ThroughputMeter>>,
+        received_throughput: Arc<Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
-        sequencer_input_bytes: Arc<zakura_rt::sync::atomic::AtomicU64>,
-        sequencer_input_decoded_attributed_memory_bytes: Arc<zakura_rt::sync::atomic::AtomicU64>,
+        sequencer_input_bytes: Arc<AtomicU64>,
+        sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
@@ -1473,13 +1473,11 @@ impl PeerRoutine {
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,
             applying_buffered_blocks: view.applying_len,
-            sequencer_input_queued_bytes: self
-                .sequencer_input_bytes
-                .load(zakura_rt::sync::atomic::Ordering::Relaxed),
+            sequencer_input_queued_bytes: self.sequencer_input_bytes.load(Ordering::Relaxed),
             in_flight_submission_bytes: view.in_flight_submission_bytes,
             decoded_resident_bytes: self
                 .sequencer_input_decoded_attributed_memory_bytes
-                .load(zakura_rt::sync::atomic::Ordering::Relaxed)
+                .load(Ordering::Relaxed)
                 .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                 .saturating_add(view.applying_decoded_attributed_memory_bytes),
             reserved_above_floor_bytes,

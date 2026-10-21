@@ -29,7 +29,10 @@ use std::{
 use zakura_chain::block;
 use zakura_rt::{
     collections::HashMap,
-    sync::{Mutex as StdMutex, Notify},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex as StdMutex, MutexGuard, Notify,
+    },
 };
 
 use super::{
@@ -241,7 +244,7 @@ pub(super) struct PeerRegistry {
     body_retry_avoid: StdMutex<SupplierRetryState>,
     body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
     /// Source of monotonically-increasing routine generations.
-    next_generation: zakura_rt::sync::atomic::AtomicU64,
+    next_generation: AtomicU64,
 }
 
 impl Default for PeerRegistry {
@@ -258,7 +261,7 @@ impl PeerRegistry {
             session_parks: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(SupplierRetryState::default()),
             body_retry_all: StdMutex::new(HashMap::new()),
-            next_generation: zakura_rt::sync::atomic::AtomicU64::new(1),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -495,29 +498,25 @@ impl PeerRegistry {
         all_deadline.into_iter().chain(source_deadline).min()
     }
 
-    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<ZakuraPeerId, Entry>> {
         self.peers
             .lock()
             .expect("peer registry mutex is never poisoned")
     }
 
-    fn body_retry_lock(&self) -> zakura_rt::sync::MutexGuard<'_, SupplierRetryState> {
+    fn body_retry_lock(&self) -> MutexGuard<'_, SupplierRetryState> {
         self.body_retry_avoid
             .lock()
             .expect("body retry registry mutex is never poisoned")
     }
 
-    fn body_retry_all_lock(
-        &self,
-    ) -> zakura_rt::sync::MutexGuard<'_, HashMap<BodyRetryKey, Instant>> {
+    fn body_retry_all_lock(&self) -> MutexGuard<'_, HashMap<BodyRetryKey, Instant>> {
         self.body_retry_all
             .lock()
             .expect("global body retry registry mutex is never poisoned")
     }
 
-    fn lock_session_parks(
-        &self,
-    ) -> zakura_rt::sync::MutexGuard<'_, HashMap<ZakuraPeerId, SessionPark>> {
+    fn lock_session_parks(&self) -> MutexGuard<'_, HashMap<ZakuraPeerId, SessionPark>> {
         self.session_parks
             .lock()
             .expect("peer registry session-park mutex is never poisoned")
@@ -673,11 +672,9 @@ impl PeerRegistry {
         }
         let generation = self
             .next_generation
-            .try_update(
-                zakura_rt::sync::atomic::Ordering::Relaxed,
-                zakura_rt::sync::atomic::Ordering::Relaxed,
-                |generation| generation.checked_add(1),
-            )
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
             .unwrap_or_else(|_| panic!("block-sync routine generation counter is exhausted"));
 
         // Every entry field describes the session, so a replacement starts from

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
-use zakura_rt::sync::CancellationToken;
+use zakura_rt::sync::{mpsc, CancellationToken};
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -412,7 +412,7 @@ impl ZakuraHandshakeConnector {
         &self,
         peer_id: ZakuraPeerId,
         book_addr: PeerSocketAddr,
-        address_book_updater: zakura_rt::sync::mpsc::Sender<MetaAddrChange>,
+        address_book_updater: mpsc::Sender<MetaAddrChange>,
     ) {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return;
@@ -501,7 +501,7 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
 /// ownership ends or when the address book updater closes.
 async fn run_legacy_liveness_keeper(
     book_addr: PeerSocketAddr,
-    address_book_updater: zakura_rt::sync::mpsc::Sender<MetaAddrChange>,
+    address_book_updater: mpsc::Sender<MetaAddrChange>,
     dial_lifetime: CancellationToken,
     refresh_interval: Duration,
 ) {

@@ -57,12 +57,15 @@ use std::{
     hash::Hash,
     sync::{Arc, OnceLock},
 };
-use zakura_rt::{
-    collections::HashMap,
-    sync::{Mutex, PoisonError},
-};
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        CancellationToken, Mutex, MutexGuard, PoisonError,
+    },
+};
 
 use super::{
     serve::{ending_reserve, ResponseCap},
@@ -680,7 +683,7 @@ impl<K: Eq + Hash> SharedReservations<K> {
     }
 
     /// Lock the reservations. No holder panics, so the lock is never poisoned.
-    pub(crate) fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, Reservations<K>> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Reservations<K>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -742,25 +745,19 @@ pub(crate) struct PrecheckSlot(Arc<PrecheckSetup>);
 #[derive(Debug, Default)]
 struct PrecheckSetup {
     choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
-    gated: zakura_rt::sync::atomic::AtomicBool,
-    ready: zakura_rt::sync::CancellationToken,
+    gated: AtomicBool,
+    ready: CancellationToken,
 }
 
 impl PrecheckSlot {
     /// Pause ingress before spawning the transport reader.
     pub(crate) fn pause(&self) {
-        self.0
-            .gated
-            .store(true, zakura_rt::sync::atomic::Ordering::Release);
+        self.0.gated.store(true, Ordering::Release);
     }
 
     /// Wait for the service to choose its header check.
     pub(crate) async fn ready(&self) {
-        if self
-            .0
-            .gated
-            .load(zakura_rt::sync::atomic::Ordering::Acquire)
-        {
+        if self.0.gated.load(Ordering::Acquire) {
             self.0.ready.cancelled().await;
         }
     }

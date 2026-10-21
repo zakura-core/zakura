@@ -14,7 +14,8 @@ use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    task::JoinSet,
+    sync::{oneshot, watch},
+    task::{JoinHandle, JoinSet},
     time::Instant,
 };
 
@@ -86,7 +87,7 @@ pub(crate) fn spawn_native_discovery_dialer(
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
-) -> zakura_rt::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     spawn_erased(run_native_discovery_dialer(
         endpoint,
         discovery,
@@ -450,7 +451,7 @@ async fn run_discovery_dial_once(
         };
     }
 
-    let (admitted_ip_tx, mut admitted_ip_rx) = zakura_rt::sync::oneshot::channel();
+    let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
     let dial = spawn_erased({
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
@@ -515,11 +516,9 @@ async fn run_discovery_dial_once(
 }
 
 async fn wait_for_discovery_registration_to_settle(
-    registered: &mut zakura_rt::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
-    dial: &mut std::pin::Pin<
-        &mut zakura_rt::task::JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
-    >,
+    dial: &mut std::pin::Pin<&mut JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>>,
 ) -> DiscoveryDialResult {
     let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
     zakura_rt::pin!(healthy);

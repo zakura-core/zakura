@@ -43,7 +43,10 @@ use zakura_node_services::header_chain::{
     RetainedHeaderPathPage, SelectedChainMembership, ServingCapacitySignal,
 };
 use zakura_node_services::task::spawn_erased;
-use zakura_rt::sync::{mpsc, watch, CancellationToken, Mutex, Notify, PoisonError};
+use zakura_rt::{
+    sync::{mpsc, watch, CancellationToken, Mutex, MutexGuard, Notify, PoisonError},
+    task::JoinHandle,
+};
 
 use super::{
     entry_bytes, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation,
@@ -213,7 +216,7 @@ impl Publisher {
         owner: LeaseOwner,
         limits: PageLimits,
         cancel: CancellationToken,
-    ) -> (Self, zakura_rt::task::JoinHandle<()>) {
+    ) -> (Self, JoinHandle<()>) {
         let limits_row = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
             .expect("SUBSCRIBE_HEADERS is a subscription row");
         let shared = Arc::new(Mutex::new(Shared {
@@ -687,7 +690,7 @@ fn page_bytes(count: u32, schema: AuxSchema, header_bytes: usize) -> usize {
 
 /// Lock `shared`, recovering from a poisoned lock: every update leaves the
 /// state consistent before it can panic.
-fn lock(shared: &Mutex<Shared>) -> zakura_rt::sync::MutexGuard<'_, Shared> {
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

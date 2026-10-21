@@ -25,7 +25,7 @@
 
 use zakura_rt::{
     collections::HashMap,
-    sync::{watch, CancellationToken, Mutex, PoisonError},
+    sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
 };
 
 use super::WriterFence;
@@ -86,7 +86,7 @@ impl<S: Clone> SessionTable<S> {
         self.changed.subscribe()
     }
 
-    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Current<S>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<ZakuraPeerId, Current<S>>> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

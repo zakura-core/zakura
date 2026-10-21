@@ -34,10 +34,10 @@ use zakura_rt::{
     stream::StreamMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        broadcast, mpsc, oneshot, watch, AsyncMutex, CancellationToken, Mutex as StdMutex,
-        OwnedSemaphorePermit, Semaphore,
+        broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
+        MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
     },
-    task::{AbortHandle, JoinHandle, JoinSet},
+    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet},
     time::{timeout, Instant},
 };
 
@@ -846,7 +846,7 @@ impl ZakuraEndpoint {
     /// recovery path for short Zakura disconnects; the address-book liveness
     /// keeper prevents the slower legacy crawler from churning while this dial
     /// owns the peer.
-    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> zakura_rt::task::JoinHandle<()> {
+    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
         let policy = RedialPolicy::maintain(
@@ -1065,10 +1065,8 @@ struct IpSlotCounts {
 }
 
 impl IpSlots {
-    fn counts(&self) -> zakura_rt::sync::MutexGuard<'_, IpSlotCounts> {
-        self.0
-            .lock()
-            .unwrap_or_else(zakura_rt::sync::PoisonError::into_inner)
+    fn counts(&self) -> MutexGuard<'_, IpSlotCounts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Registered connections from `ip`.
@@ -4725,7 +4723,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     failure_cause: Option<OrderedStreamFailureCause>,
-    application_drain: Option<Arc<zakura_rt::sync::Barrier>>,
+    application_drain: Option<Arc<Barrier>>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4737,7 +4735,7 @@ async fn persistent_stream_worker_with_policy(
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
-    let reader = zakura_rt::task::AbortOnDropHandle::new(spawn_erased(async move {
+    let reader = AbortOnDropHandle::new(spawn_erased(async move {
         // Session teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
@@ -6197,7 +6195,7 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// A worker holds this briefly (no `.await` while locked) to spend one token
 /// per decoded frame, so N concurrent same-kind streams draw from a single
 /// per-connection budget instead of N independent ones (FLUP-014).
-type SharedMessageBucket<C = RealClock> = Arc<zakura_rt::sync::Mutex<TokenBucket<C>>>;
+type SharedMessageBucket<C = RealClock> = Arc<StdMutex<TokenBucket<C>>>;
 
 /// Per-connection message-rate state, shared across that connection's workers.
 ///
@@ -6214,9 +6212,7 @@ impl<C: Clock + Default> MessageRateBuckets<C> {
     fn new() -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(zakura_rt::sync::Mutex::new(CadenceBuckets::new(
-                C::default(),
-            ))),
+            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
         }
     }
 }
@@ -6230,7 +6226,7 @@ impl<C: Clock> MessageRateBuckets<C> {
 }
 
 /// One connection's cadence buckets, shared by its readers.
-type SharedCadenceBuckets<C = RealClock> = Arc<zakura_rt::sync::Mutex<CadenceBuckets<C>>>;
+type SharedCadenceBuckets<C = RealClock> = Arc<StdMutex<CadenceBuckets<C>>>;
 
 /// A tabled stream's view of its connection's cadence buckets.
 #[derive(Clone, Debug)]
@@ -6268,7 +6264,7 @@ fn message_bucket_for<C: Clock>(
         .streams
         .entry(stream_kind)
         .or_insert_with(|| {
-            Arc::new(zakura_rt::sync::Mutex::new(TokenBucket::with_clock(
+            Arc::new(StdMutex::new(TokenBucket::with_clock(
                 message_rate_per_second,
                 clock,
             )))

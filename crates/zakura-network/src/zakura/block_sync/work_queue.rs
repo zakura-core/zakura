@@ -24,9 +24,12 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use zakura_chain::block;
-use zakura_rt::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex as StdMutex, Notify,
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex as StdMutex, MutexGuard, Notify,
+    },
 };
 
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
@@ -104,10 +107,7 @@ struct WorkQueueInner {
     in_flight_reserved: ReservedTally,
     /// Weak owners allow reset notification without retaining session resources.
     /// Their status survives until writing or terminal cleanup finishes.
-    request_writes: zakura_rt::collections::HashMap<
-        zakura_header_chain::BodyWorkOwner,
-        RequestWriteRegistration,
-    >,
+    request_writes: HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
 }
 
 /// A running count and byte sum of nonzero reservations.
@@ -195,7 +195,7 @@ impl WorkQueue {
                 floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
                 reserved_bytes: 0,
                 in_flight_reserved: ReservedTally::default(),
-                request_writes: zakura_rt::collections::HashMap::new(),
+                request_writes: HashMap::new(),
             }),
             available: Notify::new(),
             revocations: AtomicU64::new(0),
@@ -232,7 +232,7 @@ impl WorkQueue {
         inner.floor_estimate_bytes = floor.max(1);
     }
 
-    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, WorkQueueInner> {
+    fn lock(&self) -> MutexGuard<'_, WorkQueueInner> {
         self.inner
             .lock()
             .expect("work queue mutex is never poisoned")

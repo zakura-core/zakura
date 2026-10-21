@@ -3,7 +3,7 @@
 use std::{fmt, sync::Arc};
 
 use thiserror::Error;
-use zakura_rt::sync::{mpsc, Mutex, PoisonError};
+use zakura_rt::sync::{mpsc, Mutex, MutexGuard, PoisonError};
 
 use super::{Commitment, ResponseGrants};
 use crate::zakura::{
@@ -272,7 +272,7 @@ where
         }
     }
 
-    fn core(&self) -> zakura_rt::sync::MutexGuard<'_, SinkCore> {
+    fn core(&self) -> MutexGuard<'_, SinkCore> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

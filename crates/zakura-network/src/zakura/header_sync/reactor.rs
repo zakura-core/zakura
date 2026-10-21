@@ -9,7 +9,7 @@ use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Semaphore},
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -258,7 +258,7 @@ fn build_header_sync_reactor(
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
         pending_locator_queries: HashSet::new(),
-        locator_capacity: std::sync::Arc::new(zakura_rt::sync::Semaphore::new(
+        locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
@@ -372,7 +372,7 @@ struct HeaderSyncReactor {
     /// Peers with one direct continuation-locator read currently in flight.
     pending_locator_queries: HashSet<ZakuraPeerId>,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
-    locator_capacity: std::sync::Arc<zakura_rt::sync::Semaphore>,
+    locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
     scheduling_revision: u64,
     last_scheduling_opportunity: Option<SchedulingOpportunity>,

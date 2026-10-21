@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use zakura_rt::sync::{CancellationToken, Mutex, PoisonError};
+use zakura_rt::sync::{CancellationToken, Mutex, MutexGuard, PoisonError};
 
 use crate::zakura::{
     transport::{FrameWriteClaim, GuardedFrameSlot},
@@ -117,7 +117,7 @@ impl WriterFence {
         }))
     }
 
-    fn lock(&self) -> zakura_rt::sync::MutexGuard<'_, FenceState> {
+    fn lock(&self) -> MutexGuard<'_, FenceState> {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -155,12 +155,7 @@ impl WriterFence {
 
 impl ExchangeState {
     /// Lock the fence, then the phase.
-    fn lock(
-        &self,
-    ) -> (
-        zakura_rt::sync::MutexGuard<'_, FenceState>,
-        zakura_rt::sync::MutexGuard<'_, Phase>,
-    ) {
+    fn lock(&self) -> (MutexGuard<'_, FenceState>, MutexGuard<'_, Phase>) {
         let state = self.fence.lock();
         let phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         (state, phase)

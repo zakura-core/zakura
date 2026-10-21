@@ -3,7 +3,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
-use zakura_rt::time::Instant;
+use zakura_rt::{sync::watch, time::Instant};
 
 use crate::zakura::{
     ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
@@ -178,7 +178,7 @@ pub(crate) async fn native_dial_supervised(
 /// unit-testable without real network I/O.
 async fn run_dial_supervisor<F>(
     peer_id: ZakuraPeerId,
-    mut registered: zakura_rt::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    mut registered: watch::Receiver<Vec<ZakuraPeerId>>,
     policy: RedialPolicy,
     mut dial: F,
 ) where
@@ -305,7 +305,7 @@ async fn run_dial_supervisor<F>(
 /// connection. Ignores unrelated peer-set changes. Returns `false` when the
 /// registration watch closes (node shutdown).
 async fn sleep_unless_registered(
-    registered: &mut zakura_rt::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
     wait: Duration,
 ) -> bool {
@@ -331,7 +331,7 @@ async fn sleep_unless_registered(
 /// Returns how long the peer remained registered after this observer first saw
 /// it, or `None` when the sender closes while the peer remains registered.
 async fn wait_for_peer_deregistration(
-    registered: &mut zakura_rt::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
 ) -> Option<Duration> {
     let registered_at = Instant::now();

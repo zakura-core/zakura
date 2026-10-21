@@ -1,3 +1,5 @@
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
+
 use super::{
     config::*, events::*, peer_registry::SessionAdmission, regulated::status_sender::StatusSend,
     wire::*, *,
@@ -9,7 +11,6 @@ use crate::zakura::{
     ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::time::Instant;
-use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///

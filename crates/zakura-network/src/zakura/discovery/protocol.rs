@@ -19,7 +19,10 @@ use zakura_chain::{
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 use zakura_rt::{
-    collections::{hash_map::RandomState, HashMap, HashSet},
+    collections::{
+        hash_map::{self, RandomState},
+        HashMap, HashSet,
+    },
     sync::{watch, AsyncMutex},
 };
 
@@ -3048,9 +3051,7 @@ impl ZakuraDiscoveryBook {
         let Some(relay) = relay else {
             return;
         };
-        if let zakura_rt::collections::hash_map::Entry::Occupied(mut count) =
-            self.relayed.entry(relay)
-        {
+        if let hash_map::Entry::Occupied(mut count) = self.relayed.entry(relay) {
             *count.get_mut() -= 1;
             if *count.get() == 0 {
                 count.remove();

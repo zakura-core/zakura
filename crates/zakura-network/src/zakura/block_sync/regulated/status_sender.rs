@@ -1,5 +1,7 @@
 //! Status cadence and the latest received advertisement live with the connection.
 
+use zakura_rt::sync::{Mutex, PoisonError};
+
 use super::wire::Message;
 use crate::zakura::{
     block_sync::{BlockSyncStatus, MSG_BS_STATUS},
@@ -7,7 +9,6 @@ use crate::zakura::{
     FramedSend, OrderedSendError,
 };
 use std::time::{Duration, Instant};
-use zakura_rt::sync::{Mutex, PoisonError};
 
 /// What one attempt did with the latest local Status.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

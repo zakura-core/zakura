@@ -4,6 +4,7 @@ use std::{
     num::NonZeroU64,
     sync::{Arc, Weak},
 };
+
 use zakura_rt::sync::{Mutex, PoisonError};
 
 /// A caller key and a unique admission on this completion queue.

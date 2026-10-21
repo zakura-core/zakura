@@ -548,9 +548,14 @@ fn fold_current_roots(
                 sapling_root: &roots.sapling_root,
                 orchard_root: &roots.orchard_root,
                 ironwood_root: &roots.ironwood_root,
+                // The verification above rejects NuTachyon: this wire format has no Tachyon roots.
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor: &Default::default(),
                 sapling_tx: roots.sapling_tx,
                 orchard_tx: roots.orchard_tx,
                 ironwood_tx: roots.ironwood_tx,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_tx: 0,
             },
         )
         .ok()?;

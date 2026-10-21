@@ -96,7 +96,7 @@ use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::spawn_erased;
 use zakura_rpc::SubmitBlockChannel;
-use zakura_state::StorageMode;
+use zakura_state::{DatabaseWriterMetadata, StorageMode};
 
 use zakura::{
     drive_block_sync_actions, query_block_sync_frontiers, zakura_header_sync_driver_startup,
@@ -104,7 +104,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, last_known_release_tag, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -440,18 +440,25 @@ impl StartCmd {
 
         let state_config = config.mirrored_state_config();
 
+        let database_writer_metadata = DatabaseWriterMetadata::new(
+            "Zakura",
+            build_version().to_string(),
+            last_known_release_tag(),
+        );
+
         let (
             mut state_service,
             read_only_state_service,
             latest_chain_tip,
             chain_tip_change,
             header_chain_body_evidence,
-        ) = zakura_state::init_with_header_chain_body_evidence(
+        ) = zakura_state::init_with_database_writer_metadata(
             state_config,
             &config.network.network,
             max_checkpoint_height,
             config.sync.checkpoint_verify_concurrency_limit
                 * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+            database_writer_metadata,
         )
         .boxed()
         .await

@@ -54,6 +54,9 @@ use crate::tests::test_rpc::{TestChainTip, TestRpcImpl};
 use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
+#[cfg(zcash_unstable = "nutachyon")]
+mod tachyon_sync;
+
 fn mock_rpc<Mempool, State, ReadState>(
     network: Network,
     mempool: Mempool,

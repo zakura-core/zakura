@@ -309,6 +309,14 @@ fn peer_action(error: &TransactionError) -> PeerAction {
     use TransactionError::*;
 
     match error {
+        #[cfg(zcash_unstable = "nutachyon")]
+        TachyonIdentityAction(_) => Ban,
+        #[cfg(zcash_unstable = "nutachyon")]
+        TachyonSignatureInvalid(_) => BanV5AndLater,
+        // Aggregate and adjunct bundles can be valid in blocks but not admitted alone.
+        #[cfg(zcash_unstable = "nutachyon")]
+        NonAutonomeTachyon => Ignore,
+
         // The transaction's structure, encodings, Sprout proofs, proof sizes,
         // and value balance. An outpoint fixes the value of the output it
         // spends, so the fee does not depend on the tip either.

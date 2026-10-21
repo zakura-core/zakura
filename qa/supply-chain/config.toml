@@ -31,16 +31,40 @@ url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audi
 [policy.zakura]
 audit-as-crates-io = false
 
+[policy.zakura-address]
+audit-as-crates-io = false
+
+[policy.zakura-bellman]
+audit-as-crates-io = false
+
+[policy.zakura-bls12-381]
+audit-as-crates-io = false
+
 [policy.zakura-chain]
 audit-as-crates-io = false
 
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
+[policy.zakura-equihash]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-gadgets]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-poseidon]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-proofs]
+audit-as-crates-io = false
+
 [policy.zakura-header-chain]
 audit-as-crates-io = false
 
 [policy.zakura-jsonl-trace]
+audit-as-crates-io = false
+
+[policy.zakura-jubjub]
 audit-as-crates-io = false
 
 [policy.zakura-mmr-tree]
@@ -52,13 +76,46 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
+[policy.zakura-note-encryption]
+audit-as-crates-io = false
+
+[policy.zakura-orchard]
+audit-as-crates-io = false
+
+[policy.zakura-orchard-legacy]
+audit-as-crates-io = false
+
+[policy.zakura-pairing]
+audit-as-crates-io = false
+
+[policy.zakura-pasta-curves]
+audit-as-crates-io = false
+
+[policy.zakura-primitives]
+audit-as-crates-io = false
+
+[policy.zakura-protocol]
+audit-as-crates-io = false
+
 [policy.zakura-quic]
+audit-as-crates-io = false
+
+[policy.zakura-reddsa]
+audit-as-crates-io = false
+
+[policy.zakura-redjubjub]
 audit-as-crates-io = false
 
 [policy.zakura-rpc]
 audit-as-crates-io = false
 
+[policy.zakura-sapling-crypto]
+audit-as-crates-io = false
+
 [policy.zakura-script]
+audit-as-crates-io = false
+
+[policy.zakura-sinsemilla]
 audit-as-crates-io = false
 
 [policy.zakura-state]
@@ -67,7 +124,13 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
+[policy.zakura-transparent]
+audit-as-crates-io = false
+
 [policy.zakura-utils]
+audit-as-crates-io = false
+
+[policy.zcash_script]
 audit-as-crates-io = false
 
 [[exemptions.addchain]]
@@ -132,6 +195,11 @@ notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pen
 [[exemptions.console]]
 version = "0.15.11"
 criteria = "safe-to-deploy"
+
+[[exemptions.const-oid]]
+version = "0.10.2"
+criteria = "safe-to-deploy"
+notes = "Experimental WOTS digest dependency; exact-version audit backlog entry, not an audit certification."
 
 [[exemptions.criterion]]
 version = "0.8.2"

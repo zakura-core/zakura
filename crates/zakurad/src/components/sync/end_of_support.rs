@@ -229,15 +229,18 @@ mod tests {
     #[test]
     fn mainnet_end_of_support_is_capped_at_the_release_deadline() {
         let _init_guard = zakura_test::init();
-        let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         assert_eq!(
             end_of_support_height(&Network::Mainnet),
             Some(MAINNET_EOS_HEIGHT),
         );
+        // 27 days of estimated blocks cross the ZIP 259 NU7 activation:
+        // 22,676 blocks at 75 seconds reach the block before activation
+        // (3,543,404) in 1,700,700 seconds, and the remaining 632,100
+        // seconds add 25,284 blocks at 25 seconds.
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
-            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * post_blossom_blocks_per_day),
+            Height(3_568_688),
         );
     }
 

@@ -295,9 +295,15 @@ mod tests {
 
     #[test]
     fn nu7_fpf_rotation_boundaries() {
-        // Mainnet periods contain 35,000 blocks and align with the first halving.
-        // 3,146,400 starts H3; 3,566,400 starts its thirteenth period.
-        for (activation, first_new) in [(3_566_400, 12), (3_566_401, 13), (3_601_399, 13)] {
+        // Pre-NU7 Mainnet periods contain 35,000 blocks and align with the first
+        // halving: 3,146,400 starts H3, and 3,531,400 starts its twelfth period.
+        // The ZIP 259 activation height lands mid-period, so its first new slot
+        // matches an activation just after that period boundary.
+        for (activation, first_new) in [
+            (3_531_400, 11),
+            (3_531_401, 12),
+            (activation_heights::mainnet::NU7.0, 12),
+        ] {
             let addresses = nu7_fpf_addresses(Some(Height(activation)));
             assert_eq!(
                 &addresses[..first_new],
@@ -309,28 +315,34 @@ mod tests {
             let address: crate::transparent::Address = addresses[first_new].parse().unwrap();
             assert_eq!(address.to_string(), NU7_FPF_ADDRESS);
         }
+
+        // The built-in funding streams pay the rotated addresses.
+        let grants_addresses: Vec<String> = FUNDING_STREAMS[2]
+            .recipient(FundingStreamReceiver::MajorGrants)
+            .expect("the stream pays grants")
+            .addresses()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            grants_addresses,
+            nu7_fpf_addresses(Some(activation_heights::mainnet::NU7)),
+        );
     }
 
     #[test]
-    fn test_only_november_mainnet_activation_rotates_to_zip_2008_recipient() {
-        // Test-only November 5 fixture; ZIP 259 has not assigned Mainnet NU7.
-        // TODO(zip-259): use the assigned height and recheck the first new slot.
-        const ACTIVATION: u32 = 3_543_000;
-        const ROTATION: u32 = 3_613_200;
-        const STREAM_END: u32 = 6_133_200;
+    fn zip_259_mainnet_activation_rotates_to_zip_2008_recipient() {
+        // The ZIP 259 Mainnet NU7 activation height, its first moved address
+        // rotation, and the moved end of the Revision 2 stream.
+        const ACTIVATION: u32 = 3_543_405;
+        const ROTATION: u32 = 3_612_390;
+        const STREAM_END: u32 = 6_132_390;
+        assert_eq!(Height(ACTIVATION), activation_heights::mainnet::NU7);
         let addresses = nu7_fpf_addresses(Some(Height(ACTIVATION)));
         let old = "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow";
         let new = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
 
-        let mut activation_heights: crate::parameters::testnet::ConfiguredActivationHeights =
-            Network::Mainnet.activation_list().into();
-        activation_heights.nu7 = Some(ACTIVATION);
-        let network = crate::parameters::testnet::Parameters::build()
-            .with_activation_heights(activation_heights)
-            .unwrap()
-            .clear_funding_streams()
-            .to_network()
-            .unwrap();
+        let network = Network::Mainnet;
         let start_period = funding_stream_address_period(Height(3_146_400), &network);
 
         assert!(addresses[..12].iter().all(|address| *address == old));
@@ -359,12 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn nu7_fpf_rotation_without_remaining_periods() {
-        for activation in [None, Some(Height(4_406_400)), Some(Height(4_406_401))] {
-            assert_eq!(
-                nu7_fpf_addresses(activation),
-                POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES
-            );
-        }
+    fn nu7_fpf_rotation_requires_an_activation_height() {
+        assert_eq!(
+            nu7_fpf_addresses(None),
+            POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES
+        );
     }
 }

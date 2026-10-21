@@ -17,6 +17,7 @@ use std::{
 use support::*;
 use zakura_rt::{
     sim,
+    sync::{Notify, Semaphore},
     task::{self, JoinSet},
     time::{self, Instant},
 };
@@ -24,6 +25,8 @@ use zakura_scheduler::{Scheduler, SchedulerConfig, SimInstant, Status};
 
 /// Seeds to try when a planted race must be found.
 const FIND: u64 = 2_000;
+/// Seeds that must all pass on correct code.
+const CLEAN: u64 = 2_000;
 
 #[test]
 fn scheduler_is_the_rt_executor_for_its_run() {
@@ -308,4 +311,82 @@ fn same_seed_replays_rt_programs() {
     for seed in 0..50 {
         assert_eq!(picks(seed), picks(seed), "seed {seed}");
     }
+}
+
+/// Discovery's `wait_complete` shape on `zakura-rt`'s `Notify`: check a flag,
+/// then create `notified()`. The fixed version creates and enables the
+/// future before checking.
+fn missed_notify(fixed: bool) -> impl Fn(&mut Scheduler) -> Check {
+    move |s| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let (f, n, t) = (flag.clone(), notify.clone(), timed_out.clone());
+        s.spawn_root("waiter", async move {
+            let wait = async {
+                if fixed {
+                    let mut notified = std::pin::pin!(n.notified());
+                    notified.as_mut().enable();
+                    if !f.load(Ordering::Relaxed) {
+                        notified.await;
+                    }
+                } else if !f.load(Ordering::Relaxed) {
+                    n.notified().await;
+                }
+            };
+            if time::timeout(Duration::from_secs(2), wait).await.is_err() {
+                t.store(true, Ordering::Relaxed);
+            }
+        });
+        s.spawn_root("marker", async move {
+            flag.store(true, Ordering::Relaxed);
+            notify.notify_waiters();
+        });
+        Box::new(move |_| {
+            timed_out
+                .load(Ordering::Relaxed)
+                .then(|| "timed out".to_owned())
+        })
+    }
+}
+
+#[test]
+fn rt_notify_finds_the_missed_wakeup() {
+    assert!(first_violation(2, FIND, missed_notify(false)).is_some());
+    assert_eq!(first_violation(2, CLEAN, missed_notify(true)), None);
+}
+
+/// `SessionReservation::drop`'s shape: one task holds a permit from each of
+/// two pools and drops them in turn. A second task takes from both and
+/// reports "full" if it gets only the first.
+fn back_to_back_release(s: &mut Scheduler) -> Check {
+    let a = Arc::new(Semaphore::new(1));
+    let b = Arc::new(Semaphore::new(1));
+    let partial = Arc::new(AtomicBool::new(false));
+    let (ha, hb) = (
+        Arc::clone(&a).try_acquire_owned().unwrap(),
+        Arc::clone(&b).try_acquire_owned().unwrap(),
+    );
+    s.spawn_root("holder", async move {
+        drop(ha);
+        drop(hb);
+    });
+    let p = partial.clone();
+    s.spawn_root("reserver", async move {
+        if let Ok(_first) = a.try_acquire() {
+            if b.try_acquire().is_err() {
+                p.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    Box::new(move |_| {
+        partial
+            .load(Ordering::Relaxed)
+            .then(|| "false full".to_owned())
+    })
+}
+
+#[test]
+fn release_points_split_back_to_back_drops() {
+    assert!(first_violation(2, FIND, back_to_back_release).is_some());
 }

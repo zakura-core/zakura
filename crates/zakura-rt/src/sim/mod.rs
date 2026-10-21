@@ -331,3 +331,13 @@ impl Point {
         }
     }
 }
+
+/// A preemption point for `op` at `site`, if this thread is in a run.
+///
+/// Wrappers call this before each operation on shared state. Outside a run
+/// it does nothing, so the wrapper behaves like the type it wraps.
+pub(crate) fn point(op: Op, site: &'static Location<'static>) {
+    if let Some(executor) = executor() {
+        executor.preempt(Point::at(op, site));
+    }
+}

@@ -5,6 +5,9 @@
 //! time to the next timer. Preemption points are only recorded, since tasks
 //! here aren't coroutines and can't stop inside a poll.
 
+// Each test binary uses a different part of this module.
+#![allow(dead_code)]
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},

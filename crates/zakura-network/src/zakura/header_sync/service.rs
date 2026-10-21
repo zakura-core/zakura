@@ -3,9 +3,10 @@ use std::sync::Arc;
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased;
 #[cfg(any(test, feature = "zakura-testkit"))]
+use zakura_rt::sync::mpsc;
 use zakura_rt::{
     collections::HashMap,
-    sync::{mpsc, watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
+    sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
     task::JoinHandle,
 };
 

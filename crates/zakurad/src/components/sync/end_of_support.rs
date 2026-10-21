@@ -14,9 +14,9 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected three days after the committed October 15, 2026 Mainnet
+/// Projected three days after the committed October 19, 2026 Mainnet
 /// release-state bundle at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_520_728;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -229,15 +229,18 @@ mod tests {
     #[test]
     fn mainnet_end_of_support_is_capped_at_the_release_deadline() {
         let _init_guard = zakura_test::init();
-        let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         assert_eq!(
             end_of_support_height(&Network::Mainnet),
             Some(MAINNET_EOS_HEIGHT),
         );
+        // 27 days of estimated blocks cross the ZIP 259 NU7 activation:
+        // 18,288 blocks at 75 seconds reach the block before activation
+        // (3,543,404) in 1,371,600 seconds, and the remaining 961,200
+        // seconds add 38,448 blocks at 25 seconds.
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
-            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * post_blossom_blocks_per_day),
+            Height(3_581_852),
         );
     }
 

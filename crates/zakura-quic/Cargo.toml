@@ -1,6 +1,6 @@
 [package]
 name = "zakura-quic"
-version = "0.1.0"
+version = "0.1.0-rc0"
 authors.workspace = true
 description = "Direct QUIC transport for Zakura's native P2P stack, built on quinn-proto. Internal crate, published to support cargo install zakura"
 license.workspace = true

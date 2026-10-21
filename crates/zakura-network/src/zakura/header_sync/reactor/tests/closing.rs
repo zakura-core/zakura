@@ -189,3 +189,103 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
     assert!(reactor.close_deadlines.contains_key(&peer));
     assert!(reactor.pending_closes.is_empty());
 }
+
+/// A full lifecycle queue still has room for every admitted session's teardown.
+#[tokio::test]
+async fn lifecycle_admission_reserves_disconnect_capacity() {
+    let (sender, mut receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
+    let (send, _outbound) = framed_channel(8);
+    let first =
+        PeerSession::from_parts_with_session_id(peer(), 7, send.clone(), CancellationToken::new());
+    let rejected =
+        PeerSession::from_parts_with_session_id(peer(), 8, send, CancellationToken::new());
+    let first_ack = sender.send(Event::PeerConnected(first.clone())).unwrap();
+    assert!(sender.send(Event::PeerConnected(rejected.clone())).is_err());
+    assert!(rejected.cancel_token().is_cancelled());
+    sender
+        .send(Event::PeerDisconnected {
+            peer: peer(),
+            session_id: 7,
+            reason: "test",
+        })
+        .unwrap();
+    let connected = receiver.recv().await.unwrap();
+    assert!(matches!(connected.event, Event::PeerConnected(_)));
+    connected.applied.send(()).unwrap();
+    first_ack.await.unwrap();
+    let disconnected = receiver.recv().await.unwrap();
+    assert!(matches!(
+        disconnected.event,
+        Event::PeerDisconnected { session_id: 7, .. }
+    ));
+    assert!(receiver.try_recv().is_err());
+}
+
+/// Actual service replacement and pre-acknowledgement cancellation reclaim lifecycle slots.
+#[tokio::test]
+async fn service_teardown_reclaims_lifecycle_capacity() {
+    use crate::zakura::header_sync::service::HeaderSyncService;
+    use crate::zakura::{
+        transport::ServiceStream, CloseCause, Peer, Service, ServicePeerDirection,
+    };
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup(CancellationToken::new())).unwrap();
+    let service = HeaderSyncService::new(handle.clone());
+    let add = |generation: u64| {
+        let (incoming, recv) = framed_channel(8);
+        let (send, outgoing) = framed_channel(8);
+        let cancel = CancellationToken::new();
+        service.add_peer(Peer::new_with_service_streams(
+            generation,
+            peer(),
+            None,
+            crate::zakura::ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+            [(
+                crate::zakura::header_sync::ZAKURA_STREAM_HEADER_SYNC,
+                ServiceStream::new(generation, 9, recv, send, cancel.clone()),
+            )]
+            .into(),
+            CancellationToken::new(),
+            CloseCause::new(),
+        ));
+        (incoming, outgoing, cancel)
+    };
+    // Replacing a session before its admission is acknowledged must still run its teardown.
+    let first = add(7);
+    let second = add(8);
+    assert!(first.2.is_cancelled());
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    while let Ok(event) = reactor.lifecycle.try_recv() {
+        reactor.handle_lifecycle(event);
+    }
+    assert_eq!(reactor.peer_state[&peer()].session.session_id(), 8);
+    assert!(!second.2.is_cancelled());
+    service.remove_peer(&peer(), 7);
+    assert!(!second.2.is_cancelled());
+    service.remove_peer(&peer(), 8);
+    service.remove_peer(&peer(), 8);
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    while let Ok(event) = reactor.lifecycle.try_recv() {
+        reactor.handle_lifecycle(event);
+    }
+    assert!(!reactor.peer_state.contains_key(&peer()));
+    // Repeating beyond the entire queue capacity catches leaked reservations.
+    for generation in 9..410 {
+        let session = add(generation);
+        session.2.cancel();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let mut connected = false;
+        while let Ok(event) = reactor.lifecycle.try_recv() {
+            connected |= matches!(event.event, Event::PeerConnected(_));
+            reactor.handle_lifecycle(event);
+        }
+        assert!(connected, "admission leaked at generation {generation}");
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-mmr-tree"
-version = "0.0.1"
+version = "0.1.0-rc2"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true

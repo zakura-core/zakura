@@ -1,6 +1,11 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{block, parameters::Network};
 
@@ -145,11 +150,75 @@ pub(crate) enum PortDispatch {
     External,
 }
 
+/// A bounded lifecycle queue whose admitted sessions retain their cleanup capacity.
+#[derive(Clone, Debug)]
+pub(super) struct LifecycleSender {
+    sender: mpsc::Sender<LifecycleEvent>,
+    disconnects: Arc<Mutex<HashMap<(ZakuraPeerId, u64), mpsc::OwnedPermit<LifecycleEvent>>>>,
+}
+
+/// One lifecycle transition and its completion notification.
+#[derive(Debug)]
+pub(super) struct LifecycleEvent {
+    pub event: Event,
+    pub applied: oneshot::Sender<()>,
+}
+
+impl LifecycleSender {
+    /// Allocate two slots per configured peer, shared by pending admission and teardown.
+    pub(super) fn channel(peers: usize) -> (Self, mpsc::Receiver<LifecycleEvent>) {
+        let (sender, receiver) = mpsc::channel(peers.max(1).saturating_mul(2));
+        (
+            Self {
+                sender,
+                disconnects: Arc::new(Mutex::new(HashMap::new())),
+            },
+            receiver,
+        )
+    }
+
+    /// Reserve cleanup before queueing a connection; duplicate/stale teardown is harmless.
+    pub(super) fn send(
+        &self,
+        event: Event,
+    ) -> Result<oneshot::Receiver<()>, mpsc::error::SendError<Event>> {
+        let (applied, completion) = oneshot::channel();
+        let mut disconnects = self
+            .disconnects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &event {
+            Event::PeerConnected(session) => {
+                let key = (session.peer_id().clone(), session.session_id());
+                let Ok(connect) = self.sender.clone().try_reserve_owned() else {
+                    session.cancel_token().cancel();
+                    return Err(mpsc::error::SendError(event));
+                };
+                let Ok(disconnect) = self.sender.clone().try_reserve_owned() else {
+                    session.cancel_token().cancel();
+                    return Err(mpsc::error::SendError(event));
+                };
+                disconnects.insert(key, disconnect);
+                connect.send(LifecycleEvent { event, applied });
+            }
+            Event::PeerDisconnected {
+                peer, session_id, ..
+            } => {
+                if let Some(disconnect) = disconnects.remove(&(peer.clone(), *session_id)) {
+                    disconnect.send(LifecycleEvent { event, applied });
+                }
+            }
+            _ => return Err(mpsc::error::SendError(event)),
+        }
+        Ok(completion)
+    }
+}
+
 /// Cheap cloneable handle used by transport and discovery services.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncHandle {
     pub(super) events: mpsc::Sender<Event>,
-    pub(super) lifecycle: mpsc::UnboundedSender<Event>,
+    pub(super) lifecycle: LifecycleSender,
     pub(super) tip: watch::Receiver<(block::Height, block::Hash)>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) candidates: watch::Receiver<ZakuraHeaderSyncCandidateState>,
@@ -177,11 +246,17 @@ impl HeaderSyncHandle {
         self.events.try_send(event)
     }
 
-    /// Send a lifecycle event over the unbounded control channel.
+    /// Queue lifecycle work with a disconnect slot reserved at connection admission.
     pub fn send_lifecycle(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
-        self.lifecycle
-            .send(event)
-            .map_err(|error| mpsc::error::SendError(error.0))
+        self.lifecycle.send(event).map(drop)
+    }
+
+    /// Wait for reactor admission before forwarding this session's messages.
+    pub(super) fn connect_session(
+        &self,
+        session: PeerSession,
+    ) -> Result<oneshot::Receiver<()>, mpsc::error::SendError<Event>> {
+        self.lifecycle.send(Event::PeerConnected(session))
     }
 
     /// Subscribe to selected header-tip updates.

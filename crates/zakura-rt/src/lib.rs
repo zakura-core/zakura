@@ -14,7 +14,7 @@ pub use tokio::{pin, select};
 /// Tasks.
 pub mod task {
     pub use tokio::task::{
-        coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinError, JoinHandle, JoinSet,
+        coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinHandle, JoinSet,
     };
     pub use tokio_util::task::AbortOnDropHandle;
 }
@@ -25,8 +25,7 @@ pub mod task {
 /// because tokio's `Instant` behaves differently under paused test time.
 pub mod time {
     pub use tokio::time::{
-        error, interval, sleep, sleep_until, timeout, Instant, Interval, MissedTickBehavior, Sleep,
-        Timeout,
+        error, interval, sleep, sleep_until, timeout, Instant, MissedTickBehavior, Sleep, Timeout,
     };
 }
 
@@ -34,17 +33,17 @@ pub mod time {
 ///
 /// `Mutex` is the std mutex. Tokio's mutex is `AsyncMutex`.
 pub mod sync {
-    pub use std::sync::{atomic, Mutex, MutexGuard, PoisonError, TryLockError};
+    pub use std::sync::{atomic, Mutex, MutexGuard, PoisonError};
     pub use tokio::sync::{
-        broadcast, futures, mpsc, oneshot, watch, AcquireError, Barrier, Mutex as AsyncMutex,
-        Notify, OwnedSemaphorePermit, Semaphore, SemaphorePermit, TryAcquireError,
+        broadcast, futures, mpsc, oneshot, watch, Barrier, Mutex as AsyncMutex, Notify,
+        OwnedSemaphorePermit, Semaphore,
     };
-    pub use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
+    pub use tokio_util::sync::CancellationToken;
 }
 
 /// Hashed collections, whose iteration order depends on a random seed.
 pub mod collections {
-    pub use std::collections::{hash_map, hash_set, HashMap, HashSet};
+    pub use std::collections::{hash_map, HashMap, HashSet};
 }
 
 /// Streams.

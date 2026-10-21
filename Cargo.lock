@@ -3614,6 +3614,7 @@ version = "0.1.0"
 dependencies = [
  "corosensei",
  "tokio",
+ "zakura-rt",
 ]
 
 [[package]]

@@ -15,6 +15,11 @@ publish = false
 [dependencies]
 corosensei = { workspace = true }
 
+# Only the simulator build, `RUSTFLAGS="--cfg zakura_sim"`, implements
+# `zakura_rt::sim::Executor`.
+[target.'cfg(zakura_sim)'.dependencies]
+zakura-rt = { path = "../zakura-rt" }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync"] }
 

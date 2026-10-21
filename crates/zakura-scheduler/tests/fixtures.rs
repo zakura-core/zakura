@@ -442,6 +442,22 @@ fn hooks_do_nothing_outside_a_run() {
     hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Lock));
 }
 
+#[test]
+fn spawn_from_setup_code_is_ready_at_once() {
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let ran = shared(Cell::new(false));
+    let flag = ran.clone();
+    // Outside any task, as when a harness builds a component that spawns.
+    let handle = hooks::spawn("setup", async move { flag.set(true) });
+    assert_eq!(
+        s.ready().iter().map(|t| t.task).collect::<Vec<_>>(),
+        [handle.task()]
+    );
+    s.run(handle.task());
+    assert!(ran.get());
+    assert_eq!(s.status(), Status::Quiescent);
+}
+
 /// A future that, on its first poll, runs `before_point`, reaches a
 /// preemption point, and returns `Pending`. Its second poll is `Ready`.
 fn pending_after_point(

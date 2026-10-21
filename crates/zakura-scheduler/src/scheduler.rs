@@ -80,6 +80,9 @@ pub(crate) struct RunState {
     object_counts: BTreeMap<Option<TaskId>, u32>,
     root_counts: BTreeMap<&'static str, u32>,
     pub(crate) shutting_down: bool,
+    /// Panic payloads of tasks that panicked, until a joiner takes them.
+    #[cfg(zakura_sim)]
+    pub(crate) panics: BTreeMap<TaskId, Box<dyn std::any::Any + Send>>,
 }
 
 impl RunState {
@@ -141,6 +144,10 @@ impl RunState {
             child_counts: BTreeMap::new(),
         });
         self.spawn_queue.push((id, task));
+        if parent.is_none() {
+            // Setup code between steps. `run` admits it before its next step.
+            self.ready.insert(id);
+        }
         Ok(id)
     }
 
@@ -291,6 +298,10 @@ pub struct Scheduler {
     coroutines: Vec<Option<Co>>,
     stack_size: usize,
     shut_down: bool,
+    /// Keeps this scheduler installed as `zakura-rt`'s executor until the
+    /// run's state is gone.
+    #[cfg(zakura_sim)]
+    rt_run: Option<zakura_rt::sim::RunGuard>,
 }
 
 impl Scheduler {
@@ -329,12 +340,16 @@ impl Scheduler {
                 object_counts: BTreeMap::new(),
                 root_counts: BTreeMap::new(),
                 shutting_down: false,
+                #[cfg(zakura_sim)]
+                panics: BTreeMap::new(),
             });
         });
         Scheduler {
             coroutines: Vec::new(),
             stack_size: config.stack_size,
             shut_down: false,
+            #[cfg(zakura_sim)]
+            rt_run: Some(zakura_rt::sim::enter(&crate::executor::EXECUTOR)),
         }
     }
 
@@ -383,6 +398,8 @@ impl Scheduler {
     ///
     /// If `task` isn't in [`ready`](Self::ready).
     pub fn run(&mut self, task: TaskId) -> RunOutcome {
+        // Setup code may have spawned through the hooks since the last step.
+        self.admit();
         let cmd = self.state(|s| {
             assert!(
                 s.eligible().any(|t| t == task),
@@ -440,6 +457,8 @@ impl Scheduler {
                     .map(|s| s.to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_default();
+                #[cfg(zakura_sim)]
+                self.state(|s| s.panics.insert(task, payload));
                 (RunOutcome::Panicked(msg), Some(TaskExit::Panicked))
             }
         };
@@ -563,6 +582,8 @@ impl Scheduler {
         // borrow, since their destructors may call hooks.
         let state = RUN.with(|r| r.borrow_mut().take());
         drop(state);
+        #[cfg(zakura_sim)]
+        drop(self.rt_run.take());
         report
     }
 

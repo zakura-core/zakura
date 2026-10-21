@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    scheduler::{with_run, RunState, TaskYielder, Yield},
+    scheduler::{with_run, BoxTask, RunState, TaskYielder, Yield},
     ObjectId, Point, SimInstant, TaskExit, TaskId, TimerId,
 };
 
@@ -84,16 +84,35 @@ pub fn unpark_all(wait: ObjectId) {
 }
 
 /// Spawns a child of the current task. It becomes ready once the current
-/// step returns.
+/// step returns. From setup code outside any task, it spawns a root task
+/// that is ready at once.
 ///
 /// # Panics
 ///
 /// Outside a run, or past the run's task limit.
 pub fn spawn(label: &'static str, task: impl Future<Output = ()> + 'static) -> JoinHandle {
-    let queued = with_run(|s| s.queue_spawn(label, Box::pin(task)))
+    JoinHandle::new(spawn_boxed(label, Box::pin(task)))
+}
+
+/// [`spawn`] for a task that is already boxed.
+pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
+    let queued = with_run(|s| s.queue_spawn(label, task))
         .expect("zakura-rt checks in_run before spawning on the scheduler");
-    let id = queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected));
-    JoinHandle::new(id)
+    queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
+}
+
+/// Requests cancellation of `task` without a preemption point. See
+/// [`JoinHandle::abort`].
+pub(crate) fn request_abort(task: TaskId) {
+    with_run(|s| {
+        if s.done.contains_key(&task) {
+            return;
+        }
+        s.cancel_requested.insert(task);
+        if s.waiting.remove(&task) {
+            s.ready.insert(task);
+        }
+    });
 }
 
 /// The current virtual time, or `None` outside a run.
@@ -187,15 +206,7 @@ impl JoinHandle {
     #[track_caller]
     pub fn abort(&self) {
         preempt(Point::here(crate::Op::Abort));
-        with_run(|s| {
-            if s.done.contains_key(&self.task) {
-                return;
-            }
-            s.cancel_requested.insert(self.task);
-            if s.waiting.remove(&self.task) {
-                s.ready.insert(self.task);
-            }
-        });
+        request_abort(self.task);
     }
 
     /// True once the task has ended.

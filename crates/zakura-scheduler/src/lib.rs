@@ -14,12 +14,16 @@
 //! run every hook does nothing or returns `None`, so code that calls them keeps
 //! working in ordinary tests.
 //!
-//! The design is in the `scheduler.md` plan. This crate doesn't yet implement
-//! `zakura_rt::sim::Executor`, and it has no `draw` for random choices. Both
-//! wait for the runtime's sim build.
+//! In the simulator build (`RUSTFLAGS="--cfg zakura_sim"`), a [`Scheduler`]
+//! also installs itself as `zakura_rt::sim::Executor` for its run, so
+//! production code that uses `zakura-rt` names runs on it.
+//!
+//! The design is in the `scheduler.md` plan.
 
 use std::{fmt, panic::Location, time::Duration};
 
+#[cfg(zakura_sim)]
+mod executor;
 pub mod hooks;
 mod scheduler;
 
@@ -104,6 +108,8 @@ pub enum Op {
     Poll,
     /// `Mutex::lock` and `try_lock`.
     Lock,
+    /// Right after a release, such as a guard or permit drop.
+    Release,
     /// A channel send or reserve.
     Send,
     /// A channel receive.
@@ -126,6 +132,8 @@ pub enum Op {
     AtomicRmw,
     /// A task spawn.
     Spawn,
+    /// `JoinHandle::is_finished`.
+    Join,
     /// A timer registration.
     Sleep,
     /// Polling the branches of a `select!`.
@@ -144,6 +152,7 @@ impl Op {
         match self {
             Op::Poll => "poll",
             Op::Lock => "lock",
+            Op::Release => "release",
             Op::Send => "send",
             Op::Recv => "recv",
             Op::Notify => "notify",
@@ -155,6 +164,7 @@ impl Op {
             Op::AtomicStore => "store",
             Op::AtomicRmw => "rmw",
             Op::Spawn => "spawn",
+            Op::Join => "join",
             Op::Sleep => "sleep",
             Op::Select => "select",
             Op::Yield => "yield",

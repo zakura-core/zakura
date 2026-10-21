@@ -8,10 +8,26 @@
 //! used before, so routing through this crate changes no behavior. The
 //! deterministic simulator will give these names its own implementations, and
 //! the list below is the surface it must cover.
+//!
+//! The simulator build is `RUSTFLAGS="--cfg zakura_sim"`. It swaps in the
+//! modules under `src/sim/` and adds [`sim`], the interface the simulator's
+//! scheduler implements. Names it doesn't cover yet stay re-exports.
 
 pub use tokio::{pin, select};
 
+#[cfg(zakura_sim)]
+pub mod sim;
+
+#[cfg(zakura_sim)]
+#[path = "sim/task.rs"]
+pub mod task;
+
+#[cfg(zakura_sim)]
+#[path = "sim/time.rs"]
+pub mod time;
+
 /// Tasks.
+#[cfg(not(zakura_sim))]
 pub mod task {
     pub use tokio::task::{
         coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinHandle, JoinSet,
@@ -23,6 +39,7 @@ pub mod task {
 ///
 /// `Instant` is tokio's. Code that uses `std::time::Instant` keeps it for now,
 /// because tokio's `Instant` behaves differently under paused test time.
+#[cfg(not(zakura_sim))]
 pub mod time {
     pub use tokio::time::{
         error, interval, sleep, sleep_until, timeout, Instant, MissedTickBehavior, Sleep, Timeout,

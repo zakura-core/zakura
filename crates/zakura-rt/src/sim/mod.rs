@@ -1,0 +1,278 @@
+//! The interface between `zakura-rt` and the simulator's scheduler.
+//!
+//! Only the `--cfg zakura_sim` build has this module. A scheduler implements
+//! [`Executor`] and installs it with [`enter`] for the length of a run. While
+//! it's installed, the sim versions of the runtime names hand every task,
+//! timer and preemption point to it. Outside a run, [`executor`] is `None` and
+//! the same names behave like production.
+//!
+//! Production code never calls this module. Each runtime primitive places its
+//! own preemption points.
+
+use std::{
+    any::Any,
+    cell::Cell,
+    fmt,
+    future::Future,
+    marker::PhantomData,
+    panic::Location,
+    pin::Pin,
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
+
+/// A task future as the executor stores it.
+///
+/// It needn't be `Send`, because a run happens on one OS thread.
+pub type BoxTask = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
+/// What a deterministic scheduler provides to the runtime primitives.
+///
+/// Virtual time is a [`Duration`] since the start of the run, and only the
+/// scheduler moves it. Every method is called on the thread that called
+/// [`enter`].
+pub trait Executor {
+    /// A preemption point. The scheduler may run other tasks before this
+    /// returns. Does nothing outside a task, during shutdown, or while the
+    /// thread is unwinding.
+    fn preempt(&self, point: Point);
+
+    /// Parks the current task until [`Executor::unpark_all`] on `wait`. The
+    /// task keeps its simulated worker. Only synchronous waits, such as a
+    /// contended `Mutex`, park. Async waits return `Pending` instead.
+    ///
+    /// `held_by` names the task holding `wait`, if known, so the scheduler can
+    /// tell a lock cycle from starved workers. Returns false without parking
+    /// when the current task can't park, such as during shutdown.
+    fn park(&self, wait: ObjectId, held_by: Option<TaskId>) -> bool;
+
+    /// Makes every task parked on `wait` ready again. Not a preemption point.
+    fn unpark_all(&self, wait: ObjectId);
+
+    /// Spawns `task` as a child of the current task, or as a root task outside
+    /// one. `label` names the spawn site in task identities.
+    fn spawn(&self, label: &'static str, task: BoxTask) -> TaskId;
+
+    /// Requests cancellation. The task's future is dropped at its next poll
+    /// boundary, as with tokio's abort. A no-op once the task has ended.
+    fn abort(&self, task: TaskId);
+
+    /// True once `task` has ended.
+    fn is_finished(&self, task: TaskId) -> bool;
+
+    /// Polls for the end of `task`, registering `cx`'s waker while it runs.
+    ///
+    /// Returns each task's exit once. A panic payload moves to the caller.
+    fn poll_join(&self, task: TaskId, cx: &mut Context<'_>) -> Poll<TaskExit>;
+
+    /// The current virtual time.
+    fn now(&self) -> Duration;
+
+    /// Registers `waker` to fire when virtual time reaches `deadline`.
+    ///
+    /// Primitives pass the `Waker` they were polled with, so the wakeup
+    /// reaches the right child future inside a `select!`.
+    fn register_timer(&self, deadline: Duration, waker: &Waker) -> TimerId;
+
+    /// Removes a timer. A no-op if it already fired.
+    fn cancel_timer(&self, timer: TimerId);
+
+    /// A fresh identity for a runtime object, such as a `Mutex` or a channel.
+    fn new_object(&self) -> ObjectId;
+
+    /// The task running now, or `None` in setup code between steps.
+    fn current_task(&self) -> Option<TaskId>;
+
+    /// Marks whether the current task waits on a source outside the
+    /// scheduler, so an idle run isn't reported as a deadlock.
+    fn set_external_wait(&self, waiting: bool);
+}
+
+thread_local! {
+    static EXECUTOR: Cell<Option<&'static dyn Executor>> = const { Cell::new(None) };
+}
+
+/// The executor of the run on this thread, or `None` outside a run.
+pub fn executor() -> Option<&'static dyn Executor> {
+    EXECUTOR.try_with(Cell::get).ok().flatten()
+}
+
+/// Installs `executor` for a run on this thread, until the guard drops.
+///
+/// # Panics
+///
+/// If this thread is already in a run. Runs don't nest.
+pub fn enter(executor: &'static dyn Executor) -> RunGuard {
+    EXECUTOR.with(|cell| {
+        assert!(
+            cell.get().is_none(),
+            "a zakura-rt sim run is already active on this thread"
+        );
+        cell.set(Some(executor));
+    });
+    RunGuard {
+        _not_send: PhantomData,
+    }
+}
+
+/// Ends the run started by [`enter`] when dropped.
+#[must_use = "the run ends when the guard drops"]
+pub struct RunGuard {
+    // The executor is installed per thread, so the guard must stay on it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let _ = EXECUTOR.try_with(|cell| cell.set(None));
+    }
+}
+
+impl fmt::Debug for RunGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RunGuard")
+    }
+}
+
+/// A task's identity, as the executor assigns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    /// Wraps the executor's raw id.
+    pub const fn new(raw: u64) -> Self {
+        TaskId(raw)
+    }
+
+    /// The executor's raw id.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A runtime object's identity: the creating task (or `None` for setup code)
+/// and a creation ordinal, so it stays stable when unrelated tasks change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectId {
+    /// The task that created the object, or `None` for setup code.
+    pub creator: Option<TaskId>,
+    /// How many objects that creator made before this one.
+    pub ordinal: u32,
+}
+
+/// A registered timer. Ordered by deadline, then by registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimerId {
+    deadline: Duration,
+    seq: u64,
+}
+
+impl TimerId {
+    /// A timer that fires at `deadline`, the `seq`-th the executor registered.
+    pub const fn new(deadline: Duration, seq: u64) -> Self {
+        TimerId { deadline, seq }
+    }
+
+    /// When this timer fires, in virtual time.
+    pub const fn deadline(self) -> Duration {
+        self.deadline
+    }
+
+    /// The executor's registration counter for this timer.
+    pub const fn seq(self) -> u64 {
+        self.seq
+    }
+}
+
+/// How a task ended.
+pub enum TaskExit {
+    /// The future returned `Ready`.
+    Completed,
+    /// The task was aborted before it finished.
+    Cancelled,
+    /// The future panicked. Holds the panic payload.
+    Panicked(Box<dyn Any + Send + 'static>),
+}
+
+impl fmt::Debug for TaskExit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskExit::Completed => f.write_str("Completed"),
+            TaskExit::Cancelled => f.write_str("Cancelled"),
+            TaskExit::Panicked(_) => f.write_str("Panicked(..)"),
+        }
+    }
+}
+
+/// The operation a task is about to perform at a preemption point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Op {
+    /// `Mutex::lock` and `try_lock`.
+    Lock,
+    /// Right after a release, such as a guard or permit drop.
+    Release,
+    /// A channel send or reserve.
+    Send,
+    /// A channel receive.
+    Recv,
+    /// `Notify::notify_one` or `notify_waiters`.
+    Notify,
+    /// `Notify::notified` creation.
+    Notified,
+    /// A `Semaphore` acquire or permit count read.
+    Acquire,
+    /// `CancellationToken::cancel`.
+    Cancel,
+    /// `CancellationToken::is_cancelled` or the first poll of `cancelled`.
+    Cancelled,
+    /// An atomic load.
+    AtomicLoad,
+    /// An atomic store.
+    AtomicStore,
+    /// An atomic read-modify-write.
+    AtomicRmw,
+    /// A task spawn.
+    Spawn,
+    /// `JoinHandle::is_finished`.
+    Join,
+    /// `JoinHandle::abort`.
+    Abort,
+    /// A timer's registration or expiry.
+    Sleep,
+    /// Polling the branches of a `select!`.
+    Select,
+    /// `yield_now`.
+    Yield,
+    /// A `watch` read or write.
+    Watch,
+}
+
+/// A preemption point, as a runtime primitive reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Point {
+    /// The operation about to run.
+    pub op: Op,
+    /// The object it touches, if the primitive has one.
+    pub object: Option<ObjectId>,
+    /// Where production code called the primitive.
+    pub site: &'static Location<'static>,
+}
+
+impl Point {
+    /// A point for `op` at the caller's source location.
+    #[track_caller]
+    pub fn here(op: Op) -> Self {
+        Point::at(op, Location::caller())
+    }
+
+    /// A point for `op` at `site`, for primitives that recorded their call
+    /// site earlier, such as a timer polled after it was created.
+    pub fn at(op: Op, site: &'static Location<'static>) -> Self {
+        Point {
+            op,
+            object: None,
+            site,
+        }
+    }
+}

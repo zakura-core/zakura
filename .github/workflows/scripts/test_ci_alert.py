@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Tests for ci_alert.py and the workflow list in ci-alerts.yml."""
 
-import re
 import unittest
 from pathlib import Path
+
+import yaml
 
 import ci_alert
 
@@ -29,16 +30,43 @@ def run(number, conclusion, event="push", attempt=1):
     }
 
 
-def watched_workflows():
-    """Returns the workflow names listed under `workflow_run.workflows` in ci-alerts.yml."""
-    lines = (WORKFLOWS / "ci-alerts.yml").read_text().splitlines()
-    watched = []
-    for line in lines[lines.index("    workflows:") + 1 :]:
-        match = re.fullmatch(r"      - (.+)", line)
-        if not match:
-            break
-        watched.append(match.group(1))
-    return watched
+# These workflows have their own alert policy. Keep exceptions explicit so a new
+# scheduled workflow cannot silently miss the central notifier.
+ALERT_EXCEPTIONS = {
+    "PR node image bake": "Has a dedicated failure notification job.",
+    "VCT handoff canary": "Has phase-aware alerts with persistent deduplication.",
+    "Zakura continuous genesis sync fleet": (
+        "Audit alerts are deduplicated across runs. Setup failures before the "
+        "audit remain outside that notification path."
+    ),
+    "Upstream PR Triage Pilot": "Intentionally muted until the pilot passes again.",
+}
+
+
+def workflow_events(workflow):
+    """Normalizes YAML event mappings, lists, and single event names."""
+    events = workflow["on"]
+    if isinstance(events, str):
+        return {events: None}
+    if isinstance(events, list):
+        return dict.fromkeys(events)
+    return events
+
+
+def needs_alert_coverage(workflow):
+    """Includes scheduled and branch-push workflows, conservatively ignoring branch filters."""
+    events = workflow_events(workflow)
+    if "schedule" in events:
+        return True
+    if "push" not in events:
+        return False
+    push = events["push"] or {}
+    # A tags-only filter disables branch pushes. Path filters do not.
+    return not (
+        ("tags" in push or "tags-ignore" in push)
+        and "branches" not in push
+        and "branches-ignore" not in push
+    )
 
 
 class AlertTextTest(unittest.TestCase):
@@ -129,15 +157,51 @@ class MessageTest(unittest.TestCase):
 
 
 class WatchedWorkflowsTest(unittest.TestCase):
-    def test_every_watched_workflow_exists(self):
-        names = set()
-        for path in WORKFLOWS.glob("*.yml"):
-            match = re.search(r"^name:\s*(.+?)\s*$", path.read_text(), re.MULTILINE)
-            if match:
-                names.add(match.group(1).strip("'\""))
-        watched = watched_workflows()
+    def test_every_automatic_workflow_has_an_alert_policy(self):
+        """Requires coverage or a named exception for every automatic workflow."""
+        workflows = {}
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            # BaseLoader preserves GitHub's `on` key instead of YAML 1.1's True.
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            self.assertNotIn(workflow["name"], workflows, "Workflow names must be unique")
+            workflows[workflow["name"]] = workflow
+        watched = workflow_events(workflows["CI alerts"])["workflow_run"]["workflows"]
+        automatic = {
+            name for name, workflow in workflows.items() if needs_alert_coverage(workflow)
+        }
+        exceptions = set(ALERT_EXCEPTIONS)
         self.assertTrue(watched)
-        self.assertEqual(sorted(set(watched) - names), [])
+        self.assertEqual(len(watched), len(set(watched)), "Duplicate watched workflow")
+        self.assertEqual(set(watched) - workflows.keys(), set(), "Unknown watched workflow")
+        self.assertEqual(exceptions - automatic, set(), "Stale alert exception")
+        self.assertEqual(set(watched) & exceptions, set(), "Watched and exempted")
+        self.assertEqual(
+            automatic - set(watched) - exceptions,
+            set(),
+            "Add missing workflows to ci-alerts.yml or document an alert exception",
+        )
+
+    def test_event_forms_and_filters(self):
+        """Recognizes YAML trigger forms without mistaking job text for triggers."""
+        cases = [
+            ("on: push", True),
+            ('"on": [pull_request, push]', True),
+            ("on: {push: {}}", True),
+            ("on: {schedule: [{cron: '0 0 * * *'}]}", True),
+            ("on: {push: {branches: [main], paths: ['docs/**']}}", True),
+            ("on: {push: {branches-ignore: [release], tags: ['v*']}}", True),
+            ("on: {push: {tags: ['v*']}}", False),
+            ("on: {push: {tags-ignore: ['v*']}}", False),
+            ("on: [pull_request, workflow_dispatch]", False),
+            ("on: workflow_call", False),
+            ("on: workflow_dispatch\njobs: {example: {name: 'schedule: push'}}", False),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                workflow = yaml.load(source, Loader=yaml.BaseLoader)
+                self.assertEqual(needs_alert_coverage(workflow), expected)
 
 
 if __name__ == "__main__":

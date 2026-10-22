@@ -13,10 +13,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -40,10 +39,9 @@ on:
       - .cargo/config.toml
       - deny.toml
       - rust-toolchain.toml
-      - .github/workflows/lint.yml
-      - .github/workflows/zakura-mainnet-deploy.yml
-      - .github/workflows/cross-platform.yml
-      - .github/workflows/ci-alerts.yml
+      # CI alert coverage checks every workflow trigger.
+      - ".github/workflows/*.yml"
+      - ".github/workflows/*.yaml"
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -240,7 +238,9 @@ jobs:
 
       - name: CI alert tests
         if: ${{ !cancelled() }}
-        run: python3 .github/workflows/scripts/test_ci_alert.py
+        run: |
+          python3 -m pip install --disable-pip-version-check -r .github/workflows/scripts/requirements-ci-alerts.txt
+          python3 .github/workflows/scripts/test_ci_alert.py
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

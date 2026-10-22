@@ -342,8 +342,6 @@ impl SequencerState {
         let scope_is_current = self.current_scope.is_some_and(|current| {
             current.body_work_epoch == body.owner.authority().body_work_epoch
         });
-        #[cfg(test)]
-        let scope_is_current = scope_is_current || self.current_scope.is_none();
         if !scope_is_current {
             return BodyAcceptance::StaleScope;
         }

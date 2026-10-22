@@ -753,6 +753,22 @@ proptest! {
 }
 
 #[test]
+fn body_without_committed_authority_is_rejected() {
+    let mut state = SequencerState::new(
+        Sequencer::new(block::Height(0), 1),
+        genesis_frontiers(),
+        None,
+        SeededRetryJitter::new([0; 32]),
+    );
+    assert!(matches!(
+        state.accept_body(received(&test_block(), 1, 0)),
+        BodyAcceptance::StaleScope
+    ));
+    assert_eq!(state.sequencer().reorder_len(), 0);
+    assert_eq!(state.sequencer().applying_len(), 0);
+}
+
+#[test]
 fn missing_direct_successor_cannot_prove_reset_anchor() {
     let anchor_hash = block::Hash([1; 32]);
 

@@ -4,7 +4,7 @@
 //! checks that the stop settles every resource the attempt acquired: work,
 //! byte budget, requester pool entries, response authorization, and the
 //! outstanding record. Fence refusal and a transport close during publication
-//! need a concurrent writer, so the simulator covers them.
+//! need concurrent coverage when the simulator becomes available.
 
 use std::time::{Duration, Instant};
 

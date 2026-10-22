@@ -33,12 +33,12 @@ fn retry_filter_retains_each_small_allowed_run() {
             let items: Vec<_> = (0..len).collect();
             let mut calls = vec![0usize; len];
 
-            let keep = first_allowed_run(&items, |item| {
+            let actual = first_allowed_run(&items, |item| {
                 calls[*item] += 1;
                 allowed[*item]
             });
 
-            assert_eq!(keep, expected, "len={len}, mask={mask:#08b}");
+            assert_eq!(actual, expected, "len={len}, mask={mask:#08b}");
 
             let visited_len = match &expected {
                 Some(range) if range.end < len => range.end + 1,
@@ -52,36 +52,6 @@ fn retry_filter_retains_each_small_allowed_run() {
                     "len={len}, mask={mask:#08b}, index={index}"
                 );
             }
-
-            let mut retained = items;
-            let mut returned = Vec::new();
-            match keep {
-                Some(keep) => {
-                    let keep_len = keep.len();
-                    if keep.start > 0 {
-                        returned.extend(retained.drain(..keep.start));
-                    }
-                    if keep_len < retained.len() {
-                        returned.extend(retained.split_off(keep_len));
-                    }
-                }
-                None => {
-                    returned.extend(retained.iter().copied());
-                    retained.clear();
-                }
-            }
-
-            let expected_retained: Vec<_> = expected.clone().into_iter().flatten().collect();
-            let expected_returned: Vec<_> = (0..len)
-                .filter(|index| !expected.as_ref().is_some_and(|range| range.contains(index)))
-                .collect();
-            assert_eq!(retained, expected_retained, "len={len}, mask={mask:#08b}");
-            assert_eq!(returned, expected_returned, "len={len}, mask={mask:#08b}");
-            assert_eq!(
-                retained.is_empty(),
-                expected.is_none(),
-                "len={len}, mask={mask:#08b}"
-            );
         }
     }
 }

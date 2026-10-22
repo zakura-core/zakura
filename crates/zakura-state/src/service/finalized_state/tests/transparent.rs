@@ -133,7 +133,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         receipt_order: None,
     };
     let finalized = FinalizedBlock::from_checkpoint_verified(
-        CheckpointVerifiedBlock(semantically_verified),
+        CheckpointVerifiedBlock(semantically_verified, None),
         Treestate::default(),
     );
 

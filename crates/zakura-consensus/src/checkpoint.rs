@@ -23,7 +23,7 @@ use std::{
 
 use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tower::{Service, ServiceExt};
 use tracing::instrument;
 
@@ -203,6 +203,9 @@ where
     reset_sender: mpsc::Sender<CheckpointReset>,
     /// The generation assigned to new checkpoint commits.
     reset_generation: u64,
+    /// The latest generation with a rejected body, and the lowest failed height in it.
+    /// Commit tasks above that height in that generation or earlier stop waiting for parent info.
+    rejected_generation: watch::Sender<Option<(u64, block::Height)>>,
 }
 
 impl<S> std::fmt::Debug for CheckpointVerifier<S>
@@ -337,6 +340,7 @@ where
             reset_receiver: receiver,
             reset_sender: sender,
             reset_generation: 0,
+            rejected_generation: watch::channel(None).0,
         };
 
         if !verifier_progress.is_final_checkpoint() {
@@ -1182,13 +1186,22 @@ impl VerifyCheckpointError {
 
     /// Returns `true` if the state dropped this block because an ancestor's delivered body
     /// failed its authorizing data commitment.
+    ///
+    /// This includes a ZIP 234 block whose wait for its parent's block info ended because the
+    /// state rejected the parent. Checkpoints authenticate the parent's hash, so the rejected
+    /// parent is still wanted.
     pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
         match self {
-            VerifyCheckpointError::CommitCheckpointVerified(source) => source
-                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
-                .is_some_and(
+            VerifyCheckpointError::CommitCheckpointVerified(source) => {
+                source
+                    .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                    .is_some_and(
                     zs::CommitCheckpointVerifiedError::is_descendant_of_auth_commitment_mismatch,
-                ),
+                ) || matches!(
+                    source.downcast_ref::<zs::AwaitBlockInfoError>(),
+                    Some(zs::AwaitBlockInfoError::Rejected { .. })
+                )
+            }
             VerifyCheckpointError::VerifyBlock(error) => {
                 error.is_descendant_of_auth_commitment_mismatch()
             }
@@ -1306,6 +1319,9 @@ where
             .then(|| self.state_service.clone());
         let recovery_state = self.state_service.clone();
         let reset_sender = self.reset_sender.clone();
+        let rejected_generation = self.rejected_generation.clone();
+        let mut rejection = rejected_generation.subscribe();
+        let height = req_block.block.height;
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
             let queued_result = req_block
@@ -1321,11 +1337,22 @@ where
 
                 if is_zip234_active(&network, req_block.block.height) {
                     let parent_hash = req_block.block.block.header.previous_block_hash;
-                    let response = state_service
-                        .clone()
-                        .oneshot(zs::Request::AwaitBlockInfo(parent_hash))
-                        .map_err(VerifyCheckpointError::CommitCheckpointVerified)
-                        .await?;
+                    let response = tokio::select! {
+                        response = state_service
+                            .clone()
+                            .oneshot(zs::Request::AwaitBlockInfo(parent_hash)) => {
+                            response.map_err(VerifyCheckpointError::CommitCheckpointVerified)?
+                        }
+                        _ = rejection.wait_for(|rejected| {
+                            rejected.is_some_and(|(generation, failed_height)| {
+                                reset_generation <= generation && height > failed_height
+                            })
+                        }) => {
+                            return Err(VerifyCheckpointError::CommitCheckpointVerified(
+                                zs::AwaitBlockInfoError::Rejected { hash: parent_hash }.into(),
+                            ));
+                        }
+                    };
                     let zs::Response::BlockInfo(parent_info) = response else {
                         unreachable!("wrong response to Request::AwaitBlockInfo");
                     };
@@ -1367,8 +1394,10 @@ where
 
                 // We use a `ServiceExt::oneshot`, so that every state service
                 // `poll_ready` has a corresponding `call`. See #1593.
+                // The generation lets the state fail late copies after a rejection resets us.
+                let block = req_block.block.with_verifier_generation(reset_generation);
                 match state_service
-                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(block))
                     .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                     .await?
                 {
@@ -1406,6 +1435,26 @@ where
                 }
             }
             .await;
+
+            // ZIP 234 descendants can wait before submitting a state commit. State cannot
+            // notify their children, so release the parent waits above the failed block.
+            // A child can fail spuriously while its honest parent still waits, so the
+            // release must not reach the parent.
+            if result.as_ref().is_err_and(|error| {
+                error.is_auth_commitment_mismatch()
+                    || error.is_descendant_of_auth_commitment_mismatch()
+            }) {
+                rejected_generation.send_if_modified(|rejected| {
+                    let lowers = rejected.is_none_or(|(generation, failed_height)| {
+                        reset_generation > generation
+                            || (reset_generation == generation && height < failed_height)
+                    });
+                    if lowers {
+                        *rejected = Some((reset_generation, height));
+                    }
+                    lowers
+                });
+            }
 
             // The commit task owns recovery so a canceled caller cannot discard the reset.
             if zakura_chain::shutdown::is_shutting_down() {

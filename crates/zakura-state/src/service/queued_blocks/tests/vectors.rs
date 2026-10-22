@@ -269,6 +269,50 @@ fn sent_hashes_remove_drops_rejected_hash_and_utxos() -> Result<()> {
     Ok(())
 }
 
+/// After a finalized write reset, the state forgets every sent block above the durable tip.
+/// `hashes_above` must find those blocks in finished and unfinished batches.
+#[test]
+fn sent_hashes_above_a_height_cover_every_batch() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let lower: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let upper: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let lower = lower.prepare();
+    let upper = upper.prepare();
+    let upper_child = upper.block.make_fake_child().prepare();
+
+    let mut sent = SentHashes::default();
+    sent.add(&lower);
+    sent.add(&upper);
+    sent.finish_batch();
+    sent.add(&upper_child);
+
+    let above_lower = sent.hashes_above(Some(lower.height));
+    assert_eq!(
+        above_lower
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>(),
+        [upper.hash, upper_child.hash].into_iter().collect(),
+    );
+    assert_eq!(sent.hashes_above(None).len(), 3);
+    assert!(sent.hashes_above(Some(upper_child.height)).is_empty());
+
+    let lower_utxos = lower.new_outputs.len();
+    sent.remove_many(&above_lower);
+    assert!(sent.contains(&lower.hash));
+    assert!(!sent.contains(&upper.hash));
+    assert!(!sent.contains(&upper_child.hash));
+    assert_eq!(
+        sent.known_utxos.len(),
+        lower_utxos,
+        "removing the blocks above the tip releases their outputs",
+    );
+
+    Ok(())
+}
+
 #[test]
 fn sent_hashes_remove_many_preserves_other_blocks_across_batches() -> Result<()> {
     let _init_guard = zakura_test::init();

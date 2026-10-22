@@ -133,16 +133,19 @@ fn test_block_db_round_trip_with(
             let new_outputs =
                 new_ordered_outputs_with_height(&original_block, Height(0), &transaction_hashes);
 
-            CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
-                block: original_block.clone(),
-                hash,
-                height: Height(0),
-                new_outputs,
-                transaction_hashes,
-                deferred_pool_balance_change: None,
-                auth_data_root: None,
-                receipt_order: None,
-            })
+            CheckpointVerifiedBlock(
+                SemanticallyVerifiedBlock {
+                    block: original_block.clone(),
+                    hash,
+                    height: Height(0),
+                    new_outputs,
+                    transaction_hashes,
+                    deferred_pool_balance_change: None,
+                    auth_data_root: None,
+                    receipt_order: None,
+                },
+                None,
+            )
         };
 
         let dummy_treestate = Treestate::default();

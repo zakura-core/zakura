@@ -429,7 +429,14 @@ impl From<&SemanticallyVerifiedBlock> for BlockCommitmentData {
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckpointVerifiedBlock(pub(crate) SemanticallyVerifiedBlock);
+pub struct CheckpointVerifiedBlock(
+    pub(crate) SemanticallyVerifiedBlock,
+    /// The checkpoint verifier generation that released this block, if any.
+    ///
+    /// This is process-local metadata, not serialized block data.
+    /// See [`CheckpointVerifiedBlock::with_verifier_generation`].
+    pub(crate) Option<u64>,
+);
 
 // Some fields are pub(crate), so we can add whatever db-format-dependent
 // precomputation we want here without leaking internal details.
@@ -708,16 +715,36 @@ impl CheckpointVerifiedBlock {
         let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
         let new_outputs = transparent::new_ordered_outputs(&block, &transaction_hashes);
 
-        Self(SemanticallyVerifiedBlock {
-            block,
-            hash,
-            height,
-            new_outputs,
-            transaction_hashes,
-            deferred_pool_balance_change: None,
-            auth_data_root: None,
-            receipt_order: None,
-        })
+        Self(
+            SemanticallyVerifiedBlock {
+                block,
+                hash,
+                height,
+                new_outputs,
+                transaction_hashes,
+                deferred_pool_balance_change: None,
+                auth_data_root: None,
+                receipt_order: None,
+            },
+            None,
+        )
+    }
+
+    /// Returns this checkpoint block tagged with the checkpoint verifier generation that
+    /// released it.
+    ///
+    /// NU5+ block hashes do not commit to authorizing data (ZIP 244), so a body that fails
+    /// its commitment and an honest resubmission share every hash. After the state rejects a
+    /// body, it uses this generation to fail late copies the verifier released before its reset,
+    /// and to queue the copies it releases afterwards. Untagged blocks are never failed this way.
+    pub fn with_verifier_generation(mut self, generation: u64) -> Self {
+        self.1 = Some(generation);
+        self
+    }
+
+    /// Returns the checkpoint verifier generation that released this block, if it was tagged.
+    pub fn verifier_generation(&self) -> Option<u64> {
+        self.1
     }
 
     /// Returns this checkpoint block with an auth-data root computed from its wrapped block.
@@ -772,7 +799,7 @@ impl SemanticallyVerifiedBlock {
 
 impl From<Arc<Block>> for CheckpointVerifiedBlock {
     fn from(block: Arc<Block>) -> Self {
-        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block))
+        CheckpointVerifiedBlock(SemanticallyVerifiedBlock::from(block), None)
     }
 }
 

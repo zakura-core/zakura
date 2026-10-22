@@ -20,6 +20,7 @@ use tracing::Span;
 use zakura_chain::{
     block::{self, Height},
     parallel::tree::NoteCommitmentTrees,
+    parameters::GENESIS_PREVIOUS_BLOCK_HASH,
 };
 use zakura_header_chain::{
     checkpoint_finality_evidence, full_state_finality_evidence, ApplyResult, AuxEvidence,
@@ -1713,7 +1714,7 @@ struct WriteBlockWorkerTask {
     non_finalized_block_write_receiver: UnboundedReceiver<NonFinalizedWriteMessage>,
     finalized_state: FinalizedState,
     non_finalized_state: NonFinalizedState,
-    invalid_block_reset_sender: UnboundedSender<block::Hash>,
+    invalid_block_reset_sender: UnboundedSender<FinalizedWriteReset>,
     /// Signals the [`crate::service::StateService`] that a non-finalized block was rejected or evicted by
     /// the write task, so its hash should be removed from
     /// `non_finalized_block_write_sent_hashes`.
@@ -1733,6 +1734,45 @@ struct WriteBlockWorkerTask {
     header_chain: Option<HeaderChainWriter>,
     attach_header_chain_at_handoff: bool,
     header_chain_observers: HeaderChainObservers,
+}
+
+/// The finalized writer rejected a checkpoint block and discards its descendants in the channel.
+///
+/// The writer sends this before it answers the rejected block, so the state service applies the
+/// reset before the checkpoint verifier can observe the failure and release replacements.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::service) struct FinalizedWriteReset {
+    /// The durable finalized tip after the rejection, or `None` if the state has no blocks.
+    pub(in crate::service) tip: Option<(block::Height, block::Hash)>,
+    /// The height of the rejected block.
+    pub(in crate::service) rejected_height: block::Height,
+    /// The hash of the rejected block.
+    pub(in crate::service) rejected_hash: block::Hash,
+    /// Whether the rejected body failed its authorizing data commitment.
+    ///
+    /// Its header is still valid, so the block and its descendants are still wanted.
+    pub(in crate::service) body_rejected: bool,
+    /// The checkpoint verifier generation that released the rejected block, if it was tagged.
+    pub(in crate::service) rejected_generation: Option<u64>,
+}
+
+impl FinalizedWriteReset {
+    /// Returns the hash of the last block the writer accepted.
+    pub(in crate::service) fn tip_hash(&self) -> block::Hash {
+        self.tip
+            .map(|(_, hash)| hash)
+            .unwrap_or(GENESIS_PREVIOUS_BLOCK_HASH)
+    }
+
+    /// Returns the error for a block that descends from the rejected block.
+    pub(in crate::service) fn descendant_error(&self) -> CommitBlockError {
+        let error = if self.body_rejected {
+            ValidateContextError::AncestorBodyRejected(self.rejected_hash)
+        } else {
+            ValidateContextError::InvalidAncestorBlock(self.rejected_hash)
+        };
+        CommitBlockError::ValidateContextError(Box::new(error))
+    }
 }
 
 /// Writer outcomes that retire entries from the service's sent-block cache.
@@ -1992,7 +2032,7 @@ impl BlockWriteSender {
         header_chain_observers: HeaderChainObservers,
     ) -> (
         Self,
-        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        tokio::sync::mpsc::UnboundedReceiver<FinalizedWriteReset>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
@@ -2029,7 +2069,7 @@ impl BlockWriteSender {
         header_chain_observers: HeaderChainObservers,
     ) -> (
         Self,
-        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
+        tokio::sync::mpsc::UnboundedReceiver<FinalizedWriteReset>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
@@ -2856,8 +2896,14 @@ impl WriteBlockWorkerTask {
                         "committing a block to the finalized state failed, resetting state queue",
                     );
 
-                    let send_result =
-                        invalid_block_reset_sender.send(finalized_state.db.finalized_tip_hash());
+                    let body_rejected = error.is_auth_commitment_mismatch();
+                    let send_result = invalid_block_reset_sender.send(FinalizedWriteReset {
+                        tip: finalized_tip,
+                        rejected_height: ordered_block.0.height,
+                        rejected_hash: ordered_block.0.hash,
+                        body_rejected,
+                        rejected_generation: ordered_block.0.verifier_generation(),
+                    });
 
                     if send_result.is_err() {
                         info!(
@@ -2866,9 +2912,7 @@ impl WriteBlockWorkerTask {
                         return BlockWriteTaskExit::Completed;
                     }
 
-                    rejected_body_ancestor = error
-                        .is_auth_commitment_mismatch()
-                        .then_some(ordered_block.0.hash);
+                    rejected_body_ancestor = body_rejected.then_some(ordered_block.0.hash);
 
                     // Publish the reset before reporting failure, so the verifier's
                     // recovery Tip request can drain queued replacements.

@@ -17,6 +17,8 @@ use zakura_chain::{
 
 use super::*;
 
+mod poison;
+
 /// The timeout we apply to each verify future during testing.
 ///
 /// The checkpoint verifier uses `tokio::sync::oneshot` channels as futures.

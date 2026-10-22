@@ -26,7 +26,7 @@ use crate::components::sync;
 use super::{
     block_verify_error_class, block_verify_error_diagnostic,
     trace::block_driver::BlockDriverTraceExt, BlocksyncThroughputProbe,
-    ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+    ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
 };
 
 #[cfg(test)]
@@ -1395,7 +1395,30 @@ where
                 expected_hash,
                 ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             );
-            block_commit_outcome(owner, source, Some(height), expected_hash, commit.await)
+            let remaining =
+                ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE.saturating_sub(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT);
+            match tokio::time::timeout(remaining, commit).await {
+                Ok(outcome) => {
+                    block_commit_outcome(owner, source, Some(height), expected_hash, outcome)
+                }
+                // Dropping the commit future stops this wait, not the commit. A resubmitted body
+                // that finds the block already committed gets a duplicate outcome.
+                Err(_) => {
+                    warn!(
+                        ?height,
+                        ?expected_hash,
+                        deadline = ?ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE,
+                        "Zakura block-sync commit did not finish before its deadline, retrying the body"
+                    );
+                    metrics::counter!("sync.block.commit.deadline.count").increment(1);
+                    retryable_body_outcome(
+                        owner,
+                        source,
+                        expected_hash,
+                        zakura_header_chain::TransientBodyFailureKind::Timeout,
+                    )
+                }
+            }
         }
     }
 }
@@ -1927,6 +1950,60 @@ mod tests {
 
     fn test_source() -> zakura_header_chain::SourceId {
         zakura_header_chain::SourceId::from_digest([2; 32])
+    }
+
+    /// A verifier commit that never resolves gets a retryable timeout at the commit deadline,
+    /// so it cannot hold its submission slot forever.
+    #[tokio::test(start_paused = true)]
+    async fn commit_deadline_retries_a_commit_that_never_resolves() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let hash = block.hash();
+        let verifier = service_fn(|_request: zakura_consensus::Request| {
+            futures::future::pending::<Result<block::Hash, zakura_consensus::BoxError>>()
+        });
+
+        let started = tokio::time::Instant::now();
+        let outcome = commit_block_sync_body_with_stall_trace(
+            verifier,
+            block,
+            BlockApplyClass::Checkpoint,
+            &ZakuraTrace::noop(),
+            test_owner(),
+            test_source(),
+            1,
+            block::Height(1),
+            hash,
+        )
+        .await;
+
+        assert_eq!(outcome.result(), BlockApplyResult::TimedOut);
+        assert_eq!(started.elapsed(), ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE);
+    }
+
+    /// A slow commit that resolves after the stall trace but before the deadline still commits.
+    #[tokio::test(start_paused = true)]
+    async fn commit_deadline_keeps_a_slow_commit() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let hash = block.hash();
+        let verifier = service_fn(move |_request: zakura_consensus::Request| async move {
+            tokio::time::sleep(ZAKURA_BLOCK_SYNC_COMMIT_DEADLINE - Duration::from_secs(1)).await;
+            Ok::<_, zakura_consensus::BoxError>(hash)
+        });
+
+        let outcome = commit_block_sync_body_with_stall_trace(
+            verifier,
+            block,
+            BlockApplyClass::Checkpoint,
+            &ZakuraTrace::noop(),
+            test_owner(),
+            test_source(),
+            1,
+            block::Height(1),
+            hash,
+        )
+        .await;
+
+        assert_eq!(outcome.result(), BlockApplyResult::Committed);
     }
 
     #[tokio::test(flavor = "current_thread")]

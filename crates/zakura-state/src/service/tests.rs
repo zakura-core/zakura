@@ -2455,8 +2455,10 @@ fn continuous_empty_blocks_from_test_vectors() -> impl Strategy<
         })
         .prop_map(|(network, mut blocks, finalized_blocks_count)| {
             let non_finalized_blocks = blocks.split_off(finalized_blocks_count);
-            let finalized_blocks: Vec<_> =
-                blocks.into_iter().map(CheckpointVerifiedBlock).collect();
+            let finalized_blocks: Vec<_> = blocks
+                .into_iter()
+                .map(|block| CheckpointVerifiedBlock(block, None))
+                .collect();
 
             (
                 network,
@@ -3172,7 +3174,15 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     let replacement = state.queue_and_commit_to_finalized_state(child.clone().into());
     assert_eq!(state.finalized_state_queued_blocks.len(), 1);
     assert!(intercepted.try_recv().is_err());
-    reset_tx.send(parent).unwrap();
+    reset_tx
+        .send(crate::service::write::FinalizedWriteReset {
+            tip: Some((Height(0), parent)),
+            rejected_height: Height(1),
+            rejected_hash: child.hash(),
+            body_rejected: false,
+            rejected_generation: None,
+        })
+        .unwrap();
     old_write
         .1
         .send(Err(CommitBlockError::WriteTaskExited.into()))
@@ -3195,6 +3205,112 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     assert!(state.finalized_state_queued_blocks.is_empty());
     real_writer.send(replacement_write).unwrap();
     timeout(limit, replacement).await.unwrap().unwrap().unwrap();
+    state.invalid_block_write_reset_receiver = real_reset_rx;
+}
+
+/// After the writer rejects a checkpoint body, the state answers every block that the verifier
+/// released in the rejected generation, and commits the blocks of the next generation.
+///
+/// The writer reports the reset before it answers the rejected block. So a late block from the
+/// rejected generation is failed even if the state service is not polled in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_body_rejection_fails_its_generation_and_keeps_the_next() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    // The production concurrency limit puts the whole range in the final checkpoint window,
+    // where the state reports sent blocks as known.
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(3), 1000)
+            .await
+            .unwrap();
+    let blocks: Vec<Arc<Block>> = [
+        &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
+        &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+        &zakura_test::vectors::BLOCK_MAINNET_2_BYTES[..],
+        &zakura_test::vectors::BLOCK_MAINNET_3_BYTES[..],
+    ]
+    .into_iter()
+    .map(|bytes| bytes.zcash_deserialize_into().unwrap())
+    .collect();
+    let tagged = |height: usize, generation| {
+        CheckpointVerifiedBlock::from(blocks[height].clone()).with_verifier_generation(generation)
+    };
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(blocks[0].clone().into()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    // Keep the real writer alive but control its responses and resets.
+    let real_writer = state.block_write_sender.finalized.take().unwrap();
+    let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.finalized = Some(gate);
+    let (reset_tx, reset_rx) = tokio::sync::mpsc::unbounded_channel();
+    let real_reset_rx = std::mem::replace(&mut state.invalid_block_write_reset_receiver, reset_rx);
+
+    // Generation 0 sends block 1 to the writer and queues block 3 behind the missing block 2.
+    // A generation 1 copy of block 1 is also queued, as after an earlier verifier reset.
+    let rejected = state.queue_and_commit_to_finalized_state(tagged(1, 0));
+    let rejected_write = intercepted.try_recv().unwrap();
+    let stale_queued = state.queue_and_commit_to_finalized_state(tagged(3, 0));
+    let replacement = state.queue_and_commit_to_finalized_state(tagged(1, 1));
+    assert_eq!(state.finalized_state_queued_blocks.len(), 2);
+    assert!(intercepted.try_recv().is_err());
+
+    // The writer rejects block 1's body, resets, then answers block 1.
+    reset_tx
+        .send(crate::service::write::FinalizedWriteReset {
+            tip: Some((Height(0), blocks[0].hash())),
+            rejected_height: Height(1),
+            rejected_hash: blocks[1].hash(),
+            body_rejected: true,
+            rejected_generation: Some(0),
+        })
+        .unwrap();
+    rejected_write
+        .1
+        .send(Err(CommitBlockError::WriteTaskExited.into()))
+        .unwrap();
+    assert!(rejected.await.unwrap().is_err());
+
+    // A late generation 0 block arrives before the state service is polled again.
+    let stale_late = state.queue_and_commit_to_finalized_state(tagged(2, 0));
+    for (name, response) in [("queued", stale_queued), ("late", stale_late)] {
+        let result = timeout(limit, response).await.unwrap().unwrap();
+        assert!(
+            matches!(&result, Err(error) if error.is_descendant_of_auth_commitment_mismatch()),
+            "the {name} generation 0 block gets the retryable descendant error: {result:?}",
+        );
+    }
+
+    // The generation 1 copy of block 1 goes to the writer, and keeps its known hash.
+    let replacement_write = intercepted.try_recv().unwrap();
+    assert_eq!(replacement_write.0.hash, blocks[1].hash());
+    assert!(state.finalized_state_queued_blocks.is_empty());
+    assert_eq!(
+        state.known_sent_hash(&blocks[1].hash()),
+        Some(crate::KnownBlock::WriteChannel)
+    );
+    // The writer dropped every other block above the tip, so the syncer can download it again.
+    assert_eq!(state.known_sent_hash(&blocks[2].hash()), None);
+    assert_eq!(state.known_sent_hash(&blocks[3].hash()), None);
+
+    // Generation 1 commits the range.
+    let descendants = [
+        state.queue_and_commit_to_finalized_state(tagged(2, 1)),
+        state.queue_and_commit_to_finalized_state(tagged(3, 1)),
+    ];
+    real_writer.send(replacement_write).unwrap();
+    for _ in 0..descendants.len() {
+        real_writer.send(intercepted.try_recv().unwrap()).unwrap();
+    }
+    timeout(limit, replacement).await.unwrap().unwrap().unwrap();
+    for descendant in descendants {
+        timeout(limit, descendant).await.unwrap().unwrap().unwrap();
+    }
     state.invalid_block_write_reset_receiver = real_reset_rx;
 }
 

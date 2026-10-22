@@ -49,6 +49,8 @@ use super::{AddressTransfers, CreatedUtxos, SharedMap};
 mod chunked_height_map_tests;
 mod counted_set;
 mod height_map;
+#[cfg(feature = "internal-bench")]
+pub use height_map::benchmark::{benchmark_height_map, HeightMapBenchmarkSample};
 pub mod index;
 
 /// A single non-finalized partial chain, from the child of the finalized tip,

@@ -9,7 +9,8 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
+use tokio_rustls::{client::TlsStream, TlsAcceptor};
+use tower::BoxError;
 
 use super::super::{
     certificate_validity,
@@ -21,9 +22,10 @@ use super::super::{
     MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS, TLS_HANDSHAKE_TIMEOUT,
     TLS_HEADER_READ_TIMEOUT,
 };
+use super::http_client::{tls_connector, tls_stream, HttpConnection};
 
 // This self-signed localhost certificate and key are exclusively test fixtures.
-const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
+pub(super) const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
 const HANDSHAKE_KEY: &str = include_str!("handshake-key.pem");
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the `slow` test method takes to respond.
@@ -132,10 +134,10 @@ impl TestTlsListener {
         }
     }
 
-    async fn ping(&self) -> reqwest::Client {
-        let (client, result) = self.call("ping").await.unwrap();
+    async fn ping(&self) -> HttpConnection {
+        let (connection, result) = self.call("ping").await.unwrap();
         assert_eq!(result, "pong");
-        client
+        connection
     }
 
     /// Pings until the listener frees the capacity of a closed connection.
@@ -149,44 +151,31 @@ impl TestTlsListener {
         .unwrap();
     }
 
-    async fn call(&self, method: &str) -> reqwest::Result<(reqwest::Client, serde_json::Value)> {
-        crate::indexer::server::install_tls_crypto_provider();
-        let client = reqwest::Client::builder()
-            .tls_certs_only([reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap()])
-            .resolve("localhost", self.address)
-            .no_proxy()
-            .timeout(TEST_TIMEOUT)
-            .build()
-            .unwrap();
-        let response = client
-            .post(format!("https://localhost:{}/", self.address.port()))
-            .header("content-type", "application/json")
-            .body(format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1}}"#))
-            .send()
-            .await?;
-        assert!(response.status().is_success());
-        let mut body: serde_json::Value = serde_json::from_str(&response.text().await?).unwrap();
-        Ok((client, body["result"].take()))
+    /// Calls `method` on a new connection, and returns the connection, which stays open, and
+    /// the method's result.
+    async fn call(&self, method: &str) -> Result<(HttpConnection, serde_json::Value), BoxError> {
+        timeout(TEST_TIMEOUT, async {
+            let stream = TcpStream::connect(self.address).await?;
+            let stream = tls_connector()
+                .connect(ServerName::try_from("localhost").unwrap(), stream)
+                .await?;
+            let mut connection = HttpConnection::new(stream, "localhost").await?;
+            let (status, body) = connection
+                .post_json(
+                    format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1}}"#),
+                    None,
+                )
+                .await?;
+            assert!(status.is_success());
+            let mut body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            Ok((connection, body["result"].take()))
+        })
+        .await?
     }
 
     /// Completes a TLS handshake without sending an HTTP request.
     async fn connect_tls(&self) -> TlsStream<TcpStream> {
-        let mut roots = rustls::RootCertStore::empty();
-        for certificate in parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap() {
-            roots.add(certificate).unwrap();
-        }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let socket = TcpStream::connect(self.address).await.unwrap();
-        TlsConnector::from(Arc::new(config))
-            .connect(ServerName::try_from("localhost").unwrap(), socket)
-            .await
-            .unwrap()
+        tls_stream(self.address).await
     }
 
     async fn stop(self) {

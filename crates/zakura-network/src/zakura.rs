@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::sync::{mpsc, CancellationToken};
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -26,6 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod peer_memory;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
@@ -40,6 +41,7 @@ pub use handshake::*;
 pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
+pub use peer_memory::*;
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -410,7 +412,7 @@ impl ZakuraHandshakeConnector {
         &self,
         peer_id: ZakuraPeerId,
         book_addr: PeerSocketAddr,
-        address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+        address_book_updater: mpsc::Sender<MetaAddrChange>,
     ) {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return;
@@ -499,14 +501,14 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
 /// ownership ends or when the address book updater closes.
 async fn run_legacy_liveness_keeper(
     book_addr: PeerSocketAddr,
-    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
+    address_book_updater: mpsc::Sender<MetaAddrChange>,
     dial_lifetime: CancellationToken,
     refresh_interval: Duration,
 ) {
     loop {
         // Refresh the peer's `Responded` liveness so the crawler treats it as a
         // live (Zakura) peer instead of re-dialing it over legacy TCP.
-        let sent = tokio::select! {
+        let sent = zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => return,
             sent = address_book_updater.send(MetaAddr::new_responded(book_addr, None)) => sent,
@@ -516,10 +518,10 @@ async fn run_legacy_liveness_keeper(
             break;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = dial_lifetime.cancelled() => break,
-            _ = tokio::time::sleep(refresh_interval) => {}
+            _ = zakura_rt::time::sleep(refresh_interval) => {}
         }
     }
 }

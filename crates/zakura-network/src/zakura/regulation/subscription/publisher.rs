@@ -1,10 +1,8 @@
 //! The publisher's side: subscriptions a peer opened on this session.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    hash::Hash,
-    sync::Arc,
-};
+use std::{collections::VecDeque, hash::Hash, sync::Arc};
+
+use zakura_rt::collections::HashMap;
 
 use super::{
     credit::{ResponseCredit, Totals},

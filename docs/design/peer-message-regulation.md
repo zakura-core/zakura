@@ -44,6 +44,19 @@ connection at 500 ms round-trip time, and a test checks each default against its
 local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
 today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
+Paused reads leave a peer's data in QUIC's receive window, so the windows are also memory every
+peer can fill. The node bounds that credit by holding fewer connections, not by shrinking windows:
+`peer_memory_budget_bytes` (8 GiB), less one 256 MiB datagram queue per bound socket, divided by
+one connection's windows (64 MiB) caps the transport at 124 live QUIC connections. A closed
+connection releases its stream buffers and waits out its drain in a separate, cheap allowance, so a
+peer that gets rejected and reconnects can't pile up buffers, and its closed connections take no
+slot from inbound peers. The node keeps `max_pending_handshakes` (32) of the live slots for
+handshakes and admits 92 peers. CTRL-26, ADM-12 and ADM-13 in the zakura-quic spec give the rules
+and the overheads the budget leaves out.
+
+Configuration loading checks this budget only when the resolved P2P stack runs v2. Legacy-only
+nodes retain the configured value without enforcing it because they create no QUIC endpoint.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a

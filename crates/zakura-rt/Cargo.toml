@@ -1,0 +1,20 @@
+[package]
+name = "zakura-rt"
+version = "0.1.0-rc0"
+authors.workspace = true
+description = "Runtime names for Zakura's native P2P stack: tasks, time, sync, collections, streams and randomness. Internal crate, published to support cargo install zakura"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["asynchronous", "cryptography::cryptocurrencies"]
+
+[dependencies]
+rand_10 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[lints]
+workspace = true

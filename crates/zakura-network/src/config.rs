@@ -700,7 +700,7 @@ impl Config {
         //
         // Sort to destroy any peer order, which could leak peer connection times.
         // (Currently the HashSet argument does this as well.)
-        peer_list.sort();
+        peer_list.sort_unstable();
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
@@ -1399,6 +1399,13 @@ impl<'de> Deserialize<'de> for Config {
             ));
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
+        if p2p_stack.resolve(&network).runs_zakura() {
+            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
+            // lowers a larger cap after tracing starts so its warning is logged.
+            zakura
+                .budgeted_max_connections()
+                .map_err(de::Error::custom)?;
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),

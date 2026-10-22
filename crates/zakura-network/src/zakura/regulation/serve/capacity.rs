@@ -1,14 +1,15 @@
 //! Serving capacity: node budgets, per-peer budgets, and serving metrics.
 
-use std::{
+use std::sync::Arc;
+
+use thiserror::Error;
+use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, PoisonError,
+        Mutex, PoisonError,
     },
 };
-
-use thiserror::Error;
 
 use crate::zakura::{
     regulation::{

@@ -139,10 +139,30 @@ These figures come from a release build on an Apple M3 Ultra. Rates on the pause
 | `Status` interval | The specification lets a peer send its new `Status` up to two seconds after the commit. This node's `StatusPublisher` sends it within its one-second floor, which `initial_refresh_and_coalesced_change_deadlines_are_bounded` checks. The subscriber starts the new target as soon as it has both that `Status` and `SubscriptionSuperseded`, in either order, without a timer wait. So recovery takes at most two seconds plus the round trips against any conformant peer, and at most one second plus the round trips against this node. Before this evidence, a `Status` that arrived first was spent while the subscription was still active, and recovery waited for the peer's 30 s refresh. No longer floor is proposed. |
 | Load | 512 sessions finish in 1.4 s and 202 scheduler passes, and 40 in 0.23 s. Running reads reach the node limit of 8, and no peer holds more than its 2 slots. |
 
-`Status` floods start no repeated work. A 602-message burst of repeated statuses from each of 16
-peers starts one locator read and costs 7.3 µs per status. From each of 255 peers it costs 40 µs per
-status. About 30 µs of that is the pass over cached statuses that the reactor runs after every
-event, so the cost of each status grows with the number of connected peers. The 602-message burst
-is the cadence capacity, not a ceiling. Cadence exhaustion records and forwards, so one peer can
-keep sending. At 40 µs per status with 255 peers connected, about 25,000 statuses per second
-saturate the reactor. Sizing that as a denial-of-service bound is follow-up work.
+`Status` floods start no repeated work, and the full pass over cached offers no longer runs once per
+message. Each run sends a 602-message burst of repeated statuses from every peer, or the same number of
+statuses from one peer that flips its own unstarted target, which changes the scheduling key every
+time. The time per status includes the reactor loop's scan for its next deadline.
+
+| Sessions | Repeated, before | Repeated, after | Retargeting, before | Retargeting, after |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | 2.1 µs | 0.31 µs | 2.2 µs | 0.45 µs |
+| 256 | 54 µs | 0.85 µs | 43 µs | 1.1 µs |
+| 512 | 106 µs | 1.7 µs | 104 µs | 2.1 µs |
+
+Before, nearly all of the time went to the pass over cached statuses that the reactor ran after every
+event. That pass now runs only when something that can make a held-back offer eligible changes, and at
+most 32 times back to back, then once per millisecond of time spent outside a pass. The before column
+already computes the header size once. Without that, every headroom check on this Regtest fixture
+rebuilt the Regtest parameters, and the same runs cost 9.4, 50 and 115 µs per repeated status. Mainnet
+never paid that rebuild.
+
+Cadence exhaustion still records and forwards, so one peer can keep sending. The 2.1 µs is an average
+over a tight flood, not a per-message cap. Each of the first 32 changed keys, and one per millisecond
+after each pass ends, still pays a full pass of about 100 µs at 512 sessions, so full passes take at
+most about 9% of the reactor. At the 2.1 µs average, it takes about 475,000 statuses per second,
+roughly 57 MB/s from one peer, to saturate the reactor with 512 sessions. An honest peer event behind
+a full event queue of 128 waits about 0.27 ms instead of about 13 ms. The committed-snapshot and VCT
+repair watches are different. The loop polls them only once the event queue drains, so a sustained
+flood can hold them off longer (#1516). What still grows with peers is the deadline scan, at about 3
+ns per session.

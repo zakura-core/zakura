@@ -7,26 +7,24 @@
 //! travels in one transport frame whose type is the message's discriminator;
 //! `wire` defines the payloads and their bounds.
 
-use std::{
+use std::{sync::Arc, time::Duration};
+
+use zakura_node_services::task::spawn_erased;
+use zakura_quic::NodeId;
+use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
+        CancellationToken, Mutex as StdMutex, Notify,
     },
-    time::Duration,
 };
-
-use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
-use zakura_node_services::task::spawn_erased;
-use zakura_quic::NodeId;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, Peer, PeerStreamSession,
     Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SessionDemand, SessionOpening,
-    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace, FRAME_HEADER_BYTES,
-    ZAKURA_CAP_DISCOVERY,
+    SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerId, ZakuraTrace,
+    DEFAULT_ZAKURA_MAX_CONNECTIONS, FRAME_HEADER_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 use crate::BoxError;
 
@@ -240,27 +238,36 @@ impl SessionSlot {
 }
 
 impl DiscoveryService {
-    /// Builds a discovery service driven by `handle`.
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for the default connection cap.
     pub fn new(handle: ZakuraDiscoveryHandle) -> Self {
+        Self::with_max_connections(handle, DEFAULT_ZAKURA_MAX_CONNECTIONS)
+    }
+
+    /// Builds a discovery service driven by `handle`, with serving pools sized
+    /// for a node that admits `max_connections`.
+    pub fn with_max_connections(handle: ZakuraDiscoveryHandle, max_connections: usize) -> Self {
         Self {
             handle,
             header_sync: None,
             block_sync: None,
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
-            serving: ServingCapacity::new(),
+            serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
             trace: ZakuraTrace::default(),
         }
     }
 
     /// Builds a discovery service with header-sync and block-sync summary
-    /// providers, which writes its violations to `trace`.
+    /// providers, which writes its violations to `trace` and sizes its serving
+    /// pools for `max_connections`.
     pub(crate) fn with_sync_services(
         handle: ZakuraDiscoveryHandle,
         header_sync: HeaderSyncHandle,
         block_sync: Option<BlockSyncHandle>,
         trace: ZakuraTrace,
+        max_connections: usize,
     ) -> Self {
         Self {
             handle,
@@ -268,7 +275,7 @@ impl DiscoveryService {
             block_sync,
             session_states: Arc::new(StdMutex::new(HashMap::new())),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
-            serving: ServingCapacity::new(),
+            serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
             trace,
         }
@@ -660,11 +667,11 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 // Closing drops every unwritten answer, and the peer's
                 // exchange would end without it.
                 let cancel = source.session.cancel_token();
-                tokio::select! {
+                zakura_rt::select! {
                     biased;
                     _ = cancel.cancelled() => {}
                     () = answers.wait() => {}
-                    () = tokio::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE) => {}
+                    () = zakura_rt::time::sleep(DISCOVERY_ANSWER_WRITE_DEADLINE) => {}
                 }
                 handle.mark_short_lived_exchange(&peer_node_id).await;
                 // A retired session is never charged, so a timed-out
@@ -720,7 +727,7 @@ async fn run_discovery_pipe(
     // A cancelled session drops its pending work, including a wait for a
     // verification slot, so it neither holds the slot queue nor imports after
     // its session ends.
-    tokio::select! {
+    zakura_rt::select! {
         biased;
         _ = cancel.cancelled() => Ok(()),
         read = read_discovery_messages(pipe, recv, &sink) => read,
@@ -888,11 +895,11 @@ impl DiscoverySource {
             return InitialExchange::Ended;
         }
         let cancel = self.session.cancel_token();
-        let outcome = tokio::select! {
+        let outcome = zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => InitialExchange::Ended,
             _ = self.progress.wait_complete() => InitialExchange::Complete,
-            _ = tokio::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => InitialExchange::TimedOut,
+            _ = zakura_rt::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => InitialExchange::TimedOut,
         };
         if outcome == InitialExchange::Ended
             || !self
@@ -908,10 +915,10 @@ impl DiscoverySource {
     /// Exchanges again once the rows' send interval has passed.
     async fn refresh_after_interval(&mut self) -> Result<(), ()> {
         let cancel = self.session.cancel_token();
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = cancel.cancelled() => Err(()),
-            _ = tokio::time::sleep(SEND_INTERVAL) => self.exchange().await,
+            _ = zakura_rt::time::sleep(SEND_INTERVAL) => self.exchange().await,
         }
     }
 
@@ -1362,6 +1369,7 @@ mod tests {
             header_sync,
             Some(block_sync.clone()),
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let peer_node_id = NodeSecretKey::from_bytes(&[25u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
@@ -1723,6 +1731,7 @@ mod tests {
             header_sync.clone(),
             None,
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let peer_secret = NodeSecretKey::from_bytes(&[43u8; 32]);
         let peer_node_id = peer_secret.public();
@@ -1848,7 +1857,7 @@ mod tests {
     ) -> (DiscoverySink, FramedRecv) {
         let (send, recv) = framed_channel(capacity);
         let cancel = CancellationToken::new();
-        let serving = ServingCapacity::new().session(
+        let serving = ServingCapacity::new(DEFAULT_ZAKURA_MAX_CONNECTIONS).session(
             PeerSampler {
                 handle: handle.clone(),
                 requester: peer_node_id,
@@ -3452,6 +3461,7 @@ mod tests {
             header_sync.clone(),
             None,
             ZakuraTrace::default(),
+            DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         let header_service = Arc::new(HeaderSyncService::new(header_sync.clone()));
         service.set_connection_owners(vec![header_service.clone()]);

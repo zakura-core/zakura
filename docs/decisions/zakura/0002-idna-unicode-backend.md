@@ -1,5 +1,12 @@
 # IDNA Unicode backend
 
+## Status
+
+Superseded. The managed `zcashd` download now parses its URLs with `http::Uri`,
+which accepts only ASCII host names, so no Zakura package depends on `url` or
+`idna`, and the `idna_adapter` constraint was removed. If a dependency on `url`
+or `idna` returns, revisit this decision before choosing a backend.
+
 ## Decision
 
 Zakura constrains `idna_adapter` to `~1.1.0`, allowing 1.1.x patch releases while

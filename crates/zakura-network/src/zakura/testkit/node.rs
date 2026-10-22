@@ -227,6 +227,9 @@ pub struct ZakuraTestNodeBuilder {
     header_sync_request_timeout: Option<Duration>,
     /// The port header-sync publishers read pages from.
     header_sync_port: Option<Arc<dyn zakura_node_services::header_chain::Port>>,
+    #[cfg(test)]
+    header_snapshot_override:
+        Option<tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>>,
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
     block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
@@ -284,6 +287,8 @@ impl ZakuraTestNodeBuilder {
             header_sync_config: ZakuraHeaderSyncConfig::default(),
             header_sync_request_timeout: None,
             header_sync_port: None,
+            #[cfg(test)]
+            header_snapshot_override: None,
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
             block_range_source: None,
@@ -388,6 +393,16 @@ impl ZakuraTestNodeBuilder {
         port: Arc<dyn zakura_node_services::header_chain::Port>,
     ) -> Self {
         self.header_sync_port = Some(port);
+        self
+    }
+
+    /// Publish committed snapshots into the real reactor in ingress load tests.
+    #[cfg(test)]
+    pub(crate) fn header_snapshots(
+        mut self,
+        snapshots: tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    ) -> Self {
+        self.header_snapshot_override = Some(snapshots);
         self
     }
 
@@ -507,6 +522,10 @@ impl ZakuraTestNodeBuilder {
                 let (_snapshots_tx, snapshots_rx) = tokio::sync::watch::channel(Some(snapshot));
                 startup.committed_snapshots = Some(snapshots_rx);
             }
+            #[cfg(test)]
+            if let Some(snapshots) = self.header_snapshot_override {
+                startup.committed_snapshots = Some(snapshots);
+            }
             let shutdown = CancellationToken::new();
             startup.shutdown = shutdown.clone();
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
@@ -553,9 +572,13 @@ impl ZakuraTestNodeBuilder {
                 header_sync.clone(),
                 block_sync_handle.clone(),
                 ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
+                self.limits.max_connections,
             ))
         } else {
-            Arc::new(DiscoveryService::new(discovery.clone()))
+            Arc::new(DiscoveryService::with_max_connections(
+                discovery.clone(),
+                self.limits.max_connections,
+            ))
         };
         let registry = service_registry(
             &supervisor,
@@ -808,6 +831,7 @@ mod tests {
                     peer_addr,
                     &limits,
                     Some(admitted_ip_tx),
+                    crate::zakura::handler::NativeDialKind::Maintained,
                 )
                 .await
             });

@@ -1,14 +1,16 @@
-use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
+
+use super::{
+    config::*, events::*, peer_registry::SessionAdmission, regulated::status_sender::StatusSend,
+    wire::*, *,
+};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
     SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
     ZakuraPeerId, FRAME_HEADER_BYTES,
 };
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::time::Instant;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -100,7 +102,10 @@ impl BlockSyncPeerSession {
 
     #[cfg(test)]
     pub(super) fn with_status_for_test(mut self, status: BlockSyncStatus) -> Self {
-        let state = Arc::new(super::regulated::status_sender::StatusSender::new(u32::MAX));
+        let state = Arc::new(super::regulated::status_sender::StatusSender::new(
+            u32::MAX,
+            Duration::ZERO,
+        ));
         state.record_received(status);
         self.status_sender = Some(state);
         self
@@ -138,31 +143,47 @@ impl BlockSyncPeerSession {
     }
 
     /// Send a typed status advertisement.
+    ///
+    /// Returns `Full` when the connection's cadence defers the Status, when the
+    /// previous Status is still unwritten, or when the outbound queue is full.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
+        match self.offer_status(status)? {
+            StatusSend::Queued => Ok(()),
+            StatusSend::Deferred(_) | StatusSend::Unwritten | StatusSend::QueueFull => {
+                Err(OrderedSendError::Full)
+            }
+        }
+    }
+
+    /// Offer the latest local status to this connection's Status cadence.
+    pub(super) fn offer_status(
+        &self,
+        status: BlockSyncStatus,
+    ) -> Result<StatusSend, OrderedSendError> {
         if let Some(sender) = &self.status_sender {
             return sender.try_send(status, &self.send);
         }
-        self.try_send_message(BlockSyncMessage::Status(status))
+        match self.try_send_message(BlockSyncMessage::Status(status)) {
+            Ok(()) => Ok(StatusSend::Queued),
+            Err(OrderedSendError::Full) => Ok(StatusSend::QueueFull),
+            Err(error) => Err(error),
+        }
     }
 
-    /// Send a typed status advertisement, waiting for transport queue capacity.
+    /// Send a typed status advertisement, waiting for its cadence and for
+    /// transport queue capacity.
     pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
-        if self.status_sender.is_none() {
-            return self.send_message(BlockSyncMessage::Status(status)).await;
-        }
         loop {
-            match self.try_send_status(status) {
-                Err(OrderedSendError::Full) => {
-                    let next = self
-                        .status_next_due()
-                        .unwrap_or_else(Instant::now)
-                        .max(Instant::now() + Duration::from_millis(100));
-                    tokio::select! {
-                        () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
-                        () = tokio::time::sleep_until(next.into()) => {},
-                    }
+            let retry_at = match self.offer_status(status)? {
+                StatusSend::Queued => return Ok(()),
+                StatusSend::Deferred(at) => at,
+                StatusSend::Unwritten | StatusSend::QueueFull => {
+                    Instant::now() + Duration::from_millis(100)
                 }
-                result => return result,
+            };
+            zakura_rt::select! {
+                () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
+                () = zakura_rt::time::sleep_until(retry_at.into()) => {},
             }
         }
     }
@@ -179,12 +200,6 @@ impl BlockSyncPeerSession {
         }
     }
 
-    pub(super) fn status_next_due(&self) -> Option<Instant> {
-        self.status_sender
-            .as_ref()
-            .and_then(|sender| sender.next_due())
-    }
-
     fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
         let frame = msg
             .encode_frame()
@@ -194,16 +209,6 @@ impl BlockSyncPeerSession {
             Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
         }
-    }
-
-    async fn send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
-        let frame = msg
-            .encode_frame()
-            .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        self.send
-            .send(frame)
-            .await
-            .map_err(|_error| OrderedSendError::Closed)
     }
 }
 
@@ -496,7 +501,7 @@ impl BlockSyncService {
                 let mut service_demand = self.service_demand.clone();
                 return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
-                        tokio::select! {
+                        zakura_rt::select! {
                             changed = candidates.changed() => {
                                 if changed.is_err() {
                                     std::future::pending::<()>().await;
@@ -663,7 +668,7 @@ impl Service for BlockSyncService {
 
         // Production outbound block-sync frames go directly through
         // `BlockSyncPeerSession` (the per-peer routine's `GetBlocks` send /
-        // the reactor's `try_send_status`, the serving session), so the raw transport
+        // the reactor's `offer_status`, the serving session), so the raw transport
         // sender taken from the stream here is redundant. The outbound stream stays
         // alive through the `BlockSyncPeerSession` clone the reactor holds, so
         // nothing is lost by dropping it.
@@ -785,6 +790,7 @@ impl Service for BlockSyncService {
                                 super::regulated::session::serving_max_inflight_requests(
                                     &self.inner.config,
                                 ),
+                                self.inner.config.status_refresh_interval,
                             ))
                         })
                         .clone(),
@@ -886,7 +892,7 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
-                        tokio::select! {
+                        zakura_rt::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),
                             result = routine.run() => result,
@@ -1028,7 +1034,7 @@ impl Service for BlockSyncService {
 /// exists to act on them.
 async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Result<(), SinkReject> {
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             () = cancel.cancelled() => return Ok(()),
             frame = recv.recv() => {
                 if frame.is_none() {

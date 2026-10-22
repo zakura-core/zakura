@@ -11,7 +11,7 @@
 //! After an application receiver closes, incoming frames still pass transport
 //! checks and are discarded until the session retires.
 
-use tokio::sync::mpsc;
+use zakura_rt::sync::mpsc;
 
 use super::Frame;
 use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck, SlotBudget, SlotPermit};

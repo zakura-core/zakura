@@ -1556,10 +1556,7 @@ async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> 
     // Test rpc endpoint response
     assert!(res.status().is_success());
 
-    let body = res.bytes().await;
-    let (body, mut child) = child.kill_on_error(body)?;
-
-    let parsed: Value = serde_json::from_slice(&body)?;
+    let parsed: Value = serde_json::from_slice(res.body())?;
 
     // Check that we have at least 4 characters in the `build` field.
     let build = parsed["result"]["build"].as_str().unwrap();
@@ -1824,24 +1821,21 @@ fn zakura_rpc_conflict() -> Result<()> {
         return Ok(());
     }
 
-    // Write a configuration that has RPC listen_addr set
-    // [Note on port conflict](#Note on port conflict)
-    //
-    // This is the required setting to detect port conflicts.
-    let mut config = common::config::random_known_rpc_port_config(false, &Mainnet)?;
+    let mut config = os_assigned_rpc_port_config(false, &Mainnet)?;
 
     let dir1 = testdir()?.with_config(&mut config)?;
-    let regex1 = regex::escape(&format!(
-        r"Opened RPC endpoint at {}",
-        config.rpc.listen_addr.unwrap(),
-    ));
+    let mut node1 = dir1
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
 
-    // From another folder create a configuration with the same endpoint.
-    // `rpc.listen_addr` will be the same in the 2 nodes.
-    // But they will have different Zcash listeners (auto port) and states (ephemeral)
+    // Keep the OS-assigned port bound until the second node tries to use it.
+    config.rpc.listen_addr = Some(read_listen_addr_from_logs(
+        &mut node1,
+        OPENED_RPC_ENDPOINT_MSG,
+    )?);
     let dir2 = testdir()?.with_config(&mut config)?;
 
-    check_config_conflict(dir1, regex1.as_str(), dir2, "Address already in use")?;
+    check_running_node_conflict(node1, dir2, "Address already in use")?;
 
     Ok(())
 }
@@ -1910,6 +1904,20 @@ where
     // Wait until node1 has used the conflicting resource.
     node1.expect_stdout_line_matches(first_stdout_regex)?;
 
+    check_running_node_conflict(node1, second_dir, second_stderr_regex)
+}
+
+/// Checks that a second node fails to acquire a resource held by a running node,
+/// then shuts down both nodes and checks their exit statuses.
+fn check_running_node_conflict<T, U>(
+    mut node1: zakura_test::command::TestChild<T>,
+    second_dir: U,
+    second_stderr_regex: &str,
+) -> Result<()>
+where
+    T: std::fmt::Debug,
+    U: ZakuradTestDirExt + std::fmt::Debug,
+{
     // Spawn the second node and wait for the expected resource conflict.
     let mut node2 = second_dir
         .spawn_child(args!["start"])?
@@ -2356,8 +2364,7 @@ async fn fully_synced_rpc_z_getsubtreesbyindex_snapshot_test() -> Result<()> {
 
     for i in zcashd_test_vectors {
         let res = client.call("z_getsubtreesbyindex", i.1).await?;
-        let body = res.bytes().await;
-        let parsed: Value = serde_json::from_slice(&body.expect("Response is valid json"))?;
+        let parsed: Value = serde_json::from_slice(res.body())?;
         insta::assert_json_snapshot!(i.0, parsed);
     }
 
@@ -3947,19 +3954,9 @@ async fn generate_with_cookie(
         .trim()
         .split_once(':')
         .ok_or_else(|| eyre!("RPC cookie does not contain basic-auth credentials"))?;
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let response = reqwest::Client::builder()
-        .timeout(EXTENDED_LAUNCH_DELAY)
-        .build()?
-        .post(format!("http://{rpc_address}"))
-        .basic_auth(username, Some(password))
-        .header("Content-Type", "application/json")
-        .body(format!(
-            r#"{{"jsonrpc":"2.0","method":"generate","params":[{num_blocks}],"id":123}}"#
-        ))
-        .send()
-        .await?
-        .text()
+    let response = RpcRequestClient::new_with_timeout(rpc_address, EXTENDED_LAUNCH_DELAY)
+        .with_basic_auth(username, password)
+        .text_from_call("generate", format!("[{num_blocks}]"))
         .await?;
 
     let mut response: serde_json::Map<String, Value> = serde_json::from_str(&response)?;

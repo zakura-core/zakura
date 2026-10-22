@@ -11,6 +11,7 @@ use zakura_chain::{
     serialization::{BytesInDisplayOrder, ZcashDeserializeInto},
     transaction::Transaction,
 };
+use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::{
     client::{BlockTemplateResponse, BlockTemplateTimeSource},
     proposal_block_from_template,
@@ -178,20 +179,15 @@ async fn single_zakura_peer_addr(setup: &ZcashdCompatSetup) -> Result<String> {
         .ok_or_else(|| eyre!("Zakura peer is missing its address: {peer}"))
 }
 
-async fn oversized_rejection_count(
-    client: &reqwest::Client,
-    metrics_addr: SocketAddr,
-) -> Result<f64> {
-    let body = client
-        .get(format!("http://{metrics_addr}"))
-        .send()
+async fn oversized_rejection_count(metrics_addr: SocketAddr) -> Result<f64> {
+    let response = RpcRequestClient::new(metrics_addr)
+        .get()
         .await
-        .map_err(|error| eyre!("fetching Zakura metrics: {error}"))?
-        .error_for_status()
-        .map_err(|error| eyre!("Zakura metrics response: {error}"))?
-        .text()
-        .await
-        .map_err(|error| eyre!("reading Zakura metrics: {error}"))?;
+        .map_err(|error| eyre!("fetching Zakura metrics: {error}"))?;
+    if !response.status().is_success() {
+        return Err(eyre!("Zakura metrics response: HTTP {}", response.status()));
+    }
+    let body = String::from_utf8_lossy(response.body());
 
     Ok(body
         .lines()
@@ -207,15 +203,11 @@ async fn oversized_rejection_count(
         .unwrap_or(0.0))
 }
 
-async fn wait_for_oversized_rejection(
-    client: &reqwest::Client,
-    metrics_addr: SocketAddr,
-    previous_count: f64,
-) -> Result<()> {
+async fn wait_for_oversized_rejection(metrics_addr: SocketAddr, previous_count: f64) -> Result<()> {
     let mut last_seen = previous_count;
 
     for attempt in 1..=60u32 {
-        last_seen = oversized_rejection_count(client, metrics_addr).await?;
+        last_seen = oversized_rejection_count(metrics_addr).await?;
         if last_seen >= previous_count + 1.0 {
             return Ok(());
         }
@@ -266,8 +258,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
 
     let peer_identity = peer_connection_identity(&single_zcashd_peer(&setup).await?)?;
     let zakura_peer_addr = single_zakura_peer_addr(&setup).await?;
-    let metrics_client = reqwest::Client::new();
-    let rejection_count = oversized_rejection_count(&metrics_client, metrics_addr).await?;
+    let rejection_count = oversized_rejection_count(metrics_addr).await?;
     let relayed_txid: String = setup
         .zcashd_client
         .json_result_from_call(
@@ -288,7 +279,7 @@ pub async fn oversized_transparent_tx_rejected() -> Result<()> {
         "zcashd must accept the transaction before relaying it"
     );
 
-    wait_for_oversized_rejection(&metrics_client, metrics_addr, rejection_count).await?;
+    wait_for_oversized_rejection(metrics_addr, rejection_count).await?;
     assert_eq!(
         peer_connection_identity(&single_zcashd_peer(&setup).await?)?,
         peer_identity,

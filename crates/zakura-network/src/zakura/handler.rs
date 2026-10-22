@@ -5,30 +5,19 @@ mod trace;
 use service_session::{spawn_service_session, PendingSessions, PreparedStream, SetupIo};
 
 use std::{
-    collections::{HashMap, HashSet},
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::Arc,
     time::Duration,
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, StreamExt as _};
+use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
-use tokio::{
-    sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
-    task::{AbortHandle, JoinHandle, JoinSet},
-    time::{timeout, Instant},
-};
-use tokio_stream::StreamMap;
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
     parameters::{Network, NetworkKind},
@@ -41,9 +30,25 @@ use zakura_quic::{
     Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, NodeId, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt,
 };
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    stream::StreamMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
+        MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
+    },
+    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet},
+    time::{timeout, Instant},
+};
 
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::peer_memory::{
+    budget_admitted_connections, budgeted_max_connections, PeerMemoryBudgetError,
+    DEFAULT_ZAKURA_BUDGETED_CONNECTIONS, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
+    ZAKURA_CLOSING_CONNECTIONS_PER_LIVE,
+};
 use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
@@ -80,8 +85,9 @@ use crate::{
     },
 };
 
-/// Default total Zakura connections when P2P v2 is enabled.
-pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = 256;
+/// Default total Zakura connections when P2P v2 is enabled: as many as the
+/// default peer memory budget admits (see `peer_memory`).
+pub const DEFAULT_ZAKURA_MAX_CONNECTIONS: usize = DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
 /// Default per-IP Zakura connection cap.
 pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 /// Default simultaneous Zakura control handshakes.
@@ -315,7 +321,27 @@ pub struct ZakuraConfig {
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
+    ///
+    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
+    /// larger value at startup.
     pub max_connections: usize,
+    /// Bytes of QUIC flow-control credit and queued datagrams that native
+    /// connections together may make this node hold.
+    ///
+    /// Each live QUIC connection can hold its `[network.zakura.quic]` receive
+    /// and send windows, 64 MiB at the defaults, whether or not the node
+    /// reads. Each bound socket can also queue 256 MiB of datagrams, however
+    /// many connections it serves (zakura-quic CTRL-26 lists what this leaves
+    /// out). The node reserves one socket queue per bound socket and funds the
+    /// rest divided by the per-connection cost, 124 live connections on the
+    /// one socket `listen_addr` binds. `max_pending_handshakes` of those are
+    /// headroom for handshakes, so the node admits 92, and a larger
+    /// `max_connections` is lowered at startup. A closed connection releases
+    /// its stream buffers and costs nothing more until it drains.
+    /// Startup fails when the budget admits fewer than 16 connections, or
+    /// twice the discovery headroom plus one (19 with Mainnet's 9 bootstrap
+    /// peers), or fewer than `max_connections` when that is smaller.
+    pub peer_memory_budget_bytes: u64,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
@@ -324,6 +350,10 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Also the QUIC connections that
+    /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
+    /// beyond the admitted ones, for handshakes and extra dial attempts.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
@@ -377,6 +407,7 @@ impl Default for ZakuraConfig {
             nat_traversal: false,
             quic: QuicConfig::default(),
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
+            peer_memory_budget_bytes: DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
@@ -412,6 +443,53 @@ impl ZakuraConfig {
         } else {
             self.max_connections_per_ip
         }
+    }
+
+    /// Return the connection cap after the peer memory budget (see
+    /// [`budgeted_max_connections`]), or an error naming the keys when the
+    /// budget admits too few connections.
+    ///
+    /// The floor counts distinct bootstrap identities, as discovery does.
+    /// Without the node key it can't tell whether one of them is this node, so
+    /// it counts one fewer: it never refuses a config that
+    /// [`Self::budgeted_max_connections_for_node`] accepts.
+    pub fn budgeted_max_connections(&self) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(None)
+    }
+
+    /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
+    /// of the bootstrap count, exactly as discovery does.
+    pub fn budgeted_max_connections_for_node(
+        &self,
+        local_node_id: NodeId,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        self.budgeted_max_connections_excluding(Some(local_node_id))
+    }
+
+    fn budgeted_max_connections_excluding(
+        &self,
+        local_node_id: Option<NodeId>,
+    ) -> Result<usize, PeerMemoryBudgetError> {
+        budgeted_max_connections(
+            self.max_connections,
+            self.peer_memory_budget_bytes,
+            self.bound_socket_count(),
+            self.quic.connection_memory_bytes(),
+            match local_node_id {
+                Some(local_node_id) => {
+                    remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
+                }
+                // One entry may be this node's own.
+                None => remote_bootstrap_peer_count(&self.bootstrap_peers, None).saturating_sub(1),
+            },
+            self.max_pending_handshakes.max(1),
+        )
+    }
+
+    /// Returns how many sockets the native endpoint binds for this config (see
+    /// `native_bind_addrs`), each with its own datagram queue.
+    fn bound_socket_count(&self) -> u64 {
+        u64::try_from(native_bind_addrs(self.listen_addr).len()).unwrap_or(u64::MAX)
     }
 
     /// Return the default bootstrap peers for `network`.
@@ -483,7 +561,18 @@ impl ZakuraLocalLimits {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         Self {
             quic: config.zakura.quic.clone(),
-            max_connections: config.zakura.max_connections.max(1),
+            // The floor only decides whether endpoint startup refuses the
+            // config, so the cap is the budget's count either way.
+            max_connections: config
+                .zakura
+                .max_connections
+                .max(1)
+                .min(budget_admitted_connections(
+                    config.zakura.peer_memory_budget_bytes,
+                    config.zakura.bound_socket_count(),
+                    config.zakura.quic.connection_memory_bytes(),
+                    config.zakura.max_pending_handshakes.max(1),
+                )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: config.zakura.quic.idle_timeout(),
             keep_alive_interval: config.zakura.quic.keep_alive_interval(),
@@ -541,10 +630,22 @@ impl ZakuraLocalLimits {
     }
 
     /// Returns the QUIC bind settings for `addrs` under these limits.
+    ///
+    /// The transport holds the admitted connections plus
+    /// `max_pending_handshakes` more live ones, half of those (rounded up, so
+    /// at least one) kept for dials, and two closing connections per live slot
+    /// (see `peer_memory`).
     pub fn quic_bind_config(&self, addrs: Vec<SocketAddr>) -> QuicBindConfig {
+        let max_connections = self
+            .max_connections
+            .saturating_add(self.max_pending_handshakes);
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
+            max_connections,
+            dial_reserve: self.max_pending_handshakes.div_ceil(2),
+            max_closing_connections: max_connections
+                .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }
     }
 }
@@ -606,10 +707,10 @@ pub struct ZakuraEndpoint {
     block_sync: Option<BlockSyncHandle>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
     header_sync_fatal_events:
-        Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
+        Option<Arc<AsyncMutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
     #[cfg(any(test, feature = "zakura-testkit"))]
-    header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
-    block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
+    header_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
+    block_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
@@ -625,7 +726,7 @@ struct UpgradeDialOwnership {
 #[derive(Debug)]
 struct HeaderSyncBackgroundTasks {
     shutdown: CancellationToken,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: AsyncMutex<Vec<JoinHandle<()>>>,
 }
 
 /// Durable state facts required before attaching the production header-sync driver.
@@ -772,7 +873,7 @@ impl ZakuraEndpoint {
     /// recovery path for short Zakura disconnects; the address-book liveness
     /// keeper prevents the slower legacy crawler from churning while this dial
     /// owns the peer.
-    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
         let policy = RedialPolicy::maintain(
@@ -884,12 +985,11 @@ impl ZakuraEndpoint {
         }
     }
 
-    /// Returns whether the local admission semaphore has a free permit, i.e.
-    /// whether this node can accept another inbound/dialed Zakura connection.
-    /// Used by the discovery dialer to avoid starting candidate dials that would
-    /// immediately bounce off the admission cap.
-    pub(crate) fn has_native_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0
+    /// Whether discovery has an admission permit and can start an address
+    /// attempt while preserving inbound capacity (zakura-quic ADM-12).
+    /// Multi-address dials still reserve all their slots in the transport.
+    pub(crate) fn has_discovery_admission_capacity(&self) -> bool {
+        self.handler.admission.available_permits() > 0 && self.quic.has_discovery_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -950,13 +1050,13 @@ impl ZakuraEndpoint {
             block_sync: Some(block_sync),
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
-                tasks: Mutex::new(tasks),
+                tasks: AsyncMutex::new(tasks),
             })),
             header_sync_fatal_events: None,
             header_sync_actions: header_sync_actions
-                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
+                .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
-                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
+                .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -966,7 +1066,7 @@ impl ZakuraEndpoint {
 #[derive(Clone, Debug)]
 pub struct ZakuraSupervisorHandle {
     id: u64,
-    inner: Arc<Mutex<ZakuraSupervisorState>>,
+    inner: Arc<AsyncMutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
@@ -992,10 +1092,8 @@ struct IpSlotCounts {
 }
 
 impl IpSlots {
-    fn counts(&self) -> std::sync::MutexGuard<'_, IpSlotCounts> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn counts(&self) -> MutexGuard<'_, IpSlotCounts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Registered connections from `ip`.
@@ -1289,7 +1387,7 @@ impl ZakuraSupervisorHandle {
         let max_connections_per_ip = max_connections_per_ip.max(1);
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
-            inner: Arc::new(Mutex::new(ZakuraSupervisorState {
+            inner: Arc::new(AsyncMutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 ip_slots: ip_slots.clone(),
@@ -1964,7 +2062,7 @@ impl ServiceSessionState {
                 self.install_demand_wait(
                     waits,
                     Box::pin(async move {
-                        tokio::time::sleep_until(at.into()).await;
+                        zakura_rt::time::sleep_until(at.into()).await;
                     }),
                 );
             }
@@ -1992,7 +2090,7 @@ impl ServiceSessionState {
         self.install_wait(
             waits,
             SessionWaitReason::Transport,
-            Box::pin(tokio::time::sleep(delay)),
+            Box::pin(zakura_rt::time::sleep(delay)),
         );
         Some(delay)
     }
@@ -2248,7 +2346,7 @@ pub struct ZakuraProtocolHandler {
 }
 
 fn random_stream_session_seed() -> u64 {
-    let mut rng = rand_10::rng();
+    let mut rng = zakura_rt::rand::rng();
     loop {
         let seed = rng.next_u64();
         if seed != 0 {
@@ -2541,7 +2639,7 @@ impl ZakuraProtocolHandler {
         hello.validate(&expected)?;
 
         let mut local_nonce = [0; 32];
-        rand_10::rng().fill_bytes(&mut local_nonce);
+        zakura_rt::rand::rng().fill_bytes(&mut local_nonce);
 
         let accepted_limits = self.accepted_limits_for(&hello.initial_limits);
         let ack = ZakuraControlAck {
@@ -2736,6 +2834,7 @@ impl ZakuraProtocolHandler {
                         context.direction,
                         session_exit_tx.clone(),
                     )
+                    .boxed()
                     .await
                 {
                     Ok(admitted) => admitted,
@@ -2807,12 +2906,12 @@ impl ZakuraProtocolHandler {
 
         loop {
             let session_deadline = pending_sessions.deadline();
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
                 _ = async {
                     match session_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        Some(deadline) => zakura_rt::time::sleep_until(deadline).await,
                         None => future::pending().await,
                     }
                 } => pending_sessions.expire(Instant::now()),
@@ -2904,6 +3003,7 @@ impl ZakuraProtocolHandler {
                             context.direction,
                             session_exit_tx.clone(),
                         )
+                        .boxed()
                         .await
                     {
                         Ok(admitted) => {
@@ -3142,7 +3242,7 @@ impl ZakuraProtocolHandler {
                             if let Some(started) = started {
                                 let _ = started.send(());
                             }
-                            let result = tokio::select! {
+                            let result = zakura_rt::select! {
                                 biased;
                                 _ = completion.closed() => {
                                     Err(OutboundRequestError::Local(
@@ -3860,11 +3960,16 @@ fn advertises_no_discovery_address(config: &Config, advertised: &[SocketAddr]) -
     config.zakura.listen_addr.is_some() && advertised.is_empty()
 }
 
-fn remote_bootstrap_peer_count(bootstrap_peers: &[String], local_node_id: NodeId) -> usize {
+/// Counts the distinct parseable bootstrap identities other than `local_node_id`.
+fn remote_bootstrap_peer_count(
+    bootstrap_peers: &[String],
+    local_node_id: impl Into<Option<NodeId>>,
+) -> usize {
+    let local_node_id = local_node_id.into();
     bootstrap_peers
         .iter()
         .filter_map(|entry| super::discovery::parse_bootstrap_peer(entry).ok())
-        .filter(|node_addr| node_addr.id != local_node_id)
+        .filter(|node_addr| Some(node_addr.id) != local_node_id)
         .map(|node_addr| node_addr.id)
         .collect::<HashSet<_>>()
         .len()
@@ -4025,10 +4130,24 @@ async fn spawn_zakura_endpoint_inner(
         .block_sync
         .validate()
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
-    let limits = ZakuraLocalLimits::from_config(config);
-    validate_idle_invariant(&limits)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
+    let budgeted_max_connections = config
+        .zakura
+        .budgeted_max_connections_for_node(local_node_id)?;
+    if budgeted_max_connections < config.zakura.max_connections {
+        warn!(
+            max_connections = config.zakura.max_connections,
+            budgeted_max_connections,
+            peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
+            connection_memory_bytes = config.zakura.quic.connection_memory_bytes(),
+            "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
+             admits at the configured QUIC windows; raise the budget or lower \
+             max_connections to silence this"
+        );
+    }
+    let limits = ZakuraLocalLimits::from_config(config);
+    validate_idle_invariant(&limits)?;
     let discovery_secret_key = secret_key.clone();
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
@@ -4056,7 +4175,7 @@ async fn spawn_zakura_endpoint_inner(
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
-        config.zakura.max_connections,
+        limits.max_connections,
         remote_bootstrap_peer_count(&config.zakura.bootstrap_peers, local_node_id),
         supervisor.subscribe(),
     )?;
@@ -4140,6 +4259,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync.clone(),
         block_sync.clone(),
         trace.clone(),
+        limits.max_connections,
     ));
     let legacy_service = sink_factory(supervisor.clone(), trace.clone());
     let service_demand = header_sync_driver_startup
@@ -4168,9 +4288,9 @@ async fn spawn_zakura_endpoint_inner(
     }
     #[cfg(any(test, feature = "zakura-testkit"))]
     let header_sync_actions = if block_sync_driver_enabled {
-        Some(Arc::new(Mutex::new(Some(header_sync_actions))))
+        Some(Arc::new(AsyncMutex::new(Some(header_sync_actions))))
     } else {
-        let action_driver_task = tokio::spawn(drive_header_sync_actions(
+        let action_driver_task = zakura_rt::task::spawn(drive_header_sync_actions(
             header_sync_actions,
             header_sync.clone(),
             supervisor.clone(),
@@ -4183,10 +4303,10 @@ async fn spawn_zakura_endpoint_inner(
     drop(header_sync_actions);
     let block_sync_actions = block_sync_actions
         .filter(|_| block_sync_driver_enabled)
-        .map(|actions| Arc::new(Mutex::new(Some(actions))));
+        .map(|actions| Arc::new(AsyncMutex::new(Some(actions))));
     let header_sync_tasks = Arc::new(HeaderSyncBackgroundTasks {
         shutdown: header_sync_shutdown,
-        tasks: Mutex::new(tasks),
+        tasks: AsyncMutex::new(tasks),
     });
     let header_sync_ready = service_demand
         .as_ref()
@@ -4219,7 +4339,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync: Some(header_sync),
         block_sync,
         header_sync_tasks: Some(header_sync_tasks),
-        header_sync_fatal_events: Some(Arc::new(Mutex::new(Some(header_sync_fatal_rx)))),
+        header_sync_fatal_events: Some(Arc::new(AsyncMutex::new(Some(header_sync_fatal_rx)))),
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
@@ -4243,7 +4363,7 @@ async fn spawn_zakura_endpoint_inner(
                     )
                     .await;
                 }
-                tokio::select! {
+                zakura_rt::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
                     changed = service_demand.changed() => {
@@ -4265,7 +4385,7 @@ async fn spawn_zakura_endpoint_inner(
         let shutdown = endpoint.background_shutdown_token();
         let log_endpoint = endpoint.clone();
         let task = spawn_erased(async move {
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = shutdown.cancelled() => {}
                 node_addr = log_endpoint.node_addr() => {
@@ -4331,12 +4451,28 @@ fn trace_conn_id(connection: &Connection) -> u64 {
     connection.stable_id() as u64
 }
 
+/// Selects whether a native dial may use the transport's reserved capacity.
+pub(crate) enum NativeDialKind {
+    /// Bootstrap and maintained dials may use every live slot.
+    Maintained,
+    /// Discovery leaves room for an inbound connection and maintained dials.
+    Discovery,
+}
+
+/// Dials and serves a maintained native connection using the full transport cap.
 pub(crate) async fn serve_native_dial_connection(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
-    serve_native_dial_connection_reporting_admitted_ip(endpoint, node_addr, limits, None).await
+    serve_native_dial_connection_reporting_admitted_ip(
+        endpoint,
+        node_addr,
+        limits,
+        None,
+        NativeDialKind::Maintained,
+    )
+    .await
 }
 
 /// Dials `node_addr` and serves the connection, like [`serve_native_dial_connection`].
@@ -4348,13 +4484,14 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
     admitted_ip: Option<oneshot::Sender<IpAddr>>,
+    kind: NativeDialKind,
 ) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
         .handler
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
+        .map_err(|_| ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT))?;
     let dial_timeout = native_dial_timeout(
         endpoint.quic.config(),
         node_addr.direct.len(),
@@ -4362,9 +4499,26 @@ pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
     );
     let alpns = supported_p2p_v2_alpns();
     let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
-    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
+    let dial = async {
+        match kind {
+            NativeDialKind::Maintained => endpoint.quic.connect(node_addr, &offered).await,
+            NativeDialKind::Discovery => endpoint.quic.connect_discovery(node_addr, &offered).await,
+        }
+    };
+    let connection = match timeout(dial_timeout, dial)
         .await
-        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
+    {
+        Ok(connection) => connection,
+        // zakura-quic ADM-12: this node's dial ceiling, so discovery doesn't
+        // back off from the peer.
+        Err(zakura_quic::ConnectError::ConnectionLimit) => {
+            return Err(ZakuraHandlerError::ResourceLimit(
+                TRANSPORT_CONNECTIONS_LIMIT,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let Some(admitted_ip) = admitted_ip {
         // The receiver is gone when the caller stopped waiting for the result.
         let _ = admitted_ip.send(connection.admitted_ip());
@@ -4471,7 +4625,7 @@ async fn run_native_initiator_handshake(
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("open control stream"))??;
     let mut local_nonce = [0; 32];
-    rand_10::rng().fill_bytes(&mut local_nonce);
+    zakura_rt::rand::rng().fill_bytes(&mut local_nonce);
 
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
@@ -4590,7 +4744,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     failure_cause: Option<OrderedStreamFailureCause>,
-    application_drain: Option<Arc<tokio::sync::Barrier>>,
+    application_drain: Option<Arc<Barrier>>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4602,13 +4756,13 @@ async fn persistent_stream_worker_with_policy(
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
-    let reader = tokio_util::task::AbortOnDropHandle::new(spawn_erased(async move {
+    let reader = AbortOnDropHandle::new(spawn_erased(async move {
         // Session teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
         let mut recv = recv;
         let waiting_since = Instant::now();
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = reader_context.connection_token.cancelled() => return,
             _ = reader_context.stream_token.cancelled() => return,
@@ -4617,7 +4771,7 @@ async fn persistent_stream_worker_with_policy(
         }
         reader_context.credit_read_pause(waiting_since.elapsed());
         loop {
-            let frame = tokio::select! {
+            let frame = zakura_rt::select! {
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
@@ -4643,7 +4797,7 @@ async fn persistent_stream_worker_with_policy(
                     match admit_inbound_message(&frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
                             let waiting_since = Instant::now();
-                            let forwarded = tokio::select! {
+                            let forwarded = zakura_rt::select! {
                                 biased;
                                 _ = reader_context.connection_token.cancelled() => break,
                                 _ = reader_context.stream_token.cancelled() => break,
@@ -4717,7 +4871,7 @@ async fn persistent_stream_worker_with_policy(
     let mut outbound_rx = Some(outbound_rx);
     let mut drained = false;
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = context.connection_token.cancelled() => break,
             _ = context.stream_token.cancelled() => break,
@@ -4726,7 +4880,7 @@ async fn persistent_stream_worker_with_policy(
                 // An idle member must not cancel another member's queued writes
                 // or retained application handles. Faults still interrupt draining.
                 if let Some(barrier) = &application_drain {
-                    tokio::select! {
+                    zakura_rt::select! {
                         biased;
                         _ = context.connection_token.cancelled() => {},
                         _ = context.stream_token.cancelled() => {},
@@ -4744,7 +4898,7 @@ async fn persistent_stream_worker_with_policy(
                 match outbound {
                     Some(queued_frame) => {
                         // Cancellation resets the stream before a replacement can write.
-                        let result = tokio::select! {
+                        let result = zakura_rt::select! {
                             biased;
                             _ = context.connection_token.cancelled() => break,
                             _ = context.stream_token.cancelled() => break,
@@ -4853,7 +5007,7 @@ async fn request_stream_worker(
         return;
     };
 
-    let frame = tokio::select! {
+    let frame = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         frame = read_frame(
@@ -4952,8 +5106,8 @@ async fn freshness_reaper(mut freshness_rx: watch::Receiver<Instant>, idle_timeo
         if elapsed >= idle_timeout {
             return;
         }
-        tokio::select! {
-            _ = tokio::time::sleep(idle_timeout - elapsed) => return,
+        zakura_rt::select! {
+            _ = zakura_rt::time::sleep(idle_timeout - elapsed) => return,
             changed = freshness_rx.changed() => {
                 if changed.is_err() {
                     return;
@@ -6062,7 +6216,7 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// A worker holds this briefly (no `.await` while locked) to spend one token
 /// per decoded frame, so N concurrent same-kind streams draw from a single
 /// per-connection budget instead of N independent ones (FLUP-014).
-type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
+type SharedMessageBucket<C = RealClock> = Arc<StdMutex<TokenBucket<C>>>;
 
 /// Per-connection message-rate state, shared across that connection's workers.
 ///
@@ -6079,7 +6233,7 @@ impl<C: Clock + Default> MessageRateBuckets<C> {
     fn new() -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(std::sync::Mutex::new(CadenceBuckets::new(C::default()))),
+            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
         }
     }
 }
@@ -6093,7 +6247,7 @@ impl<C: Clock> MessageRateBuckets<C> {
 }
 
 /// One connection's cadence buckets, shared by its readers.
-type SharedCadenceBuckets<C = RealClock> = Arc<std::sync::Mutex<CadenceBuckets<C>>>;
+type SharedCadenceBuckets<C = RealClock> = Arc<StdMutex<CadenceBuckets<C>>>;
 
 /// A tabled stream's view of its connection's cadence buckets.
 #[derive(Clone, Debug)]
@@ -6131,7 +6285,7 @@ fn message_bucket_for<C: Clock>(
         .streams
         .entry(stream_kind)
         .or_insert_with(|| {
-            Arc::new(std::sync::Mutex::new(TokenBucket::with_clock(
+            Arc::new(StdMutex::new(TokenBucket::with_clock(
                 message_rate_per_second,
                 clock,
             )))
@@ -6269,7 +6423,26 @@ pub enum ZakuraHandlerError {
     Io(#[from] std::io::Error),
 }
 
+/// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the admission
+/// semaphore is full, before it sends any packet.
+const ADMISSION_LIMIT: &str = "admission";
+/// The [`ZakuraHandlerError::ResourceLimit`] a dial returns when the transport
+/// cannot fit the dial under its connection ceiling, before any packet
+/// (zakura-quic ADM-12).
+const TRANSPORT_CONNECTIONS_LIMIT: &str = "transport connections";
+
 impl ZakuraHandlerError {
+    /// Whether a dial stopped at one of this node's own caps before sending
+    /// any packet, so retrying it costs the peer nothing. A pending-handshake
+    /// limit isn't one: it fires after QUIC and TLS with the peer completed.
+    pub(crate) fn is_pre_dial_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::ResourceLimit(limit)
+                if *limit == ADMISSION_LIMIT || *limit == TRANSPORT_CONNECTIONS_LIMIT
+        )
+    }
+
     /// Whether a dial failed because the peer speaks another ALPN (zakura-quic DIAL-5).
     pub(crate) fn is_alpn_mismatch(&self) -> bool {
         matches!(
@@ -7659,6 +7832,61 @@ mod tests {
         assert!(endpoint.header_sync().is_some());
         endpoint.shutdown().await;
         Ok(())
+    }
+
+    /// A full transport stops discovery dials even while admission permits
+    /// remain, so the dialer can't spin on `ConnectionLimit` (zakura-quic
+    /// ADM-12).
+    #[tokio::test]
+    async fn a_full_transport_reports_no_dial_capacity() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        // No bootstrap dials, so nothing else takes the admission permit.
+        config.zakura.bootstrap_peers = Vec::new();
+        config.zakura.max_connections = 2;
+        config.zakura.max_pending_handshakes = 1;
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        assert!(endpoint.has_discovery_admission_capacity());
+
+        // Three dials to a socket that never answers hold every live slot.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let target = NodeAddr::with_addrs(
+            zakura_quic::NodeSecretKey::generate().public(),
+            vec![silent.local_addr()?],
+        );
+        let mut dials = Vec::new();
+        for _ in 0..3 {
+            let (quic, target) = (endpoint.quic.clone(), target.clone());
+            dials.push(tokio::spawn(async move {
+                quic.connect(target, &[P2P_V2_ALPN]).await
+            }));
+        }
+        while endpoint.quic.connection_count() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(endpoint.handler.admission.available_permits() > 0);
+        assert!(!endpoint.has_discovery_admission_capacity());
+        for dial in dials {
+            dial.abort();
+        }
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// Only limits a dial hits before sending a packet are local: the
+    /// pending-handshake limit follows a completed QUIC handshake with the
+    /// peer, so redials must count it.
+    #[test]
+    fn only_limits_before_the_first_packet_are_pre_dial() {
+        assert!(ZakuraHandlerError::ResourceLimit(ADMISSION_LIMIT).is_pre_dial_limit());
+        assert!(ZakuraHandlerError::ResourceLimit(TRANSPORT_CONNECTIONS_LIMIT).is_pre_dial_limit());
+        assert!(!ZakuraHandlerError::ResourceLimit("pending handshake").is_pre_dial_limit());
+        assert!(!ZakuraHandlerError::Timeout("native dial").is_pre_dial_limit());
     }
 
     #[tokio::test]

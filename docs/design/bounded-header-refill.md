@@ -213,3 +213,23 @@ Each now asserts zero extra visits, and also checks changed nonzero slot counts,
 priority and limits that leave the effective claim unchanged. Separate tests
 check that reducing a pending claim wakes an alternate, retargeting releases the
 old target, and a newly eligible Status starts its sender immediately.
+
+## Cached-pass budget
+
+The opportunity key cannot tell a real opportunity from one peer churning its
+own unstarted target. Flipping that target between two hashes changes the queue
+revision on every `Status`, through a retarget or a removal and a fresh
+insertion. Each change would buy a full pass, which clones and sorts every idle
+offer.
+
+So full passes draw from a token bucket of 32 that refills one pass per
+millisecond (`CACHED_PASS_BURST`, `CACHED_PASS_REFILL`). The refill clock
+restarts when a pass ends, so time spent scanning earns no refill. Otherwise a
+pass that took a whole interval would pay for the next one, and passes could run
+back to back. Past the burst, a pass of cost P takes at most P / (P + 1 ms) of
+the reactor. A changed key whose
+pass finds the bucket empty stays uncached, and the refill joins the
+maintenance deadlines. The deferred opportunity is therefore scheduled at the
+refill without a new `Status`. The sender's own offer is still considered
+synchronously, so only cross-peer opportunities wait, and only while something
+changes the key more than 1,000 times a second. Unchanged keys spend nothing.

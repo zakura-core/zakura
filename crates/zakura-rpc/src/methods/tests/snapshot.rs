@@ -5,6 +5,7 @@
 //! cargo insta test --review --release -p zakura-rpc --lib -- test_rpc_response_data
 //! ```
 
+use crate::tests::test_rpc::TestRpcImpl;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -142,7 +143,7 @@ async fn test_z_get_treestate() {
     let (state, read_state, tip, _) =
         zakura_state::populated_state(blocks.clone(), &custom_testnet).await;
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         custom_testnet,
         Default::default(),
         false,
@@ -253,7 +254,7 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         Default::default(),
         false,
@@ -642,7 +643,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
     let mut read_state = MockService::build().for_unit_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         Default::default(),
         false,
@@ -1091,7 +1092,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf.clone(),
         false,
@@ -1250,7 +1251,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     // send tip hash and time needed for getblocktemplate rpc
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
 
-    let (rpc_mock_state, _) = RpcImpl::new(
+    let (rpc_mock_state, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf.clone(),
         false,
@@ -1368,7 +1369,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     // the following snapshots use a mock read_state and block_verifier_router
 
     let mut mock_block_verifier_router = MockService::build().for_unit_tests();
-    let (rpc_mock_state_verifier, _) = RpcImpl::new(
+    let (rpc_mock_state_verifier, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf,
         false,

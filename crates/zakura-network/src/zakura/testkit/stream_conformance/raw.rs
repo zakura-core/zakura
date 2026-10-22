@@ -168,6 +168,20 @@ impl RawLayoutPeer {
         self.write(member, &bytes).await
     }
 
+    /// Send frames on a member in one write, so a burst of small requests
+    /// costs one stream write instead of one per frame.
+    pub(crate) async fn send_all(
+        &mut self,
+        member: usize,
+        frames: impl IntoIterator<Item = Frame>,
+    ) -> Result<(), BoxError> {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bytes.extend(frame.encode(self.limits.max_frame_bytes)?);
+        }
+        self.write(member, &bytes).await
+    }
+
     /// Receive the next frame on a member.
     pub(crate) async fn recv(&mut self, member: usize) -> Result<Frame, BoxError> {
         let max_frame_bytes = self.limits.max_frame_bytes;

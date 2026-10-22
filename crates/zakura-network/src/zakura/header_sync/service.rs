@@ -1,14 +1,14 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError},
-};
+use std::sync::Arc;
 
-#[cfg(any(test, feature = "zakura-testkit"))]
-use tokio::sync::mpsc;
-use tokio::{sync::watch, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased;
+#[cfg(any(test, feature = "zakura-testkit"))]
+use zakura_rt::sync::mpsc;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
+    task::JoinHandle,
+};
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
@@ -471,7 +471,7 @@ pub(crate) async fn drive_header_sync_actions(
     shutdown: CancellationToken,
 ) {
     loop {
-        let action = tokio::select! {
+        let action = zakura_rt::select! {
             _ = shutdown.cancelled() => return,
             action = actions.recv() => match action {
                 Some(action) => action,
@@ -748,14 +748,20 @@ impl Service for HeaderSyncService {
             service_cancel_token.clone(),
         );
 
-        let _ = self
-            .header_sync
-            .send_lifecycle(Event::PeerConnected(session.clone()));
+        let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
         let pipe_cancel = service_cancel_token.clone();
         let protocol_connection_cancel = connection_cancel_token.clone();
         let protocol_close_cause = close_cause.clone();
         let pipe: BoxRunFuture<'static, ()> = Box::pin(async move {
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            zakura_rt::select! {
+                biased;
+                _ = pipe_cancel.cancelled() => return,
+                result = admitted => if result.is_err() { return; },
+            }
             let result = if header_bytes == REGTEST_HEADER_BYTES {
                 run_peer::<REGTEST_HEADER_BYTES>(
                     handle,
@@ -790,13 +796,13 @@ impl Service for HeaderSyncService {
         let teardown_peer = peer_id.clone();
         let teardown_close_cause = close_cause.clone();
         let on_teardown = move || {
-            if teardown_sessions.remove(&teardown_peer, key).is_some() {
-                let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
-                    peer: teardown_peer,
-                    session_id,
-                    reason: teardown_close_cause.get_or("stream_closed"),
-                });
-            }
+            teardown_sessions.remove(&teardown_peer, key);
+            // Replaced sessions still own a reserved teardown slot. The reactor checks generations.
+            let _ = teardown_handle.send_lifecycle(Event::PeerDisconnected {
+                peer: teardown_peer,
+                session_id,
+                reason: teardown_close_cause.get_or("stream_closed"),
+            });
         };
         let panic_connection_cancel = connection_cancel_token.clone();
         let panic_close_cause = close_cause.clone();
@@ -974,7 +980,7 @@ impl Sink for HeaderSyncPassthroughSink {
     fn run(self: Box<Self>, mut recv: FramedRecv) -> BoxRunFuture<'static, Result<(), SinkReject>> {
         Box::pin(async move {
             loop {
-                let frame = tokio::select! {
+                let frame = zakura_rt::select! {
                     _ = self.cancel_token.cancelled() => return Ok(()),
                     frame = recv.recv() => match frame {
                         Some(frame) => frame,

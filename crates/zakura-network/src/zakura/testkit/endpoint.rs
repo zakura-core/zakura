@@ -5,7 +5,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use blake2b_simd::Params as Blake2bParams;
 use zakura_quic::{NodeAddr, NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint};
 
-use crate::{zakura::ZakuraLocalLimits, BoxError};
+use crate::{
+    zakura::{
+        ZakuraLocalLimits, DEFAULT_ZAKURA_MAX_CONNECTIONS, DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
+    },
+    BoxError,
+};
 
 /// Bidirectional stream limit for endpoints built without Zakura limits.
 const DEFAULT_TEST_MAX_BIDI_STREAMS: u32 = 100;
@@ -15,7 +20,7 @@ const DEFAULT_TEST_MAX_BIDI_STREAMS: u32 = 100;
 #[derive(Clone, Debug)]
 pub struct LocalEndpointFactory {
     quic: QuicConfig,
-    max_bidi_streams: u32,
+    bind: QuicBindConfig,
 }
 
 impl LocalEndpointFactory {
@@ -23,7 +28,15 @@ impl LocalEndpointFactory {
     pub fn new() -> Self {
         Self {
             quic: QuicConfig::default(),
-            max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
+            bind: QuicBindConfig {
+                addrs: Vec::new(),
+                max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
+                max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS
+                    + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
+                dial_reserve: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES.div_ceil(2),
+                max_closing_connections: 2
+                    * (DEFAULT_ZAKURA_MAX_CONNECTIONS + DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES),
+            },
         }
     }
 
@@ -31,7 +44,7 @@ impl LocalEndpointFactory {
     pub fn with_limits(limits: &ZakuraLocalLimits) -> Self {
         Self {
             quic: limits.quic.clone(),
-            max_bidi_streams: u32::from(limits.max_open_streams),
+            bind: limits.quic_bind_config(Vec::new()),
         }
     }
 
@@ -43,7 +56,7 @@ impl LocalEndpointFactory {
 
     /// Override the peer's bidirectional stream limit.
     pub fn max_bidi_streams(mut self, max_bidi_streams: u32) -> Self {
-        self.max_bidi_streams = max_bidi_streams;
+        self.bind.max_bidi_streams = max_bidi_streams;
         self
     }
 
@@ -66,7 +79,7 @@ impl LocalEndpointFactory {
     pub async fn endpoint(self, seed: u64) -> Result<QuicEndpoint, BoxError> {
         let bind = QuicBindConfig {
             addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
-            max_bidi_streams: self.max_bidi_streams,
+            ..self.bind
         };
         Ok(QuicEndpoint::bind(
             Self::secret_key(seed),

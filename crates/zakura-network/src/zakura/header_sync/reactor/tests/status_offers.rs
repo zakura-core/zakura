@@ -6,6 +6,7 @@
 use super::*;
 use crate::zakura::testkit::TraceCapture;
 use crate::zakura::FramedRecv;
+use tokio::time;
 use zakura_header_chain::MAX_STAGED_TARGETS_V1;
 
 /// Runs `phase` with `reactor`'s header sync trace captured, and returns how
@@ -840,15 +841,21 @@ fn status_during_repair_keeps_its_ordinary_attempt() {
     );
 }
 
-/// A full cadence burst of repeated statuses from each of `peers` peers
-/// starts one locator read, and another peer's new target still starts at
-/// once. The port never answers, so each read stays pending, as under a slow
-/// state.
+/// A full cadence burst of statuses from each of `peers` peers starts one
+/// locator read, and another peer's new target still starts at once. The port
+/// never answers, so each read stays pending, as under a slow state.
+///
+/// The peers all advertise one target. Without `retarget`, they repeat their
+/// statuses. With it, one more peer sends the same number of statuses while
+/// flipping its own unstarted target, which changes the scheduling key every
+/// time, so only the cached-pass budget bounds the cost.
 #[allow(clippy::print_stderr)]
-fn status_flood(peers: u8) {
+fn status_flood(peers: u16, retarget: bool) {
     // The `Status` cadence capacity.
     const BURST: usize = 602;
     let mut startup = startup(CancellationToken::new());
+    // Admit the default 256 inbound and 256 outbound sessions in one direction.
+    startup.config.peer_limits.max_inbound_peers = 512;
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
@@ -857,23 +864,50 @@ fn status_flood(peers: u8) {
     startup.use_direct_port();
     let (_, _actions, mut reactor) =
         build_header_sync_reactor(startup).expect("the reactor builds");
-    let flooders: Vec<_> = (0..peers).map(|byte| connect(&mut reactor, byte)).collect();
-    let (honest, _outbound) = connect(&mut reactor, 0xff);
+    let connect_index = |reactor: &mut HeaderSyncReactor, index: u16| {
+        let mut id = vec![0xa5; 32];
+        id[..2].copy_from_slice(&index.to_be_bytes());
+        let peer = ZakuraPeerId::new(id).expect("the test peer ID has the required length");
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts(
+            peer.clone(),
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().expect("the initial status was sent");
+        (peer, outbound)
+    };
+    let flooders: Vec<_> = (0..peers)
+        .map(|index| connect_index(&mut reactor, index))
+        .collect();
+    let (attacker, _attacker_outbound) = connect_index(&mut reactor, u16::MAX - 1);
+    let (honest, _outbound) = connect_index(&mut reactor, u16::MAX);
     let flooded = block::Hash([0x42; 32]);
+    let flips = [block::Hash([0x51; 32]), block::Hash([0x52; 32])];
+    for (peer, _) in &flooders {
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
+        reactor.schedule_cached_statuses();
+    }
+    let statuses = BURST * flooders.len();
     let started = std::time::Instant::now();
-    for _ in 0..BURST {
-        for (peer, _) in &flooders {
-            reactor.handle_status(peer.clone(), 0, status_for(&snapshot, flooded));
-            reactor.schedule_cached_statuses();
-        }
+    for index in 0..statuses {
+        let (peer, target) = if retarget {
+            (&attacker, flips[index % 2])
+        } else {
+            (&flooders[index % flooders.len()].0, flooded)
+        };
+        // The loop scans maintenance deadlines before each event.
+        std::hint::black_box(reactor.next_maintenance_deadline());
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, target));
+        reactor.schedule_cached_statuses();
     }
     let elapsed = started.elapsed();
-    assert_eq!(reactor.pending_port_operations.len(), 1);
+    let reads = 1 + usize::from(retarget);
+    assert_eq!(reactor.pending_port_operations.len(), reads);
     reactor.handle_status(honest, 0, status_for(&snapshot, block::Hash([0x43; 32])));
-    assert_eq!(reactor.pending_port_operations.len(), 2);
-    let statuses = BURST * flooders.len();
+    assert_eq!(reactor.pending_port_operations.len(), reads + 1);
     eprintln!(
-        "status_flood peers={peers} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
+        "status_flood peers={peers} retarget={retarget} statuses={statuses} elapsed={elapsed:?} ns_per_status={}",
         elapsed.as_nanos() / u128::try_from(statuses).expect("fits u128"),
     );
 }
@@ -881,15 +915,16 @@ fn status_flood(peers: u8) {
 /// Sixteen flooding peers, on every pull request.
 #[test]
 fn status_floods_start_no_repeated_work() {
-    status_flood(16);
+    status_flood(16, false);
+    status_flood(16, true);
 }
 
-/// Every peer a one-byte test identity allows but the honest one, in
-/// full-coverage CI runs.
+/// The default 512 sessions, in full-coverage CI runs.
 #[test]
 #[ignore = "broad load run; full-coverage CI passes --run-ignored"]
 fn maximum_status_floods_start_no_repeated_work() {
-    status_flood(255);
+    status_flood(510, false);
+    status_flood(510, true);
 }
 
 /// A status for another tip that arrives while a target applies stays
@@ -1181,17 +1216,20 @@ async fn unchanged_blocked_offers_do_not_repeat_cached_offer_work() {
                         // The end-of-event pass also runs on events with no scheduling effect.
                         if unconditional {
                             reactor.last_scheduling_opportunity = None;
+                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                         let (peer, status) = &offers[iteration % offers.len()];
                         reactor.handle_status(peer.clone(), 0, status.clone());
                         if unconditional {
                             reactor.last_scheduling_opportunity = None;
+                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                         reactor.handle_status(owner.clone(), 0, owner_status.clone());
                         if unconditional {
                             reactor.last_scheduling_opportunity = None;
+                            reactor.cached_pass_budget = CachedPassBudget::new(Instant::now());
                         }
                         reactor.schedule_cached_statuses();
                     }
@@ -1405,4 +1443,649 @@ fn changed_offer_is_considered_immediately_without_global_invalidation() {
         reactor.handle_status(peer.clone(), 0, eligible);
         assert!(reactor.peer_work_queue.awaiting_target(&peer).is_some());
     }
+}
+
+/// A peer that keeps changing its own unstarted target changes the scheduling
+/// key on every `Status`. Past the burst, it buys one full cached-offer pass
+/// per refill, however fast it sends. A real opportunity that arrives while
+/// the budget is empty still schedules at the refill, with no new status.
+#[tokio::test(start_paused = true)]
+async fn a_retargeting_flood_buys_bounded_cached_offer_passes() {
+    const IDLE: u8 = 64;
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.header_chain_port = v9::FakePort::new(0);
+    startup.use_direct_port();
+    let (_, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    // The owner's locator read never answers, so the idle peers stay blocked
+    // behind its target.
+    let shared = block::Hash([0x42; 32]);
+    let (owner, _owner_outbound) = connect(&mut reactor, 0);
+    reactor.handle_status(owner.clone(), 0, status_for(&snapshot, shared));
+    let idle: Vec<_> = (1..=IDLE).map(|byte| connect(&mut reactor, byte)).collect();
+    for (peer, _) in &idle {
+        reactor.handle_status(peer.clone(), 0, status_for(&snapshot, shared));
+        reactor.schedule_cached_statuses();
+    }
+    let (attacker, _attacker_outbound) = connect(&mut reactor, 0xfe);
+    let peers = reactor.peer_state.len();
+    // Connecting and the first statuses spent part of the burst.
+    time::advance(CACHED_PASS_REFILL * CACHED_PASS_BURST).await;
+    let flips = [block::Hash([0x51; 32]), block::Hash([0x52; 32])];
+    let flood_visits = cached_offer_visits(&mut reactor, |reactor| {
+        for index in 0..1000 {
+            reactor.handle_status(attacker.clone(), 0, status_for(&snapshot, flips[index % 2]));
+            reactor.schedule_cached_statuses();
+        }
+    })
+    .await;
+    assert_eq!(
+        flood_visits,
+        u64::from(CACHED_PASS_BURST) * u64::try_from(peers).expect("the peer count fits u64"),
+        "1000 retargets buy one burst of passes"
+    );
+    assert!(reactor.cached_pass_deferred);
+
+    // The owner leaves while the budget is empty. Flushing the trace may have
+    // let paused time advance, so empty the budget again at this instant.
+    reactor.cached_pass_budget = CachedPassBudget {
+        passes: 0,
+        refilled_at: Instant::now(),
+    };
+    reactor.handle_peer_disconnected(&owner, 0, "test owner leaves");
+    reactor.schedule_cached_statuses();
+    let has_work = |reactor: &HeaderSyncReactor| {
+        idle.iter()
+            .any(|(peer, _)| reactor.peer_work_queue.has_work(peer))
+    };
+    assert!(!has_work(&reactor), "the pass waits for the refill");
+    let deadline = reactor.next_maintenance_deadline();
+    assert!(deadline <= Instant::now() + CACHED_PASS_REFILL);
+    time::advance(CACHED_PASS_REFILL).await;
+    reactor.schedule_cached_statuses();
+    assert!(
+        has_work(&reactor),
+        "the refilled pass stages the released target"
+    );
+}
+
+/// A pass the budget deferred, followed by a return for another reason, drops
+/// its refill deadline. Otherwise the deadline would sit in the past and the
+/// reactor loop would wake at once on every iteration.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_pass_drops_its_refill_deadline_when_discovery_pauses() {
+    let (mut reactor, _actions, snapshot) = offers_reactor();
+    reactor.cached_pass_budget = CachedPassBudget {
+        passes: 0,
+        refilled_at: Instant::now(),
+    };
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
+    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_pass_deferred);
+
+    // A resource stall pauses discovery before the refill.
+    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    time::advance(CACHED_PASS_REFILL * 2).await;
+    reactor.schedule_cached_statuses();
+    assert!(!reactor.cached_pass_deferred);
+    assert!(reactor.next_maintenance_deadline() > Instant::now());
+}
+
+/// The running reactor still reads the committed snapshot that ends a
+/// resource stall after a deferred pass. A stale refill deadline would keep
+/// the biased loop on its maintenance arm and never read the snapshot.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_pass_does_not_starve_the_snapshot_that_ends_a_stall() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let shutdown = startup.shutdown.clone();
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([1; 32])));
+    reactor.cached_pass_budget = CachedPassBudget {
+        passes: 0,
+        refilled_at: Instant::now(),
+    };
+    reactor.scheduling_revision = reactor.scheduling_revision.wrapping_add(1);
+    reactor.schedule_cached_statuses();
+    assert!(reactor.cached_pass_deferred);
+    reactor.ordinary_resource_stall = Some(snapshot.state_version);
+    time::advance(CACHED_PASS_REFILL * 2).await;
+
+    let task = tokio::spawn(reactor.run());
+    tokio::task::yield_now().await;
+    let mut applied = snapshot;
+    applied.state_version = applied.state_version.checked_next().unwrap();
+    applied.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(applied.frontiers.header_best.height.0 + 1),
+        block::Hash([0x77; 32]),
+    );
+    snapshots_tx.send_replace(Some(applied.clone()));
+    // A spinning reactor never lets paused time advance, so bound the wait by
+    // scheduler turns instead of a timer.
+    let mut read = false;
+    for _ in 0..1_000 {
+        tokio::task::yield_now().await;
+        if handle.tip.borrow().1 == applied.frontiers.header_best.hash {
+            read = true;
+            break;
+        }
+    }
+    assert!(read, "the reactor reads the new snapshot");
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+}
+
+/// A pass that runs longer than a refill interval doesn't pay for the next
+/// one. The next retargeting `Status` waits a full interval after the pass
+/// ends, however slow the pass was.
+#[tokio::test(start_paused = true)]
+async fn a_slow_pass_earns_no_refill_while_it_runs() {
+    let start = Instant::now();
+    let mut budget = CachedPassBudget {
+        passes: 1,
+        refilled_at: start,
+    };
+    assert!(budget.try_take(start));
+    // The pass takes five refill intervals.
+    let end = start + CACHED_PASS_REFILL * 5;
+    budget.finish_pass(end);
+    assert!(!budget.try_take(end), "the scan time refilled nothing");
+    assert_eq!(budget.next_refill(), end + CACHED_PASS_REFILL);
+    assert!(budget.try_take(end + CACHED_PASS_REFILL));
+}
+
+/// A continuously ready Status queue cannot hide the snapshot that releases a resource stall.
+#[tokio::test]
+async fn saturated_status_queue_observes_snapshot_and_resumes_discovery() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let (repairs, repairs_rx) = watch::channel(Default::default());
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let (owner, _owner_output) = connect(&mut reactor, 0x71);
+    let (alternate, _alternate_output) = connect(&mut reactor, 0x72);
+    let (source, owner_scope, branch) =
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let status = applying_target_status(&reactor, &owner);
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
+        peer: owner.clone(),
+        source,
+        owner: owner_scope,
+        result: HeaderTargetAdmissionResult::ResourceStalled(
+            zakura_header_chain::CommittedStallReceipt {
+                state_version: snapshot.state_version,
+                alarm_changed: true,
+                attempted_branch: Some(branch),
+            },
+        ),
+    });
+    reactor.handle_status(alternate.clone(), 0, status.clone());
+    assert_quiescent(&mut reactor, &mut actions);
+    assert!(reactor.pending_port_operations.is_empty());
+    let message = || Event::Status {
+        peer: alternate.clone(),
+        session_id: 0,
+        status: status.clone(),
+    };
+    while handle.try_send(message()).is_ok() {}
+    let flood_handle = handle.clone();
+    let flood_stop = shutdown.clone();
+    let flood = tokio::spawn(async move {
+        while !flood_stop.is_cancelled() {
+            while flood_handle
+                .try_send(Event::Status {
+                    peer: alternate.clone(),
+                    session_id: 0,
+                    status: status.clone(),
+                })
+                .is_ok()
+            {}
+            tokio::task::yield_now().await;
+        }
+    });
+    let lifecycle_handle = handle.clone();
+    let churn_stop = shutdown.clone();
+    let churn = tokio::spawn(async move {
+        let (send, _outbound) = framed_channel(8);
+        let mut generation = 1;
+        while !churn_stop.is_cancelled() {
+            for _ in 0..184 {
+                let session = PeerSession::from_parts_with_session_id(
+                    ZakuraPeerId::new(vec![0x73; 32]).unwrap(),
+                    generation,
+                    send.clone(),
+                    CancellationToken::new(),
+                );
+                if lifecycle_handle
+                    .send_lifecycle(Event::PeerConnected(session.clone()))
+                    .is_err()
+                {
+                    break;
+                }
+                lifecycle_handle
+                    .send_lifecycle(Event::PeerDisconnected {
+                        peer: session.peer_id().clone(),
+                        session_id: generation,
+                        reason: "churn",
+                    })
+                    .unwrap();
+                generation += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let running = tokio::spawn(reactor.run());
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    let mut newer = snapshot;
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    snapshots.send(Some(newer.clone())).unwrap();
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), actions.recv()).await;
+    assert!(
+        matches!(
+            resumed,
+            Ok(Some(HeaderPortOperation::QueryHeaderLocator { .. }))
+        ),
+        "{resumed:?}"
+    );
+    newer.frontiers.header_best.height = block::Height(1);
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    snapshots.send(Some(newer)).unwrap();
+    repairs
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: block::Height(1),
+            },
+            generation: 7,
+        })
+        .unwrap();
+    let repair = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(action @ HeaderPortOperation::QueryVctRepairContext { .. }) =
+                actions.recv().await
+            {
+                break action;
+            }
+        }
+    })
+    .await;
+    assert!(repair.is_ok(), "a Status flood must not hide repair work");
+    shutdown.cancel();
+    running.await.unwrap();
+    flood.await.unwrap();
+    churn.await.unwrap();
+}
+
+/// Queued peer work uses the final snapshot's generation even after its sender closes.
+#[tokio::test(start_paused = true)]
+async fn queued_status_uses_final_closed_snapshot_generation() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let (peer, _outbound) = connect(&mut reactor, 0x71);
+    let target = block::Hash([0x78; 32]);
+    while handle
+        .try_send(Event::Status {
+            peer: peer.clone(),
+            session_id: 0,
+            status: status_for(&snapshot, target),
+        })
+        .is_ok()
+    {}
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    snapshot.header_generation = snapshot.header_generation.checked_next().unwrap();
+    snapshots.send(Some(snapshot.clone())).unwrap();
+    drop(snapshots);
+    let mut running = Box::pin(reactor.run());
+    assert!(futures::poll!(running.as_mut()).is_pending());
+    let scope = expect_locator_query(&mut actions, &peer, target);
+    assert_eq!(scope.header_generation, snapshot.header_generation);
+    shutdown.cancel();
+    running.await;
+}
+
+/// Closed watches deliver their final unseen values before a busy peer queue is drained.
+#[tokio::test(start_paused = true)]
+async fn saturated_status_queue_observes_final_closed_watch_values() {
+    for (close_snapshots, close_repairs) in [(true, false), (false, true), (true, true)] {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+            startup.anchor.0,
+            startup.anchor.1,
+        ));
+        let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        let (repairs, repairs_rx) = watch::channel(Default::default());
+        startup.committed_snapshots = Some(snapshots_rx);
+        startup.vct_root_repairs = Some(repairs_rx);
+        let (handle, mut actions, reactor) = build_header_sync_reactor(startup).unwrap();
+        // Stale-session events keep the queue ready without triggering other state reads.
+        while handle
+            .try_send(Event::Status {
+                peer: peer(),
+                session_id: 0,
+                status: status_for(&snapshot, snapshot.frontiers.header_best.hash),
+            })
+            .is_ok()
+        {}
+        snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x77; 32]));
+        snapshots.send(Some(snapshot.clone())).unwrap();
+        repairs
+            .send(zakura_header_chain::VctRootRepairStatus {
+                state: zakura_header_chain::VctRootRepairState::Unavailable {
+                    height: block::Height(1),
+                },
+                generation: 7,
+            })
+            .unwrap();
+        let _snapshots = (!close_snapshots).then_some(snapshots);
+        let _repairs = (!close_repairs).then_some(repairs);
+        let mut running = Box::pin(reactor.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(
+            handle.tip.borrow().1,
+            snapshot.frontiers.header_best.hash,
+            "the final snapshot is observed with closed watches {close_snapshots}/{close_repairs}"
+        );
+        assert!(
+            matches!(
+                actions.try_recv(),
+                Ok(HeaderPortOperation::QueryVctRepairContext { height, .. })
+                    if height == block::Height(1)
+            ),
+            "the final repair is observed with closed watches {close_snapshots}/{close_repairs}"
+        );
+        shutdown.cancel();
+        running.await;
+    }
+}
+
+/// The flood benchmark also covers the repair state that previously rebuilt the peer set.
+#[tokio::test(start_paused = true)]
+async fn status_flood_during_context_backoff_keeps_supplier_history() {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best.height = block::Height(1);
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let mut outputs = Vec::new();
+    for index in 1..=92 {
+        outputs.push(connect(&mut reactor, index));
+    }
+    reactor.observe_vct_root_repair(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: block::Height(1),
+        },
+        generation: 7,
+    });
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = actions.try_recv().unwrap()
+    else {
+        panic!("context read")
+    };
+    reactor.handle_vct_repair_context_ready(owner, VctRepairContextResult::Unavailable);
+    let before = reactor.vct_repair.current().unwrap().state.clone();
+    for _ in 0..602 {
+        for (peer, _) in &outputs {
+            reactor.handle_status(
+                peer.clone(),
+                0,
+                status_for(&snapshot, snapshot.frontiers.header_best.hash),
+            );
+        }
+    }
+    assert_eq!(reactor.vct_repair.current().unwrap().state, before);
+    assert!(actions.try_recv().is_err());
+}
+
+/// Measure the per-Status repair cost separately from Tokio's frozen retry deadlines.
+#[tokio::test(start_paused = true)]
+#[allow(clippy::print_stderr)]
+async fn active_repair_status_flood_cost() {
+    for peers in [16_u16, 92, 512] {
+        let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+        reactor.startup.config.peer_limits.max_inbound_peers = 512;
+        reactor.startup.config.peer_limits.max_outbound_peers = 512;
+        reactor.startup.committed_snapshots = None;
+        snapshot.frontiers.header_best =
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x40; 32]));
+        reactor.observe_latest_committed_snapshot(snapshot.clone());
+        let outputs: Vec<_> = (0..peers)
+            .map(|index| {
+                let mut id = vec![0xa5; 32];
+                id[..2].copy_from_slice(&index.to_le_bytes());
+                let peer = ZakuraPeerId::new(id).unwrap();
+                let (send, outbound) = framed_channel(8);
+                reactor.handle_peer_connected(PeerSession::from_parts(
+                    peer.clone(),
+                    send,
+                    CancellationToken::new(),
+                ));
+                (peer, outbound)
+            })
+            .collect();
+        ready_repair(&mut reactor, &mut actions, &snapshot);
+        let RepairPolicyState::Ready { context } =
+            reactor.vct_repair.current().unwrap().state.clone()
+        else {
+            panic!("ready repair")
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let phases = [
+            RepairPolicyState::QueryingContext {
+                deadline,
+                retry_at: deadline,
+            },
+            RepairPolicyState::ContextBackoff { retry_at: deadline },
+            RepairPolicyState::StateBlocked {
+                context: context.clone(),
+                state_version: snapshot.state_version,
+            },
+            RepairPolicyState::Assigned {
+                context: context.clone(),
+            },
+            RepairPolicyState::Completed,
+        ];
+        for (phase, state) in phases.into_iter().enumerate() {
+            reactor.vct_repair.current_mut().unwrap().state = state.clone();
+            let start = std::time::Instant::now();
+            for _ in 0..602 {
+                for (peer, _) in &outputs {
+                    reactor.handle_status(
+                        peer.clone(),
+                        0,
+                        status_for(&snapshot, snapshot.frontiers.header_best.hash),
+                    );
+                }
+            }
+            eprintln!(
+                "active_repair_status_flood peers={peers} phase={phase} ns_per_status={}",
+                start.elapsed().as_nanos() / (u128::from(peers) * 602)
+            );
+            assert_eq!(reactor.vct_repair.current().unwrap().state, state);
+            assert!(actions.try_recv().is_err());
+        }
+    }
+}
+
+/// Exercise the production QUIC handler, service pipe, and reactor at the default connection cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "92 loopback peers; explicit rollout load validation"]
+#[allow(clippy::print_stderr)]
+async fn production_ingress_status_flood_observes_snapshots() -> Result<(), crate::BoxError> {
+    use crate::zakura::{
+        testkit::{HostilePeer, ZakuraTestNode},
+        ZakuraLocalLimits, ZAKURA_CAP_HEADER_SYNC,
+    };
+    let _guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let anchor = (block::Height(0), network.genesis_hash());
+    let mut snapshot = committed_snapshot(zakura_header_chain::Frontier::new(anchor.0, anchor.1));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let limits = ZakuraLocalLimits::from_config(&crate::Config::default());
+    let node = ZakuraTestNode::builder(86100)
+        .limits(limits.clone())
+        // Loopback represents independently addressed peers in this load measurement.
+        .max_connections_per_ip(limits.max_connections)
+        .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
+        .header_sync_driver(
+            network.clone(),
+            anchor,
+            FullStateFrontiers {
+                finalized_height: anchor.0,
+                verified_block_tip: anchor.0,
+                verified_block_hash: anchor.1,
+            },
+            Some(anchor),
+        )
+        .header_snapshots(snapshots_rx)
+        .spawn()
+        .await?;
+    let mut actions = node.take_header_sync_actions().await.unwrap();
+    let mut outbound = Vec::new();
+    // Fill the reserved outbound connections with honest, idle nodes.
+    for index in 0..28_u64 {
+        let other = ZakuraTestNode::builder(86200 + index)
+            .supported_capabilities(ZAKURA_CAP_HEADER_SYNC)
+            .header_sync_driver(
+                network.clone(),
+                anchor,
+                FullStateFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .spawn()
+            .await?;
+        node.connect_native(&other, std::time::Duration::from_secs(10))
+            .await?;
+        outbound.push(other);
+    }
+    let mut peers = Vec::new();
+    for index in 0..64_u64 {
+        peers.push(Arc::new(
+            HostilePeer::connect_native_with_capabilities(
+                &node,
+                86300 + index,
+                ZAKURA_CAP_HEADER_SYNC,
+            )
+            .await?,
+        ));
+    }
+    let mut status = v9::test_support::status::<COMMON_HEADER_BYTES>(
+        zakura_header_chain::Frontier::new(anchor.0, anchor.1),
+    );
+    status.work_anchor_height = anchor.0;
+    status.work_anchor_hash = anchor.1;
+    status.suffix_cumulative_work = zakura_chain::work::difficulty::U256::zero();
+    let status = v9::CommonMessage::Status(status);
+    for peer in &peers {
+        peer.send_header_sync_message(&status).await?;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while {
+            let peers = node.header_sync().unwrap().peer_snapshot();
+            peers.inbound_peers + peers.outbound_peers < 92
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    while actions.try_recv().is_ok() {}
+    let stop = CancellationToken::new();
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut floods = Vec::new();
+    for peer in &peers[..63] {
+        let peer = peer.clone();
+        let status = status.clone();
+        let stop = stop.clone();
+        let sent = sent.clone();
+        floods.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    result = peer.send_header_sync_message(&status) => { if result.is_err() { break; } sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
+            }
+        }));
+    }
+    let began = std::time::Instant::now();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let mut tips = node.header_sync().unwrap().subscribe_tip();
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    snapshot.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x66; 32]));
+    let updated = std::time::Instant::now();
+    snapshots.send(Some(snapshot.clone())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while tips.borrow_and_update().1 != snapshot.frontiers.header_best.hash {
+            tips.changed().await.unwrap();
+        }
+    })
+    .await?;
+    let delay = updated.elapsed();
+    let honest = peers.last().unwrap();
+    let mut offered = v9::test_support::status::<COMMON_HEADER_BYTES>(
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x67; 32])),
+    );
+    offered.work_anchor_height = anchor.0;
+    offered.work_anchor_hash = anchor.1;
+    honest
+        .send_header_sync_message(&v9::CommonMessage::Status(offered))
+        .await?;
+    let honest_id = honest.id()?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(HeaderPortOperation::QueryHeaderLocator { peer, .. }) = actions.recv().await
+            {
+                if peer == honest_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await?;
+    eprintln!(
+        "production_ingress peers=92 statuses={} snapshot_delay={delay:?} elapsed={:?}",
+        sent.load(std::sync::atomic::Ordering::Relaxed),
+        began.elapsed()
+    );
+    stop.cancel();
+    for task in floods {
+        task.await?;
+    }
+    drop(peers);
+    node.shutdown().await;
+    for other in outbound {
+        other.shutdown().await;
+    }
+    Ok(())
 }

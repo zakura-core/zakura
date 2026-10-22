@@ -1591,6 +1591,7 @@ where
                 minimum_peer_version,
                 is_protected_peer,
             )
+            .boxed()
             .await
             {
                 Ok(info) => {
@@ -1647,6 +1648,7 @@ where
                     peer_registry.as_ref(),
                     &address_book_updater,
                 )
+                .boxed()
                 .await
                 {
                     Ok(

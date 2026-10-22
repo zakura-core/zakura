@@ -1,12 +1,12 @@
 //! Ownership from provisional download reservation through the request write.
 
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc, Weak,
-};
+use std::sync::{Arc, Weak};
 
-use tokio_util::sync::CancellationToken;
 use zakura_header_chain::BodyWorkOwner;
+use zakura_rt::sync::{
+    atomic::{AtomicU8, Ordering},
+    CancellationToken,
+};
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};

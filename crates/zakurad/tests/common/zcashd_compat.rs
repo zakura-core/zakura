@@ -7,10 +7,13 @@
 
 use std::{net::SocketAddr, path::Path};
 
+use bytes::Bytes;
 use eyre::{eyre, Result};
-use reqwest::Client;
 use serde::de::DeserializeOwned;
-use zakura_node_services::BoxError;
+use zakura_node_services::{
+    rpc_client::{RpcRequestClient, RpcRequestError},
+    BoxError,
+};
 
 pub mod chain;
 pub mod config;
@@ -85,20 +88,16 @@ pub fn zakura_skip_zcashd_compat_tests() -> bool {
 /// Used to talk to zcashd's own RPC endpoint (which requires credentials).
 #[derive(Clone, Debug)]
 pub struct ZcashdRpcClient {
-    client: Client,
+    client: RpcRequestClient,
     addr: SocketAddr,
-    user: String,
-    pass: String,
 }
 
 impl ZcashdRpcClient {
     /// Creates a new client using explicit username and password credentials.
     pub fn new(addr: SocketAddr, user: impl Into<String>, pass: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: RpcRequestClient::new(addr).with_basic_auth(&user.into(), &pass.into()),
             addr,
-            user: user.into(),
-            pass: pass.into(),
         }
     }
 
@@ -118,18 +117,8 @@ impl ZcashdRpcClient {
         &self,
         method: impl AsRef<str>,
         params: impl AsRef<str>,
-    ) -> reqwest::Result<reqwest::Response> {
-        let method = method.as_ref();
-        let params = params.as_ref();
-        self.client
-            .post(format!("http://{}", self.addr))
-            .basic_auth(&self.user, Some(&self.pass))
-            .header("Content-Type", "application/json")
-            .body(format!(
-                r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":123}}"#
-            ))
-            .send()
-            .await
+    ) -> std::result::Result<hyper::Response<Bytes>, RpcRequestError> {
+        self.client.call(method, params).await
     }
 
     /// Returns the RPC address this client is configured to connect to.
@@ -147,7 +136,7 @@ impl ZcashdRpcClient {
         method: impl AsRef<str>,
         params: impl AsRef<str>,
     ) -> std::result::Result<T, BoxError> {
-        let text = self.call(method, params).await?.text().await?;
+        let text = self.client.text_from_call(method, params).await?;
         let mut response: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)?;
         match response.remove("error") {
             Some(error) if !error.is_null() => Err(error.to_string().into()),

@@ -1,21 +1,18 @@
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet, VecDeque},
-    future::Future,
-    num::NonZeroU64,
-    panic::AssertUnwindSafe,
+    cell::Cell, collections::VecDeque, future::Future, num::NonZeroU64, panic::AssertUnwindSafe,
     pin::Pin,
 };
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-    time::{self, Instant},
-};
 use zakura_chain::block;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{mpsc, watch, Semaphore},
+    task::JoinHandle,
+    time::{self, Instant},
+};
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES},
@@ -49,6 +46,71 @@ struct SchedulingOpportunity {
     claimed_headers: usize,
     available_locators: usize,
     resource_stalled: bool,
+}
+
+/// Full cached-offer passes the reactor may run back to back.
+///
+/// A pass clones and sorts every idle offer. One peer whose statuses keep
+/// changing its own unstarted target changes the scheduling key on every
+/// message, so without a budget it could buy one such pass per message.
+/// Past the burst, passes refill one per [`CACHED_PASS_REFILL`].
+const CACHED_PASS_BURST: u32 = 32;
+
+/// The interval that refills one full cached-offer pass.
+const CACHED_PASS_REFILL: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A token bucket of full cached-offer passes; see [`CACHED_PASS_BURST`].
+#[derive(Clone, Copy, Debug)]
+struct CachedPassBudget {
+    passes: u32,
+    refilled_at: Instant,
+}
+
+impl CachedPassBudget {
+    /// A full bucket at `now`.
+    fn new(now: Instant) -> Self {
+        Self {
+            passes: CACHED_PASS_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Refill for the time since the last refill, then take one pass if any
+    /// is left.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let refills = elapsed.as_nanos() / CACHED_PASS_REFILL.as_nanos();
+        if refills > 0 {
+            // At most the burst refills count, which fits u32.
+            let refills = u32::try_from(refills.min(u128::from(CACHED_PASS_BURST)))
+                .expect("the burst fits u32");
+            self.passes = self.passes.saturating_add(refills).min(CACHED_PASS_BURST);
+            self.refilled_at = if self.passes == CACHED_PASS_BURST {
+                now
+            } else {
+                self.refilled_at + CACHED_PASS_REFILL * refills
+            };
+        }
+        let Some(passes) = self.passes.checked_sub(1) else {
+            return false;
+        };
+        self.passes = passes;
+        true
+    }
+
+    /// Restart the refill clock when a pass ends at `now`.
+    ///
+    /// Time spent scanning earns no refill. Otherwise a pass that takes a whole
+    /// refill interval would pay for the next one, and passes could run back to
+    /// back.
+    fn finish_pass(&mut self, now: Instant) {
+        self.refilled_at = self.refilled_at.max(now);
+    }
+
+    /// When the next pass refills.
+    fn next_refill(&self) -> Instant {
+        self.refilled_at + CACHED_PASS_REFILL
+    }
 }
 
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
@@ -139,7 +201,13 @@ fn build_header_sync_reactor(
     }
 
     let (events_tx, events_rx) = mpsc::channel(128);
-    let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+    let (lifecycle_tx, lifecycle_rx) = super::events::LifecycleSender::channel(
+        startup
+            .config
+            .peer_limits
+            .max_inbound_peers
+            .saturating_add(startup.config.peer_limits.max_outbound_peers),
+    );
     let (actions_tx, actions_rx) = mpsc::channel(128);
     let initial_tip = startup.best_header_tip.unwrap_or(startup.anchor);
     let (tip_tx, tip_rx) = watch::channel(initial_tip);
@@ -182,6 +250,7 @@ fn build_header_sync_reactor(
         serving: v9::serving_capacity(),
         page_limits,
     };
+    let header_bytes = header_sync_header_bytes_for_network(&startup.network);
     let mut reactor = HeaderSyncReactor {
         startup,
         events: events_rx,
@@ -189,15 +258,18 @@ fn build_header_sync_reactor(
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
         pending_locator_queries: HashSet::new(),
-        locator_capacity: std::sync::Arc::new(tokio::sync::Semaphore::new(
+        locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
         scheduling_revision: 0,
         last_scheduling_opportunity: None,
+        cached_pass_budget: CachedPassBudget::new(Instant::now()),
+        cached_pass_deferred: false,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
+        header_bytes,
         page_limits,
         committed_snapshot,
         vct_repair_status,
@@ -293,20 +365,28 @@ impl PrunedBackoff {
 struct HeaderSyncReactor {
     startup: HeaderSyncStartup,
     events: mpsc::Receiver<Event>,
-    lifecycle: mpsc::UnboundedReceiver<Event>,
+    lifecycle: mpsc::Receiver<super::events::LifecycleEvent>,
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
     /// Peers with one direct continuation-locator read currently in flight.
     pending_locator_queries: HashSet<ZakuraPeerId>,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
-    locator_capacity: std::sync::Arc<tokio::sync::Semaphore>,
+    locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
     scheduling_revision: u64,
     last_scheduling_opportunity: Option<SchedulingOpportunity>,
+    cached_pass_budget: CachedPassBudget,
+    /// A changed key whose pass waits for [`Self::cached_pass_budget`] to refill.
+    cached_pass_deferred: bool,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
+    /// One header's wire size on this network, fixed for the reactor's life.
+    ///
+    /// Checking a configured testnet for Regtest builds its parameters, and
+    /// every headroom check needs this, so it is computed once.
+    header_bytes: usize,
     /// The serving limits this node advertises in its `Status`.
     page_limits: PageLimits,
     committed_snapshot: Option<zakura_header_chain::EngineSnapshot>,
@@ -744,10 +824,57 @@ impl HeaderSyncReactor {
                 self.startup.shutdown.cancelled().await;
                 break HeaderRequestTerminal::Shutdown;
             }
+            if self.startup.shutdown.is_cancelled() {
+                break HeaderRequestTerminal::Shutdown;
+            }
+            // Retire already-ready state operations before any event can enforce
+            // their hard deadlines. Bound this pass to the current operation set.
+            for _ in 0..self.pending_port_operations.len() {
+                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
+                else {
+                    break;
+                };
+                self.handle_port_completion(completion);
+            }
+            // Inspect watches on every turn, even when peer queues never become empty.
+            // `changed` delivers a final unseen value before reporting channel closure.
+            if let Some(snapshots) = committed_snapshots.as_mut() {
+                match snapshots.changed().now_or_never() {
+                    Some(Ok(())) => {
+                        let snapshot = snapshots.borrow_and_update().clone();
+                        if let Some(snapshot) = snapshot {
+                            self.observe_latest_committed_snapshot(snapshot);
+                        }
+                    }
+                    Some(Err(_)) => committed_snapshots = None,
+                    None => {}
+                }
+            }
+            if let Some(repairs) = vct_root_repairs.as_mut() {
+                match repairs.changed().now_or_never() {
+                    Some(Ok(())) => {
+                        let status = *repairs.borrow_and_update();
+                        self.observe_vct_root_repair(status);
+                    }
+                    Some(Err(_)) => vct_root_repairs = None,
+                    None => {}
+                }
+            }
+            // One item from each queue per turn prevents either queue monopolizing the loop.
+            // Session readers wait for connection acknowledgement before publishing peer events.
+            let mut handled_event = false;
+            if let Ok(event) = self.lifecycle.try_recv() {
+                self.handle_lifecycle(event);
+                handled_event = true;
+            }
+            if let Ok(event) = self.events.try_recv() {
+                self.handle_event(event);
+                handled_event = true;
+            }
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => break HeaderRequestTerminal::Shutdown,
                 completion = async {
@@ -768,13 +895,14 @@ impl HeaderSyncReactor {
                 _ = capacity_releases.changed() => {},
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
                 event = self.lifecycle.recv() => match event {
-                    Some(event) => self.handle_event(event),
+                    Some(event) => self.handle_lifecycle(event),
                     None => break HeaderRequestTerminal::Shutdown,
                 },
                 event = self.events.recv() => match event {
                     Some(event) => self.handle_event(event),
                     None => break HeaderRequestTerminal::Shutdown,
                 },
+                _ = zakura_rt::task::yield_now(), if handled_event => {},
                 changed = async {
                     match committed_snapshots.as_mut() {
                         Some(snapshots) => snapshots.changed().await,
@@ -812,6 +940,12 @@ impl HeaderSyncReactor {
             self.schedule_cached_statuses();
         };
         self.retire_all_peer_work(terminal_outcome);
+    }
+
+    /// Acknowledge admission only after the reactor has installed or refused the session.
+    fn handle_lifecycle(&mut self, event: super::events::LifecycleEvent) {
+        self.handle_event(event.event);
+        let _ = event.applied.send(());
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -1207,6 +1341,10 @@ impl HeaderSyncReactor {
 
     /// Stage idle unspent offers only after an eligibility input changes.
     fn schedule_cached_statuses(&mut self) {
+        // Only a pass refused by the budget below waits for its refill. Every
+        // other return either has nothing to do or waits for its own wakeup, so
+        // a stale refill deadline would spin the loop.
+        self.cached_pass_deferred = false;
         let opportunity = self.scheduling_opportunity();
         if self.last_scheduling_opportunity == Some(opportunity) {
             return;
@@ -1223,6 +1361,11 @@ impl HeaderSyncReactor {
             // Cached offers can become idle without a fresh dispatch refusal.
             // Arm the wakeup even when we skip their scan at exhausted capacity.
             self.locator_capacity_waiting = true;
+            return;
+        }
+        if !self.cached_pass_budget.try_take(Instant::now()) {
+            // The key stays uncached, so the pass after the refill scans.
+            self.cached_pass_deferred = true;
             return;
         }
         let peers = self.peer_state.len();
@@ -1251,7 +1394,7 @@ impl HeaderSyncReactor {
                 Some((priority, peer.clone(), target))
             })
             .collect();
-        offers.sort_by(
+        offers.sort_unstable_by(
             |(left_priority, left_peer, _), (right_priority, right_peer, _)| {
                 right_priority
                     .cmp(left_priority)
@@ -1272,6 +1415,7 @@ impl HeaderSyncReactor {
             }
             self.consider_advertised_header_target(peer, target.session_id, target.status);
         }
+        self.cached_pass_budget.finish_pass(Instant::now());
         // Retain the pre-pass key: an external lease can drop while we scan.
         // Recording a fresh key here would swallow that release's wakeup.
         self.last_scheduling_opportunity = Some(opportunity);
@@ -1442,7 +1586,7 @@ impl HeaderSyncReactor {
             AuxSchema::None
         };
         let byte_limited_count = v9::page_capacity(
-            header_sync_header_bytes_for_network(&self.startup.network),
+            self.header_bytes,
             tree_aux_schema,
             usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                 .unwrap_or(usize::MAX),
@@ -3123,16 +3267,17 @@ impl HeaderSyncReactor {
     }
 
     fn prune_vct_supplier_history(&mut self) {
+        // Membership changes invalidate supplier history. Status updates do not.
+        let Some(task) = self.vct_repair.current_mut() else {
+            return;
+        };
         let connected_sources: HashSet<_> =
             self.peer_state.keys().map(source_id_from_peer).collect();
-        if let Some(task) = self.vct_repair.current_mut() {
-            task.retain_connected_sources(&connected_sources);
-        }
+        task.retain_connected_sources(&connected_sources);
     }
 
     fn try_assign_vct_repair(&mut self) {
         let now = Instant::now();
-        self.prune_vct_supplier_history();
         if let Some(task) = self.vct_repair.current_mut() {
             task.resume_retry(now);
         }
@@ -3177,7 +3322,7 @@ impl HeaderSyncReactor {
                 .and_then(|distance| distance.checked_add(1))
                 .unwrap_or(0);
             let message_capacity = v9::page_capacity(
-                header_sync_header_bytes_for_network(&self.startup.network),
+                self.header_bytes,
                 AuxSchema::V1,
                 usize::try_from(status.max_message_bytes.min(self.page_limits.max_bytes))
                     .unwrap_or(usize::MAX),
@@ -3562,6 +3707,10 @@ impl HeaderSyncReactor {
             )
             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
             .chain(
+                self.cached_pass_deferred
+                    .then(|| self.cached_pass_budget.next_refill()),
+            )
+            .chain(
                 self.vct_local_operation
                     .as_ref()
                     .filter(|operation| !operation.fatal_sent)
@@ -3746,7 +3895,7 @@ impl HeaderSyncReactor {
             .keys()
             .filter_map(node_id_from_peer)
             .collect();
-        admitted_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        admitted_node_ids.sort_unstable();
         admitted_node_ids.dedup();
         let now = Instant::now();
         let mut backed_off_node_ids: Vec<_> = self
@@ -3755,7 +3904,7 @@ impl HeaderSyncReactor {
             .filter(|(_, until)| **until > now)
             .filter_map(|(peer, _)| node_id_from_peer(peer))
             .collect();
-        backed_off_node_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        backed_off_node_ids.sort_unstable();
         backed_off_node_ids.dedup();
         let tip = *self.tip.borrow();
         let _ = self.candidates.send(ZakuraHeaderSyncCandidateState {
@@ -4059,7 +4208,7 @@ impl HeaderSyncReactor {
                     target_tip_hash: _,
                     scope,
                 } => Box::pin(async move {
-                    let locator = match tokio::time::timeout(
+                    let locator = match zakura_rt::time::timeout(
                         request_timeout,
                         header_chain.continuation_locator(
                             locator_permit
@@ -4087,7 +4236,7 @@ impl HeaderSyncReactor {
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
                     Box::pin(async move {
-                        let result = match tokio::time::timeout(
+                        let result = match zakura_rt::time::timeout(
                             request_timeout,
                             header_chain.vct_repair_context(owner, height),
                         )

@@ -19,7 +19,8 @@ use crate::{
     EligibilityState, EngineConfig, EngineMode, EvidenceId, FinalityEpoch, FinalityRecord,
     FinalitySource, Frontier, FullStateFinalityProvenance, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderValidationState, HeaderWorkAuthority, HeaderWorkOwner,
-    SourceId, StateVersion, StoreAuditSnapshot, StoreError, SuffixWork, WorkCoordinate,
+    SourceId, StateVersion, StoreAuditSnapshot, StoreError, SuffixWork, SystemClock,
+    WorkCoordinate,
 };
 
 #[test]
@@ -127,7 +128,7 @@ fn headers_only_recovery_rejects_an_unsettled_selected_suffix() {
     store.finality[0].source = FinalitySource::MigratedHeadersOnly;
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Source {
             violations: vec![AuditViolation::Finality],
         })
@@ -287,7 +288,7 @@ fn propagates_every_store_audit_read_error() {
         store.failed_read = Some(failed_read);
 
         assert_eq!(
-            audit_store(&store, &config),
+            audit_store(&store, &config, &SystemClock),
             Err(RecoveryFailure::Store(injected_store_error())),
             "{failed_read:?}"
         );
@@ -333,7 +334,7 @@ fn rejects_invalid_verified_paths_in_both_modes() {
         }
 
         assert_eq!(
-            audit_store(&store, &config),
+            audit_store(&store, &config, &SystemClock),
             Err(RecoveryFailure::Source {
                 violations: vec![AuditViolation::ProtectedPath(child.hash)],
             }),
@@ -365,7 +366,7 @@ fn rejects_an_ineligible_integrated_verified_projection() {
     store.metadata.header_best_score = ChainScore::new(SuffixWork::zero(), anchor.hash);
     store.snapshot = store.metadata.snapshot();
 
-    let plan = audit_store(&store, &config)
+    let plan = audit_store(&store, &config, &SystemClock)
         .expect("an ineligible verified side branch remains valid outside the verified projection");
     assert!(matches!(
         plan.header_nodes
@@ -380,7 +381,7 @@ fn rejects_an_ineligible_integrated_verified_projection() {
     store.snapshot = store.metadata.snapshot();
     store.verified = vec![anchor, child];
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Source {
             violations: vec![AuditViolation::ProtectedPath(child.hash)],
         })
@@ -424,7 +425,7 @@ fn rebased_work_origin_requires_finality_history_and_canonical_authentication() 
         ));
     store.snapshot = store.metadata.snapshot();
 
-    audit_store(&store, &config).expect("the authenticated rebased origin recovers");
+    audit_store(&store, &config, &SystemClock).expect("the authenticated rebased origin recovers");
 
     store
         .canonical
@@ -498,7 +499,8 @@ fn disk_migration_preserves_a_rebased_work_origin_below_the_migrated_frontier() 
     store.canonical.insert(grandchild.height, grandchild.hash);
     store.snapshot = store.metadata.snapshot();
 
-    audit_store(&store, &config).expect("a v3 disk migration keeps an earlier rebased work origin");
+    audit_store(&store, &config, &SystemClock)
+        .expect("a v3 disk migration keeps an earlier rebased work origin");
 
     store
         .canonical
@@ -558,7 +560,8 @@ fn migrated_finality_requires_an_explicit_integrated_migration_boundary() {
 
     store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(0));
     store.snapshot = store.metadata.snapshot();
-    audit_store(&store, &config).expect("the explicit migration boundary authenticates the prefix");
+    audit_store(&store, &config, &SystemClock)
+        .expect("the explicit migration boundary authenticates the prefix");
 
     store.metadata.headers_only_migration_epoch = Some(FinalityEpoch::new(1));
     store.snapshot = store.metadata.snapshot();
@@ -604,7 +607,8 @@ fn migrated_finality_is_rejected_after_the_migration_boundary() {
         height: anchor.height,
     }];
 
-    audit_store(&store, &config).expect("full-state provenance after the boundary audits cleanly");
+    audit_store(&store, &config, &SystemClock)
+        .expect("full-state provenance after the boundary audits cleanly");
 
     store.finality[1].source = FinalitySource::MigratedHeadersOnly;
     assert!(violations(&store, &config).contains(&AuditViolation::Finality));
@@ -619,7 +623,7 @@ fn recovery_rejects_an_extra_node_before_decoding_rows() {
     store.failed_read = Some(AuditRead::HeaderNodes);
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::HeaderNodes,
             limit: crate::RowLimit::new(2),
@@ -638,7 +642,7 @@ fn resource_alarm_does_not_exempt_the_startup_node_limit() {
     store.failed_read = Some(AuditRead::HeaderNodes);
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::HeaderNodes,
             limit: crate::RowLimit::new(2),
@@ -671,7 +675,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
     store.failed_read = Some(AuditRead::AuxDeliveries);
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::AuxiliaryDeliveries,
             limit: crate::RowLimit::new(1),
@@ -689,7 +693,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
     store.failed_read = Some(AuditRead::ValidationContexts);
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::ValidationContexts,
             limit: crate::RowLimit::new(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN),
@@ -705,7 +709,7 @@ fn fatal_configuration_mismatch_fails_before_collection_visit() {
     store.failed_read = Some(AuditRead::HeaderNodes);
 
     assert_eq!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Source {
             violations: vec![AuditViolation::Configuration],
         })
@@ -717,7 +721,7 @@ fn policy_mismatch_updates_digest_only_after_source_audit() {
     let (mut store, config) = fixture();
     store.metadata.network_policy_digest[0] ^= 1;
     store.snapshot = store.metadata.snapshot();
-    let plan = audit_store(&store, &config).expect("a digest mismatch is diagnostic");
+    let plan = audit_store(&store, &config, &SystemClock).expect("a digest mismatch is diagnostic");
     assert!(plan
         .repairs
         .contains(&RecoveryRepair::NetworkPolicyConfiguration));
@@ -748,10 +752,11 @@ fn bounded_finality_history_continues_from_the_bootstrap_checkpoint() {
     store.metadata.finality_epoch = FinalityEpoch::new(1);
     store.snapshot = store.metadata.snapshot();
 
-    audit_store(&store, &config).expect("the authenticated checkpoint continues finality audit");
+    audit_store(&store, &config, &SystemClock)
+        .expect("the authenticated checkpoint continues finality audit");
 
     store.canonical.remove(&anchor.height);
-    audit_store(&store, &config)
+    audit_store(&store, &config, &SystemClock)
         .expect("the configured bootstrap anchor authenticates its checkpoint directly");
 }
 
@@ -1041,13 +1046,14 @@ fn recovery_authenticates_headers_only_selected_tip_witness() {
     use std::sync::atomic::Ordering;
 
     let (store, config, _) = headers_only_depth_history_fixture();
-    audit_store(&store, &config).expect("the retained selected-tip witness recovers");
+    audit_store(&store, &config, &SystemClock).expect("the retained selected-tip witness recovers");
     // The witness sits above the finalized frontier, so only the frontier itself is read from
     // the canonical index, which does not cover unsettled heights.
     assert_eq!(store.canonical_reads.load(Ordering::Relaxed), 1);
 
     let (settled, settled_config, _) = settled_headers_only_depth_history_fixture();
-    audit_store(&settled, &settled_config).expect("the settled selected-tip witness recovers");
+    audit_store(&settled, &settled_config, &SystemClock)
+        .expect("the settled selected-tip witness recovers");
     assert_eq!(settled.canonical_reads.load(Ordering::Relaxed), 2);
 }
 
@@ -1055,7 +1061,7 @@ fn recovery_authenticates_headers_only_selected_tip_witness() {
 fn recovery_authenticates_historical_witnesses_against_the_current_frontier() {
     let (store, config, _) = historical_headers_only_depth_history_fixture();
 
-    audit_store(&store, &config)
+    audit_store(&store, &config, &SystemClock)
         .expect("retained historical witnesses descend to the current finalized frontier");
 }
 
@@ -1173,7 +1179,7 @@ fn audits_each_normative_invariant() {
         evidence,
         rule,
     });
-    let plan = audit_store(&store, &config)
+    let plan = audit_store(&store, &config, &SystemClock)
         .expect("body invalidity is authoritative without an eligibility reason");
     assert_eq!(
         plan.selected_projection,
@@ -1256,7 +1262,7 @@ fn audits_each_normative_invariant() {
     let mut oversized = base.clone();
     oversized.nodes.push(oversized.nodes[1].clone());
     assert_eq!(
-        audit_store(&oversized, &limited),
+        audit_store(&oversized, &limited, &SystemClock),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::HeaderNodes,
             limit: crate::RowLimit::new(2),

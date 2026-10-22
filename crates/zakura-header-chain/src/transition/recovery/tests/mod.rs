@@ -23,8 +23,8 @@ use crate::{
     ConsensusInvalidBodyTombstone, EligibilityReason, EligibilityState, EngineMetadata, EngineMode,
     EngineSnapshot, FinalityEpoch, FinalityRecord, Frontier, FrontierSet, HeaderChainDiskVersion,
     HeaderGeneration, HeaderNode, HeaderValidationState, RowLimit, StateVersion, StoreCollection,
-    StoreError, SuffixWork, TrustedAnchor, UntrustedAuxDeliveryRow, VerifiedGeneration,
-    WorkCoordinate,
+    StoreError, SuffixWork, SystemClock, TrustedAnchor, UntrustedAuxDeliveryRow,
+    VerifiedGeneration, WorkCoordinate,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -455,7 +455,7 @@ pub(super) fn injected_store_error() -> StoreError {
 }
 
 pub(super) fn violations(store: &AuditStore, config: &EngineConfig) -> Vec<AuditViolation> {
-    match audit_store(store, config) {
+    match audit_store(store, config, &SystemClock) {
         Err(RecoveryFailure::Source { violations }) => violations,
         other => panic!("expected source audit failure, got {other:?}"),
     }

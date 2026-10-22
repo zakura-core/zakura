@@ -11,7 +11,7 @@ mod tests;
 
 use chrono::{DateTime, Utc};
 
-use crate::EngineConfig;
+use crate::{Clock, EngineConfig};
 
 pub use contracts::{
     AuditViolation, RecoveryFailure, RecoveryPlan, RecoveryRepair, StoreAuditRead,
@@ -23,12 +23,14 @@ use phases::load_pre_audit_store_rows;
 use reconstruction::reconstruct_derived_views;
 use repair::classify_and_plan;
 
-/// Audit authoritative rows and derive only reconstructible repairs.
+/// Audit authoritative rows and derive only reconstructible repairs, at
+/// `clock`'s consensus-local time.
 pub fn audit_store<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,
+    clock: &dyn Clock,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
-    audit_store_at_with_policy(store, config, Utc::now(), false)
+    audit_store_at_with_policy(store, config, clock.now(), false)
 }
 
 /// Audit authoritative rows using an injected consensus-local recovery time.
@@ -45,12 +47,13 @@ pub fn audit_store_at<S: StoreAuditRead>(
 /// policy digest differs. A policy digest mismatch alone never rejects the store.
 ///
 /// The path rejects mode, network, disk format, bootstrap origin, checkpoint, and source-row
-/// mismatches.
+/// mismatches. Like [`audit_store`], it reads the time from `clock`.
 pub fn audit_store_for_trust_anchor_update<S: StoreAuditRead>(
     store: &S,
     config: &EngineConfig,
+    clock: &dyn Clock,
 ) -> Result<RecoveryPlan, RecoveryFailure> {
-    audit_store_at_with_policy(store, config, Utc::now(), true)
+    audit_store_at_with_policy(store, config, clock.now(), true)
 }
 
 fn audit_store_at_with_policy<S: StoreAuditRead>(

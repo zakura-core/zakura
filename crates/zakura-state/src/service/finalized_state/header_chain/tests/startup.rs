@@ -556,7 +556,7 @@ fn rocksdb_recovery_rejects_a_forged_headers_only_witness() {
         .expect("the independent canonical finalized row encodes");
     db.write(canonical)
         .expect("the independent canonical finalized row commits");
-    audit_store(&runtime.store, &engine_config)
+    audit_store(&runtime.store, &engine_config, &SystemClock)
         .expect("the exact headers-only selected-tip witness recovers");
 
     let witness_key = HeaderFinalityWitnessKey {

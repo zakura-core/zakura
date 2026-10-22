@@ -12,13 +12,14 @@ use super::super::{
 use super::fixture;
 use crate::{
     BodyUnavailableSummary, BodyValidationState, CheckpointSet, EngineMode, Frontier,
-    HeaderGeneration, StateVersion, VerifiedGeneration,
+    HeaderGeneration, StateVersion, SystemClock, VerifiedGeneration,
 };
 
 #[test]
 fn coherent_source_and_indexes_need_no_recovery_write() {
     let (store, config) = fixture();
-    let plan = audit_store(&store, &config).expect("the coherent fixture audits cleanly");
+    let plan =
+        audit_store(&store, &config, &SystemClock).expect("the coherent fixture audits cleanly");
     assert!(plan.is_clean());
     assert_eq!(plan.metadata, store.metadata);
 }
@@ -33,11 +34,11 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
     );
 
     assert!(matches!(
-        audit_store(&store, &config),
+        audit_store(&store, &config, &SystemClock),
         Err(RecoveryFailure::Source { violations })
             if violations == vec![AuditViolation::Configuration]
     ));
-    let plan = audit_store_for_trust_anchor_update(&store, &config)
+    let plan = audit_store_for_trust_anchor_update(&store, &config, &SystemClock)
         .expect("a future checkpoint extension can rebind an otherwise coherent store");
     assert_eq!(
         plan.repairs,
@@ -64,14 +65,14 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
 
     store.metadata = plan.metadata;
     store.snapshot = store.metadata.snapshot();
-    assert!(audit_store(&store, &config)
+    assert!(audit_store(&store, &config, &SystemClock)
         .expect("the rebound store passes the strict audit")
         .is_clean());
 
     let mut wrong_mode = config.clone();
     wrong_mode.mode = EngineMode::HeadersOnly;
     assert!(matches!(
-        audit_store_for_trust_anchor_update(&store, &wrong_mode),
+        audit_store_for_trust_anchor_update(&store, &wrong_mode, &SystemClock),
         Err(RecoveryFailure::Source { violations })
             if violations.contains(&AuditViolation::Configuration)
     ));
@@ -85,7 +86,7 @@ fn trust_anchor_update_rebinds_only_after_current_pins_audit() {
         .expect("the conflicting checkpoint is unique"),
     );
     assert!(matches!(
-        audit_store_for_trust_anchor_update(&store, &conflicting),
+        audit_store_for_trust_anchor_update(&store, &conflicting, &SystemClock),
         Err(RecoveryFailure::Source { violations })
             if violations.iter().any(|violation| matches!(violation, AuditViolation::TrustPin(_, _)))
     ));
@@ -102,7 +103,8 @@ fn body_unavailability_alarm_is_reconstructed_from_the_selected_node() {
     };
     store.nodes[1].body_validation_state = BodyValidationState::Unavailable(summary);
 
-    let plan = audit_store(&store, &config).expect("the derived alarm is reconstructible");
+    let plan =
+        audit_store(&store, &config, &SystemClock).expect("the derived alarm is reconstructible");
     assert_eq!(
         plan.repairs,
         BTreeSet::from([RecoveryRepair::BodyAvailabilityAlarm])
@@ -122,7 +124,8 @@ fn repairs_retention_metadata_without_advancing_projection_generations() {
     store.metadata.oldest_retained_height = store.metadata.frontiers.header_best.height;
     store.snapshot = store.metadata.snapshot();
 
-    let plan = audit_store(&store, &config).expect("retention metadata is reconstructible");
+    let plan =
+        audit_store(&store, &config, &SystemClock).expect("retention metadata is reconstructible");
 
     assert_eq!(
         plan.repairs,
@@ -168,7 +171,7 @@ fn fails_closed_when_each_repair_counter_is_exhausted() {
         }
         store.snapshot = store.metadata.snapshot();
 
-        let error = match audit_store(&store, &config) {
+        let error = match audit_store(&store, &config, &SystemClock) {
             Err(RecoveryFailure::Counter(error)) => error,
             other => panic!("expected {label} exhaustion, got {other:?}"),
         };
@@ -190,7 +193,8 @@ fn recompute_not_cached_projection() {
     store.deferred.push((Utc::now(), child_hash));
     store.nodes[1].eligibility.inherited_from = Some(anchor.hash);
 
-    let plan = audit_store(&store, &config).expect("cache corruption is reconstructible");
+    let plan =
+        audit_store(&store, &config, &SystemClock).expect("cache corruption is reconstructible");
     assert_eq!(
         plan.repairs,
         BTreeSet::from([

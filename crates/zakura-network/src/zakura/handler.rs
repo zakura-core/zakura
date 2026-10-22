@@ -2036,7 +2036,7 @@ impl ServiceSessionState {
                 self.install_demand_wait(
                     waits,
                     Box::pin(async move {
-                        zakura_rt::time::sleep_until(at.into()).await;
+                        zakura_rt::time::sleep_until(at).await;
                     }),
                 );
             }
@@ -8968,7 +8968,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(waits.len(), 1);
@@ -8995,7 +8995,7 @@ mod tests {
         );
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.reopen_attempts, 1);
@@ -9014,7 +9014,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
 
         assert_eq!(session.schedule_transport_backoff(&mut waits), None);
@@ -9034,7 +9034,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         session.schedule_demand(&mut waits, SessionDemand::Retire);
 
@@ -9092,7 +9092,7 @@ mod tests {
 
         session.schedule_demand(
             &mut waits,
-            SessionDemand::RetryAt(std::time::Instant::now() + Duration::from_secs(60)),
+            SessionDemand::RetryAt(Instant::now() + Duration::from_secs(60)),
         );
         tokio::time::advance(Duration::from_secs(60)).await;
         let (kind, ()) = waits

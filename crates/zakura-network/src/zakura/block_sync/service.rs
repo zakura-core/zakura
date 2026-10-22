@@ -463,7 +463,8 @@ impl BlockSyncService {
         reserved: bool,
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
-            return SessionDemand::RetryAt(deadline);
+            // Block sync still runs on std's clock.
+            return SessionDemand::RetryAt(deadline.into());
         }
 
         if !reserved && self.inner.routine_wiring.is_some() {

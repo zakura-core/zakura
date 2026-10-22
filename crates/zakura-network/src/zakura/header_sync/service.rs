@@ -8,6 +8,7 @@ use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
     task::JoinHandle,
+    time::Instant,
 };
 
 use super::{
@@ -629,9 +630,7 @@ impl Service for HeaderSyncService {
         {
             // The reactor publishes the backed-off set without per-node deadlines.
             // The service re-offers each target after one conservative backoff window.
-            return SessionDemand::RetryAt(
-                std::time::Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF,
-            );
+            return SessionDemand::RetryAt(Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF);
         }
 
         SessionDemand::OpenNow

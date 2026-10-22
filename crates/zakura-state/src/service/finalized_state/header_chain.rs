@@ -4233,7 +4233,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let plan = audit_store_for_trust_anchor_update(&self, config)?;
+        let plan = audit_store_for_trust_anchor_update(&self, config, &SystemClock)?;
         if let Some(pin) = plan.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -4291,7 +4291,8 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let source = audit_store_for_trust_anchor_update(&self, &headers_only_config)?;
+        let source =
+            audit_store_for_trust_anchor_update(&self, &headers_only_config, &SystemClock)?;
         if let Some(pin) = source.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -4327,7 +4328,7 @@ impl HeaderChainStore {
         self.put_value(&mut batch, HEADER_ENGINE_META, METADATA_KEY, &metadata)?;
         self.db.write(batch)?;
 
-        let target = audit_store(&self, integrated_config)?;
+        let target = audit_store(&self, integrated_config, &SystemClock)?;
         repairs.extend(target.repairs.iter().copied());
         if !target.is_clean() {
             self.db.write(self.recovery_batch(&target)?)?;
@@ -4370,7 +4371,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let initial = audit_store_for_trust_anchor_update(&self, config)?;
+        let initial = audit_store_for_trust_anchor_update(&self, config, &SystemClock)?;
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -4406,7 +4407,7 @@ impl HeaderChainStore {
             self.reconcile_finalized(config, full_state_finalized)?;
         }
 
-        let final_audit = audit_store(&self, config)?;
+        let final_audit = audit_store(&self, config, &SystemClock)?;
         repairs.extend(final_audit.repairs.iter().copied());
         if !final_audit.is_clean() {
             self.db.write(self.recovery_batch(&final_audit)?)?;
@@ -4458,7 +4459,7 @@ impl HeaderChainStore {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let initial = audit_store_for_trust_anchor_update(&self, config)?;
+        let initial = audit_store_for_trust_anchor_update(&self, config, &SystemClock)?;
         if let Some(pin) = initial.metadata.alarms.migrated_pin_refuted {
             return Err(HeaderChainStoreError::MigratedPinRefuted { pin });
         }
@@ -4615,7 +4616,7 @@ impl HeaderChainStore {
             last_committed: Some(progress.last_committed),
         });
 
-        let final_audit = audit_store(&self, config)?;
+        let final_audit = audit_store(&self, config, &SystemClock)?;
         if progress.last_committed != full_state_finalized
             || final_audit.metadata.frontiers.finalized != full_state_finalized
         {

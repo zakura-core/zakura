@@ -174,13 +174,13 @@ async fn port_future_panic_disconnects_exact_session_and_reactor_survives() {
 
     assert!(connection_cancel.is_cancelled());
     assert_eq!(close_cause.get_or("missing"), "header_port_panic");
-    assert!(!reactor.request_deadlines.contains_key(&peer));
+    assert!(!reactor.state.request_deadlines.contains_key(&peer));
 
     let second_peer =
         ZakuraPeerId::new(vec![0x82; 32]).expect("the second peer ID has the required length");
     let (second_cancel, _) = connected_session(&mut reactor, second_peer.clone(), 8);
     assert!(!second_cancel.is_cancelled());
-    assert!(reactor.peer_state.contains_key(&second_peer));
+    assert!(reactor.sessions.contains_key(&second_peer));
 }
 
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn stale_port_panic_does_not_disconnect_replacement_session() {
     assert!(!replacement_cancel.is_cancelled());
     assert_eq!(
         reactor
-            .peer_state
+            .sessions
             .get(&peer)
             .expect("the replacement remains admitted")
             .session
@@ -262,7 +262,7 @@ async fn internal_vct_port_panic_is_contained_without_peer_disconnect() {
     reactor.handle_port_completion(completion);
 
     assert!(!connection_cancel.is_cancelled());
-    assert!(reactor.peer_state.contains_key(&peer));
+    assert!(reactor.sessions.contains_key(&peer));
 }
 
 #[tokio::test(start_paused = true)]
@@ -514,7 +514,7 @@ async fn status_tip_churn_coalesces_to_one_in_flight_locator_query() {
     }
 
     assert_eq!(reactor.pending_port_operations.len(), 1);
-    assert_eq!(reactor.locators.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
 
     let latest = churn_status(anchor, (STATUS_CHURN - 1) as u8);
     assert_eq!(
@@ -533,7 +533,7 @@ async fn status_tip_churn_coalesces_to_one_in_flight_locator_query() {
         .expect("the coalesced locator completes");
     reactor.handle_port_completion(completion);
 
-    assert_eq!(reactor.locators.len(), 0);
+    assert_eq!(reactor.state.locators.len(), 0);
     assert_eq!(
         counters.started.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -577,7 +577,7 @@ async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
     let status = churn_status(anchor, 1);
     reactor.handle_status(peer.clone(), session_id, status.clone());
     assert_eq!(reactor.pending_port_operations.len(), 1);
-    assert_eq!(reactor.locators.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
 
     let mut advanced = snapshot;
     advanced.state_version = advanced
@@ -589,7 +589,8 @@ async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
         .checked_next()
         .expect("the fixture header generation advances");
     reactor
-        .peer_state
+        .state
+        .peers
         .get_mut(&peer)
         .expect("the peer remains admitted")
         .last_status = Some(status.clone());
@@ -626,7 +627,7 @@ async fn generation_change_does_not_reuse_a_stale_locator_under_coalescing() {
         1,
         "a stale locator must re-dispatch under the new header generation"
     );
-    assert_eq!(reactor.locators.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), outbound.recv())
             .await
@@ -672,7 +673,7 @@ async fn hanging_locator_port_future_is_removed_at_the_request_deadline() {
 
     assert!(Instant::now().duration_since(started) >= reactor.startup.request_timeout);
     assert!(reactor.pending_port_operations.is_empty());
-    assert_eq!(reactor.locators.len(), 0);
+    assert_eq!(reactor.state.locators.len(), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -729,7 +730,7 @@ async fn locator_timeout_after_tip_churn_rediscovers_the_latest_target() {
         1,
         "the reactor must rediscover a locator for the latest tip"
     );
-    assert_eq!(reactor.locators.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
 }
 
 #[tokio::test]
@@ -759,7 +760,7 @@ async fn late_locator_after_session_replacement_leaves_the_replacement_unchanged
     let _ = first_outbound.recv().await;
     reactor.handle_status(peer.clone(), 7, churn_status(anchor, 1));
     assert_eq!(reactor.pending_port_operations.len(), 1);
-    assert_eq!(reactor.locators.len(), 1);
+    assert_eq!(reactor.state.locators.len(), 1);
 
     let (send, mut replacement_outbound) = crate::zakura::framed_channel(8);
     reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
@@ -769,15 +770,7 @@ async fn late_locator_after_session_replacement_leaves_the_replacement_unchanged
         CancellationToken::new(),
     ));
     let _ = replacement_outbound.recv().await;
-    let schedule = |reactor: &HeaderSyncReactor| {
-        let state = &reactor.peer_state[&peer];
-        (
-            state.last_status.clone(),
-            state.status_spent,
-            state.unproductive_requests,
-        )
-    };
-    let replacement = schedule(&reactor);
+    let replacement = reactor.state.peers[&peer].clone();
 
     release.notify_one();
     let completion = reactor
@@ -787,15 +780,15 @@ async fn late_locator_after_session_replacement_leaves_the_replacement_unchanged
         .expect("the first session's locator completes");
     reactor.handle_port_completion(completion);
 
-    assert_eq!(reactor.locators.len(), 0);
+    assert_eq!(reactor.state.locators.len(), 0);
     assert_eq!(
         reactor.locator_capacity.available_permits(),
         zakura_header_chain::MAX_STAGED_TARGETS_V1,
         "the late read settles its permit"
     );
     assert!(reactor.peer_work_queue.awaiting_target(&peer).is_none());
-    assert_eq!(reactor.peer_state[&peer].session.session_id(), 8);
-    assert_eq!(schedule(&reactor), replacement);
+    assert_eq!(reactor.sessions[&peer].session.session_id(), 8);
+    assert_eq!(reactor.state.peers[&peer], replacement);
     assert!(
         replacement_outbound.try_recv().is_err(),
         "the late read opens no subscription on the replacement"

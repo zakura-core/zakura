@@ -77,7 +77,7 @@ fn invalid_header_failure(
 /// subscriber when it holds the page's subscription, as the session reader
 /// does, or as admitted when a test seeded the work without one.
 fn admit_page(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId, page: &Headers) -> v9::Admitted {
-    if let Some(state) = reactor.peer_state.get(peer) {
+    if let Some(state) = reactor.sessions.get(peer) {
         let mut subscriber = state.session.subscriber();
         if subscriber.live() == Some(page.subscription_id) {
             let frame = encode_frame(&v9::RegtestMessage::Headers(page.clone()))
@@ -117,7 +117,7 @@ impl HeaderSyncReactor {
     /// Deliver `outcome` from `peer`'s session `session_id` as its subscriber
     /// admits it, or as admitted when a test seeded the work without one.
     fn deliver_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, outcome: HeadersOutcome) {
-        let live = self.peer_state.get(&peer).and_then(|state| {
+        let live = self.sessions.get(&peer).and_then(|state| {
             let mut subscriber = state.session.subscriber();
             (subscriber.live() == Some(outcome.subscription_id)).then(|| {
                 subscriber

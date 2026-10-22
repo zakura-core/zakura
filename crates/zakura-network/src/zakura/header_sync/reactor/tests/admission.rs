@@ -24,7 +24,8 @@ fn committed_header_generation_reconsiders_the_cached_peer_target() {
         .status
         .clone();
     reactor
-        .peer_state
+        .state
+        .peers
         .get_mut(&peer)
         .expect("the peer is connected")
         .last_status = Some(advertised.clone());
@@ -84,6 +85,7 @@ fn committed_resource_stall_is_terminal_without_retry_or_peer_fault() {
 
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(!reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, branch));
     assert!(
@@ -115,6 +117,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         });
         assert!(
             reactor
+                .state
                 .completed_targets
                 .contains(owner.header_authority().header_generation, branch),
             "the current-result control proves the live handler can mark completion"
@@ -157,6 +160,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
 
         assert!(reactor.peer_work_queue.active(&peer).is_none());
         assert!(!reactor
+            .state
             .completed_targets
             .contains(owner.header_authority().header_generation, old_branch));
         let published_tip = handle.best_header_tip();
@@ -174,6 +178,7 @@ fn committed_snapshot_retires_in_flight_state_results() {
         assert_eq!(handle.best_header_tip(), published_tip);
         assert_eq!(handle.candidate_state(), published_candidates);
         assert!(!reactor
+            .state
             .completed_targets
             .contains(owner.header_authority().header_generation, old_branch));
         assert!(matches!(
@@ -241,7 +246,7 @@ fn monotone_finality_records_an_exact_rebased_apply_completion() {
         actions.try_recv().is_err(),
         "the completed state call emits no duplicate action or peer score"
     );
-    assert!(reactor.completed_targets.contains(
+    assert!(reactor.state.completed_targets.contains(
         completion_authority.header_generation,
         completion_authority.branch,
     ));
@@ -399,6 +404,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
 
     assert!(reactor.peer_work_queue.active(&peer).is_none());
     assert!(!reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(
@@ -463,7 +469,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
     assert_eq!(status.selected_tip_hash, replacement.hash);
     assert!(
         !reactor
-            .peer_state
+            .sessions
             .get(&peer)
             .and_then(|state| state.status_publisher.as_ref())
             .expect("the connected peer retains its publisher")
@@ -516,6 +522,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert_eq!(same_handle.candidate_state(), same_candidates);
     assert!(same_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!same_reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
@@ -564,6 +571,7 @@ fn restart_drops_old_preparation_and_admission_completions() {
     assert_eq!(committed_handle.candidate_state(), committed_candidates);
     assert!(committed_reactor.peer_work_queue.active(&peer).is_none());
     assert!(!committed_reactor
+        .state
         .completed_targets
         .contains(owner.header_authority().header_generation, old_branch));
     assert!(matches!(
@@ -651,7 +659,7 @@ async fn restart_rejects_old_ordered_stream_response() {
 
     assert_eq!(
         fresh_reactor
-            .peer_state
+            .sessions
             .get(&peer)
             .expect("the replacement peer remains connected")
             .session
@@ -772,7 +780,7 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
             .status
             .clone();
         advertised.selected_tip_height = block::Height(anchor.height.0 + target_height);
-        reactor.peer_state.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
+        reactor.state.peers.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
         reactor.clear_peer_work_for_test(&peer);
         let caught_up_peer = ZakuraPeerId::new(vec![0x72; 32]).unwrap();
         let (send, _caught_up_outbound) = framed_channel(8);
@@ -786,7 +794,8 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
         caught_up.selected_tip_height = initial.frontiers.header_best.height;
         caught_up.selected_tip_hash = initial.frontiers.header_best.hash;
         reactor
-            .peer_state
+            .state
+            .peers
             .get_mut(&caught_up_peer)
             .unwrap()
             .last_status = Some(caught_up);
@@ -940,7 +949,7 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32, window_open: bool)
                 )),
                 "refill waits for the retired repair's subscription to end"
             );
-            let session = reactor.peer_state[&peer].session.clone();
+            let session = reactor.sessions[&peer].session.clone();
             reactor.handle_event(outcome_event(
                 &session,
                 HeadersOutcome {

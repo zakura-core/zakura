@@ -552,7 +552,10 @@ impl UdpIo for SimSocket {
         // Read the clock under the lock that assigns sequence numbers, so
         // concurrent sends get windows in sequence order.
         let now = now();
-        for datagram in contents.chunks(segment) {
+        // `chunks` yields nothing for an empty payload, which UDP still
+        // sends as one datagram.
+        let empty = std::iter::once(contents).filter(|contents| contents.is_empty());
+        for datagram in empty.chain(contents.chunks(segment)) {
             state.send(
                 self.addr,
                 transmit.destination,

@@ -152,6 +152,20 @@ async fn a_segmented_transmit_becomes_one_datagram_per_segment() {
     }
 }
 
+#[test]
+fn an_empty_payload_is_one_datagram() {
+    let net = SimNet::new(fifo(0, 10));
+    let a = net.bind(addr(1)).unwrap();
+    let b = net.bind(addr(2)).unwrap();
+    send(&a, addr(2), b"");
+    let [id] = net.in_flight()[..] else {
+        panic!("one datagram in flight")
+    };
+    net.deliver(id).unwrap();
+    assert_eq!(recv(&b).unwrap(), (addr(1), Vec::new()));
+    assert!(would_block(recv(&b)));
+}
+
 // M2.2
 
 #[tokio::test(start_paused = true)]
@@ -777,7 +791,7 @@ async fn run_sequence(seed: u64, steps: usize) {
             0 | 1 => {
                 let Some(socket) = &sockets[i] else { continue };
                 let dst = rng.pick(&targets);
-                let len = 1 + rng.below(16) as usize;
+                let len = rng.below(17) as usize;
                 let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
                 send(socket, dst, &bytes);
                 sent.push(model.send(senders[i], dst, bytes, now));

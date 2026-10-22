@@ -1,0 +1,22 @@
+[package]
+name = "zakura-scheduler"
+version = "0.1.0"
+authors.workspace = true
+description = "Deterministic coroutine scheduler for Zakura's P2P simulator. Internal test crate, not published"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["development-tools::testing"]
+# Only the simulator depends on it, and no published crate does.
+publish = false
+
+[dependencies]
+corosensei = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

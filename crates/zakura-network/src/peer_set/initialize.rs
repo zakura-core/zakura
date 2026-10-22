@@ -39,7 +39,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     diagnostic::task::{CheckForPanics, WaitForPanics},
 };
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::{spawn_buffer, spawn_erased};
 
 use crate::{
     address_book_updater::{AddressBookUpdater, MIN_CHANNEL_SIZE},
@@ -534,7 +534,7 @@ where
                 trace,
                 config.zakura.stream_open_rate_per_second,
             );
-            Buffer::new(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
+            spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE)
         }
         None => peer_set,
     };

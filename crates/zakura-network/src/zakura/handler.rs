@@ -1518,7 +1518,8 @@ impl ZakuraSupervisorHandle {
             !already_closing
         });
         if disconnected {
-            metrics::counter!("sync.block.peer.tampered_body_disconnect").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.peer.tampered_body_disconnect")
+                .increment(1);
         }
         info!(
             ?peer_id,
@@ -1576,12 +1577,14 @@ impl ZakuraSupervisorHandle {
             if !same_ip_duplicate_redial
                 && state.ip_slots.registered(remote_ip) >= state.max_connections_per_ip
             {
-                metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+                zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.admission")
+                    .increment(1);
                 return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
             }
         }
         if state.next_registration_id == u64::MAX {
-            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.admission")
+                .increment(1);
             return ZakuraRegistration::Rejected(ZakuraRejectReason::TemporaryUnavailable);
         }
 
@@ -1606,7 +1609,10 @@ impl ZakuraSupervisorHandle {
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
                     state.decrement_ip(old_entry.remote_ip);
                     old_entry.disconnect_token.cancel();
-                    metrics::counter!("zakura.p2p.conn.duplicate.evicted_upgraded").increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "zakura.p2p.conn.duplicate.evicted_upgraded"
+                    )
+                    .increment(1);
                 }
                 state.increment_ip(remote_ip);
                 state.debug_assert_accounting();
@@ -1660,7 +1666,10 @@ impl ZakuraSupervisorHandle {
                         && !entry.disconnect_token.is_cancelled()
                     {
                         entry.disconnect_token.cancel();
-                        metrics::counter!("zakura.p2p.conn.duplicate.evicted_stale").increment(1);
+                        zakura_node_services::metrics::counter!(
+                            "zakura.p2p.conn.duplicate.evicted_stale"
+                        )
+                        .increment(1);
                     }
                 }
                 ZakuraRegistration::Duplicate { peer_id }
@@ -1725,7 +1734,7 @@ impl ZakuraSupervisorHandle {
 fn set_active_connection_gauge(active_connections: usize) {
     // Active Zakura connections are bounded by the configured connection limit,
     // far below f64's exact integer range.
-    metrics::gauge!("zakura.p2p.conn.active").set(active_connections as f64);
+    zakura_node_services::metrics::gauge!("zakura.p2p.conn.active").set(active_connections as f64);
 }
 
 #[derive(Debug)]
@@ -2178,7 +2187,7 @@ fn admit_inbound_message(
     let max_message_bytes = usize::try_from(context.limits.max_message_bytes)
         .expect("u32 message byte limit fits in usize");
     if payload_len > max_message_bytes {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.ratelimit.message.oversize",
             "stream_kind" => stream_kind,
         )
@@ -2227,7 +2236,7 @@ fn admit_inbound_message(
         bucket.try_take()
     };
     if !admitted {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.ratelimit.message.throttled",
             "stream_kind" => stream_kind,
         )
@@ -2479,7 +2488,8 @@ impl ZakuraProtocolHandler {
             control_handshake,
         }) = claim
         else {
-            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.admission")
+                .increment(1);
             let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
             conn.trace_connection(
                 "rejected.admission",
@@ -2557,7 +2567,8 @@ impl ZakuraProtocolHandler {
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
         let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.pending_handshake")
+                .increment(1);
             conn.trace_connection(
                 "rejected.admission",
                 None,
@@ -3099,7 +3110,7 @@ impl ZakuraProtocolHandler {
                                 !matches!(demand, SessionDemand::OpenNow)
                             })
                         {
-                            metrics::counter!(
+                            zakura_node_services::metrics::counter!(
                                 "zakura.p2p.stream.parked.no_demand",
                                 "stream_kind" => stream_kind_label(kind),
                             )
@@ -3269,7 +3280,7 @@ impl ZakuraProtocolHandler {
         }
         workers.abort_all();
         cleanup_guard.cleanup_registered_peer().await;
-        metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
         conn.trace_connection(
             "closed.neutral",
             None,
@@ -3351,7 +3362,8 @@ impl ZakuraProtocolHandler {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
-            metrics::counter!("zakura.p2p.stream.rejected.semaphore").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.stream.rejected.semaphore")
+                .increment(1);
             admission
                 .conn
                 .trace_stream("rejected.semaphore", stream_id, None);
@@ -3367,7 +3379,8 @@ impl ZakuraProtocolHandler {
         // such streams indefinitely without ever spending open-rate budget.
         if !admission.open_limiter.try_take() {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-            metrics::counter!("zakura.p2p.stream.rejected.open_rate").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.stream.rejected.open_rate")
+                .increment(1);
             admission
                 .conn
                 .trace_stream("rejected.open_rate", stream_id, None);
@@ -3389,7 +3402,8 @@ impl ZakuraProtocolHandler {
                 Err(error) => {
                     debug!(?error, "rejecting Zakura stream with bad prelude");
                     let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
-                    metrics::counter!("zakura.p2p.stream.rejected.prelude").increment(1);
+                    zakura_node_services::metrics::counter!("zakura.p2p.stream.rejected.prelude")
+                        .increment(1);
                     conn.trace_stream("rejected.prelude", stream_id, None);
                     return None;
                 }
@@ -3403,7 +3417,7 @@ impl ZakuraProtocolHandler {
                     "rejecting Zakura stream with unknown kind or unsupported version"
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "zakura.p2p.stream.rejected.unknown_kind",
                     "stream_kind" => stream_kind,
                 )
@@ -3420,7 +3434,7 @@ impl ZakuraProtocolHandler {
                     "rejecting Zakura stream that was not negotiated for this peer"
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "zakura.p2p.stream.rejected.unnegotiated_capability",
                     "stream_kind" => stream_kind,
                 )
@@ -3445,7 +3459,7 @@ impl ZakuraProtocolHandler {
                     "rejecting a lower ordered-stream version than the mutually selected version"
                 );
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_UNKNOWN_STREAM));
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "zakura.p2p.stream.rejected.unselected_version",
                     "stream_kind" => stream_kind,
                 )
@@ -3459,7 +3473,10 @@ impl ZakuraProtocolHandler {
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 close_cause.record("unexpected_request_id");
                 connection_token.cancel();
-                metrics::counter!("zakura.p2p.stream.rejected.unexpected_request_id").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "zakura.p2p.stream.rejected.unexpected_request_id"
+                )
+                .increment(1);
                 conn.trace_stream(
                     "rejected.unexpected_request_id",
                     stream_id,
@@ -3473,7 +3490,10 @@ impl ZakuraProtocolHandler {
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                 close_cause.record("request_without_id");
                 connection_token.cancel();
-                metrics::counter!("zakura.p2p.stream.rejected.request_without_id").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "zakura.p2p.stream.rejected.request_without_id"
+                )
+                .increment(1);
                 conn.trace_stream("rejected.request_without_id", stream_id, Some(stream_kind));
                 return None;
             }
@@ -3492,7 +3512,7 @@ impl ZakuraProtocolHandler {
                 return None;
             }
 
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.p2p.stream.accepted",
                 "stream_kind" => stream_kind,
             )
@@ -3705,7 +3725,7 @@ impl ZakuraProtocolHandler {
                 remote_ip,
                 disconnect_token,
             } => {
-                metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
+                zakura_node_services::metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
                 context.conn.trace_connection(
                     "accepted",
                     Some(context.role),
@@ -3741,7 +3761,7 @@ impl ZakuraProtocolHandler {
             }
             ZakuraRegistration::Duplicate { peer_id } => {
                 debug!(?peer_id, "closing duplicate Zakura peer neutrally");
-                metrics::counter!("zakura.p2p.conn.duplicate").increment(1);
+                zakura_node_services::metrics::counter!("zakura.p2p.conn.duplicate").increment(1);
                 context.conn.trace_connection(
                     "duplicate",
                     Some(context.role),
@@ -3802,10 +3822,11 @@ impl Acceptor for ZakuraProtocolHandler {
             // Require validation before consuming the last slot, including
             // the redial slot, so spoofed Initials cannot fill an IP's budget.
             if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.per_ip").increment(1);
+                zakura_node_services::metrics::counter!("zakura.p2p.conn.retried.per_ip")
+                    .increment(1);
                 return Admit::Retry;
             }
-            metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
             return Admit::Refuse;
         }
         let control_handshakes = self
@@ -3818,14 +3839,19 @@ impl Acceptor for ZakuraProtocolHandler {
             // As above: spoofed Initials could fill the budget, so an
             // unvalidated source gets a Retry instead of a refusal.
             if !incoming.validated {
-                metrics::counter!("zakura.p2p.conn.retried.pending_handshake").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "zakura.p2p.conn.retried.pending_handshake"
+                )
+                .increment(1);
                 return Admit::Retry;
             }
-            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.pending_handshake")
+                .increment(1);
             return Admit::Refuse;
         }
         if self.admission.available_permits() == 0 {
-            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.conn.rejected.admission")
+                .increment(1);
             return Admit::Refuse;
         }
         Admit::Accept
@@ -3991,7 +4017,7 @@ async fn enable_header_sync_and_renegotiate(
     }
 
     if disconnected > 0 {
-        metrics::counter!("zakura.p2p.header_sync.capability_reconnects")
+        zakura_node_services::metrics::counter!("zakura.p2p.header_sync.capability_reconnects")
             .increment(u64::try_from(disconnected).expect("peer count always fits in u64"));
         info!(
             disconnected,
@@ -4794,7 +4820,7 @@ async fn persistent_stream_worker_with_policy(
                             }
                             // Queue depth is capped by the negotiated u16 limit, so
                             // this integer is exactly representable as f64.
-                            metrics::gauge!(
+                            zakura_node_services::metrics::gauge!(
                                 "zakura.p2p.queue.depth",
                                 "stream_kind" => stream_kind_label(stream_kind),
                             )
@@ -5204,7 +5230,7 @@ async fn read_frame(
     let max_frame_bytes = filter
         .check_header(message_type, flags, payload_len, max_frame_bytes)
         .map_err(|rejection| {
-            metrics::counter!("zakura.p2p.frame.rejected", "reason" => rejection.label())
+            zakura_node_services::metrics::counter!("zakura.p2p.frame.rejected", "reason" => rejection.label())
                 .increment(1);
             ZakuraHandlerError::RejectedFrame {
                 message_type,
@@ -5213,7 +5239,7 @@ async fn read_frame(
         })?;
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
-        metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
         return Err(ZakuraHandlerError::OversizeFrame {
             payload_len,
             frame_len,

@@ -745,41 +745,47 @@ impl DiskDb {
                 total_live += live;
                 total_mem += mem;
 
-                metrics::gauge!("zakura.state.rocksdb.cf_disk_size_bytes", "cf" => cf_name.clone())
+                zakura_node_services::metrics::gauge!("zakura.state.rocksdb.cf_disk_size_bytes", "cf" => cf_name.clone())
                     .set(disk as f64);
-                metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name)
+                zakura_node_services::metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name)
                     .set(mem as f64);
             } else {
                 complete_disk_measurement = false;
             }
         }
 
-        metrics::gauge!("zakura.state.rocksdb.total_disk_size_bytes").set(total_disk as f64);
+        zakura_node_services::metrics::gauge!("zakura.state.rocksdb.total_disk_size_bytes")
+            .set(total_disk as f64);
         if measured_column_family && complete_disk_measurement {
             self.cached_size
                 .store(total_disk, atomic::Ordering::Relaxed);
         }
-        metrics::gauge!("zakura.state.rocksdb.live_data_size_bytes").set(total_live as f64);
-        metrics::gauge!("zakura.state.rocksdb.total_memory_size_bytes").set(total_mem as f64);
+        zakura_node_services::metrics::gauge!("zakura.state.rocksdb.live_data_size_bytes")
+            .set(total_live as f64);
+        zakura_node_services::metrics::gauge!("zakura.state.rocksdb.total_memory_size_bytes")
+            .set(total_mem as f64);
 
         // Compaction metrics - these use database-wide properties (not per-column-family)
         if let Ok(Some(pending)) = db.property_int_value("rocksdb.compaction-pending") {
-            metrics::gauge!("zakura.state.rocksdb.compaction.pending_bytes").set(pending as f64);
+            zakura_node_services::metrics::gauge!("zakura.state.rocksdb.compaction.pending_bytes")
+                .set(pending as f64);
         }
 
         if let Ok(Some(running)) = db.property_int_value("rocksdb.num-running-compactions") {
-            metrics::gauge!("zakura.state.rocksdb.compaction.running").set(running as f64);
+            zakura_node_services::metrics::gauge!("zakura.state.rocksdb.compaction.running")
+                .set(running as f64);
         }
 
         if let Ok(Some(cache)) = db.property_int_value("rocksdb.block-cache-usage") {
-            metrics::gauge!("zakura.state.rocksdb.block_cache_usage_bytes").set(cache as f64);
+            zakura_node_services::metrics::gauge!("zakura.state.rocksdb.block_cache_usage_bytes")
+                .set(cache as f64);
         }
 
         // Level-by-level file counts (RocksDB typically has up to 7 levels)
         for level in 0..7 {
             let prop = format!("rocksdb.num-files-at-level{level}");
             if let Ok(Some(count)) = db.property_int_value(&prop) {
-                metrics::gauge!("zakura.state.rocksdb.num_files_at_level", "level" => level.to_string())
+                zakura_node_services::metrics::gauge!("zakura.state.rocksdb.num_files_at_level", "level" => level.to_string())
                     .set(count as f64);
             }
         }

@@ -444,7 +444,10 @@ fn anchor_for(
                     %error,
                     "ignoring a published frontier entry that does not match the authenticated root",
                 );
-                metrics::counter!("state.historical_tree.artifact_entry_rejected").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "state.historical_tree.artifact_entry_rejected"
+                )
+                .increment(1);
                 skip_at_or_above = Some(anchor_height);
             }
         }

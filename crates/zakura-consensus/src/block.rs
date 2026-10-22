@@ -776,7 +776,7 @@ where
         prepared: cached_prepared_block,
     }) = prepared_candidates.lookup(&block, network)
     else {
-        metrics::histogram!("mining.solved_header_check.duration_seconds")
+        zakura_node_services::metrics::histogram!("mining.solved_header_check.duration_seconds")
             .record(solved_header_start.elapsed().as_secs_f64());
         return Ok(None);
     };
@@ -788,7 +788,7 @@ where
             .map_err(VerifyBlockError::Transaction)?;
     }
     check::merkle_root_validity(network, &block, &cached_prepared_block.transaction_hashes)?;
-    metrics::histogram!("mining.solved_header_check.duration_seconds")
+    zakura_node_services::metrics::histogram!("mining.solved_header_check.duration_seconds")
         .record(solved_header_start.elapsed().as_secs_f64());
 
     let mut prepared_block = cached_prepared_block.as_ref().clone();
@@ -843,7 +843,7 @@ where
     if let (Ok(_), Some(source), Some(cache_copy)) = (&response, prepared_source, cache_copy) {
         let id = prepared::CandidateId::of(&cache_copy.block, network);
         prepared_candidates.insert(id, source, cache_copy);
-        metrics::histogram!("mining.preparation.duration_seconds")
+        zakura_node_services::metrics::histogram!("mining.preparation.duration_seconds")
             .record(preparation_start.elapsed().as_secs_f64());
     }
 
@@ -870,7 +870,7 @@ where
             .map_err(|source| map_commit_error(source, hash))
     }
     .await;
-    metrics::histogram!("mining.prepared_relay_preflight.duration_seconds")
+    zakura_node_services::metrics::histogram!("mining.prepared_relay_preflight.duration_seconds")
         .record(preflight_start.elapsed().as_secs_f64());
 
     match response? {
@@ -897,8 +897,10 @@ where
         .await
         .map_err(|source| VerifyBlockError::StateService { source, hash })?;
     if is_mined_commit {
-        metrics::histogram!("state.semantic_commit.ready_wait.duration_seconds")
-            .record(ready_start.elapsed().as_secs_f64());
+        zakura_node_services::metrics::histogram!(
+            "state.semantic_commit.ready_wait.duration_seconds"
+        )
+        .record(ready_start.elapsed().as_secs_f64());
     }
 
     let request = match admission {
@@ -911,7 +913,7 @@ where
     };
     let response = ready_state_service.call(request).await;
     if is_mined_commit {
-        metrics::histogram!("mining.contextual_commit.duration_seconds")
+        zakura_node_services::metrics::histogram!("mining.contextual_commit.duration_seconds")
             .record(commit_start.elapsed().as_secs_f64());
     }
 

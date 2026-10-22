@@ -51,7 +51,7 @@ macro_rules! timed_commit_phase {
         let _start = std::time::Instant::now();
         let result = $body;
         #[cfg(feature = "commit-metrics")]
-        metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
+        zakura_node_services::metrics::histogram!($name).record(_start.elapsed().as_secs_f64());
         result
     }};
 }
@@ -712,19 +712,22 @@ impl FinalizedState {
         );
 
         if result.is_ok() {
-            metrics::counter!("state.checkpoint.finalized.block.count").increment(1);
-            metrics::gauge!("state.checkpoint.finalized.block.height")
+            zakura_node_services::metrics::counter!("state.checkpoint.finalized.block.count")
+                .increment(1);
+            zakura_node_services::metrics::gauge!("state.checkpoint.finalized.block.height")
                 .set(checkpoint_verified.height.0 as f64);
 
             // This height gauge is updated for both fully verified and checkpoint blocks.
             // These updates can't conflict, because the state makes sure that blocks
             // are committed in order.
-            metrics::gauge!("zcash.chain.verified.block.height")
+            zakura_node_services::metrics::gauge!("zcash.chain.verified.block.height")
                 .set(checkpoint_verified.height.0 as f64);
-            metrics::counter!("zcash.chain.verified.block.total").increment(1);
+            zakura_node_services::metrics::counter!("zcash.chain.verified.block.total")
+                .increment(1);
         } else {
-            metrics::counter!("state.checkpoint.error.block.count").increment(1);
-            metrics::gauge!("state.checkpoint.error.block.height")
+            zakura_node_services::metrics::counter!("state.checkpoint.error.block.count")
+                .increment(1);
+            zakura_node_services::metrics::gauge!("state.checkpoint.error.block.height")
                 .set(checkpoint_verified.height.0 as f64);
         };
 
@@ -963,8 +966,10 @@ impl FinalizedState {
                                 && prevalidated_hash == block_hash
                                 && expected_auth_data_root != actual_auth_data_root
                             {
-                                metrics::counter!("state.vct.block.auth_data_root_mismatch.count")
-                                    .increment(1);
+                                zakura_node_services::metrics::counter!(
+                                    "state.vct.block.auth_data_root_mismatch.count"
+                                )
+                                .increment(1);
                                 tracing::warn!(
                                     ?height,
                                     ?block_hash,
@@ -991,7 +996,10 @@ impl FinalizedState {
                             // Observability: the previous fast block's look-ahead already
                             // validated this header, so its commitment check was skipped (the
                             // dedup). A subset of `state.vct.fast.block.count`.
-                            metrics::counter!("state.vct.prevalidated.block.count").increment(1);
+                            zakura_node_services::metrics::counter!(
+                                "state.vct.prevalidated.block.count"
+                            )
+                            .increment(1);
                         }
 
                         let mut verification_items = vec![
@@ -1095,7 +1103,10 @@ impl FinalizedState {
                             // not the last checkpoint: defer rather than persist it unverified. Leaves
                             // the database untouched; the block re-commits once the successor
                             // is buffered.
-                            metrics::counter!("state.vct.root.await_successor.count").increment(1);
+                            zakura_node_services::metrics::counter!(
+                                "state.vct.root.await_successor.count"
+                            )
+                            .increment(1);
                             return Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
                                 height,
                             }
@@ -1119,7 +1130,8 @@ impl FinalizedState {
                         // This block folded supplied roots and skipped note-commitment frontier
                         // recomputation. This counter and `state.vct.legacy.block.count` provide a
                         // live VCT-to-legacy ratio.
-                        metrics::counter!("state.vct.fast.block.count").increment(1);
+                        zakura_node_services::metrics::counter!("state.vct.fast.block.count")
+                            .increment(1);
 
                         // When final frontiers are loaded, this is a persistent fast
                         // sync: mark the database fast-synced (per-height trees absent
@@ -1191,7 +1203,8 @@ impl FinalizedState {
                         // incorrect root into the history MMR and corrupt state. Return a retryable
                         // error and leave the database untouched. State commits the block after a
                         // peer supplies a verifiable root.
-                        metrics::counter!("state.vct.root.unavailable.count").increment(1);
+                        zakura_node_services::metrics::counter!("state.vct.root.unavailable.count")
+                            .increment(1);
                         tracing::warn!(
                             ?height,
                             "VCT: no verifiable supplied root for a frozen-frontier height; \
@@ -1208,7 +1221,8 @@ impl FinalizedState {
                         // Observability: this block recomputed the note-commitment frontier
                         // (the legacy path) — either VCT is off, or the fast path's roots were
                         // unavailable for this height and it safely fell back.
-                        metrics::counter!("state.vct.legacy.block.count").increment(1);
+                        zakura_node_services::metrics::counter!("state.vct.legacy.block.count")
+                            .increment(1);
 
                         // Legacy / capture path: recompute the note-commitment frontier.
                         //
@@ -1217,8 +1231,10 @@ impl FinalizedState {
                         // checking this block's commitment against the *parent* history
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
-                        metrics::histogram!("zakura.state.write.block_tx_count")
-                            .record(block.transactions.len() as f64);
+                        zakura_node_services::metrics::histogram!(
+                            "zakura.state.write.block_tx_count"
+                        )
+                        .record(block.transactions.len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;
@@ -1269,7 +1285,7 @@ impl FinalizedState {
                             .map_err(ValidateContextError::from)?;
 
                         #[cfg(feature = "commit-metrics")]
-                        metrics::histogram!(
+                        zakura_node_services::metrics::histogram!(
                             "zakura.state.write.checkpoint_compute.duration_seconds"
                         )
                         .record(_ckpt_compute.elapsed().as_secs_f64());
@@ -1485,7 +1501,7 @@ impl FinalizedState {
             return error.into();
         }
 
-        metrics::counter!("state.vct.root.rejected.count").increment(1);
+        zakura_node_services::metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,
             ?error,

@@ -331,25 +331,25 @@ pub async fn run(
 
 /// Sets metrics for zcashd-compat mode when zcashd supervision is intentionally disabled.
 pub fn set_supervision_config_disabled_metrics() {
-    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
-    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
-    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
 }
 
 /// Sets metrics for zcashd-compat mode when supervision has unexpectedly stopped.
 pub fn set_supervision_unexpectedly_disabled_metrics() {
-    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
-    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(1.0);
 }
 
 fn set_supervision_active_metrics() {
-    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(1.0);
-    metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(0.0);
-    metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(1.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_DISABLED_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_EXHAUSTED_METRIC).set(0.0);
 }
 
 fn set_supervision_inactive_metrics() {
-    metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
+    zakura_node_services::metrics::gauge!(SUPERVISOR_ACTIVE_METRIC).set(0.0);
 }
 
 /// Returns `true` when a child ran long enough to make previous failures stale.

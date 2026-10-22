@@ -157,7 +157,7 @@ impl Verifier {
             Ok(Ok(())) => "success",
             _ => "failure",
         };
-        metrics::histogram!(
+        zakura_node_services::metrics::histogram!(
             "zakura.consensus.batch.duration_seconds",
             "verifier" => "ed25519",
             "result" => result_label
@@ -200,10 +200,16 @@ impl Service<BatchControl<Item>> for Verifier {
 
                             if result.is_ok() {
                                 tracing::trace!(?result, "validated ed25519 signature");
-                                metrics::counter!("signatures.ed25519.validated").increment(1);
+                                zakura_node_services::metrics::counter!(
+                                    "signatures.ed25519.validated"
+                                )
+                                .increment(1);
                             } else {
                                 tracing::trace!(?result, "invalid ed25519 signature");
-                                metrics::counter!("signatures.ed25519.invalid").increment(1);
+                                zakura_node_services::metrics::counter!(
+                                    "signatures.ed25519.invalid"
+                                )
+                                .increment(1);
                             }
                             result.map_err(BoxError::from)
                         }

@@ -156,12 +156,12 @@ impl SessionCapacity {
             self.changed.send_replace(());
             return Err(SessionFull);
         };
-        let reserved = metrics::gauge!(
+        let reserved = zakura_node_services::metrics::gauge!(
             "zakura.p2p.sessions.reserved",
             "service" => self.service,
             "direction" => direction.trace_label(),
         );
-        let setting_up = metrics::gauge!("zakura.p2p.sessions.setup", "service" => self.service);
+        let setting_up = zakura_node_services::metrics::gauge!("zakura.p2p.sessions.setup", "service" => self.service);
         reserved.increment(1.0);
         setting_up.increment(1.0);
         Ok(Arc::new(SessionReservation {

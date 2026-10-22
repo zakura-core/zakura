@@ -162,7 +162,8 @@ impl Encoder<Message> for Codec {
 
         // Aggregate totals only: per-addr labels are never pruned by the Prometheus
         // exporter and grow without bound on public listeners.
-        metrics::counter!("zcash.net.out.bytes.total").increment((body_length + HEADER_LEN) as u64);
+        zakura_node_services::metrics::counter!("zcash.net.out.bytes.total")
+            .increment((body_length + HEADER_LEN) as u64);
 
         use Message::*;
         // Note: because all match arms must have
@@ -423,7 +424,7 @@ impl Decoder for Codec {
                         return Err(Parse("Zakura p2pv2up payload exceeds the hard prelude cap"));
                     }
 
-                    metrics::counter!("zcash.net.in.bytes.total")
+                    zakura_node_services::metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
                     // Reserve buffer space for the expected body and the following header.
@@ -546,7 +547,7 @@ impl Decoder for Codec {
                             let command = escape_command(&command)
                                 .trim_end_matches(r"\x00")
                                 .to_owned();
-                            metrics::counter!(
+                            zakura_node_services::metrics::counter!(
                                 "peer.message.parse.panics",
                                 "parser" => "legacy_body"
                             )

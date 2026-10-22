@@ -216,14 +216,18 @@ fn renders_like_metrics_exporter_prometheus() {
     let recorder = PrometheusRecorder::default();
     metrics::with_local_recorder(&recorder, || {
         metrics::describe_counter!("sync.blocks", "Blocks \"synced\"\nfrom peers");
-        metrics::counter!("sync.blocks").increment(3);
-        metrics::counter!("peer.messages", "kind" => "inv", "dir" => "in").increment(2);
-        metrics::counter!("peer.messages", "kind" => "tx", "dir" => "in").increment(5);
-        metrics::gauge!("state.tip.height").set(1234.5);
-        metrics::gauge!("1bad-name", "bad key" => "va\"lue").set(-1.0);
-        metrics::histogram!("rpc.latency", "method" => "getinfo").record(0.25);
-        metrics::histogram!("rpc.latency", "method" => "getinfo").record(0.75);
-        let _empty = metrics::histogram!("rpc.empty");
+        zakura_node_services::metrics::counter!("sync.blocks").increment(3);
+        zakura_node_services::metrics::counter!("peer.messages", "kind" => "inv", "dir" => "in")
+            .increment(2);
+        zakura_node_services::metrics::counter!("peer.messages", "kind" => "tx", "dir" => "in")
+            .increment(5);
+        zakura_node_services::metrics::gauge!("state.tip.height").set(1234.5);
+        zakura_node_services::metrics::gauge!("1bad-name", "bad key" => "va\"lue").set(-1.0);
+        zakura_node_services::metrics::histogram!("rpc.latency", "method" => "getinfo")
+            .record(0.25);
+        zakura_node_services::metrics::histogram!("rpc.latency", "method" => "getinfo")
+            .record(0.75);
+        let _empty = zakura_node_services::metrics::histogram!("rpc.empty");
     });
 
     assert_eq!(
@@ -272,7 +276,7 @@ rpc_latency_count{method="getinfo"} 2
 async fn endpoint_serves_the_metrics() {
     let recorder = PrometheusRecorder::default();
     metrics::with_local_recorder(&recorder, || {
-        metrics::counter!("endpoint.test").increment(7);
+        zakura_node_services::metrics::counter!("endpoint.test").increment(7);
     });
     let addr = endpoint::spawn("127.0.0.1:0".parse().expect("valid address"), recorder)
         .expect("the endpoint starts");

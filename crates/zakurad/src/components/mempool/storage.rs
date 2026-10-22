@@ -589,7 +589,7 @@ impl Storage {
         ancestors: &HashSet<transaction::Hash>,
     ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError> {
         if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
-            metrics::gauge!("zcash.mempool.eviction_cost.floor").set(0.0);
+            zakura_node_services::metrics::gauge!("zcash.mempool.eviction_cost.floor").set(0.0);
             return Ok(HashSet::new());
         }
 
@@ -600,12 +600,13 @@ impl Storage {
         if let Some(cheapest) = victims.cheapest {
             // In zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of cost, the increment is
             // one `MARGINAL_FEE`. Metrics tolerate the precision loss of converting to `f64`.
-            metrics::gauge!("zcash.mempool.eviction_cost.floor")
+            zakura_node_services::metrics::gauge!("zcash.mempool.eviction_cost.floor")
                 .set(cheapest.zat_per_threshold_cost() + zip317::MARGINAL_FEE as f64);
         }
 
         let roots = victims.roots.ok_or_else(|| {
-            metrics::counter!("zcash.mempool.rejected.below_eviction_cost").increment(1);
+            zakura_node_services::metrics::counter!("zcash.mempool.rejected.below_eviction_cost")
+                .increment(1);
             ExactTipRejectionError::BelowEvictionCost
         })?;
 
@@ -618,7 +619,8 @@ impl Storage {
             }
         }
         // A `usize` always fits in a `u64` on supported platforms.
-        metrics::counter!("zcash.mempool.evicted").increment(evicted_ids.len() as u64);
+        zakura_node_services::metrics::counter!("zcash.mempool.evicted")
+            .increment(evicted_ids.len() as u64);
 
         Ok(evicted_ids)
     }
@@ -1088,12 +1090,12 @@ impl Storage {
     ///
     /// Must be called every time the rejected lists change.
     fn update_rejected_metrics(&mut self) {
-        metrics::gauge!("mempool.rejected.transaction.ids",)
+        zakura_node_services::metrics::gauge!("mempool.rejected.transaction.ids",)
             .set(self.rejected_transaction_count() as f64);
         // This is just an approximation.
         // TODO: make it more accurate #2869
         let item_size = size_of::<(transaction::Hash, SameEffectsTipRejectionError)>();
-        metrics::gauge!("mempool.rejected.transaction.ids.bytes",)
+        zakura_node_services::metrics::gauge!("mempool.rejected.transaction.ids.bytes",)
             .set((self.rejected_transaction_count() * item_size) as f64);
     }
 }

@@ -196,13 +196,13 @@ fn liveness_grace_allowed(
 fn record_decoded_memory_size(block: &block::Block, body_wire_bytes: Option<u64>) -> u64 {
     let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
     // Metrics accepts f64 samples; these lossy conversions are observability-only.
-    metrics::histogram!(
+    zakura_node_services::metrics::histogram!(
         "sync.block.body.decoded.attributed_memory_size_bytes",
         "stage" => "peer"
     )
     .record(decoded_attributed_memory_size_bytes as f64);
     if let Some(serialized_bytes) = body_wire_bytes.filter(|bytes| *bytes > 0) {
-        metrics::histogram!(
+        zakura_node_services::metrics::histogram!(
             "sync.block.body.decoded.to_serialized_ratio",
             "stage" => "peer"
         )
@@ -1151,7 +1151,7 @@ impl PeerRoutine {
                     AdmissionOutcome::Admit(grant)
                         if grant.priority == RequestPriority::AboveFloor =>
                     {
-                        metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
+                        zakura_node_services::metrics::gauge!("sync.block.backlog.at_cap").set(0.0);
                         // Bound the take by remaining cwnd byte headroom (byte mode, no floor
                         // bonus) so an above-floor request never overshoots the byte window
                         // beyond the one always-taken item.
@@ -1173,7 +1173,7 @@ impl PeerRoutine {
                     // to `no_work`, exactly as before).
                     AdmissionOutcome::Admit(_) => {}
                     AdmissionOutcome::LookaheadAtCap => {
-                        metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
+                        zakura_node_services::metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
                         break FillStop::LookaheadCap;
                     }
                     AdmissionOutcome::InflightBudgetEmpty => break FillStop::InflightBudget,
@@ -1395,7 +1395,7 @@ impl PeerRoutine {
                 self.requester.retire(first_height, true);
                 break FillStop::SendError;
             }
-            metrics::counter!("sync.block.request.sent").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.request.sent").increment(1);
             let estimate_kind = if reserved_bytes
                 >= u64::from(request_count).saturating_mul(block::MAX_BLOCK_BYTES)
             {
@@ -1403,11 +1403,12 @@ impl PeerRoutine {
             } else {
                 "hinted"
             };
-            metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
+            zakura_node_services::metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
                 .increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
-                metrics::counter!("sync.block.request.floor_bypass").increment(1);
+                zakura_node_services::metrics::counter!("sync.block.request.floor_bypass")
+                    .increment(1);
             }
             self.window
                 .arm_liveness(queued_at, self.config.effective_liveness_timeout());
@@ -1429,9 +1430,9 @@ impl PeerRoutine {
         // budget + work all free, stopped anyway). The at-cap gauge is latched here so
         // every gate refusal — floor arm, speculative arm, in bypass or not — sets it.
         if fill_stop == FillStop::LookaheadCap {
-            metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
+            zakura_node_services::metrics::gauge!("sync.block.backlog.at_cap").set(1.0);
         }
-        metrics::counter!("sync.block.fill_stop", "reason" => fill_stop.as_str()).increment(1);
+        zakura_node_services::metrics::counter!("sync.block.fill_stop", "reason" => fill_stop.as_str()).increment(1);
         if fill_sent == 0 {
             self.trace_fill_stop(fill_stop.as_str());
         }
@@ -1504,7 +1505,8 @@ impl PeerRoutine {
             // floor-priority overdraft globally. Its charge is released by the
             // normal reservation paths: receipt, timeout, watchdog, or reset.
             self.budget.charge(reserved_bytes);
-            metrics::counter!("sync.block.budget.floor_overdraft").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.budget.floor_overdraft")
+                .increment(1);
             return true;
         }
         false
@@ -1853,7 +1855,10 @@ impl PeerRoutine {
                 return;
             }
             // Local retirement, reorgs and GC change interest, not authority.
-            metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
+            zakura_node_services::metrics::counter!(
+                "sync.block.response.unmatched_authorized_ignored"
+            )
+            .increment(1);
             tracing::debug!(
                 peer = ?self.peer,
                 ?height,
@@ -1894,7 +1899,7 @@ impl PeerRoutine {
             .record_block_body_received(hash, BlockBodySource::Zakura);
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
+            zakura_node_services::metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
                 .increment(1);
             self.drop_obsolete_outstanding(key);
             return;
@@ -1943,10 +1948,11 @@ impl PeerRoutine {
             // advertised size stall this height on every honest delivery. A
             // regulated reservation already bounds the body's bytes, so the
             // estimate says nothing about that supplier.
-            metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.body.size_hint_mismatch")
+                .increment(1);
         }
 
-        metrics::counter!("sync.block.body.received").increment(1);
+        zakura_node_services::metrics::counter!("sync.block.body.received").increment(1);
         self.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
@@ -2150,7 +2156,10 @@ impl PeerRoutine {
             // later duplicate. The received body charges no request budget, but any
             // stale request reservation the height still owned is released below.
             let _ = self.work.take_in_range(height, height, 1);
-            metrics::counter!("sync.block.response.unmatched_queued_accepted").increment(1);
+            zakura_node_services::metrics::counter!(
+                "sync.block.response.unmatched_queued_accepted"
+            )
+            .increment(1);
             self.work.claim_received_for_owner(owner, height)
         } else {
             // First-completion-wins for a timed-out height already re-issued to
@@ -2160,7 +2169,10 @@ impl PeerRoutine {
             let Some(estimate) = self.work.release_answered_elsewhere(owner, height) else {
                 return false;
             };
-            metrics::counter!("sync.block.response.unmatched_active_accepted").increment(1);
+            zakura_node_services::metrics::counter!(
+                "sync.block.response.unmatched_active_accepted"
+            )
+            .increment(1);
             estimate
         };
 
@@ -2509,7 +2521,7 @@ impl PeerRoutine {
         // This path only records misbehavior: observe and forward it, but never
         // cancel the session. Only a proven tampered body, reported by the
         // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).
-        metrics::counter!("sync.block.peer.violation").increment(1);
+        zakura_node_services::metrics::counter!("sync.block.peer.violation").increment(1);
         // `Misbehavior` is best-effort: never block the routine. The reactor owns
         // action dispatch so attacker-triggered reports cannot bypass its reserved
         // control capacity.
@@ -2529,7 +2541,8 @@ impl PeerRoutine {
 
     fn record_received(&self, bytes: u64) {
         // Count accepted serialized block payloads, excluding transport framing.
-        metrics::counter!("sync.block.payload.received.bytes").increment(bytes);
+        zakura_node_services::metrics::counter!("sync.block.payload.received.bytes")
+            .increment(bytes);
         if let Ok(mut meter) = self.received_throughput.lock() {
             meter.record(bytes);
         }

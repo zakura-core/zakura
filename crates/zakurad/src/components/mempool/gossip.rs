@@ -95,8 +95,10 @@ where
                             ?skip_count,
                             "dropped mempool changes before gossiping, draining pending transaction IDs"
                         );
-                        metrics::counter!("mempool.gossip.lagged.events.total")
-                            .increment(skip_count);
+                        zakura_node_services::metrics::counter!(
+                            "mempool.gossip.lagged.events.total"
+                        )
+                        .increment(skip_count);
                         // Exit the wait loop to re-advertise the pending transaction IDs.
                         break;
                     }
@@ -119,8 +121,10 @@ where
                             ?skip_count,
                             "dropped mempool changes before gossiping, draining pending transaction IDs"
                         );
-                        metrics::counter!("mempool.gossip.lagged.events.total")
-                            .increment(skip_count);
+                        zakura_node_services::metrics::counter!(
+                            "mempool.gossip.lagged.events.total"
+                        )
+                        .increment(skip_count);
                     }
                     Err(closed @ TryRecvError::Closed) => Err(closed)?,
                 }
@@ -196,8 +200,10 @@ where
     }
 
     if advertised_count > 0 {
-        metrics::counter!("mempool.gossip.pending.transactions.total").increment(advertised_count);
-        metrics::counter!("mempool.gossiped.transactions.total").increment(advertised_count);
+        zakura_node_services::metrics::counter!("mempool.gossip.pending.transactions.total")
+            .increment(advertised_count);
+        zakura_node_services::metrics::counter!("mempool.gossiped.transactions.total")
+            .increment(advertised_count);
     }
 
     Ok(advertised_count)

@@ -862,7 +862,8 @@ where
 
     debug!(?our_version, "sending initial version message");
     if our_services.contains(PeerServices::NODE_P2P_V2) {
-        metrics::counter!("zakura.p2p.handshake.service_bit.advertised").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.handshake.service_bit.advertised")
+            .increment(1);
     }
     peer_conn.send(our_version.clone().into()).await?;
 
@@ -900,7 +901,8 @@ where
         );
     }
     if remote.services.contains(PeerServices::NODE_P2P_V2) {
-        metrics::counter!("zakura.p2p.handshake.service_bit.remote").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.handshake.service_bit.remote")
+            .increment(1);
     }
 
     // Check for nonce reuse, indicating self-connection
@@ -941,14 +943,15 @@ where
 
         // Handshake rejects by protocol version. Not labeled by peer address or
         // user-agent: the Prometheus exporter never prunes series.
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zcash.net.peers.obsolete",
             "remote_version" => remote.version.to_string(),
             "min_version" => min_version.to_string(),
         )
         .increment(1);
 
-        metrics::gauge!("zcash.net.peers.version.obsolete").set(remote.version.0 as f64);
+        zakura_node_services::metrics::gauge!("zcash.net.peers.version.obsolete")
+            .set(remote.version.0 as f64);
 
         // Disconnect if peer is using an obsolete version.
         return Err(HandshakeError::ObsoleteVersion(remote.version));
@@ -976,7 +979,7 @@ where
 
     // Handshake count by protocol version. Not labeled by peer address or
     // user-agent: the Prometheus exporter never prunes series.
-    metrics::counter!(
+    zakura_node_services::metrics::counter!(
         "zcash.net.peers.connected",
         "remote_version" => connection_info.remote.version.to_string(),
         "negotiated_version" => negotiated_version.to_string(),
@@ -984,7 +987,7 @@ where
     )
     .increment(1);
 
-    metrics::gauge!("zcash.net.peers.version.connected")
+    zakura_node_services::metrics::gauge!("zcash.net.peers.version.connected")
         .set(connection_info.remote.version.0 as f64);
 
     peer_conn.send(Message::Verack).await?;
@@ -1038,7 +1041,7 @@ where
     PeerTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(connector) = zakura_handshake_connector else {
-        metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.handshake.upgrade.error").increment(1);
         return Err(HandshakeError::ZakuraUpgrade(
             crate::zakura::ZakuraUpgradeError::Unavailable,
         ));
@@ -1120,7 +1123,7 @@ where
                 ?peer_id,
                 "closing duplicate Zakura peer neutrally"
             );
-            metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
         }
         ZakuraUpgradeOutcome::Rejected { reason } => {
             debug!(
@@ -1129,7 +1132,7 @@ where
                 ?reason,
                 "Zakura upgrade not completed; continuing on the legacy connection",
             );
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.p2p.upgrade.prelude.rejected",
                 "reason" => format!("{reason:?}"),
                 "network" => upgrade_config.network_label(),
@@ -1426,11 +1429,12 @@ fn decode_upgrade_prelude_with(
     match panic::catch_unwind(decode) {
         Ok(Ok(prelude)) => Ok(prelude),
         Ok(Err(error)) => {
-            metrics::counter!("zakura.p2p.upgrade.prelude.malformed").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.upgrade.prelude.malformed")
+                .increment(1);
             Err(HandshakeError::ZakuraUpgradePreludeMalformed(error))
         }
         Err(_panic_payload) => {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "peer.message.parse.panics",
                 "parser" => "upgrade_prelude",
             )
@@ -1597,7 +1601,7 @@ where
                 Ok(info) => {
                     // Record successful handshake duration
                     let duration = handshake_start.elapsed().as_secs_f64();
-                    metrics::histogram!(
+                    zakura_node_services::metrics::histogram!(
                         "zcash.net.peer.handshake.duration_seconds",
                         "result" => "success"
                     )
@@ -1622,12 +1626,12 @@ where
                             unreachable!("negotiate_version returns before Zakura upgrade routing")
                         }
                     };
-                    metrics::histogram!(
+                    zakura_node_services::metrics::histogram!(
                         "zcash.net.peer.handshake.duration_seconds",
                         "result" => "failure"
                     )
                     .record(duration);
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "zcash.net.peer.handshake.failures.total",
                         "reason" => reason
                     )
@@ -1726,7 +1730,7 @@ where
             let peer_tx = peer_tx.with(move |msg: Message| {
                 let span = debug_span!(parent: inner_conn_span.clone(), "outbound_metric");
                 // Add a metric for outbound messages.
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "zcash.net.out.messages",
                     "command" => msg.command(),
                 )
@@ -1762,7 +1766,7 @@ where
                     async move {
                         match &msg {
                             Ok(msg) => {
-                                metrics::counter!(
+                                zakura_node_services::metrics::counter!(
                                     "zcash.net.in.messages",
                                     "command" => msg.command(),
                                 )
@@ -1774,7 +1778,7 @@ where
                                 // to a shared channel or do anything expensive here.
                             }
                             Err(err) => {
-                                metrics::counter!(
+                                zakura_node_services::metrics::counter!(
                                     "zakura.net.in.errors",
                                     "error" => err.to_string(),
                                 )

@@ -1593,7 +1593,7 @@ impl Request {
 
     /// Counts metric for StateService call
     pub fn count_metric(&self) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "state.requests",
             "service" => "state",
             "type" => self.variant_name()
@@ -2210,7 +2210,7 @@ impl ReadRequest {
 
     /// Counts metric for ReadStateService call
     pub fn count_metric(&self) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "state.requests",
             "service" => "read_state",
             "type" => self.variant_name()

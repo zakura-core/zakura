@@ -266,9 +266,11 @@ where
                             succeeded = broadcast => succeeded,
                         };
                         if succeeded {
-                            metrics::counter!("mining.optimistic_inventory.early_inventories")
-                                .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
+                            zakura_node_services::metrics::counter!(
+                                "mining.optimistic_inventory.early_inventories"
+                            )
+                            .increment(1);
+                            zakura_node_services::metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
                                 .record(submitted_at.elapsed().as_secs_f64());
                         }
                         succeeded

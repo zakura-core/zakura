@@ -747,8 +747,9 @@ impl StateService {
             self.max_finalized_queue_height = queued_height.0 as f64;
         }
 
-        metrics::gauge!("state.checkpoint.queued.max.height").set(self.max_finalized_queue_height);
-        metrics::gauge!("state.checkpoint.queued.block.count")
+        zakura_node_services::metrics::gauge!("state.checkpoint.queued.max.height")
+            .set(self.max_finalized_queue_height);
+        zakura_node_services::metrics::gauge!("state.checkpoint.queued.block.count")
             .set(self.finalized_state_queued_blocks.len() as f64);
 
         rsp_rx
@@ -803,7 +804,7 @@ impl StateService {
 
                     self.clear_finalized_block_queue(CommitBlockError::WriteTaskExited);
                 } else {
-                    metrics::gauge!("state.checkpoint.sent.block.height")
+                    zakura_node_services::metrics::gauge!("state.checkpoint.sent.block.height")
                         .set(last_sent_finalized_block_height.0 as f64);
                 };
             }
@@ -1330,16 +1331,20 @@ impl StateService {
         // `requested_at`, so that is what tells the two apart.
         let measure_submission_latency = requested_at.is_some();
         if let Some(requested_at) = requested_at {
-            metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
-                .record(requested_at.elapsed().as_secs_f64());
+            zakura_node_services::metrics::histogram!(
+                "state.semantic_commit.dispatch.duration_seconds"
+            )
+            .record(requested_at.elapsed().as_secs_f64());
         }
 
         let prequeue_checks_start = measure_submission_latency.then(Instant::now);
         self.assert_block_can_be_validated(&block);
         self.pending_utxos.check_against_ordered(&block.new_outputs);
         if let Some(prequeue_checks_start) = prequeue_checks_start {
-            metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
-                .record(prequeue_checks_start.elapsed().as_secs_f64());
+            zakura_node_services::metrics::histogram!(
+                "state.semantic_commit.prequeue_checks.duration_seconds"
+            )
+            .record(prequeue_checks_start.elapsed().as_secs_f64());
         }
 
         // # Performance
@@ -1357,8 +1362,10 @@ impl StateService {
             span.in_scope(|| self.queue_and_commit_to_non_finalized_state(block, admission))
         });
         if let Some(queue_send_start) = queue_send_start {
-            metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
-                .record(queue_send_start.elapsed().as_secs_f64());
+            zakura_node_services::metrics::histogram!(
+                "state.semantic_commit.queue_and_commit.duration_seconds"
+            )
+            .record(queue_send_start.elapsed().as_secs_f64());
         }
 
         // TODO:
@@ -1723,7 +1730,10 @@ impl ReadStateService {
                 "discarding historical frontier artifact that does not cover the database's VCT \
                  handoff"
             );
-            metrics::counter!("state.historical_tree.artifact_before_vct_handoff").increment(1);
+            zakura_node_services::metrics::counter!(
+                "state.historical_tree.artifact_before_vct_handoff"
+            )
+            .increment(1);
             *historical_trees = read::HistoricalTreeCache::default();
             return false;
         }
@@ -2709,7 +2719,8 @@ where
         Some(upgrade) if end < upgrade => "trees",
         Some(_) => "mixed",
     };
-    metrics::counter!("state.block_roots.response", "source" => source).increment(1);
+    zakura_node_services::metrics::counter!("state.block_roots.response", "source" => source)
+        .increment(1);
     let mut roots = Vec::new();
     let mut selected_aux_roots: Option<std::vec::IntoIter<BlockCommitmentRoots>> = None;
 

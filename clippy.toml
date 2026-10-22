@@ -1,0 +1,7 @@
+# Each `metrics` macro call site compiles its own copy of the recorder lookup.
+# The `zakura_node_services::metrics` macros take the same arguments and share one.
+disallowed-macros = [
+    { path = "metrics::counter", reason = "use zakura_node_services::metrics::counter!", replacement = "zakura_node_services::metrics::counter" },
+    { path = "metrics::gauge", reason = "use zakura_node_services::metrics::gauge!", replacement = "zakura_node_services::metrics::gauge" },
+    { path = "metrics::histogram", reason = "use zakura_node_services::metrics::histogram!", replacement = "zakura_node_services::metrics::histogram" },
+]

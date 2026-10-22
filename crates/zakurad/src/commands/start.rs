@@ -420,20 +420,21 @@ impl StartCmd {
                 ),
             ] {
                 if let Some(height) = upgrade.activation_height(&config.network.network) {
-                    metrics::gauge!(metric).set(f64::from(height.0));
+                    zakura_node_services::metrics::gauge!(metric).set(f64::from(height.0));
                 }
             }
-            metrics::gauge!("sync.report.checkpoint.height")
+            zakura_node_services::metrics::gauge!("sync.report.checkpoint.height")
                 .set(f64::from(max_checkpoint_height.0));
             for metric in [
                 "sync.block.payload.received.bytes",
                 "state.vct.fast.block.count",
                 "state.vct.legacy.block.count",
             ] {
-                metrics::counter!(metric).increment(0);
+                zakura_node_services::metrics::counter!(metric).increment(0);
             }
             #[cfg(feature = "sync-metrics")]
-            metrics::counter!("sync.block.payload.committed.bytes").increment(0);
+            zakura_node_services::metrics::counter!("sync.block.payload.committed.bytes")
+                .increment(0);
         }
 
         info!("opening database, this may take a few minutes");

@@ -362,7 +362,7 @@ impl Shared {
                     "the publisher queued {outcome:?} outside its window"
                 );
                 let terminal = self.publications.end(&id)?;
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header.v9.publisher.outcome",
                     "outcome" => outcome_label(outcome),
                 )
@@ -526,11 +526,11 @@ impl Shared {
                 }
             }
             Output::Retry(reason) => {
-                metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => reason)
+                zakura_node_services::metrics::counter!("sync.header.v9.publisher.page_dropped", "reason" => reason)
                     .increment(1);
             }
             Output::Stall(stall, reason) => {
-                metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
+                zakura_node_services::metrics::counter!("sync.header.v9.publisher.stall", "reason" => reason)
                     .increment(1);
                 if moved {
                     return;

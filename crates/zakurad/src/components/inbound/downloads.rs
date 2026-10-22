@@ -479,7 +479,8 @@ where
                 retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
                 "poisoned gossip block retry budget exhausted, leaving the block to the syncer"
             );
-            metrics::counter!("gossip.poisoned.block.retry.limit.count").increment(1);
+            zakura_node_services::metrics::counter!("gossip.poisoned.block.retry.limit.count")
+                .increment(1);
 
             return None;
         };
@@ -496,7 +497,8 @@ where
                     retry_limit = POISONED_GOSSIP_BLOCK_RETRY_LIMIT,
                     "gossiped block body was poisoned, re-requesting the block from another peer"
                 );
-                metrics::counter!("gossip.poisoned.block.requeued.count").increment(1);
+                zakura_node_services::metrics::counter!("gossip.poisoned.block.requeued.count")
+                    .increment(1);
             }
             DownloadAction::AlreadyQueued | DownloadAction::FullQueue => {
                 warn!(
@@ -507,7 +509,10 @@ where
                     "poisoned gossip block re-request was refused, \
                      spending the retry budget without dispatching"
                 );
-                metrics::counter!("gossip.poisoned.block.requeue.refused.count").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "gossip.poisoned.block.requeue.refused.count"
+                )
+                .increment(1);
             }
         }
 
@@ -543,8 +548,12 @@ where
                 "block hash already queued for inbound download: ignored block",
             );
 
-            metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
-            metrics::counter!("gossip.already.queued.dropped.block.hash.count").increment(1);
+            zakura_node_services::metrics::gauge!("gossip.queued.block.count")
+                .set(self.queue_len() as f64);
+            zakura_node_services::metrics::counter!(
+                "gossip.already.queued.dropped.block.hash.count"
+            )
+            .increment(1);
 
             return DownloadAction::AlreadyQueued;
         }
@@ -557,8 +566,10 @@ where
                 "too many blocks queued for inbound download: ignored block",
             );
 
-            metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
-            metrics::counter!("gossip.full.queue.dropped.block.hash.count").increment(1);
+            zakura_node_services::metrics::gauge!("gossip.queued.block.count")
+                .set(self.queue_len() as f64);
+            zakura_node_services::metrics::counter!("gossip.full.queue.dropped.block.hash.count")
+                .increment(1);
 
             return DownloadAction::FullQueue;
         }
@@ -577,8 +588,12 @@ where
                     "too many blocks queued for inbound download from one source: ignored block",
                 );
 
-                metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
-                metrics::counter!("gossip.source.queue.dropped.block.hash.count").increment(1);
+                zakura_node_services::metrics::gauge!("gossip.queued.block.count")
+                    .set(self.queue_len() as f64);
+                zakura_node_services::metrics::counter!(
+                    "gossip.source.queue.dropped.block.hash.count"
+                )
+                .increment(1);
 
                 return DownloadAction::FullQueue;
             }
@@ -598,7 +613,8 @@ where
             concurrency_limit = self.full_verify_concurrency_limit,
             "queued hash for download",
         );
-        metrics::gauge!("gossip.queued.block.count").set(self.queue_len() as f64);
+        zakura_node_services::metrics::gauge!("gossip.queued.block.count")
+            .set(self.queue_len() as f64);
 
         DownloadAction::AddedToQueue
     }
@@ -700,7 +716,7 @@ where
                     advertiser_addr,
                 ));
             }
-            metrics::counter!("gossip.downloaded.block.count").increment(1);
+            zakura_node_services::metrics::counter!("gossip.downloaded.block.count").increment(1);
 
             // # Security & Performance
             //
@@ -742,7 +758,8 @@ where
                         ?hash,
                         "gossiped block with no height: dropped downloaded block"
                     );
-                    metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
+                    zakura_node_services::metrics::counter!("gossip.no.height.dropped.block.count")
+                        .increment(1);
 
                     BoxError::from("gossiped block with no height")
                 })
@@ -767,7 +784,8 @@ where
                     "gossiped tip child claimed the wrong coinbase height: \
                      dropped downloaded block"
                 );
-                metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
+                zakura_node_services::metrics::counter!("gossip.tip.child.height.mismatch.count")
+                    .increment(1);
 
                 Err((
                     BoxError::from(GossipedTipChildHeightMismatch {
@@ -788,7 +806,10 @@ where
                     lookahead_limit = full_verify_concurrency_limit,
                     "gossiped block height too far ahead of the tip: dropped downloaded block",
                 );
-                metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "gossip.max.height.limit.dropped.block.count"
+                )
+                .increment(1);
 
                 Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
             } else if block_height < min_accepted_height {
@@ -800,7 +821,10 @@ where
                     behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
                     "gossiped block height behind the finalized tip: dropped downloaded block",
                 );
-                metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "gossip.min.height.limit.dropped.block.count"
+                )
+                .increment(1);
 
                 Err("gossiped block height behind the finalized tip")
                     .map_err(|e| (e.into(), None))?;
@@ -819,7 +843,7 @@ where
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
-            metrics::counter!("gossip.verified.block.count").increment(1);
+            zakura_node_services::metrics::counter!("gossip.verified.block.count").increment(1);
             hash
         })
         // Tack the hash onto the error so poll_next can look up the cancel
@@ -833,7 +857,7 @@ where
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
-                    metrics::counter!("gossip.cancelled.count").increment(1);
+                    zakura_node_services::metrics::counter!("gossip.cancelled.count").increment(1);
                     Err(("canceled".into(), hash, None))
                 }
                 verification = fut => verification,

@@ -397,7 +397,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
 
     fn count_over_limit(&mut self, held: usize) {
         self.over_limit += 1;
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.subscription.over_limit",
             "message_type" => self.limits.message_type.to_string(),
         )

@@ -600,7 +600,7 @@ async fn engage_legacy_fallback_alongside_zakura(
     let lease = block_sync_handoff
         .acquire_legacy_fallback(std::time::Duration::from_secs(60))
         .await?;
-    metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
+    zakura_node_services::metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
     Ok(lease)
 }
 
@@ -1594,7 +1594,7 @@ where
                 result?;
                 last_progress = Instant::now();
             }
-            metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
+            zakura_node_services::metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
 
             // Ask for more block hashes while we still have some left to download.
@@ -1707,7 +1707,7 @@ where
                             state_tip = ?self.latest_chain_tip.best_tip_height(),
                             "refreshing tips: in-flight blocks are waiting on undiscovered hashes",
                         );
-                        metrics::counter!("sync.tip.refresh").increment(1);
+                        zakura_node_services::metrics::counter!("sync.tip.refresh").increment(1);
 
                         let refreshed =
                             timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
@@ -2119,7 +2119,7 @@ where
                     let new_download_len = download_set.len();
                     let new_hashes = new_download_len - prev_download_len;
                     debug!(new_hashes, "added hashes to download set");
-                    metrics::histogram!("sync.obtain.response.hash.count")
+                    zakura_node_services::metrics::histogram!("sync.obtain.response.hash.count")
                         .record(new_hashes as f64);
                 }
                 Ok(_) => unreachable!("network returned wrong response"),
@@ -2146,7 +2146,8 @@ where
 
         let new_downloads = download_set.len();
         debug!(new_downloads, "queueing new downloads");
-        metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
+        zakura_node_services::metrics::gauge!("sync.obtain.queued.hash.count")
+            .set(new_downloads as f64);
 
         // security: use the actual number of new downloads from all peers,
         // so the last peer to respond can't toggle our mempool
@@ -2154,7 +2155,7 @@ where
 
         let response = self.request_blocks(download_set).await;
 
-        metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
+        zakura_node_services::metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
@@ -2283,8 +2284,10 @@ where
                         let new_download_len = download_set.len();
                         let new_hashes = new_download_len - prev_download_len;
                         debug!(new_hashes, "added hashes to download set");
-                        metrics::histogram!("sync.extend.response.hash.count")
-                            .record(new_hashes as f64);
+                        zakura_node_services::metrics::histogram!(
+                            "sync.extend.response.hash.count"
+                        )
+                        .record(new_hashes as f64);
                     }
                     Ok(_) => unreachable!("network returned wrong response"),
                     // We ignore this error because we made multiple fanout requests.
@@ -2295,9 +2298,10 @@ where
 
         let new_downloads = download_set.len();
         debug!(new_downloads, "discovered new hashes to download");
-        metrics::gauge!("sync.extend.queued.hash.count").set(new_downloads as f64);
+        zakura_node_services::metrics::gauge!("sync.extend.queued.hash.count")
+            .set(new_downloads as f64);
 
-        metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
+        zakura_node_services::metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
         // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
@@ -2707,7 +2711,8 @@ where
                     "sync block body failed a header commitment check, or descends from one that \
                      did, retrying required block"
                 );
-                metrics::counter!("sync.poisoned.block.requeued.count").increment(1);
+                zakura_node_services::metrics::counter!("sync.poisoned.block.requeued.count")
+                    .increment(1);
 
                 match self.downloads.download_and_verify(hash).await {
                     Ok(())
@@ -2727,7 +2732,8 @@ where
                 retry_limit = POISONED_BLOCK_RETRY_LIMIT,
                 "poisoned sync block retry budget exhausted, restarting sync"
             );
-            metrics::counter!("sync.poisoned.block.retry.limit.count").increment(1);
+            zakura_node_services::metrics::counter!("sync.poisoned.block.retry.limit.count")
+                .increment(1);
         }
 
         if let Some((hash, kind)) = response
@@ -2751,7 +2757,10 @@ where
                             retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
                             "missing sync block download failed, retrying required block"
                         );
-                        metrics::counter!("sync.missing.block.requeued.count").increment(1);
+                        zakura_node_services::metrics::counter!(
+                            "sync.missing.block.requeued.count"
+                        )
+                        .increment(1);
 
                         match self.downloads.download_and_verify(hash).await {
                             Ok(()) => return Ok(()),
@@ -2773,7 +2782,8 @@ where
                         retry_limit = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT,
                         "missing sync block retry budget exhausted, restarting sync"
                     );
-                    metrics::counter!("sync.missing.block.retry.limit.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.missing.block.retry.limit.count")
+                        .increment(1);
                 }
 
                 // No currently-connected peer has the block. Routing to another connected peer
@@ -2785,7 +2795,10 @@ where
                 // giving the crawler time to connect new peers / inventory marks time to expire.
                 // Only a block that stays missing for the whole budget (e.g. a bad tip) restarts.
                 NotFoundKind::Registry => {
-                    metrics::counter!("sync.missing.block.registry.miss.count").increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "sync.missing.block.registry.miss.count"
+                    )
+                    .increment(1);
 
                     let retry_count = self.registry_miss_retry_counts.entry(hash).or_default();
 
@@ -2798,7 +2811,10 @@ where
                             retry_limit = MISSING_BLOCK_REGISTRY_RETRY_LIMIT,
                             "required sync block is missing from all current peers, retrying after backoff"
                         );
-                        metrics::counter!("sync.missing.block.registry.retry.count").increment(1);
+                        zakura_node_services::metrics::counter!(
+                            "sync.missing.block.registry.retry.count"
+                        )
+                        .increment(1);
 
                         // Schedule the retry instead of blocking the loop on an inline `sleep`. While
                         // it's pending, `sync_round` gates new speculative dispatch (head-of-line
@@ -2843,7 +2859,8 @@ where
                     retry_limit = TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT,
                     "transient sync block download failed, retrying required block"
                 );
-                metrics::counter!("sync.transient.block.requeued.count").increment(1);
+                zakura_node_services::metrics::counter!("sync.transient.block.requeued.count")
+                    .increment(1);
 
                 match self.downloads.download_and_verify(hash).await {
                     Ok(())
@@ -2864,7 +2881,8 @@ where
                 peer_request_ceiling = MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND,
                 "transient sync block download retry budget exhausted, restarting sync"
             );
-            metrics::counter!("sync.transient.block.retry.limit.count").increment(1);
+            zakura_node_services::metrics::counter!("sync.transient.block.retry.limit.count")
+                .increment(1);
         }
 
         self.handle_block_response(response)?;
@@ -2933,8 +2951,10 @@ where
     }
 
     fn update_metrics(&mut self) {
-        metrics::gauge!("sync.prospective_tips.len",).set(self.prospective_tips.len() as f64);
-        metrics::gauge!("sync.downloads.in_flight",).set(self.downloads.in_flight() as f64);
+        zakura_node_services::metrics::gauge!("sync.prospective_tips.len",)
+            .set(self.prospective_tips.len() as f64);
+        zakura_node_services::metrics::gauge!("sync.downloads.in_flight",)
+            .set(self.downloads.in_flight() as f64);
         let phase_counts = self.downloads.phase_counts();
         for (phase, metric) in [
             ("waiting_network", "sync.downloads.waiting_network"),
@@ -2945,7 +2965,7 @@ where
         ] {
             let count = u32::try_from(phase_counts.get(phase).copied().unwrap_or_default())
                 .unwrap_or(u32::MAX);
-            metrics::gauge!(metric).set(f64::from(count));
+            zakura_node_services::metrics::gauge!(metric).set(f64::from(count));
         }
     }
 

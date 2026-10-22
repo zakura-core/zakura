@@ -767,13 +767,13 @@ impl Publisher {
 }
 
 fn record_published_snapshot(snapshot: &EngineSnapshot) {
-    metrics::gauge!("sync.header_chain.frontier.finalized_height")
+    zakura_node_services::metrics::gauge!("sync.header_chain.frontier.finalized_height")
         .set(f64::from(snapshot.frontiers.finalized.height.0));
-    metrics::gauge!("sync.header_chain.frontier.header_best_height")
+    zakura_node_services::metrics::gauge!("sync.header_chain.frontier.header_best_height")
         .set(f64::from(snapshot.frontiers.header_best.height.0));
-    metrics::gauge!("sync.header_chain.frontier.verified_best_height")
+    zakura_node_services::metrics::gauge!("sync.header_chain.frontier.verified_best_height")
         .set(f64::from(snapshot.frontiers.verified_best.height.0));
-    metrics::gauge!("sync.header_chain.frontier.divergence").set(f64::from(
+    zakura_node_services::metrics::gauge!("sync.header_chain.frontier.divergence").set(f64::from(
         snapshot
             .frontiers
             .header_best
@@ -783,18 +783,18 @@ fn record_published_snapshot(snapshot: &EngineSnapshot) {
     ));
     // Metrics expose approximate floating-point generations.
     // The durable counters retain the exact generation values.
-    metrics::gauge!("sync.header_chain.generation.header")
+    zakura_node_services::metrics::gauge!("sync.header_chain.generation.header")
         .set(snapshot.header_generation.get() as f64);
-    metrics::gauge!("sync.header_chain.generation.verified")
+    zakura_node_services::metrics::gauge!("sync.header_chain.generation.verified")
         .set(snapshot.verified_generation.get() as f64);
-    metrics::gauge!("sync.header_chain.alarm.resource_stalled").set(
+    zakura_node_services::metrics::gauge!("sync.header_chain.alarm.resource_stalled").set(
         if snapshot.alarms.resource_stalled {
             1.0
         } else {
             0.0
         },
     );
-    metrics::gauge!("sync.header_chain.alarm.migrated_pin_refuted").set(
+    zakura_node_services::metrics::gauge!("sync.header_chain.alarm.migrated_pin_refuted").set(
         if snapshot.alarms.migrated_pin_refuted.is_some() {
             1.0
         } else {
@@ -3577,15 +3577,15 @@ impl HeaderChainRuntime {
             attempted_branch: branch,
         });
         if transition_effect.is_header_work_rebased() {
-            metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
+            zakura_node_services::metrics::counter!("state.header.work.rebase.total", "outcome" => "rebased")
                 .increment(1);
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "state.header.work.rebase.headers.total",
                 "outcome" => "rebased"
             )
             .increment(u64::try_from(transition.change_set().put_nodes.len()).unwrap_or(u64::MAX));
         } else if transition_effect.is_header_work_already_applied() {
-            metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
+            zakura_node_services::metrics::counter!("state.header.work.rebase.total", "outcome" => "already_applied")
                 .increment(1);
         }
         if resource_stalled {
@@ -3640,10 +3640,14 @@ impl HeaderChainRuntime {
                     });
                 }
             }
-            metrics::histogram!("state.header.full_state_expectation.headers")
-                .record(f64::from(staged_header_count));
-            metrics::histogram!("state.header.full_state_expectation.duration_seconds")
-                .record(staged_check_start.elapsed().as_secs_f64());
+            zakura_node_services::metrics::histogram!(
+                "state.header.full_state_expectation.headers"
+            )
+            .record(f64::from(staged_header_count));
+            zakura_node_services::metrics::histogram!(
+                "state.header.full_state_expectation.duration_seconds"
+            )
+            .record(staged_check_start.elapsed().as_secs_f64());
         }
         if let Some(expected) = expectation.verified {
             let actual = transition.change_set().metadata.frontiers.verified_best;

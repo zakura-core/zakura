@@ -101,7 +101,7 @@ impl ReservationPool {
         if let Some(entry) = self.try_entry() {
             return entry;
         }
-        metrics::counter!("zakura.p2p.reservation.pool_waited").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.reservation.pool_waited").increment(1);
         PoolEntry(self.entries.reserve().await)
     }
 
@@ -503,7 +503,7 @@ impl<K: Eq + Hash> Reservations<K> {
         if row.queued.frames + frame.frames > row.owed.frames
             || row.queued.bytes + frame.bytes > row.owed.bytes
         {
-            metrics::counter!("zakura.p2p.reservation.refused", "reason" => "over_owed")
+            zakura_node_services::metrics::counter!("zakura.p2p.reservation.refused", "reason" => "over_owed")
                 .increment(1);
             return Err(ClaimRefused::OverOwed {
                 frames: row.owed.frames,
@@ -587,7 +587,7 @@ impl<K: Eq + Hash> Reservations<K> {
         ends: bool,
     ) -> Result<(u16, u64, u64, bool), ClaimRefused> {
         let refused = |refused: ClaimRefused| {
-            metrics::counter!("zakura.p2p.reservation.refused", "reason" => refused.label())
+            zakura_node_services::metrics::counter!("zakura.p2p.reservation.refused", "reason" => refused.label())
                 .increment(1);
             refused
         };
@@ -635,7 +635,7 @@ impl<K: Eq + Hash> Reservations<K> {
             row.owed.add(owed_after);
         }
         if abandoned {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.p2p.reservation.unwanted",
                 "message_type" => message_type.to_string(),
             )

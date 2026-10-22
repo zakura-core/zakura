@@ -657,7 +657,8 @@ impl BlockSyncReactor {
                 );
             }
             self.trace_floor_watchdog_cancelled(&claim, released);
-            metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.floor_watchdog.cancelled")
+                .increment(1);
             tracing::debug!(
                 peer = ?claim.peer,
                 height = ?claim.height,
@@ -812,7 +813,7 @@ impl BlockSyncReactor {
             // pipe-routine, whose `Drop` returns any taken work). Its teardown
             // closes the registry entry and queues the disconnect that removes
             // it. Removing it here could remove a newer session's entry.
-            metrics::counter!("sync.block.peer.parked").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.peer.parked").increment(1);
             tracing::info!(
                 ?peer,
                 ?direction,
@@ -1315,7 +1316,7 @@ impl BlockSyncReactor {
             .pending_needed_query
             .map(|pending| (pending.query_id, pending.scope));
         if pending != Some(completion) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
+            zakura_node_services::metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query")
                 .increment(1);
             return;
         }
@@ -1325,7 +1326,7 @@ impl BlockSyncReactor {
         self.clear_pending_needed_query();
 
         if self.body_work_scope() != Some(scope) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
+            zakura_node_services::metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks")
                 .increment(1);
             self.query_needed_blocks().await;
             return;
@@ -1375,7 +1376,7 @@ impl BlockSyncReactor {
             .pending_needed_query
             .map(|pending| (pending.query_id, pending.scope));
         if pending != Some(completion) {
-            metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query_failed")
+            zakura_node_services::metrics::counter!("sync.block.stale_completion.total", "kind" => "needed_blocks_query_failed")
                 .increment(1);
             return;
         }
@@ -1627,7 +1628,8 @@ impl BlockSyncReactor {
 
     fn schedule_needed_query_retry(&mut self) {
         self.needed_query_retry_at = Some(Instant::now() + NEEDED_BLOCK_QUERY_RETRY_DELAY);
-        metrics::counter!("sync.block.needed_query.retry_scheduled").increment(1);
+        zakura_node_services::metrics::counter!("sync.block.needed_query.retry_scheduled")
+            .increment(1);
     }
 
     /// Producer refill. When `force` is set (destructive reset), skip the
@@ -1780,7 +1782,7 @@ impl BlockSyncReactor {
                 Some((owner, current.state_version))
             }
             zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header_chain.stale_completion.total",
                     "kind" => format!("body_{reason:?}")
                 )
@@ -2017,31 +2019,42 @@ impl BlockSyncReactor {
         let sequencer_input_decoded_attributed_memory_bytes = self
             .sequencer_input_decoded_attributed_memory_bytes
             .load(Ordering::Relaxed);
-        metrics::gauge!("sync.block.best_header_tip.height")
+        zakura_node_services::metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
-        metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);
-        metrics::gauge!("sync.block.missing_bodies").set(self.state.needed_heights.len() as f64);
-        metrics::gauge!("sync.block.budget.reserved_bytes")
+        zakura_node_services::metrics::gauge!("sync.block.verified_tip.height")
+            .set(self.verified_block_tip.0 as f64);
+        zakura_node_services::metrics::gauge!("sync.block.missing_bodies")
+            .set(self.state.needed_heights.len() as f64);
+        zakura_node_services::metrics::gauge!("sync.block.budget.reserved_bytes")
             .set(self.state.budget.reserved() as f64);
-        metrics::gauge!("sync.block.reorder.buffered_bytes")
+        zakura_node_services::metrics::gauge!("sync.block.reorder.buffered_bytes")
             .set(self.last_view.reorder_buffered_bytes as f64);
-        metrics::gauge!("sync.block.sequencer_input.decoded.attributed_memory_bytes")
-            .set(sequencer_input_decoded_attributed_memory_bytes as f64);
-        metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")
+        zakura_node_services::metrics::gauge!(
+            "sync.block.sequencer_input.decoded.attributed_memory_bytes"
+        )
+        .set(sequencer_input_decoded_attributed_memory_bytes as f64);
+        zakura_node_services::metrics::gauge!("sync.block.reorder.decoded.attributed_memory_bytes")
             .set(view.reorder_decoded_attributed_memory_bytes as f64);
-        metrics::gauge!("sync.block.applying.decoded.attributed_memory_bytes")
-            .set(view.applying_decoded_attributed_memory_bytes as f64);
-        metrics::gauge!("sync.block.active_pipeline.decoded.attributed_memory_bytes").set(
+        zakura_node_services::metrics::gauge!(
+            "sync.block.applying.decoded.attributed_memory_bytes"
+        )
+        .set(view.applying_decoded_attributed_memory_bytes as f64);
+        zakura_node_services::metrics::gauge!(
+            "sync.block.active_pipeline.decoded.attributed_memory_bytes"
+        )
+        .set(
             sequencer_input_decoded_attributed_memory_bytes
                 .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                 .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
         );
-        metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
-        metrics::gauge!("sync.block.applying.unsubmitted")
+        zakura_node_services::metrics::gauge!("sync.block.applying")
+            .set(self.last_view.applying_len as f64);
+        zakura_node_services::metrics::gauge!("sync.block.applying.unsubmitted")
             .set(view.unsubmitted_applying_count as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
-        metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);
+        zakura_node_services::metrics::gauge!("sync.block.outstanding")
+            .set(self.registry.total_unreceived() as f64);
         self.publish_body_unavailable_metrics();
     }
 
@@ -2058,7 +2071,7 @@ impl BlockSyncReactor {
             if let Some(previous) = self.published_body_alarm {
                 let hash = format!("{:?}", previous.hash);
                 let height = previous.height.0.to_string();
-                metrics::gauge!(
+                zakura_node_services::metrics::gauge!(
                     "sync.header_chain.body_unavailable",
                     "hash" => hash.clone(),
                     "height" => height.clone(),
@@ -2069,13 +2082,13 @@ impl BlockSyncReactor {
                     "sync.header_chain.body_unavailable.attempts",
                     "sync.header_chain.body_unavailable.available_suppliers",
                 ] {
-                    metrics::gauge!(name, "hash" => hash.clone(), "height" => height.clone())
+                    zakura_node_services::metrics::gauge!(name, "hash" => hash.clone(), "height" => height.clone())
                         .set(0.0);
                 }
             }
             self.published_body_alarm = current_frontier;
         }
-        metrics::gauge!("sync.header_chain.body_unavailable.active")
+        zakura_node_services::metrics::gauge!("sync.header_chain.body_unavailable.active")
             .set(f64::from(current.is_some()));
         if let Some((frontier, summary)) = current {
             let hash = format!("{:?}", frontier.hash);
@@ -2085,25 +2098,25 @@ impl BlockSyncReactor {
                 .num_milliseconds()
                 .max(0) as f64
                 / 1_000.0;
-            metrics::gauge!(
+            zakura_node_services::metrics::gauge!(
                 "sync.header_chain.body_unavailable",
                 "hash" => hash.clone(),
                 "height" => height.clone(),
             )
             .set(1.0);
-            metrics::gauge!(
+            zakura_node_services::metrics::gauge!(
                 "sync.header_chain.body_unavailable.age_seconds",
                 "hash" => hash.clone(),
                 "height" => height.clone(),
             )
             .set(age_seconds);
-            metrics::gauge!(
+            zakura_node_services::metrics::gauge!(
                 "sync.header_chain.body_unavailable.attempts",
                 "hash" => hash.clone(),
                 "height" => height.clone(),
             )
             .set(f64::from(summary.attempts));
-            metrics::gauge!(
+            zakura_node_services::metrics::gauge!(
                 "sync.header_chain.body_unavailable.available_suppliers",
                 "hash" => hash,
                 "height" => height,
@@ -2135,7 +2148,7 @@ impl BlockSyncReactor {
             match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
                 Ok(permits) => Some(permits),
                 Err(mpsc::error::TrySendError::Full(())) => {
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "sync.block.action.control_capacity_reserved",
                         "action" => action_label
                     )
@@ -2148,7 +2161,7 @@ impl BlockSyncReactor {
             None
         };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
-        metrics::histogram!(
+        zakura_node_services::metrics::histogram!(
             "sync.block.action.queue.depth",
             "action" => action_label
         )
@@ -2166,7 +2179,7 @@ impl BlockSyncReactor {
         match self.actions.try_send(action) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.block.action.send_queue_full",
                     "action" => action_label
                 )
@@ -2181,7 +2194,7 @@ impl BlockSyncReactor {
         // This path only records misbehavior: trace and forward it, but never
         // cancel the session. Only a proven tampered body, reported by the
         // sequencer, disconnects (see `BlockSyncMisbehavior::proves_tampered_body`).
-        metrics::counter!("sync.block.peer.violation").increment(1);
+        zakura_node_services::metrics::counter!("sync.block.peer.violation").increment(1);
         // The Misbehavior action carries the violation to the driver as a record.
         // Deliver it without ever blocking the reactor: awaiting a full `actions`
         // channel here was the backpressure stall that delayed request timeouts and
@@ -2189,7 +2202,8 @@ impl BlockSyncReactor {
         // the reactor live.
         let action = BlockSyncAction::Misbehavior { peer, reason };
         if !self.dispatch_action(action) {
-            metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.peer.violation.action_dropped")
+                .increment(1);
         }
     }
 }
@@ -2206,7 +2220,7 @@ fn elapsed_ms_u64(duration: Duration) -> u64 {
 fn set_block_reactor_active_connection_gauge(active_connections: usize) {
     // Active Zakura reactor sessions are bounded by the configured connection
     // limit, far below f64's exact integer range.
-    metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "block_sync")
+    zakura_node_services::metrics::gauge!("zakura.p2p.reactor.active_connections", "reactor" => "block_sync")
         .set(active_connections as f64);
 }
 

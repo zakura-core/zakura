@@ -449,7 +449,8 @@ impl Service for DiscoveryService {
                     )
                     .await;
                 if decision != ServiceAdmissionDecision::Admit {
-                    metrics::counter!("zakura.discovery.peer.parked").increment(1);
+                    zakura_node_services::metrics::counter!("zakura.discovery.peer.parked")
+                        .increment(1);
                     tracing::info!(
                         peer = ?discovery_session.peer_id(),
                         direction = ?discovery_session.direction(),

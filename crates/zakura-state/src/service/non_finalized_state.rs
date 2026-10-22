@@ -76,9 +76,9 @@ impl ContextualMetrics {
         }
 
         let duration = duration.as_secs_f64();
-        metrics::histogram!(metric_name).record(duration);
+        zakura_node_services::metrics::histogram!(metric_name).record(duration);
         if self == Self::Mined {
-            metrics::histogram!(mined_metric_name).record(duration);
+            zakura_node_services::metrics::histogram!(mined_metric_name).record(duration);
         }
     }
 }
@@ -1160,8 +1160,9 @@ impl NonFinalizedState {
             return;
         }
 
-        metrics::counter!("state.memory.committed.block.count").increment(1);
-        metrics::gauge!("state.memory.committed.block.height").set(height.0 as f64);
+        zakura_node_services::metrics::counter!("state.memory.committed.block.count").increment(1);
+        zakura_node_services::metrics::gauge!("state.memory.committed.block.height")
+            .set(height.0 as f64);
 
         if self
             .best_chain()
@@ -1169,8 +1170,10 @@ impl NonFinalizedState {
             .non_finalized_tip_hash()
             == hash
         {
-            metrics::counter!("state.memory.best.committed.block.count").increment(1);
-            metrics::gauge!("state.memory.best.committed.block.height").set(height.0 as f64);
+            zakura_node_services::metrics::counter!("state.memory.best.committed.block.count")
+                .increment(1);
+            zakura_node_services::metrics::gauge!("state.memory.best.committed.block.height")
+                .set(height.0 as f64);
         }
 
         self.update_metrics_for_chains();
@@ -1182,8 +1185,9 @@ impl NonFinalizedState {
             return;
         }
 
-        metrics::gauge!("state.memory.chain.count").set(self.chain_set.len() as f64);
-        metrics::gauge!("state.memory.best.chain.length",)
+        zakura_node_services::metrics::gauge!("state.memory.chain.count")
+            .set(self.chain_set.len() as f64);
+        zakura_node_services::metrics::gauge!("state.memory.best.chain.length",)
             .set(self.best_chain_len().unwrap_or_default() as f64);
     }
 

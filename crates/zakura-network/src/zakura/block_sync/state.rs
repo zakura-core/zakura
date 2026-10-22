@@ -337,14 +337,10 @@ impl BlockSyncHandle {
     }
 }
 
+/// The reactor's peer sessions and its handles to the shared download owners.
+/// The reactor's logical state lives in its `ReactorState`.
 #[derive(Debug)]
 pub(super) struct BlockSyncState {
-    pub(super) finalized_height: block::Height,
-    pub(super) verified_block_hash: block::Hash,
-    pub(super) servable_high: block::Height,
-    pub(super) servable_hash: block::Hash,
-    pub(super) best_header_tip: block::Height,
-    pub(super) best_header_hash: block::Hash,
     /// Thin per-peer handles the reactor keeps for demux/serving/admission. The
     /// per-peer *download* state moved into the spawned [`PeerRoutine`](super::peer_routine)
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
@@ -358,7 +354,6 @@ pub(super) struct BlockSyncState {
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
-    pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
@@ -369,29 +364,11 @@ pub(super) struct BlockSyncState {
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
         Self {
-            finalized_height: startup.frontiers.finalized_height,
-            verified_block_hash: startup.frontiers.verified_block_hash,
-            servable_high: startup.frontiers.verified_block_tip,
-            servable_hash: startup.frontiers.verified_block_hash,
-            best_header_tip: startup.best_header_tip.0,
-            best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
-            needed_heights: Vec::new(),
             received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
-        }
-    }
-
-    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
-        BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: self.servable_high,
-            tip_hash: self.servable_hash,
-            max_blocks_per_response: config.advertised_max_blocks_per_response(),
-            max_inflight_requests: config.advertised_max_inflight_requests(),
-            max_response_bytes: config.advertised_max_response_bytes(),
         }
     }
 

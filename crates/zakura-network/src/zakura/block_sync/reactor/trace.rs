@@ -2,7 +2,7 @@ use zakura_rt::sync::atomic::Ordering;
 
 use super::*;
 
-impl BlockSyncReactor {
+impl ReactorIO {
     pub(super) fn emit_block(
         &self,
         event: &'static str,
@@ -29,10 +29,10 @@ impl BlockSyncReactor {
             row.released_count = Some(released.released_count);
             row.missing_count = Some(released.missing_count);
             row.pending_after = Some(u64::from(
-                self.state.work_queue.pending_contains(claim.height),
+                self.resources.work_queue.pending_contains(claim.height),
             ));
             row.in_flight_after = Some(u64::from(
-                self.state.work_queue.in_flight_contains(claim.height),
+                self.resources.work_queue.in_flight_contains(claim.height),
             ));
         });
     }
@@ -51,7 +51,7 @@ impl BlockSyncReactor {
         // The received (download) meter is shared with the routines (they record
         // on receipt); only the reactor samples it. The committed (commit) rate is
         // sampled by the Sequencer task and read from the latest view snapshot.
-        if let Ok(mut meter) = self.state.received_throughput.lock() {
+        if let Ok(mut meter) = self.resources.received_throughput.lock() {
             meter.sample(now);
         }
     }
@@ -66,18 +66,18 @@ impl BlockSyncReactor {
             let slots = include_diagnostics.then(|| self.registry.slot_summary());
             let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
             let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
-            let view = self.last_view;
+            let view = self.state.progress.last_view;
             let submitted_applies = view.in_flight_submission_count;
             let (received_bytes_per_sec, received_blocks_per_sec) = self
-                .state
+                .resources
                 .received_throughput
                 .lock()
                 .map(|meter| (meter.bytes_per_sec(), meter.blocks_per_sec()))
                 .unwrap_or((0, 0));
-            row.request_floor = Some(height(self.request_floor));
+            row.request_floor = Some(height(self.state.progress.request_floor));
             row.body_download_floor = Some(height(view.download_floor));
             row.verified_block_tip = Some(height(view.verified_tip));
-            row.best_header_tip = Some(height(self.state.best_header_tip));
+            row.best_header_tip = Some(height(self.state.progress.best_header_tip));
             row.body_lag = Some(u64::from(self.body_lag()));
             row.applying = Some(view.applying_len);
             row.submitted_applies = Some(submitted_applies);
@@ -95,8 +95,8 @@ impl BlockSyncReactor {
                 row.floor_gap_oldest_outstanding_ms = floor_gap.oldest_outstanding_ms;
                 row.floor_gap_next_deadline_ms = floor_gap.next_deadline_ms;
             }
-            row.budget_available = Some(self.state.budget.available());
-            row.budget_reserved = Some(self.state.budget.reserved());
+            row.budget_available = Some(self.resources.budget.available());
+            row.budget_reserved = Some(self.resources.budget.reserved());
             let sequencer_input_queued_bytes = self.sequencer_input_bytes.load(Ordering::Relaxed);
             let sequencer_input_decoded_attributed_memory_bytes = self
                 .sequencer_input_decoded_attributed_memory_bytes
@@ -133,7 +133,7 @@ impl BlockSyncReactor {
                 }
                 .wire_bytes(),
             );
-            row.peers = Some(saturating_usize(self.state.peers.len()));
+            row.peers = Some(saturating_usize(self.resources.peers.len()));
             if let Some(peers_with_status) = peers_with_status {
                 row.peers_with_status = Some(saturating_usize(peers_with_status));
             }
@@ -146,7 +146,7 @@ impl BlockSyncReactor {
                 let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
                 let download_blocked_on_budget = u64::from(
                     peers_wanting_slots > 0
-                        && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                        && self.resources.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
                 );
                 row.peers_wanting_slots = Some(saturating_usize(peers_wanting_slots));
                 row.download_blocked_on_budget = Some(download_blocked_on_budget);
@@ -176,15 +176,18 @@ impl BlockSyncReactor {
                     row.needed_min = Some(height(*min));
                 }
                 row.needed_count = Some(saturating_usize(self.state.needed_heights.len()));
-                row.queue_len = Some(saturating_usize(self.state.work_queue.pending_run_count()));
-                row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
-                if let Some(start) = self.state.work_queue.min_pending() {
+                row.queue_len = Some(saturating_usize(
+                    self.resources.work_queue.pending_run_count(),
+                ));
+                row.queue_blocks = Some(saturating_usize(self.resources.work_queue.pending_len()));
+                if let Some(start) = self.resources.work_queue.min_pending() {
                     row.queue_min_start = Some(height(start));
                 }
-                row.assigned_len = Some(saturating_usize(self.state.work_queue.in_flight_len()));
+                row.assigned_len =
+                    Some(saturating_usize(self.resources.work_queue.in_flight_len()));
                 row.local_body_work = Some(saturating_usize(self.local_body_work_blocks()));
                 row.refill_low_water = Some(saturating_usize(self.refill_low_water_blocks()));
-                if let Some(end) = self.state.work_queue.max_in_flight() {
+                if let Some(end) = self.resources.work_queue.max_in_flight() {
                     row.covered_max_end = Some(height(end));
                 }
             }
@@ -311,7 +314,7 @@ impl BlockSyncReactor {
         }
         self.emit_block(bs_trace::BLOCK_WORK_EXTENDED, |row| {
             row.range_count = Some(saturating_usize(inserted));
-            row.queue_blocks = Some(saturating_usize(self.state.work_queue.pending_len()));
+            row.queue_blocks = Some(saturating_usize(self.resources.work_queue.pending_len()));
         });
     }
 
@@ -319,7 +322,7 @@ impl BlockSyncReactor {
     pub(super) fn trace_frontiers_changed(&self, verified_block_tip: block::Height) {
         self.emit_block(bs_trace::BLOCK_FRONTIERS_CHANGED, |row| {
             row.verified_block_tip = Some(height(verified_block_tip));
-            row.best_header_tip = Some(height(self.state.best_header_tip));
+            row.best_header_tip = Some(height(self.state.progress.best_header_tip));
         });
     }
 

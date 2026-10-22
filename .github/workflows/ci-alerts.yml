@@ -20,6 +20,7 @@ on:
       - Docs Check
       - Header-chain fuzzing
       - Lint
+      - P2P fuzzing
       - Perf bench (ephemeral droplets)
       - Semver checks
       - Test Crate Build

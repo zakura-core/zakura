@@ -172,6 +172,7 @@ enum Phase {
     CheckingOwners,
     Refreshing,
     AwaitingAnswers,
+    CheckingClose,
     MarkingShortLived,
     Ended,
 }
@@ -265,13 +266,19 @@ impl PeerState {
                     (initial == InitialExchange::Complete).then_some(SessionCharge::Succeed);
                 PeerStep::new(charge, PeerOutput::CheckSoleOwner)
             }
-            (Phase::CheckingOwners, PeerInput::Owners(Ownership::Shared)) => {
+            (
+                Phase::CheckingOwners | Phase::CheckingClose,
+                PeerInput::Owners(Ownership::Shared),
+            ) => {
                 self.phase = Phase::Refreshing;
                 PeerStep::then(PeerOutput::Refresh {
                     interval: SEND_INTERVAL,
                 })
             }
-            (Phase::CheckingOwners, PeerInput::Owners(Ownership::Superseded))
+            (
+                Phase::CheckingOwners | Phase::CheckingClose,
+                PeerInput::Owners(Ownership::Superseded),
+            )
             | (Phase::Refreshing, PeerInput::Refreshed { sent: false }) => self.release(),
             (Phase::CheckingOwners, PeerInput::Owners(Ownership::Sole)) => {
                 // Closing drops every unwritten answer, and the peer's
@@ -286,6 +293,10 @@ impl PeerState {
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }
             (Phase::AwaitingAnswers, PeerInput::AnswersSettled) => {
+                self.phase = Phase::CheckingClose;
+                PeerStep::then(PeerOutput::CheckSoleOwner)
+            }
+            (Phase::CheckingClose, PeerInput::Owners(Ownership::Sole)) => {
                 self.phase = Phase::MarkingShortLived;
                 PeerStep::then(PeerOutput::MarkShortLived)
             }

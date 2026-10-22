@@ -78,8 +78,14 @@ impl SharedPeerState {
 
     /// Resolves once the peer answered every part of the exchange.
     async fn wait_complete(&self) {
-        while !self.lock().is_complete() {
-            self.0.progressed.notified().await;
+        loop {
+            let progressed = self.0.progressed.notified();
+            zakura_rt::pin!(progressed);
+            progressed.as_mut().enable();
+            if self.lock().is_complete() {
+                return;
+            }
+            progressed.await;
         }
     }
 }
@@ -203,6 +209,10 @@ impl PeerIO {
     /// Ends the session's serving and queries and releases its admission,
     /// then closes the connection if `close` names a reason.
     async fn end(self, close: Option<CloseReason>) {
+        let close = match close {
+            Some(reason) if self.owners().await == Ownership::Sole => Some(reason),
+            _ => None,
+        };
         self.session.cancel_token().cancel();
         self.queries.retire();
         self.handle.remove_session(&self.slot.key).await;

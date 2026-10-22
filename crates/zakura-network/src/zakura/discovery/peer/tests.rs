@@ -118,6 +118,10 @@ fn a_missing_hello_times_out_the_initial_exchange() {
             assert_eq!(step, then(WAIT_FOR_ANSWERS));
             assert_eq!(
                 state.on_input(PeerInput::AnswersSettled),
+                then(PeerOutput::CheckSoleOwner)
+            );
+            assert_eq!(
+                state.on_input(PeerInput::Owners(Ownership::Sole)),
                 then(PeerOutput::MarkShortLived)
             );
             assert_eq!(state.on_input(PeerInput::ShortLivedMarked), end);
@@ -222,6 +226,10 @@ fn a_pending_answer_holds_the_close_until_it_settles() {
     state.record_answer(&admitted(QueryKind::Services));
     assert_eq!(
         state.on_input(PeerInput::AnswersSettled),
+        then(PeerOutput::CheckSoleOwner)
+    );
+    assert_eq!(
+        state.on_input(PeerInput::Owners(Ownership::Sole)),
         then(PeerOutput::MarkShortLived)
     );
     assert_eq!(
@@ -317,6 +325,7 @@ enum Line {
     Refresh,
     /// The select over cancellation, written answers, and the deadline.
     Answers,
+    ClosingOwners,
     /// `mark_short_lived_exchange`.
     ShortLived,
     Done,
@@ -353,7 +362,7 @@ impl Model {
             Line::Current { .. } => PeerInput::CurrentSession {
                 current: !choice.is_multiple_of(4),
             },
-            Line::Owners => PeerInput::Owners(match choice % 3 {
+            Line::Owners | Line::ClosingOwners => PeerInput::Owners(match choice % 3 {
                 0 => Ownership::Shared,
                 1 => Ownership::Superseded,
                 _ => Ownership::Sole,
@@ -420,8 +429,13 @@ impl Model {
                 }
             }
             (Line::Answers, PeerInput::AnswersSettled) => {
-                (Line::ShortLived, then(PeerOutput::MarkShortLived))
+                (Line::ClosingOwners, then(PeerOutput::CheckSoleOwner))
             }
+            (Line::ClosingOwners, PeerInput::Owners(owners)) => match owners {
+                Ownership::Shared => (Line::Refresh, then(REFRESH)),
+                Ownership::Superseded => (Line::Done, self.settle_open()),
+                Ownership::Sole => (Line::ShortLived, then(PeerOutput::MarkShortLived)),
+            },
             (Line::ShortLived, PeerInput::ShortLivedMarked) => {
                 let reason = if self.continued == Some(true) {
                     CloseReason::ExchangeTimedOut
@@ -499,7 +513,7 @@ proptest! {
                     match input {
                         PeerInput::CurrentSession { current: false }
                         | PeerInput::Owners(Ownership::Superseded) => replaced = true,
-                        PeerInput::Owners(Ownership::Sole) => sole_then_settled = false,
+                        PeerInput::Owners(Ownership::Shared) => sole_then_settled = false,
                         PeerInput::AnswersSettled => sole_then_settled = true,
                         _ => {}
                     }
@@ -528,5 +542,45 @@ proptest! {
             }
             prop_assert_eq!(state.is_complete(), model.complete());
         }
+    }
+}
+
+#[test]
+fn ownership_changes_during_answer_wait_prevent_close() {
+    for (owner, expected) in [
+        (Ownership::Shared, REFRESH),
+        (Ownership::Superseded, END_OPEN),
+    ] {
+        let mut state = waiting_session();
+        complete(&mut state);
+        settle_initial(&mut state, InitialWait::Complete);
+        assert_eq!(
+            state.on_input(PeerInput::Owners(Ownership::Sole)),
+            then(WAIT_FOR_ANSWERS)
+        );
+        assert_eq!(
+            state.on_input(PeerInput::AnswersSettled),
+            then(PeerOutput::CheckSoleOwner)
+        );
+        assert_eq!(state.on_input(PeerInput::Owners(owner)), then(expected));
+    }
+}
+
+#[tokio::test]
+async fn completion_wait_observes_progress_before_and_after_polling() {
+    use super::SharedPeerState;
+    use futures::{poll, FutureExt};
+
+    for complete_before_poll in [false, true] {
+        let state = SharedPeerState::default();
+        let wait = state.wait_complete();
+        zakura_rt::pin!(wait);
+        if !complete_before_poll {
+            assert!(poll!(wait.as_mut()).is_pending());
+        }
+        state.record_hello();
+        state.record_answer(&admitted(QueryKind::Peers));
+        state.record_answer(&admitted(QueryKind::Services));
+        assert!(wait.now_or_never().is_some());
     }
 }

@@ -33,7 +33,7 @@ use crate::{
         decide, inbound_handshake, Acceptor, Admit, ConnectionSlot, IncomingInfo, Shared,
         SocketSlot,
     },
-    socket::{bind_udp, SocketCell, UdpIo, RECV_BUFFER_BYTES},
+    socket::{SocketCell, SocketFactory, UdpIo, RECV_BUFFER_BYTES},
     sys::canonical_addr,
 };
 
@@ -88,9 +88,11 @@ struct RecvCounters {
     oversize_drops: u64,
 }
 
-pub(crate) struct EndpointTask {
+pub(crate) struct EndpointTask<F: SocketFactory> {
     endpoint: quinn_proto::Endpoint,
-    socket: Arc<SocketCell>,
+    /// Builds the SOCK-9 replacement socket.
+    factory: Arc<F>,
+    socket: Arc<SocketCell<F::Socket>>,
     slot: Arc<SocketSlot>,
     shared: Arc<Shared>,
     cmds: mpsc::UnboundedReceiver<EndpointCmd>,
@@ -113,18 +115,20 @@ pub(crate) struct EndpointTask {
     queued_total: Arc<AtomicUsize>,
 }
 
-impl Drop for EndpointTask {
+impl<F: SocketFactory> Drop for EndpointTask<F> {
     /// Releases the socket even when `shutdown` aborts the task (API-7).
     fn drop(&mut self) {
         self.socket.close();
     }
 }
 
-impl EndpointTask {
+impl<F: SocketFactory> EndpointTask<F> {
+    /// A task for the socket `io`, which `factory` bound at `slot.local_addr`.
     pub(crate) fn new(
         shared: Arc<Shared>,
         slot: Arc<SocketSlot>,
-        io: UdpIo,
+        factory: Arc<F>,
+        io: F::Socket,
         cmds: mpsc::UnboundedReceiver<EndpointCmd>,
     ) -> Self {
         let allow_mtud = io.mtud_allowed();
@@ -137,6 +141,7 @@ impl EndpointTask {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
             endpoint,
+            factory,
             socket: Arc::new(SocketCell::new(io)),
             slot,
             shared,
@@ -343,7 +348,7 @@ impl EndpointTask {
     }
 
     /// Reads until the socket is empty or the per-wakeup budget runs out.
-    async fn receive(&mut self, io: Option<Arc<crate::socket::UdpIo>>) {
+    async fn receive(&mut self, io: Option<Arc<F::Socket>>) {
         let Some(io) = io else {
             return;
         };
@@ -393,7 +398,7 @@ impl EndpointTask {
         dst_ip: Option<std::net::IpAddr>,
         stride: usize,
         data: &[u8],
-        io: &UdpIo,
+        io: &F::Socket,
     ) {
         let now = now();
         // The advertised limit fits in a u16, so the cast can't truncate.
@@ -443,7 +448,7 @@ impl EndpointTask {
         }
     }
 
-    fn send_response(&self, transmit: &Transmit, io: &UdpIo) {
+    fn send_response(&self, transmit: &Transmit, io: &F::Socket) {
         // A stateless response that can't go out now is dropped; the peer
         // retries.
         if let Err(error) = io.try_send(transmit, &self.response_buf[..transmit.size]) {
@@ -455,7 +460,7 @@ impl EndpointTask {
     }
 
     /// Admission (SPEC §7): decide before any handshake work (ADM-2).
-    fn on_incoming(&mut self, incoming: Incoming, io: &UdpIo) {
+    fn on_incoming(&mut self, incoming: Incoming, io: &F::Socket) {
         let Some((server, acceptor)) = self
             .serve
             .as_ref()
@@ -555,19 +560,15 @@ impl EndpointTask {
             self.stop_socket();
             return;
         }
-        let config = &self.shared.config;
+        let factory = &self.factory;
         let slot = &self.slot;
         let rebound = self
             .socket
             .replace(|| {
-                let bound = bind_udp(
-                    local_addr,
-                    config.recv_buffer_bytes as usize,
-                    config.send_buffer_bytes as usize,
-                )?;
+                let bound = factory.bind(local_addr)?;
                 slot.inode
                     .store(bound.inode.unwrap_or(0), Ordering::Relaxed);
-                UdpIo::new(bound.socket, config.gso)
+                Ok(bound.io)
             })
             .await;
         match rebound {

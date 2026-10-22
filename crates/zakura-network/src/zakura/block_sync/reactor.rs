@@ -9,7 +9,9 @@ use crate::zakura::{
 };
 use rand_10::Rng;
 use state::{
-    admission_decision, floor_cancel_avoids_peer, floor_claim_expired, BootstrapGate, NeededReply,
+    admission_decision, block_sync_frontiers, body_completion_authority,
+    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
+    ActionRefusal, AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply,
     QueryOpening, QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts,
 };
 use std::num::NonZeroU64;
@@ -106,14 +108,6 @@ fn synchronize_persisted_body_alarm(
             })
     });
     registry.set_persisted_body_alarm(alarm);
-}
-
-fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> BlockSyncFrontiers {
-    BlockSyncFrontiers {
-        finalized_height: snapshot.frontiers.finalized.height,
-        verified_block_tip: snapshot.frontiers.verified_best.height,
-        verified_block_hash: snapshot.frontiers.verified_best.hash,
-    }
 }
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
@@ -215,13 +209,6 @@ pub fn spawn_block_sync_reactor(
     let initial_state_version = committed_view
         .as_ref()
         .map(|snapshot| snapshot.state_version);
-    #[cfg(test)]
-    let initial_state_version = initial_state_version.or_else(|| {
-        startup
-            .committed_views
-            .is_none()
-            .then_some(zakura_header_chain::StateVersion::default())
-    });
     let sequencer_input_bytes = Arc::new(AtomicU64::new(0));
     let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
@@ -305,13 +292,14 @@ pub fn spawn_block_sync_reactor(
         }),
     );
     let reactor = ReactorIO {
-        state: ReactorState::new(startup.state_queries_enabled, progress, bootstrap),
+        state: ReactorState::new(
+            startup.state_queries_enabled,
+            progress,
+            bootstrap,
+            committed_view,
+        ),
         body_retention,
-        status_refresh_at: None,
-        pending_body_supplier_restart: None,
-        pending_operator_body_retry: None,
         published_body_alarm: None,
-        committed_view,
         startup,
         resources: state,
         registry,
@@ -348,13 +336,9 @@ pub(super) struct ReactorIO {
     /// The reactor's logical state.
     state: ReactorState,
     body_retention: Option<BodyRetention>,
-    /// Earliest pending status delivery, rebuilt after delivery state changes.
-    status_refresh_at: Option<Instant>,
     startup: BlockSyncStartup,
     /// Peer sessions and handles to the shared download owners.
     resources: BlockSyncState,
-    /// Latest atomic header-engine view used to stamp body-work ownership.
-    committed_view: Option<zakura_header_chain::CommittedHeaderChainView>,
     /// Shared per-peer fact table: servable/caps/outstanding written by the
     /// per-peer pipe-routines; read by producer/candidate/trace. The reactor owns
     /// only entry insert (admission) / remove (teardown).
@@ -395,24 +379,8 @@ pub(super) struct ReactorIO {
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
     /// Latest-wins progress view published by the Sequencer task.
     sequencer_view: watch::Receiver<SequencerView>,
-    /// Supplier-set restart submitted against the current durable version.
-    pending_body_supplier_restart:
-        Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
-    /// Operator retry submitted against the current durable version.
-    pending_operator_body_retry: Option<(zakura_header_chain::StateVersion, block::Hash, [u8; 32])>,
     /// Last labeled persistent alarm exported to metrics, for exact clearing.
     published_body_alarm: Option<zakura_header_chain::Frontier>,
-}
-
-fn empty_state_header_quiet_required(snapshot: &zakura_header_chain::EngineSnapshot) -> bool {
-    snapshot.frontiers.verified_best.height == block::Height(0)
-        && snapshot
-            .frontiers
-            .header_best
-            .height
-            .0
-            .saturating_sub(snapshot.frontiers.verified_best.height.0)
-            >= EMPTY_STATE_HEADER_QUIET_MIN_LAG
 }
 
 impl ReactorIO {
@@ -447,7 +415,7 @@ impl ReactorIO {
             zakura_rt::pin!(empty_state_header_quiet);
             let needed_query_retry = self.needed_query_retry_sleep();
             zakura_rt::pin!(needed_query_retry);
-            let status_refresh_at = self.status_refresh_at;
+            let status_refresh_at = self.state.status.refresh_at();
             let status_refresh = async move {
                 match status_refresh_at {
                     Some(deadline) => time::sleep_until(deadline.into()).await,
@@ -664,8 +632,9 @@ impl ReactorIO {
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => {
                 let scope = self
+                    .state
                     .body_work_scope()
-                    .expect("test reactors synthesize a body-work scope");
+                    .expect("test reactors start with a committed view");
                 self.handle_needed_blocks(scope, blocks).await;
             }
             BlockSyncEvent::BlockApplyFinished {
@@ -785,6 +754,7 @@ impl ReactorIO {
         // routine nor holds a per-peer inbound channel.
         let peer_state = PeerBlockState::new(session);
         self.resources.peers.insert(peer.clone(), peer_state);
+        self.state.status.admit(&peer, Instant::now());
         set_block_reactor_active_connection_gauge(self.resources.peers.len());
 
         self.trace_peer_connected(&peer, direction, self.resources.peers.len());
@@ -803,6 +773,7 @@ impl ReactorIO {
         // thin serving handle and the closed registry entry. A replacement
         // admitted before this event keeps its entry.
         if self.resources.peers.remove(&peer).is_some() {
+            self.state.status.remove(&peer);
             set_block_reactor_active_connection_gauge(self.resources.peers.len());
             self.trace_peer_disconnected(
                 &peer,
@@ -826,162 +797,98 @@ impl ReactorIO {
         self.query_needed_blocks().await;
     }
 
+    /// Run the operations a new committed view asks for, in the order the
+    /// view's state chose them.
     async fn observe_committed_view(
         &mut self,
         view: zakura_header_chain::CommittedHeaderChainView,
     ) {
-        let previous = self.committed_view.clone();
-        let previous_scope = self.body_work_scope();
-        let body_work_epoch_changed = previous
-            .as_ref()
-            .is_some_and(|old| old.body_work_epoch != view.body_work_epoch);
-        let previous_body_alarm = previous.as_ref().and_then(|old| {
-            old.alarms
-                .header_best_body_unavailable
-                .filter(|summary| summary.alarmed)
-                .map(|_| {
-                    (
-                        zakura_header_chain::BodyWorkAuthority::for_view(old),
-                        old.frontiers.header_best.hash,
-                    )
-                })
-        });
-        let frontiers = block_sync_frontiers(&view);
-        let header_best = view.frontiers.header_best;
-        self.committed_view = Some(view.clone());
-        self.pending_body_supplier_restart = None;
-        self.pending_operator_body_retry = None;
         synchronize_persisted_body_alarm(&self.registry, Some(&view));
+        let update = self
+            .state
+            .observe_committed_view(view, time::Instant::now());
 
-        let current_alarm_hash = view
-            .alarms
-            .header_best_body_unavailable
-            .filter(|summary| summary.alarmed)
-            .map(|_| header_best.hash);
-        if let Some((scope, hash)) =
-            previous_body_alarm.filter(|(_, hash)| Some(*hash) != current_alarm_hash)
-        {
+        if let Some((scope, hash)) = update.alarm_cleared {
             let _ = self
                 .sequencer_control
                 .send(SequencerControlInput::BodyAlarmCleared { scope, hash });
         }
-
-        let current_scope = self.body_work_scope();
-        if previous.as_ref().map(|old| old.state_version) != Some(view.state_version) {
+        if let Some(state_version) = update.state_version {
             let _ = self
                 .sequencer_control
-                .send(SequencerControlInput::StateVersionChanged(
-                    view.state_version,
-                ));
+                .send(SequencerControlInput::StateVersionChanged(state_version));
         }
-        if current_scope != previous_scope {
-            self.state.queries.clear();
-            let authority =
-                current_scope.expect("a committed view always constructs current body authority");
-            if body_work_epoch_changed {
+        match update.authority {
+            None => {}
+            Some(AuthorityUpdate::EpochChanged {
+                authority,
+                frontiers,
+            }) => {
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::BodyWorkEpochChanged {
                         authority,
                         frontiers,
                     });
-            } else {
+            }
+            Some(AuthorityUpdate::Refreshed(authority)) => {
                 self.resources.work_queue.refresh_authority(authority);
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::WorkAuthorityRefreshed { authority });
             }
         }
-
-        let header_changed = previous
-            .as_ref()
-            .is_none_or(|old| old.frontiers.header_best != header_best);
-        if header_changed {
-            self.state
-                .progress
-                .observe_header_tip(header_best.height, header_best.hash);
-            if empty_state_header_quiet_required(&view) {
-                self.state
-                    .bootstrap
-                    .hold_for_headers(time::Instant::now() + EMPTY_STATE_HEADER_QUIET_PERIOD);
+        match update.frontiers {
+            FrontierUpdate::Unchanged => {}
+            FrontierUpdate::Initial(frontiers) => {
+                self.handle_chain_tip_reset(frontiers, false).await
+            }
+            FrontierUpdate::Advanced(frontiers) => {
+                self.handle_state_frontiers_changed(frontiers).await
             }
         }
-
-        match previous.as_ref() {
-            None => self.handle_chain_tip_reset(frontiers, false).await,
-            Some(_) if body_work_epoch_changed => {}
-            Some(old)
-                if old.frontiers.verified_best != view.frontiers.verified_best
-                    || old.frontiers.finalized != view.frontiers.finalized =>
-            {
-                debug_assert!(
-                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
-                    "same-epoch verified authority cannot retreat"
-                );
-                debug_assert!(
-                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
-                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
-                    "same-epoch verified authority cannot replace a hash at the same height"
-                );
-                self.handle_state_frontiers_changed(frontiers).await;
-            }
-            Some(_) => {}
+        match update.hints {
+            HintUpdate::Unchanged => {}
+            HintUpdate::Apply { after_revision } => self.apply_body_size_hints(after_revision),
+            HintUpdate::Restart { revision } => self
+                .state
+                .queries
+                .start_hint_refresh(revision, self.resources.work_queue.queued_bounds()),
         }
-
-        if body_work_epoch_changed {
-            self.state.queries.end_hint_refresh();
-        }
-        let hints_changed = previous
-            .as_ref()
-            .is_some_and(|old| old.body_size_hint_revision != view.body_size_hint_revision);
-        let refresh_pending_query = hints_changed && self.state.queries.pending().is_some();
-        if hints_changed {
-            // An older query can carry sizes from before this correction.
-            self.state.queries.clear();
-            let old_revision = previous
-                .as_ref()
-                .expect("a hint change has a previous view")
-                .body_size_hint_revision;
-            let batches = view.body_size_hint_batches.as_deref().unwrap_or_default();
-            let first_revision = batches.first().map(|batch| batch.revision);
-            if first_revision.is_some_and(|first| first <= old_revision.saturating_add(1)) {
-                if let Some(scope) = current_scope {
-                    self.resources.work_queue.refresh_size_estimates(
-                        scope,
-                        batches
-                            .iter()
-                            .filter(|batch| batch.revision > old_revision)
-                            .flat_map(|batch| batch.updates.iter().copied())
-                            .map(|(height, hash, hint)| {
-                                (
-                                    height,
-                                    hash,
-                                    match hint {
-                                        zakura_header_chain::BodySizeHint::Known(size) => {
-                                            BlockSizeEstimate::Advertised(size.get())
-                                        }
-                                        zakura_header_chain::BodySizeHint::Unknown => {
-                                            BlockSizeEstimate::Unknown
-                                        }
-                                    },
-                                )
-                            }),
-                    );
-                }
-            } else {
-                self.state.queries.start_hint_refresh(
-                    view.body_size_hint_revision,
-                    self.resources.work_queue.queued_bounds(),
-                );
-            }
-        }
-        if header_changed
-            || current_scope != previous_scope
-            || refresh_pending_query
-            || (hints_changed && self.state.queries.hint_refresh().is_some())
-        {
+        if update.forces_refill(self.state.queries.hint_refresh().is_some()) {
             self.query_needed_blocks_with_options(true).await;
         }
+    }
+
+    /// Apply the committed view's body-size hint batches newer than
+    /// `after_revision` to queued work.
+    fn apply_body_size_hints(&self, after_revision: u64) {
+        let Some(view) = self.state.committed_view() else {
+            return;
+        };
+        let scope = zakura_header_chain::BodyWorkAuthority::for_view(view);
+        let batches = view.body_size_hint_batches.as_deref().unwrap_or_default();
+        self.resources.work_queue.refresh_size_estimates(
+            scope,
+            batches
+                .iter()
+                .filter(|batch| batch.revision > after_revision)
+                .flat_map(|batch| batch.updates.iter().copied())
+                .map(|(height, hash, hint)| {
+                    (
+                        height,
+                        hash,
+                        match hint {
+                            zakura_header_chain::BodySizeHint::Known(size) => {
+                                BlockSizeEstimate::Advertised(size.get())
+                            }
+                            zakura_header_chain::BodySizeHint::Unknown => {
+                                BlockSizeEstimate::Unknown
+                            }
+                        },
+                    )
+                }),
+        );
     }
 
     async fn handle_state_frontiers_changed(&mut self, frontiers: BlockSyncFrontiers) {
@@ -1229,7 +1136,7 @@ impl ReactorIO {
         body_anchor: zakura_header_chain::Frontier,
         blocks: Vec<BlockSyncBlockMeta>,
     ) {
-        let current_scope = self.body_work_scope();
+        let current_scope = self.state.body_work_scope();
         let completed_query = match self.state.complete_needed_query(
             query_id,
             scope,
@@ -1325,131 +1232,39 @@ impl ReactorIO {
     }
 
     fn restart_body_alarm_for_new_supplier(&mut self) {
-        let Some(snapshot) = self.committed_view.as_ref() else {
+        let Some(header) = self.state.alarmed_header() else {
             return;
         };
-        let Some(previous) = snapshot
-            .alarms
-            .header_best_body_unavailable
-            .filter(|summary| summary.alarmed)
+        let eligible_sources = self.registry.eligible_sources(header.height);
+        let Some(request) = self
+            .state
+            .propose_supplier_restart(&eligible_sources, chrono::Utc::now())
         else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
-        let eligible_sources = self.registry.eligible_sources(header.height);
-        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
-        let supplier_set_digest =
-            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
-        let has_new_supplier = suppliers > previous.suppliers
-            || (suppliers == previous.suppliers
-                && supplier_set_digest != previous.supplier_set_digest);
-        if !has_new_supplier
-            || self.pending_body_supplier_restart
-                == Some((snapshot.state_version, header.hash, supplier_set_digest))
-        {
-            return;
+        if self.dispatch_action(request.action()).is_ok() {
+            self.state.alarm_request_accepted(request);
         }
-
-        let now = chrono::Utc::now();
-        let availability = zakura_header_chain::BodyUnavailableSummary {
-            started_at: previous.started_at,
-            attempts: previous.attempts,
-            suppliers,
-            supplier_set_digest,
-            alarmed: true,
-            next_probe_at: now,
-        };
-        let mut hasher = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"ZkBodyDiscover1_")
-            .to_state();
-        hasher.update(&snapshot.state_version.get().to_le_bytes());
-        hasher.update(&header.height.0.to_le_bytes());
-        hasher.update(&header.hash.0);
-        hasher.update(&supplier_set_digest);
-        let discovery = zakura_header_chain::BodySupplierDiscovered {
-            hash: header.hash,
-            evidence: zakura_header_chain::EvidenceId::from_digest(
-                hasher
-                    .finalize()
-                    .as_bytes()
-                    .try_into()
-                    .expect("the configured discovery digest is exactly 32 bytes"),
-            ),
-            availability,
-        };
-        if !self.dispatch_action(BlockSyncAction::RestartBodyAvailability {
-            expected_version: snapshot.state_version,
-            discovery,
-        }) {
-            return;
-        }
-        self.pending_body_supplier_restart =
-            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     fn retry_body_availability(&mut self, hash: block::Hash) {
-        let Some(snapshot) = self.committed_view.as_ref() else {
+        let Some(header) = self
+            .state
+            .alarmed_header()
+            .filter(|header| header.hash == hash)
+        else {
             return;
         };
-        let header = snapshot.frontiers.header_best;
-        if header.hash != hash
-            || !snapshot
-                .alarms
-                .header_best_body_unavailable
-                .is_some_and(|summary| summary.alarmed)
-        {
-            return;
-        }
         let eligible_sources = self.registry.eligible_sources(header.height);
-        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
-        if suppliers == 0 {
+        let Some(request) =
+            self.state
+                .propose_operator_retry(hash, &eligible_sources, chrono::Utc::now())
+        else {
             return;
-        }
-        let supplier_set_digest =
-            zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(&eligible_sources);
-        if self.pending_operator_body_retry
-            == Some((snapshot.state_version, header.hash, supplier_set_digest))
-        {
-            return;
-        }
-
-        let now = chrono::Utc::now();
-        let availability = zakura_header_chain::BodyUnavailableSummary {
-            started_at: now,
-            attempts: 0,
-            suppliers,
-            supplier_set_digest,
-            alarmed: false,
-            next_probe_at: now,
         };
-        let mut hasher = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"ZkBodyOperator1_")
-            .to_state();
-        hasher.update(&snapshot.state_version.get().to_le_bytes());
-        hasher.update(&header.height.0.to_le_bytes());
-        hasher.update(&header.hash.0);
-        hasher.update(&supplier_set_digest);
-        let retry = zakura_header_chain::OperatorBodyRetry {
-            hash: header.hash,
-            evidence: zakura_header_chain::EvidenceId::from_digest(
-                hasher
-                    .finalize()
-                    .as_bytes()
-                    .try_into()
-                    .expect("the configured operator-retry digest is exactly 32 bytes"),
-            ),
-            availability,
-        };
-        if !self.dispatch_action(BlockSyncAction::RetryBodyAvailability {
-            expected_version: snapshot.state_version,
-            retry,
-        }) {
-            return;
+        if self.dispatch_action(request.action()).is_ok() {
+            self.state.alarm_request_accepted(request);
         }
-        self.pending_operator_body_retry =
-            Some((snapshot.state_version, header.hash, supplier_set_digest));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1477,7 +1292,7 @@ impl ReactorIO {
             outcome.result(),
             self.resources.budget.reserved(),
         );
-        let persisted_availability = self.committed_view.as_ref().and_then(|snapshot| {
+        let persisted_availability = self.state.committed_view().and_then(|snapshot| {
             (snapshot.frontiers.header_best.hash == hash)
                 .then_some(snapshot.alarms.header_best_body_unavailable)
                 .flatten()
@@ -1531,7 +1346,7 @@ impl ReactorIO {
         };
         let proposal = match self
             .state
-            .propose_query(force, start, self.body_work_scope())
+            .propose_query(force, start, self.state.body_work_scope())
         {
             QueryPlan::Idle | QueryPlan::Covered => return,
             QueryPlan::NoAuthority => {
@@ -1546,7 +1361,7 @@ impl ReactorIO {
             }
             QueryPlan::Dispatch(proposal) => proposal,
         };
-        if self.dispatch_action(proposal.action()) {
+        if self.dispatch_action(proposal.action()).is_ok() {
             self.state.queries.accepted(proposal);
         } else {
             self.state.queries.refused(proposal, Instant::now());
@@ -1566,35 +1381,8 @@ impl ReactorIO {
         }
     }
 
-    fn body_work_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
-        let scope = self
-            .committed_view
-            .as_ref()
-            .map(zakura_header_chain::BodyWorkAuthority::for_view);
-        #[cfg(not(test))]
-        {
-            scope
-        }
-        #[cfg(test)]
-        {
-            scope.or_else(|| {
-                self.startup.committed_views.is_none().then_some(
-                    zakura_header_chain::BodyWorkAuthority {
-                        header: zakura_header_chain::HeaderWorkAuthority {
-                            header_generation: zakura_header_chain::HeaderGeneration::new(0),
-                            branch: zakura_header_chain::BranchId::new(
-                                self.startup.frontiers.verified_block_hash,
-                                self.state.progress.best_header_hash,
-                            ),
-                        },
-                        verified_generation: zakura_header_chain::VerifiedGeneration::new(0),
-                        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
-                    },
-                )
-            })
-        }
-    }
-
+    /// Check a body completion against the latest committed view on the
+    /// watch, which can be newer than the view this reactor observed.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
@@ -1607,31 +1395,16 @@ impl ReactorIO {
             .startup
             .committed_views
             .as_ref()
-            .and_then(|snapshots| snapshots.borrow().clone());
-        #[cfg(test)]
-        if current.is_none() {
-            return (self.body_work_scope() == Some(owner.authority()))
-                .then_some((*owner, zakura_header_chain::StateVersion::default()));
-        }
-        let current = current?;
-        let mut pending = zakura_header_chain::PendingOwners::default();
-        pending.insert(source, *owner);
-        match zakura_header_chain::Gate::check_body(&current, &pending, source, owner) {
-            zakura_header_chain::BodyCompletionDecision::Current => {
-                Some((*owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Rebased(owner) => {
-                Some((owner, current.state_version))
-            }
-            zakura_header_chain::BodyCompletionDecision::Stale(reason) => {
+            .and_then(|snapshots| snapshots.borrow().clone())?;
+        body_completion_authority(&current, source, owner)
+            .inspect_err(|reason| {
                 metrics::counter!(
                     "sync.header_chain.stale_completion.total",
                     "kind" => format!("body_{reason:?}")
                 )
                 .increment(1);
-                None
-            }
-        }
+            })
+            .ok()
     }
 
     fn local_body_work_blocks(&self) -> usize {
@@ -1671,7 +1444,10 @@ impl ReactorIO {
         now: Instant,
         reason: &'static str,
     ) -> bool {
-        let Some(peer_state) = self.resources.peers.get_mut(peer) else {
+        let (Some(peer_state), Some(delivery)) = (
+            self.resources.peers.get(peer),
+            self.state.status.delivery_mut(peer),
+        ) else {
             return false;
         };
         let session = peer_state.session.clone();
@@ -1681,7 +1457,7 @@ impl ReactorIO {
         let started = Instant::now();
         let error = match session.offer_status(status) {
             Ok(StatusSend::Queued) => {
-                peer_state.status_delivery.queued(status);
+                delivery.queued(status);
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, sent);
                 return true;
@@ -1689,20 +1465,20 @@ impl ReactorIO {
             // The connection's cadence allows the next Status later.
             // Legal pacing is not queue pressure.
             Ok(StatusSend::Deferred(at)) => {
-                peer_state.status_delivery.deferred_until(at);
+                delivery.deferred_until(at);
                 self.trace_message_sent(peer, &msg, "deferred", started.elapsed());
                 return false;
             }
             // The previous Status frame is still waiting for its transport
             // write. The queue may have free slots, so this is not a queue failure.
             Ok(StatusSend::Unwritten) => {
-                peer_state.status_delivery.queue_full(now);
+                delivery.queue_full(now);
                 tracing::debug!(?peer, "previous Zakura block-sync Status is unwritten");
                 self.trace_message_sent(peer, &msg, "unwritten", started.elapsed());
                 return false;
             }
             Ok(StatusSend::QueueFull) => {
-                peer_state.status_delivery.queue_full(now);
+                delivery.queue_full(now);
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
                 self.trace_queue_send_failed(
@@ -1748,33 +1524,26 @@ impl ReactorIO {
             .filter_map(|(peer, received_status, _, _)| (!received_status).then_some(peer))
             .collect();
         let now = Instant::now();
-        let due: Vec<_> = self
-            .resources
-            .peers
-            .iter()
-            .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
-            .filter_map(|(id, peer)| {
-                peer.status_delivery
-                    .next_deadline(status, !unready.contains(id))
-                    .filter(|deadline| *deadline <= now)
-                    .map(|_| id.clone())
-            })
-            .collect();
+        let due = self
+            .state
+            .status
+            .due(status, &self.live_status_peers(&unready), now);
         for peer in due {
             self.send_status(&peer, status, now, "refresh");
         }
-        // The same delivery rules choose both sends and wakes. A full queue
-        // cannot lose its retry when another peer accepts the new range.
-        self.status_refresh_at = self
-            .resources
+        // A send can cancel its session, so rearm from the sessions still live.
+        let live = self.live_status_peers(&unready);
+        self.state.status.rearm(status, &live);
+    }
+
+    /// The uncancelled peer sessions, each with whether the peer supplied its status.
+    fn live_status_peers(&self, unready: &HashSet<ZakuraPeerId>) -> Vec<(ZakuraPeerId, bool)> {
+        self.resources
             .peers
             .iter()
             .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
-            .filter_map(|(id, peer)| {
-                peer.status_delivery
-                    .next_deadline(status, !unready.contains(id))
-            })
-            .min();
+            .map(|(id, _)| (id.clone(), !unready.contains(id)))
+            .collect()
     }
 
     fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {
@@ -1866,7 +1635,7 @@ impl ReactorIO {
     }
 
     fn publish_body_unavailable_metrics(&mut self) {
-        let current = self.committed_view.as_ref().and_then(|snapshot| {
+        let current = self.state.committed_view().and_then(|snapshot| {
             snapshot
                 .alarms
                 .header_best_body_unavailable
@@ -1940,32 +1709,37 @@ impl ReactorIO {
     }
 
     /// Hand a data-plane action to the action driver without letting a slow or
-    /// stalled driver wedge the reactor. Returns `true` only if the action was
-    /// accepted.
-    fn dispatch_action(&self, action: BlockSyncAction) -> bool {
+    /// stalled driver wedge the reactor.
+    ///
+    /// A [`ActionClass::Required`] action may use the protected control
+    /// reserve. A [`ActionClass::Optional`] action must leave it free.
+    fn dispatch_action(&self, action: BlockSyncAction) -> Result<(), ActionRefusal> {
         let action_label = action.metric_label();
         let queue_depth = self
             .actions
             .max_capacity()
             .saturating_sub(self.actions.capacity());
-        let peer_action_permits = if matches!(action, BlockSyncAction::Misbehavior { .. }) {
-            // Acquire the peer-action slot and protected control capacity in one
+        let optional_permits = match ActionClass::of(&action) {
+            ActionClass::Required => None,
+            // Acquire the optional slot and protected control capacity in one
             // semaphore operation. The Sequencer sends concurrently, so a
             // separate capacity check followed by `try_send` has a race.
-            match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
-                Ok(permits) => Some(permits),
-                Err(mpsc::error::TrySendError::Full(())) => {
-                    metrics::counter!(
-                        "sync.block.action.control_capacity_reserved",
-                        "action" => action_label
-                    )
-                    .increment(1);
-                    return false;
+            ActionClass::Optional => {
+                match self.actions.try_reserve_many(BS_ACTION_CONTROL_RESERVE + 1) {
+                    Ok(permits) => Some(permits),
+                    Err(mpsc::error::TrySendError::Full(())) => {
+                        metrics::counter!(
+                            "sync.block.action.control_capacity_reserved",
+                            "action" => action_label
+                        )
+                        .increment(1);
+                        return Err(ActionRefusal::ControlReserve);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        return Err(ActionRefusal::Closed)
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(())) => return false,
             }
-        } else {
-            None
         };
         // Metrics accepts f64 samples; this lossy conversion is observability-only.
         metrics::histogram!(
@@ -1976,24 +1750,24 @@ impl ReactorIO {
         self.startup
             .trace
             .emit_event(|| BlockActionDispatched::new(&action));
-        if let Some(mut permits) = peer_action_permits {
+        if let Some(mut permits) = optional_permits {
             permits
                 .next()
-                .expect("the atomic reservation includes one peer-action permit")
+                .expect("the atomic reservation includes one optional-action permit")
                 .send(action);
-            return true;
+            return Ok(());
         }
         match self.actions.try_send(action) {
-            Ok(()) => true,
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 metrics::counter!(
                     "sync.block.action.send_queue_full",
                     "action" => action_label
                 )
                 .increment(1);
-                false
+                Err(ActionRefusal::Full)
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ActionRefusal::Closed),
         }
     }
 
@@ -2008,7 +1782,7 @@ impl ReactorIO {
         // lifecycle draining whenever the action driver was slow. `try_send` keeps
         // the reactor live.
         let action = BlockSyncAction::Misbehavior { peer, reason };
-        if !self.dispatch_action(action) {
+        if self.dispatch_action(action).is_err() {
             metrics::counter!("sync.block.peer.violation.action_dropped").increment(1);
         }
     }

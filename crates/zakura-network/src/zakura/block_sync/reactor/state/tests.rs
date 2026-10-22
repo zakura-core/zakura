@@ -61,6 +61,7 @@ fn reactor_state(tip: u32, header_tip: u32) -> ReactorState {
             initial_view(frontiers(tip)),
         ),
         BootstrapGate::new(true, None),
+        None,
     )
 }
 
@@ -406,6 +407,7 @@ fn header_quiet_holds_queries_until_body_sync_starts() {
             initial_view(frontiers(0)),
         ),
         BootstrapGate::new(false, None),
+        None,
     );
     state
         .bootstrap

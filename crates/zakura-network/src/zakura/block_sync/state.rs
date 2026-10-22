@@ -862,14 +862,12 @@ impl DownloadWindow {
 pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
-    pub(super) status_delivery: super::status::StatusDelivery,
 }
 
 impl PeerBlockState {
     pub(super) fn new(session: BlockSyncPeerSession) -> Self {
         Self {
             direction: session.direction(),
-            status_delivery: super::status::StatusDelivery::new(Instant::now()),
             session,
         }
     }

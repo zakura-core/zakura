@@ -15,19 +15,27 @@
 //!    [`QueryState::refused`] before it reads another input.
 //!
 //! Only an accepted proposal replaces the pending query and consumes a query ID.
+//! Body-availability requests follow the same rule: only an accepted request
+//! records its deduplication key.
 
-use std::{num::NonZeroU64, time::Instant};
+use std::{collections::BTreeSet, num::NonZeroU64, time::Instant};
 
 use zakura_chain::block;
-use zakura_header_chain::{BodyWorkAuthority, Frontier};
-use zakura_rt::time;
+use zakura_header_chain::{
+    BodyCompletionDecision, BodySupplierDiscovered, BodyUnavailableSummary, BodyWorkAuthority,
+    BodyWorkOwner, CommittedHeaderChainView, EngineSnapshot, EvidenceId, Frontier, Gate,
+    OperatorBodyRetry, PendingOwners, SourceId, StaleReason, StateVersion,
+};
+use zakura_rt::{collections::HashMap, time};
 
 use super::{
     BlockSyncAction, BlockSyncFrontiers, BlockSyncStatus, OutstandingClaim, SequencerView,
     ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits, WorkReturnOutcome,
-    ZakuraBlockSyncConfig, NEEDED_BLOCK_QUERY_RETRY_DELAY, NEEDED_BLOCK_REFILL_LIMIT,
+    ZakuraBlockSyncConfig, ZakuraPeerId, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
+    EMPTY_STATE_HEADER_QUIET_PERIOD, NEEDED_BLOCK_QUERY_RETRY_DELAY, NEEDED_BLOCK_REFILL_LIMIT,
 };
 use crate::zakura::block_sync::state::next_height;
+use crate::zakura::block_sync::status::StatusDelivery;
 
 #[cfg(test)]
 mod tests;
@@ -42,6 +50,11 @@ pub(super) struct ReactorState {
     pub(super) bootstrap: BootstrapGate,
     /// Sorted needed download heights, published as the candidate gap.
     pub(super) needed_heights: Vec<block::Height>,
+    /// Latest committed header-engine view. It stamps body-work authority.
+    committed_view: Option<CommittedHeaderChainView>,
+    /// Body-availability requests accepted against the current committed view.
+    alarm_requests: AlarmRequests,
+    pub(super) status: StatusSchedule,
 }
 
 impl ReactorState {
@@ -49,6 +62,7 @@ impl ReactorState {
         state_queries_enabled: bool,
         progress: ReactorProgress,
         bootstrap: BootstrapGate,
+        committed_view: Option<CommittedHeaderChainView>,
     ) -> Self {
         Self {
             state_queries_enabled,
@@ -56,7 +70,22 @@ impl ReactorState {
             progress,
             bootstrap,
             needed_heights: Vec::new(),
+            committed_view,
+            alarm_requests: AlarmRequests::default(),
+            status: StatusSchedule::default(),
         }
+    }
+
+    pub(super) fn committed_view(&self) -> Option<&CommittedHeaderChainView> {
+        self.committed_view.as_ref()
+    }
+
+    /// The body-work authority of the latest committed view.
+    /// `None` until the reactor has a committed view.
+    pub(super) fn body_work_scope(&self) -> Option<BodyWorkAuthority> {
+        self.committed_view
+            .as_ref()
+            .map(BodyWorkAuthority::for_view)
     }
 
     /// Apply the query gates that need no shared-state reads.
@@ -696,6 +725,534 @@ impl BootstrapGate {
         self.body_sync_started = true;
         self.header_quiet_until = None;
     }
+}
+
+// ---- committed authority ----
+
+/// The verified and finalized frontiers a committed snapshot carries.
+pub(super) fn block_sync_frontiers(snapshot: &EngineSnapshot) -> BlockSyncFrontiers {
+    BlockSyncFrontiers {
+        finalized_height: snapshot.frontiers.finalized.height,
+        verified_block_tip: snapshot.frontiers.verified_best.height,
+        verified_block_hash: snapshot.frontiers.verified_best.hash,
+    }
+}
+
+/// Whether an empty node must wait for far-ahead headers before its first body query.
+pub(super) fn empty_state_header_quiet_required(snapshot: &EngineSnapshot) -> bool {
+    snapshot.frontiers.verified_best.height == block::Height(0)
+        && snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0)
+            >= EMPTY_STATE_HEADER_QUIET_MIN_LAG
+}
+
+/// The authority and header hash of `view`'s body-unavailable alarm, if alarmed.
+fn alarmed_header_authority(
+    view: &CommittedHeaderChainView,
+) -> Option<(BodyWorkAuthority, block::Hash)> {
+    view.alarms
+        .header_best_body_unavailable
+        .filter(|summary| summary.alarmed)
+        .map(|_| {
+            (
+                BodyWorkAuthority::for_view(view),
+                view.frontiers.header_best.hash,
+            )
+        })
+}
+
+/// How a committed view changes body-work authority.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum AuthorityUpdate {
+    /// A new body-work epoch: the Sequencer resets work to `frontiers`.
+    EpochChanged {
+        authority: BodyWorkAuthority,
+        frontiers: BlockSyncFrontiers,
+    },
+    /// The same epoch under a refreshed authority: queued work moves to it.
+    Refreshed(BodyWorkAuthority),
+}
+
+/// How a committed view moves the verified frontiers.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum FrontierUpdate {
+    Unchanged,
+    /// The first committed view resets the Sequencer to its frontiers.
+    Initial(BlockSyncFrontiers),
+    /// Same-epoch verified or finalized progress.
+    Advanced(BlockSyncFrontiers),
+}
+
+/// How a committed view changes queued body-size hints.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum HintUpdate {
+    Unchanged,
+    /// Apply the view's hint batches newer than `after_revision` to queued work.
+    Apply {
+        after_revision: u64,
+    },
+    /// The view's batches miss a revision: refresh the queued window from state
+    /// at hint `revision`.
+    Restart {
+        revision: u64,
+    },
+}
+
+/// What [`ReactorState::observe_committed_view`] asks IO to do, in field order.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[must_use = "a committed view's operations must run"]
+pub(super) struct CommittedViewUpdate {
+    /// The previous view's alarm that this view clears.
+    pub(super) alarm_cleared: Option<(BodyWorkAuthority, block::Hash)>,
+    /// The new durable state version, when it changed.
+    pub(super) state_version: Option<StateVersion>,
+    pub(super) authority: Option<AuthorityUpdate>,
+    pub(super) frontiers: FrontierUpdate,
+    pub(super) hints: HintUpdate,
+    header_changed: bool,
+    /// The hint change retired a pending query whose sizes it corrects.
+    refreshed_pending_query: bool,
+}
+
+impl CommittedViewUpdate {
+    /// Whether the view needs a forced refill, once IO applied [`Self::hints`].
+    pub(super) fn forces_refill(&self, hint_refresh_active: bool) -> bool {
+        self.header_changed
+            || self.authority.is_some()
+            || self.refreshed_pending_query
+            || (self.hints != HintUpdate::Unchanged && hint_refresh_active)
+    }
+}
+
+impl ReactorState {
+    /// Adopt `view` as the committed view.
+    ///
+    /// The state retires the pending query when authority or hints change,
+    /// mirrors a changed header tip, holds an empty node for far-ahead headers
+    /// until `now` plus the quiet period, and drops the accepted
+    /// body-availability requests of the previous view.
+    pub(super) fn observe_committed_view(
+        &mut self,
+        view: CommittedHeaderChainView,
+        now: time::Instant,
+    ) -> CommittedViewUpdate {
+        let previous = self.committed_view.take();
+        let previous_scope = previous.as_ref().map(BodyWorkAuthority::for_view);
+        let body_work_epoch_changed = previous
+            .as_ref()
+            .is_some_and(|old| old.body_work_epoch != view.body_work_epoch);
+        let frontiers = block_sync_frontiers(&view);
+        let header_best = view.frontiers.header_best;
+        self.alarm_requests = AlarmRequests::default();
+
+        let current_alarm_hash = alarmed_header_authority(&view).map(|(_, hash)| hash);
+        let alarm_cleared = previous
+            .as_ref()
+            .and_then(alarmed_header_authority)
+            .filter(|(_, hash)| Some(*hash) != current_alarm_hash);
+        let state_version = (previous.as_ref().map(|old| old.state_version)
+            != Some(view.state_version))
+        .then_some(view.state_version);
+
+        let current_scope = BodyWorkAuthority::for_view(&view);
+        let authority = (previous_scope != Some(current_scope)).then(|| {
+            self.queries.clear();
+            if body_work_epoch_changed {
+                AuthorityUpdate::EpochChanged {
+                    authority: current_scope,
+                    frontiers,
+                }
+            } else {
+                AuthorityUpdate::Refreshed(current_scope)
+            }
+        });
+
+        let header_changed = previous
+            .as_ref()
+            .is_none_or(|old| old.frontiers.header_best != header_best);
+        if header_changed {
+            self.progress
+                .observe_header_tip(header_best.height, header_best.hash);
+            if empty_state_header_quiet_required(&view) {
+                self.bootstrap
+                    .hold_for_headers(now + EMPTY_STATE_HEADER_QUIET_PERIOD);
+            }
+        }
+
+        let frontier_update = match previous.as_ref() {
+            None => FrontierUpdate::Initial(frontiers),
+            Some(_) if body_work_epoch_changed => FrontierUpdate::Unchanged,
+            Some(old)
+                if old.frontiers.verified_best != view.frontiers.verified_best
+                    || old.frontiers.finalized != view.frontiers.finalized =>
+            {
+                debug_assert!(
+                    view.frontiers.verified_best.height >= old.frontiers.verified_best.height,
+                    "same-epoch verified authority cannot retreat"
+                );
+                debug_assert!(
+                    view.frontiers.verified_best.height != old.frontiers.verified_best.height
+                        || view.frontiers.verified_best.hash == old.frontiers.verified_best.hash,
+                    "same-epoch verified authority cannot replace a hash at the same height"
+                );
+                FrontierUpdate::Advanced(frontiers)
+            }
+            Some(_) => FrontierUpdate::Unchanged,
+        };
+
+        if body_work_epoch_changed {
+            self.queries.end_hint_refresh();
+        }
+        let old_hint_revision = previous
+            .as_ref()
+            .map(|old| old.body_size_hint_revision)
+            .filter(|old| *old != view.body_size_hint_revision);
+        let refreshed_pending_query =
+            old_hint_revision.is_some() && self.queries.pending().is_some();
+        let hints = match old_hint_revision {
+            None => HintUpdate::Unchanged,
+            Some(old_revision) => {
+                // An older query can carry sizes from before this correction.
+                self.queries.clear();
+                let first_revision = view
+                    .body_size_hint_batches
+                    .as_deref()
+                    .unwrap_or_default()
+                    .first()
+                    .map(|batch| batch.revision);
+                if first_revision.is_some_and(|first| first <= old_revision.saturating_add(1)) {
+                    HintUpdate::Apply {
+                        after_revision: old_revision,
+                    }
+                } else {
+                    HintUpdate::Restart {
+                        revision: view.body_size_hint_revision,
+                    }
+                }
+            }
+        };
+
+        self.committed_view = Some(view);
+        CommittedViewUpdate {
+            alarm_cleared,
+            state_version,
+            authority,
+            frontiers: frontier_update,
+            hints,
+            header_changed,
+            refreshed_pending_query,
+        }
+    }
+}
+
+/// Decide whether a body completion from `source` for `owner` is current
+/// under the committed view `current`. Returns the owner to complete and the
+/// view's state version, or the stale reason.
+pub(super) fn body_completion_authority(
+    current: &CommittedHeaderChainView,
+    source: SourceId,
+    owner: &BodyWorkOwner,
+) -> Result<(BodyWorkOwner, StateVersion), StaleReason> {
+    let mut pending = PendingOwners::default();
+    pending.insert(source, *owner);
+    match Gate::check_body(current, &pending, source, owner) {
+        BodyCompletionDecision::Current => Ok((*owner, current.state_version)),
+        BodyCompletionDecision::Rebased(owner) => Ok((owner, current.state_version)),
+        BodyCompletionDecision::Stale(reason) => Err(reason),
+    }
+}
+
+// ---- body-availability requests ----
+
+/// Deduplication key of one body-availability request: the committed state
+/// version, the alarmed header hash, and the eligible supplier-set digest.
+type AlarmKey = (StateVersion, block::Hash, [u8; 32]);
+
+/// Body-availability requests the action channel accepted against the
+/// current committed view. A new committed view drops both.
+#[derive(Debug, Default)]
+struct AlarmRequests {
+    supplier_restart: Option<AlarmKey>,
+    operator_retry: Option<AlarmKey>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AlarmRequestKind {
+    SupplierRestart,
+    OperatorRetry,
+}
+
+/// A body-availability action that the reactor must offer to the action channel.
+///
+/// The request changes nothing until the reactor reports an accepted dispatch
+/// to [`ReactorState::alarm_request_accepted`]. A refused request records
+/// nothing, so the next trigger proposes it again.
+#[derive(Debug)]
+#[must_use = "an accepted request must reach ReactorState"]
+pub(super) struct AlarmRequest {
+    kind: AlarmRequestKind,
+    key: AlarmKey,
+    action: BlockSyncAction,
+}
+
+impl AlarmRequest {
+    pub(super) fn action(&self) -> BlockSyncAction {
+        self.action.clone()
+    }
+}
+
+/// The 32-byte evidence digest of a body-availability request.
+fn alarm_evidence(personal: &[u8; 16], header: Frontier, key: AlarmKey) -> EvidenceId {
+    let mut hasher = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(personal)
+        .to_state();
+    hasher.update(&key.0.get().to_le_bytes());
+    hasher.update(&header.height.0.to_le_bytes());
+    hasher.update(&header.hash.0);
+    hasher.update(&key.2);
+    EvidenceId::from_digest(
+        hasher
+            .finalize()
+            .as_bytes()
+            .try_into()
+            .expect("the configured evidence digest is exactly 32 bytes"),
+    )
+}
+
+impl ReactorState {
+    /// The header frontier of the committed view's body-unavailable alarm.
+    pub(super) fn alarmed_header(&self) -> Option<Frontier> {
+        self.committed_view
+            .as_ref()
+            .filter(|view| {
+                view.alarms
+                    .header_best_body_unavailable
+                    .is_some_and(|summary| summary.alarmed)
+            })
+            .map(|view| view.frontiers.header_best)
+    }
+
+    /// Propose restarting the alarmed body search because `eligible_sources`
+    /// for the alarmed header holds a supplier the alarm has not tried.
+    ///
+    /// Returns `None` without an alarm, without a new supplier, or when the
+    /// channel already accepted the same restart.
+    pub(super) fn propose_supplier_restart(
+        &self,
+        eligible_sources: &BTreeSet<SourceId>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<AlarmRequest> {
+        let view = self.committed_view.as_ref()?;
+        let previous = view
+            .alarms
+            .header_best_body_unavailable
+            .filter(|summary| summary.alarmed)?;
+        let header = view.frontiers.header_best;
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        let supplier_set_digest = BodyUnavailableSummary::supplier_set_digest(eligible_sources);
+        let has_new_supplier = suppliers > previous.suppliers
+            || (suppliers == previous.suppliers
+                && supplier_set_digest != previous.supplier_set_digest);
+        let key = (view.state_version, header.hash, supplier_set_digest);
+        if !has_new_supplier || self.alarm_requests.supplier_restart == Some(key) {
+            return None;
+        }
+
+        let discovery = BodySupplierDiscovered {
+            hash: header.hash,
+            evidence: alarm_evidence(b"ZkBodyDiscover1_", header, key),
+            availability: BodyUnavailableSummary {
+                started_at: previous.started_at,
+                attempts: previous.attempts,
+                suppliers,
+                supplier_set_digest,
+                alarmed: true,
+                next_probe_at: now,
+            },
+        };
+        Some(AlarmRequest {
+            kind: AlarmRequestKind::SupplierRestart,
+            key,
+            action: BlockSyncAction::RestartBodyAvailability {
+                expected_version: view.state_version,
+                discovery,
+            },
+        })
+    }
+
+    /// Propose an operator retry of the alarmed body `hash` across
+    /// `eligible_sources`.
+    ///
+    /// Returns `None` unless `hash` is the alarmed header, a supplier is
+    /// eligible, and the channel has not accepted the same retry.
+    pub(super) fn propose_operator_retry(
+        &self,
+        hash: block::Hash,
+        eligible_sources: &BTreeSet<SourceId>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<AlarmRequest> {
+        let view = self.committed_view.as_ref()?;
+        let header = self.alarmed_header().filter(|header| header.hash == hash)?;
+        let suppliers = u32::try_from(eligible_sources.len()).unwrap_or(u32::MAX);
+        if suppliers == 0 {
+            return None;
+        }
+        let supplier_set_digest = BodyUnavailableSummary::supplier_set_digest(eligible_sources);
+        let key = (view.state_version, header.hash, supplier_set_digest);
+        if self.alarm_requests.operator_retry == Some(key) {
+            return None;
+        }
+
+        let retry = OperatorBodyRetry {
+            hash: header.hash,
+            evidence: alarm_evidence(b"ZkBodyOperator1_", header, key),
+            availability: BodyUnavailableSummary {
+                started_at: now,
+                attempts: 0,
+                suppliers,
+                supplier_set_digest,
+                alarmed: false,
+                next_probe_at: now,
+            },
+        };
+        Some(AlarmRequest {
+            kind: AlarmRequestKind::OperatorRetry,
+            key,
+            action: BlockSyncAction::RetryBodyAvailability {
+                expected_version: view.state_version,
+                retry,
+            },
+        })
+    }
+
+    /// The action channel accepted `request`: suppress the same request until
+    /// the committed view changes.
+    pub(super) fn alarm_request_accepted(&mut self, request: AlarmRequest) {
+        match request.kind {
+            AlarmRequestKind::SupplierRestart => {
+                self.alarm_requests.supplier_restart = Some(request.key)
+            }
+            AlarmRequestKind::OperatorRetry => {
+                self.alarm_requests.operator_retry = Some(request.key)
+            }
+        }
+    }
+}
+
+// ---- status delivery ----
+
+/// Status-delivery records of the admitted peers and the next refresh wake.
+///
+/// Its keys equal the reactor's admitted peer sessions: the reactor admits and
+/// removes both together.
+#[derive(Debug, Default)]
+pub(super) struct StatusSchedule {
+    deliveries: HashMap<ZakuraPeerId, StatusDelivery>,
+    /// Earliest pending status delivery, rebuilt after delivery state changes.
+    refresh_at: Option<Instant>,
+}
+
+impl StatusSchedule {
+    pub(super) fn refresh_at(&self) -> Option<Instant> {
+        self.refresh_at
+    }
+
+    /// Start a fresh delivery record for `peer`'s new session at `now`.
+    pub(super) fn admit(&mut self, peer: &ZakuraPeerId, now: Instant) {
+        self.deliveries
+            .insert(peer.clone(), StatusDelivery::new(now));
+    }
+
+    pub(super) fn remove(&mut self, peer: &ZakuraPeerId) {
+        self.deliveries.remove(peer);
+    }
+
+    /// `peer`'s delivery record, to record a send outcome.
+    pub(super) fn delivery_mut(&mut self, peer: &ZakuraPeerId) -> Option<&mut StatusDelivery> {
+        self.deliveries.get_mut(peer)
+    }
+
+    /// The peers in `peers` whose send of `status` is due at `now`.
+    ///
+    /// `peers` lists the live sessions in send order, each with whether the
+    /// peer has supplied its own status.
+    pub(super) fn due(
+        &self,
+        status: BlockSyncStatus,
+        peers: &[(ZakuraPeerId, bool)],
+        now: Instant,
+    ) -> Vec<ZakuraPeerId> {
+        peers
+            .iter()
+            .filter(|(peer, received_status)| {
+                self.next_deadline(peer, status, *received_status)
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
+    /// Rebuild the refresh wake from the live sessions in `peers`.
+    ///
+    /// The same delivery rules choose both sends and wakes, so a full queue
+    /// cannot lose its retry when another peer accepts the new range.
+    pub(super) fn rearm(&mut self, status: BlockSyncStatus, peers: &[(ZakuraPeerId, bool)]) {
+        self.refresh_at = peers
+            .iter()
+            .filter_map(|(peer, received_status)| {
+                self.next_deadline(peer, status, *received_status)
+            })
+            .min();
+    }
+
+    fn next_deadline(
+        &self,
+        peer: &ZakuraPeerId,
+        status: BlockSyncStatus,
+        received_status: bool,
+    ) -> Option<Instant> {
+        self.deliveries
+            .get(peer)?
+            .next_deadline(status, received_status)
+    }
+}
+
+// ---- action classes ----
+
+/// How much action-channel capacity an action may use.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum ActionClass {
+    /// Reactor control: needed-block queries and body-availability requests.
+    /// It may use the protected control reserve.
+    Required,
+    /// Expendable peer reports. It must leave the control reserve free.
+    Optional,
+}
+
+impl ActionClass {
+    pub(super) fn of(action: &BlockSyncAction) -> Self {
+        if matches!(action, BlockSyncAction::Misbehavior { .. }) {
+            Self::Optional
+        } else {
+            Self::Required
+        }
+    }
+}
+
+/// Why the action channel refused an action.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum ActionRefusal {
+    /// An optional action found only the control reserve free.
+    ControlReserve,
+    /// The channel is full.
+    Full,
+    /// The action driver closed the channel.
+    Closed,
 }
 
 // ---- peers and the floor watchdog ----

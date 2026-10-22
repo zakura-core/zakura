@@ -26,7 +26,7 @@ use zakura_rt::{
     sync::{watch, AsyncMutex},
 };
 
-use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState};
+use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
@@ -994,10 +994,6 @@ pub enum DiscoveryBookError {
     #[error("Zakura discovery record verification was cancelled")]
     VerificationCancelled,
 
-    /// A newer session replaced the session that delivered the record.
-    #[error("Zakura discovery session was replaced before its record was installed")]
-    SupersededSession,
-
     /// A record field exceeded a book-specific storage limit.
     #[error("Zakura discovery record {field} count {actual} exceeds book limit {max}")]
     Limit {
@@ -1042,8 +1038,7 @@ pub(super) fn hello_verdict(error: &DiscoveryBookError) -> RecordVerdict {
         | DiscoveryBookError::NoUsableDirectAddress
         | DiscoveryBookError::NonDialableDirectAddress { .. }
         | DiscoveryBookError::Limit { .. }
-        | DiscoveryBookError::VerificationCancelled
-        | DiscoveryBookError::SupersededSession => RecordVerdict::Drop,
+        | DiscoveryBookError::VerificationCancelled => RecordVerdict::Drop,
     }
 }
 
@@ -1553,36 +1548,45 @@ impl ZakuraDiscoveryHandle {
         Ok(outcome)
     }
 
-    /// Imports a connected peer's first-party live service summaries, received on `session`.
+    /// Imports a connected peer's first-party live service summaries.
     ///
     /// Live summaries are accepted only from the authenticated peer they describe, are bounded by
-    /// the connected-peer set, and expire independently of durable signed node records. A replaced
-    /// `session` caches nothing.
-    pub(super) async fn import_connected_peer_services(
+    /// the connected-peer set, and expire independently of durable signed node records.
+    pub async fn import_connected_peer_services(
         &self,
-        session: &DiscoverySessionKey,
         services: Services,
         peer_node_id: NodeId,
     ) -> Result<(), DiscoveryWireError> {
-        self.import_connected_peer_services_at(session, services, peer_node_id, current_unix_secs())
+        self.import_connected_peer_services_at(services, peer_node_id, current_unix_secs())
             .await
     }
 
     async fn import_connected_peer_services_at(
         &self,
-        session: &DiscoverySessionKey,
         services: Services,
         peer_node_id: NodeId,
         now: u64,
     ) -> Result<(), DiscoveryWireError> {
-        if services.node_id != peer_node_id {
-            return Err(DiscoveryWireError::MismatchedNodeId {
-                field: "services node id",
-            });
-        }
-
         let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
         self.inner.lock().await.receive_live_summaries(
+            peer_node_id,
+            services,
+            &connected_node_ids,
+            now,
+        )
+    }
+
+    /// Imports a connected peer's first-party live service summaries, received on `session`, as
+    /// [`Self::import_connected_peer_services`] does. A replaced `session` caches nothing.
+    pub(super) async fn import_session_services(
+        &self,
+        session: &DiscoverySessionKey,
+        services: Services,
+        peer_node_id: NodeId,
+    ) -> Result<(), DiscoveryWireError> {
+        let now = current_unix_secs();
+        let connected_node_ids = connected_peer_node_ids(&self.connected.borrow());
+        self.inner.lock().await.receive_session_live_summaries(
             session,
             peer_node_id,
             services,
@@ -1600,32 +1604,58 @@ impl ZakuraDiscoveryHandle {
         self.inner.lock().await.import_static_record(record, now)
     }
 
-    /// Imports a connected peer's latest self-record, received on `session`, and updates active
-    /// service hints.
+    /// Imports a connected peer's latest self-record and updates active service hints.
     ///
     /// Active service hints come only from the authenticated peer's own signed `Hello`.
     /// Addressless or locally non-dialable records can still update active services, because the
     /// live connection is already established; they are still rejected from dialable storage.
     ///
     /// Signature verification runs outside the discovery lock. A record identical to the
-    /// stored one skips it, and policy runs in one short lock hold. That hold installs nothing
-    /// once `session` is replaced.
-    pub(super) async fn import_connected_peer_record(
+    /// stored one skips it, and policy runs in one short lock hold.
+    pub async fn import_connected_peer_record(
         &self,
-        session: &DiscoverySessionKey,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        if record.body.node_id != peer_node_id {
-            return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
-        }
-        let record = self.verify_unless_stored(record).await?;
-
+        let record = self
+            .verify_connected_peer_record(record, peer_node_id)
+            .await?;
         let now = current_unix_secs();
         self.inner
             .lock()
             .await
-            .install_connected_peer_record(session, record, now)
+            .install_connected_peer_record(record, now)
+    }
+
+    /// Imports a connected peer's latest self-record, received on `session`, as
+    /// [`Self::import_connected_peer_record`] does. The lock hold installs nothing once
+    /// `session` is replaced.
+    pub(super) async fn import_session_record(
+        &self,
+        session: &DiscoverySessionKey,
+        record: ZakuraNodeRecord,
+        peer_node_id: NodeId,
+    ) -> Result<ImportOutcome, SessionRecordError> {
+        let record = self
+            .verify_connected_peer_record(record, peer_node_id)
+            .await?;
+        let now = current_unix_secs();
+        self.inner
+            .lock()
+            .await
+            .install_session_record(session, record, now)
+    }
+
+    /// Checks that `record` is `peer_node_id`'s own and verifies it unless it is already stored.
+    async fn verify_connected_peer_record(
+        &self,
+        record: ZakuraNodeRecord,
+        peer_node_id: NodeId,
+    ) -> Result<VerifiedRecord, DiscoveryBookError> {
+        if record.body.node_id != peer_node_id {
+            return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
+        }
+        self.verify_unless_stored(record).await
     }
 
     /// Verifies `record`'s author checks off the lock, unless the record is
@@ -2052,9 +2082,28 @@ impl ZakuraDiscoveryBook {
     /// its first peers without waiting for the next epoch. The snapshot never drops an id
     /// within an epoch, so book churn cannot widen what a requester learns.
     ///
-    /// `exclude_node_ids` must be in ascending byte order. `rng` shuffles a new
-    /// snapshot and the returned sample.
-    pub fn sample_peers<R: rand_10::Rng + ?Sized>(
+    /// `exclude_node_ids` must be in ascending byte order.
+    pub fn sample_peers(
+        &mut self,
+        limit: usize,
+        wanted_services: &[ZakuraServiceId],
+        exclude_node_ids: &[[u8; 32]],
+        now: u64,
+        requester: NodeId,
+    ) -> Vec<ZakuraNodeRecord> {
+        self.sample_peers_with_rng(
+            limit,
+            wanted_services,
+            exclude_node_ids,
+            now,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        )
+    }
+
+    /// Returns the same sample as [`Self::sample_peers`], with `rng` shuffling a
+    /// new snapshot and the returned sample.
+    pub(super) fn sample_peers_with_rng<R: rand_10::Rng + ?Sized>(
         &mut self,
         limit: usize,
         wanted_services: &[ZakuraServiceId],
@@ -3813,22 +3862,6 @@ mod tests {
         ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("node id is a valid peer id")
     }
 
-    /// Admits a test session for `node_id` and returns its key.
-    async fn admitted_session(
-        handle: &ZakuraDiscoveryHandle,
-        node_id: NodeId,
-    ) -> DiscoverySessionKey {
-        let session = DiscoverySessionKey::new(peer_id_for(node_id), 0, 1);
-        handle
-            .admit_peer_session(session.clone(), ServicePeerDirection::Inbound)
-            .await;
-        assert!(
-            handle.is_current_session(&session).await,
-            "the test session is admitted"
-        );
-        session
-    }
-
     fn header_summary() -> HeaderSyncServiceSummary {
         HeaderSyncServiceSummary {
             best_height: block::Height(42),
@@ -5068,7 +5101,6 @@ mod tests {
             &[],
             NOW,
             test_requester(),
-            &mut zakura_rt::rand::rng(),
         );
         assert_eq!(sample.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         let encoded = DiscoveryMessage::Peers { records: sample }
@@ -5404,15 +5436,8 @@ mod tests {
         // Dialability is a local hint only: until the record owner confirms first-party or a
         // local dial succeeds, the record must not be re-gossiped through peer samples.
         assert!(
-            book.sample_peers(
-                10,
-                &[],
-                &[],
-                NOW,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            )
-            .is_empty(),
+            book.sample_peers(10, &[], &[], NOW, test_requester())
+                .is_empty(),
             "unconfirmed third-party gossip must stay out of peer samples"
         );
 
@@ -5424,14 +5449,7 @@ mod tests {
             ImportOutcome::MetadataUpdated
         );
         assert_eq!(
-            book.sample_peers(
-                10,
-                &[],
-                &[],
-                NOW + 1,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            ),
+            book.sample_peers(10, &[], &[], NOW + 1, test_requester()),
             vec![public_target.clone()],
             "first-party confirmation makes the record sample-eligible"
         );
@@ -5529,14 +5547,7 @@ mod tests {
             .expect("additional address for the same static identity imports");
 
         assert!(book
-            .sample_peers(
-                10,
-                &[],
-                &[],
-                NOW,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            )
+            .sample_peers(10, &[], &[], NOW, test_requester())
             .is_empty());
         let mut rng = StdRng::seed_from_u64(7);
         assert_eq!(
@@ -5755,7 +5766,7 @@ mod tests {
         book.import_record(confirmed.clone(), Some(author), NOW - 1, &context())
             .expect("a first-party record imports");
         assert_eq!(
-            book.sample_peers(32, &[], &[], NOW, requester, &mut zakura_rt::rand::rng()),
+            book.sample_peers(32, &[], &[], NOW, requester),
             vec![confirmed.clone()]
         );
 
@@ -5775,7 +5786,7 @@ mod tests {
         }
         assert_eq!(book.discovered_len(), 2);
         assert_eq!(
-            book.sample_peers(32, &[], &[], NOW, requester, &mut zakura_rt::rand::rng()),
+            book.sample_peers(32, &[], &[], NOW, requester),
             vec![confirmed.clone()]
         );
 
@@ -5810,9 +5821,7 @@ mod tests {
             later / DISCOVERY_DISCLOSURE_EPOCH.as_secs(),
             NOW / DISCOVERY_DISCLOSURE_EPOCH.as_secs()
         );
-        assert!(book
-            .sample_peers(32, &[], &[], later, requester, &mut zakura_rt::rand::rng())
-            .is_empty());
+        assert!(book.sample_peers(32, &[], &[], later, requester).is_empty());
 
         let mut renewed = body(&secret);
         renewed.sequence = 2;
@@ -5824,7 +5833,7 @@ mod tests {
             ImportOutcome::Updated
         );
         assert_eq!(
-            book.sample_peers(32, &[], &[], later, requester, &mut zakura_rt::rand::rng()),
+            book.sample_peers(32, &[], &[], later, requester),
             vec![renewed]
         );
     }
@@ -5845,14 +5854,7 @@ mod tests {
         let windows: HashSet<Vec<NodeId>> = (0..8)
             .map(|_| {
                 let mut window: Vec<NodeId> = book
-                    .sample_peers(
-                        32,
-                        &[],
-                        &[],
-                        NOW,
-                        test_requester(),
-                        &mut zakura_rt::rand::rng(),
-                    )
+                    .sample_peers(32, &[], &[], NOW, test_requester())
                     .into_iter()
                     .map(|record| record.body.node_id)
                     .collect();
@@ -5879,14 +5881,7 @@ mod tests {
             )
             .unwrap();
         }
-        let first = book.sample_peers(
-            MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-            &[],
-            &[],
-            NOW,
-            requester,
-            &mut zakura_rt::rand::rng(),
-        );
+        let first = book.sample_peers(MAX_DISCOVERY_RECORDS_PER_RESPONSE, &[], &[], NOW, requester);
         assert_eq!(first.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         let mut exclude: Vec<[u8; 32]> = first
             .iter()
@@ -5900,7 +5895,6 @@ mod tests {
                 &exclude,
                 NOW,
                 requester,
-                &mut zakura_rt::rand::rng()
             )
             .is_empty());
     }
@@ -5926,7 +5920,6 @@ mod tests {
             &[*excluded.as_bytes()],
             NOW,
             test_requester(),
-            &mut zakura_rt::rand::rng(),
         );
         let sample_ids: HashSet<_> = sample.iter().map(|record| record.body.node_id).collect();
 
@@ -5943,14 +5936,7 @@ mod tests {
         let record = signed_record_with(1, service(1), test_addr(1));
         import_confirmed_record(&mut book, record).unwrap();
 
-        let sample = book.sample_peers(
-            10,
-            &[],
-            &[],
-            NOW + 61,
-            test_requester(),
-            &mut zakura_rt::rand::rng(),
-        );
+        let sample = book.sample_peers(10, &[], &[], NOW + 61, test_requester());
 
         assert!(sample.is_empty());
     }
@@ -6456,11 +6442,7 @@ mod tests {
         let node_id = record.body.node_id;
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                record,
-                node_id,
-            )
+            .import_connected_peer_record(record, node_id)
             .await
             .expect("connected self-record imports");
 
@@ -6480,11 +6462,7 @@ mod tests {
         let record = runtime_record_with(1, service(9), test_addr(9));
         let node_id = record.body.node_id;
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                record,
-                node_id,
-            )
+            .import_connected_peer_record(record, node_id)
             .await
             .expect("connected self-record imports");
         assert_eq!(handle.active_services(node_id).await, None);
@@ -6523,7 +6501,6 @@ mod tests {
         };
         handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, node_id).await,
                 first_party_services(
                     node_id,
                     u64::MAX,
@@ -6561,7 +6538,6 @@ mod tests {
         };
         handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, node_id).await,
                 first_party_services(
                     node_id,
                     now + 10,
@@ -6596,7 +6572,6 @@ mod tests {
 
         handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, node_id).await,
                 first_party_services(
                     node_id,
                     NOW - 1,
@@ -6619,7 +6594,6 @@ mod tests {
 
         handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, node_id).await,
                 first_party_services(
                     node_id,
                     NOW - DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs() - 1,
@@ -6647,7 +6621,6 @@ mod tests {
 
         let error = handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, peer_node_id).await,
                 first_party_services(
                     claimed_node_id,
                     NOW + 30,
@@ -6713,11 +6686,7 @@ mod tests {
         let node_id = active_record.body.node_id;
 
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                active_record,
-                node_id,
-            )
+            .import_connected_peer_record(active_record, node_id)
             .await
             .expect("connected self-record imports");
         import_one_peer_record(&handle, stale_book_record, Some(secret_key().public())).await;
@@ -6746,20 +6715,12 @@ mod tests {
         let addressless_node_id = addressless.body.node_id;
         connected_tx.send_replace(vec![peer_id_for(node_id), peer_id_for(addressless_node_id)]);
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                stored.clone(),
-                node_id,
-            )
+            .import_connected_peer_record(stored.clone(), node_id)
             .await
             .expect("the first hello imports");
         assert!(matches!(
             handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, addressless_node_id).await,
-                    addressless.clone(),
-                    addressless_node_id
-                )
+                .import_connected_peer_record(addressless.clone(), addressless_node_id)
                 .await,
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
@@ -6768,11 +6729,7 @@ mod tests {
         assert_eq!(
             tokio::time::timeout(
                 Duration::from_secs(5),
-                handle.import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    stored,
-                    node_id
-                ),
+                handle.import_connected_peer_record(stored, node_id),
             )
             .await
             .expect("an identical hello needs no verification slot")
@@ -6782,11 +6739,7 @@ mod tests {
         assert!(matches!(
             tokio::time::timeout(
                 Duration::from_secs(5),
-                handle.import_connected_peer_record(
-                    &admitted_session(&handle, addressless_node_id).await,
-                    addressless,
-                    addressless_node_id
-                ),
+                handle.import_connected_peer_record(addressless, addressless_node_id),
             )
             .await
             .expect("an identical addressless hello needs no verification slot"),
@@ -6794,15 +6747,7 @@ mod tests {
         ));
         let waiting = tokio::spawn({
             let handle = handle.clone();
-            async move {
-                handle
-                    .import_connected_peer_record(
-                        &admitted_session(&handle, node_id).await,
-                        newer,
-                        node_id,
-                    )
-                    .await
-            }
+            async move { handle.import_connected_peer_record(newer, node_id).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -6840,27 +6785,19 @@ mod tests {
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         handle
-            .import_connected_peer_record(&admitted_session(&handle, node_id).await, newer, node_id)
+            .import_connected_peer_record(newer, node_id)
             .await
             .expect("newer connected self-record imports");
         assert_eq!(
             handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    older,
-                    node_id
-                )
+                .import_connected_peer_record(older, node_id)
                 .await
                 .expect("older connected self-record verifies and is ignored"),
             ImportOutcome::IgnoredOlder
         );
         assert_eq!(
             handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    equal_conflicting,
-                    node_id
-                )
+                .import_connected_peer_record(equal_conflicting, node_id)
                 .await
                 .expect("equal-sequence connected self-record refreshes metadata only"),
             ImportOutcome::MetadataUpdated
@@ -6868,11 +6805,7 @@ mod tests {
         import_one_peer_record(&handle, stored_newer, Some(secret_key().public())).await;
         assert_eq!(
             handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    older_than_stored,
-                    node_id
-                )
+                .import_connected_peer_record(older_than_stored, node_id)
                 .await
                 .expect("connected self-record older than the book is ignored"),
             ImportOutcome::IgnoredOlder
@@ -6897,32 +6830,16 @@ mod tests {
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert!(matches!(
-            handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    newer,
-                    node_id
-                )
-                .await,
+            handle.import_connected_peer_record(newer, node_id).await,
+            Err(DiscoveryBookError::NoUsableDirectAddress)
+        ));
+        assert!(matches!(
+            handle.import_connected_peer_record(older, node_id).await,
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
         assert!(matches!(
             handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    older,
-                    node_id
-                )
-                .await,
-            Err(DiscoveryBookError::NoUsableDirectAddress)
-        ));
-        assert!(matches!(
-            handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    equal_conflicting,
-                    node_id
-                )
+                .import_connected_peer_record(equal_conflicting, node_id)
                 .await,
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
@@ -6947,19 +6864,13 @@ mod tests {
         old.expires_at_unix_secs = current_unix_secs() - 1;
         let old = ZakuraNodeRecord::sign(old, &secret).expect("record signs");
         handle
-            .import_connected_peer_record(&admitted_session(&handle, node_id).await, old, node_id)
+            .import_connected_peer_record(old, node_id)
             .await
             .expect("a dialable record imports");
 
         let reset = runtime_record_with_secret_and_addrs(&secret, 1, service(3), Vec::new());
         assert!(matches!(
-            handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    reset,
-                    node_id
-                )
-                .await,
+            handle.import_connected_peer_record(reset, node_id).await,
             Err(DiscoveryBookError::NoUsableDirectAddress)
         ));
         assert_eq!(
@@ -6985,13 +6896,7 @@ mod tests {
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         assert!(matches!(
-            handle
-                .import_connected_peer_record(
-                    &admitted_session(&handle, node_id).await,
-                    expired,
-                    node_id
-                )
-                .await,
+            handle.import_connected_peer_record(expired, node_id).await,
             Err(DiscoveryBookError::Record(DiscoveryRecordError::Expired))
         ));
         assert_eq!(handle.active_services(node_id).await, None);
@@ -7008,7 +6913,6 @@ mod tests {
 
         let error = handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, peer_node_id).await,
                 first_party_services(
                     claimed_node_id,
                     now + 30,
@@ -7067,16 +6971,11 @@ mod tests {
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                record.clone(),
-                node_id,
-            )
+            .import_connected_peer_record(record.clone(), node_id)
             .await
             .expect("connected self-record imports");
         handle
             .import_connected_peer_services_at(
-                &admitted_session(&handle, node_id).await,
                 first_party_services(
                     node_id,
                     NOW + 5,
@@ -7123,17 +7022,12 @@ mod tests {
         ]);
 
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, record_backed_node_id).await,
-                record_backed,
-                record_backed_node_id,
-            )
+            .import_connected_peer_record(record_backed, record_backed_node_id)
             .await
             .expect("connected record imports");
         for node_id in [live_only_node_id, record_backed_node_id] {
             handle
                 .import_connected_peer_services_at(
-                    &admitted_session(&handle, node_id).await,
                     first_party_services(
                         node_id,
                         now + 30,
@@ -7162,7 +7056,6 @@ mod tests {
         for node_id in [live_only_node_id, record_backed_node_id] {
             handle
                 .import_connected_peer_services_at(
-                    &admitted_session(&handle, node_id).await,
                     first_party_services(
                         node_id,
                         now.saturating_sub(DEFAULT_DISCOVERY_CLOCK_SKEW_TOLERANCE.as_secs()),
@@ -7196,11 +7089,7 @@ mod tests {
         connected_tx.send_replace(vec![peer_id_for(node_id)]);
 
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, node_id).await,
-                record,
-                node_id,
-            )
+            .import_connected_peer_record(record, node_id)
             .await
             .expect("connected record imports");
         assert_eq!(
@@ -7546,15 +7435,8 @@ mod tests {
         .expect("third-party gossip record imports");
 
         assert!(
-            book.sample_peers(
-                10,
-                &[],
-                &[],
-                NOW,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            )
-            .is_empty(),
+            book.sample_peers(10, &[], &[], NOW, test_requester())
+                .is_empty(),
             "unconfirmed third-party record must not be re-gossiped"
         );
 
@@ -7567,14 +7449,7 @@ mod tests {
         )
         .expect("repeated third-party gossip imports");
         assert!(book
-            .sample_peers(
-                10,
-                &[],
-                &[],
-                NOW,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            )
+            .sample_peers(10, &[], &[], NOW, test_requester())
             .is_empty());
         assert!(book
             .get(&gossiped_id)
@@ -7585,14 +7460,7 @@ mod tests {
         // A successful local dial is an explicit trust transition that makes it shareable.
         book.mark_dial_success(&gossiped_id, NOW + 1);
         assert_eq!(
-            book.sample_peers(
-                10,
-                &[],
-                &[],
-                NOW + 1,
-                test_requester(),
-                &mut zakura_rt::rand::rng()
-            ),
+            book.sample_peers(10, &[], &[], NOW + 1, test_requester()),
             vec![gossiped],
             "locally dialed record becomes sample-eligible"
         );
@@ -7623,26 +7491,12 @@ mod tests {
         let node_ids = |records: Vec<ZakuraNodeRecord>| -> HashSet<NodeId> {
             records.iter().map(|record| record.body.node_id).collect()
         };
-        let first = book.sample_peers(
-            DISCLOSURE_LIMIT,
-            &[],
-            &[],
-            NOW,
-            requester,
-            &mut zakura_rt::rand::rng(),
-        );
+        let first = book.sample_peers(DISCLOSURE_LIMIT, &[], &[], NOW, requester);
         assert_eq!(first.len(), DISCLOSURE_LIMIT);
         let disclosure_set = node_ids(first);
         assert_eq!(
             disclosure_set,
-            node_ids(book.sample_peers(
-                DISCLOSURE_LIMIT,
-                &[],
-                &[],
-                NOW,
-                requester,
-                &mut zakura_rt::rand::rng()
-            ))
+            node_ids(book.sample_peers(DISCLOSURE_LIMIT, &[], &[], NOW, requester))
         );
 
         // Exclude everything already returned and query each record's unique service id.
@@ -7650,25 +7504,13 @@ mod tests {
         let mut seen = disclosure_set.clone();
         let mut excluded: Vec<_> = seen.iter().map(|id| *id.as_bytes()).collect();
         excluded.sort_unstable();
-        for record in book.sample_peers(
-            DISCLOSURE_LIMIT,
-            &[],
-            &excluded,
-            NOW,
-            requester,
-            &mut zakura_rt::rand::rng(),
-        ) {
+        for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &excluded, NOW, requester) {
             seen.insert(record.body.node_id);
         }
         for index in 0..BOOK_SIZE {
-            for record in book.sample_peers(
-                DISCLOSURE_LIMIT,
-                &[service(index)],
-                &[],
-                NOW,
-                requester,
-                &mut zakura_rt::rand::rng(),
-            ) {
+            for record in
+                book.sample_peers(DISCLOSURE_LIMIT, &[service(index)], &[], NOW, requester)
+            {
                 seen.insert(record.body.node_id);
             }
         }
@@ -7684,14 +7526,7 @@ mod tests {
         let mut now = NOW;
         for _ in 0..48 {
             now = next_epoch(now);
-            for record in book.sample_peers(
-                DISCLOSURE_LIMIT,
-                &[],
-                &[],
-                now,
-                requester,
-                &mut zakura_rt::rand::rng(),
-            ) {
+            for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &[], now, requester) {
                 across_epochs.insert(record.body.node_id);
             }
         }
@@ -7704,17 +7539,10 @@ mod tests {
     /// Samples for one fixed requester, so every call reads the same window.
     fn sampled_node_ids(book: &mut ZakuraDiscoveryBook, now: u64) -> HashSet<NodeId> {
         let requester = NodeSecretKey::from_bytes(&[7; 32]).public();
-        book.sample_peers(
-            usize::MAX,
-            &[],
-            &[],
-            now,
-            requester,
-            &mut zakura_rt::rand::rng(),
-        )
-        .iter()
-        .map(|record| record.body.node_id)
-        .collect()
+        book.sample_peers(usize::MAX, &[], &[], now, requester)
+            .iter()
+            .map(|record| record.body.node_id)
+            .collect()
     }
 
     /// While one window covers the whole snapshot, a newly confirmed entry
@@ -8088,11 +7916,7 @@ mod tests {
         let candidate_id = candidate.body.node_id;
         import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, connected_id).await,
-                connected,
-                connected_id,
-            )
+            .import_connected_peer_record(connected, connected_id)
             .await
             .expect("connected self-record imports");
 
@@ -8115,11 +7939,7 @@ mod tests {
         let candidate_id = candidate.body.node_id;
         import_one_peer_record(&handle, candidate.clone(), Some(candidate_id)).await;
         handle
-            .import_connected_peer_record(
-                &admitted_session(&handle, connected_id).await,
-                connected,
-                connected_id,
-            )
+            .import_connected_peer_record(connected, connected_id)
             .await
             .expect("connected self-record imports");
 

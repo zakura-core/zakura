@@ -28,8 +28,8 @@ use crate::BoxError;
 use super::peer::{PeerIO, SharedPeerState};
 use super::pipe::{discovery_pipe, DsEnv, DsLocal};
 use super::protocol::{
-    hello_verdict, DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle,
-    ZakuraNodeRecord, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
+    DiscoveryMessage, RecordVerdict, Services, ZakuraDiscoveryHandle, ZakuraNodeRecord,
+    ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use super::requester::{reservation_pool, AdmittedAnswer, Queries};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity};
@@ -769,7 +769,7 @@ impl DiscoverySink {
             ));
         }
         self.handle
-            .import_connected_peer_services(&self.key, services, self.peer_node_id)
+            .import_session_services(&self.key, services, self.peer_node_id)
             .await
             .map_err(SinkReject::protocol)?;
         Ok(())
@@ -780,10 +780,10 @@ impl DiscoverySink {
     async fn handle_hello(&self, record: ZakuraNodeRecord) -> Result<(), SinkReject> {
         if let Err(error) = self
             .handle
-            .import_connected_peer_record(&self.key, record, self.peer_node_id)
+            .import_session_record(&self.key, record, self.peer_node_id)
             .await
         {
-            match hello_verdict(&error) {
+            match error.verdict() {
                 RecordVerdict::Drop => {
                     tracing::debug!(?error, "dropped Zakura discovery hello");
                 }

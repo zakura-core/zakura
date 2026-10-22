@@ -867,6 +867,7 @@ def completion_updates(
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
+    """Audits the fleet and confirms handled notifications only after saving alert state."""
     nodes = load_nodes(args.config, args.node)
     problems: dict[str, Problem] = {}
     statuses: dict[str, dict[str, Any]] = {}
@@ -935,6 +936,11 @@ def cmd_audit(args: argparse.Namespace) -> int:
         pass
     elif posted:
         save_audit_state(state_file, state)
+        # The CI fallback must distinguish an incident (including a suppressed
+        # repeat) from an audit crash or undelivered notification.
+        if output := os.environ.get("GITHUB_OUTPUT"):
+            with open(output, "a", encoding="utf-8") as stream:
+                stream.write("notification_handled=true\n")
     else:
         # Advancing `last_sent` here would record an undelivered page as sent and
         # stay silent until the reminder interval elapsed. Leave the old state so

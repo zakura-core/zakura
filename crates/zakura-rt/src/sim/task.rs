@@ -22,9 +22,25 @@ use crate::sim::{self, Op, Point, RunId, TaskExit, TaskId};
 /// Spawns `future` as a new task, as `tokio::spawn` does.
 ///
 /// Inside a run, the executor runs it, and the spawn is a preemption point.
-/// The task's label is the caller's source file until spawn sites get names.
+/// The task's label is the caller's source file, which changes when code
+/// moves. Use [`spawn_named`] for a stable one.
 #[track_caller]
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_named(Location::caller().file(), future)
+}
+
+/// Spawns `future` as [`spawn`] does, with `label` naming the task.
+///
+/// The executor builds task identities from labels, such as
+/// `header_sync_publisher.1/header_sync_page_job.2`, so a label that doesn't
+/// depend on where the code lives keeps traces and replays stable across
+/// refactors.
+#[track_caller]
+pub fn spawn_named<F>(label: &'static str, future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -32,9 +48,14 @@ where
     let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
         return JoinHandle::tokio(tokio::spawn(future));
     };
-    spawn_in_run(executor, run, Location::caller(), future, |label, task| {
-        Some(executor.spawn(label, task))
-    })
+    spawn_in_run(
+        executor,
+        run,
+        label,
+        Location::caller(),
+        future,
+        |label, task| Some(executor.spawn(label, task)),
+    )
     .expect("the infallible executor spawn always returns a task")
 }
 
@@ -55,16 +76,19 @@ where
             .ok()
             .map(|runtime| JoinHandle::tokio(runtime.spawn(future)));
     };
-    spawn_in_run(executor, run, Location::caller(), future, |label, task| {
+    let site = Location::caller();
+    spawn_in_run(executor, run, site.file(), site, future, |label, task| {
         executor.try_spawn(label, task)
     })
 }
 
-/// Hands `future` to the run's executor through `spawn_task`, after the
-/// spawn's preemption point. Returns `None` if `spawn_task` refuses it.
+/// Hands `future` to the run's executor through `spawn_task` under `label`,
+/// after the spawn's preemption point at `site`. Returns `None` if
+/// `spawn_task` refuses it.
 fn spawn_in_run<F>(
     executor: &'static dyn sim::Executor,
     run: RunId,
+    label: &'static str,
     site: &'static Location<'static>,
     future: F,
     spawn_task: impl FnOnce(&'static str, sim::BoxTask) -> Option<TaskId>,
@@ -77,7 +101,7 @@ where
     let output = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&output);
     let task = spawn_task(
-        site.file(),
+        label,
         Box::pin(async move {
             let value = future.await;
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);

@@ -907,6 +907,7 @@ impl Service for BlockSyncService {
         // Let the returned handle drop to detach the supervised task (like
         // `tokio::spawn`); the `PipeTeardown` still runs on every exit path.
         spawn_supervised_pipe(
+            "block_sync_pipe",
             peer_id.clone(),
             service_cancel_token.clone(),
             on_teardown,

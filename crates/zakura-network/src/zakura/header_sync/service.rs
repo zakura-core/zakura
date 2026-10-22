@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use zakura_header_chain::Frontier;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use zakura_rt::sync::mpsc;
 use zakura_rt::{
@@ -809,7 +809,14 @@ impl Service for HeaderSyncService {
             panic_close_cause.record("service_panic");
             panic_connection_cancel.cancel();
         };
-        spawn_supervised_pipe(peer_id, service_cancel_token, on_teardown, on_panic, pipe);
+        spawn_supervised_pipe(
+            "header_sync_pipe",
+            peer_id,
+            service_cancel_token,
+            on_teardown,
+            on_panic,
+            pipe,
+        );
     }
 
     fn owns_connection_for_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
@@ -949,7 +956,7 @@ impl Service for HeaderSyncPassthroughService {
             inner: self.inner.clone(),
             cancel_token: peer.cancel_token(),
         };
-        spawn_erased(async move {
+        spawn_erased_named("header_sync_passthrough", async move {
             if let Err(error) = Box::new(sink).run(recv).await {
                 tracing::debug!(?error, "header-sync passthrough stopped");
             }

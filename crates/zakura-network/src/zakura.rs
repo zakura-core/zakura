@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::sync::CancellationToken;
 
@@ -423,12 +423,15 @@ impl ZakuraHandshakeConnector {
         let Some(dial_lifetime) = endpoint.upgrade_dial_lifetime(&peer_id) else {
             return;
         };
-        spawn_erased(run_legacy_liveness_keeper(
-            book_addr,
-            address_book_updater,
-            dial_lifetime,
-            ZAKURA_LIVENESS_REFRESH_INTERVAL,
-        ));
+        spawn_erased_named(
+            "legacy_liveness_keeper",
+            run_legacy_liveness_keeper(
+                book_addr,
+                address_book_updater,
+                dial_lifetime,
+                ZAKURA_LIVENESS_REFRESH_INTERVAL,
+            ),
+        );
     }
 
     /// Returns the deterministic upgrade outcome injected for handshake routing

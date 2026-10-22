@@ -81,6 +81,18 @@ pub mod task {
     };
     pub use tokio_util::task::AbortOnDropHandle;
 
+    /// Spawns `future` as [`spawn`] does. `label` names the task in the
+    /// simulator build's task identities, and production ignores it.
+    #[track_caller]
+    pub fn spawn_named<F>(label: &'static str, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let _ = label;
+        tokio::spawn(future)
+    }
+
     /// Spawns `future` as [`spawn`] does, or returns `None` outside a tokio
     /// runtime instead of panicking.
     ///

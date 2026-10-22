@@ -38,6 +38,19 @@ pub fn spawn_erased<T: Send + 'static>(
     zakura_rt::task::spawn(erased(future))
 }
 
+/// [`spawn_erased`] with `label` naming the task, through
+/// [`zakura_rt::task::spawn_named`].
+///
+/// Production ignores the label. The simulator builds task identities from
+/// it, so a named task keeps its identity when its spawn site moves.
+#[track_caller]
+pub fn spawn_erased_named<T: Send + 'static>(
+    label: &'static str,
+    future: impl Future<Output = T> + Send + 'static,
+) -> JoinHandle<T> {
+    zakura_rt::task::spawn_named(label, erased(future))
+}
+
 /// Wrap `service` in a [`Buffer`], spawning its worker as an [`ErasedFuture`].
 ///
 /// Behaves like [`Buffer::new`], which spawns its worker with `tokio::spawn`

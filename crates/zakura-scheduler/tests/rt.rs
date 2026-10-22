@@ -173,6 +173,28 @@ fn spawn_join_panic_and_abort_go_through_the_scheduler() {
 }
 
 #[test]
+fn named_spawns_take_their_label() {
+    let (result, violation) = run_fixture(1, 0, |s| {
+        s.spawn_root("root", async {
+            task::spawn_named("worker", async {}).await.unwrap();
+            task::spawn_named("worker", async {}).await.unwrap();
+        });
+        Box::new(|_| None)
+    });
+    assert_eq!(violation, None);
+    for name in ["root.1/worker.1", "root.1/worker.2"] {
+        assert!(
+            result
+                .picks
+                .iter()
+                .any(|p| p.starts_with(&format!("{name}:"))),
+            "{name} in {:?}",
+            result.picks
+        );
+    }
+}
+
+#[test]
 fn rt_time_reads_the_virtual_clock() {
     for seed in 0..20 {
         let (result, violation) = run_fixture(2, seed, |s| {

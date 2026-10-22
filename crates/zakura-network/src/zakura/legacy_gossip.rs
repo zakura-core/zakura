@@ -2737,6 +2737,7 @@ impl ZakuraService for LegacyGossipSink {
         let replay_panic_outbound = outbound.clone();
         let replay_panic_cancel = cancel_token.clone();
         spawn_supervised_peer_task(
+            "legacy_gossip_replay",
             replay_task_peer_id,
             || {},
             move || {
@@ -2764,6 +2765,7 @@ impl ZakuraService for LegacyGossipSink {
         let recv_teardown_outbound = outbound.clone();
         let recv_panic_cancel = cancel_token.clone();
         spawn_supervised_peer_task(
+            "legacy_gossip_recv",
             recv_task_peer_id,
             move || {
                 recv_teardown_outbound.finish_session(

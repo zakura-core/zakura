@@ -147,7 +147,9 @@ macro_rules! atomic_int {
                 F: FnMut($int) -> Option<$int>,
             {
                 point(Op::AtomicRmw, Location::caller());
-                self.0.fetch_update(set_order, fetch_order, f)
+                // Newer std deprecates `fetch_update` for `try_update`,
+                // which behaves the same.
+                self.0.try_update(set_order, fetch_order, f)
             }
 
             /// std's `try_update`: [`fetch_update`](Self::fetch_update) by

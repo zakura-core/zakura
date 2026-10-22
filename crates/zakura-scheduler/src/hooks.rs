@@ -102,6 +102,15 @@ pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
     queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
 }
 
+/// [`spawn_boxed`], but returns `None` past the run's task limit, or outside
+/// a run, instead of panicking. The rejected task is dropped unpolled.
+#[cfg(zakura_sim)]
+pub(crate) fn try_spawn_boxed(label: &'static str, task: BoxTask) -> Option<TaskId> {
+    // Drop a rejected task outside the borrow, since its destructor can run
+    // arbitrary code.
+    with_run(|s| s.queue_spawn(label, task))?.ok()
+}
+
 /// Requests cancellation of `task` without a preemption point. See
 /// [`JoinHandle::abort`].
 pub(crate) fn request_abort(task: TaskId) {

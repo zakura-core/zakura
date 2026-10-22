@@ -54,6 +54,11 @@ pub trait Executor {
     /// one. `label` names the spawn site in task identities.
     fn spawn(&self, label: &'static str, task: BoxTask) -> TaskId;
 
+    /// Spawns `task` as [`Executor::spawn`] does, or returns `None` and drops
+    /// it unpolled when the run can't take another task. Code that spawns
+    /// from a `Drop` impl uses this, since a panic there could abort.
+    fn try_spawn(&self, label: &'static str, task: BoxTask) -> Option<TaskId>;
+
     /// Requests cancellation. The task's future is dropped at its next poll
     /// boundary, as with tokio's abort. A no-op once the task has ended.
     fn abort(&self, task: TaskId);

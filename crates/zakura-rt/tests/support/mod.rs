@@ -268,6 +268,10 @@ impl Executor for TestExecutor {
         })
     }
 
+    fn try_spawn(&self, label: &'static str, task: BoxTask) -> Option<TaskId> {
+        Some(self.spawn(label, task))
+    }
+
     fn abort(&self, task: TaskId) {
         with(|s| {
             let t = &mut s.tasks[index(task)];

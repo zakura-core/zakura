@@ -47,6 +47,10 @@ impl rt::Executor for SchedulerExecutor {
         task_to_rt(hooks::spawn_boxed(label, task))
     }
 
+    fn try_spawn(&self, label: &'static str, task: rt::BoxTask) -> Option<rt::TaskId> {
+        hooks::try_spawn_boxed(label, task).map(task_to_rt)
+    }
+
     fn abort(&self, task: rt::TaskId) {
         hooks::request_abort(task_from_rt(task));
     }

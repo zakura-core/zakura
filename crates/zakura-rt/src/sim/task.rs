@@ -32,20 +32,60 @@ where
     let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
         return JoinHandle::tokio(tokio::spawn(future));
     };
-    let site = Location::caller();
+    spawn_in_run(executor, run, Location::caller(), future, |label, task| {
+        Some(executor.spawn(label, task))
+    })
+    .expect("the infallible executor spawn always returns a task")
+}
+
+/// Spawns `future` as [`spawn`] does, or returns `None` instead of
+/// panicking when there's nowhere to run it.
+///
+/// Outside a run, that's when there's no tokio runtime. Inside a run, it's
+/// when the executor can't take another task. For code that may run without
+/// a runtime, such as a `Drop` impl.
+#[track_caller]
+pub fn try_spawn<F>(future: F) -> Option<JoinHandle<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
+        return tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|runtime| JoinHandle::tokio(runtime.spawn(future)));
+    };
+    spawn_in_run(executor, run, Location::caller(), future, |label, task| {
+        executor.try_spawn(label, task)
+    })
+}
+
+/// Hands `future` to the run's executor through `spawn_task`, after the
+/// spawn's preemption point. Returns `None` if `spawn_task` refuses it.
+fn spawn_in_run<F>(
+    executor: &'static dyn sim::Executor,
+    run: RunId,
+    site: &'static Location<'static>,
+    future: F,
+    spawn_task: impl FnOnce(&'static str, sim::BoxTask) -> Option<TaskId>,
+) -> Option<JoinHandle<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
     executor.preempt(Point::at(Op::Spawn, site));
     let output = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&output);
-    let task = executor.spawn(
+    let task = spawn_task(
         site.file(),
         Box::pin(async move {
             let value = future.await;
             *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(value);
         }),
-    );
-    JoinHandle {
+    )?;
+    Some(JoinHandle {
         inner: Inner::Sim { run, task, output },
-    }
+    })
 }
 
 /// Runs `f` on tokio's blocking pool, as `tokio::task::spawn_blocking` does.

@@ -74,10 +74,27 @@ pub mod rand;
 /// Tasks.
 #[cfg(not(zakura_sim))]
 pub mod task {
+    use std::future::Future;
+
     pub use tokio::task::{
         coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinError, JoinHandle, JoinSet,
     };
     pub use tokio_util::task::AbortOnDropHandle;
+
+    /// Spawns `future` as [`spawn`] does, or returns `None` outside a tokio
+    /// runtime instead of panicking.
+    ///
+    /// For code that may run without a runtime, such as a `Drop` impl.
+    #[track_caller]
+    pub fn try_spawn<F>(future: F) -> Option<JoinHandle<F::Output>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|runtime| runtime.spawn(future))
+    }
 }
 
 /// Time.

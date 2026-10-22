@@ -143,6 +143,23 @@ fn spawned_output_reaches_the_join_handle() {
 }
 
 #[test]
+fn try_spawn_runs_on_the_executor_inside_a_run() {
+    let (value, report) = run(async {
+        task::try_spawn(async { 5 })
+            .expect("the test executor takes every task")
+            .await
+            .unwrap()
+    });
+    assert_eq!(value, 5);
+    assert_eq!(report.points, [(Some(0), Op::Spawn)]);
+}
+
+#[test]
+fn try_spawn_outside_a_runtime_returns_none() {
+    assert!(task::try_spawn(async {}).is_none());
+}
+
+#[test]
 fn panic_payload_reaches_the_join_error() {
     let (error, _) = run(async { task::spawn(async { panic!("boom") }).await.unwrap_err() });
     assert!(error.is_panic());

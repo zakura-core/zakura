@@ -1811,11 +1811,9 @@ impl Drop for RegisteredPeerCleanupGuard {
         let supervisor = self.supervisor.clone();
         let peer_id = self.peer_id.clone();
         let conn_id = self.conn_id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _task = handle.spawn(erased(async move {
-                supervisor.deregister(&peer_id, conn_id).await;
-            }));
-        }
+        let _task = zakura_rt::task::try_spawn(erased(async move {
+            supervisor.deregister(&peer_id, conn_id).await;
+        }));
     }
 }
 

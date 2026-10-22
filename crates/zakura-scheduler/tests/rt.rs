@@ -53,6 +53,9 @@ impl sim::Executor for Unused {
     fn spawn(&self, _: &'static str, _: sim::BoxTask) -> sim::TaskId {
         unreachable!()
     }
+    fn try_spawn(&self, _: &'static str, _: sim::BoxTask) -> Option<sim::TaskId> {
+        unreachable!()
+    }
     fn abort(&self, _: sim::TaskId) {}
     fn is_finished(&self, _: sim::TaskId) -> bool {
         unreachable!()
@@ -215,6 +218,26 @@ fn join_set_tasks_join_in_finish_order() {
         Box::new(move |_| (*order.borrow() != [1, 2, 3]).then(|| format!("{:?}", order.borrow())))
     });
     assert_eq!(violation, None);
+}
+
+#[test]
+fn rt_try_spawn_past_the_task_limit_returns_none() {
+    let config = SchedulerConfig {
+        max_tasks: 2,
+        ..SchedulerConfig::default()
+    };
+    let mut s = Scheduler::new(config, SimInstant::ZERO);
+    let spawned = shared(Cell::new(None));
+    let out = spawned.clone();
+    let root = s.spawn_root("root", async move {
+        let child = task::try_spawn(async {}).is_some();
+        let past_limit = task::try_spawn(async {}).is_some();
+        out.set(Some((child, past_limit)));
+    });
+    while !root.is_finished() {
+        s.run(root.task());
+    }
+    assert_eq!(spawned.get(), Some((true, false)));
 }
 
 #[test]

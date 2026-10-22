@@ -57,12 +57,7 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 ];
 
 /// Direct runtime paths the v2 code may keep, with the reason for each.
-const ALLOWED: [(&str, &str, &str); 3] = [
-    (
-        "crates/zakura-network/src/zakura/handler.rs",
-        "tokio::runtime::Handle",
-        "runtime introspection, which the simulator build will define",
-    ),
+const ALLOWED: [(&str, &str, &str); 2] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",

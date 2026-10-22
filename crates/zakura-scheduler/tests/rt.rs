@@ -175,6 +175,32 @@ fn rt_spawn_from_setup_code_is_ready_at_once() {
     assert_eq!(result.status, Status::Quiescent);
 }
 
+#[test]
+fn sleep_reset_into_the_past_fires_at_the_next_advance() {
+    let (result, violation) = run_fixture(2, 0, |s| {
+        s.spawn_root("root", async {
+            let mut early = std::pin::pin!(time::sleep(Duration::from_secs(10)));
+            assert!(futures_poll_once(early.as_mut()).is_pending());
+            time::sleep(Duration::from_secs(20)).await;
+            // Registers a timer for 5 s while the clock reads 20 s.
+            early
+                .as_mut()
+                .reset(Instant::now() - Duration::from_secs(15));
+            time::sleep(Duration::from_secs(1)).await;
+        });
+        Box::new(|_| None)
+    });
+    assert_eq!(violation, None);
+    assert_eq!(result.status, Status::Quiescent);
+}
+
+/// Polls `future` once with a no-op waker.
+fn futures_poll_once<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
 /// Reads the virtual clock when dropped, as a destructor that logs a
 /// timestamp would.
 struct ReadsClockOnDrop(Arc<AtomicBool>);

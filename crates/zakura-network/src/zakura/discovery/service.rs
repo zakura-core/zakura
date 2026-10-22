@@ -761,7 +761,7 @@ async fn read_frame(
     sink: &DiscoverySink,
 ) -> Result<(), (ViolationStage, SinkReject)> {
     // An answer claims its query before its payload is decoded.
-    let asked = sink
+    let answer = sink
         .queries
         .claim(frame.message_type, frame.payload.len())
         .map_err(|error| (ViolationStage::Claim, SinkReject::protocol(error)))?;
@@ -771,8 +771,8 @@ async fn read_frame(
     let Some(message) = pipe.local_mut().take_decoded() else {
         return Ok(());
     };
-    if let Some(asked) = asked {
-        asked
+    if let Some(answer) = answer {
+        answer
             .check(&message)
             .map_err(|error| (ViolationStage::Answer, SinkReject::protocol(error)))?;
     }

@@ -11,6 +11,12 @@
 //! [`WriterFence`] skips a query that was never written, and closes the
 //! connection if a written query is still unanswered: no receiver remains for
 //! its answer.
+//!
+//! [`QueryState`] holds the logical side of each live query: what it asked
+//! and whether the queue accepted it. [`Queries`] applies its transitions
+//! under the one lock that also guards the reservations, so the transport
+//! precheck and the claim read one ledger. Only a claim mints an
+//! [`AdmittedAnswer`].
 
 use std::sync::Arc;
 
@@ -36,7 +42,7 @@ use crate::zakura::{
 
 /// A discovery query, keying its response's reservation.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-enum QueryKind {
+pub(super) enum QueryKind {
     Peers,
     Services,
 }
@@ -133,19 +139,138 @@ pub(super) enum QueryUnsent {
     Closed,
 }
 
-/// One session's reservations and what each live query asked. One lock
-/// guards both, so a claim reads what its own query asked.
+/// How far one live query got.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum QueryPhase {
+    /// Reserved, and not yet accepted by the queue. A failed write releases
+    /// it.
+    Unsent,
+    /// The queue accepted it. Only its answer or the session's retirement
+    /// ends it.
+    Queued,
+}
+
+/// One live query.
+#[derive(Debug)]
+struct LiveQuery {
+    asked: Asked,
+    phase: QueryPhase,
+}
+
+/// A query of this kind is already live.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct QueryLive;
+
+/// An answer that claimed its live query, exactly once.
+///
+/// Only [`QueryState::claim`] mints one, so holding one proves the claim.
+#[derive(Debug)]
+pub(super) struct AdmittedAnswer {
+    asked: Asked,
+}
+
+impl AdmittedAnswer {
+    /// The kind of query this answers.
+    pub(super) fn kind(&self) -> QueryKind {
+        self.asked.kind()
+    }
+
+    /// Checks the decoded answer against what its query asked.
+    pub(super) fn check(&self, answer: &DiscoveryMessage) -> Result<(), &'static str> {
+        self.asked.check(answer)
+    }
+}
+
+/// What each of one session's live queries asked, and how far it got.
+///
+/// A session holds at most one live query of each kind. A query is
+/// [`QueryPhase::Unsent`] from its reservation until the queue accepts it,
+/// then [`QueryPhase::Queued`]. Its answer's claim ends it in either phase,
+/// because the peer can answer before the writer learns that the queue
+/// accepted the query. Retiring the session drops every live query.
+#[derive(Debug, Default)]
+pub(super) struct QueryState {
+    live: HashMap<QueryKind, LiveQuery>,
+}
+
+impl QueryState {
+    /// Records `asked` as an unsent live query, before its first byte is
+    /// queued.
+    pub(super) fn reserve(&mut self, asked: Asked) -> Result<(), QueryLive> {
+        let kind = asked.kind();
+        if self.live.contains_key(&kind) {
+            return Err(QueryLive);
+        }
+        self.live.insert(
+            kind,
+            LiveQuery {
+                asked,
+                phase: QueryPhase::Unsent,
+            },
+        );
+        Ok(())
+    }
+
+    /// Records that the queue accepted the live `kind` query. Its answer may
+    /// have claimed it already.
+    pub(super) fn queued(&mut self, kind: QueryKind) {
+        if let Some(query) = self.live.get_mut(&kind) {
+            query.phase = QueryPhase::Queued;
+        }
+    }
+
+    /// Releases the unsent `kind` query. Returns whether one was released:
+    /// its answer may have claimed it already.
+    pub(super) fn release_unsent(&mut self, kind: QueryKind) -> bool {
+        let unsent = self
+            .live
+            .get(&kind)
+            .is_some_and(|query| query.phase == QueryPhase::Unsent);
+        if unsent {
+            self.live.remove(&kind);
+        }
+        unsent
+    }
+
+    /// Claims the live `kind` query for an answer of `payload_len` bytes.
+    /// Returns `None` if no query of `kind` is live.
+    ///
+    /// The claim ends the query even when the answer is larger than its
+    /// query allows, because that answer is a violation.
+    pub(super) fn claim(
+        &mut self,
+        kind: QueryKind,
+        payload_len: usize,
+    ) -> Option<Result<AdmittedAnswer, ClaimRefused>> {
+        let LiveQuery { asked, .. } = self.live.remove(&kind)?;
+        let cap = asked.cap().bytes;
+        // Widening usize to u64 is lossless on supported targets.
+        if payload_len as u64 > cap {
+            return Some(Err(ClaimRefused::OverBytes { bytes: cap }));
+        }
+        Some(Ok(AdmittedAnswer { asked }))
+    }
+
+    /// Live queries.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.live.len()
+    }
+}
+
+/// One session's reservations and its live queries. One lock guards both,
+/// so a claim reads what its own query asked.
 #[derive(Debug)]
 struct LiveQueries {
     reservations: Reservations<QueryKind>,
-    asked: HashMap<QueryKind, Asked>,
+    state: QueryState,
 }
 
 impl LiveQueries {
     fn new() -> Self {
         Self {
             reservations: Reservations::new(DiscoveryMessage::RULES, QUERY_KINDS.len()),
-            asked: HashMap::new(),
+            state: QueryState::default(),
         }
     }
 }
@@ -219,13 +344,20 @@ impl Queries {
         let exchange = self.fence.open().ok_or(QueryUnsent::Closed)?;
         let writer = exchange.writer();
         let entry = self.pool.try_entry().ok_or(QueryUnsent::NotDue)?;
-        let kind = asked.kind();
+        let (kind, request_type, cap) = (asked.kind(), asked.request_type(), asked.cap());
         {
-            let mut live = self.lock();
-            live.reservations
-                .reserve_fenced(kind, asked.request_type(), asked.cap(), entry, exchange)
-                .map_err(|_| QueryUnsent::NotDue)?;
-            live.asked.insert(kind, asked);
+            let live = &mut *self.lock();
+            live.state
+                .reserve(asked)
+                .map_err(|QueryLive| QueryUnsent::NotDue)?;
+            if live
+                .reservations
+                .reserve_fenced(kind, request_type, cap, entry, exchange)
+                .is_err()
+            {
+                live.state.release_unsent(kind);
+                return Err(QueryUnsent::NotDue);
+            }
         }
 
         let sent = zakura_rt::select! {
@@ -233,42 +365,38 @@ impl Queries {
             () = self.cancel.cancelled() => false,
             sent = self.send.send_fenced(frame, &writer) => sent.is_ok(),
         };
-        if !sent {
-            let mut live = self.lock();
-            live.reservations.retract(&kind);
-            live.asked.remove(&kind);
-            return Err(QueryUnsent::Closed);
+        let live = &mut *self.lock();
+        if sent {
+            live.state.queued(kind);
+            return Ok(());
         }
-        Ok(())
+        if live.state.release_unsent(kind) {
+            live.reservations.retract(&kind);
+        }
+        Err(QueryUnsent::Closed)
     }
 
     /// Claims the live query that a `message_type` frame of `payload_len`
-    /// bytes answers, before its payload is decoded. Returns what the query
-    /// asked, or `None` if the frame answers no query.
+    /// bytes answers, before its payload is decoded. Returns the admitted
+    /// answer, or `None` if the frame answers no query.
     pub(super) fn claim(
         &self,
         message_type: u16,
         payload_len: usize,
-    ) -> Result<Option<Asked>, ClaimRefused> {
+    ) -> Result<Option<AdmittedAnswer>, ClaimRefused> {
         let Some(kind) = QueryKind::answered_by(message_type) else {
             return Ok(None);
         };
-        let mut live = self.lock();
+        let live = &mut *self.lock();
         if self.transport_admits {
             live.reservations.take_admitted(message_type, payload_len);
         }
         live.reservations
             .claim_end(&kind, message_type, payload_len)?;
-        let asked = live
-            .asked
-            .remove(&kind)
-            .expect("every live reservation records what its query asked");
-        let cap = asked.cap().bytes;
-        // Widening usize to u64 is lossless on supported targets.
-        if payload_len as u64 > cap {
-            return Err(ClaimRefused::OverBytes { bytes: cap });
-        }
-        Ok(Some(asked))
+        live.state
+            .claim(kind, payload_len)
+            .expect("every live reservation records its live query")
+            .map(Some)
     }
 
     /// Ends the session's queries: an unwritten query is skipped, and an
@@ -316,6 +444,19 @@ mod tests {
     };
 
     const PEERS: u16 = MSG_DISCOVERY_PEERS as u16;
+
+    impl Queries {
+        /// Claims as [`Queries::claim`] does, and returns what the admitted
+        /// answer's query asked.
+        fn claim_asked(
+            &self,
+            message_type: u16,
+            payload_len: usize,
+        ) -> Result<Option<Asked>, ClaimRefused> {
+            self.claim(message_type, payload_len)
+                .map(|answer| answer.map(|answer| answer.asked))
+        }
+    }
 
     fn get_peers(limit: u16) -> GetPeers {
         GetPeers {
@@ -373,7 +514,7 @@ mod tests {
         } = session(&reservation_pool());
 
         assert!(matches!(
-            queries.claim(PEERS, 2),
+            queries.claim_asked(PEERS, 2),
             Err(ClaimRefused::Unsolicited { .. })
         ));
         queries
@@ -387,11 +528,11 @@ mod tests {
         written.recv().await.expect("the query was queued");
 
         assert_eq!(
-            queries.claim(PEERS, peers_len(3)),
+            queries.claim_asked(PEERS, peers_len(3)),
             Ok(Some(Asked::Peers { limit: 3 }))
         );
         assert!(matches!(
-            queries.claim(PEERS, 2),
+            queries.claim_asked(PEERS, 2),
             Err(ClaimRefused::Unsolicited { .. })
         ));
         queries
@@ -400,10 +541,10 @@ mod tests {
             .expect("an answered query frees its kind");
         written.recv().await.expect("the query was queued");
         assert!(matches!(
-            queries.claim(PEERS, peers_len(1) + 1),
+            queries.claim_asked(PEERS, peers_len(1) + 1),
             Err(ClaimRefused::OverBytes { .. })
         ));
-        assert_eq!(queries.claim(GET_PEERS.message_type, 2), Ok(None));
+        assert_eq!(queries.claim_asked(GET_PEERS.message_type, 2), Ok(None));
     }
 
     fn get_services(wanted_services: Vec<ZakuraServiceId>) -> GetServices {
@@ -431,7 +572,7 @@ mod tests {
         let wanted = get_services(vec![ZakuraServiceId::discovery()]);
 
         assert!(matches!(
-            queries.claim(SERVICES, services_len(0)),
+            queries.claim_asked(SERVICES, services_len(0)),
             Err(ClaimRefused::Unsolicited { .. })
         ));
         queries
@@ -450,15 +591,15 @@ mod tests {
         written.recv().await.expect("GetServices was queued");
 
         assert_eq!(
-            queries.claim(SERVICES, services_len(1)),
+            queries.claim_asked(SERVICES, services_len(1)),
             Ok(Some(Asked::Services(wanted.clone())))
         );
         assert!(matches!(
-            queries.claim(SERVICES, services_len(1)),
+            queries.claim_asked(SERVICES, services_len(1)),
             Err(ClaimRefused::Unsolicited { .. })
         ));
         assert_eq!(
-            queries.claim(PEERS, peers_len(1)),
+            queries.claim_asked(PEERS, peers_len(1)),
             Ok(Some(Asked::Peers { limit: 1 }))
         );
 
@@ -470,7 +611,7 @@ mod tests {
             .expect("an answered query frees its kind");
         written.recv().await.expect("GetServices was queued");
         assert!(matches!(
-            queries.claim(SERVICES, services_len(1) + 1),
+            queries.claim_asked(SERVICES, services_len(1) + 1),
             Err(ClaimRefused::OverBytes { .. })
         ));
 
@@ -481,7 +622,7 @@ mod tests {
             .expect("an answered query frees its kind");
         written.recv().await.expect("GetServices was queued");
         assert_eq!(
-            queries.claim(SERVICES, services_len(0)),
+            queries.claim_asked(SERVICES, services_len(0)),
             Ok(Some(Asked::Services(get_services(Vec::new()))))
         );
     }
@@ -601,7 +742,7 @@ mod tests {
             Err(FrameRejection::AboveOwed { .. })
         ));
         assert_eq!(
-            queries.claim(PEERS, peers_len(1)),
+            queries.claim_asked(PEERS, peers_len(1)),
             Ok(Some(Asked::Peers { limit: 1 }))
         );
         assert_eq!(
@@ -635,7 +776,7 @@ mod tests {
             Err(QueryUnsent::Closed)
         ));
         assert_eq!(pool.held(), 0);
-        assert!(queries.lock().asked.is_empty());
+        assert_eq!(queries.lock().state.len(), 0);
 
         let Session {
             queries, written, ..
@@ -646,7 +787,7 @@ mod tests {
             Err(QueryUnsent::Closed)
         ));
         assert_eq!(pool.held(), 0);
-        assert!(queries.lock().asked.is_empty());
+        assert_eq!(queries.lock().state.len(), 0);
     }
 
     /// A full node-wide pool defers the query to the next exchange.
@@ -721,5 +862,164 @@ mod tests {
         assert!(connection.is_cancelled());
         assert_eq!(close_cause.get_or("none"), UNFINISHED_EXCHANGE);
         assert_eq!(pool.held(), 0, "retiring returns every reservation");
+    }
+
+    /// One step of a live-query operation sequence.
+    #[derive(Clone, Debug)]
+    enum QueryOp {
+        /// Reserve a query of `kind`, sized by `size`.
+        Reserve {
+            kind: QueryKind,
+            size: usize,
+        },
+        Queued(QueryKind),
+        ReleaseUnsent(QueryKind),
+        /// Claim `kind` with an answer `excess` bytes above its query's cap,
+        /// or empty when `excess` is `None`.
+        Claim {
+            kind: QueryKind,
+            excess: Option<u64>,
+        },
+    }
+
+    fn query_kind() -> impl proptest::strategy::Strategy<Value = QueryKind> {
+        proptest::sample::select(QUERY_KINDS.to_vec())
+    }
+
+    fn query_op() -> impl proptest::strategy::Strategy<Value = QueryOp> {
+        use proptest::prelude::*;
+        prop_oneof![
+            3 => (query_kind(), 0usize..4).prop_map(|(kind, size)| QueryOp::Reserve { kind, size }),
+            2 => query_kind().prop_map(QueryOp::Queued),
+            1 => query_kind().prop_map(QueryOp::ReleaseUnsent),
+            3 => (query_kind(), proptest::option::of(0u64..2))
+                .prop_map(|(kind, excess)| QueryOp::Claim { kind, excess }),
+        ]
+    }
+
+    /// The query a `Reserve` step asks. `size` is a `GetPeers` limit or the
+    /// length of a `GetServices` wanted list.
+    fn asked_for(kind: QueryKind, size: usize) -> Asked {
+        let wanted = [
+            ZakuraServiceId::discovery(),
+            ZakuraServiceId::header_sync(),
+            ZakuraServiceId::block_sync(),
+        ];
+        match kind {
+            QueryKind::Peers => Asked::Peers {
+                limit: u16::try_from(size).expect("test sizes are small"),
+            },
+            QueryKind::Services => Asked::Services(get_services(wanted[..size.min(3)].to_vec())),
+        }
+    }
+
+    /// The model's view of one live query.
+    #[derive(Clone, Debug)]
+    struct QueryModel {
+        asked: Asked,
+        queued: bool,
+        /// Distinguishes this reservation from earlier ones of its kind.
+        reservation: usize,
+    }
+
+    /// The largest answer the model allows for `asked`, restated from the
+    /// wire caps.
+    fn model_cap(asked: &Asked) -> u64 {
+        match asked {
+            Asked::Peers { limit } => peers_cap(*limit).bytes,
+            Asked::Services(query) => services_cap(query.wanted_services.len()).bytes,
+        }
+    }
+
+    proptest::proptest! {
+        /// After every step the live queries match an independent model: one
+        /// live query of each kind, a failed write releases only an unsent
+        /// query, and each reservation admits at most one answer, which
+        /// carries what its own query asked.
+        #[test]
+        fn live_queries_match_independent_model(
+            ops in proptest::collection::vec(query_op(), 1..96),
+        ) {
+            let mut state = QueryState::default();
+            let mut model: std::collections::HashMap<QueryKind, QueryModel> =
+                std::collections::HashMap::new();
+            let mut reservations = 0usize;
+            let mut admitted = std::collections::HashSet::new();
+            for op in ops {
+                match op {
+                    QueryOp::Reserve { kind, size } => {
+                        let asked = asked_for(kind, size);
+                        let expected = if model.contains_key(&kind) {
+                            Err(QueryLive)
+                        } else {
+                            reservations += 1;
+                            model.insert(kind, QueryModel {
+                                asked: asked.clone(),
+                                queued: false,
+                                reservation: reservations,
+                            });
+                            Ok(())
+                        };
+                        proptest::prop_assert_eq!(state.reserve(asked), expected);
+                    }
+                    QueryOp::Queued(kind) => {
+                        state.queued(kind);
+                        if let Some(query) = model.get_mut(&kind) {
+                            query.queued = true;
+                        }
+                    }
+                    QueryOp::ReleaseUnsent(kind) => {
+                        let expected = model.get(&kind).is_some_and(|query| !query.queued);
+                        if expected {
+                            model.remove(&kind);
+                        }
+                        proptest::prop_assert_eq!(state.release_unsent(kind), expected);
+                    }
+                    QueryOp::Claim { kind, excess } => {
+                        let expected = model.remove(&kind);
+                        let payload_len = match (&expected, excess) {
+                            (Some(query), Some(excess)) => model_cap(&query.asked) + excess,
+                            _ => 0,
+                        };
+                        let claimed = state.claim(
+                            kind,
+                            usize::try_from(payload_len).expect("test caps fit usize"),
+                        );
+                        match (expected, claimed) {
+                            (None, None) => {}
+                            (Some(query), Some(Ok(answer))) => {
+                                proptest::prop_assert!(payload_len <= model_cap(&query.asked));
+                                proptest::prop_assert_eq!(answer.kind(), kind);
+                                proptest::prop_assert_eq!(&answer.asked, &query.asked);
+                                proptest::prop_assert!(
+                                    admitted.insert(query.reservation),
+                                    "a reservation admits at most one answer"
+                                );
+                            }
+                            (Some(query), Some(Err(refused))) => {
+                                let cap = model_cap(&query.asked);
+                                proptest::prop_assert!(payload_len > cap);
+                                proptest::prop_assert_eq!(
+                                    refused,
+                                    ClaimRefused::OverBytes { bytes: cap }
+                                );
+                            }
+                            (expected, claimed) => proptest::prop_assert!(
+                                false,
+                                "model {expected:?} disagrees with claim {claimed:?}"
+                            ),
+                        }
+                    }
+                }
+
+                proptest::prop_assert_eq!(state.len(), model.len());
+                proptest::prop_assert!(state.len() <= QUERY_KINDS.len());
+                for (kind, query) in &model {
+                    let live = state.live.get(kind).expect("the model's live query is live");
+                    proptest::prop_assert_eq!(&live.asked, &query.asked);
+                    proptest::prop_assert_eq!(live.phase == QueryPhase::Queued, query.queued);
+                }
+            }
+        }
     }
 }

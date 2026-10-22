@@ -740,7 +740,7 @@ impl Harness {
 
     fn assert_coherent(&mut self) {
         let runtime = self.runtime();
-        let plan = audit_store(&runtime.store, &self.config, &SystemClock)
+        let plan = audit_store(&runtime.store, &self.config)
             .expect("the production exhaustive audit accepts every writer state");
         assert!(
             plan.is_clean(),

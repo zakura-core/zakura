@@ -300,7 +300,7 @@ pub(super) fn crash_fixture_migrated_pin_refutation_fails_closed_at_every_reacha
             .expect("the migrated finality record encodes");
         db.write(migration_batch)
             .expect("the migrated finality record commits");
-        audit_store(&store, &headers_only_config, &SystemClock)
+        audit_store(&store, &headers_only_config)
             .expect("the headers-only source store is coherent");
         let (runtime, _) = store
             .migrate_headers_only_to_integrated(&integrated_config, anchor_frontier)

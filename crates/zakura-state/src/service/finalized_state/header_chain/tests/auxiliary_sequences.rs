@@ -190,11 +190,9 @@ impl Sequence {
                     .count()
             );
         }
-        assert!(
-            audit_store(&self.runtime().store, &self.config, &SystemClock)
-                .unwrap()
-                .is_clean()
-        );
+        assert!(audit_store(&self.runtime().store, &self.config)
+            .unwrap()
+            .is_clean());
     }
 
     fn grow(&mut self, fork: bool) {

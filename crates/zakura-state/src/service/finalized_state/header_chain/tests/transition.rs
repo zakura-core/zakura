@@ -184,7 +184,7 @@ fn migrated_headers_only_pin_refutation_is_durable_and_fail_closed() {
         )
         .expect("the finality record encodes");
     db.write(batch).expect("the headers-only record commits");
-    audit_store(&store, &headers_only_config, &SystemClock).expect("the source store is coherent");
+    audit_store(&store, &headers_only_config).expect("the source store is coherent");
     assert!(matches!(
         preserve_headers_only_pin(FinalityRecord {
             previous: anchor_frontier,

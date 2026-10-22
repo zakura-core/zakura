@@ -380,7 +380,7 @@ def parse_commit_trace(trace_path, min_height=None):
     blocks and `headers` lists `(elapsed_ms, range_count)` per committed range.
     """
     with trace.locked_directory(Path(trace_path).parent):
-        rows = list(trace.read_segment(trace_path, "commit_state", trace.Budget()))
+        rows = list(trace.read_segment(trace_path, "commit_state"))
     return parse_commit_rows(rows, min_height)
 
 
@@ -434,13 +434,12 @@ def trace_segments(trace_dir, filename):
 
 
 def parse_trace_segments(paths, min_height=None):
-    """Analyze the latest process in a consistent, bounded CSV snapshot."""
+    """Analyze the latest process in a consistent CSV snapshot."""
     if not paths:
         return parse_commit_rows([], min_height)
-    budget = trace.Budget()
     with trace.locked_directory(Path(paths[0]).parent):
         # Rediscover under the lock because rotation can rename the input paths.
-        rows = list(trace.read_table(Path(paths[0]).parent / "commit_state.csv", budget))
+        rows = list(trace.read_table(Path(paths[0]).parent / "commit_state.csv"))
     return parse_commit_rows(rows, min_height)
 
 

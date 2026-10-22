@@ -1,29 +1,11 @@
 //! Shared value validation for CSV readers.
 
-use std::{collections::HashSet, fmt, io, sync::OnceLock};
+use std::{collections::HashSet, io, sync::OnceLock};
 
-use serde::{
-    de::{self, MapAccess, SeqAccess, Visitor},
-    Deserialize, Deserializer,
-};
 use serde_json::{Map, Value};
 
 /// Shared valid and invalid CSV cases for independent readers.
 pub const CSV_READER_FIXTURES: &str = include_str!("../tests/fixtures/csv.json");
-
-/// Maximum bytes accepted from one imported capture.
-pub const MAX_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
-/// Maximum records retained from one imported capture.
-pub const MAX_CAPTURE_ROWS: usize = 500_000;
-/// Maximum files accepted from one imported capture.
-pub const MAX_CAPTURE_FILES: usize = 256;
-/// Maximum bytes in a decoded CSV record.
-pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
-/// Maximum bytes in a decoded CSV field.
-///
-/// Legacy sync stall snapshots store up to one checkpoint concurrency limit of
-/// in-flight tasks in one JSON field, so a field may use a whole record.
-pub const MAX_FIELD_BYTES: usize = MAX_RECORD_BYTES;
 
 /// Return the checked producer schema.
 pub fn schema() -> &'static Value {
@@ -33,88 +15,9 @@ pub fn schema() -> &'static Value {
     })
 }
 
-/// Decode JSON without accepting duplicate object keys.
+/// Decode one JSON-typed CSV field.
 pub fn json(text: &str) -> io::Result<Value> {
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut escaped = false;
-    for byte in text.bytes() {
-        if escaped {
-            escaped = false;
-        } else if quoted && byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted {
-            if byte == b'[' || byte == b'{' {
-                depth += 1;
-                if depth > 64 {
-                    return Err(invalid("JSON nesting budget exceeded"));
-                }
-            } else if byte == b']' || byte == b'}' {
-                depth = depth.saturating_sub(1);
-            }
-        }
-    }
-    serde_json::from_str::<UniqueValue>(text)
-        .map(|value| value.0)
-        .map_err(|_| invalid("invalid or ambiguous JSON field"))
-}
-
-struct UniqueValue(Value);
-
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueVisitor;
-        impl<'de> Visitor<'de> for UniqueVisitor {
-            type Value = UniqueValue;
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("JSON with unique object keys")
-            }
-            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(UniqueValue(value.into()))
-            }
-            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(value.into()))
-            }
-            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(UniqueValue(value.into()))
-            }
-            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(|number| UniqueValue(Value::Number(number)))
-                    .ok_or_else(|| E::custom("nonfinite JSON number"))
-            }
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(UniqueValue(value.into()))
-            }
-            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueValue(Value::Null))
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut sequence: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(UniqueValue(value)) = sequence.next_element()? {
-                    values.push(value);
-                }
-                Ok(UniqueValue(Value::Array(values)))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut object: A) -> Result<Self::Value, A::Error> {
-                let mut values = Map::new();
-                while let Some((key, UniqueValue(value))) =
-                    object.next_entry::<String, UniqueValue>()?
-                {
-                    if values.insert(key, value).is_some() {
-                        return Err(de::Error::custom("duplicate JSON key"));
-                    }
-                }
-                Ok(UniqueValue(Value::Object(values)))
-            }
-        }
-        deserializer.deserialize_any(UniqueVisitor)
-    }
+    serde_json::from_str(text).map_err(|_| invalid("invalid JSON field"))
 }
 
 /// Validate envelope and declared value types before consumers inspect a row.

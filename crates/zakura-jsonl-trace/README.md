@@ -65,19 +65,15 @@ counters from the latest record of either kind.
 The invariant checks and flush guard share one commit matcher.
 It consumes each finish once and scopes identities by process and source.
 
-Python import tools require POSIX file descriptors. Readers reject symlinked or
-special trace files; the operator-supplied directory may sit below symlinks. The
-writer uses no-follow regular-file opens and bounded locks. A reader holds the
+Only our own nodes write trace files and only our own tools read them, so
+readers trust their input files. A reader holds the
 directory lock only while it opens descriptors, then parses after releasing it,
-so a slow reader never stalls the node's writer. The Rust test reader consumes
-captures after writers stop. Imported captures have limits
-of 256 MiB, 500,000 rows, and 256 files. Records and fields are limited to 1 MiB,
-and embedded JSON to 64 nesting levels. Budget failures prevent validation.
+so a slow reader never stalls the node's writer. The writer gives up on a busy
+lock after two seconds. The Rust test reader consumes captures after writers stop.
 The invariant checker caches diagnostics and limits reported failures. The benchmark digest
 uses only the latest process generation for its monotonic latency series.
 
-Production directories can exceed the import limits; copy the segments of interest
-into a separate directory for analysis. Without complete writer status,
+Without complete writer status,
 the invariant checker reports INCOMPLETE even when the available checks pass. Row-count
 cursors require unrotated captures. Preserve `capture-*.json` files when sharing a
 validation capture; CSV files alone cannot establish completeness.

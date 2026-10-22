@@ -314,10 +314,10 @@ def decode_error(node: str, table: str, error: Exception) -> TraceRow:
     return TraceRow(node, table, 0, {"event": "csv_decode_error", "error": str(error)[:200]})
 
 
-def read_csv_segment(path: Path, node: str, table: str, budget: trace.Budget | None = None) -> list[TraceRow]:
+def read_csv_segment(path: Path, node: str, table: str) -> list[TraceRow]:
     try:
         return [TraceRow(node, table, index, value)
-                for index, value in enumerate(trace.read_segment(path, table, budget or trace.Budget()), 1)]
+                for index, value in enumerate(trace.read_segment(path, table), 1)]
     except (ValueError, OSError) as error:
         return [decode_error(node, table, error)]
 
@@ -326,10 +326,10 @@ def csv_segments(path: Path) -> list[Path]:
     return trace.segments(path)
 
 
-def read_csv(path: Path, node: str, table: str, budget: trace.Budget | None = None) -> list[TraceRow]:
+def read_csv(path: Path, node: str, table: str) -> list[TraceRow]:
     try:
         return [TraceRow(node, table, index, value)
-                for index, value in enumerate(trace.read_table(path, budget), 1)]
+                for index, value in enumerate(trace.read_table(path), 1)]
     except (ValueError, OSError) as error:
         return [decode_error(node, table, error)]
 
@@ -338,8 +338,8 @@ def has_traces(path: Path) -> bool:
     return any(csv_segments(path / name) for name in trace_files())
 
 
-def capture_error(path: Path, tables: dict[str, list[TraceRow]], run_id: str, budget: trace.Budget) -> str | None:
-    statuses = [trace.read_status(item, budget) for item in trace.entries(path)
+def capture_error(path: Path, tables: dict[str, list[TraceRow]], run_id: str) -> str | None:
+    statuses = [trace.read_status(item) for item in trace.entries(path)
                 if item.name.startswith("capture-") and item.suffix == ".json"]
     if not statuses:
         return "capture writer status is missing"
@@ -371,22 +371,19 @@ def capture_error(path: Path, tables: dict[str, list[TraceRow]], run_id: str, bu
 
 def load_traces(root: Path, run_id: str | None = None) -> list[NodeTrace]:
     nodes: list[NodeTrace] = []
-    budget = trace.Budget()
-    node_dirs = [path for path in trace.entries(root, budget) if path.name.startswith("node") and (path.is_dir() or path.is_symlink())]
+    node_dirs = [path for path in trace.entries(root) if path.name.startswith("node") and path.is_dir()]
     if not node_dirs and has_traces(root):
         node_dirs = [root]
     for node_dir in node_dirs:
-        if node_dir.is_symlink():
-            raise trace.TraceInputError("node directory must not be a symlink")
         candidates = [node_dir]
-        candidates += [child for child in trace.entries(node_dir, budget)
+        candidates += [child for child in trace.entries(node_dir)
                        if child.is_dir() and has_traces(child)]
         for trace_dir in candidates:
             node = node_dir.name if trace_dir == node_dir else f"{node_dir.name}/{trace_dir.name}"
             with trace.locked_directory(trace_dir):
-                tables = {table: read_csv(trace_dir / f"{table}.csv", node, table, budget)
+                tables = {table: read_csv(trace_dir / f"{table}.csv", node, table)
                           for table in CSV_SCHEMAS}
-                error = capture_error(trace_dir, tables, run_id, budget) if run_id else None
+                error = capture_error(trace_dir, tables, run_id) if run_id else None
                 if any(tables.values()) or has_traces(trace_dir):
                     nodes.append(NodeTrace(node, tables, error))
     return nodes
@@ -1995,7 +1992,7 @@ def run_self_test() -> None:
             ]
 
         assert not json_rejection("valid_json", '{"label":1}')
-        assert any("ambiguous JSON" in error for error in json_rejection("duplicate_json", '{"label":1,"label":2}'))
+        assert json_rejection("invalid_json", '{"label":')
 
         invalid_key = root / "invalid_key" / "node1"
         write_csv(
@@ -2005,11 +2002,6 @@ def run_self_test() -> None:
         assert any(
             f.invariant == "trace_csv_is_valid"
             for f in check_sync_invariants(root / "invalid_key")
-        )
-
-        assert any(
-            "JSON nesting budget exceeded" in error
-            for error in json_rejection("nested_json", '{"label":' + "[" * 20_000 + "]" * 20_000 + "}")
         )
 
         extra_collision = root / "extra_collision" / "node1"
@@ -2132,13 +2124,11 @@ def main(argv: list[str]) -> int:
                 for path in trace.entries(directory):
                     if not path.name.startswith("capture-") or path.suffix != ".json":
                         continue
-                    status = trace.read_status(path, trace.Budget())
+                    status = trace.read_status(path)
                     process = status.get("process_trace_id", "")
-                    if status.get("run_id") != args.seal_capture or not process or not all(c.isascii() and (c.isalnum() or c in "-_") for c in process):
+                    if status.get("run_id") != args.seal_capture or not process:
                         raise trace.TraceInputError("cannot seal a foreign or invalid capture")
-                    marker = directory / f".seal-{process}"
-                    if not marker.exists():
-                        marker.touch(exist_ok=False)
+                    (directory / f".seal-{process}").touch()
                     found = True
         return 0 if found else 1
 

@@ -2,9 +2,9 @@
 
 pub mod decode;
 mod encode;
-pub mod files;
+mod files;
 
-use files::{open_entry, TraceLock};
+use files::TraceLock;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -974,7 +974,7 @@ impl TableWriter {
     /// another writer or an external rotator renamed it.
     fn current_file(&mut self) -> io::Result<&mut File> {
         let path = self.trace_dir.join(self.file_name);
-        let replaced = match (&self.current, fs::symlink_metadata(&path)) {
+        let replaced = match (&self.current, fs::metadata(&path)) {
             (Some(current), Ok(metadata)) => {
                 current.identity.is_none() || current.identity != file_identity(&metadata)
             }
@@ -1002,10 +1002,11 @@ impl TableWriter {
     /// After a valid header, a trailing partial row from a crash is removed so
     /// the next row starts on its own line.
     fn open_current(&mut self, path: &Path) -> io::Result<File> {
-        let mut file = open_entry(
-            path,
-            OpenOptions::new().create(true).read(true).append(true),
-        )?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
         let length = file.metadata()?.len();
         if length == 0 {
             file.write_all(&self.header_line)?;
@@ -1024,7 +1025,7 @@ impl TableWriter {
     fn validate_retained_segments(&self) -> io::Result<()> {
         for index in 1..=self.rotation_segments {
             let path = self.segment_path(index);
-            let mut file = match open_entry(&path, OpenOptions::new().read(true)) {
+            let mut file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
@@ -1239,10 +1240,7 @@ impl TraceWriter {
         if let Err(error) = tokio::task::spawn_blocking(move || -> io::Result<()> {
             let temporary = path.with_extension("pending");
             // Truncation lets a later publish replace one that failed midway.
-            let file = open_entry(
-                &temporary,
-                OpenOptions::new().create(true).truncate(true).write(true),
-            )?;
+            let file = File::create(&temporary)?;
             let mut file = io::BufWriter::new(file);
             serde_json::to_writer(&mut file, &status)?;
             file.into_inner()
@@ -1265,9 +1263,8 @@ impl TraceWriter {
         }
         let path = self.trace_dir.join(format!(".seal-{}", process_trace_id()));
         matches!(
-            tokio::task::spawn_blocking(move || open_entry(&path, OpenOptions::new().read(true)))
-                .await,
-            Ok(Ok(_))
+            tokio::task::spawn_blocking(move || path.exists()).await,
+            Ok(true)
         )
     }
 
@@ -2380,28 +2377,6 @@ mod tests {
         assert_eq!(status["failed_tables"], serde_json::json!([]));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn writer_rejects_symlinked_current_retained_and_lock_entries() {
-        use std::os::unix::fs::symlink;
-        for name in ["csv.csv", "csv.csv.1", ".trace.lock"] {
-            let dir = tempfile::tempdir().expect("temporary trace directory");
-            let target = dir.path().join("outside");
-            fs::write(&target, "").expect("fixture target is writable");
-            symlink(&target, dir.path().join(name)).expect("fixture symlink");
-            let mut writer = TableWriter::new(
-                dir.path().to_owned(),
-                "csv.csv",
-                &["event"],
-                &JsonlTraceConfig::default(),
-            );
-            assert!(
-                append_locked(&mut writer, &[b"row".to_vec()]).is_err(),
-                "{name}"
-            );
-            assert_eq!(fs::read(&target).expect("target is readable"), b"");
-        }
-    }
     #[tokio::test]
     async fn requested_seal_drains_rows_and_stops_recording() {
         let dir = tempfile::tempdir().expect("temporary capture directory");
@@ -2451,23 +2426,5 @@ mod tests {
         assert_eq!(status["dropped"], 0);
         assert_eq!(status["tables"]["csv"], 1);
         guard.shutdown().await;
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn writer_rejects_fifo_without_waiting_for_a_peer() {
-        let dir = tempfile::tempdir().expect("temporary trace directory");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(dir.path().join("csv.csv"))
-            .status()
-            .expect("POSIX mkfifo is installed")
-            .success());
-        let mut writer = TableWriter::new(
-            dir.path().to_owned(),
-            "csv.csv",
-            &["event"],
-            &JsonlTraceConfig::default(),
-        );
-        assert!(append_locked(&mut writer, &[b"row".to_vec()]).is_err());
     }
 }

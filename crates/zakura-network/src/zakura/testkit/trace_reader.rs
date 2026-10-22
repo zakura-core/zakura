@@ -3,20 +3,16 @@
 use std::{
     collections::HashSet,
     fs, io,
-    io::Read,
     path::{Path, PathBuf},
 };
 
 use serde_json::Value;
-use zakura_jsonl_trace::{decode, files::open_regular, ENVELOPE_COLUMNS, EXTRA_COLUMN};
+use zakura_jsonl_trace::{decode, ENVELOPE_COLUMNS, EXTRA_COLUMN};
 
 /// Loaded Zakura trace tables.
 #[derive(Clone, Debug, Default)]
 pub struct TraceReader {
     rows: Vec<TraceRow>,
-    input_bytes: u64,
-    input_files: usize,
-    input_entries: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -57,22 +53,10 @@ impl TraceReader {
             return Ok(reader);
         }
 
-        if fs::symlink_metadata(path)?.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trace directory must not be a symlink",
-            ));
-        }
         reader.load_dir(path, None)?;
-        let mut dirs = directory_entries(path, &mut reader.input_entries)?;
+        let mut dirs = directory_entries(path)?;
         dirs.sort_by_key(|entry| entry.path());
         for entry in dirs {
-            if entry.file_type()?.is_symlink() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "trace directory entry must not be a symlink",
-                ));
-            }
             if entry.file_type()?.is_dir() {
                 let source_node = source_node_from_dir(&entry.path());
                 reader.load_dir(&entry.path(), source_node)?;
@@ -106,19 +90,13 @@ impl TraceReader {
     }
 
     fn load_dir(&mut self, path: &Path, source_node: Option<String>) -> io::Result<()> {
-        let mut files = directory_entries(path, &mut self.input_entries)?;
+        let mut files = directory_entries(path)?;
         files.sort_by_key(|entry| trace_segment(&entry.path()));
 
         for entry in files {
             let path = entry.path();
             if trace_segment(&path).is_none() {
                 continue;
-            }
-            if !entry.file_type()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "trace entry must be a regular file",
-                ));
             }
 
             self.load_file(path, source_node.clone())?;
@@ -130,34 +108,11 @@ impl TraceReader {
     fn load_file(&mut self, path: PathBuf, source_node: Option<String>) -> io::Result<()> {
         let (table, _) = trace_segment(&path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?;
-        let file = open_regular(&path, fs::OpenOptions::new().read(true))?;
-        let size = file.metadata()?.len();
-        self.input_bytes = self.input_bytes.saturating_add(size);
-        self.input_files += 1;
-        if self.input_bytes > decode::MAX_CAPTURE_BYTES
-            || self.input_files > decode::MAX_CAPTURE_FILES
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trace byte/file budget exceeded",
-            ));
-        }
-        let mut reader = csv::Reader::from_reader(file.take(size));
+        let mut reader = csv::Reader::from_path(&path)?;
         let headers = reader.headers()?.clone();
         let header_columns = validate_csv_headers(&table, &headers)?;
         for record in reader.records() {
             let record = record?;
-            if self.rows.len() >= decode::MAX_CAPTURE_ROWS
-                || record.as_slice().len() > decode::MAX_RECORD_BYTES
-                || record
-                    .iter()
-                    .any(|field| field.len() > decode::MAX_FIELD_BYTES)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "trace row/field budget exceeded",
-                ));
-            }
             let mut row = serde_json::Map::new();
             let mut extra = None;
             for (column, value) in headers.iter().zip(record.iter()) {
@@ -217,18 +172,8 @@ impl TraceReader {
     }
 }
 
-fn directory_entries(path: &Path, visited: &mut usize) -> io::Result<Vec<fs::DirEntry>> {
-    let entries = fs::read_dir(path)?
-        .take(1025)
-        .collect::<Result<Vec<_>, _>>()?;
-    *visited = visited.saturating_add(entries.len());
-    if entries.len() > 1024 || *visited > 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trace directory entry budget exceeded",
-        ));
-    }
-    Ok(entries)
+fn directory_entries(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    fs::read_dir(path)?.collect()
 }
 
 fn trace_schema() -> &'static Value {

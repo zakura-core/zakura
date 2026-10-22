@@ -3226,7 +3226,6 @@ version = "2.0.0"
 dependencies = [
  "chrono",
  "csv",
- "libc",
  "serde",
  "serde_json",
  "tempfile",

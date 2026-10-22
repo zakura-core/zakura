@@ -135,31 +135,6 @@ wait_for_block_sync_reset node1 162 1 1
             with self.assertRaises(trace.TraceInputError):
                 list(trace.read_table(path))
 
-    def test_special_files_and_symlinks_fail_without_opening_targets(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            path = root / "commit_state.csv"
-            outside = root / "outside"
-            outside.write_text("private fixture")
-            path.symlink_to(outside)
-            with self.assertRaises(trace.TraceInputError):
-                list(trace.read_table(path))
-            path.unlink()
-            for target in (path, root / "commit_state.csv.1"):
-                os.mkfifo(target)
-                with self.assertRaises(trace.TraceInputError):
-                    list(trace.read_table(path))
-                target.unlink()
-
-    def test_limits_cover_the_entire_capture(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "commit_state.csv"
-            invariants.write_csv(path, [dict(event="sample"), dict(event="sample")])
-            for budget in (trace.Budget(bytes_left=1), trace.Budget(rows_left=1), trace.Budget(files_left=0),
-                           trace.Budget(values_left=3)):
-                with self.assertRaises(trace.TraceInputError):
-                    list(trace.read_table(path, budget))
-
     def test_diagnostics_are_cached_and_failure_count_is_bounded(self):
         node = invariants.NodeTrace("node1", {"commit_state": [
             invariants.TraceRow("node1", "commit_state", index, dict(event=invariants.COMMIT_START, apply_token=index))
@@ -180,10 +155,6 @@ wait_for_block_sync_reset node1 162 1 1
             self.assertEqual([item["event"] for item in trace.read_table(path)],
                              ["oldest", "older", "current"])
 
-            budget = trace.Budget(bytes_left=path.with_name("block_sync.csv.2.gz").stat().st_size + 1)
-            with self.assertRaises(trace.TraceInputError):
-                list(trace.read_table(path, budget))
-
             path.with_name("block_sync.csv.1.gz").write_bytes(b"not gzip")
             with self.assertRaises(trace.TraceInputError):
                 list(trace.read_table(path))
@@ -201,18 +172,6 @@ wait_for_block_sync_reset node1 162 1 1
                     with path.open("a") as appended:
                         appended.write("partial,row")
                 self.assertEqual([row["event"] for row in trace.read_table(path)], ["before"])
-
-    def test_symlinked_ancestor_directories_are_readable(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            real = Path(temporary) / "real"
-            invariants.write_csv(real / "traces" / "block_sync.csv", [dict(event="linked")])
-            (Path(temporary) / "link").symlink_to(real)
-            path = Path(temporary) / "link" / "traces" / "block_sync.csv"
-            with trace.locked_directory(path.parent):
-                self.assertEqual([row["event"] for row in trace.read_table(path)], ["linked"])
-            (real / "traces" / "commit_state.csv").symlink_to(path)
-            with self.assertRaises(trace.TraceInputError):
-                list(trace.read_table(real / "traces" / "commit_state.csv"))
 
     def test_row_count_cursor_rejects_rotated_capture(self):
         with tempfile.TemporaryDirectory() as temporary:

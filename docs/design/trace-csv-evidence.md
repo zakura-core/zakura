@@ -31,13 +31,18 @@ defines required fields for events consumed by the checks.
 | --- | --- |
 | F-273501 | Versioned process-wide clock; process-scoped invariant evaluation. |
 | F-273502, F-273541 | Explicit commit and sync evidence requirements; sealed writer counts. |
-| F-273519, F-273520, F-273549 | Bounded JSON decoding, typed envelopes, and required event fields. JSONL input was removed earlier in this PR. |
+| F-273519, F-273520, F-273549 | Typed envelopes and required event fields. JSONL input was removed earlier in this PR. |
 | F-273524 | Preserve machine identities; document text-only spreadsheet import. |
-| F-273530 | Inspect nested candidates even when root files exist; bound discovery. |
+| F-273530 | Inspect nested candidates even when root files exist. |
 | F-273534 | Fresh run directory, expected run ID, and sealed process acknowledgements. |
-| F-273535, F-273536, F-273548 | No-follow regular-file access, snapshot locks, bounded lock acquisition, and guarded-shutdown timeout. |
-| F-273540, F-273545 | Capture-wide input limits (including decoded JSON values), cached diagnostics, bounded diagnostic rows, capped failure reports, and indexed header-recovery and handoff searches. |
-| F-273542, F-273544 | Shared Python decoder and cross-language fixtures for duplicate keys, schema headers, and extra-field collisions. |
+| F-273535, F-273536, F-273548 | Snapshot locks, bounded lock acquisition, and guarded-shutdown timeout. |
+| F-273540, F-273545 | Cached diagnostics, bounded diagnostic rows, capped failure reports, and indexed header-recovery and handoff searches. |
+| F-273542, F-273544 | Shared Python decoder and cross-language fixtures for schema headers and extra-field collisions. |
+
+Only our own nodes write trace files, and only our own tools read them. The
+readers therefore do not defend against hostile files: they follow symlinks and
+apply no input size limits. Findings that assumed untrusted captures are
+addressed only where they also affect correctness.
 | F-273546 | One parsed, process-scoped commit matcher for both validation and flush checks. |
 
 The Docker verification also exposed a configuration conflict: the node's generic
@@ -55,16 +60,15 @@ without inventing values for omitted fields.
 Readers hold the directory lock only while they open descriptors, so they never
 observe an append or rotation halfway through and never stall the writer. The Rust test reader runs after its writers stop.
 Row-count cursors reject rotated input. Complete validation captures never rotate.
-Production captures without completeness evidence support partial analysis
-within the import limits, but cannot produce a complete invariant PASS.
+Production captures without completeness evidence support partial analysis,
+but cannot produce a complete invariant PASS.
 
-The [trace README](../../crates/zakura-jsonl-trace/README.md) documents the commands,
-limits, platform requirements, and shutdown behavior. A timeout does not cancel an
-operating-system filesystem call that has already started. The file-type checks
-exclude FIFO/device blocking, while failing storage remains an operational limit.
+The [trace README](../../crates/zakura-jsonl-trace/README.md) documents the commands
+and shutdown behavior. A timeout does not cancel an operating-system filesystem
+call that has already started.
 
 Regression tests cover commit-matcher agreement, process-isolated activity,
 required coverage, sealed counts, dropped records, stale runs, malformed fields,
-symlinks/FIFOs, import budgets, cached diagnostics, and retention-unsafe cursors.
+cached diagnostics, and retention-unsafe cursors.
 Rust and Python consume the same valid/invalid CSV fixtures. The node config tests
 cover runtime environment variables alongside normal TOML environment overrides.

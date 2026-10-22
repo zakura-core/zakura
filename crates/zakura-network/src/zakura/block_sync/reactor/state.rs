@@ -1181,14 +1181,14 @@ impl StatusSchedule {
     ///
     /// `peers` lists the live sessions in send order, each with whether the
     /// peer has supplied its own status.
-    pub(super) fn due(
+    pub(super) fn due<'a>(
         &self,
         status: BlockSyncStatus,
-        peers: &[(ZakuraPeerId, bool)],
+        peers: impl IntoIterator<Item = (&'a ZakuraPeerId, bool)>,
         now: Instant,
     ) -> Vec<ZakuraPeerId> {
         peers
-            .iter()
+            .into_iter()
             .filter(|(peer, received_status)| {
                 self.next_deadline(peer, status, *received_status)
                     .is_some_and(|deadline| deadline <= now)
@@ -1201,12 +1201,14 @@ impl StatusSchedule {
     ///
     /// The same delivery rules choose both sends and wakes, so a full queue
     /// cannot lose its retry when another peer accepts the new range.
-    pub(super) fn rearm(&mut self, status: BlockSyncStatus, peers: &[(ZakuraPeerId, bool)]) {
+    pub(super) fn rearm<'a>(
+        &mut self,
+        status: BlockSyncStatus,
+        peers: impl IntoIterator<Item = (&'a ZakuraPeerId, bool)>,
+    ) {
         self.refresh_at = peers
-            .iter()
-            .filter_map(|(peer, received_status)| {
-                self.next_deadline(peer, status, *received_status)
-            })
+            .into_iter()
+            .filter_map(|(peer, received_status)| self.next_deadline(peer, status, received_status))
             .min();
     }
 

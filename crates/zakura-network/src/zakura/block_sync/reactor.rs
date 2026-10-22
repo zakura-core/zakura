@@ -1524,26 +1524,29 @@ impl ReactorIO {
             .filter_map(|(peer, received_status, _, _)| (!received_status).then_some(peer))
             .collect();
         let now = Instant::now();
-        let due = self
-            .state
-            .status
-            .due(status, &self.live_status_peers(&unready), now);
+        let due = self.state.status.due(
+            status,
+            Self::live_status_peers(&self.resources, &unready),
+            now,
+        );
         for peer in due {
             self.send_status(&peer, status, now, "refresh");
         }
         // A send can cancel its session, so rearm from the sessions still live.
-        let live = self.live_status_peers(&unready);
-        self.state.status.rearm(status, &live);
+        let live = Self::live_status_peers(&self.resources, &unready);
+        self.state.status.rearm(status, live);
     }
 
     /// The uncancelled peer sessions, each with whether the peer supplied its status.
-    fn live_status_peers(&self, unready: &HashSet<ZakuraPeerId>) -> Vec<(ZakuraPeerId, bool)> {
-        self.resources
+    fn live_status_peers<'a>(
+        resources: &'a BlockSyncState,
+        unready: &'a HashSet<ZakuraPeerId>,
+    ) -> impl Iterator<Item = (&'a ZakuraPeerId, bool)> {
+        resources
             .peers
             .iter()
             .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
-            .map(|(id, _)| (id.clone(), !unready.contains(id)))
-            .collect()
+            .map(|(id, _)| (id, !unready.contains(id)))
     }
 
     fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {

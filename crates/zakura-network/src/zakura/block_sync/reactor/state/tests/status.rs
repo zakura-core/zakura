@@ -41,19 +41,39 @@ fn a_ready_peer_with_the_latest_status_needs_no_send() {
     let mut schedule = StatusSchedule::default();
     schedule.admit(&peer(0), now);
     let peers = [(peer(0), true)];
-    assert_eq!(schedule.due(status(5), &peers, now), vec![peer(0)]);
+    assert_eq!(
+        schedule.due(
+            status(5),
+            peers.iter().map(|(peer, ready)| (peer, *ready)),
+            now
+        ),
+        vec![peer(0)]
+    );
 
     schedule
         .delivery_mut(&peer(0))
         .expect("the admitted peer has a delivery record")
         .queued(status(5));
-    assert!(schedule.due(status(5), &peers, now).is_empty());
-    schedule.rearm(status(5), &peers);
+    assert!(schedule
+        .due(
+            status(5),
+            peers.iter().map(|(peer, ready)| (peer, *ready)),
+            now
+        )
+        .is_empty());
+    schedule.rearm(status(5), peers.iter().map(|(peer, ready)| (peer, *ready)));
     assert_eq!(schedule.refresh_at(), None);
 
     // A peer that has not sent its own status still needs ours.
     let unready = [(peer(0), false)];
-    assert_eq!(schedule.due(status(5), &unready, now), vec![peer(0)]);
+    assert_eq!(
+        schedule.due(
+            status(5),
+            unready.iter().map(|(peer, ready)| (peer, *ready)),
+            now
+        ),
+        vec![peer(0)]
+    );
 }
 
 #[test]
@@ -67,7 +87,7 @@ fn a_replacement_session_starts_a_fresh_delivery() {
         .queued(status(5));
     schedule.admit(&peer(0), now);
     assert_eq!(
-        schedule.due(status(5), &[(peer(0), true)], now),
+        schedule.due(status(5), [(&peer(0), true)], now),
         vec![peer(0)]
     );
 }
@@ -161,7 +181,7 @@ proptest! {
                 Input::Flush { live, ready } => {
                     let admitted: Vec<bool> = model.iter().map(Option::is_some).collect();
                     let peers = flush_peers(&admitted, live, ready);
-                    let due = schedule.due(status(latest), &peers, now);
+                    let due = schedule.due(status(latest), peers.iter().map(|(peer, ready)| (peer, *ready)), now);
                     let expected_due: Vec<_> = peers
                         .iter()
                         .filter(|(id, ready)| {
@@ -174,7 +194,7 @@ proptest! {
                         .collect();
                     prop_assert_eq!(&due, &expected_due);
 
-                    schedule.rearm(status(latest), &peers);
+                    schedule.rearm(status(latest), peers.iter().map(|(peer, ready)| (peer, *ready)));
                     let expected_wake = peers
                         .iter()
                         .filter_map(|(id, ready)| {

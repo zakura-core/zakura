@@ -13,7 +13,7 @@ use std::{
     sync::{LockResult, PoisonError, TryLockError, TryLockResult},
 };
 
-use crate::sim::{executor, point, ObjectId, Op, Point, TaskId};
+use crate::sim::{executor, executor_for, point, run_id, ObjectId, Op, Point, RunId, TaskId};
 
 /// A std-style mutex that parks contended tasks on the scheduler.
 pub struct Mutex<T: ?Sized> {
@@ -23,8 +23,9 @@ pub struct Mutex<T: ?Sized> {
 
 /// Who holds a [`Mutex`], for the scheduler's lock-cycle check.
 struct LockState {
-    /// The identity tasks park on, made on first use inside a run.
-    object: Option<ObjectId>,
+    /// The identity tasks park on, made on first use inside each run. A
+    /// mutex kept across runs gets a new one, since ids repeat across runs.
+    object: Option<(RunId, ObjectId)>,
     /// The holding task, if the holder is a sim task.
     holder: Option<TaskId>,
 }
@@ -75,9 +76,19 @@ impl<T: ?Sized> Mutex<T> {
                 }
                 Err(TryLockError::WouldBlock) => {
                     let holder = self.state().holder;
+                    // This can abort the process when it fires in a
+                    // destructor, so name what's needed to replay it.
                     assert!(
                         executor.park(object, holder),
-                        "contended zakura-rt Mutex where the caller can't park"
+                        "contended zakura-rt Mutex at {site} where the caller can't park: \
+                         {}, task {:?}, held by {holder:?}{}",
+                        run_id().map_or_else(|| "no run".to_owned(), |run| run.to_string()),
+                        executor.current_task(),
+                        if std::thread::panicking() {
+                            ", while unwinding"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }
@@ -124,15 +135,18 @@ impl<T: ?Sized> Mutex<T> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The identity tasks park on, made on first use.
+    /// The identity tasks park on in the current run, made on first use.
     fn object(&self) -> ObjectId {
-        if let Some(object) = self.state().object {
-            return object;
+        let run = run_id().expect("objects are only made inside a run");
+        if let Some((made_in, object)) = self.state().object {
+            if made_in == run {
+                return object;
+            }
         }
         let object = executor()
             .expect("objects are only made inside a run")
             .new_object();
-        self.state().object = Some(object);
+        self.state().object = Some((run, object));
         object
     }
 
@@ -225,9 +239,13 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
             state.holder = None;
             state.object
         };
-        if let (Some(executor), Some(object)) = (executor(), object) {
-            executor.unpark_all(object);
-            point(Op::Release, self.site);
+        // A guard kept past the run that made the identity has nobody to
+        // wake in a later run.
+        if let Some((run, object)) = object {
+            if let Some(executor) = executor_for(run) {
+                executor.unpark_all(object);
+                point(Op::Release, self.site);
+            }
         }
     }
 }

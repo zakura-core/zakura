@@ -461,6 +461,39 @@ jobs:
       - name: Check no git dependencies
         run: cargo nextest run --profile check-no-git-dependencies --locked --run-ignored=only
 
+  # `zakura-rt` and `zakura-scheduler` have a simulator build behind
+  # `--cfg zakura_sim` that no other job compiles. Changing RUSTFLAGS rebuilds
+  # every crate, so this job uses its own target directory and cache key.
+  sim-build:
+    name: zakura_sim build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/sim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+          components: clippy
+          cache-shared-key: zakura-sim
+          cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint the simulator build
+        run: cargo clippy --locked -p zakura-rt -p zakura-scheduler --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+      - name: Test the simulator build
+        run: cargo test --locked -p zakura-rt -p zakura-scheduler
+        env:
+          RUSTFLAGS: --cfg zakura_sim
+
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:
   # it dry-run-publishes the real publish set against the live crates.io
@@ -533,6 +566,7 @@ jobs:
       - pruned-storage
       - check-no-git-dependencies
       - publish-graph
+      - sim-build
       - zakura-testkit
     timeout-minutes: 30
     steps:
@@ -545,9 +579,10 @@ jobs:
           # that touch no test-relevant paths (unit-tests and zakura-config
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
-          # skips on PRs that do not touch Cargo manifests or this check.
+          # skips on PRs that do not touch Cargo manifests or this check, and
+          # sim-build skips with the same test-relevant filter as build-tests.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

@@ -80,7 +80,13 @@ impl rt::Executor for SchedulerExecutor {
     }
 
     fn register_timer(&self, deadline: Duration, waker: &Waker) -> rt::TimerId {
-        let timer = hooks::register_timer(SimInstant::from_start(deadline), waker);
+        let now =
+            hooks::now().expect("zakura-rt calls the executor only while it's installed for a run");
+        // A deadline behind the clock, as after `Sleep::reset` to a past
+        // instant, fires at the next advance. Left as is, `advance_to` could
+        // never reach it.
+        let deadline = SimInstant::from_start(deadline).max(now);
+        let timer = hooks::register_timer(deadline, waker);
         rt::TimerId::new(timer.deadline.since_start(), timer.seq)
     }
 

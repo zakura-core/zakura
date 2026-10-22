@@ -10,7 +10,7 @@
 //! the list below is the surface it must cover.
 //!
 //! The simulator build is `RUSTFLAGS="--cfg zakura_sim"`. It swaps in the
-//! modules under `src/sim/` and adds [`sim`], the interface the simulator's
+//! modules under `src/sim/` and adds `sim`, the interface the simulator's
 //! scheduler implements. Names it doesn't cover yet stay re-exports.
 
 #[cfg(not(zakura_sim))]

@@ -239,13 +239,33 @@ fn interval_ticks_on_the_virtual_period() {
 }
 
 #[test]
-fn yield_now_is_one_point_and_never_pending() {
-    let (polled, report) = run(async {
+fn yield_now_is_pending_once_and_wakes_itself() {
+    let (polls, report) = run(async {
         let mut yielded = pin!(task::yield_now());
-        poll_fn(|cx| Poll::Ready(yielded.as_mut().poll(cx))).await
+        let mut polls = Vec::new();
+        poll_fn(|cx| {
+            let poll = yielded.as_mut().poll(cx);
+            polls.push(poll.is_ready());
+            poll
+        })
+        .await;
+        polls
     });
-    assert!(polled.is_ready());
-    assert_eq!(report.count(Op::Yield), 1);
+    // The second poll only happens because the first one woke the task.
+    assert_eq!(polls, [false, true]);
+    assert_eq!(report.count(Op::Yield), 0);
+}
+
+#[test]
+fn yield_now_loses_a_biased_select_to_a_ready_branch() {
+    let (winner, _) = run(async {
+        zakura_rt::select! {
+            biased;
+            () = task::yield_now() => "yield",
+            () = std::future::ready(()) => "ready",
+        }
+    });
+    assert_eq!(winner, "ready");
 }
 
 #[test]

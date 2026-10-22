@@ -68,11 +68,11 @@ where
 
 /// Lets other tasks run, as `tokio::task::yield_now` does.
 ///
-/// Inside a run this is one preemption point, and the task stays ready.
-#[track_caller]
+/// Inside a run, the first poll wakes the task and returns `Pending`, so the
+/// task frees its worker and stays ready. The next poll returns `Ready`.
 pub fn yield_now() -> YieldNow {
     YieldNow {
-        site: Location::caller(),
+        yielded: false,
         tokio: None,
     }
 }
@@ -80,7 +80,7 @@ pub fn yield_now() -> YieldNow {
 /// The future [`yield_now`] returns.
 #[must_use = "futures do nothing unless polled"]
 pub struct YieldNow {
-    site: &'static Location<'static>,
+    yielded: bool,
     tokio: Option<Pin<Box<dyn Future<Output = ()> + Send + Sync>>>,
 }
 
@@ -88,11 +88,15 @@ impl Future for YieldNow {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.tokio.is_none() {
-            if let Some(executor) = sim::executor() {
-                executor.preempt(Point::at(Op::Yield, self.site));
+        if self.tokio.is_none() && sim::executor().is_some() {
+            if self.yielded {
                 return Poll::Ready(());
             }
+            self.yielded = true;
+            // The executor holds a wake that lands mid-poll until the poll
+            // returns, the way tokio defers this wake.
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
         self.tokio
             .get_or_insert_with(|| Box::pin(tokio::task::yield_now()))

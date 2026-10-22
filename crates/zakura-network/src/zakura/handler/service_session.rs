@@ -10,6 +10,10 @@ use zakura_node_services::task::erased;
 use zakura_rt::sync::Barrier;
 
 mod state;
+pub(super) use state::{
+    may_open_ordered_stream, ConnectionRoles, DemandChange, DemandWait, RemoteCompletion,
+    ServiceSessionState, SessionExit,
+};
 use state::{MemberArrival, MemberReservation, PendingState};
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.

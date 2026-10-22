@@ -64,7 +64,7 @@ mod trace;
 
 use fill::FillStop;
 use io::PeerIO;
-use state::{unreceived_heights, BodyMatch, Disposition, PeerState, SharedDeadlines};
+use state::{unreceived_heights, BodyMatch, Disposition, PeerState, SharedDeadlines, StatusUpdate};
 
 /// Heights checked for lost ownership per work-queue lock hold.
 const OWNERSHIP_CHECK_CHUNK: usize = 1024;
@@ -611,57 +611,27 @@ impl PeerRoutine {
         Ok(permit)
     }
 
-    /// Apply this peer's `Status` locally (servable range, caps, `received_status`)
-    /// and into the registry, then ping the reactor to advertise our reply and
-    /// republish the candidate. Runs the validate / rate-meter / upsert; the
-    /// servable read for want-work is this routine's own fields.
+    /// Apply this peer's `Status` through [`PeerState::on_status`]. When the
+    /// meter allows publication, write it to the registry and ping the reactor
+    /// to advertise our reply and republish the candidate.
     fn handle_status(&mut self, status: BlockSyncStatus) {
         self.io.session.record_received_status(status);
-        let now = time::Instant::now().into_std();
-        let range_changed = status.servable_high != self.state.servable_high
-            || status.servable_low != self.state.servable_low;
-        let limits = (
-            super::config::clamp_advertised_blocks(status.max_blocks_per_response),
-            super::config::clamp_advertised_response_bytes(status.max_response_bytes),
-            super::config::clamp_advertised_inflight(status.max_inflight_requests),
-        );
-        // Requests must obey the peer's latest limits even while publication waits.
-        (
-            self.state.max_blocks_per_response,
-            self.state.max_response_bytes,
-            self.state.window.max_inflight_requests,
-        ) = limits;
-        // Publish a stop before the rate limiter, so no routine keeps deferring
-        // the floor to this peer. A reopen waits for a rate-limited publication,
-        // so a Status flood cannot toggle the shared ranking on every frame.
+        let update = self
+            .state
+            .on_status(status, time::Instant::now().into_std());
+        // Publish a stop even when the meter defers the status, so no routine
+        // keeps deferring the floor to this peer. A reopen waits for a
+        // rate-limited publication, so a Status flood cannot toggle the shared
+        // ranking on every frame.
         if self.requester_stop().is_some() && !self.state.published_requester_stopped {
             self.publish_slot_diagnostics();
         }
-        let limits_changed = limits != self.state.published_limits;
-        if self.state.inbound_status_meter.try_take(now) {
-            self.state.status_range_bypass_available = true;
-        } else if range_changed && self.state.status_range_bypass_available {
-            // Allow prompt pruning updates, but only once per window so a peer
-            // cannot flood registry/reactor work by oscillating its range.
-            self.state.status_range_bypass_available = false;
-        } else {
-            // Keep only the latest Status that changes the published range or
-            // limits. A return to the published state cancels an older pending
-            // change without causing a status reply loop.
-            self.state.pending_status = (range_changed || limits_changed).then_some(status);
+        let StatusUpdate::Publish { send_reply } = update else {
             return;
-        }
-        self.state.pending_status = None;
+        };
         if self.requester_stop().is_some() != self.state.published_requester_stopped {
             self.publish_slot_diagnostics();
         }
-        // Replies have their own allowance. The reactor also retries any local
-        // status that has not entered this peer's outbound queue.
-        let send_reply = self.state.status_reply_meter.try_take(now);
-        self.state.received_status = true;
-        self.state.servable_low = status.servable_low;
-        self.state.servable_high = status.servable_high;
-        self.state.published_limits = limits;
         // Publish the servable range / clamped caps / received_status to the
         // registry so the reactor's candidate reads see them; generation-gated.
         self.io
@@ -681,14 +651,7 @@ impl PeerRoutine {
     }
 
     fn flush_pending_status(&mut self) {
-        if !self
-            .state
-            .inbound_status_meter
-            .is_ready(time::Instant::now().into_std())
-        {
-            return;
-        }
-        if let Some(status) = self.state.pending_status.take() {
+        if let Some(status) = self.state.take_due_status(time::Instant::now().into_std()) {
             self.handle_status(status);
         }
     }
@@ -1705,18 +1668,7 @@ impl PeerRoutine {
 
     /// Why the live requester refuses another request, whatever the window allows.
     fn requester_stop(&self) -> Option<FillStop> {
-        let occupancy = self.io.requester.occupancy();
-        // Count unanswered exchanges, including scheduler-abandoned work.
-        // The peer's u32 advertised limit fits usize on supported targets.
-        if occupancy.at_capacity
-            || occupancy.len >= self.state.window.max_inflight_requests as usize
-        {
-            return Some(FillStop::CwndSaturated);
-        }
-        if occupancy.pending_endings >= super::regulated::live_requester::MAX_PENDING_ENDINGS {
-            return Some(FillStop::PendingEndings);
-        }
-        None
+        self.state.requester_stop(self.io.requester.occupancy())
     }
 
     /// Publish the window diagnostics for the reactor's periodic trace row and

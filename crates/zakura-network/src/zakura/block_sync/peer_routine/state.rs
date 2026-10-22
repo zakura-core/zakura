@@ -15,8 +15,10 @@ use super::{
 };
 
 mod requests;
+mod status;
 
 pub(super) use requests::{unreceived_heights, BodyMatch, Disposition, SharedDeadlines};
+pub(super) use status::StatusUpdate;
 
 /// One block-sync session's download, status, and liveness facts.
 ///

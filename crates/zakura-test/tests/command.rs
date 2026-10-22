@@ -295,6 +295,13 @@ fn failure_regex_reads_multi_line_output_on_expect_line() {
         .with_timeout(Duration::from_secs(5))
         .with_failure_regex_set("failure_message", RegexSet::empty());
 
+    // Give the child process enough time to print its output.
+    //
+    // Some `echo` implementations, such as the Rust uutils one, write each line
+    // separately. The failure on the first line kills the child, so reading
+    // early can lose the second line.
+    std::thread::sleep(Duration::from_secs(1));
+
     // Any method that reads output should work here.
     // We use a non-matching regex, to trigger the failure panic.
     let expected_error = child

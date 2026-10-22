@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Zakura regtest trace oracle.
+"""Zakura regtest sync invariant checks.
 
-The oracle reads the per-node CSV trace layout produced by the Docker e2e:
+The checks read the per-node CSV trace layout produced by the Docker e2e:
 
     node*/commit_state.csv
     node*/block_sync.csv
@@ -130,7 +130,7 @@ class TraceActivityIndex:
             timestamps=tuple(ts for ts, _ in timestamped if ts is not None),
         )
 
-    def near_count(self, state: TraceRow, options: OracleOptions) -> int:
+    def near_count(self, state: TraceRow, options: InvariantOptions) -> int:
         if state.ts is None:
             return sum(1 for _ in self._rows_near_event_index(state))
 
@@ -140,7 +140,7 @@ class TraceActivityIndex:
     def near_tail(
         self,
         state: TraceRow,
-        options: OracleOptions,
+        options: InvariantOptions,
         limit: int,
     ) -> list[TraceRow]:
         if limit <= 0:
@@ -151,14 +151,14 @@ class TraceActivityIndex:
         lower, upper = self._timestamp_bounds(state.ts, options.persistent_lag_micros)
         return list(self.timestamped_rows[max(lower, upper - limit) : upper])
 
-    def has_near(self, state: TraceRow, options: OracleOptions) -> bool:
+    def has_near(self, state: TraceRow, options: InvariantOptions) -> bool:
         if state.ts is None:
             return any(self._rows_near_event_index(state))
 
         lower, upper = self._timestamp_bounds(state.ts, options.persistent_lag_micros)
         return lower < upper
 
-    def has_forward(self, state: TraceRow, options: OracleOptions) -> bool:
+    def has_forward(self, state: TraceRow, options: InvariantOptions) -> bool:
         if state.ts is None:
             return any(
                 row.table != state.table
@@ -202,7 +202,7 @@ class Failure:
 
 
 @dataclass(frozen=True)
-class OracleOptions:
+class InvariantOptions:
     commit_event_window: int = COMMIT_EVENT_WINDOW
     commit_elapsed_micros: int = COMMIT_MICROS_WINDOW
     persistent_lag_micros: int = RECENT_ACTIVITY_MICROS
@@ -437,7 +437,7 @@ def match_commits(rows: list[TraceRow]) -> CommitMatches:
     return CommitMatches(pairs, errors)
 
 
-def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]:
+def check_commit_pairs(node: NodeTrace, options: InvariantOptions) -> list[Failure]:
     matches = match_commits(node.table("commit_state"))
     failures = [failure(node, invariant, row, {"key": row_key(row)})
                 for invariant, row in matches.errors[:100]]
@@ -478,7 +478,7 @@ def check_required_commit_evidence(node: NodeTrace) -> list[Failure]:
     return failures
 
 
-def check_commit_latency_trend(node: NodeTrace, options: OracleOptions) -> list[Failure]:
+def check_commit_latency_trend(node: NodeTrace, options: InvariantOptions) -> list[Failure]:
     failures: list[Failure] = []
     elapsed_by_class: dict[str, list[tuple[TraceRow, int]]] = {}
 
@@ -620,7 +620,7 @@ def check_frontiers(node: NodeTrace) -> list[Failure]:
     return failures
 
 
-def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[Failure]:
+def check_block_sync_activity(node: NodeTrace, options: InvariantOptions) -> list[Failure]:
     failures: list[Failure] = []
     states = node.events("block_sync", BLOCK_SYNC_STATE)
     real_activity = TraceActivityIndex.build(
@@ -729,7 +729,7 @@ def body_sync_has_pinned_queue(state: TraceRow) -> bool:
     )
 
 
-def check_header_recovery(node: NodeTrace, options: OracleOptions) -> list[Failure]:
+def check_header_recovery(node: NodeTrace, options: InvariantOptions) -> list[Failure]:
     failures: list[Failure] = []
     recoveries = HeaderRecoveries(
         row
@@ -788,7 +788,7 @@ class HeaderRecoveries:
         yield from rows[bisect_right(indexes, rejected.index):bisect_right(indexes, rejected.index + RECENT_ACTIVITY_EVENTS)]
 
 
-def header_reject_has_recovery(rejected: TraceRow, recoveries: HeaderRecoveries, options: OracleOptions) -> bool:
+def header_reject_has_recovery(rejected: TraceRow, recoveries: HeaderRecoveries, options: InvariantOptions) -> bool:
     start = int_field(rejected.row, "range_start")
 
     for row in recoveries.near(rejected, options.persistent_lag_micros):
@@ -815,7 +815,7 @@ def trace_extends_past(node: NodeTrace, row: TraceRow, micros: int) -> bool:
     return latest_ts - row.ts >= micros
 
 
-def check_checkpoint_to_full_handoff(nodes: list[NodeTrace], options: OracleOptions) -> list[Failure]:
+def check_checkpoint_to_full_handoff(nodes: list[NodeTrace], options: InvariantOptions) -> list[Failure]:
     observations = [checkpoint_to_full_handoff(node, options) for node in nodes]
     if any(observation[0] is None for observation in observations):
         return []
@@ -844,7 +844,7 @@ def check_checkpoint_to_full_handoff(nodes: list[NodeTrace], options: OracleOpti
 
 
 def checkpoint_to_full_handoff(
-    node: NodeTrace, options: OracleOptions
+    node: NodeTrace, options: InvariantOptions
 ) -> tuple[Failure | None, dict[str, Any]]:
     handoffs = [
         row
@@ -994,7 +994,7 @@ def diagnostics(node: NodeTrace) -> dict[str, Any]:
     return node._diagnostics
 
 
-def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Failure]:
+def check_sync_invariants(root: Path, options: InvariantOptions = InvariantOptions()) -> list[Failure]:
     try:
         nodes = load_traces(root, options.capture_run_id)
     except (ValueError, OSError) as error:
@@ -1157,7 +1157,7 @@ def print_failures(failures: list[Failure]) -> None:
             "first_offending_row": compact_row(item.row),
             **item.detail,
         }
-        print("TRACE ORACLE FAILURE", file=sys.stderr)
+        print("SYNC INVARIANT FAILURE", file=sys.stderr)
         print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
 
 
@@ -1213,7 +1213,7 @@ def run_self_test() -> None:
         for stale in ("", "invalid header\n"):
             (root / "node1" / "commit_state.csv").write_text(stale)
             assert any(f.node == "node1/current" and f.invariant == "commit_start_has_finish"
-                       for f in run_oracle(root))
+                       for f in check_sync_invariants(root))
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1249,7 +1249,7 @@ def run_self_test() -> None:
         TraceRow("node1", "block_sync", index, {"ts": ts})
         for index, ts in enumerate((89, 90, 100, 110, 111), start=1)
     )
-    window = OracleOptions(persistent_lag_micros=10)
+    window = InvariantOptions(persistent_lag_micros=10)
     assert activity.near_count(state, window) == 3
     assert [row.ts for row in activity.near_tail(state, window, 2)] == [100, 110]
     assert activity.has_near(state, window)
@@ -1273,7 +1273,7 @@ def run_self_test() -> None:
     assert cross_table_activity.near_count(unclocked_state, window) == 1
     assert cross_table_activity.has_forward(unclocked_state, window)
 
-    with tempfile.TemporaryDirectory(prefix="zakura-trace-oracle.") as tmp:
+    with tempfile.TemporaryDirectory(prefix="zakura-sync-invariants.") as tmp:
         root = Path(tmp)
 
         good = root / "good" / "node1"
@@ -1317,7 +1317,7 @@ def run_self_test() -> None:
                 }
             ],
         )
-        assert not run_oracle(root / "good"), "good trace should pass"
+        assert not check_sync_invariants(root / "good"), "good trace should pass"
 
         v7_ids = root / "v7_ids" / "node2"
         write_csv(
@@ -1370,7 +1370,7 @@ def run_self_test() -> None:
             write_csv(directory / "header_sync.csv", [row])
             assert any(
                 failure.invariant == expected
-                for failure in run_oracle(root / name, OracleOptions(require_v7_request_ids=True))
+                for failure in check_sync_invariants(root / name, InvariantOptions(require_v7_request_ids=True))
             )
 
         duplicate_ids = root / "v7_duplicate_ids" / "node2"
@@ -1441,9 +1441,9 @@ def run_self_test() -> None:
                 },
             ],
         )
-        assert not run_oracle(
+        assert not check_sync_invariants(
             root / "handoff",
-            OracleOptions(require_handoff_boundary=True),
+            InvariantOptions(require_handoff_boundary=True),
         ), "checkpoint-to-full handoff trace should pass"
 
         no_handoff = root / "no_handoff" / "node2"
@@ -1464,7 +1464,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "checkpoint_to_full_handoff_observed"
-            for f in run_oracle(root / "no_handoff", OracleOptions(require_handoff_boundary=True))
+            for f in check_sync_invariants(root / "no_handoff", InvariantOptions(require_handoff_boundary=True))
         )
 
         no_later_full = root / "no_later_full" / "node2"
@@ -1483,8 +1483,8 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "checkpoint_to_full_handoff_observed"
-            for f in run_oracle(
-                root / "no_later_full", OracleOptions(require_handoff_boundary=True)
+            for f in check_sync_invariants(
+                root / "no_later_full", InvariantOptions(require_handoff_boundary=True)
             )
         )
 
@@ -1519,8 +1519,8 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "checkpoint_to_full_handoff_observed"
-            for f in run_oracle(
-                root / "cross_process", OracleOptions(require_handoff_boundary=True)
+            for f in check_sync_invariants(
+                root / "cross_process", InvariantOptions(require_handoff_boundary=True)
             )
         )
 
@@ -1555,9 +1555,9 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "checkpoint_to_full_handoff_within_window"
-            for f in run_oracle(
+            for f in check_sync_invariants(
                 root / "slow_handoff",
-                OracleOptions(require_handoff_boundary=True, handoff_stall_micros=1_000_000),
+                InvariantOptions(require_handoff_boundary=True, handoff_stall_micros=1_000_000),
             )
         )
 
@@ -1566,7 +1566,7 @@ def run_self_test() -> None:
             bad_commit / "commit_state.csv",
             [{"ts": 1, "event": COMMIT_START, "apply_token": 9, "height": 9, "hash": "bb"}],
         )
-        assert any(f.invariant == "commit_start_has_finish" for f in run_oracle(root / "bad_commit"))
+        assert any(f.invariant == "commit_start_has_finish" for f in check_sync_invariants(root / "bad_commit"))
 
         terminal_stalled = root / "terminal_stalled" / "node1"
         write_csv(
@@ -1581,7 +1581,7 @@ def run_self_test() -> None:
                 }
             ],
         )
-        assert any(f.invariant == "commit_stalled_not_terminal" for f in run_oracle(root / "terminal_stalled"))
+        assert any(f.invariant == "commit_stalled_not_terminal" for f in check_sync_invariants(root / "terminal_stalled"))
 
         bad_frontier = root / "bad_frontier" / "node1"
         write_csv(
@@ -1598,7 +1598,7 @@ def run_self_test() -> None:
                 }
             ],
         )
-        failures = run_oracle(root / "bad_frontier")
+        failures = check_sync_invariants(root / "bad_frontier")
         assert any(f.invariant == "finalized_height_monotonic" for f in failures)
         assert any(f.invariant == "verified_body_height_monotonic_except_reset" for f in failures)
 
@@ -1617,7 +1617,7 @@ def run_self_test() -> None:
                 }
             ],
         )
-        assert not run_oracle(root / "valid_reset"), "valid reorg/reset should pass"
+        assert not check_sync_invariants(root / "valid_reset"), "valid reorg/reset should pass"
 
         persistent_lag = root / "persistent_lag" / "node1"
         write_csv(
@@ -1643,7 +1643,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "lagging_body_sync_has_real_activity"
-            for f in run_oracle(root / "persistent_lag", OracleOptions(persistent_lag_micros=1_000_000))
+            for f in check_sync_invariants(root / "persistent_lag", InvariantOptions(persistent_lag_micros=1_000_000))
         )
 
         query_spin = root / "query_spin" / "node1"
@@ -1686,7 +1686,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "lagging_body_sync_not_query_spin"
-            for f in run_oracle(root / "query_spin", OracleOptions(persistent_lag_micros=10_000_000))
+            for f in check_sync_invariants(root / "query_spin", InvariantOptions(persistent_lag_micros=10_000_000))
         )
 
         self_healed_wedge = root / "self_healed_wedge" / "node1"
@@ -1740,7 +1740,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "lagging_body_sync_has_real_activity"
-            for f in run_oracle(root / "self_healed_wedge", OracleOptions(persistent_lag_micros=30_000_000))
+            for f in check_sync_invariants(root / "self_healed_wedge", InvariantOptions(persistent_lag_micros=30_000_000))
         )
 
         lag_with_progress = root / "lag_with_progress" / "node1"
@@ -1780,7 +1780,7 @@ def run_self_test() -> None:
                 },
             ],
         )
-        assert not run_oracle(root / "lag_with_progress", OracleOptions(persistent_lag_micros=1_000_000))
+        assert not check_sync_invariants(root / "lag_with_progress", InvariantOptions(persistent_lag_micros=1_000_000))
 
         queued_lag = root / "queued_lag" / "node1"
         write_csv(
@@ -1804,7 +1804,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "block_sync_queue_lag_makes_progress"
-            for f in run_oracle(root / "queued_lag", OracleOptions(persistent_lag_micros=1_000_000))
+            for f in check_sync_invariants(root / "queued_lag", InvariantOptions(persistent_lag_micros=1_000_000))
         )
 
         latency_trend = root / "latency_trend" / "node1"
@@ -1842,9 +1842,9 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "commit_latency_trend_bounded"
-            for f in run_oracle(
+            for f in check_sync_invariants(
                 root / "latency_trend",
-                OracleOptions(commit_elapsed_micros=3_000_000_000, commit_trend_min_ms=300_000),
+                InvariantOptions(commit_elapsed_micros=3_000_000_000, commit_trend_min_ms=300_000),
             )
         )
 
@@ -1866,7 +1866,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "header_link_reject_recovers"
-            for f in run_oracle(root / "stranded_anchor", OracleOptions(persistent_lag_micros=1_000_000))
+            for f in check_sync_invariants(root / "stranded_anchor", InvariantOptions(persistent_lag_micros=1_000_000))
         )
 
         recovered_anchor = root / "recovered_anchor" / "node1"
@@ -1885,7 +1885,7 @@ def run_self_test() -> None:
                 {"ts": 2, "event": HEADER_FRONTIER_REANCHORED, "height": 99},
             ],
         )
-        assert not run_oracle(root / "recovered_anchor", OracleOptions(persistent_lag_micros=1_000_000))
+        assert not check_sync_invariants(root / "recovered_anchor", InvariantOptions(persistent_lag_micros=1_000_000))
 
         bad_leak = root / "bad_leak" / "node1"
         write_csv(
@@ -1903,7 +1903,7 @@ def run_self_test() -> None:
                 }
             ],
         )
-        assert any(f.invariant == "final_block_sync_state_has_no_leaks" for f in run_oracle(root / "bad_leak"))
+        assert any(f.invariant == "final_block_sync_state_has_no_leaks" for f in check_sync_invariants(root / "bad_leak"))
 
         optional_lag = root / "optional_lag" / "node4"
         write_csv(
@@ -1926,9 +1926,9 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant in {"lagging_body_sync_has_real_activity", "block_sync_queue_lag_makes_progress"}
-            for f in run_oracle(root / "optional_lag")
+            for f in check_sync_invariants(root / "optional_lag")
         )
-        assert not run_oracle(root / "optional_lag", OracleOptions(optional_lag_nodes=("node4",)))
+        assert not check_sync_invariants(root / "optional_lag", InvariantOptions(optional_lag_nodes=("node4",)))
 
         optional_lag_leak = root / "optional_lag_leak" / "node4"
         write_csv(
@@ -1950,10 +1950,10 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "final_block_sync_state_has_no_leaks"
-            for f in run_oracle(root / "optional_lag_leak", OracleOptions(optional_lag_nodes=("node4",)))
+            for f in check_sync_invariants(root / "optional_lag_leak", InvariantOptions(optional_lag_nodes=("node4",)))
         )
 
-        # The same commit fixture must produce the same oracle result in CSV.
+        # The same commit fixture must produce the same invariant result in CSV.
         csv_path = good / "commit_state.csv"
         original = read_csv(csv_path, "node1", "commit_state")
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -1975,7 +1975,7 @@ def run_self_test() -> None:
                 writer.writerow(record)
         csv_rows = read_csv(csv_path, "node1", "commit_state")
         assert [row.row for row in csv_rows] == [row.row for row in original]
-        assert not run_oracle(root / "good")
+        assert not check_sync_invariants(root / "good")
 
         malformed = root / "malformed_csv" / "node1"
         malformed.mkdir(parents=True)
@@ -1983,14 +1983,14 @@ def run_self_test() -> None:
             (malformed / "commit_state.csv").write_text(
                 "ts,event,height,extra\n" + record + "\n", encoding="utf-8",
             )
-            assert any(f.invariant == "trace_csv_is_valid" for f in run_oracle(root / "malformed_csv"))
+            assert any(f.invariant == "trace_csv_is_valid" for f in check_sync_invariants(root / "malformed_csv"))
 
         # Each row is valid apart from its raw `extra` text, so the JSON check must reject it.
         def json_rejection(case: str, raw_extra: str) -> list[str]:
             write_csv(root / case / "node1" / "commit_state.csv", [{"ts": 1, "event": COMMIT_START}], raw_extra)
             return [
                 str(f.row.row.get("error"))
-                for f in run_oracle(root / case)
+                for f in check_sync_invariants(root / case)
                 if f.invariant == "trace_csv_is_valid" and f.row is not None
             ]
 
@@ -2004,7 +2004,7 @@ def run_self_test() -> None:
         )
         assert any(
             f.invariant == "trace_csv_is_valid"
-            for f in run_oracle(root / "invalid_key")
+            for f in check_sync_invariants(root / "invalid_key")
         )
 
         assert any(
@@ -2028,7 +2028,7 @@ def run_self_test() -> None:
             )
         assert any(
             f.invariant == "trace_csv_is_valid"
-            for f in run_oracle(root / "extra_collision")
+            for f in check_sync_invariants(root / "extra_collision")
         )
 
         missing_evidence = root / "missing_evidence" / "node1"
@@ -2039,19 +2039,19 @@ def run_self_test() -> None:
             csv.writer(handle).writerow(CSV_SCHEMAS["commit_state"])
         assert any(
             f.invariant == "commit_state_has_events"
-            for f in run_oracle(
+            for f in check_sync_invariants(
                 root / "missing_evidence",
-                OracleOptions(required_commit_nodes=("node1",)),
+                InvariantOptions(required_commit_nodes=("node1",)),
             )
         )
 
-    print("trace_oracle self-test: PASS")
+    print("sync_invariants self-test: PASS")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace_dir", nargs="?", type=Path, help="root trace directory containing node* subdirectories")
-    parser.add_argument("--self-test", action="store_true", help="run fixture-based oracle tests")
+    parser.add_argument("--self-test", action="store_true", help="run fixture-based invariant tests")
     parser.add_argument(
         "--commit-elapsed-ms",
         type=int,
@@ -2121,7 +2121,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if (args.seal_capture is not None or args.check_capture is not None) and args.trace_dir is None:
-        print("trace_oracle.py: capture commands require a trace directory", file=sys.stderr)
+        print("sync_invariants.py: capture commands require a trace directory", file=sys.stderr)
         return 2
 
     if args.seal_capture is not None:
@@ -2164,19 +2164,19 @@ def main(argv: list[str]) -> int:
                 raise trace.TraceInputError("row-count cursors require an unrotated capture")
             rows = read_csv(args.dump_csv, args.dump_csv.parent.name, table)
         if any(row.event == "csv_decode_error" for row in rows):
-            print("trace_oracle.py: malformed CSV input", file=sys.stderr)
+            print("sync_invariants.py: malformed CSV input", file=sys.stderr)
             return 1
         for row in rows[args.after:]:
             print(json.dumps(row.row, separators=(",", ":")))
         return 0
 
     if args.trace_dir is None:
-        print("trace_oracle.py: trace_dir is required unless --self-test is used", file=sys.stderr)
+        print("sync_invariants.py: trace_dir is required unless --self-test is used", file=sys.stderr)
         return 2
 
-    failures = run_oracle(
+    failures = check_sync_invariants(
         args.trace_dir,
-        OracleOptions(
+        InvariantOptions(
             commit_elapsed_micros=args.commit_elapsed_ms * 1_000,
             persistent_lag_micros=args.persistent_lag_seconds * 1_000_000,
             require_handoff_boundary=args.require_handoff_boundary,
@@ -2196,14 +2196,14 @@ def main(argv: list[str]) -> int:
                       "commit_state_has_events", "required_sync_evidence_exists",
                       "commit_state_has_commit_start", "commit_state_has_commit_finish"}
         if any(item.invariant in incomplete for item in failures):
-            print("trace_oracle: INCOMPLETE", file=sys.stderr)
+            print("sync_invariants: INCOMPLETE", file=sys.stderr)
             return 2
         return 1
 
     if not args.capture_run_id:
-        print(f"trace_oracle: INCOMPLETE (checks passed, capture completeness not established: {args.trace_dir})")
+        print(f"sync_invariants: INCOMPLETE (checks passed, capture completeness not established: {args.trace_dir})")
         return 2
-    print(f"trace_oracle: PASS ({args.trace_dir})")
+    print(f"sync_invariants: PASS ({args.trace_dir})")
     return 0
 
 
@@ -2211,5 +2211,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
     except (OSError, trace.TraceInputError) as error:
-        print(f"trace_oracle: INCOMPLETE ({error})", file=sys.stderr)
+        print(f"sync_invariants: INCOMPLETE ({error})", file=sys.stderr)
         raise SystemExit(2)

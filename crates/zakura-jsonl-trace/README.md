@@ -18,7 +18,7 @@ nested objects into dotted column names. Fields outside the declared columns
 remain in the `extra` JSON object, so readers must inspect that column when an
 event adds fields. Identity fields such as hashes and node labels remain strings.
 
-The Rust test reader, regtest oracle, and benchmark digest read CSV segments
+The Rust test reader, regtest invariant checks, and benchmark digest read CSV segments
 from oldest to newest. External readers must use a CSV parser.
 `schema.json` lists every table's columns and value types.
 
@@ -47,11 +47,11 @@ row counts. The writer syncs rows before publishing status. Production tracing
 keeps its bounded queue and rotation defaults.
 
 The regtest harness requires a fresh directory for each run. Before a planned
-restart or final validation, it requests a seal with the oracle's
-`--seal-capture RUN_ID` command. Each writer stops accepting events, drains its
+restart or final validation, it requests a seal with the
+`sync_invariants.py --seal-capture RUN_ID` command. Each writer stops accepting events, drains its
 queue, and publishes a sealed status. Events after that boundary lie outside the
 capture. A new process starts a new capture in the same run directory.
-`--check-capture RUN_ID` checks the acknowledgements once; the harness polls it. The final oracle checks
+`--check-capture RUN_ID` checks the acknowledgements once; the harness polls it. The final invariant check verifies
 `--capture-run-id RUN_ID`, required node/table/event coverage, and exact persisted
 row counts. Missing acknowledgements, dropped events, write failures, or mismatched
 counts prevent PASS. An unsealed process exit leaves incomplete evidence.
@@ -60,9 +60,9 @@ Python readers share `scripts/zakura_trace.py`. The Rust reader and Python reade
 check the same CSV fixtures. The schema defines required fields for events that
 feed the sync invariants. Full `block_sync_state` records include peer/request counters.
 Cheaper `block_sync_pipeline_state` records contain only pipeline counters.
-The oracle takes `outstanding` from the latest full snapshot and the pipeline
+The invariant checks take `outstanding` from the latest full snapshot and the pipeline
 counters from the latest record of either kind.
-The oracle and flush guard share one commit matcher.
+The invariant checks and flush guard share one commit matcher.
 It consumes each finish once and scopes identities by process and source.
 
 Python import tools require POSIX file descriptors. Readers reject symlinked or
@@ -73,12 +73,12 @@ so a slow reader never stalls the node's writer. The Rust test reader consumes
 captures after writers stop. Imported captures have limits
 of 256 MiB, 500,000 rows, and 256 files. Records and fields are limited to 1 MiB,
 and embedded JSON to 64 nesting levels. Budget failures prevent validation.
-The oracle caches diagnostics and limits reported failures. The benchmark digest
+The invariant checker caches diagnostics and limits reported failures. The benchmark digest
 uses only the latest process generation for its monotonic latency series.
 
 Production directories can exceed the import limits; copy the segments of interest
 into a separate directory for analysis. Without complete writer status,
-the oracle reports INCOMPLETE even when the available checks pass. Row-count
+the invariant checker reports INCOMPLETE even when the available checks pass. Row-count
 cursors require unrotated captures. Preserve `capture-*.json` files when sharing a
 validation capture; CSV files alone cannot establish completeness.
 

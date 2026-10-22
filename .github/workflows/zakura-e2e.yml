@@ -141,7 +141,7 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Check trace input and evidence contracts
         run: |
-          python3 docker/zakura-regtest-e2e/trace_oracle.py --self-test
+          python3 docker/zakura-regtest-e2e/sync_invariants.py --self-test
           python3 -m unittest discover -s scripts/tests -p 'test_zakura_trace*.py'
           python3 -m unittest discover -s scripts/tests -p test_zakura_bench_digest.py
       # Compile the e2e once. `cargo test --no-run` builds both the integration

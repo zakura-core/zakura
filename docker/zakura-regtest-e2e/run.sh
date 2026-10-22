@@ -175,7 +175,7 @@ PROPAGATE_TIMEOUT="${PROPAGATE_TIMEOUT:-${DEFAULT_PROPAGATE_TIMEOUT}}"
 # ceiling only matters on failure: the waits exit as soon as catch-up starts.
 CATCHUP_TIMEOUT="${CATCHUP_TIMEOUT:-${DEFAULT_CATCHUP_TIMEOUT}}"
 # The CSV writer batches events before append and syncs files every second.
-# Wait for each commit_start to have a matching commit_finish before the oracle runs.
+# Wait for each commit_start to have a matching commit_finish before the invariant checks run.
 TRACE_FLUSH_TIMEOUT="${TRACE_FLUSH_TIMEOUT:-45}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-${DEFAULT_CHECKPOINT_INTERVAL}}"
 RUN_LABEL="${ZAKURA_REGTEST_E2E_LABEL:-zakura-${ZAKURA_E2E_MODE}}"
@@ -187,7 +187,7 @@ export ZAKURA_NODE2_STATE_VOLUME
 
 command -v docker >/dev/null || fail "docker is required"
 command -v jq >/dev/null || fail "jq is required to parse RPC responses"
-command -v python3 >/dev/null || fail "python3 is required to run the trace oracle"
+command -v python3 >/dev/null || fail "python3 is required to check trace invariants"
 
 # Ensure a container-compatible zakurad binary exists. Docker Desktop runs Linux
 # containers on macOS, so its bind-mounted executable must be Linux too.
@@ -261,7 +261,7 @@ log "run mode: ${ZAKURA_E2E_MODE} (${RUN_LABEL})"
 log "using zakurad binary: ${ZAKURAD_BIN}"
 log "writing Zakura traces under: ${ZAKURA_E2E_TRACE_DIR}"
 
-ORACLE_RAN=0
+INVARIANTS_CHECKED=0
 OPTIONAL_NODE4_QUIESCED=0
 
 trace_dir_has_csv() {
@@ -294,7 +294,7 @@ assert_trace_layout() {
   fi
 }
 
-# Wait until each node's traces are fully flushed to disk before the oracle reads
+# Wait until each node's traces are fully flushed to disk before the invariant checks read
 # them. A read immediately after the final commit can miss queued events.
 # We require two things to be on disk:
 #   1. commit_state.csv: every commit_start has a matching commit_finish
@@ -303,18 +303,18 @@ assert_trace_layout() {
 #      applying+budget_reserved+reorder+outstanding == 0 (guards
 #      final_block_sync_state_has_no_leaks). The reactor emits these release
 #      rows just after the commit_finish rows, so they flush a cycle later.
-# Best-effort: on timeout we log and run the oracle anyway so a genuine stall or
+# Best-effort: on timeout we log and check invariants anyway so a genuine stall or
 # real leak still surfaces.
 wait_for_trace_flush() {
   trace_dir_has_csv || return 0
   local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file pending last leak
-  log "waiting for Zakura traces to flush before the oracle"
+  log "waiting for Zakura traces to flush before checking invariants"
   while (( SECONDS < deadline )); do
     pending=0
     for node in node1 node2 node4; do
       file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
       if [[ -s "${file}" ]]; then
-        if ! python3 "${SCRIPT_DIR}/trace_oracle.py" --check-commit-balance "${file}"; then
+        if ! python3 "${SCRIPT_DIR}/sync_invariants.py" --check-commit-balance "${file}"; then
           printf '  %s commit_state has unmatched or malformed records (waiting for flush)\n' "${node}"
           pending=1
         fi
@@ -343,7 +343,7 @@ wait_for_trace_flush() {
     (( pending == 0 )) && { log "traces flushed"; return 0; }
     sleep 3
   done
-  log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; running oracle anyway"
+  log "trace flush wait timed out after ${TRACE_FLUSH_TIMEOUT}s; checking invariants anyway"
 }
 
 wait_for_commit_trace_balance() {
@@ -354,7 +354,7 @@ wait_for_commit_trace_balance() {
   [[ -s "${file}" ]] || fail "${label} commit trace is missing"
   log "waiting for ${label} commit trace to flush before reset"
   while (( SECONDS < deadline )); do
-    python3 "${SCRIPT_DIR}/trace_oracle.py" --check-commit-balance "${file}" && return 0
+    python3 "${SCRIPT_DIR}/sync_invariants.py" --check-commit-balance "${file}" && return 0
     printf '  %s commit_state has unmatched or malformed records\n' "${label}"
     sleep 3
   done
@@ -363,9 +363,9 @@ wait_for_commit_trace_balance() {
 
 seal_trace_capture() {
   local directory="$1" deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
-  python3 "${SCRIPT_DIR}/trace_oracle.py" --seal-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}" \
+  python3 "${SCRIPT_DIR}/sync_invariants.py" --seal-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}" \
     || { printf 'could not request trace capture seal\n' >&2; return 1; }
-  while ! python3 "${SCRIPT_DIR}/trace_oracle.py" --check-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}"; do
+  while ! python3 "${SCRIPT_DIR}/sync_invariants.py" --check-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}"; do
     if (( SECONDS >= deadline )); then
       printf 'trace capture did not seal completely: %s\n' "${directory}" >&2
       return 1
@@ -374,15 +374,15 @@ seal_trace_capture() {
   done
 }
 
-run_trace_oracle() {
+check_trace_invariants() {
   trace_dir_has_csv || return 0
-  ORACLE_RAN=1
+  INVARIANTS_CHECKED=1
   wait_for_trace_flush
-  log "running Zakura trace oracle"
-  local oracle_args=(
-    "--commit-elapsed-ms" "${ZAKURA_E2E_ORACLE_COMMIT_ELAPSED_MS:-1800000}"
-    "--persistent-lag-seconds" "${ZAKURA_E2E_ORACLE_PERSISTENT_LAG_SECONDS:-180}"
-    "--handoff-stall-seconds" "${ZAKURA_E2E_ORACLE_HANDOFF_STALL_SECONDS:-180}"
+  log "checking Zakura sync invariants"
+  local invariant_args=(
+    "--commit-elapsed-ms" "${ZAKURA_E2E_INVARIANT_COMMIT_ELAPSED_MS:-1800000}"
+    "--persistent-lag-seconds" "${ZAKURA_E2E_INVARIANT_PERSISTENT_LAG_SECONDS:-180}"
+    "--handoff-stall-seconds" "${ZAKURA_E2E_INVARIANT_HANDOFF_STALL_SECONDS:-180}"
     "--require-commit-node" "node2"
     "--require-commit-node" "node4"
     "--require-sync-node" "node1"
@@ -391,22 +391,22 @@ run_trace_oracle() {
     "--capture-run-id" "${ZAKURA_TRACE_CAPTURE_RUN}"
   )
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
-    oracle_args+=("--require-handoff-boundary")
+    invariant_args+=("--require-handoff-boundary")
   fi
   if [[ "${ZAKURA_E2E_REQUIRE_V7_IDS}" == "1" ]]; then
-    oracle_args+=("--require-v7-request-ids")
+    invariant_args+=("--require-v7-request-ids")
   fi
   if ! strict_upgrade; then
-    oracle_args+=("--optional-lag-node" "node4")
+    invariant_args+=("--optional-lag-node" "node4")
   fi
   local sealed=0
   if ! seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}"; then
-    # A crashed node cannot seal. Still print the oracle's diagnostics; the
+    # A crashed node cannot seal. Still print the invariant diagnostics; the
     # missing seal already makes the capture INCOMPLETE.
-    log "trace capture was not sealed; running the oracle for diagnostics"
+    log "trace capture was not sealed; checking invariants for diagnostics"
     sealed=1
   fi
-  python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}" || return
+  python3 "${SCRIPT_DIR}/sync_invariants.py" "${invariant_args[@]}" "${ZAKURA_E2E_TRACE_DIR}" || return
   return "${sealed}"
 }
 
@@ -414,8 +414,8 @@ cleanup() {
   local status=$?
   set +e
   snapshot_timeline "cleanup" || true
-  if [[ "${ORACLE_RAN}" != "1" ]]; then
-    run_trace_oracle
+  if [[ "${INVARIANTS_CHECKED}" != "1" ]]; then
+    check_trace_invariants
   fi
   log "node logs (tail)"
   docker compose -f "${COMPOSE_FILE}" logs --tail=30 || true
@@ -585,7 +585,7 @@ trace_line_count() {
 trace_rows_after() {
   local file="$1" lines_before="$2"
   [[ -f "${file}" ]] || return 0
-  python3 "${SCRIPT_DIR}/trace_oracle.py" --dump-csv "${file}" --after "${lines_before}"
+  python3 "${SCRIPT_DIR}/sync_invariants.py" --dump-csv "${file}" --after "${lines_before}"
 }
 
 # A reorg reaches block sync as a destructive reset of its body pipeline, traced
@@ -1048,7 +1048,7 @@ configure_node2_debug_stop() {
 
   # debug_stop_at_height exits from the state writer before the ordinary
   # block-sync driver can emit commit_finish. Preserve those intentional-stop
-  # traces as raw evidence, but keep them out of node2's strict-oracle stream.
+  # traces as raw evidence, but keep them out of node2's strict invariant input.
   rewrite_mounted_config_in_place \
     "s|^trace_dir = \"/traces/node2\"$|trace_dir = \"${debug_trace_dir}\"|; /^ephemeral = false$/a\\
 debug_stop_at_height = ${height}" \
@@ -1757,6 +1757,6 @@ if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
 fi
 
 assert_trace_layout
-run_trace_oracle
+check_trace_invariants
 
 log "PASS (${RUN_LABEL}): Zakura body frontier, peer serving, reorg survival, and legacy compatibility verified"

@@ -1,28 +1,28 @@
-PR #965 changes trace storage and the evidence consumed by the regtest oracle.
+PR #965 changes trace storage and the evidence consumed by the regtest sync invariant checks.
 The [original audit](https://github.com/zakura-core/zakura/pull/965#issuecomment-5627995452)
 reported seventeen findings. The review of head `79c7b5576` reproduced incorrect
 cross-process commit matching, reused finishes, false handoff timeouts, missing
 table coverage, and rotation-invalidated cursors.
 
 The root problem was an implicit completeness assumption. Production tracing can
-drop events when its queue fills. Rotation can delete earlier records. The oracle
+drop events when its queue fills. Rotation can delete earlier records. The invariant checks
 could not infer complete evidence from the remaining CSV files.
 
 The implementation keeps production tracing asynchronous and bounded. Validation
 captures use a fresh run ID, disable rotation, and publish writer counts and loss
 status. The harness seals each capture before a planned restart or final analysis.
 Each writer stops accepting events, drains reserved and queued events, syncs its
-files, and acknowledges the seal. The oracle requires those acknowledgements and
+files, and acknowledges the seal. The invariant checker requires those acknowledgements and
 compares loaded row counts with writer counts. An abrupt exit cannot supply a
-sealed capture. Debug-stop traces remain separate from the ordinary oracle input.
+sealed capture. Debug-stop traces remain separate from the ordinary invariant input.
 
 All emitters now share one process-wide monotonic origin. The CSV envelope includes
 `trace_version=2`, so readers reject captures with older clock semantics. The
-oracle partitions process-local checks by `process_trace_id`. The benchmark digest
+invariant checker partitions process-local checks by `process_trace_id`. The benchmark digest
 uses the latest process generation for latency calculations. Wall time remains
 available for cross-process correlation.
 
-The oracle and flush command share one ordered commit matcher. It scopes keys by
+The invariant checker and flush command share one ordered commit matcher. It scopes keys by
 process and source, consumes each finish once, and rejects unmatched or duplicate
 events. Required node/table coverage is separate from commit balance. The schema
 defines required fields for events consumed by the checks.
@@ -56,7 +56,7 @@ Readers hold the directory lock only while they open descriptors, so they never
 observe an append or rotation halfway through and never stall the writer. The Rust test reader runs after its writers stop.
 Row-count cursors reject rotated input. Complete validation captures never rotate.
 Production captures without completeness evidence support partial analysis
-within the import limits, but cannot produce a complete oracle PASS.
+within the import limits, but cannot produce a complete invariant PASS.
 
 The [trace README](../../crates/zakura-jsonl-trace/README.md) documents the commands,
 limits, platform requirements, and shutdown behavior. A timeout does not cancel an

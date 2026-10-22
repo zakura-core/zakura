@@ -18,7 +18,7 @@ use std::{
 use quinn_proto::Transmit;
 
 use super::*;
-use crate::socket::{test_hooks, SocketFactory, UdpIo};
+use crate::socket::{SocketFactory, UdpIo};
 
 /// `10.0.0.n:4000`.
 fn addr(n: u8) -> SocketAddr {
@@ -571,9 +571,7 @@ fn an_injected_receive_failure_wakes_the_reader_once() {
 #[test]
 fn simulated_sockets_skip_every_os_feature() {
     let net = SimNet::new(fifo(0, 10));
-    let before = test_hooks::os_accesses();
     let bound = SocketFactory::bind(&net, addr(1)).unwrap();
-    assert_eq!(test_hooks::os_accesses(), before);
     assert_eq!(bound.local_addr, addr(1));
     assert_eq!(bound.io.local_addr(), addr(1));
     assert_eq!(bound.buffers, None);

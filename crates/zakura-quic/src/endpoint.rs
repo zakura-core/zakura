@@ -277,8 +277,6 @@ impl QuicEndpoint {
             // SOCK-7: an injected socket has no inode to poll.
             #[cfg(target_os = "linux")]
             if socket.inode.is_some() {
-                #[cfg(test)]
-                crate::socket::test_hooks::note_os_access();
                 tokio::spawn(kernel_drop_poller(
                     Arc::downgrade(&slot),
                     config.kernel_drop_poll_interval(),
@@ -296,8 +294,6 @@ impl QuicEndpoint {
             .iter()
             .any(|socket| socket.slot.local_addr.ip().is_unspecified())
         {
-            #[cfg(test)]
-            crate::socket::test_hooks::note_os_access();
             tokio::spawn(watch_interfaces(
                 Arc::downgrade(&shared),
                 local_interface_ips,

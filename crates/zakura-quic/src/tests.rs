@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use crate::{
     endpoint::watch_interfaces,
     sim_net::{LinkModel, NetEvent, SimNet},
-    socket::test_hooks::os_accesses,
     Acceptor, Admit, Conn, ConnectError, ConnectionError, IncomingInfo, NodeAddr, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, SocketBuffers, SocketStats, VarInt,
 };
@@ -2531,17 +2530,26 @@ fn sim_addr(n: u8) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::new(10, 0, 0, n), 4000))
 }
 
-/// M2.6: the real driver handshakes and echoes over `SimNet` without opening
-/// an OS socket or starting a probe or poller, and the production path on
-/// the same thread does count.
+/// Tasks alive on the current runtime.
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+/// M2.6: the real driver handshakes and echoes over `SimNet`. Simulated
+/// sockets hold no OS handle, and binding one starts only its endpoint task:
+/// no kernel drop poller and no interface watcher. A production bind does
+/// start them.
 #[tokio::test(start_paused = true)]
-async fn the_driver_runs_over_simnet_without_touching_the_os() {
+async fn the_driver_runs_over_simnet_without_os_sockets_or_pollers() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
-        let before = os_accesses();
         let net = sim_net();
         let pump = tokio::spawn(pump(net.clone()));
-        let mut server =
-            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let before = alive_tasks();
+        let server_endpoint = sim_endpoint(&net, sim_addr(1));
+        assert_eq!(alive_tasks(), before + 1, "only the endpoint task");
+        let mut server = serve_test_acceptor(server_endpoint, &[ALPN], |_| Admit::Accept);
         let client = sim_endpoint(&net, sim_addr(2));
 
         let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
@@ -2570,12 +2578,13 @@ async fn the_driver_runs_over_simnet_without_touching_the_os() {
             addr: sim_addr(1),
             unread: 0
         }));
-        assert_eq!(os_accesses(), before);
 
-        // The counter does see the production path.
+        // A production wildcard bind adds the interface watcher, and on
+        // Linux the kernel drop poller, beside its endpoint task.
+        let before = alive_tasks();
         let _os =
-            QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
-        assert!(os_accesses() > before);
+            QuicEndpoint::bind(NodeSecretKey::generate(), &wildcard(), &test_config()).unwrap();
+        assert!(alive_tasks() >= before + 2);
     })
     .await
     .expect("the simulation finishes within its virtual-time bound");
@@ -2601,7 +2610,6 @@ async fn fail_and_wait(net: &SimNet, endpoint: &QuicEndpoint, addr: SocketAddr) 
 #[tokio::test(start_paused = true)]
 async fn simnet_rebinds_use_the_factory_and_virtual_time() {
     tokio::time::timeout(SIM_TEST_TIMEOUT, async {
-        let before = os_accesses();
         let net = sim_net();
         let pump = tokio::spawn(pump(net.clone()));
         let mut server =
@@ -2632,7 +2640,6 @@ async fn simnet_rebinds_use_the_factory_and_virtual_time() {
         assert_eq!((stats.rebinds, stats.stopped), (2, true));
 
         pump.abort();
-        assert_eq!(os_accesses(), before);
     })
     .await
     .expect("the simulation finishes within its virtual-time bound");

@@ -423,6 +423,41 @@ fn shutdown_finishes_a_release_sequence_in_a_drop() {
 }
 
 #[test]
+fn panic_in_a_leftover_drop_leaves_no_run_behind() {
+    use std::sync::Arc;
+    struct PanicOnDrop;
+    // `Waker::noop()` has no drop to panic in, so this needs its own waker.
+    #[allow(clippy::manual_noop_waker)]
+    impl std::task::Wake for PanicOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("leftover drop panicked");
+        }
+    }
+    let shutdown = std::panic::catch_unwind(|| {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let task = s.spawn_root(
+            "task",
+            poll_fn(|_| {
+                // Once this copy drops, the timer holds the last reference,
+                // so shutdown drops the waker as a leftover.
+                let waker = Waker::from(Arc::new(PanicOnDrop));
+                let deadline = SimInstant::from_start(std::time::Duration::from_secs(1));
+                hooks::register_timer(deadline, &waker);
+                Poll::<()>::Pending
+            }),
+        );
+        s.run(task.task());
+        s.shutdown()
+    });
+    assert!(shutdown.is_err(), "the leftover's drop panicked");
+    // Used to fail with "this thread already has a running Scheduler".
+    drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+}
+
+#[test]
 fn shutdown_force_unwinds_only_a_lock_cycle() {
     use zakura_scheduler::RunOutcome::Parked;
     let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);

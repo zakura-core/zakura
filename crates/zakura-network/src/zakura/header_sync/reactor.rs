@@ -246,7 +246,7 @@ enum StorageCompletion {
     /// An external driver's continuation-locator read settled.
     ///
     /// The driver answers each `QueryHeaderLocator` action by its exact
-    /// session, target tip, and scope. It bypasses [`LocatorQueries`] so that
+    /// session, target tip, and scope. It bypasses [`state::LocatorQueries`] so that
     /// every request still reaches the driver as its own action.
     #[cfg(any(test, feature = "zakura-testkit"))]
     ExternalLocator {
@@ -2223,7 +2223,7 @@ impl HeaderSyncReactor {
 
     /// Settle `key`'s locator read and use it for the peer's awaiting target.
     ///
-    /// See [`LocatorQueries::settle`] for when a read serves the target.
+    /// See [`state::LocatorQueries::settle`] for when a read serves the target.
     fn finish_header_locator_query(
         &mut self,
         key: LocatorKey,

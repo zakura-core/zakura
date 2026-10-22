@@ -24,18 +24,19 @@ use zakura_node_services::header_chain::{
 use super::super::{
     smallest_page,
     test_support::{p, record, HeaderTree, OUTCOME_CODES},
-    RegtestMessage,
+    Cursor, HeadersOutcome, Operation, RegtestMessage, SUBSCRIBE_HEADERS,
 };
-use super::*;
+use super::{state::in_window, *};
 use crate::zakura::{
     framed_channel,
     header_sync::config::REGTEST_HEADER_BYTES,
-    regulation::{ServeCapacity, ServeLimits, Subscriptions},
+    regulation::{ServeCapacity, ServeLimits, SubscriptionLimits, Subscriptions},
     wire_codec::decode_frame,
-    Credit, FramedRecv, ZakuraPeerId,
+    Credit, Frame, FramedRecv, ZakuraPeerId,
 };
 
 mod load;
+mod state_machine;
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -1276,14 +1277,14 @@ async fn a_queued_outcome_wins_over_a_later_close() {
         assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
         shared.end_due::<HB>()
     };
-    let [(ended_id, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
-    assert_eq!(ended_id, id);
+    let [Terminal { frame, .. }] = <[_; 1]>::try_from(ended).expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {
+            subscription_id,
             outcome: HeadersOutcomeCode::SubscriptionSuperseded,
             ..
-        }))
+        })) if subscription_id == id
     ));
 }
 
@@ -1981,28 +1982,23 @@ async fn a_capacity_stalled_follower_is_superseded_by_a_lower_tip() {
 
 /// An outcome a job finds after `Close` arrived gives way to
 /// `SubscriptionClosed`.
-#[tokio::test(start_paused = true)]
-async fn close_wins_over_an_outcome_found_after_it() {
-    let port = FakePort::new(Semaphore::MAX_PERMITS);
-    let chain = port.grow(2);
-    let mut harness = Harness::new(port.clone(), serve_limits());
-    let id = harness
-        .open(chain[1].hash, vec![chain[1]], credit(), AuxSchema::None)
-        .await;
-    assert!(harness.deliver_all().await.is_empty());
-    let close = harness
-        .subscriber
-        .close()
-        .expect("the subscription is live");
-    // The task has not run between these, so both reach `end_due` together.
-    let ended = {
-        let mut shared = lock(&harness.publisher.shared);
-        assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
-        shared.finish(id, found, false);
-        shared.end_due::<HB>()
-    };
-    let [(_, frame, _terminal)] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+#[test]
+fn close_wins_over_an_outcome_found_after_it() {
+    let genesis = Frontier::new(block::Height(0), block::Hash([1; 32]));
+    let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
+    let mut state = PublisherState::new();
+    let mut subscriber = Subscriber::new();
+    let open = subscriber.open(target.hash, vec![genesis], credit(), AuxSchema::None);
+    assert_eq!(state.apply(&open, limits()), Ok(Applied::Live));
+    let job = state
+        .next_job::<HB>(None, limits())
+        .expect("the path has a page to read");
+    let close = subscriber.close().expect("the subscription is live");
+    assert_eq!(state.apply(&close, limits()), Ok(Applied::Live));
+    let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
+    state.finish(job.key, found, None);
+    let ended = state.end_due::<HB>();
+    let [Terminal { frame, .. }] = <[_; 1]>::try_from(ended).expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {

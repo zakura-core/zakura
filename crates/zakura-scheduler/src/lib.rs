@@ -144,15 +144,14 @@ pub enum Op {
     Abort,
     /// A `watch` read or write.
     Watch,
-    /// A random draw from `rng()`.
-    Draw,
 }
 
 /// What a random choice is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum DrawKind {
-    /// A value from `zakura_rt::rand::rng()`.
+    /// The seed of the run's `zakura_rt::rand::rng()` stream, drawn once by
+    /// the first value.
     Rng,
     /// The first branch an unbiased `select!` polls.
     Select,
@@ -198,7 +197,6 @@ impl Op {
             Op::Yield => "yield",
             Op::Abort => "abort",
             Op::Watch => "watch",
-            Op::Draw => "draw",
         }
     }
 }

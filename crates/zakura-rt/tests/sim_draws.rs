@@ -14,25 +14,20 @@ use zakura_rt::{
 };
 
 #[test]
-fn rng_values_are_draws_with_points() {
-    let ((bytes, small), report) = run(async {
+fn rng_values_come_from_one_seeded_stream() {
+    let ((bytes, words), report) = run(async {
         let mut rng = rand::rng();
         let mut bytes = [0u8; 12];
         rng.fill_bytes(&mut bytes);
-        (bytes, rng.next_u32())
+        // A second handle continues the same run's stream.
+        let mut other = rand::rng();
+        (bytes, [rng.next_u32(), other.next_u32()])
     });
-    // The stand-in answers each draw with how many came before.
-    assert_eq!(bytes, [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
-    assert_eq!(small, 2);
-    assert_eq!(
-        report.draws,
-        [
-            (DrawKind::Rng, 0),
-            (DrawKind::Rng, 0),
-            (DrawKind::Rng, 1 << 32)
-        ]
-    );
-    assert_eq!(report.count(Op::Draw), 3);
+    // The stand-in answers the one draw with 0, as an exhausted `Plan` does.
+    assert_ne!(bytes, [0; 12]);
+    assert_ne!(words[0], words[1]);
+    assert_eq!(report.draws, [(DrawKind::Rng, 0)], "one seed for the run");
+    assert!(report.points.is_empty(), "values aren't preemption points");
 }
 
 #[test]

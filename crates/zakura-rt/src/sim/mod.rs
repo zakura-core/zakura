@@ -169,6 +169,7 @@ pub fn enter(executor: &'static dyn Executor) -> RunGuard {
         cell.set(Some(Run { executor, id }));
     });
     crate::collections::reset_run_seed();
+    crate::rand::reset_run_stream();
     RunGuard {
         _not_send: PhantomData,
     }
@@ -185,6 +186,7 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         let _ = RUN.try_with(|cell| cell.set(None));
         crate::collections::reset_run_seed();
+        crate::rand::reset_run_stream();
     }
 }
 
@@ -309,15 +311,14 @@ pub enum Op {
     Yield,
     /// A `watch` read or write.
     Watch,
-    /// A random draw from `rng()`.
-    Draw,
 }
 
 /// Where a random choice comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum DrawKind {
-    /// A value from `zakura_rt::rand::rng()`.
+    /// The seed of the run's `zakura_rt::rand::rng()` stream, drawn once by
+    /// the first value.
     Rng,
     /// The first branch an unbiased `select!` polls.
     Select,

@@ -621,7 +621,8 @@ fn drawing_run(seed: u64) -> (Vec<zakura_scheduler::Draw>, u64, Vec<u32>) {
 #[test]
 fn draws_reach_the_scheduler_draw_source() {
     let (draws, value, order) = drawing_run(7);
-    assert_eq!(value, 7);
+    assert_eq!(value, drawing_run(7).1, "the stream replays from its seed");
+    assert_ne!(value, drawing_run(8).1, "the seed changes the stream");
     let kinds: Vec<_> = draws.iter().map(|d| (d.kind, d.bound)).collect();
     assert_eq!(
         kinds,
@@ -656,4 +657,55 @@ fn select_point_reports_the_callers_site() {
     assert_eq!(at.op, zakura_scheduler::Op::Select);
     let site = at.site.expect("a select point has a site");
     assert!(site.file().ends_with("tests/rt.rs"), "{site}");
+}
+
+/// Runs `f` as one task on a scheduler with no draw source, so every `Plan`
+/// draw answers 0, as once a fuzz input's bytes run out.
+fn with_zero_draws<T: 'static>(f: impl FnOnce() -> T + 'static) -> T {
+    let out = Rc::new(RefCell::new(None));
+    let result = out.clone();
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let root = sched.spawn_root("root", async move {
+        *result.borrow_mut() = Some(f());
+    });
+    while sched.status() == Status::Running {
+        sched.run(root.task());
+    }
+    sched.shutdown();
+    let value = out.borrow_mut().take();
+    value.expect("the task ran to completion")
+}
+
+#[test]
+fn rng_values_are_not_stuck_at_zero_when_draws_are() {
+    use rand_10::Rng;
+    // The handler's session seed loops until it draws a nonzero value, so a
+    // stream stuck at 0 hung it.
+    let values = with_zero_draws(|| {
+        let mut rng = zakura_rt::rand::rng();
+        (0..4).map(|_| rng.next_u64()).collect::<Vec<_>>()
+    });
+    assert!(values.iter().all(|v| *v != 0), "{values:?}");
+}
+
+#[test]
+fn rng_ranges_and_shuffles_spread_when_draws_are_zero() {
+    use rand_10::{seq::SliceRandom, RngExt};
+    let (digits, shuffles) = with_zero_draws(|| {
+        let mut rng = zakura_rt::rand::rng();
+        let digits: std::collections::BTreeSet<u32> =
+            (0..1_000).map(|_| rng.random_range(0..10)).collect();
+        let shuffles: std::collections::BTreeSet<Vec<u8>> = (0..1_000)
+            .map(|_| {
+                let mut values: Vec<u8> = (0..8).collect();
+                values.shuffle(&mut rng);
+                values
+            })
+            .collect();
+        (digits, shuffles.len())
+    });
+    // One-byte draws used to make `random_range(0..10)` always 0, and an
+    // 8-element shuffle reach only 29 of its 40,320 orders.
+    assert_eq!(digits.len(), 10);
+    assert!(shuffles > 900, "{shuffles} distinct shuffles");
 }

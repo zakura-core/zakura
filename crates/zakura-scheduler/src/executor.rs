@@ -121,6 +121,7 @@ impl rt::Executor for SchedulerExecutor {
             rt::DrawKind::Rng => DrawKind::Rng,
             rt::DrawKind::Select => DrawKind::Select,
             rt::DrawKind::HashSeed => DrawKind::HashSeed,
+            rt::DrawKind::StreamMap => DrawKind::StreamMap,
             other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
         };
         hooks::draw(kind, site.site, bound)

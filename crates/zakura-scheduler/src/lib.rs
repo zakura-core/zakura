@@ -157,6 +157,8 @@ pub enum DrawKind {
     Select,
     /// The run's hash seed, drawn once by the first hashed collection.
     HashSeed,
+    /// The first stream a `StreamMap` polls.
+    StreamMap,
 }
 
 /// A random choice the run asks its draw source for. See

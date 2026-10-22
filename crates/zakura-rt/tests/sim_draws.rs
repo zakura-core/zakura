@@ -158,3 +158,25 @@ async fn select_outside_a_run_is_tokio() {
     };
     assert_eq!(won, 1);
 }
+
+#[test]
+fn stream_map_starts_where_the_plan_says() {
+    let (keys, report) = run(async {
+        use tokio_stream::StreamExt;
+
+        // Taking the run's rng seed first makes the map's draws 1, 2, 3, 4,
+        // which start the polls at entries 1, 2, 0 and 1 of 3.
+        let _ = rand::rng().next_u32();
+        let mut map = zakura_rt::stream::StreamMap::new();
+        for key in 0..3 {
+            map.insert(key, tokio_stream::iter([key, key]));
+        }
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            keys.push(map.next().await.expect("every stream has two items").0);
+        }
+        keys
+    });
+    assert_eq!(keys, [1, 2, 0, 1]);
+    assert_eq!(&report.draws[1..], [(DrawKind::StreamMap, 3); 4]);
+}

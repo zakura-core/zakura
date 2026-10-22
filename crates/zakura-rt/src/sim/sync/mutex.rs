@@ -13,7 +13,9 @@ use std::{
     sync::{LockResult, PoisonError, TryLockError, TryLockResult},
 };
 
-use crate::sim::{executor, executor_for, point, run_id, ObjectId, Op, Point, RunId, TaskId};
+use crate::sim::{
+    executor, executor_for, point, preempt, run_id, ObjectId, Op, Point, RunId, TaskId,
+};
 
 /// A std-style mutex that parks contended tasks on the scheduler.
 pub struct Mutex<T: ?Sized> {
@@ -63,11 +65,14 @@ impl<T: ?Sized> Mutex<T> {
             return wrap(self.inner.lock(), self, site);
         };
         let object = self.object();
-        executor.preempt(Point {
-            op: Op::Lock,
-            object: Some(object),
-            site,
-        });
+        preempt(
+            executor,
+            Point {
+                op: Op::Lock,
+                object: Some(object),
+                site,
+            },
+        );
         loop {
             match self.inner.try_lock() {
                 Ok(guard) => return Ok(self.guard(guard, site)),
@@ -100,11 +105,14 @@ impl<T: ?Sized> Mutex<T> {
     pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
         let site = Location::caller();
         if let Some(executor) = executor() {
-            executor.preempt(Point {
-                op: Op::Lock,
-                object: Some(self.object()),
-                site,
-            });
+            preempt(
+                executor,
+                Point {
+                    op: Op::Lock,
+                    object: Some(self.object()),
+                    site,
+                },
+            );
         }
         match self.inner.try_lock() {
             Ok(guard) => Ok(self.guard(guard, site)),

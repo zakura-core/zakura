@@ -71,6 +71,10 @@ pub mod collections;
 #[path = "sim/rand.rs"]
 pub mod rand;
 
+#[cfg(zakura_sim)]
+#[path = "sim/stream.rs"]
+pub mod stream;
+
 /// Tasks.
 #[cfg(not(zakura_sim))]
 pub mod task {
@@ -122,10 +126,14 @@ pub mod time {
 
 /// Synchronization.
 ///
-/// `Mutex` is the std mutex. Tokio's mutex is `AsyncMutex`.
+/// `Mutex` is the std mutex. Tokio's mutex is `AsyncMutex`. `Weak` is std's,
+/// made with [`downgrade`](sync::downgrade) so the simulator build can give it
+/// preemption points.
 #[cfg(not(zakura_sim))]
 pub mod sync {
-    pub use std::sync::{atomic, Mutex, MutexGuard, PoisonError};
+    use std::sync::Arc;
+
+    pub use std::sync::{atomic, Mutex, MutexGuard, PoisonError, Weak};
     pub use tokio::sync::{
         broadcast, futures, mpsc, oneshot, watch, Barrier, Mutex as AsyncMutex, Notify,
         OwnedSemaphorePermit, Semaphore,
@@ -138,6 +146,12 @@ pub mod sync {
     pub mod counter {
         pub use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     }
+
+    /// A weak pointer to `this`: `Arc::downgrade`, returning this module's
+    /// [`Weak`].
+    pub fn downgrade<T: ?Sized>(this: &Arc<T>) -> Weak<T> {
+        Arc::downgrade(this)
+    }
 }
 
 /// Hashed collections, whose iteration order depends on a random seed.
@@ -147,6 +161,7 @@ pub mod collections {
 }
 
 /// Streams.
+#[cfg(not(zakura_sim))]
 pub mod stream {
     pub use tokio_stream::StreamMap;
 }

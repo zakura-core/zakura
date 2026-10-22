@@ -97,7 +97,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    executor.preempt(Point::at(Op::Spawn, site));
+    sim::preempt(executor, Point::at(Op::Spawn, site));
     let output = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&output);
     let task = spawn_task(
@@ -296,7 +296,7 @@ impl AbortHandle {
             AbortInner::Sim(run, task) => {
                 // After the run ends there's nothing left to abort.
                 if let Some(executor) = sim::executor_for(*run) {
-                    executor.preempt(Point::at(Op::Abort, site));
+                    sim::preempt(executor, Point::at(Op::Abort, site));
                     executor.abort(*task);
                 }
             }
@@ -308,7 +308,7 @@ impl AbortHandle {
         match &self.inner {
             AbortInner::Tokio(handle) => handle.is_finished(),
             AbortInner::Sim(run, task) => sim::executor_for(*run).is_none_or(|executor| {
-                executor.preempt(Point::at(Op::Join, site));
+                sim::preempt(executor, Point::at(Op::Join, site));
                 executor.is_finished(*task)
             }),
         }

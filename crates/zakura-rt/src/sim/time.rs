@@ -304,7 +304,7 @@ impl Future for Sleep {
         // deadline has already passed. A later poll that finds the deadline
         // passed is the expiry point.
         if first || sleep.deadline.since_base() <= executor.now() {
-            executor.preempt(Point::at(Op::Sleep, sleep.site));
+            sim::preempt(executor, Point::at(Op::Sleep, sleep.site));
         }
         if sleep.deadline.since_base() <= executor.now() {
             sleep.cancel();

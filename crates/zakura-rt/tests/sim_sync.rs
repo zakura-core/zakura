@@ -74,7 +74,11 @@ fn mpsc_points_before_each_operation_and_after_a_released_slot() {
         "send, try_reserve, reserve, is_closed"
     );
     assert_eq!(report.count(Op::Recv), 2, "recv, try_recv");
-    assert_eq!(report.count(Op::Release), 1, "the unused permit");
+    assert_eq!(
+        report.count(Op::Release),
+        3,
+        "the unused permit, and both halves closing the channel at the end"
+    );
 }
 
 #[test]
@@ -82,8 +86,9 @@ fn owned_permit_send_is_not_a_release() {
     let (value, report) = run(async {
         let (tx, mut rx) = mpsc::channel(1);
         let tx = tx.reserve_owned().await.unwrap().send(7);
-        drop(tx);
-        rx.recv().await
+        let value = rx.recv().await;
+        std::mem::forget((tx, rx));
+        value
     });
     assert_eq!(value, Some(7));
     assert_eq!(report.count(Op::Release), 0);
@@ -306,4 +311,89 @@ fn sim_atomics_cover_the_rest_of_std() {
     assert_eq!(report.count(Op::AtomicRmw), 2, "fetch_nand and fetch_not");
     assert_eq!(report.count(Op::AtomicStore), 1);
     assert_eq!(report.count(Op::AtomicLoad), 1, "the fence is no point");
+}
+
+#[test]
+fn closing_drops_are_releases() {
+    let ((), report) = run(async {
+        let (tx, rx) = mpsc::channel::<u8>(1);
+        let spare = tx.clone();
+        drop(tx);
+        drop(spare);
+        drop(rx);
+        let (tx, rx) = mpsc::unbounded_channel::<u8>();
+        drop(rx);
+        drop(tx);
+        let (sent, unsent) = (oneshot::channel::<u8>(), oneshot::channel::<u8>());
+        sent.0.send(1).unwrap();
+        drop(unsent.0);
+        let (tx, _rx) = watch::channel(0);
+        let spare = tx.clone();
+        drop(tx);
+        drop(spare);
+    });
+    assert_eq!(
+        report.count(Op::Release),
+        6,
+        "the last bounded sender, its receiver, both unbounded halves, the \
+         unsent oneshot sender and the last watch sender"
+    );
+}
+
+#[test]
+fn gating_reads_are_points() {
+    let ((), report) = run(async {
+        let (tx, rx) = mpsc::channel::<u8>(2);
+        assert_eq!(tx.capacity() + rx.capacity(), 4);
+        let semaphore = Semaphore::new(1);
+        assert!(!semaphore.is_closed());
+        let owner = Arc::new(5);
+        let weak = zakura_rt::sync::downgrade(&owner);
+        assert_eq!(weak.strong_count(), 1);
+        assert_eq!(weak.upgrade().as_deref(), Some(&5));
+        let (watched, _rx) = watch::channel(0);
+        drop(watched.subscribe());
+        std::mem::forget((tx, rx));
+    });
+    assert_eq!(report.count(Op::Send), 1, "the sender's capacity");
+    assert_eq!(report.count(Op::Recv), 1, "the receiver's capacity");
+    assert_eq!(report.count(Op::Acquire), 1, "is_closed");
+    assert_eq!(report.count(Op::AtomicLoad), 1, "strong_count");
+    assert_eq!(report.count(Op::AtomicRmw), 1, "upgrade");
+    assert_eq!(report.count(Op::Watch), 1, "subscribe");
+}
+
+#[test]
+fn points_are_skipped_while_a_watch_lock_is_held() {
+    let (skipped, report) = run(async {
+        let (tx, mut rx) = watch::channel(0);
+        let flag = AtomicBool::new(false);
+        {
+            let value = rx.borrow_and_update();
+            // A switch here could run a writer, which would block on the
+            // read lock this task holds.
+            flag.store(*value == 0, Ordering::Relaxed);
+        }
+        tx.send_modify(|value| {
+            flag.store(true, Ordering::Relaxed);
+            *value += 1;
+        });
+        let seen = *rx
+            .wait_for(|value| flag.load(Ordering::Relaxed) && *value == 1)
+            .await
+            .unwrap();
+        assert_eq!(seen, 1);
+        flag.load(Ordering::Relaxed);
+        zakura_rt::sim::suppressed_points()
+    });
+    assert_eq!(
+        skipped, 3,
+        "the store under the Ref, the store in send_modify and the load in wait_for"
+    );
+    assert_eq!(report.count(Op::AtomicStore), 0);
+    assert_eq!(
+        report.count(Op::AtomicLoad),
+        1,
+        "only the load after the locks"
+    );
 }

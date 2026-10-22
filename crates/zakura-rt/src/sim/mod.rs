@@ -107,6 +107,11 @@ struct Run {
 
 thread_local! {
     static RUN: Cell<Option<Run>> = const { Cell::new(None) };
+    /// How many `watch` locks this thread holds now. See [`WatchLockHeld`].
+    static WATCH_LOCKS: Cell<u32> = const { Cell::new(0) };
+    /// Points skipped in the current or last run because a `watch` lock was
+    /// held.
+    static SUPPRESSED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The next [`RunId`]. Process-wide, so an id never repeats on any thread.
@@ -173,6 +178,7 @@ pub fn enter(executor: &'static dyn Executor) -> RunGuard {
         let id = RunId(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
         cell.set(Some(Run { executor, id }));
     });
+    let _ = SUPPRESSED.try_with(|cell| cell.set(0));
     crate::collections::reset_run_seed();
     crate::rand::reset_run_stream();
     RunGuard {
@@ -327,6 +333,8 @@ pub enum DrawKind {
     Select,
     /// The run's hash seed, drawn once by the first hashed collection.
     HashSeed,
+    /// The first stream a `StreamMap` polls.
+    StreamMap,
 }
 
 /// A random choice's kind and the source location that asked for it.
@@ -373,7 +381,50 @@ impl Point {
 /// it does nothing, so the wrapper behaves like the type it wraps.
 pub(crate) fn point(op: Op, site: &'static Location<'static>) {
     if let Some(executor) = executor() {
-        executor.preempt(Point::at(op, site));
+        preempt(executor, Point::at(op, site));
+    }
+}
+
+/// `executor`'s preemption point, unless this thread holds a `watch` lock.
+///
+/// Every runtime primitive preempts through here. Tokio's `watch` keeps its
+/// value behind a std `RwLock`, so a switch to a task that writes the value
+/// would block the run's only thread. While a `watch` `Ref` or
+/// `send_modify` closure holds that lock, points are skipped and counted in
+/// [`suppressed_points`].
+pub(crate) fn preempt(executor: &dyn Executor, point: Point) {
+    if WATCH_LOCKS.try_with(Cell::get).unwrap_or(0) > 0 {
+        let _ = SUPPRESSED.try_with(|cell| cell.set(cell.get().saturating_add(1)));
+        return;
+    }
+    executor.preempt(point);
+}
+
+/// How many preemption points the current run on this thread, or the last
+/// one, skipped because a `watch` lock was held. A harness can read it to see
+/// how much of a run went unexplored.
+pub fn suppressed_points() -> u64 {
+    SUPPRESSED.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Marks this thread as holding a `watch` lock until it drops. See
+/// [`preempt`].
+///
+/// A `Ref` isn't `Send`, so a spawned task can't hold one across an await,
+/// and the count never leaks into another task's poll.
+pub(crate) struct WatchLockHeld(PhantomData<*const ()>);
+
+impl WatchLockHeld {
+    /// Counts one more held `watch` lock on this thread.
+    pub(crate) fn new() -> Self {
+        let _ = WATCH_LOCKS.try_with(|cell| cell.set(cell.get().saturating_add(1)));
+        WatchLockHeld(PhantomData)
+    }
+}
+
+impl Drop for WatchLockHeld {
+    fn drop(&mut self) {
+        let _ = WATCH_LOCKS.try_with(|cell| cell.set(cell.get().saturating_sub(1)));
     }
 }
 
@@ -394,17 +445,18 @@ pub fn select_start(branches: u32, biased: bool) -> u32 {
     if biased {
         return 0;
     }
+    start_index(DrawKind::Select, site, branches)
+}
+
+/// A start index below `n` for a `kind` choice at `site`: a draw from the
+/// run's `Plan` inside a run, or tokio's thread RNG outside one, as in
+/// production. `n` must be nonzero.
+pub(crate) fn start_index(kind: DrawKind, site: &'static Location<'static>, n: u32) -> u32 {
     match executor() {
         Some(executor) => {
-            let start = executor.draw(
-                DrawSite {
-                    kind: DrawKind::Select,
-                    site,
-                },
-                u64::from(branches),
-            );
-            u32::try_from(start).expect("a draw below `branches` fits in u32")
+            let start = executor.draw(DrawSite { kind, site }, u64::from(n));
+            u32::try_from(start).expect("a draw below `n` fits in u32")
         }
-        None => tokio::macros::support::thread_rng_n(branches),
+        None => tokio::macros::support::thread_rng_n(n),
     }
 }

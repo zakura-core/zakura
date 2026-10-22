@@ -1,8 +1,9 @@
 //! Tokio's `Semaphore` with preemption points, simulator build.
 //!
-//! Each acquire and each `available_permits` read is a point, and so is the
-//! moment right after permits go back. Tokio's semaphore stays fair: a release
-//! hands permits to waiters in the order they asked, as in production.
+//! Each acquire and each `available_permits` or `is_closed` read is a point,
+//! and so is the moment right after permits go back. Tokio's semaphore stays
+//! fair: a release hands permits to waiters in the order they asked, as in
+//! production.
 
 use std::{fmt, future::Future, panic::Location, sync::Arc};
 
@@ -174,7 +175,9 @@ impl Semaphore {
     }
 
     /// True once closed.
+    #[track_caller]
     pub fn is_closed(&self) -> bool {
+        point(Op::Acquire, Location::caller());
         self.inner.is_closed()
     }
 }

@@ -84,6 +84,22 @@ fn owned_permit_send_is_not_a_release() {
     });
     assert_eq!(value, Some(7));
     assert_eq!(report.count(Op::Release), 0);
+    assert_eq!(report.count(Op::Send), 2, "reserve_owned, send");
+}
+
+#[test]
+fn each_send_through_a_reserved_permit_is_a_point() {
+    // Without a point per send, two sends through reserved permits ran as
+    // one step, so a consumer could never run between them.
+    let (received, report) = run(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        for (permit, value) in tx.try_reserve_many(2).unwrap().zip([1, 2]) {
+            permit.send(value);
+        }
+        (rx.recv().await, rx.recv().await)
+    });
+    assert_eq!(received, (Some(1), Some(2)));
+    assert_eq!(report.count(Op::Send), 3, "try_reserve_many, two sends");
 }
 
 #[test]

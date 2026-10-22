@@ -263,6 +263,22 @@ const STACK_POOL_LIMIT: usize = 1024;
 /// past it are force-unwound instead, so cleanup always ends.
 const DRAIN_STEP_LIMIT: usize = 100_000;
 
+/// Takes this thread's run state when dropped, even if shutdown panics, so
+/// later runs on the thread can still start. During a panic it leaks what the
+/// state still holds, since dropping that could panic again and abort.
+struct ClearRun;
+
+impl Drop for ClearRun {
+    fn drop(&mut self) {
+        let state = RUN.with(|r| r.borrow_mut().take());
+        if std::thread::panicking() {
+            std::mem::forget(state);
+        } else {
+            drop(state);
+        }
+    }
+}
+
 /// Runs `f` on this thread's run state, or returns `None` outside a run.
 pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
     RUN.with(|r| r.borrow_mut().as_mut().map(f))
@@ -635,6 +651,7 @@ impl Scheduler {
             return CleanupReport::default();
         }
         self.shut_down = true;
+        let clear_run = ClearRun;
         let timers_left = self.state(|s| {
             s.shutting_down = true;
             let live = (0..s.tasks.len())
@@ -690,8 +707,9 @@ impl Scheduler {
             }
             drop(left);
         }
-        let state = RUN.with(|r| r.borrow_mut().take());
-        drop(state);
+        drop(clear_run);
+        // After the state, so destructors above still found `zakura-rt`'s
+        // executor. On a panic, dropping the `Scheduler` drops this instead.
         #[cfg(zakura_sim)]
         drop(self.rt_run.take());
         report

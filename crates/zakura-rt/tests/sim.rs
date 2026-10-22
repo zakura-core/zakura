@@ -316,7 +316,10 @@ fn yield_now_is_pending_once_and_wakes_itself() {
     });
     // The second poll only happens because the first one woke the task.
     assert_eq!(polls, [false, true]);
-    assert_eq!(report.count(Op::Yield), 0);
+    assert!(
+        report.points.is_empty(),
+        "yield_now isn't a preemption point"
+    );
 }
 
 #[test]

@@ -143,7 +143,6 @@ fn op_from_rt(op: rt::Op) -> Op {
         rt::Op::Abort => Op::Abort,
         rt::Op::Sleep => Op::Sleep,
         rt::Op::Select => Op::Select,
-        rt::Op::Yield => Op::Yield,
         rt::Op::Watch => Op::Watch,
         other => panic!("zakura-scheduler has no counterpart for zakura-rt's {other:?} yet"),
     }

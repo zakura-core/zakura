@@ -307,8 +307,6 @@ pub enum Op {
     Sleep,
     /// Polling the branches of a `select!`.
     Select,
-    /// `yield_now`.
-    Yield,
     /// A `watch` read or write.
     Watch,
 }

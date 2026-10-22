@@ -17,6 +17,8 @@ use super::{
 mod liveness;
 mod requests;
 mod status;
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 pub(super) use liveness::{liveness_grace_allowed, no_progress_response};

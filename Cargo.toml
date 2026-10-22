@@ -342,6 +342,11 @@ debug = "line-tables-only"
 [profile.release.package."*"]
 # Disable debug info for dependencies to reduce binary size.
 debug = false
+# Dependencies rarely rebuild and compile in parallel with each other, so one
+# codegen unit each costs little build time. It removes the extra per-unit
+# copies of the generic code they use, shrinking zakurad's .text by about 2%.
+# Workspace crates keep 4 units so edit-and-rebuild stays parallel.
+codegen-units = 1
 
 [profile.ci-tests]
 inherits = "release"

@@ -110,7 +110,12 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.repo_dir.mkdir()
             config.paths.config_template.write_text("")
             config.paths.wipe_sentinel.write_text("")
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+            usage = sync.shutil.disk_usage(Path(tmp))
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(sync.shutil, "disk_usage", return_value=usage._replace(free=100 * 1024**3)),
+                patch.dict(os.environ, {}, clear=True),
+            ):
                 with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
                     sync.preflight(config)
                 with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
@@ -666,8 +671,12 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.repo_dir.mkdir()
             config.paths.config_template.write_text("", encoding="utf-8")
             config.paths.wipe_sentinel.write_text("", encoding="utf-8")
+            usage = sync.shutil.disk_usage(tmp_path)
 
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which:
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which,
+                patch.object(sync.shutil, "disk_usage", return_value=usage._replace(free=100 * 1024**3)),
+            ):
                 sync.preflight(config)
 
             self.assertEqual(

@@ -14,9 +14,9 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected three days after the committed October 19, 2026 Mainnet
+/// Projected three days after the committed October 21, 2026 Mainnet
 /// release-state bundle at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_525_116;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_527_516;
 
 /// The estimated number of blocks per day at the post-Blossom target spacing.
 ///
@@ -42,12 +42,13 @@ pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
 /// The last Mainnet height supported by this release.
 ///
-/// The next block projects to December 4, 2026 at 23:59:59 UTC using Mainnet
-/// height 3,490,665 at September 22, 2026 at 05:46:39 UTC, 75-second blocks
-/// through height 3,543,404, and 25-second blocks from the ZIP 259 NU7
-/// activation at height 3,543,405. This fixes EOS at approximately December 5
-/// even if release preparation advances [`ESTIMATED_RELEASE_HEIGHT`].
-/// Enforcement follows height, not time.
+/// The next block projects to December 3, 2026 at 20:43:17 UTC using Mainnet
+/// height 3,490,665 at its block timestamp, September 21, 2026 at 02:29:57
+/// UTC, 75-second blocks through height 3,543,404, and 25-second blocks from
+/// the ZIP 259 NU7 activation at height 3,543,405. This fixes EOS at
+/// approximately December 4, before the December 5 deadline, even if release
+/// preparation advances [`ESTIMATED_RELEASE_HEIGHT`]. Enforcement follows
+/// height, not time.
 ///
 /// Earlier releases deliberately halted before the expected NU7 activation.
 /// This release follows the activation, so its support window extends about
@@ -249,12 +250,12 @@ mod tests {
             Some(MAINNET_EOS_HEIGHT),
         );
         // 42 days of estimated blocks cross the ZIP 259 NU7 activation:
-        // 18,288 blocks at 75 seconds reach the block before activation
-        // (3,543,404) in 1,371,600 seconds, and the remaining 2,257,200
-        // seconds add 90,288 blocks at 25 seconds.
+        // 15,888 blocks at 75 seconds reach the block before activation
+        // (3,543,404) in 1,191,600 seconds, and the remaining 2,437,200
+        // seconds add 97,488 blocks at 25 seconds.
         assert_eq!(
             estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
-            Height(3_633_692),
+            Height(3_640_892),
         );
     }
 

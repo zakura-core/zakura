@@ -1,11 +1,9 @@
 //! Registry for Zakura protocol services and their declared streams.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use thiserror::Error;
+use zakura_rt::collections::{HashMap, HashSet};
 
 use super::{
     Frame, LayoutError, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,

@@ -15,6 +15,8 @@
 //! byte budget, and work queue directly and emit `SubmitBlock`/`Misbehavior`
 //! actions on the same channel the reactor uses.
 
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
+
 use super::{
     events::*,
     peer_registry::{retry_deadline_instant, PeerRegistry},
@@ -62,8 +64,8 @@ impl SequencedBody {
         bytes: u64,
         peer: ZakuraPeerId,
         received_at: Instant,
-        input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_bytes: Arc<AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = body.decoded_attributed_memory_size_bytes();
         Self {
@@ -93,18 +95,18 @@ impl SequencedBody {
 
 #[derive(Debug)]
 struct SequencerInputAccounting {
-    input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    input_bytes: Arc<AtomicU64>,
     bytes: u64,
-    input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     decoded_attributed_memory_size_bytes: u64,
     active: bool,
 }
 
 impl SequencerInputAccounting {
     fn new(
-        input_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_bytes: Arc<AtomicU64>,
         bytes: u64,
-        input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         add_atomic_bytes(&input_bytes, bytes);
@@ -283,8 +285,8 @@ pub(super) struct SequencerTask {
     retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
     body_input_rx: mpsc::Receiver<SequencedBody>,
     control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
-    _body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    _body_input_bytes: Arc<AtomicU64>,
+    body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     view_tx: watch::Sender<SequencerView>,
     action_send_timeout: Duration,
     submission_retry_at: Option<time::Instant>,
@@ -321,8 +323,8 @@ impl SequencerTask {
         retry_jitter: crate::zakura::header_sync::SeededRetryJitter,
         body_input_rx: mpsc::Receiver<SequencedBody>,
         control_input_rx: mpsc::UnboundedReceiver<SequencerControlInput>,
-        body_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        body_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        body_input_bytes: Arc<AtomicU64>,
+        body_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         view_tx: watch::Sender<SequencerView>,
         action_send_timeout: Duration,
         trace: ZakuraTrace,
@@ -383,7 +385,7 @@ impl SequencerTask {
                 break;
             }
             let submission_retry_at = self.submission_retry_at;
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
 
                 input = self.control_input_rx.recv(), if control_open => {
@@ -1175,7 +1177,7 @@ impl SequencerTask {
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(Ordering::Relaxed);
         let reorder_decoded_attributed_memory_bytes =
             self.sequencer.reorder_decoded_attributed_memory_bytes();
         let applying_decoded_attributed_memory_bytes =
@@ -1224,7 +1226,7 @@ impl SequencerTask {
     fn publish_decoded_ownership_view(&self) {
         let sequencer_input_decoded_attributed_memory_bytes = self
             .body_input_decoded_attributed_memory_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(Ordering::Relaxed);
         let reorder_decoded_attributed_memory_bytes =
             self.sequencer.reorder_decoded_attributed_memory_bytes();
         let applying_decoded_attributed_memory_bytes =
@@ -1246,32 +1248,22 @@ impl SequencerTask {
     }
 }
 
-fn add_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+fn add_atomic_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(bytes);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
     }
 }
 
-fn release_atomic_bytes(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
-    let mut current = counter.load(std::sync::atomic::Ordering::Relaxed);
+fn release_atomic_bytes(counter: &AtomicU64, bytes: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_sub(bytes);
-        match counter.compare_exchange_weak(
-            current,
-            next,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }

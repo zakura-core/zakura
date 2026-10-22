@@ -10,6 +10,7 @@ use rand_10::Rng;
 use std::num::NonZeroU64;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::NodeId;
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod trace;
 
@@ -219,16 +220,15 @@ pub fn spawn_block_sync_reactor(
             .is_none()
             .then_some(zakura_header_chain::StateVersion::default())
     });
-    let sequencer_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let sequencer_input_decoded_attributed_memory_bytes =
-        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sequencer_input_bytes = Arc::new(AtomicU64::new(0));
+    let sequencer_input_decoded_attributed_memory_bytes = Arc::new(AtomicU64::new(0));
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
     registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
-    rand_10::rng().fill_bytes(&mut retry_jitter_seed);
+    zakura_rt::rand::rng().fill_bytes(&mut retry_jitter_seed);
 
     let sequencer_task = SequencerTask::new(
         sequencer,
@@ -382,9 +382,9 @@ pub(super) struct BlockSyncReactor {
     /// downloaded bodies here; the reactor keeps a sender clone for diagnostics.
     sequencer_input: mpsc::Sender<SequencedBody>,
     /// Serialized bytes currently queued in [`Self::sequencer_input`].
-    sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_input_bytes: Arc<AtomicU64>,
     /// Decoded attributed-memory bytes currently queued in [`Self::sequencer_input`].
-    sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     /// Non-blocking control channel to the Sequencer task. Frontier and apply
     /// progress must never wait behind downloaded body backlog.
     sequencer_control: mpsc::UnboundedSender<SequencerControlInput>,
@@ -467,11 +467,11 @@ impl BlockSyncReactor {
             // instead of polling. Rebuilt each iteration, so any event that adds,
             // completes, or advances the floor re-arms it to the next deadline.
             let floor_watchdog = self.earliest_floor_deadline_sleep();
-            tokio::pin!(floor_watchdog);
+            zakura_rt::pin!(floor_watchdog);
             let empty_state_header_quiet = self.empty_state_header_quiet_sleep();
-            tokio::pin!(empty_state_header_quiet);
+            zakura_rt::pin!(empty_state_header_quiet);
             let needed_query_retry = self.needed_query_retry_sleep();
-            tokio::pin!(needed_query_retry);
+            zakura_rt::pin!(needed_query_retry);
             let status_refresh_at = self.status_refresh_at;
             let status_refresh = async move {
                 match status_refresh_at {
@@ -479,8 +479,8 @@ impl BlockSyncReactor {
                     None => std::future::pending().await,
                 }
             };
-            tokio::pin!(status_refresh);
-            tokio::select! {
+            zakura_rt::pin!(status_refresh);
+            zakura_rt::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else { break };
@@ -2016,7 +2016,7 @@ impl BlockSyncReactor {
         let view = *self.sequencer_view.borrow();
         let sequencer_input_decoded_attributed_memory_bytes = self
             .sequencer_input_decoded_attributed_memory_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(Ordering::Relaxed);
         metrics::gauge!("sync.block.best_header_tip.height")
             .set(self.state.best_header_tip.0 as f64);
         metrics::gauge!("sync.block.verified_tip.height").set(self.verified_block_tip.0 as f64);

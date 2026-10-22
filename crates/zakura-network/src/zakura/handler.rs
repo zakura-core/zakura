@@ -5,15 +5,11 @@ mod trace;
 use service_session::{spawn_service_session, PendingSessions, PreparedStream, SetupIo};
 
 use std::{
-    collections::{HashMap, HashSet},
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -22,13 +18,6 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
-use tokio::{
-    sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore},
-    task::{AbortHandle, JoinHandle, JoinSet},
-    time::{timeout, Instant},
-};
-use tokio_stream::StreamMap;
-use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block::{self, Block, CountedHeader},
     parameters::{Network, NetworkKind},
@@ -39,6 +28,17 @@ use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{
     Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, NodeId, NodeSecretKey,
     QuicBindConfig, QuicConfig, QuicEndpoint, RecvStream, SendStream, VarInt,
+};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    stream::StreamMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
+        MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
+    },
+    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet},
+    time::{timeout, Instant},
 };
 
 use self::trace::ZakuraConnTrace;
@@ -680,10 +680,10 @@ pub struct ZakuraEndpoint {
     block_sync: Option<BlockSyncHandle>,
     header_sync_tasks: Option<Arc<HeaderSyncBackgroundTasks>>,
     header_sync_fatal_events:
-        Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
+        Option<Arc<AsyncMutex<Option<mpsc::UnboundedReceiver<super::HeaderSyncFatalEvent>>>>>,
     #[cfg(any(test, feature = "zakura-testkit"))]
-    header_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
-    block_sync_actions: Option<Arc<Mutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
+    header_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<HeaderSyncAction>>>>>,
+    block_sync_actions: Option<Arc<AsyncMutex<Option<mpsc::Receiver<BlockSyncAction>>>>>,
     /// Maintained native dials started by the legacy->Zakura upgrade hand-off,
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
@@ -699,7 +699,7 @@ struct UpgradeDialOwnership {
 #[derive(Debug)]
 struct HeaderSyncBackgroundTasks {
     shutdown: CancellationToken,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: AsyncMutex<Vec<JoinHandle<()>>>,
 }
 
 /// Durable state facts required before attaching the production header-sync driver.
@@ -846,7 +846,7 @@ impl ZakuraEndpoint {
     /// recovery path for short Zakura disconnects; the address-book liveness
     /// keeper prevents the slower legacy crawler from churning while this dial
     /// owns the peer.
-    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_native_dial(&self, node_addr: NodeAddr) -> JoinHandle<()> {
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
         let policy = RedialPolicy::maintain(
@@ -1023,13 +1023,13 @@ impl ZakuraEndpoint {
             block_sync: Some(block_sync),
             header_sync_tasks: Some(Arc::new(HeaderSyncBackgroundTasks {
                 shutdown,
-                tasks: Mutex::new(tasks),
+                tasks: AsyncMutex::new(tasks),
             })),
             header_sync_fatal_events: None,
             header_sync_actions: header_sync_actions
-                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
+                .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             block_sync_actions: block_sync_actions
-                .map(|actions| Arc::new(Mutex::new(Some(actions)))),
+                .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -1039,7 +1039,7 @@ impl ZakuraEndpoint {
 #[derive(Clone, Debug)]
 pub struct ZakuraSupervisorHandle {
     id: u64,
-    inner: Arc<Mutex<ZakuraSupervisorState>>,
+    inner: Arc<AsyncMutex<ZakuraSupervisorState>>,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
@@ -1065,10 +1065,8 @@ struct IpSlotCounts {
 }
 
 impl IpSlots {
-    fn counts(&self) -> std::sync::MutexGuard<'_, IpSlotCounts> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn counts(&self) -> MutexGuard<'_, IpSlotCounts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Registered connections from `ip`.
@@ -1362,7 +1360,7 @@ impl ZakuraSupervisorHandle {
         let max_connections_per_ip = max_connections_per_ip.max(1);
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
-            inner: Arc::new(Mutex::new(ZakuraSupervisorState {
+            inner: Arc::new(AsyncMutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 ip_slots: ip_slots.clone(),
@@ -2037,7 +2035,7 @@ impl ServiceSessionState {
                 self.install_demand_wait(
                     waits,
                     Box::pin(async move {
-                        tokio::time::sleep_until(at.into()).await;
+                        zakura_rt::time::sleep_until(at.into()).await;
                     }),
                 );
             }
@@ -2065,7 +2063,7 @@ impl ServiceSessionState {
         self.install_wait(
             waits,
             SessionWaitReason::Transport,
-            Box::pin(tokio::time::sleep(delay)),
+            Box::pin(zakura_rt::time::sleep(delay)),
         );
         Some(delay)
     }
@@ -2321,7 +2319,7 @@ pub struct ZakuraProtocolHandler {
 }
 
 fn random_stream_session_seed() -> u64 {
-    let mut rng = rand_10::rng();
+    let mut rng = zakura_rt::rand::rng();
     loop {
         let seed = rng.next_u64();
         if seed != 0 {
@@ -2614,7 +2612,7 @@ impl ZakuraProtocolHandler {
         hello.validate(&expected)?;
 
         let mut local_nonce = [0; 32];
-        rand_10::rng().fill_bytes(&mut local_nonce);
+        zakura_rt::rand::rng().fill_bytes(&mut local_nonce);
 
         let accepted_limits = self.accepted_limits_for(&hello.initial_limits);
         let ack = ZakuraControlAck {
@@ -2881,12 +2879,12 @@ impl ZakuraProtocolHandler {
 
         loop {
             let session_deadline = pending_sessions.deadline();
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
                 _ = async {
                     match session_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        Some(deadline) => zakura_rt::time::sleep_until(deadline).await,
                         None => future::pending().await,
                     }
                 } => pending_sessions.expire(Instant::now()),
@@ -3217,7 +3215,7 @@ impl ZakuraProtocolHandler {
                             if let Some(started) = started {
                                 let _ = started.send(());
                             }
-                            let result = tokio::select! {
+                            let result = zakura_rt::select! {
                                 biased;
                                 _ = completion.closed() => {
                                     Err(OutboundRequestError::Local(
@@ -4269,9 +4267,9 @@ async fn spawn_zakura_endpoint_inner(
     }
     #[cfg(any(test, feature = "zakura-testkit"))]
     let header_sync_actions = if block_sync_driver_enabled {
-        Some(Arc::new(Mutex::new(Some(header_sync_actions))))
+        Some(Arc::new(AsyncMutex::new(Some(header_sync_actions))))
     } else {
-        let action_driver_task = tokio::spawn(drive_header_sync_actions(
+        let action_driver_task = zakura_rt::task::spawn(drive_header_sync_actions(
             header_sync_actions,
             header_sync.clone(),
             supervisor.clone(),
@@ -4284,10 +4282,10 @@ async fn spawn_zakura_endpoint_inner(
     drop(header_sync_actions);
     let block_sync_actions = block_sync_actions
         .filter(|_| block_sync_driver_enabled)
-        .map(|actions| Arc::new(Mutex::new(Some(actions))));
+        .map(|actions| Arc::new(AsyncMutex::new(Some(actions))));
     let header_sync_tasks = Arc::new(HeaderSyncBackgroundTasks {
         shutdown: header_sync_shutdown,
-        tasks: Mutex::new(tasks),
+        tasks: AsyncMutex::new(tasks),
     });
     let header_sync_ready = service_demand
         .as_ref()
@@ -4320,7 +4318,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync: Some(header_sync),
         block_sync,
         header_sync_tasks: Some(header_sync_tasks),
-        header_sync_fatal_events: Some(Arc::new(Mutex::new(Some(header_sync_fatal_rx)))),
+        header_sync_fatal_events: Some(Arc::new(AsyncMutex::new(Some(header_sync_fatal_rx)))),
         #[cfg(any(test, feature = "zakura-testkit"))]
         header_sync_actions,
         block_sync_actions,
@@ -4344,7 +4342,7 @@ async fn spawn_zakura_endpoint_inner(
                     )
                     .await;
                 }
-                tokio::select! {
+                zakura_rt::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
                     changed = service_demand.changed() => {
@@ -4366,7 +4364,7 @@ async fn spawn_zakura_endpoint_inner(
         let shutdown = endpoint.background_shutdown_token();
         let log_endpoint = endpoint.clone();
         let task = spawn_erased(async move {
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = shutdown.cancelled() => {}
                 node_addr = log_endpoint.node_addr() => {
@@ -4606,7 +4604,7 @@ async fn run_native_initiator_handshake(
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("open control stream"))??;
     let mut local_nonce = [0; 32];
-    rand_10::rng().fill_bytes(&mut local_nonce);
+    zakura_rt::rand::rng().fill_bytes(&mut local_nonce);
 
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
@@ -4725,7 +4723,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     failure_cause: Option<OrderedStreamFailureCause>,
-    application_drain: Option<Arc<tokio::sync::Barrier>>,
+    application_drain: Option<Arc<Barrier>>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4737,13 +4735,13 @@ async fn persistent_stream_worker_with_policy(
     let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
-    let reader = tokio_util::task::AbortOnDropHandle::new(spawn_erased(async move {
+    let reader = AbortOnDropHandle::new(spawn_erased(async move {
         // Session teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
         let mut recv = recv;
         let waiting_since = Instant::now();
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = reader_context.connection_token.cancelled() => return,
             _ = reader_context.stream_token.cancelled() => return,
@@ -4752,7 +4750,7 @@ async fn persistent_stream_worker_with_policy(
         }
         reader_context.credit_read_pause(waiting_since.elapsed());
         loop {
-            let frame = tokio::select! {
+            let frame = zakura_rt::select! {
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
@@ -4778,7 +4776,7 @@ async fn persistent_stream_worker_with_policy(
                     match admit_inbound_message(&frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
                             let waiting_since = Instant::now();
-                            let forwarded = tokio::select! {
+                            let forwarded = zakura_rt::select! {
                                 biased;
                                 _ = reader_context.connection_token.cancelled() => break,
                                 _ = reader_context.stream_token.cancelled() => break,
@@ -4852,7 +4850,7 @@ async fn persistent_stream_worker_with_policy(
     let mut outbound_rx = Some(outbound_rx);
     let mut drained = false;
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             _ = context.connection_token.cancelled() => break,
             _ = context.stream_token.cancelled() => break,
@@ -4861,7 +4859,7 @@ async fn persistent_stream_worker_with_policy(
                 // An idle member must not cancel another member's queued writes
                 // or retained application handles. Faults still interrupt draining.
                 if let Some(barrier) = &application_drain {
-                    tokio::select! {
+                    zakura_rt::select! {
                         biased;
                         _ = context.connection_token.cancelled() => {},
                         _ = context.stream_token.cancelled() => {},
@@ -4879,7 +4877,7 @@ async fn persistent_stream_worker_with_policy(
                 match outbound {
                     Some(queued_frame) => {
                         // Cancellation resets the stream before a replacement can write.
-                        let result = tokio::select! {
+                        let result = zakura_rt::select! {
                             biased;
                             _ = context.connection_token.cancelled() => break,
                             _ = context.stream_token.cancelled() => break,
@@ -4988,7 +4986,7 @@ async fn request_stream_worker(
         return;
     };
 
-    let frame = tokio::select! {
+    let frame = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         frame = read_frame(
@@ -5087,8 +5085,8 @@ async fn freshness_reaper(mut freshness_rx: watch::Receiver<Instant>, idle_timeo
         if elapsed >= idle_timeout {
             return;
         }
-        tokio::select! {
-            _ = tokio::time::sleep(idle_timeout - elapsed) => return,
+        zakura_rt::select! {
+            _ = zakura_rt::time::sleep(idle_timeout - elapsed) => return,
             changed = freshness_rx.changed() => {
                 if changed.is_err() {
                     return;
@@ -6197,7 +6195,7 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// A worker holds this briefly (no `.await` while locked) to spend one token
 /// per decoded frame, so N concurrent same-kind streams draw from a single
 /// per-connection budget instead of N independent ones (FLUP-014).
-type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
+type SharedMessageBucket<C = RealClock> = Arc<StdMutex<TokenBucket<C>>>;
 
 /// Per-connection message-rate state, shared across that connection's workers.
 ///
@@ -6214,7 +6212,7 @@ impl<C: Clock + Default> MessageRateBuckets<C> {
     fn new() -> Self {
         Self {
             streams: HashMap::new(),
-            cadence: Arc::new(std::sync::Mutex::new(CadenceBuckets::new(C::default()))),
+            cadence: Arc::new(StdMutex::new(CadenceBuckets::new(C::default()))),
         }
     }
 }
@@ -6228,7 +6226,7 @@ impl<C: Clock> MessageRateBuckets<C> {
 }
 
 /// One connection's cadence buckets, shared by its readers.
-type SharedCadenceBuckets<C = RealClock> = Arc<std::sync::Mutex<CadenceBuckets<C>>>;
+type SharedCadenceBuckets<C = RealClock> = Arc<StdMutex<CadenceBuckets<C>>>;
 
 /// A tabled stream's view of its connection's cadence buckets.
 #[derive(Clone, Debug)]
@@ -6266,7 +6264,7 @@ fn message_bucket_for<C: Clock>(
         .streams
         .entry(stream_kind)
         .or_insert_with(|| {
-            Arc::new(std::sync::Mutex::new(TokenBucket::with_clock(
+            Arc::new(StdMutex::new(TokenBucket::with_clock(
                 message_rate_per_second,
                 clock,
             )))

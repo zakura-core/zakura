@@ -3,7 +3,7 @@
 use std::sync::{Arc, Weak};
 
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use zakura_rt::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// A slot capacity cannot provide usable, representable permits.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]

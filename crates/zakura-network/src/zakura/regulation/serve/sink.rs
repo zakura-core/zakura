@@ -1,12 +1,9 @@
 //! The response of one served request: frames, then exactly one ending.
 
-use std::{
-    fmt,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{fmt, sync::Arc};
 
 use thiserror::Error;
-use tokio::sync::mpsc;
+use zakura_rt::sync::{mpsc, Mutex, MutexGuard, PoisonError};
 
 use super::{Commitment, ResponseGrants};
 use crate::zakura::{
@@ -275,7 +272,7 @@ where
         }
     }
 
-    fn core(&self) -> std::sync::MutexGuard<'_, SinkCore> {
+    fn core(&self) -> MutexGuard<'_, SinkCore> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

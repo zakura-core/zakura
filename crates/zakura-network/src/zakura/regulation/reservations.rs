@@ -53,12 +53,19 @@
 //! | The ending ends a fenced exchange; the map's drop closes a started one | `a_fenced_reservation_ends_its_exchange_with_its_ending` |
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     hash::Hash,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, OnceLock},
 };
 
 use thiserror::Error;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        CancellationToken, Mutex, MutexGuard, PoisonError,
+    },
+};
 
 use super::{
     serve::{ending_reserve, ResponseCap},
@@ -676,7 +683,7 @@ impl<K: Eq + Hash> SharedReservations<K> {
     }
 
     /// Lock the reservations. No holder panics, so the lock is never poisoned.
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Reservations<K>> {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Reservations<K>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -738,21 +745,19 @@ pub(crate) struct PrecheckSlot(Arc<PrecheckSetup>);
 #[derive(Debug, Default)]
 struct PrecheckSetup {
     choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
-    gated: std::sync::atomic::AtomicBool,
-    ready: tokio_util::sync::CancellationToken,
+    gated: AtomicBool,
+    ready: CancellationToken,
 }
 
 impl PrecheckSlot {
     /// Pause ingress before spawning the transport reader.
     pub(crate) fn pause(&self) {
-        self.0
-            .gated
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.gated.store(true, Ordering::Release);
     }
 
     /// Wait for the service to choose its header check.
     pub(crate) async fn ready(&self) {
-        if self.0.gated.load(std::sync::atomic::Ordering::Acquire) {
+        if self.0.gated.load(Ordering::Acquire) {
             self.0.ready.cancelled().await;
         }
     }

@@ -113,6 +113,9 @@ jobs:
       - name: Check generated RPC artifacts
         if: ${{ !cancelled() }}
         run: cargo xtask check-rpc-artifacts
+      - name: Check v2 P2P runtime imports
+        if: ${{ !cancelled() }}
+        run: cargo xtask check-rt-imports
 
   # NOTE: per-crate default / no-default-features checks moved to
   # `test-crates.yml`, which runs `cargo hack check --workspace` (and again with

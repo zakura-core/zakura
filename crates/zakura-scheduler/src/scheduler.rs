@@ -159,6 +159,34 @@ impl RunState {
         panic!("run spawned more than max_tasks ({limit}) tasks");
     }
 
+    /// Takes everything left in the run whose destructor can run arbitrary
+    /// code: queued tasks, timer and join wakers, and unjoined panic payloads.
+    fn take_leftovers(&mut self) -> Vec<Box<dyn std::any::Any>> {
+        let mut left: Vec<Box<dyn std::any::Any>> = Vec::new();
+        left.extend(
+            std::mem::take(&mut self.spawn_queue)
+                .into_iter()
+                .map(|(_, task)| Box::new(task) as _),
+        );
+        left.extend(
+            std::mem::take(&mut self.timers)
+                .into_values()
+                .map(|waker| Box::new(waker) as _),
+        );
+        left.extend(
+            std::mem::take(&mut self.join_wakers)
+                .into_values()
+                .map(|wakers| Box::new(wakers) as _),
+        );
+        #[cfg(zakura_sim)]
+        left.extend(
+            std::mem::take(&mut self.panics)
+                .into_values()
+                .map(|payload| Box::new(payload) as _),
+        );
+        left
+    }
+
     /// Allocates the next object identity for the current task.
     pub(crate) fn new_object(&mut self) -> ObjectId {
         let creator = self.current;
@@ -628,8 +656,16 @@ impl Scheduler {
             self.finish(task, TaskExit::Cancelled);
             self.admit();
         }
-        // Dropping the state drops leftover wakers and futures outside the
-        // borrow, since their destructors may call hooks.
+        // Drop what's left outside the borrow, while the run and the
+        // `zakura-rt` executor are both still installed, since destructors
+        // may call hooks or queue more. Then nothing in the state runs code.
+        loop {
+            let left = self.state(RunState::take_leftovers);
+            if left.is_empty() {
+                break;
+            }
+            drop(left);
+        }
         let state = RUN.with(|r| r.borrow_mut().take());
         drop(state);
         #[cfg(zakura_sim)]
@@ -642,6 +678,8 @@ impl Scheduler {
     /// cancels. Picks the lowest `TaskId`, so cleanup replays too.
     fn drain(&mut self, report: &mut CleanupReport) {
         for _ in 0..DRAIN_STEP_LIMIT {
+            // Setup code may have spawned since the last step.
+            self.admit();
             let next = self.state(|s| {
                 s.ready
                     .iter()

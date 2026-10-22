@@ -98,7 +98,7 @@ pub fn spawn(label: &'static str, task: impl Future<Output = ()> + 'static) -> J
 /// [`spawn`] for a task that is already boxed.
 pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
     let queued = with_run(|s| s.queue_spawn(label, task))
-        .expect("zakura-rt checks in_run before spawning on the scheduler");
+        .expect("zakura-rt spawns only while this run's executor is installed, and the run state outlives that");
     queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
 }
 

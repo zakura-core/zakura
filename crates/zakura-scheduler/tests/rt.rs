@@ -60,7 +60,10 @@ fn gap_between_load_and_store(yield_now: bool) -> impl Fn(&mut Scheduler) -> Che
 fn rt_points_preempt_inside_a_poll() {
     assert!(first_violation(2, FIND, gap_between_load_and_store(false)).is_some());
     // The point is mid-poll, so with one worker the other task can't run there.
-    assert_eq!(first_violation(1, FIND, gap_between_load_and_store(false)), None);
+    assert_eq!(
+        first_violation(1, FIND, gap_between_load_and_store(false)),
+        None
+    );
 }
 
 #[test]
@@ -172,9 +175,59 @@ fn rt_spawn_from_setup_code_is_ready_at_once() {
     assert_eq!(result.status, Status::Quiescent);
 }
 
+/// Reads the virtual clock when dropped, as a destructor that logs a
+/// timestamp would.
+struct ReadsClockOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReadsClockOnDrop {
+    fn drop(&mut self) {
+        let _ = Instant::now();
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn setup_spawn_dropped_at_shutdown_reads_the_clock() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = ReadsClockOnDrop(dropped.clone());
+    // Spawned from setup code, and never run before shutdown.
+    drop(task::spawn(async move {
+        let _guard = guard;
+        pending::<()>().await
+    }));
+    let report = sched.shutdown();
+    assert!(dropped.load(Ordering::Relaxed));
+    assert_eq!(report.cancelled, 1);
+}
+
+#[test]
+fn unjoined_panic_payload_dropped_at_shutdown_reads_the_clock() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = ReadsClockOnDrop(dropped.clone());
+    let task = task::spawn(async move { std::panic::panic_any(guard) });
+    let ready = sched.ready()[0].task;
+    assert!(matches!(
+        sched.run(ready),
+        zakura_scheduler::RunOutcome::Panicked(_)
+    ));
+    assert!(
+        !dropped.load(Ordering::Relaxed),
+        "nobody joined the payload"
+    );
+    drop(task);
+    sched.shutdown();
+    assert!(dropped.load(Ordering::Relaxed));
+}
+
 #[test]
 fn same_seed_replays_rt_programs() {
-    let picks = |seed| run_fixture(2, seed, gap_between_load_and_store(true)).0.picks;
+    let picks = |seed| {
+        run_fixture(2, seed, gap_between_load_and_store(true))
+            .0
+            .picks
+    };
     for seed in 0..50 {
         assert_eq!(picks(seed), picks(seed), "seed {seed}");
     }

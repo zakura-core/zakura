@@ -446,7 +446,6 @@ impl ReactorState {
             .is_some_and(|stalled_at| committed.is_none_or(|committed| committed <= stalled_at))
     }
 
-    /// The earliest deadline this state waits for, if any.
     /// Arm `peer`'s request deadline `timeout` after `now`.
     pub(super) fn arm_request_deadline(
         &mut self,
@@ -714,6 +713,7 @@ impl ReactorState {
         LocalOperationExpiry::Expired(operation.clone())
     }
 
+    /// The earliest deadline this state waits for, if any.
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.request_deadlines
             .values()

@@ -89,7 +89,8 @@ pub struct InnerConfig {
     /// filter shows errors only.
     ///
     /// Span and field filters, such as `[span{field=value}]=level`, are not
-    /// supported, and `zakurad` refuses to start if the filter contains one.
+    /// supported. `zakurad` prints a warning and ignores them, along with any
+    /// other directive it cannot parse.
     ///
     /// If no filter is specified (`None`), the filter is set to `info` if the
     /// `-v` flag is given and `warn` if it is not given.

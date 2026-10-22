@@ -547,9 +547,11 @@ impl UdpIo for SimSocket {
     /// Puts each datagram of the transmit in flight from this socket's
     /// address. It never fails.
     fn try_send(&self, transmit: &Transmit, contents: &[u8]) -> io::Result<()> {
-        let now = now();
         let segment = transmit.segment_size.unwrap_or(contents.len()).max(1);
         let mut state = self.net.lock();
+        // Read the clock under the lock that assigns sequence numbers, so
+        // concurrent sends get windows in sequence order.
+        let now = now();
         for datagram in contents.chunks(segment) {
             state.send(
                 self.addr,

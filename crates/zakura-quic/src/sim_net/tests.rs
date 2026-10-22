@@ -214,6 +214,38 @@ async fn zero_delay_and_equal_deadlines_need_delivery_first() {
     assert_eq!(recv(&a).unwrap(), (addr(2), b"two".to_vec()));
 }
 
+/// Sends from several threads on one link get windows in sequence order, so
+/// a FIFO link's oldest datagram is always the first to come due.
+#[test]
+fn concurrent_sends_get_windows_in_sequence_order() {
+    let net = SimNet::new(fifo(10, 10));
+    let a = Arc::new(net.bind(addr(1)).unwrap());
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    send(&a, addr(2), b"x");
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let state = net.lock();
+    let windows: Vec<_> = state
+        .in_flight
+        .values()
+        .map(|datagram| (datagram.earliest, datagram.latest))
+        .collect();
+    assert_eq!(windows.len(), 16_000);
+    assert!(
+        windows.windows(2).all(|pair| pair[0] <= pair[1]),
+        "a later sequence got an earlier window"
+    );
+}
+
 // M2.3
 
 #[tokio::test(start_paused = true)]

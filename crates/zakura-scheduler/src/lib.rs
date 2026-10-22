@@ -296,7 +296,14 @@ impl Default for SchedulerConfig {
 /// What [`Scheduler::shutdown`] found and cleaned up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CleanupReport {
-    /// Unfinished tasks whose coroutines were force-unwound.
+    /// Unfinished tasks cancelled at a poll boundary, with their futures
+    /// dropped outside any unwind.
+    pub cancelled: usize,
+    /// Tasks that panicked while shutdown ran them to a poll boundary or
+    /// dropped their futures.
+    pub panicked: usize,
+    /// Tasks still parked after the drain, such as a lock cycle, whose
+    /// coroutines were force-unwound.
     pub unwound: usize,
     /// Forced unwinds that a task's own code caught and didn't rethrow. The
     /// stack of such a task is leaked rather than reused.

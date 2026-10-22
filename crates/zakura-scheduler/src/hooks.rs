@@ -1,8 +1,9 @@
 //! The calls runtime primitives make into the running scheduler.
 //!
-//! These will back `zakura_rt::sim::Executor`. Outside a run, during
-//! shutdown, and while a thread is unwinding, every hook that would suspend
-//! returns at once, so primitives behave like production.
+//! These will back `zakura_rt::sim::Executor`. Outside a run and while a
+//! thread is unwinding, every hook that would suspend returns at once, so
+//! primitives behave like production. During shutdown, preemption points
+//! return at once, but `park` still waits (see `Scheduler::shutdown`).
 
 use std::{
     future::Future,
@@ -47,14 +48,14 @@ pub fn preempt(point: Point) {
 ///
 /// `held_by` names the task holding `wait`, if known, so the scheduler can
 /// tell a lock cycle from starved workers. Returns false without parking
-/// outside a task or during shutdown. The caller then can't wait, and should
-/// treat that as a bug.
+/// outside a task or while the thread is unwinding. The caller then can't
+/// wait, and should treat that as a bug.
 pub fn park(wait: ObjectId, held_by: Option<TaskId>) -> bool {
     if std::thread::panicking() {
         return false;
     }
     let yielder = with_run(|s| {
-        let task = s.current.filter(|_| !s.shutting_down)?;
+        let task = s.current?;
         s.parked.entry(wait).or_default().push(task);
         match held_by {
             Some(holder) => s.holders.insert(wait, holder),

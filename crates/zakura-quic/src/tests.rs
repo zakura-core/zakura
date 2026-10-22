@@ -2521,6 +2521,11 @@ async fn pump(net: SimNet) {
     }
 }
 
+/// Bounds a simulation test in virtual time. It leaves room for the 91 s the
+/// rebind test sleeps on purpose, and a hang still fails within seconds of
+/// wall time, because paused time jumps ahead while the test waits.
+const SIM_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// `10.0.0.n:4000`.
 fn sim_addr(n: u8) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::new(10, 0, 0, n), 4000))
@@ -2531,44 +2536,49 @@ fn sim_addr(n: u8) -> SocketAddr {
 /// the same thread does count.
 #[tokio::test(start_paused = true)]
 async fn the_driver_runs_over_simnet_without_touching_the_os() {
-    let before = os_accesses();
-    let net = sim_net();
-    let pump = tokio::spawn(pump(net.clone()));
-    let mut server =
-        serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
-    let client = sim_endpoint(&net, sim_addr(2));
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let before = os_accesses();
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
 
-    let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-    assert_eq!(conn.remote_id(), server.endpoint.local_id());
-    assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
-    let inbound = server.handled.recv().await.unwrap();
-    assert_eq!(inbound.remote_id(), client.local_id());
-    assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        assert_eq!(conn.remote_id(), server.endpoint.local_id());
+        assert_eq!(echo(&conn, b"over the sim").await, b"over the sim");
+        let inbound = server.handled.recv().await.unwrap();
+        assert_eq!(inbound.remote_id(), client.local_id());
+        assert_eq!(inbound.admitted_ip(), sim_addr(2).ip());
 
-    let stats = &server.endpoint.socket_stats()[0];
-    assert_eq!(stats.buffers, SocketBuffers::default());
-    assert!(!stats.gso);
-    drop((conn, inbound));
-    client.shutdown().await;
-    server.endpoint.shutdown().await;
-    pump.abort();
+        let stats = &server.endpoint.socket_stats()[0];
+        assert_eq!(stats.buffers, SocketBuffers::default());
+        assert!(!stats.gso);
+        drop((conn, inbound));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+        pump.abort();
 
-    let events = net.events();
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, NetEvent::Delivered { .. })));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, NetEvent::Dropped { .. })));
-    assert!(events.contains(&NetEvent::Unbound {
-        addr: sim_addr(1),
-        unread: 0
-    }));
-    assert_eq!(os_accesses(), before);
+        let events = net.events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Delivered { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, NetEvent::Dropped { .. })));
+        assert!(events.contains(&NetEvent::Unbound {
+            addr: sim_addr(1),
+            unread: 0
+        }));
+        assert_eq!(os_accesses(), before);
 
-    // The counter does see the production path.
-    let _os = QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
-    assert!(os_accesses() > before);
+        // The counter does see the production path.
+        let _os =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+        assert!(os_accesses() > before);
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
 }
 
 /// Injects a fatal receive error into `addr` and waits until the endpoint
@@ -2590,36 +2600,40 @@ async fn fail_and_wait(net: &SimNet, endpoint: &QuicEndpoint, addr: SocketAddr) 
 /// would see almost no elapsed time and stop the socket.
 #[tokio::test(start_paused = true)]
 async fn simnet_rebinds_use_the_factory_and_virtual_time() {
-    let before = os_accesses();
-    let net = sim_net();
-    let pump = tokio::spawn(pump(net.clone()));
-    let mut server =
-        serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
-    let client = sim_endpoint(&net, sim_addr(2));
-    let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
-    let _inbound = server.handled.recv().await.unwrap();
+    tokio::time::timeout(SIM_TEST_TIMEOUT, async {
+        let before = os_accesses();
+        let net = sim_net();
+        let pump = tokio::spawn(pump(net.clone()));
+        let mut server =
+            serve_test_acceptor(sim_endpoint(&net, sim_addr(1)), &[ALPN], |_| Admit::Accept);
+        let client = sim_endpoint(&net, sim_addr(2));
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let _inbound = server.handled.recv().await.unwrap();
 
-    let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
-    assert_eq!((stats.rebinds, stats.stopped), (1, false));
-    let rebind = [
-        NetEvent::Unbound {
-            addr: sim_addr(1),
-            unread: 0,
-        },
-        NetEvent::Bound { addr: sim_addr(1) },
-    ];
-    assert!(net.events().windows(2).any(|pair| pair == rebind));
-    // The connection lives through the rebind.
-    assert_eq!(echo(&conn, b"after the rebind").await, b"after the rebind");
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (1, false));
+        let rebind = [
+            NetEvent::Unbound {
+                addr: sim_addr(1),
+                unread: 0,
+            },
+            NetEvent::Bound { addr: sim_addr(1) },
+        ];
+        assert!(net.events().windows(2).any(|pair| pair == rebind));
+        // The connection lives through the rebind.
+        assert_eq!(echo(&conn, b"after the rebind").await, b"after the rebind");
 
-    tokio::time::sleep(Duration::from_secs(61)).await;
-    let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
-    assert_eq!((stats.rebinds, stats.stopped), (2, false));
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, false));
 
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
-    assert_eq!((stats.rebinds, stats.stopped), (2, true));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let stats = fail_and_wait(&net, &server.endpoint, sim_addr(1)).await;
+        assert_eq!((stats.rebinds, stats.stopped), (2, true));
 
-    pump.abort();
-    assert_eq!(os_accesses(), before);
+        pump.abort();
+        assert_eq!(os_accesses(), before);
+    })
+    .await
+    .expect("the simulation finishes within its virtual-time bound");
 }

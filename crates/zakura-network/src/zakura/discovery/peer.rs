@@ -9,6 +9,8 @@
 //! to a close.
 
 mod state;
+#[cfg(test)]
+mod tests;
 
 use std::{sync::Arc, time::Duration};
 

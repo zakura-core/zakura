@@ -433,6 +433,8 @@ impl ResponsePrecheck for QueriesPrecheck {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{hash_map::Entry, HashMap, HashSet};
+
     use super::*;
     use crate::zakura::{
         discovery::protocol::{
@@ -941,24 +943,24 @@ mod tests {
             ops in proptest::collection::vec(query_op(), 1..96),
         ) {
             let mut state = QueryState::default();
-            let mut model: std::collections::HashMap<QueryKind, QueryModel> =
-                std::collections::HashMap::new();
+            let mut model: HashMap<QueryKind, QueryModel> = HashMap::new();
             let mut reservations = 0usize;
-            let mut admitted = std::collections::HashSet::new();
+            let mut admitted = HashSet::new();
             for op in ops {
                 match op {
                     QueryOp::Reserve { kind, size } => {
                         let asked = asked_for(kind, size);
-                        let expected = if model.contains_key(&kind) {
-                            Err(QueryLive)
-                        } else {
-                            reservations += 1;
-                            model.insert(kind, QueryModel {
-                                asked: asked.clone(),
-                                queued: false,
-                                reservation: reservations,
-                            });
-                            Ok(())
+                        let expected = match model.entry(kind) {
+                            Entry::Occupied(_) => Err(QueryLive),
+                            Entry::Vacant(slot) => {
+                                reservations += 1;
+                                slot.insert(QueryModel {
+                                    asked: asked.clone(),
+                                    queued: false,
+                                    reservation: reservations,
+                                });
+                                Ok(())
+                            }
                         };
                         proptest::prop_assert_eq!(state.reserve(asked), expected);
                     }

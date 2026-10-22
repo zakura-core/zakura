@@ -57,11 +57,23 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 ];
 
 /// Direct runtime paths the v2 code may keep, with the reason for each.
-const ALLOWED: [(&str, &str, &str); 1] = [(
-    "crates/zakura-network/src/zakura/handler.rs",
-    "tokio::runtime::Handle",
-    "runtime introspection, which the simulator build will define",
-)];
+const ALLOWED: [(&str, &str, &str); 3] = [
+    (
+        "crates/zakura-network/src/zakura/handler.rs",
+        "tokio::runtime::Handle",
+        "runtime introspection, which the simulator build will define",
+    ),
+    (
+        "crates/zakura-network/src/zakura/handler.rs",
+        "tokio::sync::oneshot::Sender",
+        "legacy gossip's exchange-start signal, and legacy code stays on tokio",
+    ),
+    (
+        "crates/zakura-network/src/zakura.rs",
+        "tokio::sync::mpsc::Sender",
+        "the legacy address book's updater, and legacy code stays on tokio",
+    ),
+];
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 

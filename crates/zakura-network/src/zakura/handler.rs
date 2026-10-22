@@ -1296,7 +1296,7 @@ impl ZakuraPeerHandle {
         message_type: u16,
         flags: u16,
         payload: Vec<u8>,
-        started: Option<oneshot::Sender<()>>,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Vec<Frame>, BoxError> {
         let (completion, completed) = oneshot::channel();
         let frame = ZakuraOutboundFrame::Request {
@@ -1335,7 +1335,10 @@ pub enum ZakuraOutboundFrame {
         payload: Vec<u8>,
         /// Fired when the connection takes this request off its queue and
         /// starts the exchange, since it serves one request at a time.
-        started: Option<oneshot::Sender<()>>,
+        ///
+        /// Only legacy gossip sets it, and legacy code stays on tokio, so this
+        /// is tokio's sender in both builds.
+        started: Option<tokio::sync::oneshot::Sender<()>>,
         /// Completion sent with decoded raw response frames or an error.
         completion: oneshot::Sender<Result<Vec<Frame>, BoxError>>,
     },

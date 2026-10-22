@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zakura_node_services::task::spawn_erased;
 use zakura_quic::{NodeAddr, NodeId};
-use zakura_rt::sync::{mpsc, CancellationToken};
+use zakura_rt::sync::CancellationToken;
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -408,11 +408,14 @@ impl ZakuraHandshakeConnector {
     /// Only meaningful for outbound connections, where `book_addr` is the
     /// dialable remote address the crawler would otherwise reconnect to. Does
     /// nothing without a live endpoint.
+    ///
+    /// `address_book_updater` belongs to the legacy address book. Legacy code
+    /// stays on tokio, so it's tokio's sender in both builds.
     pub(crate) fn spawn_legacy_liveness_keeper(
         &self,
         peer_id: ZakuraPeerId,
         book_addr: PeerSocketAddr,
-        address_book_updater: mpsc::Sender<MetaAddrChange>,
+        address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     ) {
         let Some(endpoint) = self.endpoint.as_ref() else {
             return;
@@ -501,7 +504,7 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
 /// ownership ends or when the address book updater closes.
 async fn run_legacy_liveness_keeper(
     book_addr: PeerSocketAddr,
-    address_book_updater: mpsc::Sender<MetaAddrChange>,
+    address_book_updater: tokio::sync::mpsc::Sender<MetaAddrChange>,
     dial_lifetime: CancellationToken,
     refresh_interval: Duration,
 ) {
@@ -524,6 +527,20 @@ async fn run_legacy_liveness_keeper(
             _ = zakura_rt::time::sleep(refresh_interval) => {}
         }
     }
+}
+
+/// Resumes a task's panic on the caller, and otherwise returns its result.
+///
+/// A cancelled task stays an `Err`. This is `zakura_chain`'s
+/// `check_for_panics_with(false)` for `zakura_rt`'s `JoinError`, which
+/// `zakura-chain` can't name.
+fn resume_task_panic<T>(
+    result: Result<T, zakura_rt::task::JoinError>,
+) -> Result<T, zakura_rt::task::JoinError> {
+    result.map_err(|error| match error.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(error) => error,
+    })
 }
 
 #[cfg(test)]

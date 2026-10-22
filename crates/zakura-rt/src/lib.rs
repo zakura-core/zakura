@@ -75,7 +75,7 @@ pub mod rand;
 #[cfg(not(zakura_sim))]
 pub mod task {
     pub use tokio::task::{
-        coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinHandle, JoinSet,
+        coop, spawn, spawn_blocking, yield_now, AbortHandle, JoinError, JoinHandle, JoinSet,
     };
     pub use tokio_util::task::AbortOnDropHandle;
 }

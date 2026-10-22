@@ -29,6 +29,8 @@ use crate::zakura::{
 };
 
 mod plan;
+#[cfg(test)]
+mod tests;
 
 use plan::{Funding, RetryDeadlines, RetryFact, TakePlan};
 

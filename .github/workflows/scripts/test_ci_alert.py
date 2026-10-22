@@ -35,10 +35,6 @@ def run(number, conclusion, event="push", attempt=1):
 ALERT_EXCEPTIONS = {
     "PR node image bake": "Has a dedicated failure notification job.",
     "VCT handoff canary": "Has phase-aware alerts with persistent deduplication.",
-    "Zakura continuous genesis sync fleet": (
-        "Audit alerts are deduplicated across runs. Setup failures before the "
-        "audit remain outside that notification path."
-    ),
     "Upstream PR Triage Pilot": "Intentionally muted until the pilot passes again.",
 }
 
@@ -107,6 +103,53 @@ class AlertTextTest(unittest.TestCase):
         for conclusion in ("success", "cancelled", "skipped", None):
             responses = {f"{BASE}/runs/7/attempts/1": run(7, conclusion)}
             self.assertIsNone(self.alert(responses, 7, 1))
+
+    def test_continuous_sync_preserves_audit_suppression_but_alerts_other_failures(self):
+        """Checks the fallback using the step results exposed by GitHub's jobs API."""
+        cases = [
+            ("delivered or suppressed incident", "failure", "failure", "success", None, False),
+            ("SSH setup failed", "failure", "skipped", "skipped", "Configure SSH", True),
+            ("audit crashed or delivery failed", "failure", "failure", "skipped", None, True),
+            ("later summary check failed", "failure", "failure", "success", "Check daily summary delivery", True),
+            ("summary failed after healthy audit", "failure", "success", "success", "Check daily summary delivery", True),
+            ("timeout after handled audit", "timed_out", "failure", "success", None, True),
+            ("audit itself timed out", "failure", "timed_out", "success", None, True),
+            ("receipt step failed", "failure", "failure", "failure", None, True),
+        ]
+        for label, conclusion, audit, receipt, other, expected in cases:
+            with self.subTest(case=label):
+                attempt = run(7, conclusion, event="schedule")
+                attempt["path"] = ci_alert.CONTINUOUS_SYNC_PATH
+                job = {
+                    "name": "Continuous sync audit",
+                    "conclusion": conclusion,
+                    "steps": [
+                        {"name": ci_alert.AUDIT_STEP, "conclusion": audit},
+                        {"name": ci_alert.AUDIT_HANDLED_STEP, "conclusion": receipt},
+                    ],
+                }
+                if other:
+                    job["steps"].append({"name": other, "conclusion": "failure"})
+                responses = {
+                    f"{BASE}/runs/7/attempts/1": attempt,
+                    f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": [job]},
+                }
+                self.assertEqual(self.alert(responses, 7, 1) is not None, expected)
+                # The special receipt must never silence another workflow.
+                attempt["path"] = ".github/workflows/tests-unit.yml"
+                self.assertIsNotNone(self.alert(responses, 7, 1))
+
+    def test_continuous_sync_missing_job_evidence_alerts(self):
+        """Missing steps or jobs must not count as proof of handled notifications."""
+        attempt = run(7, "failure", event="schedule")
+        attempt["path"] = ci_alert.CONTINUOUS_SYNC_PATH
+        for jobs in ([], [{"name": "Continuous sync audit", "conclusion": "failure"}]):
+            with self.subTest(jobs=jobs):
+                responses = {
+                    f"{BASE}/runs/7/attempts/1": attempt,
+                    f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": jobs},
+                }
+                self.assertIsNotNone(self.alert(responses, 7, 1))
 
     def test_the_reported_attempt_is_judged_not_the_latest(self):
         # Attempt 2 has since passed; attempt 1's failure is still reported.
@@ -181,6 +224,19 @@ class WatchedWorkflowsTest(unittest.TestCase):
             automatic - set(watched) - exceptions,
             set(),
             "Add missing workflows to ci-alerts.yml or document an alert exception",
+        )
+
+    def test_audit_receipt_matches_the_workflow(self):
+        """Pins the API-visible receipt to the audit's output and failed-step name."""
+        workflow = yaml.load(
+            (WORKFLOWS.parents[1] / ci_alert.CONTINUOUS_SYNC_PATH).read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        steps = {step["name"]: step for step in workflow["jobs"]["fleet"]["steps"]}
+        self.assertEqual(steps[ci_alert.AUDIT_STEP]["id"], "audit")
+        self.assertEqual(
+            steps[ci_alert.AUDIT_HANDLED_STEP]["if"],
+            "${{ !cancelled() && steps.audit.outputs.notification_handled == 'true' }}",
         )
 
     def test_event_forms_and_filters(self):

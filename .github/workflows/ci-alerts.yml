@@ -28,6 +28,7 @@ on:
       - Test Docker Config
       - Unit Tests
       - Update Mainnet release state
+      - Zakura continuous genesis sync fleet
       - Zakura E2E
       - zakura-mac-cranelift
       - zcashd-compat Regtest

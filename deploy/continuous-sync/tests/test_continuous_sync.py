@@ -2011,6 +2011,39 @@ class NotificationTests(unittest.TestCase):
             result = deploy.cmd_audit(args)
         return result, post
 
+    def test_ci_receipt_preserves_repeat_suppression_and_reminders(self):
+        """Confirms handled incidents without posting again before the existing reminder."""
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            output = Path(tmp) / "output"
+            for timestamp, should_post in ((1000, True), (1100, False), (88000, True)):
+                output.write_text("")
+                with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                    result, post = self.audit(state, data, timestamp)
+                self.assertEqual(result, 1)
+                self.assertEqual(post.called, should_post)
+                self.assertEqual(output.read_text(), "notification_handled=true\n")
+
+    def test_ci_receipt_requires_delivery_and_persisted_state(self):
+        """A failed post or state write leaves the central failure alert enabled."""
+        data = self.halted_status()
+        del data["controller_state"]["failure_notification"]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state.json"
+            output = Path(tmp) / "output"
+            output.write_text("")
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                result, post = self.audit(state, data, 1000, posted=False)
+                self.assertEqual(result, 1)
+                post.assert_called_once()
+                self.assertEqual(output.read_text(), "")
+                with patch.object(deploy, "save_audit_state", side_effect=OSError("disk full")):
+                    with self.assertRaises(OSError):
+                        self.audit(state, data, 1100)
+                self.assertEqual(output.read_text(), "")
+
     def test_halt_receipt_requires_successful_delivery(self):
         for delivered in (False, True):
             with self.subTest(delivered=delivered), tempfile.TemporaryDirectory() as tmp:

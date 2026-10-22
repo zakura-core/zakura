@@ -15,7 +15,7 @@ use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        CancellationToken, Mutex as StdMutex, Notify,
+        CancellationToken, Mutex as StdMutex, MutexGuard, Notify,
     },
 };
 
@@ -36,6 +36,7 @@ use super::protocol::{
 };
 use super::requester::{reservation_pool, Queries, QueryUnsent};
 use super::serving::{PeerSampler, ServiceReporter, Serving, ServingCapacity};
+use super::state::DiscoverySessionKey;
 use super::trace::{DiscoveryViolationEvent, ViolationStage};
 use super::wire::{PEERS_MAX_BYTES, RULES, SEND_INTERVAL};
 use crate::zakura::regulation::{CadenceSendError, CadenceSender, ReservationPool, WriterFence};
@@ -108,7 +109,7 @@ pub struct DiscoveryService {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    session_states: Arc<StdMutex<SessionStateMap>>,
+    session_states: Arc<StdMutex<DiscoverySessionStates>>,
     connection_owners: Arc<StdMutex<Vec<Arc<dyn Service>>>>,
     /// Node-wide capacity of the request rows.
     serving: ServingCapacity,
@@ -141,99 +142,144 @@ struct DiscoverySessionRecord {
 /// session, and a fresh connection always starts a fresh record.
 const MAX_DISCOVERY_SESSION_FAILURES: u32 = 3;
 
-type SessionStateMap = HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionRecord>;
-
-fn retire_discovery_session(
-    session_states: &StdMutex<SessionStateMap>,
-    peer: &ZakuraPeerId,
-    conn_id: ZakuraConnId,
-    session_id: u64,
-) -> bool {
-    let mut session_states = session_states
-        .lock()
-        .expect("discovery session-state mutex is never poisoned");
-    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
-        return false;
-    };
-    if record.session_id != session_id {
-        return false;
-    }
-    record.state = DiscoverySessionState::Retired;
-    true
+/// Discovery's session records, one per `(peer, connection)`.
+///
+/// Each transition names the exact session it acts for, so a finished or
+/// failed session cannot change the record of a newer session admitted on the
+/// same connection. The service holds the records under their own lock,
+/// separate from the discovery handle's.
+#[derive(Debug, Default)]
+struct DiscoverySessionStates {
+    records: HashMap<(ZakuraPeerId, ZakuraConnId), DiscoverySessionRecord>,
 }
 
-/// Charge one failed session to the owning record; retires it at the failure
-/// bound. Session-scoped like `retire_discovery_session` so a stale task cannot
-/// charge a newer session admitted on the same connection. Returns whether the
-/// record was retired by this failure.
-fn record_discovery_session_failure(
-    session_states: &StdMutex<SessionStateMap>,
-    peer: &ZakuraPeerId,
-    conn_id: ZakuraConnId,
-    session_id: u64,
-) -> bool {
-    let mut session_states = session_states
-        .lock()
-        .expect("discovery session-state mutex is never poisoned");
-    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
-        return false;
-    };
-    if record.session_id != session_id || record.state != DiscoverySessionState::Active {
-        return false;
+/// What charging one failed session did to its record.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SessionFailure {
+    /// The session owns no active record, so nothing was charged.
+    Stale,
+    /// The record counted the failure and stays active.
+    Counted,
+    /// The failure reached the bound and retired the record.
+    Retired {
+        /// Consecutive failed sessions, including this one.
+        attempts: u32,
+    },
+}
+
+impl DiscoverySessionStates {
+    /// Whether the record for `peer` on `conn_id` is retired.
+    fn is_retired(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) -> bool {
+        self.records
+            .get(&(peer.clone(), conn_id))
+            .is_some_and(|record| record.state == DiscoverySessionState::Retired)
     }
-    record.failed_attempts = record.failed_attempts.saturating_add(1);
-    if record.failed_attempts >= MAX_DISCOVERY_SESSION_FAILURES {
-        record.state = DiscoverySessionState::Retired;
-        tracing::info!(
-            ?peer,
-            conn_id,
-            attempts = record.failed_attempts,
-            "retiring Zakura discovery sessions on this connection after repeated failed exchanges"
+
+    /// Makes `session` the active owner of its connection's record.
+    ///
+    /// The failure count carries over from the previous session, so
+    /// consecutive broken sessions on one connection stay bounded. Returns
+    /// `false`, changing nothing, when the record is retired: the remote
+    /// initiates streams on inbound connections and could otherwise churn
+    /// sessions at its own pace.
+    fn open(&mut self, session: &DiscoverySessionKey) -> bool {
+        let key = (session.peer_id.clone(), session.conn_id);
+        let previous = self.records.get(&key);
+        if previous.is_some_and(|record| record.state == DiscoverySessionState::Retired) {
+            return false;
+        }
+        let failed_attempts = previous.map_or(0, |record| record.failed_attempts);
+        self.records.insert(
+            key,
+            DiscoverySessionRecord {
+                session_id: session.session_id,
+                state: DiscoverySessionState::Active,
+                failed_attempts,
+            },
         );
-        return true;
+        true
     }
-    false
+
+    /// Retires the record `session` owns. Returns whether it did.
+    fn retire(&mut self, session: &DiscoverySessionKey) -> bool {
+        let Some(record) = self.owned_by(session) else {
+            return false;
+        };
+        record.state = DiscoverySessionState::Retired;
+        true
+    }
+
+    /// Charges one failed session to the active record `session` owns, and
+    /// retires the record at `MAX_DISCOVERY_SESSION_FAILURES`.
+    fn record_failure(&mut self, session: &DiscoverySessionKey) -> SessionFailure {
+        let Some(record) = self
+            .owned_by(session)
+            .filter(|record| record.state == DiscoverySessionState::Active)
+        else {
+            return SessionFailure::Stale;
+        };
+        record.failed_attempts = record.failed_attempts.saturating_add(1);
+        if record.failed_attempts >= MAX_DISCOVERY_SESSION_FAILURES {
+            record.state = DiscoverySessionState::Retired;
+            return SessionFailure::Retired {
+                attempts: record.failed_attempts,
+            };
+        }
+        SessionFailure::Counted
+    }
+
+    /// Resets the failure count of the record `session` owns, so the intended
+    /// shared-connection refresh loop never accumulates failures.
+    fn record_success(&mut self, session: &DiscoverySessionKey) {
+        if let Some(record) = self.owned_by(session) {
+            record.failed_attempts = 0;
+        }
+    }
+
+    /// Drops the record for `peer` on `conn_id` once the connection ends.
+    fn remove_connection(&mut self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        self.records.remove(&(peer.clone(), conn_id));
+    }
+
+    fn owned_by(&mut self, session: &DiscoverySessionKey) -> Option<&mut DiscoverySessionRecord> {
+        self.records
+            .get_mut(&(session.peer_id.clone(), session.conn_id))
+            .filter(|record| record.session_id == session.session_id)
+    }
 }
 
-/// Reset the owning record's failure count after a successful exchange, so the
-/// intended shared-connection refresh loop never accumulates failures.
-fn record_discovery_session_success(
-    session_states: &StdMutex<SessionStateMap>,
-    peer: &ZakuraPeerId,
-    conn_id: ZakuraConnId,
-    session_id: u64,
-) {
-    let mut session_states = session_states
-        .lock()
-        .expect("discovery session-state mutex is never poisoned");
-    let Some(record) = session_states.get_mut(&(peer.clone(), conn_id)) else {
-        return;
-    };
-    if record.session_id != session_id {
-        return;
-    }
-    record.failed_attempts = 0;
-}
-
-/// One session's record in the session-state map.
+/// One session's record in the shared session-state map.
 struct SessionSlot {
-    states: Arc<StdMutex<SessionStateMap>>,
-    peer: ZakuraPeerId,
-    conn_id: ZakuraConnId,
-    session_id: u64,
+    states: Arc<StdMutex<DiscoverySessionStates>>,
+    key: DiscoverySessionKey,
 }
 
 impl SessionSlot {
     fn succeed(&self) {
-        record_discovery_session_success(&self.states, &self.peer, self.conn_id, self.session_id);
+        self.lock().record_success(&self.key);
     }
 
+    /// Charges this session's failure. A parked session also charges one,
+    /// so reopen-then-park cycles stay bounded on its connection.
     fn fail(&self) {
-        record_discovery_session_failure(&self.states, &self.peer, self.conn_id, self.session_id);
+        if let SessionFailure::Retired { attempts } = self.lock().record_failure(&self.key) {
+            tracing::info!(
+                peer = ?self.key.peer_id,
+                conn_id = self.key.conn_id,
+                attempts,
+                "retiring Zakura discovery sessions on this connection after repeated failed exchanges"
+            );
+        }
     }
 
     fn retire(&self) {
-        retire_discovery_session(&self.states, &self.peer, self.conn_id, self.session_id);
+        self.lock().retire(&self.key);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DiscoverySessionStates> {
+        self.states
+            .lock()
+            .expect("discovery session-state mutex is never poisoned")
     }
 }
 
@@ -251,7 +297,7 @@ impl DiscoveryService {
             handle,
             header_sync: None,
             block_sync: None,
-            session_states: Arc::new(StdMutex::new(HashMap::new())),
+            session_states: Arc::default(),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
@@ -273,7 +319,7 @@ impl DiscoveryService {
             handle,
             header_sync: Some(header_sync),
             block_sync,
-            session_states: Arc::new(StdMutex::new(HashMap::new())),
+            session_states: Arc::default(),
             connection_owners: Arc::new(StdMutex::new(Vec::new())),
             serving: ServingCapacity::new(max_connections),
             query_pool: reservation_pool(),
@@ -321,8 +367,7 @@ impl Service for DiscoveryService {
             .session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
-            .get(&(peer.clone(), conn_id))
-            .is_some_and(|record| record.state == DiscoverySessionState::Retired)
+            .is_retired(peer, conn_id)
         {
             return SessionDemand::Retire;
         }
@@ -379,30 +424,12 @@ impl Service for DiscoveryService {
             peer.service_cancel_token(),
         );
         let discovery_session = DiscoveryPeerSession::new(&session, peer.direction);
-        let conn_id = peer.conn_id;
-        {
-            let mut session_states = self
-                .session_states
-                .lock()
-                .expect("discovery session-state mutex is never poisoned");
-            let previous = session_states.get(&(peer.id.clone(), conn_id));
-            if previous.is_some_and(|record| record.state == DiscoverySessionState::Retired) {
-                // A retired record must not be resurrected by a new stream on the
-                // same connection — the remote initiates streams on inbound
-                // connections and could otherwise churn sessions at its own pace.
-                return;
-            }
-            // Preserve the failure count across reopens so consecutive broken
-            // sessions on this connection stay bounded.
-            let failed_attempts = previous.map_or(0, |record| record.failed_attempts);
-            session_states.insert(
-                (peer.id.clone(), conn_id),
-                DiscoverySessionRecord {
-                    session_id,
-                    state: DiscoverySessionState::Active,
-                    failed_attempts,
-                },
-            );
+        let slot = SessionSlot {
+            states: self.session_states.clone(),
+            key: DiscoverySessionKey::new(peer.id.clone(), peer.conn_id, session_id),
+        };
+        if !slot.lock().open(&slot.key) {
+            return;
         }
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
@@ -416,7 +443,6 @@ impl Service for DiscoveryService {
         let serving = self.serving.clone();
         let query_pool = self.query_pool.clone();
         let trace = self.trace.clone();
-        let session_states = self.session_states.clone();
         let connection_owners = self
             .connection_owners
             .lock()
@@ -441,12 +467,7 @@ impl Service for DiscoveryService {
             },
             async move {
                 let decision = handle
-                    .admit_peer_session(
-                        conn_id,
-                        session_id,
-                        discovery_session.peer_id().clone(),
-                        discovery_session.direction(),
-                    )
+                    .admit_peer_session(slot.key.clone(), discovery_session.direction())
                     .await;
                 if decision != ServiceAdmissionDecision::Admit {
                     metrics::counter!("zakura.discovery.peer.parked").increment(1);
@@ -456,14 +477,8 @@ impl Service for DiscoveryService {
                         ?decision,
                         "locally parking Zakura discovery service session"
                     );
-                    // A parked session ends without an exchange; charge it so
-                    // reopen-then-park cycles stay bounded on this connection.
-                    record_discovery_session_failure(
-                        &session_states,
-                        discovery_session.peer_id(),
-                        conn_id,
-                        session_id,
-                    );
+                    // A parked session ends without an exchange, so it is charged.
+                    slot.fail();
                     service_cancel.cancel();
                     return;
                 }
@@ -477,13 +492,11 @@ impl Service for DiscoveryService {
                     connection_owners,
                     peer_node_id,
                     discovery_session,
-                    conn_id,
-                    session_id,
+                    slot,
                     recv,
                     service_cancel,
                     connection_cancel,
                     close_cause,
-                    session_states,
                     trace,
                 });
             },
@@ -494,7 +507,7 @@ impl Service for DiscoveryService {
         self.session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
-            .remove(&(peer.clone(), conn_id));
+            .remove_connection(peer, conn_id);
         let handle = self.handle.clone();
         let peer = peer.clone();
         spawn_erased(async move {
@@ -512,13 +525,12 @@ struct DiscoveryExchangeStart {
     connection_owners: Vec<Arc<dyn Service>>,
     peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
-    conn_id: ZakuraConnId,
-    session_id: u64,
+    /// The session's record, which also names the session.
+    slot: SessionSlot,
     recv: FramedRecv,
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
-    session_states: Arc<StdMutex<SessionStateMap>>,
     trace: ZakuraTrace,
 }
 
@@ -532,16 +544,15 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_owners,
         peer_node_id,
         discovery_session,
-        conn_id,
-        session_id,
+        slot,
         recv,
         service_cancel,
         connection_cancel,
         close_cause,
-        session_states,
         trace,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
+    let conn_id = slot.key.conn_id;
     let progress = Arc::new(DiscoveryExchangeProgress::default());
     let serving = serving.session(
         PeerSampler {
@@ -573,8 +584,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         queries: queries.clone(),
         peer_node_id,
         session: discovery_session.clone(),
-        conn_id,
-        session_id,
+        key: slot.key.clone(),
         progress: progress.clone(),
         trace,
     };
@@ -607,8 +617,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let mut source = DiscoverySource {
         handle: handle.clone(),
         session: discovery_session,
-        conn_id,
-        session_id,
+        key: slot.key.clone(),
         progress,
         hello: CadenceSender::new(),
         queries,
@@ -624,12 +633,6 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let panic_source_connection_cancel = connection_cancel.clone();
     let panic_source_close_cause = close_cause.clone();
     let source_close_cause = close_cause.clone();
-    let slot = SessionSlot {
-        states: session_states,
-        peer: peer_id.clone(),
-        conn_id,
-        session_id,
-    };
     spawn_supervised_peer_task(
         source_task_peer_id,
         || {},
@@ -658,11 +661,8 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 other_service_owner =
                     peer_has_other_service_owner(&connection_owners, &peer_id, conn_id);
             }
-            let closes_discovery_only_connection = continues
-                && !other_service_owner
-                && handle
-                    .is_current_session(&peer_id, conn_id, session_id)
-                    .await;
+            let closes_discovery_only_connection =
+                continues && !other_service_owner && handle.is_current_session(&slot.key).await;
             if closes_discovery_only_connection {
                 // Closing drops every unwritten answer, and the peer's
                 // exchange would end without it.
@@ -689,7 +689,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
             }
             service_cancel.cancel();
             source.queries.retire();
-            handle.remove_session(&peer_id, conn_id, session_id).await;
+            handle.remove_session(&slot.key).await;
             if closes_discovery_only_connection {
                 source_close_cause.record(if initial == InitialExchange::TimedOut {
                     "discovery_exchange_timed_out"
@@ -711,8 +711,8 @@ struct DiscoverySink {
     queries: Queries,
     peer_node_id: NodeId,
     session: DiscoveryPeerSession,
-    conn_id: ZakuraConnId,
-    session_id: u64,
+    /// The session this reader serves.
+    key: DiscoverySessionKey,
     progress: Arc<DiscoveryExchangeProgress>,
     /// Records each violation before the connection closes.
     trace: ZakuraTrace,
@@ -786,7 +786,7 @@ impl DiscoverySink {
         self.trace.emit_event(|| {
             DiscoveryViolationEvent::new(
                 self.session.peer_id(),
-                self.session_id,
+                self.key.session_id,
                 message_type,
                 stage,
                 error,
@@ -797,11 +797,7 @@ impl DiscoverySink {
     /// Handles one decoded message. An answer already passed its query's
     /// checks.
     async fn handle_message(&self, message: DiscoveryMessage) -> Result<(), SinkReject> {
-        if !self
-            .handle
-            .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
-            .await
-        {
+        if !self.handle.is_current_session(&self.key).await {
             return Ok(());
         }
 
@@ -837,7 +833,7 @@ impl DiscoverySink {
             ));
         }
         self.handle
-            .import_connected_peer_services(services, self.peer_node_id)
+            .import_connected_peer_services(&self.key, services, self.peer_node_id)
             .await
             .map_err(SinkReject::protocol)?;
         self.progress.mark_services();
@@ -849,7 +845,7 @@ impl DiscoverySink {
     async fn handle_hello(&self, record: ZakuraNodeRecord) -> Result<(), SinkReject> {
         if let Err(error) = self
             .handle
-            .import_connected_peer_record(record, self.peer_node_id)
+            .import_connected_peer_record(&self.key, record, self.peer_node_id)
             .await
         {
             match hello_verdict(&error) {
@@ -868,8 +864,8 @@ impl DiscoverySink {
 struct DiscoverySource {
     handle: ZakuraDiscoveryHandle,
     session: DiscoveryPeerSession,
-    conn_id: ZakuraConnId,
-    session_id: u64,
+    /// The session this writer serves.
+    key: DiscoverySessionKey,
     progress: Arc<DiscoveryExchangeProgress>,
     /// Paces `Hello` to its row's send interval.
     hello: CadenceSender<DiscoveryMessage>,
@@ -901,12 +897,7 @@ impl DiscoverySource {
             _ = self.progress.wait_complete() => InitialExchange::Complete,
             _ = zakura_rt::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT) => InitialExchange::TimedOut,
         };
-        if outcome == InitialExchange::Ended
-            || !self
-                .handle
-                .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
-                .await
-        {
+        if outcome == InitialExchange::Ended || !self.handle.is_current_session(&self.key).await {
             return InitialExchange::Ended;
         }
         outcome
@@ -927,11 +918,7 @@ impl DiscoverySource {
     /// Returns `Err(())` once the stream's send side is gone, so the caller
     /// stops the periodic loop.
     async fn exchange(&mut self) -> Result<(), ()> {
-        if !self
-            .handle
-            .is_current_session(self.session.peer_id(), self.conn_id, self.session_id)
-            .await
-        {
+        if !self.handle.is_current_session(&self.key).await {
             return Err(());
         }
 
@@ -1822,13 +1809,12 @@ mod tests {
             handle,
             queries: test_queries(&send, &cancel),
             session: DiscoveryPeerSession {
-                peer_id,
+                peer_id: peer_id.clone(),
                 direction: ServicePeerDirection::Inbound,
                 send,
                 cancel,
             },
-            conn_id: 2,
-            session_id: 1,
+            key: DiscoverySessionKey::new(peer_id, 2, 1),
             progress: Arc::default(),
             hello: CadenceSender::new(),
         }
@@ -1884,8 +1870,7 @@ mod tests {
                 send,
                 cancel,
             },
-            conn_id,
-            session_id,
+            key: DiscoverySessionKey::new(peer_id.clone(), conn_id, session_id),
             progress: Arc::new(DiscoveryExchangeProgress::default()),
             trace: ZakuraTrace::default(),
         };
@@ -1963,7 +1948,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2035,7 +2023,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2117,7 +2108,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2199,7 +2193,10 @@ mod tests {
         let peer_node_id = NodeSecretKey::from_bytes(&[61u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         handle
-            .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+            .admit_peer_session(
+                DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                ServicePeerDirection::Inbound,
+            )
             .await;
         let mut capture = TraceCapture::for_test("discovery_violation_is_traced")?;
         let (mut sink, _sent) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
@@ -2266,7 +2263,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2405,7 +2405,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(0, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 0, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit,
         );
@@ -2476,7 +2479,10 @@ mod tests {
         // Admit session 1 and then replace it with session 2 on the same connection.
         assert_eq!(
             handle
-                .admit_peer_session(conn_id, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), conn_id, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit,
         );
@@ -2484,7 +2490,10 @@ mod tests {
             discovery_sink_for_session(&handle, &peer_id, peer_node_id, conn_id, 1);
         assert_eq!(
             handle
-                .admit_peer_session(conn_id, 2, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), conn_id, 2),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit,
         );
@@ -2523,121 +2532,59 @@ mod tests {
         Ok(())
     }
 
+    /// A session-state map holding one active record for `session`.
+    fn states_with_active(session: &DiscoverySessionKey) -> DiscoverySessionStates {
+        let mut states = DiscoverySessionStates::default();
+        assert!(states.open(session));
+        states
+    }
+
+    fn record_for(
+        states: &DiscoverySessionStates,
+        peer: &ZakuraPeerId,
+        conn_id: ZakuraConnId,
+    ) -> DiscoverySessionRecord {
+        *states
+            .records
+            .get(&(peer.clone(), conn_id))
+            .expect("test session record exists")
+    }
+
     #[test]
     fn teardown_before_retirement_does_not_recreate_discovery_session_state() {
         let peer = ZakuraPeerId::new(vec![71; 32]).expect("test peer id is within bounds");
         let conn_id = 9;
-        let states = StdMutex::new(HashMap::from([(
-            (peer.clone(), conn_id),
-            DiscoverySessionRecord {
-                session_id: 1,
-                state: DiscoverySessionState::Active,
-                failed_attempts: 0,
-            },
-        )]));
+        let session = DiscoverySessionKey::new(peer.clone(), conn_id, 1);
+        let mut states = states_with_active(&session);
 
-        states
-            .lock()
-            .expect("test session-state mutex is never poisoned")
-            .remove(&(peer.clone(), conn_id));
+        states.remove_connection(&peer, conn_id);
 
-        assert!(!retire_discovery_session(&states, &peer, conn_id, 1));
-        assert!(states
-            .lock()
-            .expect("test session-state mutex is never poisoned")
-            .is_empty());
+        assert!(!states.retire(&session));
+        assert!(states.records.is_empty());
     }
 
     #[test]
     fn stale_exchange_cannot_retire_a_newer_session_on_the_same_connection() {
         let peer = ZakuraPeerId::new(vec![72; 32]).expect("test peer id is within bounds");
         let conn_id = 9;
-        let states = StdMutex::new(HashMap::from([(
-            (peer.clone(), conn_id),
-            DiscoverySessionRecord {
-                session_id: 1,
-                state: DiscoverySessionState::Active,
-                failed_attempts: 0,
-            },
-        )]));
+        let first = DiscoverySessionKey::new(peer.clone(), conn_id, 1);
+        let mut states = states_with_active(&first);
 
         // A reopened stream admits session 2 on the same connection while
         // session 1's exchange is still finishing.
-        states
-            .lock()
-            .expect("test session-state mutex is never poisoned")
-            .insert(
-                (peer.clone(), conn_id),
-                DiscoverySessionRecord {
-                    session_id: 2,
-                    state: DiscoverySessionState::Active,
-                    failed_attempts: 0,
-                },
-            );
+        let second = DiscoverySessionKey::new(peer.clone(), conn_id, 2);
+        assert!(states.open(&second));
 
         assert!(
-            !retire_discovery_session(&states, &peer, conn_id, 1),
+            !states.retire(&first),
             "session 1's finished exchange must not retire session 2's slot"
         );
         assert_eq!(
-            states
-                .lock()
-                .expect("test session-state mutex is never poisoned")
-                .get(&(peer.clone(), conn_id))
-                .map(|record| record.state),
-            Some(DiscoverySessionState::Active),
+            record_for(&states, &peer, conn_id).state,
+            DiscoverySessionState::Active,
         );
 
-        assert!(retire_discovery_session(&states, &peer, conn_id, 2));
-        assert_eq!(
-            states
-                .lock()
-                .expect("test session-state mutex is never poisoned")
-                .get(&(peer.clone(), conn_id))
-                .map(|record| record.state),
-            Some(DiscoverySessionState::Retired),
-        );
-    }
-
-    fn record_for(
-        states: &StdMutex<SessionStateMap>,
-        peer: &ZakuraPeerId,
-        conn_id: ZakuraConnId,
-    ) -> DiscoverySessionRecord {
-        *states
-            .lock()
-            .expect("test session-state mutex is never poisoned")
-            .get(&(peer.clone(), conn_id))
-            .expect("test session record exists")
-    }
-
-    #[test]
-    fn failed_sessions_retire_discovery_after_bounded_attempts() {
-        let peer = ZakuraPeerId::new(vec![73; 32]).expect("test peer id is within bounds");
-        let conn_id = 9;
-        let states = StdMutex::new(HashMap::from([(
-            (peer.clone(), conn_id),
-            DiscoverySessionRecord {
-                session_id: 1,
-                state: DiscoverySessionState::Active,
-                failed_attempts: 0,
-            },
-        )]));
-
-        for attempt in 1..MAX_DISCOVERY_SESSION_FAILURES {
-            assert!(
-                !record_discovery_session_failure(&states, &peer, conn_id, 1),
-                "attempt {attempt} must not yet retire the record"
-            );
-            let record = record_for(&states, &peer, conn_id);
-            assert_eq!(record.state, DiscoverySessionState::Active);
-            assert_eq!(record.failed_attempts, attempt);
-        }
-
-        assert!(
-            record_discovery_session_failure(&states, &peer, conn_id, 1),
-            "the failure bound must retire the record"
-        );
+        assert!(states.retire(&second));
         assert_eq!(
             record_for(&states, &peer, conn_id).state,
             DiscoverySessionState::Retired,
@@ -2645,29 +2592,57 @@ mod tests {
     }
 
     #[test]
+    fn failed_sessions_retire_discovery_after_bounded_attempts() {
+        let peer = ZakuraPeerId::new(vec![73; 32]).expect("test peer id is within bounds");
+        let conn_id = 9;
+        let session = DiscoverySessionKey::new(peer.clone(), conn_id, 1);
+        let mut states = states_with_active(&session);
+
+        for attempt in 1..MAX_DISCOVERY_SESSION_FAILURES {
+            assert_eq!(
+                states.record_failure(&session),
+                SessionFailure::Counted,
+                "attempt {attempt} must not yet retire the record"
+            );
+            let record = record_for(&states, &peer, conn_id);
+            assert_eq!(record.state, DiscoverySessionState::Active);
+            assert_eq!(record.failed_attempts, attempt);
+        }
+
+        assert_eq!(
+            states.record_failure(&session),
+            SessionFailure::Retired {
+                attempts: MAX_DISCOVERY_SESSION_FAILURES
+            },
+            "the failure bound must retire the record"
+        );
+        assert_eq!(
+            record_for(&states, &peer, conn_id).state,
+            DiscoverySessionState::Retired,
+        );
+        assert!(
+            !states.open(&DiscoverySessionKey::new(peer.clone(), conn_id, 2)),
+            "a retired record must not be resurrected by a new stream"
+        );
+    }
+
+    #[test]
     fn successful_exchange_resets_discovery_failure_count() {
         let peer = ZakuraPeerId::new(vec![74; 32]).expect("test peer id is within bounds");
         let conn_id = 9;
-        let states = StdMutex::new(HashMap::from([(
-            (peer.clone(), conn_id),
-            DiscoverySessionRecord {
-                session_id: 1,
-                state: DiscoverySessionState::Active,
-                failed_attempts: 0,
-            },
-        )]));
+        let session = DiscoverySessionKey::new(peer.clone(), conn_id, 1);
+        let mut states = states_with_active(&session);
 
         for _ in 1..MAX_DISCOVERY_SESSION_FAILURES {
-            assert!(!record_discovery_session_failure(
-                &states, &peer, conn_id, 1
-            ));
+            assert_eq!(states.record_failure(&session), SessionFailure::Counted);
         }
-        record_discovery_session_success(&states, &peer, conn_id, 1);
+        states.record_success(&session);
         assert_eq!(record_for(&states, &peer, conn_id).failed_attempts, 0);
 
         for _ in 1..MAX_DISCOVERY_SESSION_FAILURES {
-            assert!(
-                !record_discovery_session_failure(&states, &peer, conn_id, 1),
+            assert_eq!(
+                states.record_failure(&session),
+                SessionFailure::Counted,
                 "the reset counter must grant a full fresh failure budget"
             );
         }
@@ -2681,17 +2656,11 @@ mod tests {
     fn stale_session_failure_cannot_charge_a_newer_session() {
         let peer = ZakuraPeerId::new(vec![75; 32]).expect("test peer id is within bounds");
         let conn_id = 9;
-        let states = StdMutex::new(HashMap::from([(
-            (peer.clone(), conn_id),
-            DiscoverySessionRecord {
-                session_id: 2,
-                state: DiscoverySessionState::Active,
-                failed_attempts: 0,
-            },
-        )]));
+        let mut states = states_with_active(&DiscoverySessionKey::new(peer.clone(), conn_id, 2));
 
-        assert!(
-            !record_discovery_session_failure(&states, &peer, conn_id, 1),
+        assert_eq!(
+            states.record_failure(&DiscoverySessionKey::new(peer.clone(), conn_id, 1)),
+            SessionFailure::Stale,
             "session 1's failure must not charge session 2's slot"
         );
         assert_eq!(record_for(&states, &peer, conn_id).failed_attempts, 0);
@@ -2724,6 +2693,7 @@ mod tests {
             .session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
+            .records
             .insert(
                 (peer_id.clone(), 0),
                 DiscoverySessionRecord {
@@ -2747,7 +2717,14 @@ mod tests {
 
         // Asserted synchronously (current-thread runtime): a refused add_peer
         // must not have replaced the retired record or spawned an exchange.
-        let record = record_for(&service.session_states, &peer_id, 0);
+        let record = record_for(
+            &service
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned"),
+            &peer_id,
+            0,
+        );
         assert_eq!(
             record.session_id, 7,
             "a retired record must not be resurrected by a new stream"
@@ -2792,6 +2769,7 @@ mod tests {
             .session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
+            .records
             .insert(
                 (peer_id.clone(), 0),
                 DiscoverySessionRecord {
@@ -2813,7 +2791,14 @@ mod tests {
             connection_cancel.clone(),
         ));
 
-        let record = record_for(&service.session_states, &peer_id, 0);
+        let record = record_for(
+            &service
+                .session_states
+                .lock()
+                .expect("discovery session-state mutex is never poisoned"),
+            &peer_id,
+            0,
+        );
         assert_ne!(
             record.session_id, 7,
             "a live reopen must install the new stream session"
@@ -2870,7 +2855,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 2, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2916,7 +2904,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 2, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2925,7 +2916,10 @@ mod tests {
         let mut source = test_source(handle.clone(), peer_id.clone(), send);
         assert_eq!(
             handle
-                .admit_peer_session(2, 2, peer_id, ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id, 2, 2),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2963,7 +2957,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 2, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -2980,7 +2977,10 @@ mod tests {
 
         assert_eq!(
             handle
-                .admit_peer_session(2, 2, peer_id, ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id, 2, 2),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -3014,7 +3014,10 @@ mod tests {
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
-                .admit_peer_session(2, 1, peer_id.clone(), ServicePeerDirection::Inbound)
+                .admit_peer_session(
+                    DiscoverySessionKey::new(peer_id.clone(), 2, 1),
+                    ServicePeerDirection::Inbound
+                )
                 .await,
             ServiceAdmissionDecision::Admit
         );
@@ -3209,6 +3212,7 @@ mod tests {
             .session_states
             .lock()
             .expect("discovery session-state mutex is never poisoned")
+            .records
             .get(&(peer_id, 0))
             .copied()
             .expect("the session record outlives the exchange");
@@ -3263,6 +3267,7 @@ mod tests {
                 .session_states
                 .lock()
                 .expect("discovery session-state mutex is never poisoned")
+                .records
                 .get(&(peer_id.clone(), 0))
                 .map(|record| record.failed_attempts)
         };

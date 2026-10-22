@@ -17,7 +17,7 @@ use std::{
 
 pub use tokio::task::coop;
 
-use crate::sim::{self, Op, Point, TaskExit, TaskId};
+use crate::sim::{self, Op, Point, RunId, TaskExit, TaskId};
 
 /// Spawns `future` as a new task, as `tokio::spawn` does.
 ///
@@ -29,7 +29,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let Some(executor) = sim::executor() else {
+    let (Some(executor), Some(run)) = (sim::executor(), sim::run_id()) else {
         return JoinHandle::tokio(tokio::spawn(future));
     };
     let site = Location::caller();
@@ -44,7 +44,7 @@ where
         }),
     );
     JoinHandle {
-        inner: Inner::Sim { task, output },
+        inner: Inner::Sim { run, task, output },
     }
 }
 
@@ -121,6 +121,7 @@ pub struct JoinHandle<T> {
 enum Inner<T> {
     Tokio(tokio::task::JoinHandle<T>),
     Sim {
+        run: RunId,
         task: TaskId,
         /// Filled by the task's wrapper future when it completes.
         output: Arc<Mutex<Option<T>>>,
@@ -153,8 +154,8 @@ impl<T> JoinHandle<T> {
             Inner::Tokio(handle) => AbortHandle {
                 inner: AbortInner::Tokio(handle.abort_handle()),
             },
-            Inner::Sim { task, .. } => AbortHandle {
-                inner: AbortInner::Sim(*task),
+            Inner::Sim { run, task, .. } => AbortHandle {
+                inner: AbortInner::Sim(*run, *task),
             },
         }
     }
@@ -168,8 +169,8 @@ impl<T> Future for JoinHandle<T> {
             Inner::Tokio(handle) => Pin::new(handle)
                 .poll(cx)
                 .map_err(|error| JoinError(JoinErrorRepr::Tokio(error))),
-            Inner::Sim { task, output } => {
-                let executor = sim::executor()
+            Inner::Sim { run, task, output } => {
+                let executor = sim::executor_for(*run)
                     .expect("a sim JoinHandle is only polled inside the run that spawned it");
                 executor.poll_join(*task, cx).map(|exit| match exit {
                     TaskExit::Completed => Ok(output
@@ -207,7 +208,7 @@ pub struct AbortHandle {
 #[derive(Clone)]
 enum AbortInner {
     Tokio(tokio::task::AbortHandle),
-    Sim(TaskId),
+    Sim(RunId, TaskId),
 }
 
 impl AbortHandle {
@@ -228,9 +229,9 @@ impl AbortHandle {
     fn abort_at(&self, site: &'static Location<'static>) {
         match &self.inner {
             AbortInner::Tokio(handle) => handle.abort(),
-            AbortInner::Sim(task) => {
+            AbortInner::Sim(run, task) => {
                 // After the run ends there's nothing left to abort.
-                if let Some(executor) = sim::executor() {
+                if let Some(executor) = sim::executor_for(*run) {
                     executor.preempt(Point::at(Op::Abort, site));
                     executor.abort(*task);
                 }
@@ -242,7 +243,7 @@ impl AbortHandle {
     fn is_finished_at(&self, site: &'static Location<'static>) -> bool {
         match &self.inner {
             AbortInner::Tokio(handle) => handle.is_finished(),
-            AbortInner::Sim(task) => sim::executor().is_none_or(|executor| {
+            AbortInner::Sim(run, task) => sim::executor_for(*run).is_none_or(|executor| {
                 executor.preempt(Point::at(Op::Join, site));
                 executor.is_finished(*task)
             }),
@@ -254,7 +255,7 @@ impl fmt::Debug for AbortHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             AbortInner::Tokio(handle) => handle.fmt(f),
-            AbortInner::Sim(task) => f.debug_tuple("AbortHandle").field(task).finish(),
+            AbortInner::Sim(_, task) => f.debug_tuple("AbortHandle").field(task).finish(),
         }
     }
 }

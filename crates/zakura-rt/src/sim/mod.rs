@@ -17,6 +17,7 @@ use std::{
     marker::PhantomData,
     panic::Location,
     pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -88,13 +89,65 @@ pub trait Executor {
     fn set_external_wait(&self, waiting: bool);
 }
 
+/// The run installed on a thread.
+#[derive(Clone, Copy)]
+struct Run {
+    executor: &'static dyn Executor,
+    id: RunId,
+}
+
 thread_local! {
-    static EXECUTOR: Cell<Option<&'static dyn Executor>> = const { Cell::new(None) };
+    static RUN: Cell<Option<Run>> = const { Cell::new(None) };
+}
+
+/// The next [`RunId`]. Process-wide, so an id never repeats on any thread.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
+/// One run, unique within the process.
+///
+/// Task, timer and object ids are only meaningful in the run that assigned
+/// them, and executors reuse them across runs. So every sim handle that holds
+/// an id also holds its run, and reaches the executor through
+/// [`executor_for`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunId(u64);
+
+impl RunId {
+    /// The raw id, counting runs started in this process from 1.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "run {}", self.0)
+    }
 }
 
 /// The executor of the run on this thread, or `None` outside a run.
 pub fn executor() -> Option<&'static dyn Executor> {
-    EXECUTOR.try_with(Cell::get).ok().flatten()
+    current().map(|run| run.executor)
+}
+
+/// The run on this thread, or `None` outside a run.
+pub fn run_id() -> Option<RunId> {
+    current().map(|run| run.id)
+}
+
+/// The executor of `run`, or `None` once that run has ended or on another
+/// thread. A handle from an earlier run then acts as if its task or timer
+/// ended with the run, instead of reaching a later run's task or timer with
+/// the same id.
+pub fn executor_for(run: RunId) -> Option<&'static dyn Executor> {
+    current()
+        .filter(|current| current.id == run)
+        .map(|current| current.executor)
+}
+
+/// The run on this thread, if any.
+fn current() -> Option<Run> {
+    RUN.try_with(Cell::get).ok().flatten()
 }
 
 /// Installs `executor` for a run on this thread, until the guard drops.
@@ -103,12 +156,13 @@ pub fn executor() -> Option<&'static dyn Executor> {
 ///
 /// If this thread is already in a run. Runs don't nest.
 pub fn enter(executor: &'static dyn Executor) -> RunGuard {
-    EXECUTOR.with(|cell| {
+    RUN.with(|cell| {
         assert!(
             cell.get().is_none(),
             "a zakura-rt sim run is already active on this thread"
         );
-        cell.set(Some(executor));
+        let id = RunId(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
+        cell.set(Some(Run { executor, id }));
     });
     RunGuard {
         _not_send: PhantomData,
@@ -124,7 +178,7 @@ pub struct RunGuard {
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let _ = EXECUTOR.try_with(|cell| cell.set(None));
+        let _ = RUN.try_with(|cell| cell.set(None));
     }
 }
 
@@ -134,7 +188,8 @@ impl fmt::Debug for RunGuard {
     }
 }
 
-/// A task's identity, as the executor assigns it.
+/// A task's identity, as the executor assigns it. Only meaningful in its run
+/// (see [`RunId`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskId(u64);
 
@@ -152,6 +207,7 @@ impl TaskId {
 
 /// A runtime object's identity: the creating task (or `None` for setup code)
 /// and a creation ordinal, so it stays stable when unrelated tasks change.
+/// Only meaningful in its run (see [`RunId`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId {
     /// The task that created the object, or `None` for setup code.
@@ -160,7 +216,8 @@ pub struct ObjectId {
     pub ordinal: u32,
 }
 
-/// A registered timer. Ordered by deadline, then by registration.
+/// A registered timer. Ordered by deadline, then by registration. Only
+/// meaningful in its run (see [`RunId`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimerId {
     deadline: Duration,

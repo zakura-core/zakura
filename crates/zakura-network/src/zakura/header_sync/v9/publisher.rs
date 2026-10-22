@@ -772,6 +772,10 @@ enum Admission {
 }
 
 /// How a page in progress finished.
+// The simulator build's sync wrappers make `PushSend` about 376 bytes, past
+// clippy's threshold. One `Progress` is returned per page, so boxing the send
+// would only add an allocation per page in production.
+#[cfg_attr(zakura_sim, allow(clippy::large_enum_variant))]
 enum Progress<'a> {
     Page(Page, PushSend<'a>),
     Other(Output),

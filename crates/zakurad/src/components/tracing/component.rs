@@ -8,7 +8,12 @@ use std::{
 use eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    Layer,
+};
 use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
@@ -68,6 +73,7 @@ impl Tracing {
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
+        let targets = parse_filter(&filter)?;
 
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
@@ -139,18 +145,19 @@ impl Tracing {
             non_blocking(writer, config.buffer_limit.max(100)).map_err(io_error)?;
 
         // Construct a format subscriber with the supplied global logging filter.
+        // The filter is not a per-layer filter, so it applies to every layer.
         let subscriber = {
-            use tracing_subscriber::FmtSubscriber;
-
-            let logger = FmtSubscriber::builder()
+            let logger = tracing_subscriber::fmt::layer()
                 .with_ansi(use_color)
-                .with_writer(non_blocking)
-                .with_env_filter(&filter);
+                .with_writer(non_blocking);
 
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            logger.finish().with(warn_error_layer)
+            tracing_subscriber::registry()
+                .with(targets)
+                .with(logger)
+                .with(warn_error_layer)
         };
 
         // Initialise the global tracing subscriber
@@ -195,6 +202,41 @@ impl std::fmt::Debug for Tracing {
     }
 }
 
+/// Parses the configured tracing `filter` into a [`Targets`] filter.
+///
+/// The filter is a comma-separated list of `level`, `target` and `target=level`
+/// directives. Empty directives are skipped, and a filter with no directives
+/// shows errors only.
+///
+/// Returns an error for span or field directives, which [`Targets`] cannot
+/// apply, and for any other directive it cannot parse.
+fn parse_filter(filter: &str) -> Result<Targets, Report> {
+    let directives: Vec<&str> = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .collect();
+
+    if directives.is_empty() {
+        return Ok(Targets::new().with_default(LevelFilter::ERROR));
+    }
+
+    if let Some(directive) = directives
+        .iter()
+        .find(|directive| directive.contains(['[', '{']))
+    {
+        return Err(eyre!(
+            "unsupported tracing filter directive `{directive}`: span and field filters are not \
+             supported, use `level`, `target` or `target=level` directives"
+        ));
+    }
+
+    directives
+        .join(",")
+        .parse()
+        .map_err(|error| eyre!("invalid tracing filter `{filter}`: {error}"))
+}
+
 // Visitor to extract only the "message" field from a log event.
 struct MessageVisitor {
     message: Option<String>,
@@ -235,6 +277,97 @@ where
                     .last_warn_error_sender
                     .send(Some((message, level, timestamp)));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the most verbose level `targets` enables for `target`.
+    fn level_for(targets: &Targets, target: &str) -> LevelFilter {
+        [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ]
+        .into_iter()
+        .find(|level| targets.would_enable(target, level))
+        .map_or(LevelFilter::OFF, LevelFilter::from_level)
+    }
+
+    #[test]
+    fn filter_levels_follow_the_most_specific_target() {
+        let targets =
+            parse_filter("warn,zakurad=info,zakura_network=debug,zakura_network::zakura=trace")
+                .expect("the filter is valid");
+
+        assert_eq!(level_for(&targets, "zakura_state"), LevelFilter::WARN);
+        assert_eq!(
+            level_for(&targets, "zakurad::commands::start"),
+            LevelFilter::INFO
+        );
+        assert_eq!(
+            level_for(&targets, "zakura_network::peer"),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(
+            level_for(&targets, "zakura_network::zakura::discovery"),
+            LevelFilter::TRACE
+        );
+    }
+
+    #[test]
+    fn bare_target_enables_every_level_for_it() {
+        let targets = parse_filter("warn,zakura_rpc").expect("the filter is valid");
+
+        assert_eq!(
+            level_for(&targets, "zakura_rpc::server"),
+            LevelFilter::TRACE
+        );
+        assert_eq!(level_for(&targets, "zakura_state"), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn empty_filter_and_empty_directives_match_the_previous_filter() {
+        for filter in ["", " ", ",", ",,"] {
+            let targets = parse_filter(filter).expect("an empty filter is valid");
+            assert_eq!(
+                level_for(&targets, "zakurad"),
+                LevelFilter::ERROR,
+                "{filter:?}"
+            );
+        }
+
+        let targets = parse_filter("info,,zakura_network=debug,").expect("the filter is valid");
+        assert_eq!(level_for(&targets, "zakurad"), LevelFilter::INFO);
+        assert_eq!(level_for(&targets, "zakura_network"), LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn span_and_field_directives_are_rejected() {
+        for filter in [
+            r"[block_verify{height=Some\(block::Height\(.*000\)\)}]=trace",
+            "info,[sync]=debug",
+            "zakura_network[{peer}]=debug",
+        ] {
+            let error = parse_filter(filter).expect_err("span and field filters are unsupported");
+            assert!(
+                error
+                    .to_string()
+                    .contains("span and field filters are not supported"),
+                "{filter:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_directives_are_rejected() {
+        for filter in ["zakurad=loud", "info,zakurad=debug=trace"] {
+            assert!(parse_filter(filter).is_err(), "{filter:?}");
         }
     }
 }

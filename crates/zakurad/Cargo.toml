@@ -182,7 +182,7 @@ eyre = { workspace = true }
 
 thiserror = { workspace = true }
 
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }

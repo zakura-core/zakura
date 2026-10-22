@@ -1382,3 +1382,27 @@ async fn one_slot_serving_drains_before_control_uses_the_slot() {
         cancel.cancel();
     }
 }
+
+#[test]
+fn only_more_than_twice_the_limit_is_over_committed() {
+    for limit in [0u32, 1, 2, 7, u32::MAX / 2, u32::MAX] {
+        let margin = limit.saturating_mul(2);
+        for open in [0u32, 1, limit, limit.saturating_add(1), margin] {
+            if open > margin {
+                continue;
+            }
+            let expected = if open > limit {
+                CommitmentLoad::OverLimit
+            } else {
+                CommitmentLoad::Within
+            };
+            assert_eq!(commitment_load(open, limit), Ok(expected), "{open}/{limit}");
+        }
+        if let Some(open) = limit.checked_mul(2).and_then(|twice| twice.checked_add(1)) {
+            assert_eq!(
+                commitment_load(open, limit),
+                Err(ServeViolation::OverCommitted { open, limit })
+            );
+        }
+    }
+}

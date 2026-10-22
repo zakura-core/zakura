@@ -72,7 +72,7 @@ impl Fixture {
         assert_eq!(routine.io.budget.reserved(), budget_reserved);
         assert_eq!(self.pool.held(), 0);
         assert_eq!(routine.io.requester.occupancy().len, 0);
-        assert!(routine.window.outstanding.is_empty());
+        assert!(routine.state.window.outstanding.is_empty());
         assert!(self.outbound.try_recv().is_err(), "nothing was sent");
     }
 }
@@ -100,7 +100,7 @@ async fn a_full_requester_pool_waits_for_an_entry() {
     let report = fixture.routine.try_fill();
 
     assert_eq!(report.stop, FillStop::Budget);
-    assert!(fixture.routine.request_pool_waiting);
+    assert!(fixture.routine.state.request_pool_waiting);
     assert_eq!(fixture.next_request_id(), before);
     drop((held, other));
     fixture.assert_settled(0);
@@ -160,7 +160,11 @@ async fn an_attempt_without_work_still_consumes_its_request_id() {
 async fn avoided_work_returns_quietly_with_its_retry_deadline() {
     let mut fixture = fixture(1, &[1]);
     let until = Instant::now() + Duration::from_secs(60);
-    fixture.routine.retry_avoid.insert(block::Height(1), until);
+    fixture
+        .routine
+        .state
+        .retry_avoid
+        .insert(block::Height(1), until);
     let before = fixture.next_request_id();
 
     let report = fixture.routine.try_fill();
@@ -204,11 +208,16 @@ async fn a_revoked_claim_retires_its_authorization_and_returns_its_funding() {
 async fn a_pass_that_published_keeps_its_retry_deadline() {
     let mut fixture = fixture(1, &[1, 2]);
     let until = Instant::now() + Duration::from_secs(60);
-    fixture.routine.retry_avoid.insert(block::Height(2), until);
+    fixture
+        .routine
+        .state
+        .retry_avoid
+        .insert(block::Height(2), until);
     // A proven peer may send more than its single cold-start probe.
     let grace = fixture.routine.config.effective_liveness_timeout();
     fixture
         .routine
+        .state
         .window
         .note_block_progress(Instant::now(), grace);
 
@@ -227,6 +236,6 @@ async fn a_pass_that_published_keeps_its_retry_deadline() {
     );
     assert_eq!(fixture.pool.held(), 1);
     assert_eq!(routine.io.requester.occupancy().len, 1);
-    assert_eq!(routine.window.outstanding.len(), 1);
+    assert_eq!(routine.state.window.outstanding.len(), 1);
     assert!(fixture.outbound.try_recv().is_ok(), "the request was sent");
 }

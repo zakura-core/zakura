@@ -1,6 +1,10 @@
 //! Runtime handles of one block-sync peer routine.
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use zakura_rt::sync::{atomic::AtomicU64, mpsc, watch, CancellationToken, Mutex};
 
@@ -9,8 +13,8 @@ use super::super::{
     peer_registry::PeerRegistry,
     regulated::{live_requester::LiveRequester, session::ServingSession},
     sequencer_task::{SequencedBody, SequencerView},
-    state::{ByteBudget, ThroughputMeter},
-    work_queue::WorkQueue,
+    state::{ByteBudget, RequestKey, ThroughputMeter, WriteOutcome},
+    work_queue::{RequestWriteStatus, WorkQueue},
     BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
 };
 use crate::zakura::{FramedRecv, ZakuraConnId};
@@ -31,6 +35,8 @@ pub(super) struct PeerIO {
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
     /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
     pub(super) recv: FramedRecv,
+    /// Live write handles of the requests in the session's window.
+    pub(super) writes: RequestWrites,
     /// Last sampled fill-stop time for each bounded reason label.
     pub(super) fill_stop_trace_at: BTreeMap<&'static str, Instant>,
     /// Generation this routine was spawned with; gates its registry writes (and
@@ -54,4 +60,57 @@ pub(super) struct PeerIO {
     /// The routine then exits and its `Drop` guard returns work.
     pub(super) cancel: CancellationToken,
     pub(super) trace: ZakuraTrace,
+}
+
+/// Live write handles of this session's outstanding requests, under the keys
+/// of the outstanding records in [`PeerState`](super::PeerState).
+///
+/// Transport changes each handle concurrently. Reading a handle observes the
+/// write; settling it arbitrates a queued frame against writer startup.
+#[derive(Debug, Default)]
+pub(super) struct RequestWrites {
+    statuses: BTreeMap<RequestKey, RequestWriteStatus>,
+    /// Requests whose frame write had not started when last checked. Transport
+    /// can skip only these requests.
+    unstarted: BTreeSet<RequestKey>,
+}
+
+impl RequestWrites {
+    /// Track the write of the request just recorded under `key`.
+    pub(super) fn insert(&mut self, key: RequestKey, status: RequestWriteStatus) {
+        self.unstarted.insert(key);
+        self.statuses.insert(key, status);
+    }
+
+    /// Requests whose frame transport skipped, in issue order. Forget requests
+    /// whose write has started, because transport can no longer skip them.
+    pub(super) fn skipped(&mut self) -> Vec<RequestKey> {
+        let statuses = &self.statuses;
+        let mut skipped = Vec::new();
+        self.unstarted.retain(|key| {
+            let status = &statuses[key];
+            if status.was_skipped() {
+                skipped.push(*key);
+                true
+            } else {
+                !status.has_started()
+            }
+        });
+        skipped
+    }
+
+    /// Settle the write of `key` and stop tracking it. A queued frame expires
+    /// here unless transport has already started writing it.
+    pub(super) fn settle(&mut self, key: RequestKey) -> WriteOutcome {
+        self.unstarted.remove(&key);
+        let status = self
+            .statuses
+            .remove(&key)
+            .expect("every outstanding request keeps its write handle until it settles");
+        if status.expire_unwritten() || status.was_skipped() {
+            WriteOutcome::Skipped
+        } else {
+            WriteOutcome::Started
+        }
+    }
 }

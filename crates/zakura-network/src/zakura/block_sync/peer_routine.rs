@@ -40,7 +40,10 @@ use super::{
     regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     sequencer_task::{SequencedBody, SequencerView},
-    state::{DownloadWindow, LivenessOutcome, OutstandingBlockRange, RequestKey, ThroughputMeter},
+    state::{
+        DownloadWindow, LivenessOutcome, OutstandingBlockRange, RequestKey, ThroughputMeter,
+        WriteOutcome,
+    },
     work_queue::{WorkQueue, WorkReturnOutcome},
     BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus, ZakuraBlockSyncConfig,
     ZakuraPeerId, ZakuraTrace,
@@ -61,7 +64,7 @@ mod trace;
 
 use fill::FillStop;
 use io::PeerIO;
-use state::PeerState;
+use state::{PeerState, SharedDeadlines};
 
 /// Heights checked for lost ownership per work-queue lock hold.
 const OWNERSHIP_CHECK_CHUNK: usize = 1024;
@@ -207,51 +210,12 @@ impl Disposition {
 
 /// The per-peer pipe-routine: one task per connected peer, spawned at the pipe
 /// spawn point (`service::add_peer`) so a protocol reject cancels the whole
-/// connection. [`PeerIO`] owns the runtime handles, and the remaining fields
-/// hold this session's download, status, and liveness facts.
+/// connection. [`PeerState`] decides from the session's facts, and [`PeerIO`]
+/// executes those decisions with the runtime handles.
 pub(super) struct PeerRoutine {
-    io: PeerIO,
-    request_pool_waiting: bool,
     config: ZakuraBlockSyncConfig,
-    /// A connection gets one local no-progress park/re-admission cycle. A
-    /// repeated stall is connection-fatal so it cannot reclaim download slots
-    /// indefinitely without paying the redial cost.
-    allow_no_progress_park: bool,
-
-    // ---- per-peer download state (moved out of `PeerBlockState`) ----
-    window: DownloadWindow,
-    /// Request limits learned from this peer's `Status`, and request identities.
     state: PeerState,
-    /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
-    /// The reply decision is routine-local; the actual send stays reactor-side via
-    /// `RoutineToReactor::StatusReceived`.
-    status_reply_meter: super::state::RateMeter,
-    /// Rate meter for status application, with one extra range change per window.
-    inbound_status_meter: super::state::RateMeter,
-    /// Allows one immediate range change without permitting an unbounded bypass.
-    status_range_bypass_available: bool,
-    /// Clamped limits last published to the registry. Request issuance uses the
-    /// latest limits immediately; only publication waits for the meter.
-    published_limits: (u32, u32, u32),
-    /// Whether the last slot publication showed a requester that refuses work.
-    published_requester_stopped: bool,
-    /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
-    pending_status: Option<BlockSyncStatus>,
-    /// Heights this routine recently returned on a failure, mapped to the instant
-    /// after which it may re-take them. While avoided, the routine leaves the
-    /// height `pending` (contestable by any other peer) but does not re-grab it
-    /// itself — the peer-local retry bias (see [`RETRY_AVOID_BACKOFF`]). Pruned on
-    /// expiry each fill pass.
-    retry_avoid: BTreeMap<block::Height, Instant>,
-    /// Last `reset_epoch` that this routine processed.
-    /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
-    last_reset_epoch: u64,
-    /// Work-queue revocation count when this routine last checked its requests
-    /// for lost ownership.
-    checked_revocations: u64,
-    /// Start of the current interval in which this peer's outbound queue stayed full.
-    /// The liveness check uses the interval to distinguish congestion from a peer that stopped reading.
-    outbound_full_since: Option<Instant>,
+    io: PeerIO,
 }
 
 impl PeerRoutine {
@@ -288,18 +252,11 @@ impl PeerRoutine {
             "block-sync peers have 32-byte identities because they are authenticated Iroh nodes",
         );
         let source = zakura_header_chain::SourceId::from_digest(source_digest);
-        let window = DownloadWindow::new(&config);
-        let last_reset_epoch = sequencer_view.borrow().reset_epoch;
-        let checked_revocations = work.revocations();
-        let status_reply_meter = super::state::RateMeter::new(config.status_refresh_interval);
-        let inbound_status_meter = super::state::RateMeter::new(
-            config.status_refresh_interval.min(Duration::from_secs(1)),
-        );
-        let state = PeerState::new(&config);
-        let published_limits = (
-            state.max_blocks_per_response,
-            state.max_response_bytes,
-            window.max_inflight_requests,
+        let state = PeerState::new(
+            &config,
+            allow_no_progress_park,
+            sequencer_view.borrow().reset_epoch,
+            work.revocations(),
         );
         PeerRoutine {
             io: PeerIO {
@@ -310,6 +267,7 @@ impl PeerRoutine {
                 source,
                 session,
                 recv,
+                writes: io::RequestWrites::default(),
                 fill_stop_trace_at: BTreeMap::new(),
                 generation,
                 budget,
@@ -324,21 +282,8 @@ impl PeerRoutine {
                 cancel,
                 trace,
             },
-            request_pool_waiting: false,
             config,
-            allow_no_progress_park,
-            window,
             state,
-            status_reply_meter,
-            inbound_status_meter,
-            status_range_bypass_available: false,
-            published_limits,
-            published_requester_stopped: false,
-            pending_status: None,
-            retry_avoid: BTreeMap::new(),
-            checked_revocations,
-            last_reset_epoch,
-            outbound_full_since: None,
         }
     }
 
@@ -419,16 +364,7 @@ impl PeerRoutine {
             // keep abandoned authorization alive or postpone request timeouts.
             let now = time::Instant::now().into_std();
             self.check_request_liveness(now)?;
-            if self
-                .window
-                .outstanding
-                .earliest_deadline()
-                .is_some_and(|deadline| deadline <= now)
-                || self
-                    .window
-                    .block_liveness_deadline
-                    .is_some_and(|deadline| deadline <= now)
-            {
+            if self.state.deadlines_due(now) {
                 self.handle_deadlines(now)?;
             }
             self.flush_pending_status();
@@ -444,9 +380,9 @@ impl PeerRoutine {
             // reading holds this full until `outbound_full_since` ages past
             // `request_timeout`, at which point it is disconnected rather than excused.
             if outbound_queue_has_capacity {
-                self.outbound_full_since = None;
-            } else if self.outbound_full_since.is_none() {
-                self.outbound_full_since = Some(time::Instant::now().into_std());
+                self.state.outbound_full_since = None;
+            } else if self.state.outbound_full_since.is_none() {
+                self.state.outbound_full_since = Some(time::Instant::now().into_std());
             }
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
@@ -492,7 +428,7 @@ impl PeerRoutine {
                 _ = &mut floor_ranking => {
                     self.trace_wake("floor_ranking_changed");
                 }
-                entry = request_pool.entry(), if self.request_pool_waiting => { drop(entry); }
+                entry = request_pool.entry(), if self.state.request_pool_waiting => { drop(entry); }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
@@ -656,9 +592,10 @@ impl PeerRoutine {
     /// Return only unreceived work still owned by this routine. A body already
     /// handed to the sequencer keeps its ownership and cannot be requeued here.
     fn return_unreceived_requests(&mut self, reason: &'static str) {
-        let outstanding_ranges = self.window.outstanding.drain();
-        for outstanding in outstanding_ranges {
-            self.retire_authorization(&outstanding);
+        let outstanding_ranges = self.state.window.outstanding.drain();
+        for (key, outstanding) in outstanding_ranges {
+            let write = self.io.writes.settle(key);
+            self.retire_authorization(&outstanding, write);
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
             let outcome = self
                 .io
@@ -710,39 +647,39 @@ impl PeerRoutine {
         (
             self.state.max_blocks_per_response,
             self.state.max_response_bytes,
-            self.window.max_inflight_requests,
+            self.state.window.max_inflight_requests,
         ) = limits;
         // Publish a stop before the rate limiter, so no routine keeps deferring
         // the floor to this peer. A reopen waits for a rate-limited publication,
         // so a Status flood cannot toggle the shared ranking on every frame.
-        if self.requester_stop().is_some() && !self.published_requester_stopped {
+        if self.requester_stop().is_some() && !self.state.published_requester_stopped {
             self.publish_slot_diagnostics();
         }
-        let limits_changed = limits != self.published_limits;
-        if self.inbound_status_meter.try_take(now) {
-            self.status_range_bypass_available = true;
-        } else if range_changed && self.status_range_bypass_available {
+        let limits_changed = limits != self.state.published_limits;
+        if self.state.inbound_status_meter.try_take(now) {
+            self.state.status_range_bypass_available = true;
+        } else if range_changed && self.state.status_range_bypass_available {
             // Allow prompt pruning updates, but only once per window so a peer
             // cannot flood registry/reactor work by oscillating its range.
-            self.status_range_bypass_available = false;
+            self.state.status_range_bypass_available = false;
         } else {
             // Keep only the latest Status that changes the published range or
             // limits. A return to the published state cancels an older pending
             // change without causing a status reply loop.
-            self.pending_status = (range_changed || limits_changed).then_some(status);
+            self.state.pending_status = (range_changed || limits_changed).then_some(status);
             return;
         }
-        self.pending_status = None;
-        if self.requester_stop().is_some() != self.published_requester_stopped {
+        self.state.pending_status = None;
+        if self.requester_stop().is_some() != self.state.published_requester_stopped {
             self.publish_slot_diagnostics();
         }
         // Replies have their own allowance. The reactor also retries any local
         // status that has not entered this peer's outbound queue.
-        let send_reply = self.status_reply_meter.try_take(now);
+        let send_reply = self.state.status_reply_meter.try_take(now);
         self.state.received_status = true;
         self.state.servable_low = status.servable_low;
         self.state.servable_high = status.servable_high;
-        self.published_limits = limits;
+        self.state.published_limits = limits;
         // Publish the servable range / clamped caps / received_status to the
         // registry so the reactor's candidate reads see them; generation-gated.
         self.io
@@ -763,12 +700,13 @@ impl PeerRoutine {
 
     fn flush_pending_status(&mut self) {
         if !self
+            .state
             .inbound_status_meter
             .is_ready(time::Instant::now().into_std())
         {
             return;
         }
-        if let Some(status) = self.pending_status.take() {
+        if let Some(status) = self.state.pending_status.take() {
             self.handle_status(status);
         }
     }
@@ -781,28 +719,28 @@ impl PeerRoutine {
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
         let reset_epoch = self.io.sequencer_view.borrow().reset_epoch;
-        if reset_epoch == self.last_reset_epoch {
+        if reset_epoch == self.state.last_reset_epoch {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
             // to do but let the want-work loop re-run at the top (a committed
             // floor advance may GC our fully-committed outstanding).
             return;
         }
-        self.last_reset_epoch = reset_epoch;
+        self.state.last_reset_epoch = reset_epoch;
         self.trace_wake("view_reset");
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
         self.return_unreceived_requests("view_reset");
-        self.retry_avoid.clear();
+        self.state.retry_avoid.clear();
         // `return_unreceived_requests` cleared our registry claims.
         self.publish_slot_diagnostics();
         // A destructive reset pulled this peer's outstanding on our initiative, so its
         // no-progress probe streak must not stay charged: reset it (and clear the idle
         // liveness deadline) so an unproven peer whose only probe was in flight at the
         // reset can probe again instead of wedging at its cap.
-        self.window.note_locally_returned_requests();
+        self.state.window.note_locally_returned_requests();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
@@ -823,9 +761,6 @@ impl PeerRoutine {
     /// arrives. Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
         let now = time::Instant::now().into_std();
-        let earliest_deadline = self.window.outstanding.earliest_deadline();
-        let liveness_deadline = self.window.block_liveness_deadline;
-        let local_retry_avoid = self.retry_avoid.values().min().copied();
         let floor_watchdog_avoid = self
             .io
             .registry
@@ -834,22 +769,15 @@ impl PeerRoutine {
             .io
             .registry
             .next_body_retry_deadline(&self.io.peer, now);
-        let earliest = [
-            earliest_deadline,
-            liveness_deadline,
-            self.io
+        let earliest = self.state.next_wake(SharedDeadlines {
+            requester_retirement: self
+                .io
                 .requester
                 .retirement_deadline(self.config.effective_liveness_timeout()),
-            local_retry_avoid,
             floor_watchdog_avoid,
             body_retry_avoid,
-            retry_filter_deadline,
-            self.pending_status
-                .map(|_| self.inbound_status_meter.next_allowed),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+            retry_filter: retry_filter_deadline,
+        });
         match earliest {
             // Floor the wait at the deadline so a far-future request still wakes
             // promptly; an already-due deadline wakes immediately.
@@ -887,9 +815,7 @@ impl PeerRoutine {
     /// `pending` and contestable by every other peer; only this routine defers.
     fn note_retry_avoid(&mut self, heights: impl IntoIterator<Item = block::Height>) {
         let until = time::Instant::now().into_std() + RETRY_AVOID_BACKOFF;
-        for height in heights {
-            self.retry_avoid.insert(height, until);
-        }
+        self.state.avoid_retry(heights, until);
     }
 
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
@@ -912,39 +838,27 @@ impl PeerRoutine {
     fn expire_due_timeouts(&mut self, now: Instant) -> bool {
         self.gc_skipped_outstanding();
         // Arbitrate due queued frames against writer startup before charging
-        // failures. Keep started requests outstanding while refunding skipped
-        // probes so their liveness deadline cannot be cleared as idle.
-        let (skipped_keys, timed_out_keys): (Vec<_>, Vec<_>) = self
-            .window
-            .outstanding
-            .due_at(now)
+        // failures.
+        let due: Vec<_> = self
+            .state
+            .due_requests(now)
             .into_iter()
-            .partition(|key| {
-                self.window
-                    .outstanding
-                    .get(*key)
-                    .is_some_and(|outstanding| {
-                        outstanding.write_status.expire_unwritten()
-                            || outstanding.write_status.was_skipped()
-                    })
-            });
-        // Retire skipped requests while the timed-out ones still occupy the window.
-        let skipped: Vec<_> = skipped_keys
-            .into_iter()
-            .filter_map(|key| self.window.retire_locally(key))
+            .map(|key| (key, self.io.writes.settle(key)))
             .collect();
-        let timed_out: Vec<_> = timed_out_keys
-            .into_iter()
-            .filter_map(|key| self.window.outstanding.remove(key))
-            .collect();
-        if skipped.is_empty() && timed_out.is_empty() {
+        let expired = self.state.expire_requests(due);
+        if expired.is_empty() {
             return false;
         }
-        if !timed_out.is_empty() {
-            self.window.record_timeout(timed_out.len());
-        }
-        for outstanding in skipped.iter().chain(&timed_out) {
-            self.retire_authorization(outstanding);
+        let skipped = expired
+            .skipped
+            .iter()
+            .map(|outstanding| (outstanding, WriteOutcome::Skipped));
+        let timed_out = expired
+            .timed_out
+            .iter()
+            .map(|outstanding| (outstanding, WriteOutcome::Started));
+        for (outstanding, write) in skipped.chain(timed_out) {
+            self.retire_authorization(outstanding, write);
             self.withdraw_claims(outstanding);
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
@@ -960,6 +874,7 @@ impl PeerRoutine {
             self.io.budget.release(outcome.released_bytes);
             self.trace_work_returned("request_timeout", outstanding, unreceived.len(), outcome);
         }
+        let timed_out = expired.timed_out;
         // Bias away from immediately re-grabbing the heights this peer just timed
         // out, so another peer can contest them (the peer-local timeout bias).
         let timed_out_heights: Vec<_> = timed_out.iter().flat_map(unreceived_heights).collect();
@@ -974,16 +889,16 @@ impl PeerRoutine {
     }
 
     fn check_block_liveness(&mut self, now: Instant) -> Result<(), SinkReject> {
-        match self.window.check_liveness(now) {
+        match self.state.window.check_liveness(now) {
             LivenessOutcome::Ok => Ok(()),
             LivenessOutcome::Disarm => {
-                self.window.clear_liveness_if_idle();
+                self.state.window.clear_liveness_if_idle();
                 Ok(())
             }
             LivenessOutcome::Park
                 if liveness_grace_allowed(
                     self.io.session.outbound_capacity() == 0,
-                    self.outbound_full_since,
+                    self.state.outbound_full_since,
                     now,
                     self.config.request_timeout,
                 ) =>
@@ -993,7 +908,8 @@ impl PeerRoutine {
                 // a dead peer. Grant one short, BOUNDED grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
                 // full past `request_timeout`, falls through to the park arm, and is
                 // parked at the liveness deadline — it cannot dodge the timer.
-                self.window
+                self.state
+                    .window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
             }
@@ -1008,10 +924,11 @@ impl PeerRoutine {
     /// otherwise park the session for the cooldown and exit locally. An unended
     /// request still closes the connection (see `WriterFence`).
     fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
-        if no_progress_response(self.allow_no_progress_park) == NoProgressResponse::Disconnect {
+        if no_progress_response(self.state.allow_no_progress_park) == NoProgressResponse::Disconnect
+        {
             tracing::debug!(
                 peer = ?self.io.peer,
-                outstanding = self.window.outstanding.len(),
+                outstanding = self.state.window.outstanding.len(),
                 "disconnecting Zakura block-sync peer after repeated no-progress stall"
             );
             return Err(SinkReject::local(error));
@@ -1025,7 +942,7 @@ impl PeerRoutine {
         self.trace_liveness_park(error);
         tracing::debug!(
             peer = ?self.io.peer,
-            outstanding = self.window.outstanding.len(),
+            outstanding = self.state.window.outstanding.len(),
             "parking Zakura block-sync session after no accepted block progress"
         );
         Err(SinkReject::local(error))
@@ -1043,7 +960,9 @@ impl PeerRoutine {
         // for capacity. It must remain neutral when the failed stream retires.
         self.on_view_changed();
         self.gc_skipped_outstanding();
-        if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
+        if self.state.window.outstanding.is_empty()
+            && self.state.window.block_liveness_deadline.is_none()
+        {
             return Ok(());
         }
         let error = match failure {
@@ -1069,11 +988,11 @@ impl PeerRoutine {
         let floor = self.download_floor();
         let mut released = 0u64;
         let mut removed = false;
-        for key in self.window.outstanding.ending_at_or_below(floor) {
-            let Some(outstanding) = self.window.retire_locally(key) else {
+        for key in self.state.window.outstanding.ending_at_or_below(floor) {
+            let Some((outstanding, write)) = self.retire_request_locally(key) else {
                 continue;
             };
-            self.retire_authorization(&outstanding);
+            self.retire_authorization(&outstanding, write);
             self.withdraw_claims(&outstanding);
             // Release only estimates whose per-height ledger is still
             // `Reserved`. A competing delivery changes that ledger to
@@ -1089,21 +1008,25 @@ impl PeerRoutine {
         }
         if removed {
             self.publish_slot_diagnostics();
-            self.window.disarm_liveness_after_progress_if_idle();
+            self.state.window.disarm_liveness_after_progress_if_idle();
         }
     }
 
     /// A skipped frame ends the peer obligation independently of any received
     /// body whose owner must remain available to the sequencer.
     fn gc_skipped_outstanding(&mut self) {
-        let skipped = self.window.discard_skipped_requests();
+        let skipped: Vec<_> = self
+            .io
+            .writes
+            .skipped()
+            .into_iter()
+            .filter_map(|key| self.retire_request_locally(key))
+            .collect();
         if skipped.is_empty() {
             return;
         }
-        for outstanding in &skipped {
-            self.io
-                .requester
-                .retire(outstanding.request.start_height, true);
+        for (outstanding, write) in &skipped {
+            self.retire_authorization(outstanding, *write);
             self.withdraw_claims(outstanding);
         }
         self.publish_slot_diagnostics();
@@ -1117,12 +1040,13 @@ impl PeerRoutine {
     /// request, so the scan runs once after each revocation.
     fn gc_obsolete_outstanding(&mut self) {
         let revocations = self.io.work.revocations();
-        if revocations == self.checked_revocations {
+        if revocations == self.state.checked_revocations {
             return;
         }
-        self.checked_revocations = revocations;
+        self.state.checked_revocations = revocations;
 
         let unreceived: Vec<_> = self
+            .state
             .window
             .outstanding
             .entries()
@@ -1141,6 +1065,7 @@ impl PeerRoutine {
 
         let mut removed = false;
         let obsolete: Vec<_> = self
+            .state
             .window
             .outstanding
             .entries()
@@ -1152,17 +1077,17 @@ impl PeerRoutine {
             .collect();
         for key in obsolete {
             lost.remove(&key);
-            let Some(retired) = self.window.retire_locally(key) else {
+            let Some((retired, write)) = self.retire_request_locally(key) else {
                 continue;
             };
-            self.retire_authorization(&retired);
+            self.retire_authorization(&retired, write);
             self.withdraw_claims(&retired);
             removed = true;
         }
         // A request that still owns some heights keeps its slot but stops
         // advertising the heights it lost.
         for (key, heights) in lost {
-            if let Some(outstanding) = self.window.outstanding.get(key) {
+            if let Some(outstanding) = self.state.window.outstanding.get(key) {
                 self.io.registry.remove_outstanding_for_owner(
                     &self.io.peer,
                     self.io.generation,
@@ -1173,7 +1098,7 @@ impl PeerRoutine {
         }
         if removed {
             self.publish_slot_diagnostics();
-            self.window.disarm_liveness_after_progress_if_idle();
+            self.state.window.disarm_liveness_after_progress_if_idle();
         }
     }
 
@@ -1194,7 +1119,7 @@ impl PeerRoutine {
             return;
         };
 
-        let Some(key) = self.window.outstanding_key_for_height(height) else {
+        let Some(key) = self.state.window.outstanding_key_for_height(height) else {
             // No outstanding match — run the unmatched fallthroughs locally.
             if self
                 .accept_unmatched_queued_body(
@@ -1219,6 +1144,7 @@ impl PeerRoutine {
             return;
         };
         let outstanding = self
+            .state
             .window
             .outstanding
             .get(key)
@@ -1334,30 +1260,32 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
-        self.window.note_block_progress(
+        self.state.window.note_block_progress(
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
-        self.window
+        self.state
+            .window
             .outstanding
             .record_body_bytes(key, serialized_bytes);
-        self.window.outstanding.mark_received(key, height);
+        self.state.window.outstanding.mark_received(key, height);
         self.withdraw_claim(outstanding_owner, height);
         let completed = if self
+            .state
             .window
             .outstanding
             .get(key)
             .is_some_and(OutstandingBlockRange::is_complete)
         {
-            self.window.outstanding.remove(key)
+            self.remove_request(key)
         } else {
             None
         };
-        if let Some(outstanding) = &completed {
+        if let Some((outstanding, _)) = &completed {
             // Feed the BBR estimators on request completion: the round-trip (RTprop)
             // and the per-ack delivery rate (BtlBw) for this request's block count and
             // delivered bytes.
-            self.window.record_delivery(
+            self.state.window.record_delivery(
                 time::Instant::now().into_std(),
                 request_elapsed,
                 request_range_count,
@@ -1365,8 +1293,8 @@ impl PeerRoutine {
                 delivery_snapshot,
             );
         }
-        if let Some(outstanding) = completed {
-            self.finish_detached(outstanding, Disposition::Satisfied);
+        if let Some((outstanding, write)) = completed {
+            self.finish_detached(outstanding, write, Disposition::Satisfied);
         } else {
             self.publish_slot_diagnostics();
         }
@@ -1545,7 +1473,7 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        self.window.note_block_progress(
+        self.state.window.note_block_progress(
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
@@ -1554,7 +1482,7 @@ impl PeerRoutine {
         // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
         // window instead of being sealed to zero like a genuine dropper — which sends no
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
-        self.window.credit_late_delivery();
+        self.state.window.credit_late_delivery();
 
         let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_measured_decoded_block(
@@ -1589,13 +1517,14 @@ impl PeerRoutine {
         let start_height = completed.range.start();
         // Local timeouts, reorgs, and finality can retire the scheduler's work
         // while the peer's authority, already consumed above, remained live.
-        let Some(key) = self.window.outstanding_key_for_start(start_height) else {
+        let Some(key) = self.state.window.outstanding_key_for_start(start_height) else {
             return;
         };
         let retry = match completed.outcome {
             Outcome::Done => Disposition::RetryMissing,
             Outcome::Unavailable => {
                 let outstanding = self
+                    .state
                     .window
                     .outstanding
                     .get(key)
@@ -1624,19 +1553,20 @@ impl PeerRoutine {
             return;
         }
         let missing = self
+            .state
             .window
             .outstanding
             .get(key)
             .map(|outstanding| unreceived_heights(outstanding).count())
             .unwrap_or(0);
-        self.window.penalize_short_response(missing);
+        self.state.window.penalize_short_response(missing);
     }
 
     /// A late response can still match after the floor moved through its prefix;
     /// mark the stale prefix satisfied and retry only the remaining suffix.
     fn stale_adjusted_disposition(&mut self, key: RequestKey, current: Disposition) -> Disposition {
         let tip = self.download_floor();
-        let Some(outstanding) = self.window.outstanding.get(key) else {
+        let Some(outstanding) = self.state.window.outstanding.get(key) else {
             return current;
         };
         if outstanding.request.start_height > tip {
@@ -1644,13 +1574,18 @@ impl PeerRoutine {
         }
         let owner = outstanding.request.owner;
         let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
-        let _ = self.window.outstanding.mark_received_through(key, tip);
+        let _ = self
+            .state
+            .window
+            .outstanding
+            .mark_received_through(key, tip);
         let released_bytes = self
             .io
             .work
             .release_reserved_heights_for_owner(owner, released_heights);
         self.io.budget.release(released_bytes);
         if self
+            .state
             .window
             .outstanding
             .get(key)
@@ -1665,35 +1600,58 @@ impl PeerRoutine {
     // ===================== outstanding lifecycle (ported) ===================
 
     fn finish_outstanding_at(&mut self, key: RequestKey, disposition: Disposition) {
-        let Some(outstanding) = self.window.outstanding.remove(key) else {
+        let Some((outstanding, write)) = self.remove_request(key) else {
             return;
         };
-        self.finish_detached(outstanding, disposition);
+        self.finish_detached(outstanding, write, disposition);
+    }
+
+    /// Remove request `key` from the window and settle its write.
+    fn remove_request(&mut self, key: RequestKey) -> Option<(OutstandingBlockRange, WriteOutcome)> {
+        let outstanding = self.state.window.outstanding.remove(key)?;
+        Some((outstanding, self.io.writes.settle(key)))
+    }
+
+    /// Retire request `key` on this node's initiative and settle its write.
+    /// See [`DownloadWindow::retire_locally`].
+    fn retire_request_locally(
+        &mut self,
+        key: RequestKey,
+    ) -> Option<(OutstandingBlockRange, WriteOutcome)> {
+        self.state.window.outstanding.get(key)?;
+        let write = self.io.writes.settle(key);
+        let outstanding = self.state.window.retire_locally(key, write)?;
+        Some((outstanding, write))
     }
 
     /// Drop a local request after the central queue retires its work scope.
     /// The central queue already released the reservation.
     /// The cleanup path preserves any replacement item at the same height.
     fn drop_obsolete_outstanding(&mut self, key: RequestKey) {
-        let Some(retired) = self.window.retire_locally(key) else {
+        let Some((retired, write)) = self.retire_request_locally(key) else {
             return;
         };
-        self.retire_authorization(&retired);
+        self.retire_authorization(&retired, write);
         self.withdraw_claims(&retired);
         self.publish_slot_diagnostics();
-        self.window.disarm_liveness_after_progress_if_idle();
+        self.state.window.disarm_liveness_after_progress_if_idle();
     }
 
-    fn retire_authorization(&self, outstanding: &OutstandingBlockRange) {
-        let unwritten =
-            outstanding.write_status.expire_unwritten() || outstanding.write_status.was_skipped();
-        self.io
-            .requester
-            .retire(outstanding.request.start_height, unwritten);
+    /// End the live exchange of a request whose write settled as `write`.
+    fn retire_authorization(&self, outstanding: &OutstandingBlockRange, write: WriteOutcome) {
+        self.io.requester.retire(
+            outstanding.request.start_height,
+            write == WriteOutcome::Skipped,
+        );
     }
 
-    fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
-        self.retire_authorization(&outstanding);
+    fn finish_detached(
+        &mut self,
+        outstanding: OutstandingBlockRange,
+        write: WriteOutcome,
+        disposition: Disposition,
+    ) {
+        self.retire_authorization(&outstanding, write);
         self.withdraw_claims(&outstanding);
         match disposition {
             Disposition::Satisfied => {
@@ -1735,7 +1693,7 @@ impl PeerRoutine {
         }
         self.publish_slot_diagnostics();
         if disposition == Disposition::Satisfied {
-            self.window.disarm_liveness_after_progress_if_idle();
+            self.state.window.disarm_liveness_after_progress_if_idle();
         }
     }
 
@@ -1746,12 +1704,12 @@ impl PeerRoutine {
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, key: RequestKey, height: block::Height) {
-        self.window.note_block_progress(
+        self.state.window.note_block_progress(
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
-        self.window.outstanding.mark_received(key, height);
-        let Some(outstanding) = self.window.outstanding.get(key) else {
+        self.state.window.outstanding.mark_received(key, height);
+        let Some(outstanding) = self.state.window.outstanding.get(key) else {
             return;
         };
         self.withdraw_claim(outstanding.request.owner, height);
@@ -1771,7 +1729,7 @@ impl PeerRoutine {
     /// Rechecking after the insert withdraws such a claim. A later revocation
     /// triggers [`gc_obsolete_outstanding`](Self::gc_obsolete_outstanding).
     fn publish_request_claims(&self, key: RequestKey) {
-        let Some(outstanding) = self.window.outstanding.get(key) else {
+        let Some(outstanding) = self.state.window.outstanding.get(key) else {
             return;
         };
         let owner = outstanding.request.owner;
@@ -1839,7 +1797,9 @@ impl PeerRoutine {
         let occupancy = self.io.requester.occupancy();
         // Count unanswered exchanges, including scheduler-abandoned work.
         // The peer's u32 advertised limit fits usize on supported targets.
-        if occupancy.at_capacity || occupancy.len >= self.window.max_inflight_requests as usize {
+        if occupancy.at_capacity
+            || occupancy.len >= self.state.window.max_inflight_requests as usize
+        {
             return Some(FillStop::CwndSaturated);
         }
         if occupancy.pending_endings >= super::regulated::live_requester::MAX_PENDING_ENDINGS {
@@ -1853,25 +1813,28 @@ impl PeerRoutine {
     /// requester refuses new requests publishes no free slots, so no other
     /// routine defers the floor to it.
     fn publish_slot_diagnostics(&mut self) {
-        let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
-        self.published_requester_stopped = self.requester_stop().is_some();
-        let available_slots = if self.published_requester_stopped {
+        let hard_capacity = hard_outbound_capacity(self.state.window.max_inflight_requests);
+        self.state.published_requester_stopped = self.requester_stop().is_some();
+        let available_slots = if self.state.published_requester_stopped {
             0
         } else {
-            self.window.available_slots()
+            self.state.window.available_slots()
         };
         self.io.registry.publish_slots(
             &self.io.peer,
             self.io.generation,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
-                effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
+                effective_window: self.state.window.bbr_effective_cwnd().min(hard_capacity),
                 available_slots,
-                outstanding_requests: self.window.outstanding.len(),
+                outstanding_requests: self.state.window.outstanding.len(),
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
                 // floor-preference comparison.
-                bbr_rtprop_ms: self.window.bbr_rtprop_ms(time::Instant::now().into_std()),
+                bbr_rtprop_ms: self
+                    .state
+                    .window
+                    .bbr_rtprop_ms(time::Instant::now().into_std()),
             },
         );
     }
@@ -2284,8 +2247,8 @@ mod tests {
             .try_recv()
             .expect("initial status is published");
         let next_allowed = Instant::now() + Duration::from_secs(60);
-        routine.inbound_status_meter.next_allowed = next_allowed;
-        routine.status_reply_meter.next_allowed = next_allowed;
+        routine.state.inbound_status_meter.next_allowed = next_allowed;
+        routine.state.status_reply_meter.next_allowed = next_allowed;
 
         status.servable_low = block::Height(2);
         routine.handle_status(status);
@@ -2297,7 +2260,7 @@ mod tests {
             })
         ));
         let immediate_range = routine.io.registry.candidate_snapshot();
-        let immediate_caps = routine.published_limits;
+        let immediate_caps = routine.state.published_limits;
         status.max_response_bytes /= 2;
         for (low, high) in [(1, 3), (2, 4), (0, 0), (3, 3)]
             .into_iter()
@@ -2312,13 +2275,13 @@ mod tests {
                 "range oscillation must not bypass the meter indefinitely"
             );
             assert_eq!(routine.io.registry.candidate_snapshot(), immediate_range);
-            assert_eq!(routine.published_limits, immediate_caps);
+            assert_eq!(routine.state.published_limits, immediate_caps);
             assert_eq!(routine.state.max_response_bytes, status.max_response_bytes);
         }
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
 
-        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.inbound_status_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert_eq!(
             (routine.state.servable_low, routine.state.servable_high),
@@ -2335,7 +2298,7 @@ mod tests {
         ));
 
         // A newer return to the applied range must cancel an older deferred change.
-        routine.inbound_status_meter.next_allowed = next_allowed;
+        routine.state.inbound_status_meter.next_allowed = next_allowed;
         status.servable_low = block::Height(1);
         routine.handle_status(status);
         let _ = reactor_events
@@ -2345,7 +2308,7 @@ mod tests {
         routine.handle_status(status);
         status.servable_low = block::Height(1);
         routine.handle_status(status);
-        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.inbound_status_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert!(reactor_events.try_recv().is_err());
         assert_eq!(routine.state.servable_low, block::Height(1));
@@ -2366,14 +2329,14 @@ mod tests {
         let _ = reactor_events
             .try_recv()
             .expect("initial status is published");
-        assert_eq!(routine.window.max_inflight_requests, 8);
+        assert_eq!(routine.state.window.max_inflight_requests, 8);
 
         // A second Status, buffered behind a read pause, only lowers the limit.
-        routine.inbound_status_meter.next_allowed = Instant::now() + Duration::from_secs(60);
+        routine.state.inbound_status_meter.next_allowed = Instant::now() + Duration::from_secs(60);
         status.max_inflight_requests = 1;
         routine.handle_status(status);
         assert_eq!(
-            routine.window.max_inflight_requests, 1,
+            routine.state.window.max_inflight_requests, 1,
             "new requests obey the lowered limit before the meter opens"
         );
         assert!(
@@ -2407,10 +2370,10 @@ mod tests {
         // A repeat must not cancel the unpublished change.
         routine.handle_status(status);
 
-        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.state.inbound_status_meter.next_allowed = Instant::now();
         routine.flush_pending_status();
         assert_eq!(
-            routine.published_limits.2, 1,
+            routine.state.published_limits.2, 1,
             "the lowered limit is published"
         );
         assert!(matches!(
@@ -2445,19 +2408,19 @@ mod tests {
 
         // Keep both windows closed without depending on the test's runtime speed.
         let next_allowed = Instant::now() + Duration::from_secs(60);
-        routine.inbound_status_meter.next_allowed = next_allowed;
-        routine.status_reply_meter.next_allowed = next_allowed;
+        routine.state.inbound_status_meter.next_allowed = next_allowed;
+        routine.state.status_reply_meter.next_allowed = next_allowed;
         for (index, (low, high)) in [(2, 3), (1, 3), (1, 2), (1, 3), (0, 3), (0, 0), (2, 3)]
             .into_iter()
             .enumerate()
         {
             if index > 0 {
-                routine.inbound_status_meter.next_allowed = Instant::now();
+                routine.state.inbound_status_meter.next_allowed = Instant::now();
                 routine.handle_status(status);
                 let _ = routine_to_reactor_rx
                     .try_recv()
                     .expect("new status window opens");
-                routine.inbound_status_meter.next_allowed = next_allowed;
+                routine.state.inbound_status_meter.next_allowed = next_allowed;
             }
             status.servable_low = block::Height(low);
             status.servable_high = block::Height(high);
@@ -2485,10 +2448,10 @@ mod tests {
             ));
         }
 
-        let old_limits = routine.published_limits;
+        let old_limits = routine.state.published_limits;
         status.max_response_bytes /= 2;
         routine.handle_status(status);
-        assert_eq!(routine.published_limits, old_limits);
+        assert_eq!(routine.state.published_limits, old_limits);
         assert_eq!(routine.state.max_response_bytes, status.max_response_bytes);
         assert!(
             routine_to_reactor_rx.try_recv().is_err(),
@@ -2702,14 +2665,18 @@ mod tests {
         if let Some(age) = measurement_age {
             let delivered_at = Instant::now() - age;
             let elapsed = Duration::from_secs(1);
-            let snapshot = routine.window.delivery_snapshot(delivered_at - elapsed);
+            let snapshot = routine
+                .state
+                .window
+                .delivery_snapshot(delivered_at - elapsed);
             routine
+                .state
                 .window
                 .record_delivery(delivered_at, elapsed, 1, 256 * 1024, snapshot);
         }
         routine.try_fill();
 
-        let outstanding = routine.window.outstanding.first().unwrap();
+        let outstanding = routine.state.window.outstanding.first().unwrap();
         let base = if measurement_age == Some(Duration::ZERO) {
             routine.config.effective_floor_rescue_timeout()
         } else {
@@ -2856,7 +2823,7 @@ mod tests {
                 )],
             );
             routine.try_fill();
-            assert_eq!(routine.window.outstanding.len(), index + 1);
+            assert_eq!(routine.state.window.outstanding.len(), index + 1);
             match state {
                 DeadlineWriteState::Queued => {}
                 DeadlineWriteState::Started => {
@@ -2888,13 +2855,22 @@ mod tests {
             }
             if progress_after_first && index == 0 {
                 routine
+                    .state
                     .window
                     .note_block_progress(Instant::now(), liveness_timeout);
             }
         }
-        let first_owner = routine.window.outstanding.first().unwrap().request.owner;
-        let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+        let first_owner = routine
+            .state
+            .window
+            .outstanding
+            .first()
+            .unwrap()
+            .request
+            .owner;
+        let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
         let deadline = routine
+            .state
             .window
             .outstanding
             .iter()
@@ -2906,17 +2882,17 @@ mod tests {
             expected_window.record_timeout(peer_timeouts.len());
         }
         assert_eq!(
-            routine.window.bbr_reliability_permille(),
+            routine.state.window.bbr_reliability_permille(),
             expected_window.bbr_reliability_permille(),
             "only started writes count as peer failures: {writes:?}, progress={progress_after_first}"
         );
         assert_eq!(
-            routine.window.bbr_effective_cwnd(),
+            routine.state.window.bbr_effective_cwnd(),
             expected_window.bbr_effective_cwnd(),
             "queued-only expiry must not dip the congestion window"
         );
         assert_eq!(
-            routine.window.requests_without_block_progress,
+            routine.state.window.requests_without_block_progress,
             u32::try_from(peer_timeouts.len())
                 .unwrap()
                 .saturating_sub(u32::from(
@@ -2924,10 +2900,15 @@ mod tests {
                 )),
         );
         assert_eq!(
-            routine.retry_avoid.keys().copied().collect::<Vec<_>>(),
+            routine
+                .state
+                .retry_avoid
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
             peer_timeouts,
         );
-        assert!(routine.window.outstanding.is_empty());
+        assert!(routine.state.window.outstanding.is_empty());
         assert_eq!(budget.reserved(), 0);
         assert_eq!(work.reserved_bytes(), 0);
         assert_eq!(work.pending_len(), writes.len());
@@ -2937,7 +2918,7 @@ mod tests {
             assert!(!registry.peer_has_outstanding_height(&peer, height));
         }
         assert_eq!(
-            routine.window.check_liveness(liveness_deadline),
+            routine.state.window.check_liveness(liveness_deadline),
             if peer_timeouts.is_empty() {
                 super::LivenessOutcome::Ok
             } else {
@@ -2950,9 +2931,16 @@ mod tests {
             // Reissue before the old queued frame is drained. Its later drop
             // must preserve the replacement's ownership and byte charge.
             routine.try_fill();
-            assert_eq!(routine.window.outstanding.len(), 1);
+            assert_eq!(routine.state.window.outstanding.len(), 1);
             assert_ne!(
-                routine.window.outstanding.first().unwrap().request.owner,
+                routine
+                    .state
+                    .window
+                    .outstanding
+                    .first()
+                    .unwrap()
+                    .request
+                    .owner,
                 first_owner
             );
         }
@@ -3106,21 +3094,29 @@ mod tests {
             ..super::BlockSyncStatus::default()
         });
         routine.try_fill();
-        assert_eq!(routine.window.outstanding.len(), 1);
-        let owner = routine.window.outstanding.first().unwrap().request.owner;
-        let deadline = routine.window.outstanding.first().unwrap().deadline;
+        assert_eq!(routine.state.window.outstanding.len(), 1);
+        let owner = routine
+            .state
+            .window
+            .outstanding
+            .first()
+            .unwrap()
+            .request
+            .owner;
+        let deadline = routine.state.window.outstanding.first().unwrap().deadline;
         let queued = out_recv.recv().await.unwrap();
         assert!(registry.peer_has_outstanding_height(&peer, block::Height(2)));
 
         if progress_before_other {
             routine
+                .state
                 .window
                 .note_block_progress(Instant::now(), liveness_timeout);
         }
         if other_request {
             add_work(3);
             routine.try_fill();
-            assert_eq!(routine.window.outstanding.len(), 2);
+            assert_eq!(routine.state.window.outstanding.len(), 2);
         }
         let skipped = work.subscribe_available().notified();
         tokio::pin!(skipped);
@@ -3133,7 +3129,7 @@ mod tests {
         );
         match order {
             ReceiptCleanup::BeforeWriter => {
-                let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+                let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
                 assert!(
                     liveness_deadline < deadline,
                     "transfer allowance outlasts liveness"
@@ -3146,7 +3142,7 @@ mod tests {
                     result.is_ok(),
                     "a request made unwritable by receipt must not park its peer: {result:?}"
                 );
-                assert!(routine.window.outstanding.is_empty());
+                assert!(routine.state.window.outstanding.is_empty());
                 return;
             }
             ReceiptCleanup::Writer => {}
@@ -3192,22 +3188,22 @@ mod tests {
             matches!(order, ReceiptCleanup::Writer).then_some(owner),
         );
         assert!(!work.pending_contains(block::Height(2)));
-        assert!(routine.retry_avoid.is_empty());
+        assert!(routine.state.retry_avoid.is_empty());
         assert!(!cancel.is_cancelled());
         if other_request {
-            assert_eq!(routine.window.outstanding.len(), 1);
-            assert_eq!(routine.window.requests_without_block_progress, 1);
+            assert_eq!(routine.state.window.outstanding.len(), 1);
+            assert_eq!(routine.state.window.requests_without_block_progress, 1);
             assert!(registry.peer_has_outstanding_height(&peer, block::Height(3)));
-            let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+            let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
             assert_eq!(
-                routine.window.check_liveness(liveness_deadline),
+                routine.state.window.check_liveness(liveness_deadline),
                 super::LivenessOutcome::Park
             );
             assert_eq!(budget.reserved(), 1_000);
         } else {
-            assert!(routine.window.outstanding.is_empty());
-            assert_eq!(routine.window.requests_without_block_progress, 0);
-            assert!(routine.window.block_liveness_deadline.is_none());
+            assert!(routine.state.window.outstanding.is_empty());
+            assert_eq!(routine.state.window.requests_without_block_progress, 0);
+            assert!(routine.state.window.block_liveness_deadline.is_none());
             routine
                 .handle_deadlines(deadline + liveness_timeout)
                 .unwrap();
@@ -3215,7 +3211,7 @@ mod tests {
             add_work(3);
             routine.try_fill();
             assert_eq!(
-                routine.window.outstanding.len(),
+                routine.state.window.outstanding.len(),
                 1,
                 "the cold peer can probe again"
             );
@@ -3298,7 +3294,7 @@ mod tests {
         );
         assert!(!work.pending_contains(block::Height(1)));
         assert_eq!(budget_probe.reserved(), 1_000);
-        assert_eq!(routine.window.outstanding.len(), 1);
+        assert_eq!(routine.state.window.outstanding.len(), 1);
 
         // A competing peer delivers height 1 first: its receipt ends the shared
         // request reservation. The winner releases the estimate to the ByteBudget
@@ -3611,7 +3607,7 @@ mod tests {
                 ..super::BlockSyncStatus::default()
             });
             routine.try_fill();
-            assert_eq!(routine.window.outstanding.len(), 1);
+            assert_eq!(routine.state.window.outstanding.len(), 1);
             timeout(Duration::from_secs(1), out_recv.recv())
                 .await
                 .unwrap()
@@ -3621,11 +3617,11 @@ mod tests {
                 .unwrap();
             assert!(work.in_flight_contains(block::Height(1)));
             if expired {
-                let after_deadline =
-                    routine.window.outstanding.first().unwrap().deadline + Duration::from_millis(1);
+                let after_deadline = routine.state.window.outstanding.first().unwrap().deadline
+                    + Duration::from_millis(1);
                 routine.expire_due_timeouts(after_deadline);
-                assert!(routine.window.outstanding.is_empty());
-                assert!(routine.window.block_liveness_deadline.is_some());
+                assert!(routine.state.window.outstanding.is_empty());
+                assert!(routine.state.window.block_liveness_deadline.is_some());
             }
         }
         match buffered {
@@ -3878,7 +3874,7 @@ mod tests {
             ..BlockSyncStatus::default()
         });
         routine.try_fill();
-        assert_eq!(routine.window.outstanding.len(), 1);
+        assert_eq!(routine.state.window.outstanding.len(), 1);
         timeout(Duration::from_secs(1), out_recv.recv())
             .await
             .unwrap()
@@ -3942,7 +3938,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_no_progress_is_a_local_failure() {
         let (mut routine, _outbound, _events) = status_test_routine();
-        routine.allow_no_progress_park = false;
+        routine.state.allow_no_progress_park = false;
         assert!(matches!(
             routine.no_progress_stall(Instant::now(), "stalled"),
             Err(crate::zakura::SinkReject::Local(_))

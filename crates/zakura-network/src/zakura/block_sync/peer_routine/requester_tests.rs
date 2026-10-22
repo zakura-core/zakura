@@ -126,9 +126,9 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         BlockSyncMessage::GetBlocks { .. }
     ));
     assert_eq!(pool.held(), 1);
-    let deadline = routine.window.outstanding.first().unwrap().deadline;
+    let deadline = routine.state.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
-    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.state.window.outstanding.is_empty());
     assert_eq!(
         pool.held(),
         1,
@@ -136,11 +136,14 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
     );
     let grace = routine.config.effective_liveness_timeout();
     let retirement = routine.io.requester.retirement_deadline(grace).unwrap();
-    routine.retry_avoid.clear();
-    routine.window.note_block_progress(Instant::now(), grace);
+    routine.state.retry_avoid.clear();
+    routine
+        .state
+        .window
+        .note_block_progress(Instant::now(), grace);
     assert_eq!(routine.try_fill().retry_at, Some(retirement));
     assert!(
-        routine.window.outstanding.is_empty(),
+        routine.state.window.outstanding.is_empty(),
         "the old range still authorizes a response"
     );
     assert!(routine.io.work.pending_contains(block::Height(1)));
@@ -178,7 +181,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
     let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill();
     assert_eq!(pool.held(), 1);
-    let deadline = routine.window.outstanding.first().unwrap().deadline;
+    let deadline = routine.state.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
@@ -188,7 +191,17 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
     routine.try_fill();
-    assert_eq!(routine.window.outstanding.first().unwrap().request.count, 1);
+    assert_eq!(
+        routine
+            .state
+            .window
+            .outstanding
+            .first()
+            .unwrap()
+            .request
+            .count,
+        1
+    );
     next_sent(&mut outbound).await;
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let mut payload = vec![MSG_BS_BLOCK];
@@ -309,9 +322,9 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     routine.try_fill();
     next_sent(&mut outbound).await;
     // A local timeout drops the window entry but keeps the written reservation.
-    let deadline = routine.window.outstanding.first().unwrap().deadline;
+    let deadline = routine.state.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
-    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.state.window.outstanding.is_empty());
     assert_eq!(pool.held(), 1);
     // A local reorg drops the height, and the peer's later Status contracts its range.
     let released = routine.io.work.reset_above(block::Height(0));
@@ -464,7 +477,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     }
     assert_eq!(pool.held(), SESSION_RESERVATIONS);
     first.try_fill();
-    assert!(first.window.outstanding.is_empty());
+    assert!(first.state.window.outstanding.is_empty());
     assert!(!first.io.cancel.is_cancelled());
     assert!(!first_connection.is_cancelled());
 
@@ -487,13 +500,14 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let work = Arc::clone(&routine.io.work);
     routine.try_fill();
     next_sent(&mut outbound).await;
-    assert!(routine.expire_due_timeouts(routine.window.outstanding.first().unwrap().deadline));
+    assert!(routine.expire_due_timeouts(routine.state.window.outstanding.first().unwrap().deadline));
     // Unrelated accepted blocks can disarm the old block-progress watchdog.
     routine
+        .state
         .window
         .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
-    assert!(routine.window.block_liveness_deadline.is_none());
-    routine.retry_avoid.clear();
+    assert!(routine.state.window.block_liveness_deadline.is_none());
+    routine.state.retry_avoid.clear();
     let deadline = routine
         .io
         .requester
@@ -698,9 +712,10 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
         requester_routine(block::Hash([1; 32]));
     routine.try_fill();
     next_sent(&mut outbound).await;
-    assert_eq!(routine.window.outstanding.len(), 1);
-    let first = routine.window.outstanding.first_key().unwrap();
+    assert_eq!(routine.state.window.outstanding.len(), 1);
+    let first = routine.state.window.outstanding.first_key().unwrap();
     routine
+        .state
         .window
         .outstanding
         .set_deadline(first, Instant::now() - Duration::from_secs(1));
@@ -724,7 +739,7 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
     assert!(futures::poll!(&mut running).is_pending());
     drop(running);
     assert!(
-        routine.window.outstanding.is_empty(),
+        routine.state.window.outstanding.is_empty(),
         "the overdue request timed out while frames were ready"
     );
 }
@@ -745,7 +760,14 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
     routine.try_fill();
     next_sent(&mut outbound).await;
-    let owner = routine.window.outstanding.first().unwrap().request.owner;
+    let owner = routine
+        .state
+        .window
+        .outstanding
+        .first()
+        .unwrap()
+        .request
+        .owner;
     let released = routine
         .io
         .work
@@ -761,7 +783,7 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     routine.io.budget.release(released);
     routine.gc_obsolete_outstanding();
 
-    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.state.window.outstanding.is_empty());
     assert!(!routine
         .io
         .registry
@@ -807,13 +829,14 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
         .retirement_deadline(grace)
         .expect("the last block starts the missing-ending deadline");
     // Only the missing-ending deadline is due. The other timers cannot end the routine.
-    if let Some(key) = routine.window.outstanding.first_key() {
+    if let Some(key) = routine.state.window.outstanding.first_key() {
         routine
+            .state
             .window
             .outstanding
             .set_deadline(key, retirement + Duration::from_secs(3600));
     }
-    routine.window.block_liveness_deadline = None;
+    routine.state.window.block_liveness_deadline = None;
     time::advance(retirement.saturating_duration_since(time::Instant::now().into_std())).await;
     let (input, recv) = crate::zakura::framed_channel(1024);
     let status = BlockSyncMessage::Status(BlockSyncStatus {
@@ -962,6 +985,7 @@ async fn requests_stay_single_block_for_any_advertisement() {
         );
         // Lift the cold-start probe limit so the fill is bounded only by the cwnd.
         routine
+            .state
             .window
             .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
 
@@ -985,7 +1009,7 @@ async fn requests_stay_single_block_for_any_advertisement() {
                 .collect::<Vec<_>>(),
             "peer advertised {peer_max_blocks} blocks per response",
         );
-        assert_eq!(routine.window.outstanding.len(), 4);
+        assert_eq!(routine.state.window.outstanding.len(), 4);
     }
 }
 
@@ -1099,7 +1123,7 @@ async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
         requested.len()
     );
     assert_eq!(pool.held(), requested.len());
-    assert!(routine.window.outstanding.is_empty());
+    assert!(routine.state.window.outstanding.is_empty());
     assert!(routine.io.work.pending_contains(block::Height(BULK_WORK)));
     routine.try_fill();
     assert!(requested_heights(&mut outbound).is_empty());
@@ -1262,7 +1286,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         bulk_routine();
     let mut unended = withhold_endings(&mut fast, &mut fast_outbound, &blocks).await;
     assert!(
-        fast.window.bbr_rtprop_ms(Instant::now()).is_some(),
+        fast.state.window.bbr_rtprop_ms(Instant::now()).is_some(),
         "the fast peer has a measured RTprop"
     );
     let registry = Arc::clone(&fast.io.registry);
@@ -1394,6 +1418,7 @@ async fn fast_peer_holding_one_exchange() -> (
     let index = usize::try_from(first.0 - 1).unwrap();
     deliver(&mut fast, BlockSyncMessage::Block(blocks[index].clone())).await;
     assert!(fast
+        .state
         .window
         .bbr_rtprop_ms(time::Instant::now().into_std())
         .is_some());
@@ -1426,7 +1451,10 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     tokio::pin!(ranking);
     ranking.as_mut().enable();
     fast.handle_status(inflight_limit(1));
-    assert!(fast.pending_status.is_some(), "the status was rate-limited");
+    assert!(
+        fast.state.pending_status.is_some(),
+        "the status was rate-limited"
+    );
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     slow.try_fill();
     assert_eq!(
@@ -1451,7 +1479,7 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
         ranking.as_mut().enable();
         fast.handle_status(inflight_limit(if round % 2 == 0 { 1 } else { 2 }));
         assert!(
-            fast.pending_status.is_some(),
+            fast.state.pending_status.is_some(),
             "every status is rate-limited"
         );
         if futures::poll!(ranking.as_mut()).is_ready() {
@@ -1467,7 +1495,7 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     ranking.as_mut().enable();
     time::advance(Duration::from_secs(1)).await;
     fast.flush_pending_status();
-    assert!(fast.pending_status.is_none());
+    assert!(fast.state.pending_status.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
     assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
 }

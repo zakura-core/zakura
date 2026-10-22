@@ -14,7 +14,7 @@ impl PeerRoutine {
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
-            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
             row.reason = Some(reason);
         });
     }
@@ -24,10 +24,10 @@ impl PeerRoutine {
             row.peer = Some(trace_peer(&self.io.peer));
             row.reason = Some(PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS);
             row.error = Some(error.to_string());
-            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
-            row.bbr_cwnd = Some(saturating_usize(self.window.bbr_effective_cwnd()));
-            row.available_slots = Some(saturating_usize(self.window.available_slots()));
-            if let Some(last_block_at) = self.window.last_block_at {
+            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
+            row.bbr_cwnd = Some(saturating_usize(self.state.window.bbr_effective_cwnd()));
+            row.available_slots = Some(saturating_usize(self.state.window.available_slots()));
+            if let Some(last_block_at) = self.state.window.last_block_at {
                 row.last_block_age_ms = Some(elapsed_ms_u64(
                     time::Instant::from_std(last_block_at).elapsed(),
                 ));
@@ -38,7 +38,7 @@ impl PeerRoutine {
     pub(super) fn trace_ending_timeout(&self) {
         self.emit(bs_trace::BLOCK_PEER_ENDING_TIMEOUT, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
-            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+            row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
         });
     }
 
@@ -107,13 +107,15 @@ impl PeerRoutine {
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             // Mirror the effective (reliability-scaled) bypass the fill loop used.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
-            let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
+            let floor_bonus = self.state.window.scaled_floor_bonus(base_floor_bonus);
             row.peer = Some(trace_peer(&self.io.peer));
             row.fill_stop_reason = Some(reason);
             row.fill_sent = Some(0);
-            row.normal_slots = Some(saturating_usize(self.window.available_slots_at(now)));
+            row.normal_slots = Some(saturating_usize(self.state.window.available_slots_at(now)));
             row.floor_slots = Some(saturating_usize(
-                self.window.available_slots_with_bonus_at(floor_bonus, now),
+                self.state
+                    .window
+                    .available_slots_with_bonus_at(floor_bonus, now),
             ));
             row.budget_available = Some(self.io.budget.available());
             row.pending_work = Some(saturating_usize(self.io.work.pending_len()));
@@ -133,13 +135,13 @@ impl PeerRoutine {
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(count));
             row.estimated_bytes = Some(estimated_bytes);
-            row.available_slots = Some(saturating_usize(self.window.available_slots()));
-            row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));
+            row.available_slots = Some(saturating_usize(self.state.window.available_slots()));
+            row.peer_outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
             self.insert_no_progress_fields(row);
             // The reliability estimate discounts the admission cwnd, so trace it at
             // request time too (not only on delivery): a dropping peer keeps requesting at
             // a shrinking cwnd, and these rows capture the fall.
-            row.bbr_reliability_permille = Some(self.window.bbr_reliability_permille());
+            row.bbr_reliability_permille = Some(self.state.window.bbr_reliability_permille());
             // A floor request issued while the peer was saturated at its cwnd — borrowed
             // a floor-bypass slot. Lets the analysis confirm the bypass actually fired.
             row.floor_bypass = Some(u64::from(floor_bypass));
@@ -187,41 +189,41 @@ impl PeerRoutine {
     /// field names and their `u64` encoding, rather than a copy that can drift stylistically.
     pub(super) fn insert_no_progress_fields(&self, row: &mut BlockTraceFields) {
         row.requests_without_block_progress =
-            Some(u64::from(self.window.requests_without_block_progress));
-        row.no_progress_request_cap = Some(u64::from(self.window.no_progress_request_cap()));
-        row.block_progress_proven = Some(u64::from(self.window.has_block_progress()));
+            Some(u64::from(self.state.window.requests_without_block_progress));
+        row.no_progress_request_cap = Some(u64::from(self.state.window.no_progress_request_cap()));
+        row.block_progress_proven = Some(u64::from(self.state.window.has_block_progress()));
     }
 
     pub(super) fn insert_bbr_fields(&self, row: &mut BlockTraceFields) {
         // Read the windowed estimators as of now, so a trace taken during a quiet bad
         // period reports freshly-filtered (possibly `None`) values, not stale ones.
         let now = Instant::now();
-        row.bbr_cwnd = Some(saturating_usize(self.window.bbr_effective_cwnd()));
-        if let Some(rtprop_ms) = self.window.bbr_rtprop_ms(now) {
+        row.bbr_cwnd = Some(saturating_usize(self.state.window.bbr_effective_cwnd()));
+        if let Some(rtprop_ms) = self.state.window.bbr_rtprop_ms(now) {
             row.bbr_rtprop_ms = Some(rtprop_ms);
         }
-        if let Some(btlbw) = self.window.bbr_btlbw_milliblocks(now) {
+        if let Some(btlbw) = self.state.window.bbr_btlbw_milliblocks(now) {
             row.bbr_btlbw_milliblocks_per_sec = Some(btlbw);
         }
         // Byte-denomination fields (emitted only under `CwndUnit::Bytes`): byte cwnd,
         // bytes/sec BtlBw, in-flight reserved bytes. `bbr_cwnd` above stays the derived
         // in-flight *request* count so existing analysis scripts work in either unit.
-        if let Some(cwnd_bytes) = self.window.bbr_effective_cwnd_bytes() {
+        if let Some(cwnd_bytes) = self.state.window.bbr_effective_cwnd_bytes() {
             row.bbr_cwnd_bytes = Some(cwnd_bytes);
-            row.bbr_inflight_bytes = Some(self.window.bbr_inflight_bytes());
+            row.bbr_inflight_bytes = Some(self.state.window.bbr_inflight_bytes());
         }
-        if let Some(btlbw_bytes) = self.window.bbr_btlbw_bytes_per_sec(now) {
+        if let Some(btlbw_bytes) = self.state.window.bbr_btlbw_bytes_per_sec(now) {
             row.bbr_btlbw_bytes_per_sec = Some(btlbw_bytes);
         }
-        row.bbr_delivered = Some(self.window.bbr_delivered());
-        row.bbr_phase = Some(self.window.bbr_phase_code());
-        if let Some(smoothed_ms) = self.window.bbr_smoothed_elapsed_ms() {
+        row.bbr_delivered = Some(self.state.window.bbr_delivered());
+        row.bbr_phase = Some(self.state.window.bbr_phase_code());
+        if let Some(smoothed_ms) = self.state.window.bbr_smoothed_elapsed_ms() {
             row.bbr_smoothed_elapsed_ms = Some(smoothed_ms);
         }
-        if let Some(delay_cap) = self.window.bbr_delay_cap() {
+        if let Some(delay_cap) = self.state.window.bbr_delay_cap() {
             row.bbr_delay_cap = Some(delay_cap);
         }
-        row.bbr_reliability_permille = Some(self.window.bbr_reliability_permille());
+        row.bbr_reliability_permille = Some(self.state.window.bbr_reliability_permille());
     }
 
     /// Emit a per-peer BBR sample (`block_peer_bbr`). The heartbeat fires even while the
@@ -232,7 +234,7 @@ impl PeerRoutine {
     pub(super) fn trace_bbr_sample(&mut self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.io.peer));
-            row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));
+            row.peer_outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
             row.budget_reserved = Some(self.io.budget.reserved());
             self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);

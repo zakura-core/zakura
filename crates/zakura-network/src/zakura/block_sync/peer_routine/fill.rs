@@ -195,7 +195,7 @@ impl PeerRoutine {
     /// per-peer slots, never floor-distance / near-tip lag. The pass never
     /// awaits. Other tasks change shared state between its synchronous operations.
     pub(super) fn try_fill(&mut self) -> FillReport {
-        self.request_pool_waiting = false;
+        self.state.request_pool_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
@@ -212,7 +212,7 @@ impl PeerRoutine {
         // Drop expired retry-avoid entries: those heights are contestable by this
         // routine again.
         let now = time::Instant::now().into_std();
-        self.retry_avoid.retain(|_, until| *until > now);
+        self.state.prune_retry_avoid(now);
         let mut pass = FillPass {
             now,
             retry_at: None,
@@ -242,9 +242,7 @@ impl PeerRoutine {
         pass: &mut FillPass,
     ) -> Result<(), FillStop> {
         // Local eligibility: status, the no-progress cap, and the congestion window.
-        let limits = self
-            .state
-            .fill_limits(&self.config, &self.window, pass.now)?;
+        let limits = self.state.fill_limits(&self.config, pass.now)?;
         // Capacity: a requester pool entry, an exchange, and a transport slot.
         let capacity = self.acquire_request_capacity(request_sender)?;
         // A later failure of this attempt still consumes its request ID.
@@ -349,12 +347,12 @@ impl PeerRoutine {
         &mut self,
         request_sender: &'a FramedSend,
     ) -> Result<RequestCapacity<'a>, FillStop> {
-        self.request_pool_waiting = false;
+        self.state.request_pool_waiting = false;
         if let Some(stop) = self.requester_stop() {
             return Err(stop);
         }
         let Some(entry) = self.io.requester.pool.try_entry() else {
-            self.request_pool_waiting = true;
+            self.state.request_pool_waiting = true;
             return Err(FillStop::Budget);
         };
         let Some(exchange) = self.io.requester.open() else {
@@ -445,7 +443,7 @@ impl PeerRoutine {
         let deferred = self.io.registry.floor_has_preferred_unsaturated_server(
             start,
             &self.io.peer,
-            self.window.bbr_rtprop_ms(now),
+            self.state.window.bbr_rtprop_ms(now),
             limits.floor_bypass_only,
         );
         (!deferred).then_some(start)
@@ -516,7 +514,7 @@ impl PeerRoutine {
         if self.io.requester.blocks_retry(height) {
             return RetryFact::ProtocolBlocked;
         }
-        let avoided = self.retry_avoid.contains_key(&height)
+        let avoided = self.state.is_retry_avoided(height)
             || self
                 .io
                 .registry
@@ -542,7 +540,7 @@ impl PeerRoutine {
             now,
             timed_rejection,
             RetryDeadlines {
-                local: self.retry_avoid.values().min().copied(),
+                local: self.state.retry_avoid_expiry(),
                 floor_watchdog: self
                     .io
                     .registry
@@ -644,9 +642,9 @@ impl PeerRoutine {
     fn request_deadline(&self, funding: Funding, queued_at: Instant) -> Instant {
         // A block-count delivery sample proves progress even though it cannot
         // supply a byte rate for estimating transfer time.
-        let byte_rate = self.window.bbr_btlbw_bytes_per_sec(queued_at);
+        let byte_rate = self.state.window.bbr_btlbw_bytes_per_sec(queued_at);
         let has_delivery_measurement =
-            byte_rate.is_some() || self.window.bbr_btlbw_milliblocks(queued_at).is_some();
+            byte_rate.is_some() || self.state.window.bbr_btlbw_milliblocks(queued_at).is_some();
         request_deadline(
             funding.priority,
             queued_at,
@@ -654,7 +652,8 @@ impl PeerRoutine {
             self.config.effective_floor_rescue_timeout(),
             // Responses share an ordered stream. Include earlier unreceived
             // work so this request cannot expire while those bodies arrive.
-            self.window
+            self.state
+                .window
                 .outstanding_reserved_bytes()
                 .saturating_add(funding.reserved_bytes),
             // Filter BtlBw by the request's send time so a stale-high rate from a
@@ -687,15 +686,16 @@ impl PeerRoutine {
         let mut delivered = false;
         let fenced = writer.publish(|| {
             claim.publish(|| {
-                issued = Some(self.window.outstanding.push(OutstandingBlockRange {
+                let key = self.state.window.outstanding.push(OutstandingBlockRange {
                     request,
-                    write_status: claim.status(),
                     queued_at,
                     deadline,
-                    delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                    delivery_snapshot: self.state.window.delivery_snapshot(queued_at),
                     delivered_bytes: 0,
                     received: ReceivedBlockTracker::default(),
-                }));
+                });
+                self.io.writes.insert(key, claim.status());
+                issued = Some(key);
                 delivered = slot.send_request(frame, write_claim);
             });
         });
@@ -723,7 +723,8 @@ impl PeerRoutine {
             // A floor request borrowed a bypass slot while the cwnd was saturated.
             metrics::counter!("sync.block.request.floor_bypass").increment(1);
         }
-        self.window
+        self.state
+            .window
             .arm_liveness(queued_at, self.config.effective_liveness_timeout());
         self.publish_request_claims(key);
         self.publish_slot_diagnostics();
@@ -739,7 +740,7 @@ impl PeerRoutine {
     fn refill_low_water_blocks(&self) -> usize {
         let max_blocks_per_response =
             usize::try_from(self.config.advertised_max_blocks_per_response()).unwrap_or(usize::MAX);
-        let max_inflight_per_peer = hard_outbound_capacity(self.window.max_inflight_requests);
+        let max_inflight_per_peer = hard_outbound_capacity(self.state.window.max_inflight_requests);
         max_inflight_per_peer
             .saturating_mul(max_blocks_per_response)
             .max(max_blocks_per_response)

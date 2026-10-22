@@ -1615,7 +1615,7 @@ impl PeerRoutine {
         let available_slots = if self.state.published_requester_stopped {
             0
         } else {
-            self.state.window.available_slots()
+            self.state.window.available_slots_at(Instant::now())
         };
         self.io.registry.publish_slots(
             &self.io.peer,

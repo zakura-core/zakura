@@ -597,6 +597,7 @@ impl DownloadWindow {
         self.bbr.reliability_permille()
     }
 
+    #[cfg(test)]
     pub(super) fn available_slots(&self) -> usize {
         self.available_slots_at(Instant::now())
     }
@@ -607,7 +608,7 @@ impl DownloadWindow {
 
     /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
     /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
-    /// (above-floor) capacity used by [`Self::available_slots`]; a small positive `bonus` is
+    /// (above-floor) capacity used by [`Self::available_slots_at`]; a small positive `bonus` is
     /// the floor bypass — it lets the lowest missing height be fetched even when the
     /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
     ///

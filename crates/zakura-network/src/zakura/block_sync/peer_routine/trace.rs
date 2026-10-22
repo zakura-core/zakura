@@ -26,7 +26,9 @@ impl PeerRoutine {
             row.error = Some(error.to_string());
             row.outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
             row.bbr_cwnd = Some(saturating_usize(self.state.window.bbr_effective_cwnd()));
-            row.available_slots = Some(saturating_usize(self.state.window.available_slots()));
+            row.available_slots = Some(saturating_usize(
+                self.state.window.available_slots_at(Instant::now()),
+            ));
             if let Some(last_block_at) = self.state.window.last_block_at {
                 row.last_block_age_ms = Some(elapsed_ms_u64(
                     time::Instant::from_std(last_block_at).elapsed(),
@@ -135,7 +137,9 @@ impl PeerRoutine {
             row.range_start = Some(trace_height(start_height));
             row.range_count = Some(u64::from(count));
             row.estimated_bytes = Some(estimated_bytes);
-            row.available_slots = Some(saturating_usize(self.state.window.available_slots()));
+            row.available_slots = Some(saturating_usize(
+                self.state.window.available_slots_at(Instant::now()),
+            ));
             row.peer_outstanding = Some(saturating_usize(self.state.window.outstanding.len()));
             self.insert_no_progress_fields(row);
             // The reliability estimate discounts the admission cwnd, so trace it at

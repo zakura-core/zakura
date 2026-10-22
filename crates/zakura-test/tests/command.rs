@@ -295,6 +295,16 @@ fn failure_regex_reads_multi_line_output_on_expect_line() {
         .with_timeout(Duration::from_secs(5))
         .with_failure_regex_set("failure_message", RegexSet::empty());
 
+    // The error report kills the child before reading its unread output, so
+    // wait until the child has written all of it. Some `echo` implementations,
+    // such as uutils, write each line separately.
+    child
+        .child
+        .as_mut()
+        .expect("child is present because it was just spawned")
+        .wait()
+        .expect("waiting succeeds because the child has not been waited on yet");
+
     // Any method that reads output should work here.
     // We use a non-matching regex, to trigger the failure panic.
     let expected_error = child

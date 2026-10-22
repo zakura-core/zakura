@@ -471,7 +471,7 @@ async fn stale_anchor_admission_reanchors_from_durable_snapshot_without_retry_or
         !reactor
             .sessions
             .get(&peer)
-            .and_then(|state| state.status_publisher.as_ref())
+            .and_then(|handles| handles.status_publisher.as_ref())
             .expect("the connected peer retains its publisher")
             .due(Instant::now()),
         "one refreshed publication satisfies the changed status"

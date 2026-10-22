@@ -6,18 +6,18 @@
 //! as bootstrap peers. Discovery success is the peer appearing in the supervisor
 //! registration watch, not the dial future completing.
 
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-    panic::AssertUnwindSafe,
-    time::Duration,
-};
+use std::{net::IpAddr, panic::AssertUnwindSafe, time::Duration};
 
 use futures::FutureExt;
-use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
 use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    sync::{oneshot, watch},
+    task::{JoinHandle, JoinSet},
+    time::Instant,
+};
 
 use super::dialer::native_discovery_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
@@ -87,7 +87,7 @@ pub(crate) fn spawn_native_discovery_dialer(
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
     sought_services: Vec<ZakuraServiceId>,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     spawn_erased(run_native_discovery_dialer(
         endpoint,
         discovery,
@@ -157,7 +157,7 @@ pub(crate) async fn run_native_discovery_dialer(
             .await;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             // Endpoint shutdown cancels this token. The dialer holds an endpoint
             // clone, so the supervisor registration watch never closes on its
@@ -202,7 +202,7 @@ pub(crate) async fn run_native_discovery_dialer(
                     return;
                 }
             }
-            _ = tokio::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
+            _ = zakura_rt::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
         }
     }
 }
@@ -451,12 +451,12 @@ async fn run_discovery_dial_once(
         };
     }
 
-    let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+    let (admitted_ip_tx, mut admitted_ip_rx) = oneshot::channel();
     let dial = spawn_erased({
         let endpoint = endpoint.clone();
         async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     });
-    tokio::pin!(dial);
+    zakura_rt::pin!(dial);
 
     let result = loop {
         if registered
@@ -468,7 +468,7 @@ async fn run_discovery_dial_once(
                 .await;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             dial_result = &mut dial => {
                 break match dial_result {
                     // `native_bootstrap_dial` returns `Ok(())` only after the connection
@@ -516,14 +516,12 @@ async fn run_discovery_dial_once(
 }
 
 async fn wait_for_discovery_registration_to_settle(
-    registered: &mut tokio::sync::watch::Receiver<Vec<ZakuraPeerId>>,
+    registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
     peer_id: &ZakuraPeerId,
-    dial: &mut std::pin::Pin<
-        &mut tokio::task::JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>,
-    >,
+    dial: &mut std::pin::Pin<&mut JoinHandle<Result<(), crate::zakura::ZakuraHandlerError>>>,
 ) -> DiscoveryDialResult {
-    let healthy = tokio::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
-    tokio::pin!(healthy);
+    let healthy = zakura_rt::time::sleep(ZAKURA_REDIAL_HEALTHY_CONNECTION);
+    zakura_rt::pin!(healthy);
 
     loop {
         if !registered
@@ -534,7 +532,7 @@ async fn wait_for_discovery_registration_to_settle(
             return DiscoveryDialResult::ShortLivedRegistered;
         }
 
-        tokio::select! {
+        zakura_rt::select! {
             _dial_result = &mut *dial => {
                 let still_registered = registered
                     .borrow_and_update()

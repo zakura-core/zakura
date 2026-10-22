@@ -32,7 +32,7 @@ use zakura_chain::{
 };
 
 use zakura_node_services::mempool;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_state as zs;
 
 use crate::{
@@ -547,7 +547,7 @@ where
     // transaction verification
 
     let transaction = transaction::Verifier::new(network, transaction_state, mempool);
-    let transaction = Buffer::new(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let transaction = spawn_buffer(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);
@@ -583,7 +583,7 @@ where
         block,
     };
 
-    let router = Buffer::new(BoxService::new(router), VERIFIER_BUFFER_BOUND);
+    let router = spawn_buffer(BoxService::new(router), VERIFIER_BUFFER_BOUND);
 
     let task_handles = BackgroundTaskHandles {
         state_checkpoint_verify_handle,

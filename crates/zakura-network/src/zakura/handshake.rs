@@ -2,7 +2,6 @@
 
 use std::{
     cmp::min,
-    collections::HashMap,
     io::{self, Cursor, Read, Write},
     time::{Duration, Instant},
 };
@@ -10,6 +9,7 @@ use std::{
 use blake2b_simd::Params as Blake2bParams;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
+use zakura_rt::collections::HashMap;
 
 use zakura_chain::{parameters::Network, serialization::ZcashSerialize};
 

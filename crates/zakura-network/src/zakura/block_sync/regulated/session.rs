@@ -1,8 +1,8 @@
 //! Per-session serving admission with exact live-range overlap checks.
 
 use std::{collections::BTreeMap, sync::Arc};
-use tokio_util::sync::CancellationToken;
 use zakura_chain::block::Height;
+use zakura_rt::sync::CancellationToken;
 
 use super::{
     serving::{Server, Source},

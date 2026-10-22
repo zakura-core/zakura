@@ -6,6 +6,7 @@
 use super::*;
 use crate::zakura::testkit::TraceCapture;
 use crate::zakura::FramedRecv;
+use tokio::time;
 use zakura_header_chain::MAX_STAGED_TARGETS_V1;
 
 /// Runs `phase` with `reactor`'s header sync trace captured, and returns how

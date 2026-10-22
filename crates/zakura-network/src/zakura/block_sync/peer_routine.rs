@@ -21,8 +21,15 @@
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
-use tokio::sync::{futures::Notified, mpsc, watch};
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        futures::Notified,
+        mpsc, watch, CancellationToken, Mutex,
+    },
+    time,
+};
 
 use super::events::RoutineToReactor;
 use super::{
@@ -49,7 +56,6 @@ use super::{
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
-use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
 
 #[cfg(test)]
@@ -217,12 +223,7 @@ fn transactions_match_header(block: &block::Block) -> bool {
         .map(|transaction| transaction.hash())
         .collect();
     let root: block::merkle::Root = hashes.iter().copied().collect();
-    root == block.header.merkle_root
-        && hashes
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            == hashes.len()
+    root == block.header.merkle_root && hashes.iter().collect::<HashSet<_>>().len() == hashes.len()
 }
 
 fn header_hash_payload_mismatch(
@@ -350,10 +351,10 @@ pub(super) struct PeerRoutine {
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
-    received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    received_throughput: Arc<Mutex<ThroughputMeter>>,
     sequencer_input: mpsc::Sender<SequencedBody>,
-    sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    sequencer_input_bytes: Arc<AtomicU64>,
+    sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -396,10 +397,10 @@ impl PeerRoutine {
         budget: super::state::ByteBudget,
         work: Arc<WorkQueue>,
         registry: Arc<PeerRegistry>,
-        received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+        received_throughput: Arc<Mutex<ThroughputMeter>>,
         sequencer_input: mpsc::Sender<SequencedBody>,
-        sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-        sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+        sequencer_input_bytes: Arc<AtomicU64>,
+        sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
@@ -532,9 +533,9 @@ impl PeerRoutine {
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
             let floor_ranking = registry.subscribe_floor_ranking().notified();
-            tokio::pin!(capacity);
-            tokio::pin!(available);
-            tokio::pin!(floor_ranking);
+            zakura_rt::pin!(capacity);
+            zakura_rt::pin!(available);
+            zakura_rt::pin!(floor_ranking);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
             Notified::enable(floor_ranking.as_mut());
@@ -575,11 +576,11 @@ impl PeerRoutine {
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep(retry_filter_deadline);
-            tokio::pin!(timeout);
+            zakura_rt::pin!(timeout);
             let outbound_queue_poll = time::sleep(OUTBOUND_FULL_POLL_INTERVAL);
-            tokio::pin!(outbound_queue_poll);
+            zakura_rt::pin!(outbound_queue_poll);
 
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
                 frame = self.recv.recv() => {
@@ -703,8 +704,8 @@ impl PeerRoutine {
         };
         let body_permit = {
             let permit = self.reserve_body_decode_permit();
-            tokio::pin!(permit);
-            tokio::select! {
+            zakura_rt::pin!(permit);
+            zakura_rt::select! {
                 biased;
                 () = self.cancel.cancelled() => {
                     if self.recv.failure().is_none() {
@@ -1472,13 +1473,11 @@ impl PeerRoutine {
             reorder_buffered_blocks: view.reorder_len,
             applying_buffered_bytes: view.applying_buffered_bytes,
             applying_buffered_blocks: view.applying_len,
-            sequencer_input_queued_bytes: self
-                .sequencer_input_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
+            sequencer_input_queued_bytes: self.sequencer_input_bytes.load(Ordering::Relaxed),
             in_flight_submission_bytes: view.in_flight_submission_bytes,
             decoded_resident_bytes: self
                 .sequencer_input_decoded_attributed_memory_bytes
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(Ordering::Relaxed)
                 .saturating_add(view.reorder_decoded_attributed_memory_bytes)
                 .saturating_add(view.applying_decoded_attributed_memory_bytes),
             reserved_above_floor_bytes,

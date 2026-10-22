@@ -23,13 +23,10 @@
 //! | Replacing or removing retires the old fence first | `replacement_fences_the_old_publication_and_queued_first_write`, `removing_a_session_fences_its_writers_before_erasing_it` |
 //! | A same-connection replacement is refused exactly when the old fence closed the connection | `replacement_closes_a_started_exchange_even_after_its_write_finished`, `an_ended_exchange_or_a_new_connection_allows_replacement`, the proptest |
 
-use std::{
+use zakura_rt::{
     collections::HashMap,
-    sync::{Mutex, PoisonError},
+    sync::{watch, CancellationToken, Mutex, MutexGuard, PoisonError},
 };
-
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 
 use super::WriterFence;
 use crate::zakura::{ZakuraConnId, ZakuraPeerId};
@@ -89,7 +86,7 @@ impl<S: Clone> SessionTable<S> {
         self.changed.subscribe()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ZakuraPeerId, Current<S>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<ZakuraPeerId, Current<S>>> {
         self.current.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

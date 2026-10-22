@@ -2,8 +2,10 @@
 
 use std::{
     num::NonZeroU64,
-    sync::{Arc, Mutex, PoisonError, Weak},
+    sync::{Arc, Weak},
 };
+
+use zakura_rt::sync::{Mutex, PoisonError};
 
 /// A caller key and a unique admission on this completion queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

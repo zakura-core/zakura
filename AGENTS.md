@@ -17,7 +17,7 @@ Zakura is a Rust workspace; the member crates live under `crates/`. Main crates 
 
 - `crates/zakurad/` (node CLI/orchestration),
 - core libraries like `crates/zakura-chain/`, `crates/zakura-consensus/`, `crates/zakura-network/`, `crates/zakura-state/`, `crates/zakura-rpc/`, `crates/zakura-script/`,
-- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, and `crates/xtask/`.
+- support crates like `crates/zakura-node-services/`, `crates/zakura-test/`, `crates/zakura-utils/`, `crates/zakura-jsonl-trace/`, `crates/zakura-rt/`, and `crates/xtask/`.
 
 Code is primarily in each crate's `src/`; integration tests are in `crates/*/tests/`; many unit/property tests are colocated in `src/**/tests/` (for example `prop.rs`, `vectors.rs`, `preallocate.rs`). Documentation is in `docs/` and crate READMEs. CI and policy automation live in `.github/workflows/`.
 
@@ -160,6 +160,7 @@ S::Future: Send + 'static,
 - All external waits need timeouts (network, state, channels)
 - Prefer `tokio::sync::watch` over `Mutex` for shared async state
 - Prefer freshness tracking ("time since last change") to detect stalls
+- The v2 P2P code (`crates/zakura-network/src/zakura/`, except `legacy_gossip` and `testkit`) takes tasks, time, sync primitives, hashed collections and the thread RNG from `zakura_rt`, not from `tokio`, `std` or `rand`. `cargo xtask check-rt-imports` enforces this.
 
 ### Security
 

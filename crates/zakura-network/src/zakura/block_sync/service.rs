@@ -1,3 +1,5 @@
+use zakura_rt::sync::atomic::{AtomicU64, Ordering};
+
 use super::{
     config::*, events::*, peer_registry::SessionAdmission, regulated::status_sender::StatusSend,
     wire::*, *,
@@ -8,10 +10,7 @@ use crate::zakura::{
     SinkReject, Stream, StreamQueueDepths, ZakuraBlockSyncCandidateState, ZakuraConnId,
     ZakuraPeerId, FRAME_HEADER_BYTES,
 };
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::time::Instant;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
@@ -182,9 +181,9 @@ impl BlockSyncPeerSession {
                     Instant::now() + Duration::from_millis(100)
                 }
             };
-            tokio::select! {
+            zakura_rt::select! {
                 () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
-                () = tokio::time::sleep_until(retry_at.into()) => {},
+                () = zakura_rt::time::sleep_until(retry_at.into()) => {},
             }
         }
     }
@@ -502,7 +501,7 @@ impl BlockSyncService {
                 let mut service_demand = self.service_demand.clone();
                 return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
-                        tokio::select! {
+                        zakura_rt::select! {
                             changed = candidates.changed() => {
                                 if changed.is_err() {
                                     std::future::pending::<()>().await;
@@ -893,7 +892,7 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
-                        tokio::select! {
+                        zakura_rt::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),
                             result = routine.run() => result,
@@ -1035,7 +1034,7 @@ impl Service for BlockSyncService {
 /// exists to act on them.
 async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Result<(), SinkReject> {
     loop {
-        tokio::select! {
+        zakura_rt::select! {
             () = cancel.cancelled() => return Ok(()),
             frame = recv.recv() => {
                 if frame.is_none() {

@@ -18,8 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 
 use super::{Frame, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
@@ -339,7 +338,7 @@ fn spawn_boxed_pipe(
     on_panic: BoxedHook,
     pipe: BoxedTask,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zakura_rt::task::spawn(async move {
         let _teardown = PipeTeardown {
             peer_id,
             cancel,
@@ -430,7 +429,7 @@ pub(crate) fn spawn_supervised_peer_task_unboxed(
     on_panic: impl FnOnce() + Send + 'static,
     task: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zakura_rt::task::spawn(async move {
         let _teardown = PeerTaskTeardown {
             peer_id,
             on_teardown: Some(on_teardown),
@@ -478,7 +477,7 @@ pub(crate) fn handle_pipe_exit(
 pub mod supervised_spawn_bench {
     use std::future::Future;
 
-    use tokio::task::JoinHandle;
+    use zakura_rt::task::JoinHandle;
 
     use crate::zakura::ZakuraPeerId;
 

@@ -38,6 +38,7 @@ use crate::zakura::{
     FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
+use tokio::time;
 use zakura_chain::{
     fmt::HexDebug,
     serialization::{ZcashDeserializeInto, ZcashSerialize},

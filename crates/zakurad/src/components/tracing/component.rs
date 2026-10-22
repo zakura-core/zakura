@@ -8,7 +8,12 @@ use std::{
 use eyre::{eyre, Report};
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    Layer,
+};
 use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
@@ -68,6 +73,10 @@ impl Tracing {
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
+        let (targets, ignored) = parse_filter(&filter);
+        for (directive, reason) in ignored {
+            eprintln!("ignoring tracing filter directive `{directive}`: {reason}");
+        }
 
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
@@ -139,18 +148,19 @@ impl Tracing {
             non_blocking(writer, config.buffer_limit.max(100)).map_err(io_error)?;
 
         // Construct a format subscriber with the supplied global logging filter.
+        // The filter is not a per-layer filter, so it applies to every layer.
         let subscriber = {
-            use tracing_subscriber::FmtSubscriber;
-
-            let logger = FmtSubscriber::builder()
+            let logger = tracing_subscriber::fmt::layer()
                 .with_ansi(use_color)
-                .with_writer(non_blocking)
-                .with_env_filter(&filter);
+                .with_writer(non_blocking);
 
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            logger.finish().with(warn_error_layer)
+            tracing_subscriber::registry()
+                .with(targets)
+                .with(logger)
+                .with(warn_error_layer)
         };
 
         // Initialise the global tracing subscriber
@@ -195,6 +205,50 @@ impl std::fmt::Debug for Tracing {
     }
 }
 
+/// Parses the configured tracing `filter` into a [`Targets`] filter.
+///
+/// The filter is a comma-separated list of `level`, `target` and `target=level`
+/// directives. Empty directives are skipped, and a filter with no usable
+/// directives shows errors only.
+///
+/// Span and field directives, which [`Targets`] cannot apply, and directives
+/// that do not parse are left out of the filter. They are returned with the
+/// reason, so the caller can warn about them.
+fn parse_filter(filter: &str) -> (Targets, Vec<(&str, String)>) {
+    let mut directives = Vec::new();
+    let mut ignored = Vec::new();
+
+    for directive in filter.split(',').map(str::trim) {
+        if directive.is_empty() {
+            continue;
+        }
+        if directive.contains(['[', '{']) {
+            ignored.push((
+                directive,
+                "span and field filters are not supported, use `level`, `target` or \
+                 `target=level` directives"
+                    .to_string(),
+            ));
+            continue;
+        }
+        match directive.parse::<Targets>() {
+            Ok(_) => directives.push(directive),
+            Err(error) => ignored.push((directive, error.to_string())),
+        }
+    }
+
+    let targets = if directives.is_empty() {
+        Targets::new().with_default(LevelFilter::ERROR)
+    } else {
+        directives
+            .join(",")
+            .parse()
+            .expect("each directive parsed on its own and contains no comma")
+    };
+
+    (targets, ignored)
+}
+
 // Visitor to extract only the "message" field from a log event.
 struct MessageVisitor {
     message: Option<String>,
@@ -236,5 +290,112 @@ where
                     .send(Some((message, level, timestamp)));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns the most verbose level `targets` enables for `target`.
+    fn level_for(targets: &Targets, target: &str) -> LevelFilter {
+        [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ]
+        .into_iter()
+        .find(|level| targets.would_enable(target, level))
+        .map_or(LevelFilter::OFF, LevelFilter::from_level)
+    }
+
+    /// Parses `filter`, asserting that it has no ignored directives.
+    fn parse_valid(filter: &str) -> Targets {
+        let (targets, ignored) = parse_filter(filter);
+        assert!(ignored.is_empty(), "{filter:?}: {ignored:?}");
+        targets
+    }
+
+    #[test]
+    fn filter_levels_follow_the_most_specific_target() {
+        let targets =
+            parse_valid("warn,zakurad=info,zakura_network=debug,zakura_network::zakura=trace");
+
+        assert_eq!(level_for(&targets, "zakura_state"), LevelFilter::WARN);
+        assert_eq!(
+            level_for(&targets, "zakurad::commands::start"),
+            LevelFilter::INFO
+        );
+        assert_eq!(
+            level_for(&targets, "zakura_network::peer"),
+            LevelFilter::DEBUG
+        );
+        assert_eq!(
+            level_for(&targets, "zakura_network::zakura::discovery"),
+            LevelFilter::TRACE
+        );
+    }
+
+    #[test]
+    fn bare_target_enables_every_level_for_it() {
+        let targets = parse_valid("warn,zakura_rpc");
+
+        assert_eq!(
+            level_for(&targets, "zakura_rpc::server"),
+            LevelFilter::TRACE
+        );
+        assert_eq!(level_for(&targets, "zakura_state"), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn empty_filter_and_empty_directives_match_the_previous_filter() {
+        for filter in ["", " ", ",", ",,"] {
+            assert_eq!(
+                level_for(&parse_valid(filter), "zakurad"),
+                LevelFilter::ERROR,
+                "{filter:?}"
+            );
+        }
+
+        let targets = parse_valid("info,,zakura_network=debug,");
+        assert_eq!(level_for(&targets, "zakurad"), LevelFilter::INFO);
+        assert_eq!(level_for(&targets, "zakura_network"), LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn span_and_field_directives_are_ignored() {
+        let span = r"[block_verify{height=Some\(block::Height\(.*000\)\)}]=trace";
+        let filter = format!("info,{span},zakura_network[{{peer}}]=debug,zakurad=warn");
+        let (targets, ignored) = parse_filter(&filter);
+
+        let ignored: Vec<_> = ignored
+            .into_iter()
+            .map(|(directive, _)| directive)
+            .collect();
+        assert_eq!(ignored, [span, "zakura_network[{peer}]=debug"]);
+        assert_eq!(level_for(&targets, "zakura_network"), LevelFilter::INFO);
+        assert_eq!(level_for(&targets, "zakurad"), LevelFilter::WARN);
+    }
+
+    #[test]
+    fn invalid_directives_are_ignored() {
+        let (targets, ignored) = parse_filter("debug,zakurad=loud,zakura_state=info=trace");
+
+        let ignored: Vec<_> = ignored
+            .into_iter()
+            .map(|(directive, _)| directive)
+            .collect();
+        assert_eq!(ignored, ["zakurad=loud", "zakura_state=info=trace"]);
+        assert_eq!(level_for(&targets, "zakurad"), LevelFilter::DEBUG);
+    }
+
+    #[test]
+    fn a_filter_with_only_ignored_directives_shows_errors_only() {
+        let (targets, ignored) = parse_filter("zakurad=loud,[sync]=debug");
+
+        assert_eq!(ignored.len(), 2);
+        assert_eq!(level_for(&targets, "zakurad"), LevelFilter::ERROR);
     }
 }

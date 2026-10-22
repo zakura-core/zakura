@@ -13,6 +13,9 @@
 use std::{future::Future, pin::Pin};
 
 use tokio::task::JoinHandle;
+use tower::{buffer::Buffer, Service};
+
+use crate::BoxError;
 
 /// A spawned future boxed so that its type depends only on its output.
 pub type ErasedFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -31,4 +34,21 @@ pub fn spawn_erased<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> JoinHandle<T> {
     tokio::spawn(erased(future))
+}
+
+/// Wrap `service` in a [`Buffer`], spawning its worker as an [`ErasedFuture`].
+///
+/// Behaves like [`Buffer::new`], which spawns its worker with `tokio::spawn`
+/// and so compiles tokio's task code once per buffered service type.
+#[track_caller]
+pub fn spawn_buffer<S, Request>(service: S, bound: usize) -> Buffer<Request, S::Future>
+where
+    S: Service<Request> + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BoxError> + Send + Sync,
+    Request: Send + 'static,
+{
+    let (buffer, worker) = Buffer::pair(service, bound);
+    spawn_erased(worker);
+    buffer
 }

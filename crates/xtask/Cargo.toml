@@ -11,7 +11,6 @@ publish = false
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
-test = false
 
 [dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }

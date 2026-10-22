@@ -333,6 +333,28 @@ async fn loss_stays_within_each_links_budget() {
     }));
 }
 
+/// A window that closes before it opens would leave a due datagram that
+/// is still too early, so nothing could happen next.
+#[test]
+#[should_panic(expected = "min_delay must not exceed max_delay")]
+fn a_default_model_with_an_inverted_window_is_refused() {
+    SimNet::new(fifo(50, 10));
+}
+
+/// See `a_default_model_with_an_inverted_window_is_refused`.
+#[test]
+#[should_panic(expected = "min_delay must not exceed max_delay")]
+fn a_link_model_with_an_inverted_window_is_refused() {
+    let net = SimNet::new(fifo(0, 10));
+    net.set_link(
+        Link {
+            src: addr(1),
+            dst: addr(2),
+        },
+        fifo(50, 10),
+    );
+}
+
 #[test]
 #[should_panic(expected = "while datagrams are in flight")]
 fn a_link_model_is_fixed_while_datagrams_are_in_flight() {

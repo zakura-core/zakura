@@ -48,6 +48,18 @@ pub(crate) struct LinkModel {
     pub(crate) loss_budget: u64,
 }
 
+impl LinkModel {
+    /// Panics unless the delay window opens before it closes. An inverted
+    /// window would leave a datagram due but still too early to deliver,
+    /// with nothing allowed next.
+    fn check(&self) {
+        assert!(
+            self.min_delay <= self.max_delay,
+            "min_delay must not exceed max_delay"
+        );
+    }
+}
+
 impl Default for LinkModel {
     /// The header-sync defaults: 0 to 100 ms, reordering, no loss.
     fn default() -> Self {
@@ -227,7 +239,12 @@ pub(crate) struct SimNet {
 impl SimNet {
     /// An empty network whose links all follow `default_model` until
     /// [`SimNet::set_link`] says otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `default_model`'s `min_delay` exceeds its `max_delay`.
     pub(crate) fn new(default_model: LinkModel) -> Self {
+        default_model.check();
         Self {
             state: Arc::new(Mutex::new(State {
                 default_model,
@@ -250,8 +267,10 @@ impl SimNet {
     ///
     /// # Panics
     ///
-    /// If datagrams are in flight on the link.
+    /// If datagrams are in flight on the link, or if `model`'s `min_delay`
+    /// exceeds its `max_delay`.
     pub(crate) fn set_link(&self, link: Link, model: LinkModel) {
+        model.check();
         let mut state = self.lock();
         assert!(
             state.oldest(link).is_none(),

@@ -205,6 +205,9 @@ jobs:
       - name: Ubuntu package retry tests
         if: ${{ !cancelled() }}
         run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
+      - name: Real apt mirror failover test
+        if: ${{ !cancelled() }}
+        run: python3 .github/actions/setup-zakura-build/test_apt_failover.py
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh

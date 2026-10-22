@@ -4,6 +4,7 @@ set -euo pipefail
 
 # A healthy package phase needs about 20 seconds. A degraded mirror has needed
 # 13 minutes. Keep the whole phase below the shortest consuming job timeout.
+# GitHub ignores timeout-minutes on composite action steps, so enforce it here.
 readonly APT_BUDGET_SECONDS="${APT_BUDGET_SECONDS:-1200}"
 # Bound each network attempt so one stalled mirror leaves time for failover.
 readonly APT_ATTEMPT_SECONDS="${APT_ATTEMPT_SECONDS:-300}"

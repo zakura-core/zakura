@@ -12,9 +12,9 @@ export APT_BUDGET_SECONDS=120
 export APT_ATTEMPT_SECONDS=5
 export APT_MIRRORS_FILE="$test_dir/apt-mirrors.txt"
 
-printf '%s\n' \
-  'http://azure.archive.ubuntu.com/ubuntu/ priority:1' \
-  'https://archive.ubuntu.com/ubuntu/ priority:2' \
+printf '%s\t%s\n' \
+  'http://azure.archive.ubuntu.com/ubuntu/' 'priority:1' \
+  'https://archive.ubuntu.com/ubuntu/' 'priority:2' \
   > "$APT_MIRRORS_FILE"
 
 # shellcheck source=.github/actions/setup-zakura-build/install-ubuntu-packages.sh

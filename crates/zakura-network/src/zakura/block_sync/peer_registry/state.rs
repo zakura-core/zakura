@@ -34,6 +34,9 @@ use super::{
 };
 use crate::zakura::ZakuraConnId;
 
+#[cfg(test)]
+mod tests;
+
 // ---- peer summaries ----
 
 /// Per-peer facts keyed by peer identity. Each entry belongs to one routine

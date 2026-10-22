@@ -88,23 +88,7 @@ fn admit_page(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId, page: &Headers) 
                 .expect("the test page is conformant");
         }
     }
-    let count = u32::try_from(page.entries.len()).expect("a page fits u32");
-    let last = page.entries.last().expect("a page has a header");
-    v9::Admitted {
-        id: page.subscription_id,
-        parent: zakura_header_chain::Frontier::new(
-            page.common_ancestor_height,
-            page.common_ancestor_hash,
-        ),
-        cursor: v9::Cursor {
-            height: block::Height(page.common_ancestor_height.0 + count),
-            hash: last.header.hash(),
-            headers: u64::from(count),
-            bytes: 0,
-        },
-        reaches_target: page.reaches_initial_target,
-        after_close: false,
-    }
+    v9::Admitted::seeded(page)
 }
 
 impl HeaderSyncReactor {
@@ -126,18 +110,14 @@ impl HeaderSyncReactor {
                     .expect("the test outcome is conformant")
             })
         });
-        let ended = live.unwrap_or(v9::Ended {
-            id: outcome.subscription_id,
-            outcome: outcome.outcome,
-            pages: 0,
-            reached: false,
-            accepted: v9::Cursor {
-                height: block::Height(0),
-                hash: block::Hash([0; 32]),
-                headers: 0,
-                bytes: 0,
-            },
-        });
+        let start = v9::Cursor {
+            height: block::Height(0),
+            hash: block::Hash([0; 32]),
+            headers: 0,
+            bytes: 0,
+        };
+        let ended = live
+            .unwrap_or_else(|| v9::Ended::seeded(outcome.subscription_id, outcome.outcome, start));
         self.handle_outcome(peer, session_id, ended);
     }
 }

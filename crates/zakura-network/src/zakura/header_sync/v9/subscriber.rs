@@ -196,6 +196,12 @@ impl SubscriberFault {
     }
 }
 
+/// Proof that the subscriber built the value that holds it. Only this module
+/// and its children can name it, so only the admission owner constructs an
+/// [`Admitted`] page or an [`Ended`] subscription.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct Seal;
+
 /// An admitted page, for the reactor to validate.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Admitted {
@@ -210,6 +216,7 @@ pub struct Admitted {
     pub(crate) reaches_target: bool,
     /// Whether this node sent `Close` before the page arrived.
     pub(crate) after_close: bool,
+    seal: Seal,
 }
 
 /// An ended subscription, for the reactor to reschedule.
@@ -226,6 +233,7 @@ pub struct Ended {
     /// The last cursor the reactor accepted, or the start. Pages admitted
     /// after it and not yet accepted are not included.
     pub(crate) accepted: Cursor,
+    seal: Seal,
 }
 
 /// One session's subscriber: the subscription this node holds on one peer.

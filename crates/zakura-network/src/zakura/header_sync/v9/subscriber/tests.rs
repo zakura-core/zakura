@@ -28,6 +28,45 @@ use crate::zakura::{
 };
 use tokio_util::sync::CancellationToken;
 
+impl Admitted {
+    /// `page` as admitted, for a reactor test that seeds work without a
+    /// session subscriber. Production admits pages only through
+    /// [`Subscriber::receive_page`].
+    pub(crate) fn seeded(page: &Headers) -> Self {
+        let count = u32::try_from(page.entries.len()).expect("a page fits u32");
+        let last = page.entries.last().expect("a page has a header");
+        Self {
+            id: page.subscription_id,
+            parent: Frontier::new(page.common_ancestor_height, page.common_ancestor_hash),
+            cursor: Cursor {
+                height: block::Height(page.common_ancestor_height.0 + count),
+                hash: last.header.hash(),
+                headers: u64::from(count),
+                bytes: 0,
+            },
+            reaches_target: page.reaches_initial_target,
+            after_close: false,
+            seal: Seal,
+        }
+    }
+}
+
+impl Ended {
+    /// Subscription `id` as ended by `outcome` with no pages, for a reactor
+    /// test that seeds work without a session subscriber. Production ends
+    /// subscriptions only through [`Subscriber::receive_outcome`].
+    pub(crate) fn seeded(id: u64, outcome: HeadersOutcomeCode, accepted: Cursor) -> Self {
+        Self {
+            id,
+            outcome,
+            pages: 0,
+            reached: false,
+            accepted,
+            seal: Seal,
+        }
+    }
+}
+
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
 

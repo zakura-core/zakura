@@ -16,7 +16,7 @@ use super::{
         publisher::is_legal, smallest_page, Cursor, Headers, HeadersOutcome, Operation, Status,
         SubscribeHeaders, MAX_HS_PUSH_CREDIT_BYTES, MAX_HS_PUSH_CREDIT_HEADERS, MAX_LOCATOR_HASHES,
     },
-    Admitted, Ended, SubscribeError, SubscriberFault,
+    Admitted, Ended, Seal, SubscribeError, SubscriberFault,
 };
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
@@ -370,6 +370,7 @@ impl SubscriberState {
             cursor,
             reaches_target: page.reaches_initial_target,
             after_close: live.close_sent,
+            seal: Seal,
         })
     }
 
@@ -404,6 +405,7 @@ impl SubscriberState {
             pages: live.pages,
             reached: live.reached,
             accepted: live.accepted,
+            seal: Seal,
         })
     }
 

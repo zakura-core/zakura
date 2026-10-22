@@ -447,6 +447,50 @@ impl ReactorState {
     }
 
     /// The earliest deadline this state waits for, if any.
+    /// Arm `peer`'s request deadline `timeout` after `now`.
+    pub(super) fn arm_request_deadline(
+        &mut self,
+        peer: ZakuraPeerId,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        self.request_deadlines.insert(peer, now + timeout);
+    }
+
+    pub(super) fn clear_request_deadline(&mut self, peer: &ZakuraPeerId) {
+        self.request_deadlines.remove(peer);
+    }
+
+    /// Forget the `Close` this node sent to `peer`'s `session_id` once that session's
+    /// subscription ends.
+    pub(super) fn settle_close(&mut self, peer: &ZakuraPeerId, session_id: u64) {
+        if self
+            .close_deadlines
+            .get(peer)
+            .is_some_and(|(closing, _)| *closing == session_id)
+        {
+            self.close_deadlines.remove(peer);
+        }
+    }
+
+    /// Charge one unproductive request to `peer`'s current session.
+    ///
+    /// Returns whether the session reached `limit`. A zero `limit` never drops a session.
+    pub(super) fn charge_unproductive_request(&mut self, peer: &ZakuraPeerId, limit: u32) -> bool {
+        let schedule = self
+            .peers
+            .get_mut(peer)
+            .expect("sessions and schedules share their keys");
+        schedule.unproductive_requests = schedule.unproductive_requests.saturating_add(1);
+        limit != 0 && schedule.unproductive_requests >= limit
+    }
+
+    pub(super) fn reset_unproductive_requests(&mut self, peer: &ZakuraPeerId) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.unproductive_requests = 0;
+        }
+    }
+
     /// Move the supplier whose session `source` names to the back of the repair supplier order.
     pub(super) fn rotate_supplier(&mut self, source: zakura_header_chain::SourceId) {
         let Some(index) = self
@@ -595,6 +639,21 @@ impl ReactorState {
             stalled_for,
             best_peer_tip,
         })
+    }
+
+    /// Mark `owner`'s repair applied, rotate its supplier, and end its stall record.
+    pub(super) fn complete_repair(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+    ) {
+        let _ = self
+            .vct_repair
+            .get_mut(owner)
+            .expect("the admitted repair remains owned by its active request")
+            .complete();
+        self.rotate_supplier(source);
+        self.vct_repair_stall = None;
     }
 
     /// Whether `desired` is the repair the reactor already runs.

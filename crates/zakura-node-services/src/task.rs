@@ -12,8 +12,8 @@
 
 use std::{future::Future, pin::Pin};
 
-use tokio::task::JoinHandle;
 use tower::{buffer::Buffer, Service};
+use zakura_rt::task::JoinHandle;
 
 use crate::BoxError;
 
@@ -28,12 +28,14 @@ pub fn erased<T>(future: impl Future<Output = T> + Send + 'static) -> ErasedFutu
 
 /// Spawn `future` on the current runtime as an [`ErasedFuture`].
 ///
-/// Behaves like [`tokio::spawn`], including panics when called outside a runtime.
+/// Behaves like [`zakura_rt::task::spawn`], which is [`tokio::spawn`] in
+/// production, including panics when called outside a runtime. In the
+/// simulator build the task runs on the simulator's scheduler inside a run.
 #[track_caller]
 pub fn spawn_erased<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> JoinHandle<T> {
-    tokio::spawn(erased(future))
+    zakura_rt::task::spawn(erased(future))
 }
 
 /// Wrap `service` in a [`Buffer`], spawning its worker as an [`ErasedFuture`].

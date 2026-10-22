@@ -34,6 +34,55 @@ fn executor_is_installed_only_during_a_run() {
 }
 
 #[test]
+fn each_run_gets_a_new_id() {
+    let (first, _) = run(async { sim::run_id().unwrap() });
+    let (second, _) = run(async { sim::run_id().unwrap() });
+    assert_ne!(first, second);
+    assert!(sim::run_id().is_none());
+}
+
+#[test]
+fn stale_abort_handle_leaves_a_later_runs_task_alone() {
+    // Executors reuse task ids, so both runs' first spawn gets the same id.
+    let (stale, _) = run(async { task::spawn(async {}).abort_handle() });
+    let (value, _) = run(async move {
+        let handle = task::spawn(async { 7 });
+        stale.abort();
+        assert!(stale.is_finished());
+        handle.await.unwrap()
+    });
+    assert_eq!(value, 7);
+}
+
+#[test]
+fn stale_sleep_leaves_a_later_runs_timer_alone() {
+    // Both runs' first timer gets the same deadline and sequence number. The
+    // runs hand the futures out in a `Some` so clippy doesn't take them for a
+    // missing `.await`.
+    let (stale, _) = run(async {
+        let mut sleep = time::sleep(Duration::from_millis(10));
+        assert!(poll_once(&mut sleep).await.is_pending());
+        Some(sleep)
+    });
+    let ((), _) = run(async move {
+        let mut sleep = time::sleep(Duration::from_millis(10));
+        assert!(poll_once(&mut sleep).await.is_pending());
+        drop(stale);
+        sleep.await;
+    });
+}
+
+#[test]
+#[should_panic(expected = "only polled inside the run that spawned it")]
+fn stale_join_handle_panics_instead_of_joining_a_later_runs_task() {
+    let (stale, _) = run(async { Some(task::spawn(async { 1 })) });
+    run(async move {
+        let _later = task::spawn(async { 2 });
+        stale.unwrap().await.unwrap()
+    });
+}
+
+#[test]
 #[should_panic(expected = "already active")]
 fn runs_do_not_nest() {
     run(async {
@@ -239,13 +288,33 @@ fn interval_ticks_on_the_virtual_period() {
 }
 
 #[test]
-fn yield_now_is_one_point_and_never_pending() {
-    let (polled, report) = run(async {
+fn yield_now_is_pending_once_and_wakes_itself() {
+    let (polls, report) = run(async {
         let mut yielded = pin!(task::yield_now());
-        poll_fn(|cx| Poll::Ready(yielded.as_mut().poll(cx))).await
+        let mut polls = Vec::new();
+        poll_fn(|cx| {
+            let poll = yielded.as_mut().poll(cx);
+            polls.push(poll.is_ready());
+            poll
+        })
+        .await;
+        polls
     });
-    assert!(polled.is_ready());
-    assert_eq!(report.count(Op::Yield), 1);
+    // The second poll only happens because the first one woke the task.
+    assert_eq!(polls, [false, true]);
+    assert_eq!(report.count(Op::Yield), 0);
+}
+
+#[test]
+fn yield_now_loses_a_biased_select_to_a_ready_branch() {
+    let (winner, _) = run(async {
+        zakura_rt::select! {
+            biased;
+            () = task::yield_now() => "yield",
+            () = std::future::ready(()) => "ready",
+        }
+    });
+    assert_eq!(winner, "ready");
 }
 
 #[test]

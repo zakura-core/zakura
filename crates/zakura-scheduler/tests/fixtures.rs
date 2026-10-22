@@ -266,7 +266,7 @@ fn external_wait_is_not_deadlock() {
 }
 
 #[test]
-fn panic_is_isolated_and_stuck_task_is_unwound() {
+fn panic_is_isolated_and_stuck_task_is_cancelled() {
     for seed in 0..200 {
         let drops = shared(Cell::new(0));
         let survivor_done = shared(Cell::new(false));
@@ -303,9 +303,151 @@ fn panic_is_isolated_and_stuck_task_is_unwound() {
         assert_eq!(r.panics, vec!["planted panic".to_string()], "seed {seed}");
         assert!(survivor_done.get(), "seed {seed}");
         assert_eq!(r.status, Status::WaitingOnExternal, "seed {seed}");
-        assert_eq!(r.report.unwound, 1, "seed {seed}");
+        assert_eq!(r.report.cancelled, 1, "seed {seed}");
+        assert_eq!(r.report.unwound, 0, "seed {seed}");
         assert_eq!(drops.get(), 1, "seed {seed}");
     }
+}
+
+/// Records whether the thread was unwinding when it was dropped.
+struct RecordUnwinding(Rc<Cell<Option<bool>>>);
+
+impl Drop for RecordUnwinding {
+    fn drop(&mut self) {
+        self.0.set(Some(std::thread::panicking()));
+    }
+}
+
+/// A preemption point with no shared state behind it.
+#[track_caller]
+fn point() {
+    hooks::preempt(zakura_scheduler::Point::here(zakura_scheduler::Op::Yield));
+}
+
+#[test]
+fn shutdown_drops_idle_tasks_outside_an_unwind() {
+    let saw = shared(Cell::new(None));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = RecordUnwinding(saw.clone());
+    let idle = s.spawn_root("idle", async move {
+        let _guard = guard;
+        std::future::pending::<()>().await
+    });
+    assert_eq!(s.run(idle.task()), zakura_scheduler::RunOutcome::Waiting);
+    let report = s.shutdown();
+    assert_eq!(saw.get(), Some(false));
+    assert_eq!((report.cancelled, report.unwound), (1, 0));
+}
+
+#[test]
+fn shutdown_drop_can_take_a_contended_lock() {
+    use zakura_scheduler::RunOutcome::{Reached, Waiting};
+    // `holder` keeps the lock across an await, or stops mid-poll holding it.
+    // `dropper`'s destructor needs the same lock. A forced unwind used to run
+    // that destructor while panicking, so `park` refused and the process
+    // aborted.
+    for mid_poll in [false, true] {
+        struct LockOnDrop {
+            mutex: Rc<Mutex<()>>,
+            _record: RecordUnwinding,
+        }
+        impl Drop for LockOnDrop {
+            fn drop(&mut self) {
+                let _g = self.mutex.lock();
+            }
+        }
+        let saw = shared(Cell::new(None));
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let m = shared(Mutex::new(()));
+        let guard = LockOnDrop {
+            mutex: m.clone(),
+            _record: RecordUnwinding(saw.clone()),
+        };
+        let dropper = s.spawn_root("dropper", async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        });
+        let holder = s.spawn_root("holder", async move {
+            let g = m.lock();
+            if mid_poll {
+                point();
+                drop(g);
+            }
+            std::future::pending::<()>().await
+        });
+        assert_eq!(s.run(dropper.task()), Waiting);
+        assert!(matches!(s.run(holder.task()), Reached(_))); // before lock
+        if mid_poll {
+            assert!(matches!(s.run(holder.task()), Reached(_))); // holding it
+        } else {
+            assert_eq!(s.run(holder.task()), Waiting); // holding it
+        }
+        let report = s.shutdown();
+        assert_eq!(saw.get(), Some(false), "mid_poll {mid_poll}");
+        assert_eq!(
+            (report.cancelled, report.unwound, report.panicked),
+            (2, 0, 0),
+            "mid_poll {mid_poll}"
+        );
+    }
+}
+
+#[test]
+fn shutdown_finishes_a_release_sequence_in_a_drop() {
+    // Like a three-permit reservation, with a point after each release. A
+    // forced unwind used to stop the destructor after the first one.
+    struct Reservation(Rc<Cell<u32>>);
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            for _ in 0..3 {
+                self.0.set(self.0.get() + 1);
+                point();
+            }
+        }
+    }
+    let released = shared(Cell::new(0));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let reservation = Reservation(released.clone());
+    let task = s.spawn_root("task", async move {
+        drop(reservation);
+        std::future::pending::<()>().await
+    });
+    assert!(matches!(
+        s.run(task.task()),
+        zakura_scheduler::RunOutcome::Reached(_)
+    ));
+    assert_eq!(released.get(), 1);
+    let report = s.shutdown();
+    assert_eq!(released.get(), 3);
+    assert_eq!((report.cancelled, report.unwound), (1, 0));
+}
+
+#[test]
+fn shutdown_force_unwinds_only_a_lock_cycle() {
+    use zakura_scheduler::RunOutcome::Parked;
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let a = shared(Mutex::new(()));
+    let b = shared(Mutex::new(()));
+    let (a2, b2) = (a.clone(), b.clone());
+    let ab = s.spawn_root("ab", async move {
+        let _x = a.lock();
+        point();
+        let _y = b.lock();
+    });
+    let ba = s.spawn_root("ba", async move {
+        let _x = b2.lock();
+        point();
+        let _y = a2.lock();
+    });
+    for task in [ab, ab, ba, ba, ab, ba] {
+        s.run(task.task());
+    }
+    assert!(matches!(s.run(ab.task()), Parked(_)));
+    assert!(matches!(s.run(ba.task()), Parked(_)));
+    assert_eq!(s.status(), Status::Deadlock);
+    // Unwinding `ab` releases `a`, so `ba` finishes on its own.
+    let report = s.shutdown();
+    assert_eq!((report.cancelled, report.unwound), (0, 1));
 }
 
 #[test]

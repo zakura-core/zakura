@@ -40,25 +40,93 @@ fn scheduler_is_the_rt_executor_for_its_run() {
     assert!(sim::executor().is_none());
 }
 
-/// Two tasks read a counter, yield through `zakura-rt`, then write it back.
-fn yield_between_load_and_store(s: &mut Scheduler) -> Check {
-    let counter = shared(Cell::new(0));
-    for label in ["inc_a", "inc_b"] {
-        let counter = counter.clone();
-        s.spawn_root(label, async move {
-            let v = counter.get();
-            task::yield_now().await;
-            counter.set(v + 1);
-        });
+/// An executor for holding `zakura-rt`'s run slot. It's never called.
+struct Unused;
+
+impl sim::Executor for Unused {
+    fn preempt(&self, _: sim::Point) {}
+    fn park(&self, _: sim::ObjectId, _: Option<sim::TaskId>) -> bool {
+        unreachable!()
     }
-    Box::new(move |_| (counter.get() != 2).then(|| format!("counter = {}", counter.get())))
+    fn unpark_all(&self, _: sim::ObjectId) {}
+    fn spawn(&self, _: &'static str, _: sim::BoxTask) -> sim::TaskId {
+        unreachable!()
+    }
+    fn abort(&self, _: sim::TaskId) {}
+    fn is_finished(&self, _: sim::TaskId) -> bool {
+        unreachable!()
+    }
+    fn poll_join(
+        &self,
+        _: sim::TaskId,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<sim::TaskExit> {
+        unreachable!()
+    }
+    fn now(&self) -> Duration {
+        unreachable!()
+    }
+    fn register_timer(&self, _: Duration, _: &std::task::Waker) -> sim::TimerId {
+        unreachable!()
+    }
+    fn cancel_timer(&self, _: sim::TimerId) {}
+    fn new_object(&self) -> sim::ObjectId {
+        unreachable!()
+    }
+    fn current_task(&self) -> Option<sim::TaskId> {
+        None
+    }
+    fn set_external_wait(&self, _: bool) {}
+}
+
+#[test]
+fn failed_rt_enter_leaves_no_scheduler_run_behind() {
+    let other = sim::enter(&Unused);
+    let entered = std::panic::catch_unwind(|| {
+        drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+    });
+    assert!(entered.is_err(), "zakura-rt already had a run");
+    drop(other);
+    // Used to fail with "this thread already has a running Scheduler".
+    drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+}
+
+/// Two tasks read a counter, stop in `zakura-rt`, then write it back. With
+/// `yield_now` they stop with `yield_now`, and otherwise at an expired sleep,
+/// which is one preemption point inside the poll.
+fn gap_between_load_and_store(yield_now: bool) -> impl Fn(&mut Scheduler) -> Check {
+    move |s| {
+        let counter = shared(Cell::new(0));
+        for label in ["inc_a", "inc_b"] {
+            let counter = counter.clone();
+            s.spawn_root(label, async move {
+                let v = counter.get();
+                if yield_now {
+                    task::yield_now().await;
+                } else {
+                    time::sleep(Duration::ZERO).await;
+                }
+                counter.set(v + 1);
+            });
+        }
+        Box::new(move |_| (counter.get() != 2).then(|| format!("counter = {}", counter.get())))
+    }
 }
 
 #[test]
 fn rt_points_preempt_inside_a_poll() {
-    assert!(first_violation(2, FIND, yield_between_load_and_store).is_some());
-    // The yield is mid-poll, so with one worker the other task can't run there.
-    assert_eq!(first_violation(1, FIND, yield_between_load_and_store), None);
+    assert!(first_violation(2, FIND, gap_between_load_and_store(false)).is_some());
+    // The point is mid-poll, so with one worker the other task can't run there.
+    assert_eq!(
+        first_violation(1, FIND, gap_between_load_and_store(false)),
+        None
+    );
+}
+
+#[test]
+fn rt_yield_now_frees_the_worker() {
+    // `yield_now` returns `Pending` once, so even one worker finds the race.
+    assert!(first_violation(1, FIND, gap_between_load_and_store(true)).is_some());
 }
 
 #[test]
@@ -165,8 +233,84 @@ fn rt_spawn_from_setup_code_is_ready_at_once() {
 }
 
 #[test]
+fn sleep_reset_into_the_past_fires_at_the_next_advance() {
+    let (result, violation) = run_fixture(2, 0, |s| {
+        s.spawn_root("root", async {
+            let mut early = std::pin::pin!(time::sleep(Duration::from_secs(10)));
+            assert!(futures_poll_once(early.as_mut()).is_pending());
+            time::sleep(Duration::from_secs(20)).await;
+            // Registers a timer for 5 s while the clock reads 20 s.
+            early
+                .as_mut()
+                .reset(Instant::now() - Duration::from_secs(15));
+            time::sleep(Duration::from_secs(1)).await;
+        });
+        Box::new(|_| None)
+    });
+    assert_eq!(violation, None);
+    assert_eq!(result.status, Status::Quiescent);
+}
+
+/// Polls `future` once with a no-op waker.
+fn futures_poll_once<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+/// Reads the virtual clock when dropped, as a destructor that logs a
+/// timestamp would.
+struct ReadsClockOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReadsClockOnDrop {
+    fn drop(&mut self) {
+        let _ = Instant::now();
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn setup_spawn_dropped_at_shutdown_reads_the_clock() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = ReadsClockOnDrop(dropped.clone());
+    // Spawned from setup code, and never run before shutdown.
+    drop(task::spawn(async move {
+        let _guard = guard;
+        pending::<()>().await
+    }));
+    let report = sched.shutdown();
+    assert!(dropped.load(Ordering::Relaxed));
+    assert_eq!(report.cancelled, 1);
+}
+
+#[test]
+fn unjoined_panic_payload_dropped_at_shutdown_reads_the_clock() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut sched = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = ReadsClockOnDrop(dropped.clone());
+    let task = task::spawn(async move { std::panic::panic_any(guard) });
+    let ready = sched.ready()[0].task;
+    assert!(matches!(
+        sched.run(ready),
+        zakura_scheduler::RunOutcome::Panicked(_)
+    ));
+    assert!(
+        !dropped.load(Ordering::Relaxed),
+        "nobody joined the payload"
+    );
+    drop(task);
+    sched.shutdown();
+    assert!(dropped.load(Ordering::Relaxed));
+}
+
+#[test]
 fn same_seed_replays_rt_programs() {
-    let picks = |seed| run_fixture(2, seed, yield_between_load_and_store).0.picks;
+    let picks = |seed| {
+        run_fixture(2, seed, gap_between_load_and_store(true))
+            .0
+            .picks
+    };
     for seed in 0..50 {
         assert_eq!(picks(seed), picks(seed), "seed {seed}");
     }

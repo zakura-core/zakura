@@ -22,7 +22,7 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 | Workflow | What it does | Triggers |
 | --- | --- | --- |
 | `lint.yml` | Clippy, rustfmt, `cargo deny`, feature checks. A nightly scheduled run adds the expensive non-gating lints (unused deps, docs build). | PR/push on lint-relevant paths; merge queue; nightly; manual |
-| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. Also runs `scripts/check-crate-publish-graph.sh` so a skipped dependent whose crates.io index manifest still pins an old major cannot merge. | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; nightly; manual |
+| `tests-unit.yml` | Unit-test suite via `cargo nextest` on an OS matrix. Nightly run covers release mode. Also runs `scripts/check-crate-publish-graph.sh` so a skipped dependent whose crates.io index manifest still pins an old major cannot merge, and lints and tests `zakura-rt` and `zakura-scheduler` under `--cfg zakura_sim`. | Every PR (self-gated by a `changes` job); push on Rust-relevant paths; merge queue; nightly; manual |
 | `test-crates.yml` | Builds each workspace crate standalone under its feature combinations. | PR/push on crate-relevant paths; merge queue; manual |
 | `semver-checks.yml` | Runs semver checks for affected publishable crates. | PR/push on semver-relevant paths; merge queue; manual |
 | `test-docker.yml` | Builds the production runtime image once, then smoke-tests its packaged binaries, privilege drop, default startup, and combined config overrides. | PR/push on Cargo, Docker, `zakurad`, or runtime-config paths; weekly; manual |

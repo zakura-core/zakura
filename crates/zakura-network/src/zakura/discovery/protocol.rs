@@ -1471,7 +1471,11 @@ impl ZakuraDiscoveryHandle {
         let (self_record_tx, self_record_rx) = watch::channel(self_record);
         let (peer_snapshot_tx, peer_snapshot_rx) =
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
-        let book = ZakuraDiscoveryBook::with_local_node_id(config.book_limits, local.node_id);
+        let book = ZakuraDiscoveryBook::with_disclosure_key(
+            config.book_limits,
+            Some(local.node_id),
+            RandomState::new(),
+        );
         let import_validation = DiscoveryImportValidation {
             expected_network_id: local.network_id,
             expected_chain_id: local.chain_id,
@@ -1995,9 +1999,14 @@ impl ZakuraDiscoveryHandle {
         let now = current_unix_secs();
         let mut inner = self.inner.lock().await;
         let limit = limit.min(inner.config.peer_sample_limit);
-        inner
-            .book
-            .sample_peers(limit, wanted_services, exclude_node_ids, now, requester)
+        inner.book.sample_peers(
+            limit,
+            wanted_services,
+            exclude_node_ids,
+            now,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        )
     }
 
     /// Returns owned dial candidates, excluding peers currently registered with the supervisor.
@@ -2334,25 +2343,33 @@ impl Default for ZakuraDiscoveryBook {
 }
 
 impl ZakuraDiscoveryBook {
-    /// Creates an empty discovery book with `limits`.
+    /// Creates an empty discovery book with `limits` and a fresh random disclosure key.
     pub fn new(limits: ZakuraDiscoveryBookLimits) -> Self {
-        Self {
-            entries: HashMap::new(),
-            static_candidates: HashMap::new(),
-            limits,
-            local_node_id: None,
-            disclosure_key: RandomState::new(),
-            sample_snapshot: None,
-            generation: 0,
-            relayed: HashMap::new(),
-        }
+        Self::with_disclosure_key(limits, None, RandomState::new())
     }
 
     /// Creates an empty discovery book that rejects the local node's record.
     pub fn with_local_node_id(limits: ZakuraDiscoveryBookLimits, local_node_id: NodeId) -> Self {
+        Self::with_disclosure_key(limits, Some(local_node_id), RandomState::new())
+    }
+
+    /// Creates an empty discovery book that places sample windows with `disclosure_key`.
+    ///
+    /// The book rejects `local_node_id`'s record when one is given.
+    pub(super) fn with_disclosure_key(
+        limits: ZakuraDiscoveryBookLimits,
+        local_node_id: Option<NodeId>,
+        disclosure_key: RandomState,
+    ) -> Self {
         Self {
-            local_node_id: Some(local_node_id),
-            ..Self::new(limits)
+            entries: HashMap::new(),
+            static_candidates: HashMap::new(),
+            limits,
+            local_node_id,
+            disclosure_key,
+            sample_snapshot: None,
+            generation: 0,
+            relayed: HashMap::new(),
         }
     }
 
@@ -2501,14 +2518,16 @@ impl ZakuraDiscoveryBook {
     /// its first peers without waiting for the next epoch. The snapshot never drops an id
     /// within an epoch, so book churn cannot widen what a requester learns.
     ///
-    /// `exclude_node_ids` must be in ascending byte order.
-    pub fn sample_peers(
+    /// `exclude_node_ids` must be in ascending byte order. `rng` shuffles a new
+    /// snapshot and the returned sample.
+    pub fn sample_peers<R: rand_10::Rng + ?Sized>(
         &mut self,
         limit: usize,
         wanted_services: &[ZakuraServiceId],
         exclude_node_ids: &[[u8; 32]],
         now: u64,
         requester: NodeId,
+        rng: &mut R,
     ) -> Vec<ZakuraNodeRecord> {
         debug_assert!(
             exclude_node_ids.is_sorted(),
@@ -2516,7 +2535,7 @@ impl ZakuraDiscoveryBook {
         );
         let window = self.sample_window();
         let limit = limit.min(window);
-        self.refresh_sample_snapshot(now);
+        self.refresh_sample_snapshot(now, rng);
         let snapshot = self
             .sample_snapshot
             .as_ref()
@@ -2544,7 +2563,7 @@ impl ZakuraDiscoveryBook {
             .map(|entry| entry.record.clone())
             .collect();
         // The order would reveal each record's place in the snapshot.
-        records.shuffle(&mut zakura_rt::rand::rng());
+        records.shuffle(rng);
         records
     }
 
@@ -2569,14 +2588,14 @@ impl ZakuraDiscoveryBook {
     /// candidates to a snapshot shorter than one window.
     ///
     /// See [`Self::sample_peers`] for why.
-    fn refresh_sample_snapshot(&mut self, now: u64) {
+    fn refresh_sample_snapshot<R: rand_10::Rng + ?Sized>(&mut self, now: u64, rng: &mut R) {
         let epoch = now / DISCOVERY_DISCLOSURE_EPOCH.as_secs();
         let window = self.sample_window();
         let snapshot = match self.sample_snapshot.take() {
             Some(mut snapshot) if snapshot.epoch == epoch => {
                 let room = window.saturating_sub(snapshot.node_ids.len());
                 if room > 0 && snapshot.generation != self.generation {
-                    let added = self.sample_candidates(now, &snapshot.node_ids);
+                    let added = self.sample_candidates(now, &snapshot.node_ids, rng);
                     snapshot.node_ids.extend(added.into_iter().take(room));
                     snapshot.generation = self.generation;
                 }
@@ -2584,7 +2603,7 @@ impl ZakuraDiscoveryBook {
             }
             _ => SampleSnapshot {
                 epoch,
-                node_ids: self.sample_candidates(now, &[]),
+                node_ids: self.sample_candidates(now, &[], rng),
                 generation: self.generation,
             },
         };
@@ -2592,7 +2611,12 @@ impl ZakuraDiscoveryBook {
     }
 
     /// The sample-eligible ids not in `known`, in random order.
-    fn sample_candidates(&self, now: u64, known: &[NodeId]) -> Vec<NodeId> {
+    fn sample_candidates<R: rand_10::Rng + ?Sized>(
+        &self,
+        now: u64,
+        known: &[NodeId],
+        rng: &mut R,
+    ) -> Vec<NodeId> {
         let mut node_ids: Vec<NodeId> = self
             .entries
             .iter()
@@ -2601,7 +2625,7 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
-        node_ids.shuffle(&mut zakura_rt::rand::rng());
+        node_ids.shuffle(rng);
         node_ids
     }
 
@@ -5532,6 +5556,7 @@ mod tests {
             &[],
             NOW,
             test_requester(),
+            &mut zakura_rt::rand::rng(),
         );
         assert_eq!(sample.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         let encoded = DiscoveryMessage::Peers { records: sample }
@@ -5867,8 +5892,15 @@ mod tests {
         // Dialability is a local hint only: until the record owner confirms first-party or a
         // local dial succeeds, the record must not be re-gossiped through peer samples.
         assert!(
-            book.sample_peers(10, &[], &[], NOW, test_requester())
-                .is_empty(),
+            book.sample_peers(
+                10,
+                &[],
+                &[],
+                NOW,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            )
+            .is_empty(),
             "unconfirmed third-party gossip must stay out of peer samples"
         );
 
@@ -5880,7 +5912,14 @@ mod tests {
             ImportOutcome::MetadataUpdated
         );
         assert_eq!(
-            book.sample_peers(10, &[], &[], NOW + 1, test_requester()),
+            book.sample_peers(
+                10,
+                &[],
+                &[],
+                NOW + 1,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            ),
             vec![public_target.clone()],
             "first-party confirmation makes the record sample-eligible"
         );
@@ -5978,7 +6017,14 @@ mod tests {
             .expect("additional address for the same static identity imports");
 
         assert!(book
-            .sample_peers(10, &[], &[], NOW, test_requester())
+            .sample_peers(
+                10,
+                &[],
+                &[],
+                NOW,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            )
             .is_empty());
         let mut rng = StdRng::seed_from_u64(7);
         assert_eq!(
@@ -6197,7 +6243,7 @@ mod tests {
         book.import_record(confirmed.clone(), Some(author), NOW - 1, &context())
             .expect("a first-party record imports");
         assert_eq!(
-            book.sample_peers(32, &[], &[], NOW, requester),
+            book.sample_peers(32, &[], &[], NOW, requester, &mut zakura_rt::rand::rng()),
             vec![confirmed.clone()]
         );
 
@@ -6217,7 +6263,7 @@ mod tests {
         }
         assert_eq!(book.discovered_len(), 2);
         assert_eq!(
-            book.sample_peers(32, &[], &[], NOW, requester),
+            book.sample_peers(32, &[], &[], NOW, requester, &mut zakura_rt::rand::rng()),
             vec![confirmed.clone()]
         );
 
@@ -6252,7 +6298,9 @@ mod tests {
             later / DISCOVERY_DISCLOSURE_EPOCH.as_secs(),
             NOW / DISCOVERY_DISCLOSURE_EPOCH.as_secs()
         );
-        assert!(book.sample_peers(32, &[], &[], later, requester).is_empty());
+        assert!(book
+            .sample_peers(32, &[], &[], later, requester, &mut zakura_rt::rand::rng())
+            .is_empty());
 
         let mut renewed = body(&secret);
         renewed.sequence = 2;
@@ -6264,7 +6312,7 @@ mod tests {
             ImportOutcome::Updated
         );
         assert_eq!(
-            book.sample_peers(32, &[], &[], later, requester),
+            book.sample_peers(32, &[], &[], later, requester, &mut zakura_rt::rand::rng()),
             vec![renewed]
         );
     }
@@ -6285,7 +6333,14 @@ mod tests {
         let windows: HashSet<Vec<NodeId>> = (0..8)
             .map(|_| {
                 let mut window: Vec<NodeId> = book
-                    .sample_peers(32, &[], &[], NOW, test_requester())
+                    .sample_peers(
+                        32,
+                        &[],
+                        &[],
+                        NOW,
+                        test_requester(),
+                        &mut zakura_rt::rand::rng(),
+                    )
                     .into_iter()
                     .map(|record| record.body.node_id)
                     .collect();
@@ -6312,7 +6367,14 @@ mod tests {
             )
             .unwrap();
         }
-        let first = book.sample_peers(MAX_DISCOVERY_RECORDS_PER_RESPONSE, &[], &[], NOW, requester);
+        let first = book.sample_peers(
+            MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+            &[],
+            &[],
+            NOW,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        );
         assert_eq!(first.len(), MAX_DISCOVERY_RECORDS_PER_RESPONSE);
         let mut exclude: Vec<[u8; 32]> = first
             .iter()
@@ -6326,6 +6388,7 @@ mod tests {
                 &exclude,
                 NOW,
                 requester,
+                &mut zakura_rt::rand::rng()
             )
             .is_empty());
     }
@@ -6351,6 +6414,7 @@ mod tests {
             &[*excluded.as_bytes()],
             NOW,
             test_requester(),
+            &mut zakura_rt::rand::rng(),
         );
         let sample_ids: HashSet<_> = sample.iter().map(|record| record.body.node_id).collect();
 
@@ -6367,7 +6431,14 @@ mod tests {
         let record = signed_record_with(1, service(1), test_addr(1));
         import_confirmed_record(&mut book, record).unwrap();
 
-        let sample = book.sample_peers(10, &[], &[], NOW + 61, test_requester());
+        let sample = book.sample_peers(
+            10,
+            &[],
+            &[],
+            NOW + 61,
+            test_requester(),
+            &mut zakura_rt::rand::rng(),
+        );
 
         assert!(sample.is_empty());
     }
@@ -7862,8 +7933,15 @@ mod tests {
         .expect("third-party gossip record imports");
 
         assert!(
-            book.sample_peers(10, &[], &[], NOW, test_requester())
-                .is_empty(),
+            book.sample_peers(
+                10,
+                &[],
+                &[],
+                NOW,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            )
+            .is_empty(),
             "unconfirmed third-party record must not be re-gossiped"
         );
 
@@ -7876,7 +7954,14 @@ mod tests {
         )
         .expect("repeated third-party gossip imports");
         assert!(book
-            .sample_peers(10, &[], &[], NOW, test_requester())
+            .sample_peers(
+                10,
+                &[],
+                &[],
+                NOW,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            )
             .is_empty());
         assert!(book
             .get(&gossiped_id)
@@ -7887,7 +7972,14 @@ mod tests {
         // A successful local dial is an explicit trust transition that makes it shareable.
         book.mark_dial_success(&gossiped_id, NOW + 1);
         assert_eq!(
-            book.sample_peers(10, &[], &[], NOW + 1, test_requester()),
+            book.sample_peers(
+                10,
+                &[],
+                &[],
+                NOW + 1,
+                test_requester(),
+                &mut zakura_rt::rand::rng()
+            ),
             vec![gossiped],
             "locally dialed record becomes sample-eligible"
         );
@@ -7918,12 +8010,26 @@ mod tests {
         let node_ids = |records: Vec<ZakuraNodeRecord>| -> HashSet<NodeId> {
             records.iter().map(|record| record.body.node_id).collect()
         };
-        let first = book.sample_peers(DISCLOSURE_LIMIT, &[], &[], NOW, requester);
+        let first = book.sample_peers(
+            DISCLOSURE_LIMIT,
+            &[],
+            &[],
+            NOW,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        );
         assert_eq!(first.len(), DISCLOSURE_LIMIT);
         let disclosure_set = node_ids(first);
         assert_eq!(
             disclosure_set,
-            node_ids(book.sample_peers(DISCLOSURE_LIMIT, &[], &[], NOW, requester))
+            node_ids(book.sample_peers(
+                DISCLOSURE_LIMIT,
+                &[],
+                &[],
+                NOW,
+                requester,
+                &mut zakura_rt::rand::rng()
+            ))
         );
 
         // Exclude everything already returned and query each record's unique service id.
@@ -7931,13 +8037,25 @@ mod tests {
         let mut seen = disclosure_set.clone();
         let mut excluded: Vec<_> = seen.iter().map(|id| *id.as_bytes()).collect();
         excluded.sort_unstable();
-        for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &excluded, NOW, requester) {
+        for record in book.sample_peers(
+            DISCLOSURE_LIMIT,
+            &[],
+            &excluded,
+            NOW,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        ) {
             seen.insert(record.body.node_id);
         }
         for index in 0..BOOK_SIZE {
-            for record in
-                book.sample_peers(DISCLOSURE_LIMIT, &[service(index)], &[], NOW, requester)
-            {
+            for record in book.sample_peers(
+                DISCLOSURE_LIMIT,
+                &[service(index)],
+                &[],
+                NOW,
+                requester,
+                &mut zakura_rt::rand::rng(),
+            ) {
                 seen.insert(record.body.node_id);
             }
         }
@@ -7953,7 +8071,14 @@ mod tests {
         let mut now = NOW;
         for _ in 0..48 {
             now = next_epoch(now);
-            for record in book.sample_peers(DISCLOSURE_LIMIT, &[], &[], now, requester) {
+            for record in book.sample_peers(
+                DISCLOSURE_LIMIT,
+                &[],
+                &[],
+                now,
+                requester,
+                &mut zakura_rt::rand::rng(),
+            ) {
                 across_epochs.insert(record.body.node_id);
             }
         }
@@ -7966,10 +8091,17 @@ mod tests {
     /// Samples for one fixed requester, so every call reads the same window.
     fn sampled_node_ids(book: &mut ZakuraDiscoveryBook, now: u64) -> HashSet<NodeId> {
         let requester = NodeSecretKey::from_bytes(&[7; 32]).public();
-        book.sample_peers(usize::MAX, &[], &[], now, requester)
-            .iter()
-            .map(|record| record.body.node_id)
-            .collect()
+        book.sample_peers(
+            usize::MAX,
+            &[],
+            &[],
+            now,
+            requester,
+            &mut zakura_rt::rand::rng(),
+        )
+        .iter()
+        .map(|record| record.body.node_id)
+        .collect()
     }
 
     /// While one window covers the whole snapshot, a newly confirmed entry

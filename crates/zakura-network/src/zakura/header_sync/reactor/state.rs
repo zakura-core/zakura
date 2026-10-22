@@ -123,6 +123,13 @@ impl ReactorState {
         }
     }
 
+    /// Forget `key`'s read, which IO refused for lack of locator capacity, and
+    /// keep the peer's offer for a later pass.
+    pub(super) fn refuse_locator(&mut self, key: &LocatorKey) {
+        let _ = self.locators.remove_exact(key);
+        self.retain_offer(&key.peer);
+    }
+
     /// Keep `peer`'s offer for a later pass, because a local blocker deferred its work.
     pub(super) fn retain_offer(&mut self, peer: &ZakuraPeerId) {
         self.bump_scheduling_revision();
@@ -202,6 +209,12 @@ pub(super) struct LocatorQueries {
 }
 
 impl LocatorQueries {
+    /// Whether a read for `peer` is pending.
+    #[cfg(test)]
+    pub(super) fn contains(&self, peer: &ZakuraPeerId) -> bool {
+        self.pending.contains_key(peer)
+    }
+
     /// The number of pending reads.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {

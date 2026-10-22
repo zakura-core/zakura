@@ -5,6 +5,7 @@ mod completion;
 mod eviction;
 mod peer_faults;
 mod port_panics;
+mod state_machine;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;

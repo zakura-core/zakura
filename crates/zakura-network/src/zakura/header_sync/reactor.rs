@@ -4262,9 +4262,9 @@ impl HeaderSyncReactor {
                     return StorageDispatch::Joined;
                 };
                 let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
-                    let _ = self.state.locators.remove_exact(&key);
+                    self.state.refuse_locator(&key);
                     self.locator_capacity_waiting = true;
-                    self.defer_ordinary_target(peer);
+                    self.peer_work_queue.remove_unstarted(peer);
                     return StorageDispatch::Deferred;
                 };
                 (Some(key), Some(port::LocatorReadPermit::new(permit)))

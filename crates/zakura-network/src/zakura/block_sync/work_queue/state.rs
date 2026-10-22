@@ -22,6 +22,9 @@ use super::{
     WorkItem, WorkReturnOutcome, DEFAULT_BS_SIZE_FLOOR_BYTES,
 };
 
+#[cfg(test)]
+mod tests;
+
 /// Wakeups that a logical work transition requires.
 #[must_use]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]

@@ -95,18 +95,14 @@ mod sink;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::{
-    future::Future,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, Mutex, PoisonError,
-    },
-};
+use std::{future::Future, sync::Arc};
 
 use futures::future::Either;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
-use tokio_util::sync::CancellationToken;
+use zakura_rt::sync::{
+    atomic::{AtomicU32, Ordering},
+    mpsc, watch, CancellationToken, Mutex, PoisonError,
+};
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use completion::{Completion, CompletionId, Completions};
@@ -556,7 +552,7 @@ impl Output {
 impl<P: Produce> Dispatch<P> {
     async fn run(self, mut queued: mpsc::UnboundedReceiver<Job<P::Request>>) {
         loop {
-            let job = tokio::select! {
+            let job = zakura_rt::select! {
                 biased;
                 () = self.cancel.cancelled() => return,
                 job = queued.recv() => match job {
@@ -637,12 +633,12 @@ impl<P: Produce> Dispatch<P> {
     }
 
     async fn wait<T>(&self, bound: &'static str, acquire: impl Future<Output = T>) -> Option<T> {
-        tokio::pin!(acquire);
+        zakura_rt::pin!(acquire);
         if let Some(ready) = futures::FutureExt::now_or_never(&mut acquire) {
             return Some(ready);
         }
         self.capacity.metrics.delayed(bound);
-        tokio::select! {
+        zakura_rt::select! {
             biased;
             () = self.cancel.cancelled() => None,
             acquired = acquire => Some(acquired),
@@ -666,8 +662,8 @@ impl<P: Produce> Task<P> {
             let produced =
                 self.produce
                     .produce(&request, lease.clone(), ResponseSink::new(core.clone()));
-            tokio::pin!(produced);
-            tokio::select! {
+            zakura_rt::pin!(produced);
+            zakura_rt::select! {
                 produced = &mut produced => produced,
                 () = self.cancel.cancelled() => {
                     lease.cancel();
@@ -710,7 +706,7 @@ async fn write_in_order(
     cancel: CancellationToken,
 ) {
     loop {
-        let mut response = tokio::select! {
+        let mut response = zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return,
             response = responses.recv() => match response {
@@ -719,7 +715,7 @@ async fn write_in_order(
             },
         };
         loop {
-            let frame = tokio::select! {
+            let frame = zakura_rt::select! {
                 biased;
                 () = cancel.cancelled() => return,
                 frame = response.recv() => frame,
@@ -751,7 +747,7 @@ async fn write_ready(
     cancel: CancellationToken,
 ) {
     loop {
-        let frame = tokio::select! {
+        let frame = zakura_rt::select! {
             biased;
             () = cancel.cancelled() => return,
             frame = frames.recv() => match frame {
@@ -769,7 +765,7 @@ async fn write_ready(
 /// response's grants until the transport write finishes. Returns `false` once
 /// the session is cancelled, cancelling it if the transport closed.
 async fn write(send: &FramedSend, cancel: &CancellationToken, frame: ResponseFrame) -> bool {
-    let slot = tokio::select! {
+    let slot = zakura_rt::select! {
         biased;
         () = cancel.cancelled() => return false,
         slot = send.reserve_response_guarded() => slot,

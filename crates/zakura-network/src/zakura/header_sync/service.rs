@@ -1,14 +1,14 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError},
-};
+use std::sync::Arc;
 
-#[cfg(any(test, feature = "zakura-testkit"))]
-use tokio::sync::mpsc;
-use tokio::{sync::watch, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
 use zakura_header_chain::Frontier;
 use zakura_node_services::task::spawn_erased;
+#[cfg(any(test, feature = "zakura-testkit"))]
+use zakura_rt::sync::mpsc;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
+    task::JoinHandle,
+};
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
@@ -471,7 +471,7 @@ pub(crate) async fn drive_header_sync_actions(
     shutdown: CancellationToken,
 ) {
     loop {
-        let action = tokio::select! {
+        let action = zakura_rt::select! {
             _ = shutdown.cancelled() => return,
             action = actions.recv() => match action {
                 Some(action) => action,
@@ -757,7 +757,7 @@ impl Service for HeaderSyncService {
             let Ok(admitted) = admitted else {
                 return;
             };
-            tokio::select! {
+            zakura_rt::select! {
                 biased;
                 _ = pipe_cancel.cancelled() => return,
                 result = admitted => if result.is_err() { return; },
@@ -980,7 +980,7 @@ impl Sink for HeaderSyncPassthroughSink {
     fn run(self: Box<Self>, mut recv: FramedRecv) -> BoxRunFuture<'static, Result<(), SinkReject>> {
         Box::pin(async move {
             loop {
-                let frame = tokio::select! {
+                let frame = zakura_rt::select! {
                     _ = self.cancel_token.cancelled() => return Ok(()),
                     frame = recv.recv() => match frame {
                         Some(frame) => frame,

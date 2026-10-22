@@ -1,11 +1,12 @@
 //! Branch-owned body-availability retry episodes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_header_chain::{
     BodyUnavailableSummary, BranchId, Clock, Frontier, HeaderGeneration, SourceId,
 };
+use zakura_rt::collections::HashMap;
 
 const ALARM_ATTEMPTS: u32 = 10;
 const ALARM_AFTER: Duration = Duration::minutes(10);

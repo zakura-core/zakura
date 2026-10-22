@@ -12,12 +12,12 @@
 //! connection if a written query is still unanswered: no receiver remains for
 //! its answer.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{
+    collections::HashMap,
+    sync::{CancellationToken, Mutex, MutexGuard, PoisonError},
+};
 
 use super::{
     protocol::{
@@ -228,7 +228,7 @@ impl Queries {
             live.asked.insert(kind, asked);
         }
 
-        let sent = tokio::select! {
+        let sent = zakura_rt::select! {
             biased;
             () = self.cancel.cancelled() => false,
             sent = self.send.send_fenced(frame, &writer) => sent.is_ok(),

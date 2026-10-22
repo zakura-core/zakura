@@ -1,6 +1,6 @@
 //! Clock abstraction used by Zakura transport rate-limit logic.
 
-use tokio::time::Instant;
+use zakura_rt::time::Instant;
 
 /// Clock used by Zakura rate-limit logic.
 pub trait Clock: Clone + Send + Sync + 'static {

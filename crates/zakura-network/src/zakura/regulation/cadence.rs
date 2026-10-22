@@ -29,9 +29,9 @@
 //! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
 //! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
 
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
-use tokio::time::Instant;
+use zakura_rt::{collections::HashMap, time::Instant};
 
 use crate::zakura::{
     wire_codec::{encode_frame, WireMessage},

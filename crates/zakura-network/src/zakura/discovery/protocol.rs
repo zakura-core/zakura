@@ -2,7 +2,6 @@
 
 use std::{
     cmp::Reverse,
-    collections::{hash_map::RandomState, HashMap, HashSet},
     fmt,
     io::{self, Cursor, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -13,13 +12,19 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
 use zakura_chain::{
     block,
     diagnostic::task::CheckForPanics,
     primitives::ed25519::{Signature, SigningKey},
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
+use zakura_rt::{
+    collections::{
+        hash_map::{self, RandomState},
+        HashMap, HashSet,
+    },
+    sync::{watch, AsyncMutex},
+};
 
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
 use crate::zakura::{
@@ -1201,7 +1206,7 @@ impl fmt::Debug for ZakuraDiscoveryLocalConfig {
 /// Cloneable passive runtime handle for native Zakura discovery state.
 #[derive(Clone)]
 pub struct ZakuraDiscoveryHandle {
-    inner: Arc<Mutex<ZakuraDiscoveryInner>>,
+    inner: Arc<AsyncMutex<ZakuraDiscoveryInner>>,
     connected: watch::Receiver<Vec<ZakuraPeerId>>,
     self_record: watch::Receiver<Arc<ZakuraNodeRecord>>,
     self_record_tx: watch::Sender<Arc<ZakuraNodeRecord>>,
@@ -1477,7 +1482,7 @@ impl ZakuraDiscoveryHandle {
             max_imported_records_per_response: config.book_limits.max_imported_records_per_response,
         };
         Ok(Self {
-            inner: Arc::new(Mutex::new(ZakuraDiscoveryInner {
+            inner: Arc::new(AsyncMutex::new(ZakuraDiscoveryInner {
                 book,
                 active_services: HashMap::new(),
                 admitted_peers: HashMap::new(),
@@ -1943,7 +1948,7 @@ impl ZakuraDiscoveryHandle {
     ) -> Option<T> {
         let slot = self.verify_slots.reserve().await;
         let context = self.import_validation.context(current_unix_secs());
-        tokio::task::spawn_blocking(move || {
+        zakura_rt::task::spawn_blocking(move || {
             let _slot = slot;
             verify(&context)
         })
@@ -2025,7 +2030,7 @@ impl ZakuraDiscoveryHandle {
         let now = current_unix_secs();
         let inner = self.inner.lock().await;
         let wanted_services = bounded_services(wanted_services, book_limits);
-        let mut rng = rand_10::rng();
+        let mut rng = zakura_rt::rand::rng();
         inner.book.dial_candidates(
             limit,
             &wanted_services,
@@ -2068,7 +2073,7 @@ impl ZakuraDiscoveryHandle {
         let connected_node_ids = connected_peer_node_ids(&connected);
         let now = current_unix_secs();
         let inner = self.inner.lock().await;
-        let mut rng = rand_10::rng();
+        let mut rng = zakura_rt::rand::rng();
         inner.book.dial_candidates(
             limit,
             &[],
@@ -2539,7 +2544,7 @@ impl ZakuraDiscoveryBook {
             .map(|entry| entry.record.clone())
             .collect();
         // The order would reveal each record's place in the snapshot.
-        records.shuffle(&mut rand_10::rng());
+        records.shuffle(&mut zakura_rt::rand::rng());
         records
     }
 
@@ -2596,7 +2601,7 @@ impl ZakuraDiscoveryBook {
             })
             .map(|(node_id, _)| *node_id)
             .collect();
-        node_ids.shuffle(&mut rand_10::rng());
+        node_ids.shuffle(&mut zakura_rt::rand::rng());
         node_ids
     }
 
@@ -3046,7 +3051,7 @@ impl ZakuraDiscoveryBook {
         let Some(relay) = relay else {
             return;
         };
-        if let std::collections::hash_map::Entry::Occupied(mut count) = self.relayed.entry(relay) {
+        if let hash_map::Entry::Occupied(mut count) = self.relayed.entry(relay) {
             *count.get_mut() -= 1;
             if *count.get() == 0 {
                 count.remove();

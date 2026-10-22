@@ -2902,6 +2902,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "proc-macro2",
  "quote",
  "serde",
  "sha2",
@@ -3282,6 +3283,7 @@ dependencies = [
  "zakura-jsonl-trace",
  "zakura-node-services",
  "zakura-quic",
+ "zakura-rt",
  "zakura-test",
 ]
 
@@ -3537,6 +3539,16 @@ dependencies = [
  "zakura-test",
  "zakura-transparent",
  "zcash_script",
+]
+
+[[package]]
+name = "zakura-rt"
+version = "0.1.0-rc0"
+dependencies = [
+ "rand 0.10.2",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]

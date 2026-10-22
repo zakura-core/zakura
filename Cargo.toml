@@ -6,6 +6,7 @@ members = [
         "crates/zakura-header-chain",
         "crates/zakura-network",
         "crates/zakura-quic",
+        "crates/zakura-rt",
         "crates/zakura-state",
         "crates/zakura-script",
         "crates/zakura-consensus",

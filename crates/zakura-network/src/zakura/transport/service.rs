@@ -1,7 +1,6 @@
 //! Zakura protocol service trait surface.
 
 use std::{
-    collections::HashMap,
     fmt,
     future::Future,
     net::IpAddr,
@@ -10,7 +9,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{collections::HashMap, sync::CancellationToken};
 
 use super::{CloseCause, FramedRecv, FramedSend, MessageRule};
 use crate::{

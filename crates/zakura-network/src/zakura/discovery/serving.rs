@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
 use zakura_quic::NodeId;
+use zakura_rt::sync::CancellationToken;
 
 use super::{
     protocol::{

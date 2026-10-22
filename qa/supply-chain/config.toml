@@ -58,6 +58,9 @@ audit-as-crates-io = false
 [policy.zakura-rpc]
 audit-as-crates-io = false
 
+[policy.zakura-rt]
+audit-as-crates-io = false
+
 [policy.zakura-script]
 audit-as-crates-io = false
 

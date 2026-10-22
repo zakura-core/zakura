@@ -7,6 +7,7 @@
 use super::*;
 use crate::zakura::transport::SessionLayout;
 use zakura_node_services::task::erased;
+use zakura_rt::sync::Barrier;
 
 /// Own both directions of one QUIC stream until setup hands them to a new owner.
 ///
@@ -214,7 +215,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
-    let application_drain = Arc::new(tokio::sync::Barrier::new(streams.len()));
+    let application_drain = Arc::new(Barrier::new(streams.len()));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =

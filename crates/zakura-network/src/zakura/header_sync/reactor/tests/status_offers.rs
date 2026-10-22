@@ -175,7 +175,8 @@ fn answer_unretained(
     reactor.schedule_cached_statuses();
 }
 
-/// Completes `peer`'s locator read through the port-completion path and ends the event.
+/// Completes `peer`'s locator read as the external driver reports it, then
+/// refreshes the committed snapshot and ends the event as a port completion does.
 fn complete_locator(
     reactor: &mut HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
@@ -184,13 +185,11 @@ fn complete_locator(
     target: block::Hash,
     available: bool,
 ) {
-    let peer = peer.clone();
     let locator = available.then(|| {
         zakura_header_chain::HeaderLocator::for_continuation(snapshot.frontiers.header_best)
     });
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.handle_header_locator_ready(peer, 0, target, scope, locator);
-    })));
+    reactor.handle_header_locator_ready(peer.clone(), 0, target, scope, locator);
+    reactor.refresh_committed_snapshot();
     reactor.schedule_cached_statuses();
 }
 
@@ -427,9 +426,9 @@ fn completion_release_stages_a_cached_alternate() {
     reactor.handle_status(alternate.clone(), 0, status);
     assert!(actions.try_recv().is_err());
 
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.retire_peer_work(&owner, HeaderRequestTerminal::LocalError);
-    })));
+    // A completion retires the owner's work, then refreshes the committed snapshot.
+    reactor.retire_peer_work(&owner, HeaderRequestTerminal::LocalError);
+    reactor.refresh_committed_snapshot();
     reactor.schedule_cached_statuses();
     expect_locator_query(&mut actions, &alternate, target);
 }
@@ -979,7 +978,7 @@ fn locator_evictions_bound_retained_operations() {
         outbounds.push(outbound);
         reactor.handle_status(peer, 0, status_for(&snapshot, block::Hash([byte; 32])));
     }
-    assert!(reactor.pending_locator_queries.len() <= MAX_STAGED_TARGETS_V1);
+    assert!(reactor.locators.len() <= MAX_STAGED_TARGETS_V1);
     assert!(reactor.pending_port_operations.len() <= MAX_STAGED_TARGETS_V1);
 }
 
@@ -1084,13 +1083,13 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     while let Some(Some(completion)) = reactor.pending_port_operations.next().now_or_never() {
         reactor.handle_port_completion(completion);
     }
-    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.locators.len(), 0);
     assert_eq!(reactor.locator_capacity.available_permits(), 0);
     // A cached offer can become idle without a fresh refusal arming the waiter.
     reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
     assert!(reactor.locator_capacity_waiting);
-    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.locators.len(), 0);
     assert!(!reactor.peer_state[&peer].status_spent);
     // The real service finishes one orphaned read. Its last permit drop wakes
     // the reactor's capacity branch, with no timer or new wire Status needed.
@@ -1104,7 +1103,7 @@ async fn locator_timeout_keeps_accepted_work_bounded_and_release_resumes_offers(
     drop(permit);
     reactor.locator_capacity_waiting = false;
     reactor.schedule_cached_statuses();
-    assert_eq!(reactor.pending_locator_queries.len(), 1);
+    assert_eq!(reactor.locators.len(), 1);
     assert!(reactor
         .pending_port_operations
         .next()
@@ -1147,7 +1146,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
             session_id,
             status_for(&snapshot, block::Hash([2; 32])),
         );
-        assert_eq!(reactor.pending_locator_queries.len(), 1);
+        assert_eq!(reactor.locators.len(), 1);
         assert_eq!(
             reactor.locator_capacity.available_permits(),
             MAX_STAGED_TARGETS_V1 - 1
@@ -1156,7 +1155,7 @@ async fn locator_reconnect_coalesces_until_stale_completion_releases_capacity() 
     reactor.handle_peer_disconnected(&peer, 32, "test final disconnect");
     let completion = reactor.pending_port_operations.next().await.unwrap();
     reactor.handle_port_completion(completion);
-    assert!(reactor.pending_locator_queries.is_empty());
+    assert_eq!(reactor.locators.len(), 0);
     assert_eq!(
         reactor.locator_capacity.available_permits(),
         MAX_STAGED_TARGETS_V1
@@ -1400,7 +1399,7 @@ fn pending_locator_claim_shrink_wakes_cached_offer_without_changing_target() {
         .peer_work_queue
         .awaiting_target(&alternate)
         .is_some());
-    assert_eq!(reactor.pending_locator_queries.len(), 2);
+    assert_eq!(reactor.locators.len(), 2);
 }
 
 #[test]
@@ -1420,7 +1419,7 @@ fn awaiting_owner_retarget_wakes_old_target_alternate() {
         .peer_work_queue
         .awaiting_target(&alternate)
         .is_some());
-    assert_eq!(reactor.pending_locator_queries.len(), 2);
+    assert_eq!(reactor.locators.len(), 2);
 }
 
 #[test]

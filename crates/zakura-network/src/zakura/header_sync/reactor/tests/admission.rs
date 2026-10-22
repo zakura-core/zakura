@@ -993,14 +993,15 @@ fn apply_completion_observes_committed_headers_before_reusing_capacity() {
     committed.state_version = committed.state_version.checked_next().unwrap();
     snapshots_tx.send_replace(Some(committed.clone()));
 
-    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
-        reactor.handle_header_target_admission_ready(
+    reactor.handle_port_completion(StorageOutcome::Completed {
+        completion: Box::new(StorageCompletion::TargetAdmission {
             peer,
             source,
             owner,
-            HeaderTargetAdmissionResult::Applied,
-        );
-    })));
+            result: HeaderTargetAdmissionResult::Applied,
+        }),
+        capacity: Vec::new(),
+    });
 
     assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
     assert_eq!(reactor.committed_snapshot.as_ref(), Some(&committed));

@@ -382,7 +382,10 @@ impl VctLocalFixture {
 
     fn dispatch(&mut self) {
         let operation = self.operation();
-        assert!(self.reactor.dispatch_action(operation));
+        assert_eq!(
+            StorageDispatch::Started,
+            self.reactor.dispatch_action(operation)
+        );
     }
 
     fn assert_single_operation_through_timeouts(&mut self) {
@@ -786,7 +789,7 @@ fn normal_header_operations_have_no_vct_fatal_deadline() {
         entries: active.entries.clone(),
     };
 
-    assert!(reactor.dispatch_action(action));
+    assert_eq!(StorageDispatch::Started, reactor.dispatch_action(action));
     assert!(reactor.vct_local_operation.is_none());
 }
 
@@ -2469,7 +2472,7 @@ async fn disconnected_preparation_retains_capacity_until_completion() {
         },
         entries: std::mem::take(&mut active.entries),
     };
-    assert!(reactor.dispatch_action(operation));
+    assert_eq!(StorageDispatch::Started, reactor.dispatch_action(operation));
     assert!(reactor
         .pending_port_operations
         .next()

@@ -20,8 +20,8 @@ use super::{
     scheduler::{
         completed_targets::CompletedHeaderTargets,
         peer_work::{
-            HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue, QueueWorkResult,
-            MAX_HEADER_CHUNK_RESERVATION_V1,
+            HeaderCapacityLease, HeaderTargetPhase, PeerWorkPriority, PeerWorkQueue,
+            QueueWorkResult, MAX_HEADER_CHUNK_RESERVATION_V1,
         },
         repair::{RepairPolicyState, RepairRequirement, RepairRequirementSlot},
         status::StatusPublisher,
@@ -37,6 +37,10 @@ use crate::zakura::{
     OrderedSendError, ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
     ZakuraPeerId,
 };
+
+mod state;
+
+use state::{LocatorDisposition, LocatorKey, LocatorProposal, LocatorQueries};
 
 /// Inputs that can make a previously blocked ordinary offer eligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +261,7 @@ fn build_header_sync_reactor(
         lifecycle: lifecycle_rx,
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
-        pending_locator_queries: HashSet::new(),
+        locators: LocatorQueries::default(),
         locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
@@ -369,8 +373,8 @@ struct HeaderSyncReactor {
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
-    /// Peers with one direct continuation-locator read currently in flight.
-    pending_locator_queries: HashSet<ZakuraPeerId>,
+    /// Direct continuation-locator reads in flight, at most one per peer.
+    locators: LocatorQueries,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
@@ -427,13 +431,72 @@ struct HeaderSyncReactor {
     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
 }
 
-type PendingPortOperation = Pin<Box<dyn Future<Output = PortOperationResult> + Send + 'static>>;
+type PendingPortOperation = Pin<Box<dyn Future<Output = StorageOutcome> + Send + 'static>>;
 
-type HeaderSyncPortCompletion = Box<dyn FnOnce(&mut HeaderSyncReactor) + Send + 'static>;
+/// The result of one direct header storage operation, with the identity that
+/// correlates it to the reactor's pending work.
+#[derive(Debug)]
+enum StorageCompletion {
+    /// A continuation-locator read settled.
+    Locator {
+        key: LocatorKey,
+        /// The locator, or none when the read failed or timed out.
+        locator: Option<zakura_header_chain::HeaderLocator>,
+    },
+    /// A VCT repair context read settled.
+    VctRepairContext {
+        owner: zakura_header_chain::BodyWorkOwner,
+        result: VctRepairContextResult,
+    },
+    /// Target preparation settled.
+    TargetPrepared {
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetPreparationResult,
+    },
+    /// Target application settled.
+    TargetAdmission {
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetAdmissionResult,
+    },
+}
 
-enum PortOperationResult {
-    Completed(HeaderSyncPortCompletion),
+/// How one direct header storage future ended.
+enum StorageOutcome {
+    /// The operation returned a result.
+    Completed {
+        completion: Box<StorageCompletion>,
+        /// Header capacity the operation holds until the reactor handles its result.
+        capacity: Vec<HeaderCapacityLease>,
+    },
+    /// The operation panicked.
     Panicked(Box<PortPanicContext>),
+}
+
+/// How the reactor handled a request to run one header storage operation.
+#[must_use]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StorageDispatch {
+    /// The operation started, or entered the external driver's queue.
+    Started,
+    /// The peer's locator read in flight also serves this request.
+    Joined,
+    /// Locator capacity is exhausted, so the peer's offer waits for a permit.
+    Deferred,
+    /// The operation needs no storage work, so the reactor only recorded it.
+    Recorded,
+    /// The operation cannot run.
+    Refused,
+}
+
+impl StorageDispatch {
+    /// Whether the operation cannot run, so its caller must retire the work.
+    fn is_refused(self) -> bool {
+        self == Self::Refused
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -444,6 +507,8 @@ struct PortPanicContext {
     session: Option<PeerSession>,
     owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
     target_tip_hash: Option<block::Hash>,
+    /// The pending locator read that a panicked locator operation leaves behind.
+    locator: Option<LocatorKey>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1009,14 +1074,43 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn handle_port_completion(&mut self, completion: PortOperationResult) {
-        match completion {
-            PortOperationResult::Completed(completion) => completion(self),
-            PortOperationResult::Panicked(context) => self.handle_port_panic(*context),
+    fn handle_port_completion(&mut self, outcome: StorageOutcome) {
+        match outcome {
+            StorageOutcome::Completed {
+                completion,
+                capacity,
+            } => {
+                self.handle_storage_completion(*completion);
+                drop(capacity);
+            }
+            StorageOutcome::Panicked(context) => self.handle_port_panic(*context),
         }
         // Apply publishes its snapshot before completing. Observe it before another
         // event can reserve the capacity that this completion released.
         self.refresh_committed_snapshot();
+    }
+
+    fn handle_storage_completion(&mut self, completion: StorageCompletion) {
+        match completion {
+            StorageCompletion::Locator { key, locator } => {
+                self.finish_header_locator_query(key, locator)
+            }
+            StorageCompletion::VctRepairContext { owner, result } => {
+                self.handle_vct_repair_context_ready(owner, result)
+            }
+            StorageCompletion::TargetPrepared {
+                peer,
+                source,
+                owner,
+                result,
+            } => self.handle_header_target_prepared(peer, source, owner, result),
+            StorageCompletion::TargetAdmission {
+                peer,
+                source,
+                owner,
+                result,
+            } => self.handle_header_target_admission_ready(peer, source, owner, result),
+        }
     }
 
     fn refresh_committed_snapshot(&mut self) {
@@ -1307,12 +1401,15 @@ impl HeaderSyncReactor {
                     self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
                 }
                 self.spend_status(&peer);
-                if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
-                    peer: peer.clone(),
-                    session_id,
-                    target_tip_hash,
-                    scope,
-                }) {
+                if self
+                    .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                        peer: peer.clone(),
+                        session_id,
+                        target_tip_hash,
+                        scope,
+                    })
+                    .is_refused()
+                {
                     self.peer_work_queue.remove_unstarted(&peer);
                 }
             }
@@ -1866,7 +1963,7 @@ impl HeaderSyncReactor {
                     return;
                 }
             }
-            if !self.dispatch_action(action) {
+            if self.dispatch_action(action).is_refused() {
                 if let Some((owner, source)) = repair {
                     self.retry_vct_repair(
                         owner,
@@ -2303,22 +2400,24 @@ impl HeaderSyncReactor {
                     .expect("the exact preparing request passed the completion gate")
                     .phase = HeaderTargetPhase::Applying;
                 self.peer_work_queue.publish_phase_metrics();
-                if self.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
+                let dispatch = self.dispatch_action(HeaderPortOperation::ApplyHeaderTarget {
                     purpose: purpose.clone(),
                     peer: peer.clone(),
                     source,
                     owner,
                     target,
-                }) {
-                } else if is_repair {
-                    self.retry_vct_repair(
-                        owner
-                            .body_owner()
-                            .expect("an auxiliary repair has body authority"),
-                        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
-                    );
-                } else {
-                    self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
+                });
+                if dispatch.is_refused() {
+                    if is_repair {
+                        self.retry_vct_repair(
+                            owner
+                                .body_owner()
+                                .expect("an auxiliary repair has body authority"),
+                            VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
+                        );
+                    } else {
+                        self.retire_peer_work(&peer, HeaderRequestTerminal::LocalError);
+                    }
                 }
             }
             HeaderTargetPreparationResult::Failed(error) => {
@@ -2718,34 +2817,36 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Settle `key`'s locator read and use it for the peer's awaiting target.
+    ///
+    /// See [`LocatorQueries::settle`] for when a read serves the target.
     fn finish_header_locator_query(
         &mut self,
-        peer: ZakuraPeerId,
-        query_scope: zakura_header_chain::HeaderWorkAuthority,
+        key: LocatorKey,
         locator: Option<zakura_header_chain::HeaderLocator>,
     ) {
-        self.pending_locator_queries.remove(&peer);
-        let Some(target) = self.peer_work_queue.awaiting_target(&peer).cloned() else {
+        let target = self.peer_work_queue.awaiting_target(&key.peer).cloned();
+        let disposition = self
+            .locators
+            .settle(&key, target.as_ref(), locator.is_some());
+        if disposition == LocatorDisposition::Stale {
             metrics::counter!("sync.header.target.stale_locator").increment(1);
             return;
-        };
-        // Locators are derived from the local selected path, so tip churn under the same
-        // generation and finality anchor can reuse one in-flight read. A generation or
-        // reanchor change must not consume a locator fetched under the prior authority.
-        let same_selected_path_authority = target.scope.header_generation
-            == query_scope.header_generation
-            && target.scope.branch.anchor_hash == query_scope.branch.anchor_hash;
-        let superseded_tip = target.status.selected_tip_hash != query_scope.branch.target_tip_hash;
-        if !same_selected_path_authority || (locator.is_none() && superseded_tip) {
-            // Authority moved, or a timed-out/failed read belonged to a replaced tip.
+        }
+        let peer = key.peer;
+        let target = target.expect("only a read for an awaiting target settles as usable");
+        if disposition == LocatorDisposition::Refetch {
             // Keep the current staged target and fetch a fresh locator for it.
             metrics::counter!("sync.header.target.stale_locator").increment(1);
-            if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
-                peer: peer.clone(),
-                session_id: target.session_id,
-                target_tip_hash: target.status.selected_tip_hash,
-                scope: target.scope,
-            }) {
+            if self
+                .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                    peer: peer.clone(),
+                    session_id: target.session_id,
+                    target_tip_hash: target.status.selected_tip_hash,
+                    scope: target.scope,
+                })
+                .is_refused()
+            {
                 self.peer_work_queue.remove_unstarted(&peer);
             }
             return;
@@ -3194,7 +3295,10 @@ impl HeaderSyncReactor {
         };
         let owner = task.owner;
         let height = task.height;
-        if self.dispatch_action(HeaderPortOperation::QueryVctRepairContext { owner, height }) {
+        if !self
+            .dispatch_action(HeaderPortOperation::QueryVctRepairContext { owner, height })
+            .is_refused()
+        {
             let deadline = now + self.startup.request_timeout;
             let _ = self
                 .vct_repair
@@ -4139,7 +4243,7 @@ impl HeaderSyncReactor {
         });
     }
 
-    fn dispatch_action(&mut self, action: HeaderPortOperation) -> bool {
+    fn dispatch_action(&mut self, action: HeaderPortOperation) -> StorageDispatch {
         match self.startup.port_dispatch {
             PortDispatch::Direct => self.dispatch_direct_port_operation(action),
             #[cfg(any(test, feature = "zakura-testkit"))]
@@ -4147,7 +4251,7 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn dispatch_direct_port_operation(&mut self, action: HeaderPortOperation) -> bool {
+    fn dispatch_direct_port_operation(&mut self, action: HeaderPortOperation) -> StorageDispatch {
         use zakura_node_services::header_chain as port;
 
         let vct_local_operation = VctLocalOperation::from_action(&action, Instant::now());
@@ -4157,22 +4261,23 @@ impl HeaderSyncReactor {
                 attempted = ?vct_local_operation,
                 "refused to replace an owned VCT local operation"
             );
-            return false;
+            return StorageDispatch::Refused;
         }
-        let locator_permit = if let HeaderPortOperation::QueryHeaderLocator { peer, .. } = &action {
-            if self.pending_locator_queries.contains(peer) {
-                return true;
-            }
-            let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
-                self.locator_capacity_waiting = true;
-                self.defer_ordinary_target(peer);
-                return true;
+        let (locator_key, locator_permit) =
+            if let HeaderPortOperation::QueryHeaderLocator { peer, scope, .. } = &action {
+                let LocatorProposal::Start(key) = self.locators.propose(peer, *scope) else {
+                    return StorageDispatch::Joined;
+                };
+                let Ok(permit) = self.locator_capacity.clone().try_acquire_owned() else {
+                    let _ = self.locators.remove_exact(&key);
+                    self.locator_capacity_waiting = true;
+                    self.defer_ordinary_target(peer);
+                    return StorageDispatch::Deferred;
+                };
+                (Some(key), Some(port::LocatorReadPermit::new(permit)))
+            } else {
+                (None, None)
             };
-            self.pending_locator_queries.insert(peer.clone());
-            Some(port::LocatorReadPermit::new(permit))
-        } else {
-            None
-        };
         let capacity = match &action {
             HeaderPortOperation::PrepareHeaderTarget { peer, .. }
             | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
@@ -4180,14 +4285,14 @@ impl HeaderSyncReactor {
             }
             _ => Vec::new(),
         };
-        let panic_context = self.port_panic_context(&action);
+        let panic_context = self.port_panic_context(&action, locator_key.clone());
         let header_chain = self.startup.header_chain_port.clone();
         let request_timeout = self.startup.request_timeout;
-        let operation: Pin<Box<dyn Future<Output = HeaderSyncPortCompletion> + Send + 'static>> =
+        let operation: Pin<Box<dyn Future<Output = StorageCompletion> + Send + 'static>> =
             match action {
                 HeaderPortOperation::Misbehavior { peer, reason } => {
                     tracing::debug!(?peer, ?reason, "recorded Zakura header-sync peer violation");
-                    return true;
+                    return StorageDispatch::Recorded;
                 }
                 HeaderPortOperation::DropPeer {
                     peer,
@@ -4200,13 +4305,13 @@ impl HeaderSyncReactor {
                         reason,
                         "dropped an unproductive Zakura header-sync peer"
                     );
-                    return true;
+                    return StorageDispatch::Recorded;
                 }
                 HeaderPortOperation::QueryHeaderLocator {
                     peer,
                     session_id: _,
                     target_tip_hash: _,
-                    scope,
+                    scope: _,
                 } => Box::pin(async move {
                     let locator = match zakura_rt::time::timeout(
                         request_timeout,
@@ -4230,9 +4335,10 @@ impl HeaderSyncReactor {
                         }
                     };
                     drop(locator_permit);
-                    Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        reactor.finish_header_locator_query(peer, scope, locator);
-                    }) as HeaderSyncPortCompletion
+                    StorageCompletion::Locator {
+                        key: locator_key.expect("locator dispatch recorded its read"),
+                        locator,
+                    }
                 }),
                 HeaderPortOperation::QueryVctRepairContext { owner, height } => {
                     Box::pin(async move {
@@ -4257,9 +4363,7 @@ impl HeaderSyncReactor {
                                 VctRepairContextResult::Unavailable
                             }
                         };
-                        Box::new(move |reactor: &mut HeaderSyncReactor| {
-                            reactor.handle_vct_repair_context_ready(owner, result);
-                        }) as HeaderSyncPortCompletion
+                        StorageCompletion::VctRepairContext { owner, result }
                     })
                 }
                 HeaderPortOperation::PrepareHeaderTarget {
@@ -4299,9 +4403,12 @@ impl HeaderSyncReactor {
                                 ),
                             ),
                         ));
-                        return Box::new(move |reactor: &mut HeaderSyncReactor| {
-                            reactor.handle_header_target_prepared(peer, source, owner, result);
-                        }) as HeaderSyncPortCompletion;
+                        return StorageCompletion::TargetPrepared {
+                            peer,
+                            source,
+                            owner,
+                            result,
+                        };
                     }
                     let entries = match port::TargetEntries::try_from(
                         entries
@@ -4323,9 +4430,12 @@ impl HeaderSyncReactor {
                                         Some(Box::new(error)),
                                     ),
                                 ));
-                            return Box::new(move |reactor: &mut HeaderSyncReactor| {
-                                reactor.handle_header_target_prepared(peer, source, owner, result);
-                            }) as HeaderSyncPortCompletion;
+                            return StorageCompletion::TargetPrepared {
+                                peer,
+                                source,
+                                owner,
+                                result,
+                            };
                         }
                     };
                     let result = header_chain
@@ -4340,9 +4450,12 @@ impl HeaderSyncReactor {
                         .await
                         .map(HeaderTargetPreparationResult::Prepared)
                         .unwrap_or_else(HeaderTargetPreparationResult::Failed);
-                    Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        reactor.handle_header_target_prepared(peer, source, owner, result);
-                    }) as HeaderSyncPortCompletion
+                    StorageCompletion::TargetPrepared {
+                        peer,
+                        source,
+                        owner,
+                        result,
+                    }
                 }),
                 HeaderPortOperation::ApplyHeaderTarget {
                     purpose: _,
@@ -4363,40 +4476,47 @@ impl HeaderSyncReactor {
                             }
                         })
                         .unwrap_or_else(HeaderTargetAdmissionResult::Failed);
-                    Box::new(move |reactor: &mut HeaderSyncReactor| {
-                        reactor.handle_header_target_admission_ready(peer, source, owner, result);
-                    }) as HeaderSyncPortCompletion
+                    StorageCompletion::TargetAdmission {
+                        peer,
+                        source,
+                        owner,
+                        result,
+                    }
                 }),
             };
         let operation =
             AssertUnwindSafe(operation)
                 .catch_unwind()
                 .map(move |result| match result {
-                    Ok(completion) => PortOperationResult::Completed(Box::new(move |reactor| {
-                        completion(reactor);
-                        drop(capacity);
-                    })),
-                    Err(_) => PortOperationResult::Panicked(Box::new(panic_context)),
+                    Ok(completion) => StorageOutcome::Completed {
+                        completion: Box::new(completion),
+                        capacity,
+                    },
+                    Err(_) => StorageOutcome::Panicked(Box::new(panic_context)),
                 });
         if let Some(operation) = vct_local_operation {
             self.vct_local_operation = Some(operation);
         }
         self.pending_port_operations.push(Box::pin(operation));
-        true
+        StorageDispatch::Started
     }
 
     #[cfg(any(test, feature = "zakura-testkit"))]
-    fn dispatch_external_port_operation(&mut self, action: HeaderPortOperation) -> bool {
+    fn dispatch_external_port_operation(&mut self, action: HeaderPortOperation) -> StorageDispatch {
         match self.actions.try_send(action) {
-            Ok(()) => true,
+            Ok(()) => StorageDispatch::Started,
             Err(error) => {
                 tracing::debug!(?error, "header-sync action queue unavailable");
-                false
+                StorageDispatch::Refused
             }
         }
     }
 
-    fn port_panic_context(&self, action: &HeaderPortOperation) -> PortPanicContext {
+    fn port_panic_context(
+        &self,
+        action: &HeaderPortOperation,
+        locator: Option<LocatorKey>,
+    ) -> PortPanicContext {
         let (operation, peer, session_id, owner, target_tip_hash) = match action {
             HeaderPortOperation::QueryHeaderLocator {
                 peer,
@@ -4461,6 +4581,7 @@ impl HeaderSyncReactor {
             session,
             owner,
             target_tip_hash,
+            locator,
         }
     }
 
@@ -4523,10 +4644,8 @@ impl HeaderSyncReactor {
             row.insert(hs_trace::OPERATION.into(), context.operation.into());
         });
 
-        if context.operation == "query_header_locator" {
-            if let Some(peer) = context.peer.as_ref() {
-                self.pending_locator_queries.remove(peer);
-            }
+        if let Some(key) = context.locator.as_ref() {
+            let _ = self.locators.remove_exact(key);
         }
 
         if let Some(session) = context.session.as_ref() {
@@ -4745,7 +4864,7 @@ impl HeaderSyncReactor {
 
         self.start_readmission_cooldown(peer);
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
-        self.dispatch_action(HeaderPortOperation::DropPeer {
+        let _ = self.dispatch_action(HeaderPortOperation::DropPeer {
             peer: peer.clone(),
             session_id,
             reason,

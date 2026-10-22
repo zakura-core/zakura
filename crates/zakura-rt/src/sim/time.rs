@@ -18,7 +18,7 @@ use std::{
 
 pub use tokio::time::MissedTickBehavior;
 
-use crate::sim::{self, Op, Point, TimerId};
+use crate::sim::{self, Op, Point, RunId, TimerId};
 
 /// Timer errors.
 pub mod error {
@@ -193,8 +193,9 @@ pub fn sleep(duration: Duration) -> Sleep {
 /// polled. Registration and expiry are both preemption points.
 #[track_caller]
 pub fn sleep_until(deadline: Instant) -> Sleep {
-    let inner = match sim::executor() {
-        Some(_) => SleepInner::Sim(SimSleep {
+    let inner = match sim::run_id() {
+        Some(run) => SleepInner::Sim(SimSleep {
+            run,
             deadline,
             site: Location::caller(),
             polled: false,
@@ -218,6 +219,8 @@ enum SleepInner {
 }
 
 struct SimSleep {
+    /// The run whose clock this sleep waits on.
+    run: RunId,
     deadline: Instant,
     site: &'static Location<'static>,
     /// Whether the registration point has passed.
@@ -231,7 +234,7 @@ impl SimSleep {
     /// Registers a timer for the current deadline with `waker`, replacing any
     /// earlier one.
     fn register(&mut self, waker: &Waker) {
-        let Some(executor) = sim::executor() else {
+        let Some(executor) = sim::executor_for(self.run) else {
             return;
         };
         if let Some(timer) = self.timer.take() {
@@ -244,7 +247,7 @@ impl SimSleep {
     /// Removes the registered timer, if any.
     fn cancel(&mut self) {
         if let Some(timer) = self.timer.take() {
-            if let Some(executor) = sim::executor() {
+            if let Some(executor) = sim::executor_for(self.run) {
                 executor.cancel_timer(timer);
             }
         }
@@ -291,7 +294,7 @@ impl Future for Sleep {
             SleepInner::Tokio(sleep) => return sleep.as_mut().poll(cx),
             SleepInner::Sim(sleep) => sleep,
         };
-        let Some(executor) = sim::executor() else {
+        let Some(executor) = sim::executor_for(sleep.run) else {
             // The run ended, and its clock with it.
             return Poll::Pending;
         };

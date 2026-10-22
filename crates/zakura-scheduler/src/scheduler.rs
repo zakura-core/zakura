@@ -226,6 +226,10 @@ thread_local! {
 /// touched, so the pool's memory follows real stack depth.
 const STACK_POOL_LIMIT: usize = 1024;
 
+/// The most steps one shutdown drain takes. Tasks that keep waking each other
+/// past it are force-unwound instead, so cleanup always ends.
+const DRAIN_STEP_LIMIT: usize = 100_000;
+
 /// Runs `f` on this thread's run state, or returns `None` outside a run.
 pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
     RUN.with(|r| r.borrow_mut().as_mut().map(f))
@@ -400,11 +404,19 @@ impl Scheduler {
     pub fn run(&mut self, task: TaskId) -> RunOutcome {
         // Setup code may have spawned through the hooks since the last step.
         self.admit();
-        let cmd = self.state(|s| {
+        self.state(|s| {
             assert!(
                 s.eligible().any(|t| t == task),
                 "run({task:?}) on a task that isn't ready"
             );
+        });
+        self.step(task)
+    }
+
+    /// Resumes a ready `task`, ignoring the worker limit. Shared by
+    /// [`run`](Self::run) and the shutdown drain.
+    fn step(&mut self, task: TaskId) -> RunOutcome {
+        let cmd = self.state(|s| {
             s.current = Some(task);
             s.ready.remove(&task);
             let starts_poll = s.mid_poll.insert(task);
@@ -468,18 +480,26 @@ impl Scheduler {
                 .take()
                 .expect("the coroutine was live when it was resumed");
             return_stack(co.into_stack());
-            let joiners = self.state(|s| {
-                s.mid_poll.remove(&task);
-                s.woken.remove(&task);
-                s.cancel_requested.remove(&task);
-                s.external.remove(&task);
-                s.done.insert(task, exit);
-                s.join_wakers.remove(&task).unwrap_or_default()
-            });
-            joiners.into_iter().for_each(Waker::wake);
+            self.finish(task, exit);
         }
         self.admit();
         outcome
+    }
+
+    /// Records that `task` ended, and wakes its joiners.
+    fn finish(&mut self, task: TaskId, exit: TaskExit) {
+        let joiners = self.state(|s| {
+            s.ready.remove(&task);
+            s.waiting.remove(&task);
+            s.mid_poll.remove(&task);
+            s.woken.remove(&task);
+            s.cancel_requested.remove(&task);
+            s.external.remove(&task);
+            s.parked.values_mut().for_each(|p| p.retain(|t| *t != task));
+            s.done.insert(task, exit);
+            s.join_wakers.remove(&task).unwrap_or_default()
+        });
+        joiners.into_iter().for_each(Waker::wake);
     }
 
     /// The current virtual time.
@@ -541,11 +561,18 @@ impl Scheduler {
         })
     }
 
-    /// Ends the run. Preemption points become no-ops, then every unfinished
-    /// task is force-unwound so its destructors run.
+    /// Ends the run, in three stages:
     ///
-    /// Check properties before calling this. A task stopped mid-poll inside a
-    /// production `catch_unwind` sees the forced unwind as a panic.
+    /// 1. Preemption points become no-ops, and every task stopped mid-poll
+    ///    runs on to its poll boundary. `park` still waits, so a destructor
+    ///    can take a contended lock.
+    /// 2. Every task at a poll boundary is cancelled, as an abort would. Its
+    ///    future is dropped on its own stack, outside any unwind.
+    /// 3. Only a task that is still parked, as in a lock cycle, is
+    ///    force-unwound. Whatever that unwind releases drains as in stage 1.
+    ///
+    /// Check properties before calling this. A force-unwound task inside a
+    /// production `catch_unwind` sees the unwind as a panic.
     pub fn shutdown(mut self) -> CleanupReport {
         self.shutdown_inner()
     }
@@ -558,18 +585,39 @@ impl Scheduler {
         self.shut_down = true;
         let timers_left = self.state(|s| {
             s.shutting_down = true;
+            let live = (0..s.tasks.len())
+                .map(|i| TaskId(u32::try_from(i).expect("queue_spawn caps tasks at u32")))
+                .filter(|t| !s.done.contains_key(t));
+            s.cancel_requested.extend(live);
+            let waiting = std::mem::take(&mut s.waiting);
+            s.ready.extend(waiting);
             s.timers.len()
         });
         let mut report = CleanupReport {
             timers_left,
             ..CleanupReport::default()
         };
-        for slot in &mut self.coroutines {
-            let Some(mut co) = slot.take() else { continue };
+        loop {
+            self.drain(&mut report);
+            // Every task left is parked, or the drain hit its step limit.
+            let Some(task) = self
+                .coroutines
+                .iter()
+                .position(Option::is_some)
+                .map(|i| TaskId(u32::try_from(i).expect("queue_spawn caps tasks at u32")))
+            else {
+                break;
+            };
+            let mut co = self.coroutines[task.index()]
+                .take()
+                .expect("position found a live coroutine");
             if co.started() && !co.done() {
                 report.unwound += 1;
             }
-            if catch_unwind(AssertUnwindSafe(|| co.force_unwind())).is_ok() && co.done() {
+            self.state(|s| s.current = Some(task));
+            let unwound = catch_unwind(AssertUnwindSafe(|| co.force_unwind()));
+            self.state(|s| s.current = None);
+            if unwound.is_ok() && co.done() {
                 return_stack(co.into_stack());
             } else {
                 // The task caught the unwind and kept going. Its stack still
@@ -577,6 +625,8 @@ impl Scheduler {
                 report.unwind_failures += 1;
                 std::mem::forget(co);
             }
+            self.finish(task, TaskExit::Cancelled);
+            self.admit();
         }
         // Dropping the state drops leftover wakers and futures outside the
         // borrow, since their destructors may call hooks.
@@ -585,6 +635,27 @@ impl Scheduler {
         #[cfg(zakura_sim)]
         drop(self.rt_run.take());
         report
+    }
+
+    /// Runs ready tasks during shutdown until none is left: first any task
+    /// stopped mid-poll, then each task at a poll boundary, which `step`
+    /// cancels. Picks the lowest `TaskId`, so cleanup replays too.
+    fn drain(&mut self, report: &mut CleanupReport) {
+        for _ in 0..DRAIN_STEP_LIMIT {
+            let next = self.state(|s| {
+                s.ready
+                    .iter()
+                    .find(|t| s.mid_poll.contains(t))
+                    .or_else(|| s.ready.first())
+                    .copied()
+            });
+            let Some(task) = next else { return };
+            match self.step(task) {
+                RunOutcome::Cancelled => report.cancelled += 1,
+                RunOutcome::Panicked(_) => report.panicked += 1,
+                _ => {}
+            }
+        }
     }
 
     /// Creates coroutines for tasks spawned since the last step, in id order.
@@ -615,7 +686,14 @@ impl Scheduler {
                 },
             );
             self.coroutines.push(Some(co));
-            self.state(|s| s.ready.insert(id));
+            self.state(|s| {
+                s.ready.insert(id);
+                // A task spawned during shutdown is dropped unpolled, as
+                // tokio does.
+                if s.shutting_down {
+                    s.cancel_requested.insert(id);
+                }
+            });
         }
     }
 

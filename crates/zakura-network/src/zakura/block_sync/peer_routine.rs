@@ -64,7 +64,7 @@ mod trace;
 
 use fill::FillStop;
 use io::PeerIO;
-use state::{PeerState, SharedDeadlines};
+use state::{unreceived_heights, BodyMatch, Disposition, PeerState, SharedDeadlines};
 
 /// Heights checked for lost ownership per work-queue lock hold.
 const OWNERSHIP_CHECK_CHUNK: usize = 1024;
@@ -187,24 +187,6 @@ fn header_hash_payload_mismatch(
         delivered,
         kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
         source,
-    }
-}
-
-/// Outcome classification for finishing an outstanding request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Disposition {
-    Satisfied,
-    RetryOriginal,
-    RetryMissing,
-}
-
-impl Disposition {
-    fn trace_label(self) -> &'static str {
-        match self {
-            Self::Satisfied => "satisfied",
-            Self::RetryOriginal => "retry_original",
-            Self::RetryMissing => "retry_missing",
-        }
     }
 }
 
@@ -1119,64 +1101,53 @@ impl PeerRoutine {
             return;
         };
 
-        let Some(key) = self.state.window.outstanding_key_for_height(height) else {
-            // No outstanding match — run the unmatched fallthroughs locally.
-            if self
-                .accept_unmatched_queued_body(
-                    height,
-                    hash,
-                    block.clone(),
-                    body_wire_bytes,
-                    body_permit,
-                    raw_block_payload.clone(),
-                )
-                .await
-            {
+        let matched = match self.state.match_body(height, hash) {
+            BodyMatch::Matched(matched) => matched,
+            BodyMatch::Unmatched => {
+                // No outstanding match — run the unmatched fallthroughs locally.
+                if self
+                    .accept_unmatched_queued_body(
+                        height,
+                        hash,
+                        block.clone(),
+                        body_wire_bytes,
+                        body_permit,
+                        raw_block_payload.clone(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                // Local retirement, reorgs and GC change interest, not authority.
+                metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
+                tracing::debug!(
+                    peer = ?self.io.peer,
+                    ?height,
+                    "ignoring an authorized block-sync body for retired local work"
+                );
                 return;
             }
-            // Local retirement, reorgs and GC change interest, not authority.
-            metrics::counter!("sync.block.response.unmatched_authorized_ignored").increment(1);
-            tracing::debug!(
-                peer = ?self.io.peer,
-                ?height,
-                "ignoring an authorized block-sync body for retired local work"
-            );
-            return;
-        };
-        let outstanding = self
-            .state
-            .window
-            .outstanding
-            .get(key)
-            .expect("the key was just found in the window");
-        let delivery_snapshot = outstanding.delivery_snapshot;
-        if outstanding.has_received(height) {
-            tracing::debug!(peer = ?self.io.peer, ?height, "ignoring duplicate block-sync body frame");
-            return;
-        }
-        match outstanding.request.expected_hash(height) {
-            Some(requested) if requested != hash => {
-                let mismatch = header_hash_payload_mismatch(
-                    outstanding.request.owner,
-                    self.io.source,
-                    requested,
-                    hash,
-                );
+            BodyMatch::Duplicate => {
+                tracing::debug!(peer = ?self.io.peer, ?height, "ignoring duplicate block-sync body frame");
+                return;
+            }
+            BodyMatch::PayloadMismatch { owner, requested } => {
+                let mismatch = header_hash_payload_mismatch(owner, self.io.source, requested, hash);
                 self.report_misbehavior(BlockSyncMisbehavior::BodyPayloadMismatch(mismatch))
                     .await;
                 return;
             }
-            Some(_) => {}
-            None => {
+            BodyMatch::NotRequested => {
                 self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
                     .await;
                 return;
             }
-        }
+        };
+        let key = matched.key;
         self.io
             .trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
-        let outstanding_owner = outstanding.request.owner;
+        let outstanding_owner = matched.owner;
         if self.io.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
                 .increment(1);
@@ -1196,11 +1167,12 @@ impl PeerRoutine {
             self.finish_outstanding_at(key, Disposition::RetryMissing);
             return;
         }
-        let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
-        let request_start_height = outstanding.request.start_height;
-        let request_range_count = outstanding.request.count;
-        let request_elapsed = time::Instant::from_std(outstanding.queued_at).elapsed();
+        let estimated_bytes = matched.estimated_bytes;
+        let request_start_height = matched.start_height;
+        let request_range_count = matched.count;
+        let request_elapsed = time::Instant::from_std(matched.queued_at).elapsed();
         let request_elapsed_ms = elapsed_ms_u64(request_elapsed);
+        let delivery_snapshot = matched.delivery_snapshot;
 
         // The body's transactions are not validated against the header here;
         // consensus does it on apply (`handle_block_apply_finished` attributes a
@@ -1246,7 +1218,7 @@ impl PeerRoutine {
                 serialized_bytes,
                 "block-sync body already settled by another peer; marking received"
             );
-            self.accept_already_settled_height(key, height);
+            self.accept_already_settled_height(key, outstanding_owner, height);
             return;
         };
         let decoded_attributed_memory_size_bytes =
@@ -1260,23 +1232,15 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
-        self.state.window.note_block_progress(
+        let complete = self.state.record_body(
+            key,
+            height,
+            serialized_bytes,
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
         );
-        self.state
-            .window
-            .outstanding
-            .record_body_bytes(key, serialized_bytes);
-        self.state.window.outstanding.mark_received(key, height);
         self.withdraw_claim(outstanding_owner, height);
-        let completed = if self
-            .state
-            .window
-            .outstanding
-            .get(key)
-            .is_some_and(OutstandingBlockRange::is_complete)
-        {
+        let completed = if complete {
             self.remove_request(key)
         } else {
             None
@@ -1473,16 +1437,15 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        self.state.window.note_block_progress(
-            time::Instant::now().into_std(),
-            self.config.effective_liveness_timeout(),
-        );
         // Also credit the reliability EWMA: this late body offsets the failure its own
         // timeout charged, so a peer that merely slowed down (backlog draining past the
         // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
         // window instead of being sealed to zero like a genuine dropper — which sends no
         // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
-        self.state.window.credit_late_delivery();
+        self.state.record_late_body(
+            time::Instant::now().into_std(),
+            self.config.effective_liveness_timeout(),
+        );
 
         let previous_block_hash = block.header.previous_block_hash;
         let body = BufferedBlockBody::from_measured_decoded_block(
@@ -1514,87 +1477,30 @@ impl PeerRoutine {
     /// retries its missing suffix; `RangeUnavailable` retries the original
     /// range even if the peer reported a smaller count.
     fn handle_ending(&mut self, completed: CompletedRange) {
-        let start_height = completed.range.start();
         // Local timeouts, reorgs, and finality can retire the scheduler's work
         // while the peer's authority, already consumed above, remained live.
-        let Some(key) = self.state.window.outstanding_key_for_start(start_height) else {
+        let Some(ending) = self.state.on_ending(
+            completed.range.start(),
+            completed.outcome,
+            self.download_floor(),
+        ) else {
             return;
         };
-        let retry = match completed.outcome {
-            Outcome::Done => Disposition::RetryMissing,
-            Outcome::Unavailable => {
-                let outstanding = self
-                    .state
-                    .window
-                    .outstanding
-                    .get(key)
-                    .expect("the key was just found in the window");
-                self.trace_range_unavailable(
-                    start_height,
-                    outstanding.request.count,
-                    elapsed_ms_u64(time::Instant::from_std(outstanding.queued_at).elapsed()),
-                );
-                Disposition::RetryOriginal
-            }
-        };
-        let disposition = self.stale_adjusted_disposition(key, retry);
-        self.charge_short_response_reliability(key, disposition);
-        self.finish_outstanding_at(key, disposition);
-    }
-
-    /// Fold a short response into the reliability EWMA: a `BlocksDone`/`RangeUnavailable`
-    /// that leaves the outstanding request at `key` with any unreceived height is one
-    /// goodput failure for the request, like a timeout — per request, not per missing height
-    /// (see `penalize_short_response`). A `Satisfied` disposition means the shortfall was
-    /// covered by the floor advancing (not the peer's fault), so it is not charged. Reads the
-    /// outstanding *before* `finish_outstanding_at` removes it.
-    fn charge_short_response_reliability(&mut self, key: RequestKey, disposition: Disposition) {
-        if disposition == Disposition::Satisfied {
-            return;
+        if completed.outcome == Outcome::Unavailable {
+            self.trace_range_unavailable(
+                completed.range.start(),
+                ending.count,
+                elapsed_ms_u64(time::Instant::from_std(ending.queued_at).elapsed()),
+            );
         }
-        let missing = self
-            .state
-            .window
-            .outstanding
-            .get(key)
-            .map(|outstanding| unreceived_heights(outstanding).count())
-            .unwrap_or(0);
-        self.state.window.penalize_short_response(missing);
-    }
-
-    /// A late response can still match after the floor moved through its prefix;
-    /// mark the stale prefix satisfied and retry only the remaining suffix.
-    fn stale_adjusted_disposition(&mut self, key: RequestKey, current: Disposition) -> Disposition {
-        let tip = self.download_floor();
-        let Some(outstanding) = self.state.window.outstanding.get(key) else {
-            return current;
-        };
-        if outstanding.request.start_height > tip {
-            return current;
+        if !ending.stale_heights.is_empty() {
+            let released_bytes = self
+                .io
+                .work
+                .release_reserved_heights_for_owner(ending.owner, ending.stale_heights);
+            self.io.budget.release(released_bytes);
         }
-        let owner = outstanding.request.owner;
-        let released_heights: Vec<_> = outstanding_unreceived_through(outstanding, tip).collect();
-        let _ = self
-            .state
-            .window
-            .outstanding
-            .mark_received_through(key, tip);
-        let released_bytes = self
-            .io
-            .work
-            .release_reserved_heights_for_owner(owner, released_heights);
-        self.io.budget.release(released_bytes);
-        if self
-            .state
-            .window
-            .outstanding
-            .get(key)
-            .is_some_and(OutstandingBlockRange::is_complete)
-        {
-            Disposition::Satisfied
-        } else {
-            Disposition::RetryMissing
-        }
+        self.finish_outstanding_at(ending.key, ending.disposition);
     }
 
     // ===================== outstanding lifecycle (ported) ===================
@@ -1703,17 +1609,22 @@ impl PeerRoutine {
     /// received so the request can complete without re-queueing it or touching
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
-    fn accept_already_settled_height(&mut self, key: RequestKey, height: block::Height) {
-        self.state.window.note_block_progress(
+    fn accept_already_settled_height(
+        &mut self,
+        key: RequestKey,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) {
+        let Some(complete) = self.state.record_settled_body(
+            key,
+            height,
             time::Instant::now().into_std(),
             self.config.effective_liveness_timeout(),
-        );
-        self.state.window.outstanding.mark_received(key, height);
-        let Some(outstanding) = self.state.window.outstanding.get(key) else {
+        ) else {
             return;
         };
-        self.withdraw_claim(outstanding.request.owner, height);
-        if outstanding.is_complete() {
+        self.withdraw_claim(owner, height);
+        if complete {
             self.finish_outstanding_at(key, Disposition::Satisfied);
         } else {
             self.publish_slot_diagnostics();
@@ -1877,34 +1788,6 @@ impl PeerRoutine {
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// The still-unreceived heights of an outstanding request (the ones that return
-/// to `pending` on retry/timeout — never the received-and-buffered ones, which
-/// stay claimed in `work.in_flight`).
-fn unreceived_heights(
-    outstanding: &OutstandingBlockRange,
-) -> impl Iterator<Item = block::Height> + '_ {
-    outstanding
-        .request
-        .expected_blocks
-        .iter()
-        .filter(move |expected| !outstanding.has_received(expected.height))
-        .map(|expected| expected.height)
-}
-
-fn outstanding_unreceived_through(
-    outstanding: &OutstandingBlockRange,
-    tip: block::Height,
-) -> impl Iterator<Item = block::Height> + '_ {
-    outstanding
-        .request
-        .expected_blocks
-        .iter()
-        .filter(move |expected| {
-            expected.height <= tip && !outstanding.has_received(expected.height)
-        })
-        .map(|expected| expected.height)
 }
 
 impl Drop for PeerRoutine {

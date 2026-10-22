@@ -16,7 +16,7 @@ use super::{
 
 mod requests;
 
-pub(super) use requests::SharedDeadlines;
+pub(super) use requests::{unreceived_heights, BodyMatch, Disposition, SharedDeadlines};
 
 /// One block-sync session's download, status, and liveness facts.
 ///

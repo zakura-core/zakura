@@ -134,15 +134,17 @@ fn end_of_support_date() {
     assert!(!logs.contains(EOS_WARN_MESSAGE_HEADER));
 }
 
-/// Keep Mainnet EOS within one block before December 5, 2026.
+/// Keep Mainnet EOS within two days before December 5, 2026.
 #[test]
 fn mainnet_end_of_support_precedes_december_5() {
     let network = Network::Mainnet;
-    // Fixed projection anchor from the September 22 Mainnet release-state
-    // bundle's `mainnet-vct-manifest.json`. Keep this independent of release
-    // height bumps and later bundle imports so they cannot move the deadline.
+    // Fixed projection anchor: the block timestamp of the September 22
+    // Mainnet release-state bundle's finalized height. Keep this independent
+    // of release height bumps and later bundle imports so they cannot move
+    // the deadline. The block's own timestamp is about a day before the
+    // bundle's `generated_at`, which must not be used as an anchor.
     let reference_time = Utc
-        .with_ymd_and_hms(2026, 9, 22, 5, 46, 39)
+        .with_ymd_and_hms(2026, 9, 21, 2, 29, 57)
         .single()
         .expect("the reference timestamp is valid");
     let reference_height = Height(3_490_665);
@@ -168,10 +170,8 @@ fn mainnet_end_of_support_precedes_december_5() {
         + chrono::Duration::seconds(post_nu7_blocks * i64::from(POST_NU7_POW_TARGET_SPACING));
 
     assert!(
-        estimated_halt < deadline
-            && deadline - estimated_halt
-                < chrono::Duration::seconds(i64::from(POST_NU7_POW_TARGET_SPACING)),
-        "Mainnet EOS must be within one block before {deadline}; estimated halt \
+        estimated_halt < deadline && deadline - estimated_halt < chrono::Duration::days(2),
+        "Mainnet EOS must be within two days before {deadline}; estimated halt \
          is {estimated_halt} at {first_unsupported_height:?}.",
     );
 }

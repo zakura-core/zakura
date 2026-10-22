@@ -5,10 +5,12 @@
 //! whatever `Ordering` the code passes. Weak-memory behavior is out of scope
 //! (`runtime.md`, Appendix B). Metrics-only atomics belong in
 //! [`counter`](super::counter), which has no points.
+//!
+//! Fences are std's. They touch no shared value, so they aren't points.
 
 use std::{fmt, panic::Location, sync::atomic as std_atomic};
 
-pub use std_atomic::Ordering;
+pub use std_atomic::{compiler_fence, fence, Ordering};
 
 use crate::sim::{point, Op};
 
@@ -119,6 +121,13 @@ macro_rules! atomic_int {
                 self.0.fetch_xor(value, order)
             }
 
+            /// Bitwise nand with `value`. Returns the old value.
+            #[track_caller]
+            pub fn fetch_nand(&self, value: $int, order: Ordering) -> $int {
+                point(Op::AtomicRmw, Location::caller());
+                self.0.fetch_nand(value, order)
+            }
+
             /// Keeps the larger of the value and `value`. Returns the old value.
             #[track_caller]
             pub fn fetch_max(&self, value: $int, order: Ordering) -> $int {
@@ -207,6 +216,16 @@ atomic_int!(
     /// std's `AtomicUsize`, with preemption points.
     AtomicUsize,
     usize
+);
+atomic_int!(
+    /// std's `AtomicI8`, with preemption points.
+    AtomicI8,
+    i8
+);
+atomic_int!(
+    /// std's `AtomicI16`, with preemption points.
+    AtomicI16,
+    i16
 );
 atomic_int!(
     /// std's `AtomicI32`, with preemption points.
@@ -320,6 +339,45 @@ impl AtomicBool {
         point(Op::AtomicRmw, Location::caller());
         self.0.fetch_nand(value, order)
     }
+
+    /// Flips the value. Returns the old value.
+    #[track_caller]
+    pub fn fetch_not(&self, order: Ordering) -> bool {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.fetch_not(order)
+    }
+
+    /// Applies `f` until it returns `None` or its result is stored. One
+    /// point, since nothing else runs between attempts.
+    #[track_caller]
+    pub fn fetch_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: F,
+    ) -> Result<bool, bool>
+    where
+        F: FnMut(bool) -> Option<bool>,
+    {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.try_update(set_order, fetch_order, f)
+    }
+
+    /// std's `try_update`: [`fetch_update`](Self::fetch_update) by its newer
+    /// name.
+    #[track_caller]
+    pub fn try_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: F,
+    ) -> Result<bool, bool>
+    where
+        F: FnMut(bool) -> Option<bool>,
+    {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.try_update(set_order, fetch_order, f)
+    }
 }
 
 impl From<bool> for AtomicBool {
@@ -329,6 +387,125 @@ impl From<bool> for AtomicBool {
 }
 
 impl fmt::Debug for AtomicBool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// std's `AtomicPtr`, with preemption points.
+#[repr(transparent)]
+pub struct AtomicPtr<T>(std_atomic::AtomicPtr<T>);
+
+impl<T> AtomicPtr<T> {
+    /// A new atomic holding `ptr`.
+    pub const fn new(ptr: *mut T) -> Self {
+        AtomicPtr(std_atomic::AtomicPtr::new(ptr))
+    }
+
+    /// The pointer, through a unique borrow. Not a point.
+    pub fn get_mut(&mut self) -> &mut *mut T {
+        self.0.get_mut()
+    }
+
+    /// The pointer, consuming the atomic.
+    pub fn into_inner(self) -> *mut T {
+        self.0.into_inner()
+    }
+
+    /// Reads the pointer.
+    #[track_caller]
+    pub fn load(&self, order: Ordering) -> *mut T {
+        point(Op::AtomicLoad, Location::caller());
+        self.0.load(order)
+    }
+
+    /// Writes `ptr`.
+    #[track_caller]
+    pub fn store(&self, ptr: *mut T, order: Ordering) {
+        point(Op::AtomicStore, Location::caller());
+        self.0.store(ptr, order);
+    }
+
+    /// Writes `ptr` and returns the old pointer.
+    #[track_caller]
+    pub fn swap(&self, ptr: *mut T, order: Ordering) -> *mut T {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.swap(ptr, order)
+    }
+
+    /// Writes `new` if the pointer is `current`.
+    #[track_caller]
+    pub fn compare_exchange(
+        &self,
+        current: *mut T,
+        new: *mut T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<*mut T, *mut T> {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.compare_exchange(current, new, success, failure)
+    }
+
+    /// Like `compare_exchange`. It never fails spuriously here, because the
+    /// run is single-threaded.
+    #[track_caller]
+    pub fn compare_exchange_weak(
+        &self,
+        current: *mut T,
+        new: *mut T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<*mut T, *mut T> {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.compare_exchange(current, new, success, failure)
+    }
+
+    /// Applies `f` until it returns `None` or its result is stored. One
+    /// point, since nothing else runs between attempts.
+    #[track_caller]
+    pub fn fetch_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: F,
+    ) -> Result<*mut T, *mut T>
+    where
+        F: FnMut(*mut T) -> Option<*mut T>,
+    {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.try_update(set_order, fetch_order, f)
+    }
+
+    /// std's `try_update`: [`fetch_update`](Self::fetch_update) by its newer
+    /// name.
+    #[track_caller]
+    pub fn try_update<F>(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: F,
+    ) -> Result<*mut T, *mut T>
+    where
+        F: FnMut(*mut T) -> Option<*mut T>,
+    {
+        point(Op::AtomicRmw, Location::caller());
+        self.0.try_update(set_order, fetch_order, f)
+    }
+}
+
+impl<T> Default for AtomicPtr<T> {
+    fn default() -> Self {
+        AtomicPtr::new(std::ptr::null_mut())
+    }
+}
+
+impl<T> From<*mut T> for AtomicPtr<T> {
+    fn from(ptr: *mut T) -> Self {
+        AtomicPtr::new(ptr)
+    }
+}
+
+impl<T> fmt::Debug for AtomicPtr<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }

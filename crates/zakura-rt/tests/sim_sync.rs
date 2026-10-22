@@ -280,3 +280,30 @@ fn coordination_atomics_point_and_counters_do_not() {
     assert_eq!(report.count(Op::AtomicRmw), 2, "the counter adds no point");
     assert_eq!(report.count(Op::AtomicLoad), 2);
 }
+
+#[test]
+fn sim_atomics_cover_the_rest_of_std() {
+    let (values, report) = run(async {
+        let bits = zakura_rt::sync::atomic::AtomicI8::new(0b0110);
+        let old = bits.fetch_nand(0b0011, Ordering::Relaxed);
+        let flag = AtomicBool::new(false);
+        let flipped = flag.fetch_not(Ordering::Relaxed);
+        let mut target = 7_u32;
+        let expected: *mut u32 = &mut target;
+        let ptr = zakura_rt::sync::atomic::AtomicPtr::default();
+        ptr.store(expected, Ordering::Release);
+        zakura_rt::sync::atomic::fence(Ordering::SeqCst);
+        let read = ptr.load(Ordering::Acquire);
+        (
+            old,
+            bits.into_inner(),
+            flipped,
+            flag.into_inner(),
+            read == expected,
+        )
+    });
+    assert_eq!(values, (0b0110, !0b0010, false, true, true));
+    assert_eq!(report.count(Op::AtomicRmw), 2, "fetch_nand and fetch_not");
+    assert_eq!(report.count(Op::AtomicStore), 1);
+    assert_eq!(report.count(Op::AtomicLoad), 1, "the fence is no point");
+}

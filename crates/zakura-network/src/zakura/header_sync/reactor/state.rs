@@ -6,13 +6,15 @@
 
 use std::{collections::VecDeque, time::Duration};
 
+use zakura_chain::block;
 use zakura_header_chain::HeaderWorkAuthority;
 use zakura_rt::{collections::HashMap, time::Instant};
 
 use super::{
-    AdvertisedHeaderTarget, CompletedHeaderTargets, HeaderPortOperation, HeaderTargetPhase,
-    HeaderTargetPurpose, PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status,
-    ZakuraPeerId,
+    source_id_from_peer, AdvertisedHeaderTarget, AuxSchema, CompletedHeaderTargets,
+    HeaderPortOperation, HeaderRequestTerminal, HeaderTargetPhase, HeaderTargetPurpose,
+    PeerWorkPriority, RepairRequirement, RepairRequirementSlot, Status, ZakuraPeerId,
+    VCT_REPAIR_RETRY_INTERVAL,
 };
 
 /// The header-sync reactor's scheduling records.
@@ -88,15 +90,23 @@ impl ReactorState {
     /// Install fresh scheduling facts for `peer`'s new session, and return
     /// whether they replace an earlier session's facts.
     ///
+    /// A new peer joins the back of the repair supplier order. A replacement
+    /// keeps its position until [`Self::requeue_supplier`] moves it.
+    ///
     /// The replaced session's pending `Close` dies with it. The peer's pending
     /// locator read stays pending until its storage operation settles.
     pub(super) fn admit_session(&mut self, peer: &ZakuraPeerId) -> bool {
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.bump_scheduling_revision();
-        self.peers
+        let replaced = self
+            .peers
             .insert(peer.clone(), PeerSchedule::default())
-            .is_some()
+            .is_some();
+        if !replaced {
+            self.vct_supplier_order.push_back(peer.clone());
+        }
+        replaced
     }
 
     /// Remove `peer`'s session facts and its pending `Close`.
@@ -106,6 +116,7 @@ impl ReactorState {
         }
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
+        self.vct_supplier_order.retain(|queued| queued != peer);
     }
 
     /// Record `status` as `peer`'s unspent offer.
@@ -313,7 +324,337 @@ impl ReactorState {
         take_due(&mut self.close_deadlines, now)
     }
 
+    /// The schema for an ordinary round of up to `count` headers after `start`
+    /// from `peer`, whose status is `status`, at `now`: `schema` while the
+    /// round ends at or below the peer's work anchor and no `HistoryPruned`
+    /// fallback holds, and no records otherwise.
+    ///
+    /// A publisher is sure to hold records only through its finalized height,
+    /// and a schema 1 page waits for a missing record rather than dropping it,
+    /// so a round past the anchor could stall. A pruned publisher lacks them
+    /// below its index height too, which the fallback learns.
+    pub(super) fn ordinary_schema(
+        &self,
+        peer: &ZakuraPeerId,
+        schema: AuxSchema,
+        status: &Status,
+        start: block::Height,
+        count: u32,
+        now: Instant,
+    ) -> AuxSchema {
+        let fallback = self
+            .pruned_peers
+            .get(peer)
+            .and_then(|pruned| pruned.aux_fallback)
+            .is_some_and(|fallback| fallback.until > now);
+        if !fallback && start.0.saturating_add(count) <= status.work_anchor_height.0 {
+            schema
+        } else {
+            AuxSchema::None
+        }
+    }
+
+    /// Whether ordinary discovery with `peer` still waits at `now` after a
+    /// round without records ended `HistoryPruned` at the selected header tip
+    /// `tip`.
+    pub(super) fn pruned_pause_holds(
+        &self,
+        peer: &ZakuraPeerId,
+        tip: zakura_header_chain::Frontier,
+        now: Instant,
+    ) -> bool {
+        self.pruned_peers
+            .get(peer)
+            .and_then(|pruned| pruned.pruned_pause)
+            .is_some_and(|(pause, paused_at)| pause.until > now && paused_at == tip)
+    }
+
+    /// Remember that `peer` ended an ordinary round asking for `schema` with
+    /// `HistoryPruned` at `now`, while the selected header tip was `tip`.
+    /// This is legal and never a fault.
+    ///
+    /// After a schema 1 round, the peer's next rounds ask for no records,
+    /// starting at once from the validated tip, and schema 1 is probed again
+    /// after a backoff. After a round without records, ordinary discovery with
+    /// the peer pauses instead, so another peer takes the target.
+    ///
+    /// Return whether the peer's rounds now fall back to no records.
+    pub(super) fn note_history_pruned(
+        &mut self,
+        peer: &ZakuraPeerId,
+        schema: AuxSchema,
+        tip: Option<zakura_header_chain::Frontier>,
+        now: Instant,
+    ) -> bool {
+        let Some(schedule) = self.peers.get_mut(peer) else {
+            return false;
+        };
+        let pruned = self.pruned_peers.entry(peer.clone()).or_default();
+        match schema {
+            AuxSchema::V1 => {
+                pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
+                schedule.status_spent = false;
+                self.bump_scheduling_revision();
+                true
+            }
+            AuxSchema::None => {
+                if let Some(tip) = tip {
+                    let previous = pruned.pruned_pause.map(|(pause, _)| pause);
+                    pruned.pruned_pause = Some((PrunedBackoff::after(previous, now), tip));
+                }
+                false
+            }
+        }
+    }
+
+    /// End `peer`'s `HistoryPruned` pause after an admitted ordinary round,
+    /// and its schema fallback when the round asked for `schema` 1.
+    pub(super) fn note_ordinary_round_admitted(&mut self, peer: &ZakuraPeerId, schema: AuxSchema) {
+        let Some(pruned) = self.pruned_peers.get_mut(peer) else {
+            return;
+        };
+        pruned.pruned_pause = None;
+        if schema == AuxSchema::V1 {
+            pruned.aux_fallback = None;
+        }
+        if *pruned == PrunedPeer::default() {
+            self.pruned_peers.remove(peer);
+        }
+    }
+
+    /// Drop what `HistoryPruned` taught about peers once it no longer matters at `now`.
+    pub(super) fn prune_pruned_peers(&mut self, now: Instant) {
+        self.pruned_peers.retain(|_, pruned| pruned.relevant(now));
+    }
+
+    /// Hold back ordinary discovery until the committed state version passes
+    /// `state_version`, where state refused an admission for local resources.
+    pub(super) fn note_resource_stall(&mut self, state_version: zakura_header_chain::StateVersion) {
+        self.ordinary_resource_stall = self.ordinary_resource_stall.max(Some(state_version));
+    }
+
+    /// Whether a committed resource stall still holds back new ordinary
+    /// attempts under the committed state version `committed`.
+    ///
+    /// Every supplier would hit the same local stall, so discovery waits until
+    /// the committed state version advances past the stall receipt.
+    pub(super) fn ordinary_discovery_paused(
+        &self,
+        committed: Option<zakura_header_chain::StateVersion>,
+    ) -> bool {
+        self.ordinary_resource_stall
+            .is_some_and(|stalled_at| committed.is_none_or(|committed| committed <= stalled_at))
+    }
+
     /// The earliest deadline this state waits for, if any.
+    /// Move the supplier whose session `source` names to the back of the repair supplier order.
+    pub(super) fn rotate_supplier(&mut self, source: zakura_header_chain::SourceId) {
+        let Some(index) = self
+            .vct_supplier_order
+            .iter()
+            .position(|peer| source_id_from_peer(peer) == source)
+        else {
+            return;
+        };
+        let peer = self
+            .vct_supplier_order
+            .remove(index)
+            .expect("the supplier index came from this bounded queue");
+        self.vct_supplier_order.push_back(peer);
+    }
+
+    /// Forget a replaced session's repair history and move it to the back of the supplier order.
+    pub(super) fn requeue_supplier(&mut self, source: zakura_header_chain::SourceId) {
+        if let Some(task) = self.vct_repair.current_mut() {
+            task.forget_source(source);
+        }
+        self.rotate_supplier(source);
+    }
+
+    /// Apply `retry`'s attribution to `owner`'s repair and report whether a retry is scheduled.
+    ///
+    /// Supplier and excluded-input failures charge the supplier and rotate it to the back
+    /// of the supplier order. A local failure backs the repair off until
+    /// [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
+    /// When the supplier's session is no longer current, the departed session's failure
+    /// history leaves the task.
+    pub(super) fn schedule_repair_retry(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        retry: VctRepairRetry,
+        session_is_current: bool,
+        now: Instant,
+    ) -> bool {
+        let source = retry.source;
+        let scheduled =
+            self.vct_repair
+                .get_mut(owner)
+                .is_some_and(|task| match retry.attribution {
+                    VctRepairRetryAttribution::Supplier => {
+                        if retry.terminal == HeaderRequestTerminal::TargetNotSelected {
+                            task.wait_for_supplier_status(source).is_ok()
+                        } else {
+                            task.retry(source).is_ok()
+                        }
+                    }
+                    VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
+                    VctRepairRetryAttribution::Stale => false,
+                    VctRepairRetryAttribution::Local => task
+                        .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
+                        .is_ok(),
+                });
+        if !scheduled {
+            return false;
+        }
+        if !session_is_current {
+            // Retained local work can finish after its supplier reconnects.
+            // Its failure history belongs to the departed session.
+            if let Some(task) = self.vct_repair.get_mut(owner) {
+                task.forget_source(source);
+            }
+        }
+        if retry.attribution.charges_supplier() {
+            self.rotate_supplier(source);
+        }
+        true
+    }
+
+    /// Record the latest reason repair `generation` has not completed.
+    ///
+    /// A new generation restarts the stall clock at `now`.
+    pub(super) fn record_repair_stall(
+        &mut self,
+        generation: u64,
+        predecessor: zakura_header_chain::Frontier,
+        rejections: VctSupplierRejections,
+        outcome: VctRepairStallOutcome,
+        now: Instant,
+    ) {
+        match self.vct_repair_stall.as_mut() {
+            Some(record) if record.generation == generation => {
+                record.predecessor = predecessor;
+                record.rejections = rejections;
+                record.outcome = outcome;
+            }
+            _ => {
+                self.vct_repair_stall = Some(VctRepairStall {
+                    generation,
+                    since: now,
+                    last_trace: None,
+                    reported: false,
+                    predecessor,
+                    rejections,
+                    outcome,
+                });
+            }
+        }
+    }
+
+    /// Return the stall output due at `now`, and mark it emitted.
+    ///
+    /// The stall record dies with its generation. At most one trace row is due per
+    /// [`VCT_REPAIR_STALL_TRACE_INTERVAL`], and at most one error report per generation.
+    pub(super) fn refresh_repair_stall(&mut self, now: Instant) -> Option<RepairStallDue> {
+        let record = self.vct_repair_stall?;
+        let Some(task) = self
+            .vct_repair
+            .current()
+            .filter(|task| task.repair_generation == record.generation)
+            .cloned()
+        else {
+            self.vct_repair_stall = None;
+            return None;
+        };
+        let stalled_for = now.saturating_duration_since(record.since);
+        let trace = record.last_trace.is_none_or(|last| {
+            now.saturating_duration_since(last) >= VCT_REPAIR_STALL_TRACE_INTERVAL
+        });
+        let report = !record.reported && stalled_for >= VCT_REPAIR_STALL_REPORT_AFTER;
+        if !trace && !report {
+            return None;
+        }
+        let best_peer_tip = self
+            .peers
+            .values()
+            .filter_map(|schedule| schedule.last_status.as_ref())
+            .map(|status| (status.selected_tip_height, status.selected_tip_hash))
+            .max_by_key(|(height, _)| *height);
+        if let Some(current) = self.vct_repair_stall.as_mut() {
+            if trace {
+                current.last_trace = Some(now);
+            }
+            if report {
+                current.reported = true;
+            }
+        }
+        Some(RepairStallDue {
+            task,
+            record,
+            trace,
+            report,
+            stalled_for,
+            best_peer_tip,
+        })
+    }
+
+    /// Whether `desired` is the repair the reactor already runs.
+    pub(super) fn preserves_repair(&self, desired: &RepairRequirement) -> bool {
+        self.vct_repair.current().is_some_and(|task| {
+            task.repair_generation == desired.repair_generation
+                && task.height == desired.height
+                && task.owner.header_generation == desired.owner.header_generation
+                && task.owner.verified_generation == desired.owner.verified_generation
+                && task.owner.branch == desired.owner.branch
+        })
+    }
+
+    /// Remove the current repair and its stall record.
+    pub(super) fn retire_repair(&mut self) -> Option<RepairRequirement> {
+        self.vct_repair_stall = None;
+        self.vct_repair.take()
+    }
+
+    /// Install `desired` as the sole repair.
+    pub(super) fn install_repair(&mut self, desired: RepairRequirement) {
+        let replaced = self.vct_repair.insert(desired);
+        debug_assert!(
+            replaced.is_none(),
+            "the sole repair is cleared before scheduling its replacement"
+        );
+    }
+
+    /// Clear the local operation that `owner` finished in `phase`.
+    ///
+    /// An operation already reported as fatal stays installed until shutdown.
+    pub(super) fn finish_local_operation(
+        &mut self,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        phase: HeaderTargetPhase,
+    ) {
+        if self.vct_local_operation.as_ref().is_some_and(|operation| {
+            operation.owner == owner && operation.phase == phase && !operation.fatal_sent
+        }) {
+            self.vct_local_operation = None;
+        }
+    }
+
+    /// Check the local operation's hard deadline at `now`.
+    ///
+    /// An expired operation is marked fatal once, and stays installed.
+    pub(super) fn expire_local_operation(&mut self, now: Instant) -> LocalOperationExpiry {
+        let Some(operation) = self.vct_local_operation.as_mut() else {
+            return LocalOperationExpiry::Idle;
+        };
+        if operation.fatal_sent {
+            return LocalOperationExpiry::AlreadyFatal;
+        }
+        if operation.deadline > now {
+            return LocalOperationExpiry::Running;
+        }
+        operation.fatal_sent = true;
+        LocalOperationExpiry::Expired(operation.clone())
+    }
+
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.request_deadlines
             .values()
@@ -753,6 +1094,131 @@ impl VctRepairStall {
             trace_at.min(self.since + VCT_REPAIR_STALL_REPORT_AFTER)
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum VctRepairRetryAttribution {
+    Supplier,
+    ExcludedInput,
+    Stale,
+    Local,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct VctRepairRetry {
+    pub(super) source: zakura_header_chain::SourceId,
+    pub(super) terminal: HeaderRequestTerminal,
+    pub(super) attribution: VctRepairRetryAttribution,
+}
+
+impl VctRepairRetryAttribution {
+    /// Whether the failure charges the supplier and rotates it in the supplier order.
+    pub(super) fn charges_supplier(self) -> bool {
+        matches!(self, Self::Supplier | Self::ExcludedInput)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Supplier => "supplier_retry",
+            Self::ExcludedInput => "excluded_input",
+            Self::Stale => "stale_episode",
+            Self::Local => "local_backoff",
+        }
+    }
+
+    pub(super) fn stall_outcome(self) -> VctRepairStallOutcome {
+        match self {
+            Self::Supplier | Self::ExcludedInput => VctRepairStallOutcome::SupplierFailure,
+            Self::Stale | Self::Local => VctRepairStallOutcome::LocalFailure,
+        }
+    }
+}
+
+impl VctRepairRetry {
+    pub(super) fn supplier(
+        source: zakura_header_chain::SourceId,
+        terminal: HeaderRequestTerminal,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            attribution: VctRepairRetryAttribution::Supplier,
+        }
+    }
+
+    pub(super) fn local(
+        source: zakura_header_chain::SourceId,
+        terminal: HeaderRequestTerminal,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            attribution: VctRepairRetryAttribution::Local,
+        }
+    }
+
+    pub(super) fn excluded_input(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::ExcludedAuxiliaryInput,
+            attribution: VctRepairRetryAttribution::ExcludedInput,
+        }
+    }
+
+    pub(super) fn stale(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::RepairObsolete,
+            attribution: VctRepairRetryAttribution::Stale,
+        }
+    }
+}
+
+pub(super) fn vct_error_retry(
+    source: zakura_header_chain::SourceId,
+    terminal: HeaderRequestTerminal,
+    error: &zakura_header_chain::HeaderChainError,
+) -> VctRepairRetry {
+    if error.category == zakura_header_chain::ErrorCategory::StaleTargetOrGeneration {
+        return VctRepairRetry::stale(source);
+    }
+    let attributed_source = match error.attribution {
+        zakura_header_chain::Attribution::HeaderPeer(attributed)
+        | zakura_header_chain::Attribution::BodyPeer(attributed)
+        | zakura_header_chain::Attribution::AuxPeer(attributed) => Some(attributed),
+        zakura_header_chain::Attribution::None => None,
+    };
+    if attributed_source == Some(source) {
+        VctRepairRetry::supplier(source, terminal)
+    } else {
+        VctRepairRetry::local(source, HeaderRequestTerminal::LocalError)
+    }
+}
+
+/// Stall output that [`ReactorState::refresh_repair_stall`] found due.
+#[derive(Clone, Debug)]
+pub(super) struct RepairStallDue {
+    pub(super) task: RepairRequirement,
+    pub(super) record: VctRepairStall,
+    /// Emit one stall trace row.
+    pub(super) trace: bool,
+    /// Report the stall at error level.
+    pub(super) report: bool,
+    pub(super) stalled_for: Duration,
+    pub(super) best_peer_tip: Option<(block::Height, block::Hash)>,
+}
+
+/// The local operation's state at one deadline check.
+#[derive(Clone, Debug)]
+pub(super) enum LocalOperationExpiry {
+    /// No local operation runs.
+    Idle,
+    /// The operation runs within its deadline.
+    Running,
+    /// The operation was already reported as fatal.
+    AlreadyFatal,
+    /// The operation passed its deadline at this check.
+    Expired(VctLocalOperation),
 }
 
 #[derive(Clone, Debug)]

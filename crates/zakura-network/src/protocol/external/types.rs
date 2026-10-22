@@ -8,7 +8,7 @@ use zakura_chain::{
     },
 };
 
-use crate::constants::{self, CURRENT_NETWORK_PROTOCOL_VERSION};
+use crate::constants;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -91,47 +91,35 @@ impl Version {
     ) -> Version {
         Version(match (network, network_upgrade) {
             (_, Genesis) | (_, BeforeOverwinter) => 170_002,
-            (Testnet(params), Overwinter) if params.is_default_testnet() => 170_003,
+            (Testnet(_), Overwinter) => 170_003,
             (Mainnet, Overwinter) => 170_005,
-            (Testnet(params), Sapling) if params.is_default_testnet() => 170_007,
             (Testnet(params), Sapling) if params.is_regtest() => 170_006,
+            (Testnet(_), Sapling) => 170_007,
             (Mainnet, Sapling) => 170_007,
-            (Testnet(params), Blossom) if params.is_default_testnet() || params.is_regtest() => {
-                170_008
-            }
+            (Testnet(_), Blossom) => 170_008,
             (Mainnet, Blossom) => 170_009,
-            (Testnet(params), Heartwood) if params.is_default_testnet() || params.is_regtest() => {
-                170_010
-            }
+            (Testnet(_), Heartwood) => 170_010,
             (Mainnet, Heartwood) => 170_011,
-            (Testnet(params), Canopy) if params.is_default_testnet() || params.is_regtest() => {
-                170_012
-            }
+            (Testnet(_), Canopy) => 170_012,
             (Mainnet, Canopy) => 170_013,
-            (Testnet(params), Nu5) if params.is_default_testnet() || params.is_regtest() => 170_050,
+            (Testnet(_), Nu5) => 170_050,
             (Mainnet, Nu5) => 170_100,
-            (Testnet(params), Nu6) if params.is_default_testnet() || params.is_regtest() => 170_110,
+            (Testnet(_), Nu6) => 170_110,
             (Mainnet, Nu6) => 170_120,
-            (Testnet(params), Nu6_1) if params.is_default_testnet() || params.is_regtest() => {
-                170_130
-            }
+            (Testnet(_), Nu6_1) => 170_130,
             (Mainnet, Nu6_1) => 170_140,
-            (Testnet(params), Nu6_2) if params.is_default_testnet() || params.is_regtest() => {
-                170_150
-            }
+            (Testnet(_), Nu6_2) => 170_150,
             (Mainnet, Nu6_2) => 170_150,
-            (Testnet(params), Nu6_3) if params.is_default_testnet() || params.is_regtest() => {
-                170_160
-            }
+            (Testnet(_), Nu6_3) => 170_160,
             (Mainnet, Nu6_3) => 170_160,
             // From NU7 onward, ZIP 204 assigns each upgrade a Testnet version of the form
             // 170_000 + 20·k and a Mainnet version 10 higher, so no two networks share a version.
-            // Regtest uses the Testnet version.
-            (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_180,
+            // Regtest and custom testnets use the Testnet version.
+            (Testnet(_), Nu7) => 170_180,
             (Mainnet, Nu7) => 170_190,
 
-            // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
-            (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
+            #[cfg(zcash_unstable = "zfuture")]
+            (Testnet(_), ZFuture) => constants::CURRENT_NETWORK_PROTOCOL_VERSION.0,
 
             #[cfg(zcash_unstable = "zfuture")]
             (Mainnet, ZFuture) => {
@@ -175,6 +163,7 @@ impl Default for Nonce {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION;
 
     #[test]
     fn version_extremes_mainnet() {
@@ -304,6 +293,58 @@ mod test {
             Version::min_specified_for_upgrade(&Mainnet, Nu7),
             Version(base + 10)
         );
+    }
+
+    #[test]
+    fn custom_network_minimum_follows_activation_heights() {
+        use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, Parameters};
+
+        let network = Parameters::build()
+            .with_network_name("ProtocolMinimumTest")
+            .unwrap()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu6_3: Some(10),
+                nu7: Some(20),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
+        let (mut tracked, tip) = crate::peer::MinimumPeerVersion::with_mock_chain_tip(&network);
+        for (height, minimum) in [
+            (0, 170_150),
+            (9, 170_150),
+            (10, 170_160),
+            (19, 170_160),
+            (20, 170_180),
+            (21, 170_180),
+        ] {
+            tip.send_best_tip_height(Some(block::Height(height)));
+            assert_eq!(tracked.current(), Version(minimum));
+            let mut restarted =
+                crate::peer::MinimumPeerVersion::new(tracked.chain_tip().clone(), &network);
+            assert_eq!(restarted.current(), Version(minimum));
+            assert_eq!(
+                Version::min_remote_for_height(&network, block::Height(height)),
+                Version(minimum)
+            );
+        }
+        assert_eq!(
+            Version::min_remote_for_height(&network, None),
+            Version(170_150)
+        );
+        for upgrade in [
+            Overwinter, Sapling, Blossom, Heartwood, Canopy, Nu5, Nu6, Nu6_1, Nu6_2, Nu6_3, Nu7,
+        ] {
+            assert_eq!(
+                Version::min_specified_for_upgrade(&network, upgrade),
+                Version::min_specified_for_upgrade(&Network::new_default_testnet(), upgrade)
+            );
+        }
+        let minimum = Version::min_remote_for_height(&network, block::Height(20));
+        assert!(Version(170_180) >= minimum);
+        assert!(Version(170_179) < minimum);
     }
 
     #[test]

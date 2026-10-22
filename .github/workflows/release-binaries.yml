@@ -61,6 +61,10 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      DOCKERHUB_TOKEN_ZAKURA:
+        description: "Docker Hub token for authenticated image pulls in the build jobs; callers that omit it fall back to anonymous pulls"
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -291,6 +295,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+
+      # Authenticate Docker Hub pulls before any image download: the depot
+      # buildx driver container and the Dockerfile base images otherwise
+      # count against the runner IP pool's shared anonymous data limit,
+      # which intermittently fails pre-tag staging builds. Publishing stays
+      # separately gated on the tag ref below. Forks skip the login and
+      # keep pulling anonymously.
+      - name: Login to DockerHub for pulls
+        if: ${{ github.repository == 'zakura-core/zakura' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        with:
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
@@ -583,6 +600,19 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
 
+      # Authenticate Docker Hub pulls before any image download: the depot
+      # buildx driver container and the Dockerfile base images otherwise
+      # count against the runner IP pool's shared anonymous data limit,
+      # which intermittently fails pre-tag staging builds. Publishing stays
+      # separately gated on the tag ref below. Forks skip the login and
+      # keep pulling anonymously.
+      - name: Login to DockerHub for pulls
+        if: ${{ github.repository == 'zakura-core/zakura' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        with:
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
+
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.2.0 # zizmor: ignore[cache-poisoning] -- shared Docker Build Cloud cache across envs, isolation fix pending
@@ -725,6 +755,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.resolve-release.outputs.checkout_ref }}
+
+      # Authenticate Docker Hub pulls before any image download: the depot
+      # buildx driver container and the Dockerfile base images otherwise
+      # count against the runner IP pool's shared anonymous data limit,
+      # which intermittently fails pre-tag staging builds. Publishing stays
+      # separately gated on the tag ref below. Forks skip the login and
+      # keep pulling anonymously.
+      - name: Login to DockerHub for pulls
+        if: ${{ github.repository == 'zakura-core/zakura' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        with:
+          username: valaroman
+          password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
 
       - name: Set up Docker Buildx
         if: ${{ needs.resolve-release.outputs.build_backend != 'depot' }}

@@ -88,13 +88,13 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
-use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
+use tower::{load_shed::LoadShed, timeout::Timeout, util::BoxService, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
-use zakura_node_services::task::spawn_erased;
+use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_rpc::SubmitBlockChannel;
 use zakura_state::StorageMode;
 
@@ -491,9 +491,7 @@ impl StartCmd {
                 (None, None)
             };
 
-        let state = ServiceBuilder::new()
-            .buffer(Self::state_buffer_bound(&config))
-            .service(state_service);
+        let state = spawn_buffer(state_service, Self::state_buffer_bound(&config));
 
         let zakura_bootstrap_snapshots = config
             .network
@@ -551,11 +549,8 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
-        let inbound = ServiceBuilder::new()
-            .load_shed()
-            .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
-            .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(
+        let inbound = LoadShed::new(spawn_buffer(
+            Timeout::new(
                 Inbound::new(
                     config.sync.full_verify_concurrency_limit,
                     config.network.expose_peer_addresses,
@@ -564,7 +559,10 @@ impl StartCmd {
                     setup_rx,
                 )
                 .with_pending_blocks(pending_blocks.clone()),
-            );
+                MAX_INBOUND_RESPONSE_TIME,
+            ),
+            inbound::downloads::MAX_INBOUND_CONCURRENCY,
+        ));
 
         let advertised_services = Self::advertised_services(&config);
 
@@ -684,10 +682,10 @@ impl StartCmd {
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
         );
-        let mempool = BoxService::new(mempool);
-        let mempool = ServiceBuilder::new()
-            .buffer(mempool::downloads::MAX_INBOUND_CONCURRENCY)
-            .service(mempool);
+        let mempool = spawn_buffer(
+            BoxService::new(mempool),
+            mempool::downloads::MAX_INBOUND_CONCURRENCY,
+        );
 
         if tx_verifier_setup_tx.send(mempool.clone()).is_err() {
             warn!("error setting up the transaction verifier with a handle to the mempool service");

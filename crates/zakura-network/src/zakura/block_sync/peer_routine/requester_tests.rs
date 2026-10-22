@@ -1,5 +1,5 @@
 use super::super::regulated::live_requester::MAX_PENDING_ENDINGS;
-use super::super::{request::BlockSizeEstimate, MSG_BS_BLOCK};
+use super::super::{request::BlockSizeEstimate, BlockSyncMessage, MSG_BS_BLOCK};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
 use crate::zakura::{CwndUnit, MAX_BS_BLOCKS_PER_REQUEST};
@@ -96,7 +96,7 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
             BlockSizeEstimate::Confirmed(1000),
         )],
     );
-    assert!(!routine.received_status);
+    assert!(!routine.state.received_status);
     let mut running = Box::pin(routine.run());
     let request = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
@@ -118,7 +118,7 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
 #[tokio::test]
 async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.try_fill().await;
+    routine.try_fill();
     let request = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(request).unwrap(),
@@ -137,13 +137,13 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
     let retirement = routine.requester.retirement_deadline(grace).unwrap();
     routine.retry_avoid.clear();
     routine.window.note_block_progress(Instant::now(), grace);
-    assert_eq!(routine.try_fill().await, Some(retirement));
+    assert_eq!(routine.try_fill().retry_at, Some(retirement));
     assert!(
         routine.window.outstanding.is_empty(),
         "the old range still authorizes a response"
     );
     assert!(routine.work.pending_contains(block::Height(1)));
-    let before = routine.next_request_id.unwrap().get();
+    let before = routine.state.next_request_id.unwrap().get();
     let (_input, recv) = crate::zakura::framed_channel(4);
     routine.recv = recv;
     let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
@@ -156,7 +156,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         assert!(futures::poll!(&mut running).is_pending());
     }
     drop(running);
-    assert!(routine.next_request_id.unwrap().get() - before <= 2);
+    assert!(routine.state.next_request_id.unwrap().get() - before <= 2);
 
     let ending = BlockSyncMessage::RangeUnavailable {
         start_height: block::Height(1),
@@ -175,7 +175,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
 #[tokio::test]
 async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
     let (mut routine, _outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.try_fill().await;
+    routine.try_fill();
     assert_eq!(pool.held(), 1);
     let deadline = routine.window.outstanding.first().unwrap().deadline;
     assert!(routine.expire_due_timeouts(deadline));
@@ -186,7 +186,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.try_fill().await;
+    routine.try_fill();
     assert_eq!(routine.window.outstanding.first().unwrap().request.count, 1);
     next_sent(&mut outbound).await;
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
@@ -243,7 +243,7 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
 #[tokio::test]
 async fn invalid_ending_keeps_the_written_exchange_fenced() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block::Hash([1; 32]));
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     let ending = BlockSyncMessage::BlocksDone {
         start_height: block::Height(1),
@@ -267,7 +267,7 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
         routine.sequencer_input = body_sender;
         let (view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
         routine.sequencer_view = view_rx;
-        routine.try_fill().await;
+        routine.try_fill();
         next_sent(&mut outbound).await;
         if finalized {
             let released = routine.work.advance_floor(block::Height(1));
@@ -305,7 +305,7 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     let (mut routine, mut outbound, pool, connection, mut events) = requester_routine(block.hash());
     let (body_sender, _bodies) = mpsc::channel(1);
     routine.sequencer_input = body_sender;
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     // A local timeout drops the window entry but keeps the written reservation.
     let deadline = routine.window.outstanding.first().unwrap().deadline;
@@ -315,8 +315,8 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     // A local reorg drops the height, and the peer's later Status contracts its range.
     let released = routine.work.reset_above(block::Height(0));
     routine.budget.release(released);
-    routine.servable_low = block::Height(0);
-    routine.servable_high = block::Height(0);
+    routine.state.servable_low = block::Height(0);
+    routine.state.servable_high = block::Height(0);
     while events.try_recv().is_ok() {}
 
     deliver(&mut routine, BlockSyncMessage::Block(block)).await;
@@ -352,10 +352,10 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
         super::super::test_work_scope(),
         [(height, block.hash(), BlockSizeEstimate::Confirmed(500))],
     );
-    routine.servable_high = height;
+    routine.state.servable_high = height;
     let (body_sender, mut bodies) = mpsc::channel(1);
     routine.sequencer_input = body_sender;
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     while events.try_recv().is_ok() {}
 
@@ -407,10 +407,10 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
             super::super::test_work_scope(),
             [(height, block.hash(), BlockSizeEstimate::Confirmed(80_000))],
         );
-        routine.servable_high = height;
+        routine.state.servable_high = height;
         let (body_sender, mut bodies) = mpsc::channel(1);
         routine.sequencer_input = body_sender;
-        routine.try_fill().await;
+        routine.try_fill();
         next_sent(&mut outbound).await;
         while events.try_recv().is_ok() {}
 
@@ -462,14 +462,14 @@ async fn local_session_share_leaves_entries_for_another_requester() {
         assert!(writer.try_start(|| true));
     }
     assert_eq!(pool.held(), SESSION_RESERVATIONS);
-    first.try_fill().await;
+    first.try_fill();
     assert!(first.window.outstanding.is_empty());
     assert!(!first.cancel.is_cancelled());
     assert!(!first_connection.is_cancelled());
 
     let (mut second, mut outbound, _, second_connection, _) =
         requester_routine_with_pool(block::Hash([2; 32]), pool.clone());
-    second.try_fill().await;
+    second.try_fill();
     let frame = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(frame).unwrap(),
@@ -484,7 +484,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let hash = block::Hash([1; 32]);
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(hash);
     let work = Arc::clone(&routine.work);
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     assert!(routine.expire_due_timeouts(routine.window.outstanding.first().unwrap().deadline));
     // Unrelated accepted blocks can disarm the old block-progress watchdog.
@@ -505,7 +505,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
             <= deadline + Duration::from_millis(1)
     );
     assert!(matches!(
-        routine.handle_deadlines(deadline).await,
+        routine.handle_deadlines(deadline),
         Err(SinkReject::Local(_))
     ));
     assert!(connection.is_cancelled());
@@ -519,7 +519,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
 
     let (mut replacement, mut outbound, ..) = requester_routine_with_pool(hash, pool);
     replacement.work = work;
-    replacement.try_fill().await;
+    replacement.try_fill();
     let frame = next_sent(&mut outbound).await;
     assert!(matches!(
         BlockSyncMessage::decode_frame(frame).unwrap(),
@@ -540,7 +540,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
             requester_routine_with_pool(block.hash(), pool.clone());
         let (bodies, mut received) = mpsc::channel(1);
         routine.sequencer_input = bodies;
-        routine.try_fill().await;
+        routine.try_fill();
         next_sent(&mut outbound).await;
         deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
@@ -583,7 +583,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
     let (bodies, mut received) = mpsc::channel(1);
     let held = bodies.clone().try_reserve_owned().unwrap();
     routine.sequencer_input = bodies;
-    routine.try_fill().await;
+    routine.try_fill();
     outbound.recv().await.unwrap();
     let (input, mut buffered) = crate::zakura::framed_channel(1);
     input
@@ -693,7 +693,7 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
 async fn a_status_flood_cannot_postpone_request_timeouts() {
     let (mut routine, mut outbound, _pool, _connection, _events) =
         requester_routine(block::Hash([1; 32]));
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     assert_eq!(routine.window.outstanding.len(), 1);
     let first = routine.window.outstanding.first_key().unwrap();
@@ -740,7 +740,7 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let height = block.coinbase_height().unwrap();
     let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     let owner = routine.window.outstanding.first().unwrap().request.owner;
     let released = routine
@@ -789,7 +789,7 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
     let (mut routine, mut outbound, _pool, connection, _events) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
     routine.sequencer_input = bodies;
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     deliver(&mut routine, BlockSyncMessage::Block(block)).await;
     received.try_recv().unwrap();
@@ -853,8 +853,8 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
             requester_routine(block.hash());
         let (bodies, mut received) = mpsc::channel(1);
         routine.sequencer_input = bodies;
-        routine.max_response_bytes = limit;
-        routine.try_fill().await;
+        routine.state.max_response_bytes = limit;
+        routine.try_fill();
         next_sent(&mut outbound).await;
         let result = try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert_eq!(result.is_ok(), accepted, "{limit}-byte limit: {result:?}");
@@ -883,7 +883,7 @@ async fn a_local_failure_after_a_claim_keeps_the_reservation_consumed() {
     let (bodies, received) = mpsc::channel(1);
     drop(received);
     routine.sequencer_input = bodies;
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     assert!(matches!(
         try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
@@ -916,7 +916,7 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
     routine.sequencer_input = bodies;
-    routine.try_fill().await;
+    routine.try_fill();
     next_sent(&mut outbound).await;
     let error = try_deliver(&mut routine, BlockSyncMessage::Block(block))
         .await
@@ -957,7 +957,7 @@ async fn requests_stay_single_block_for_any_advertisement() {
             .window
             .note_block_progress(Instant::now(), routine.config.effective_liveness_timeout());
 
-        routine.try_fill().await;
+        routine.try_fill();
 
         let mut requested = Vec::new();
         while let Ok(frame) = outbound.try_recv() {
@@ -1055,7 +1055,7 @@ async fn withhold_endings(
     let mut unanswered = std::collections::VecDeque::new();
     let mut unended = 0;
     loop {
-        routine.try_fill().await;
+        routine.try_fill();
         let new = requested_heights(outbound);
         assert!(
             new.is_empty() || unended < MAX_PENDING_ENDINGS,
@@ -1093,7 +1093,7 @@ async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
     assert_eq!(pool.held(), requested.len());
     assert!(routine.window.outstanding.is_empty());
     assert!(routine.work.pending_contains(block::Height(BULK_WORK)));
-    routine.try_fill().await;
+    routine.try_fill();
     assert!(requested_heights(&mut outbound).is_empty());
 
     // The gate never replaces the missing-ending deadline.
@@ -1132,7 +1132,7 @@ async fn a_late_ending_below_the_bound_lets_the_peer_take_work_again() {
             },
         )
         .await;
-        routine.try_fill().await;
+        routine.try_fill();
         requested = requested_heights(&mut outbound);
         let pending = routine.requester.occupancy().pending_endings;
         if pending >= MAX_PENDING_ENDINGS {
@@ -1163,7 +1163,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
     let mut requested = 0;
     let mut most_pending = 0;
     loop {
-        routine.try_fill().await;
+        routine.try_fill();
         let new = requested_heights(&mut outbound);
         requested += new.len();
         unanswered.extend(new);
@@ -1177,7 +1177,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
             let index = usize::try_from(height.0 - 1).unwrap();
             deliver(&mut routine, BlockSyncMessage::Block(blocks[index].clone())).await;
             most_pending = most_pending.max(routine.requester.occupancy().pending_endings);
-            routine.try_fill().await;
+            routine.try_fill();
             let new = requested_heights(&mut outbound);
             requested += new.len();
             unanswered.extend(new);
@@ -1191,7 +1191,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
                 },
             )
             .await;
-            routine.try_fill().await;
+            routine.try_fill();
             let new = requested_heights(&mut outbound);
             requested += new.len();
             unanswered.extend(new);
@@ -1263,7 +1263,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
 
     let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
 
-    slow.try_fill().await;
+    slow.try_fill();
     assert_eq!(
         requested_heights(&mut slow_outbound),
         [floor],
@@ -1317,7 +1317,7 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
     for _ in 0..2 {
         let mut probe = super::scaling_tests::probe_in(WINDOW, pool.clone());
         loop {
-            probe.routine.try_fill().await;
+            probe.routine.try_fill();
             if requested_heights(&mut probe.outbound).is_empty() {
                 break;
             }
@@ -1326,7 +1326,7 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
         for block in probe.blocks.iter().take(MAX_PENDING_ENDINGS) {
             deliver(&mut probe.routine, BlockSyncMessage::Block(block.clone())).await;
         }
-        probe.routine.try_fill().await;
+        probe.routine.try_fill();
         assert!(requested_heights(&mut probe.outbound).is_empty());
         assert_eq!(
             probe.routine.requester.occupancy().len,
@@ -1344,7 +1344,7 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
 
     let (mut third, mut outbound, ..) =
         requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
-    third.try_fill().await;
+    third.try_fill();
     assert!(matches!(
         BlockSyncMessage::decode_frame(next_sent(&mut outbound).await).unwrap(),
         BlockSyncMessage::GetBlocks { .. }
@@ -1376,7 +1376,7 @@ async fn fast_peer_holding_one_exchange() -> (
     let ((mut fast, mut fast_outbound, pool, connection, events), blocks, bodies) = bulk_routine();
     fast.handle_status(inflight_limit(8));
     // The cold-start probe sends one request. Its body arrives, its ending does not.
-    fast.try_fill().await;
+    fast.try_fill();
     let [first] = requested_heights(&mut fast_outbound)[..] else {
         panic!("the cold-start probe sends one request");
     };
@@ -1394,7 +1394,7 @@ async fn fast_peer_holding_one_exchange() -> (
     let (mut slow, mut slow_outbound) = slower_floor_peer(&fast, pool, floor);
 
     // With room under its limit, the faster peer is the preferred floor server.
-    slow.try_fill().await;
+    slow.try_fill();
     assert!(requested_heights(&mut slow_outbound).is_empty());
     let keep = Box::new((fast_outbound, connection, events, bodies));
     (fast, slow, slow_outbound, floor, keep)
@@ -1416,7 +1416,7 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     fast.handle_status(inflight_limit(1));
     assert!(fast.pending_status.is_some(), "the status was rate-limited");
     assert!(futures::poll!(ranking.as_mut()).is_ready());
-    slow.try_fill().await;
+    slow.try_fill();
     assert_eq!(
         requested_heights(&mut slow_outbound),
         [floor],

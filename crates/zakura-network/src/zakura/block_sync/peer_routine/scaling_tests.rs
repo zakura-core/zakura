@@ -5,7 +5,7 @@
 //! every window size. A per-request cost that grows with the window means that
 //! some event still scans or rebuilds the whole window.
 
-use super::super::request::BlockSizeEstimate;
+use super::super::{request::BlockSizeEstimate, BlockSyncMessage};
 use super::*;
 use crate::zakura::regulation::ReservationPool;
 use zakura_chain::serialization::ZcashDeserializeInto;
@@ -154,7 +154,7 @@ async fn request_bookkeeping_scaling() {
         let started = Instant::now();
         while routine.window.outstanding.len() < blocks.len() {
             let before = routine.window.outstanding.len();
-            routine.try_fill().await;
+            routine.try_fill();
             assert!(
                 routine.window.outstanding.len() > before,
                 "fill stalled at {before} of {window} requests: {:?}",
@@ -178,7 +178,7 @@ async fn request_bookkeeping_scaling() {
             )
             .await;
             // The run loop refills after every frame.
-            routine.try_fill().await;
+            routine.try_fill();
         }
         let settle = started.elapsed();
         assert!(routine.window.outstanding.is_empty());

@@ -3,8 +3,11 @@
 //!
 //! The check parses every production module under `zakura-network`'s
 //! `zakura` module and flags paths to tokio, the std mutex and atomics, std's
-//! hashed collections, and the thread RNG. Code gated by a test-only `cfg` is
-//! skipped. Clippy's `disallowed_types` can't do this job while `zakura-rt`
+//! hashed collections, and the thread RNG. It also flags the std blocking
+//! primitives and channels, `futures::select!` and `tokio_util::time`, which
+//! `zakura-rt` has no names for: under the simulator a blocking wait hangs the
+//! run's only thread, and `futures::select!` shuffles its branches with a
+//! thread RNG. Code gated by a test-only `cfg` is skipped. Clippy's `disallowed_types` can't do this job while `zakura-rt`
 //! only re-exports, because a re-export resolves to the same item.
 //!
 //! The suggested replacements come from the `pub use` items in `zakura-rt`'s
@@ -292,7 +295,10 @@ impl Rules {
             }
             ["rand_10", "rngs", "ThreadRng" | "SysRng", ..]
             | ["tokio", ..]
-            | ["tokio_util", "sync" | "task", ..] => Some(MISSING_NAME.to_owned()),
+            | ["tokio_util", "sync" | "task" | "time", ..]
+            | ["std", "sync", "RwLock" | "RwLockReadGuard" | "RwLockWriteGuard" | "Condvar" | "Barrier"
+            | "BarrierWaitResult" | "mpsc", ..]
+            | ["futures" | "futures_util", "select"] => Some(MISSING_NAME.to_owned()),
             _ => None,
         }
     }
@@ -715,6 +721,34 @@ mod tests {
             [
                 "tokio::select -> zakura_rt::select",
                 "tokio::time::sleep -> zakura_rt::time::sleep",
+            ]
+        );
+    }
+
+    #[test]
+    fn blocking_primitives_and_shuffled_selects_are_flagged() {
+        let source = "
+            use std::sync::{Condvar, RwLock, mpsc::channel};
+            use futures::select;
+            use tokio_util::time::DelayQueue;
+            async fn f(barrier: &core::sync::Barrier) {
+                futures::select! { _ = a => {} }
+                futures::select_biased! { _ = a => {} }
+                let _ = futures::future::select(a, b);
+                let _ = std::sync::Arc::new(());
+            }
+        ";
+        let missing = MISSING_NAME;
+        assert_eq!(
+            violations(source),
+            [
+                format!("std::sync::Condvar -> {missing}"),
+                format!("std::sync::RwLock -> {missing}"),
+                format!("std::sync::mpsc::channel -> {missing}"),
+                format!("futures::select -> {missing}"),
+                format!("tokio_util::time::DelayQueue -> {missing}"),
+                format!("core::sync::Barrier -> {missing}"),
+                format!("futures::select -> {missing}"),
             ]
         );
     }

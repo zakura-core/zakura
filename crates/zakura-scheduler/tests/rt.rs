@@ -487,3 +487,63 @@ fn rt_mutex_held_across_await_starves_one_worker() {
     assert!(first_violation(1, FIND, held_across_await).is_some());
     assert_eq!(first_violation(2, CLEAN, held_across_await), None);
 }
+
+/// Runs `task` until it returns `Pending`, which leaves it waiting at a poll
+/// boundary.
+fn run_until_waiting(s: &mut Scheduler, task: zakura_scheduler::TaskId) {
+    while s.run(task) != zakura_scheduler::RunOutcome::Waiting {}
+}
+
+#[test]
+fn shutdown_leaves_a_mutex_held_by_an_idle_task_unpoisoned() {
+    // A forced unwind dropped the guard while panicking, which poisons a std
+    // mutex. Shutdown now cancels the idle holder instead.
+    let lock = Arc::new(RtMutex::new(()));
+    let held = lock.clone();
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    run_until_waiting(&mut s, holder.task());
+    let report = s.shutdown();
+    assert!(!lock.is_poisoned());
+    assert_eq!((report.cancelled, report.unwound), (1, 0));
+}
+
+#[test]
+fn shutdown_lets_a_drop_take_a_contended_mutex() {
+    // `dropper`'s destructor locks the mutex `holder` keeps across an await.
+    // A forced unwind ran that destructor while panicking, so `park` refused
+    // and the contended-lock assert aborted the process.
+    struct LockOnDrop(Arc<RtMutex<()>>, Arc<AtomicBool>);
+    impl Drop for LockOnDrop {
+        fn drop(&mut self) {
+            drop(self.0.lock().unwrap());
+            self.1.store(true, Ordering::Relaxed);
+        }
+    }
+    let lock = Arc::new(RtMutex::new(()));
+    let locked = Arc::new(AtomicBool::new(false));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let guard = LockOnDrop(lock.clone(), locked.clone());
+    let dropper = s.spawn_root("dropper", async move {
+        let _guard = guard;
+        pending::<()>().await
+    });
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = lock.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    run_until_waiting(&mut s, dropper.task());
+    run_until_waiting(&mut s, holder.task());
+    let report = s.shutdown();
+    assert!(locked.load(Ordering::Relaxed));
+    assert_eq!((report.cancelled, report.unwound), (2, 0));
+}

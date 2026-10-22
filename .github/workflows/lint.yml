@@ -201,7 +201,10 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+        run: shellcheck .github/actions/setup-zakura-build/*.sh scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: Ubuntu package retry tests
+        if: ${{ !cancelled() }}
+        run: bash .github/actions/setup-zakura-build/test-install-ubuntu-packages.sh
       - name: zcashd compat manifest resolver tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh

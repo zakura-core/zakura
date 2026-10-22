@@ -18,11 +18,11 @@ use zakura_rt::collections::hash_map::RandomState;
 
 use super::protocol::{
     DiscoveryBookError, DiscoveryRecordError, DiscoveryRecordValidationContext,
-    DiscoveryServiceSummary, ImportOutcome, ServiceSummaryEnvelope, Services, ZakuraDiscoveryBook,
-    ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryLocalConfig, ZakuraNodeRecord,
-    ZakuraNodeRecordBody, ZakuraServiceId,
+    DiscoveryServiceSummary, ImportOutcome, RecordVerdict, ServiceSummaryEnvelope, Services,
+    ZakuraDiscoveryBook, ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig,
+    ZakuraDiscoveryLocalConfig, ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId,
 };
-use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState};
+use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
 use crate::zakura::{
     ServiceAdmissionDecision, ServicePeerDirection, ServicePeerLimits, ServicePeerSnapshot,
@@ -438,7 +438,7 @@ proptest! {
                     model.dial_failure(node_id);
                 }
                 BookOp::Sample { requester, limit } => {
-                    let sample = book.sample_peers(limit, &[], &[], now, relay(requester), &mut rng);
+                    let sample = book.sample_peers_with_rng(limit, &[], &[], now, relay(requester), &mut rng);
                     prop_assert!(sample.len() <= limit.min(SAMPLE_WINDOW));
                     let ids: HashSet<NodeId> = sample.iter().map(|record| record.body.node_id).collect();
                     prop_assert_eq!(ids.len(), sample.len(), "a sample repeats no node");
@@ -725,7 +725,7 @@ proptest! {
                         continue;
                     }
                     let (peer, conn_id, session_id, verified) = pending.remove(index % pending.len());
-                    let result = state.install_connected_peer_record(
+                    let result = state.install_session_record(
                         &session(peer, conn_id, session_id),
                         verified,
                         now,
@@ -740,14 +740,14 @@ proptest! {
                         model.peers[peer].in_book = true;
                         model.peers[peer].hinted = true;
                     } else {
-                        prop_assert!(matches!(result, Err(DiscoveryBookError::SupersededSession)));
+                        prop_assert!(matches!(result, Err(SessionRecordError::Superseded)));
                     }
                 }
                 StateOp::ReceiveServices { peer, conn_id, session_id, ttl } => {
                     let node_id = peer_secret(peer).public();
                     let connected = model.connected_node_ids();
                     state
-                        .receive_live_summaries(
+                        .receive_session_live_summaries(
                             &session(peer, conn_id, session_id),
                             node_id,
                             services(node_id, now + ttl),
@@ -817,12 +817,15 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
         ServiceAdmissionDecision::Admit
     );
 
-    assert!(matches!(
-        state.install_connected_peer_record(&a, verified_for_a, now),
-        Err(DiscoveryBookError::SupersededSession)
-    ));
+    let late = state.install_session_record(&a, verified_for_a, now);
+    assert!(matches!(late, Err(SessionRecordError::Superseded)));
+    assert_eq!(
+        late.map_err(|error| error.verdict()),
+        Err(RecordVerdict::Drop),
+        "A's late result does not penalize the peer"
+    );
     state
-        .receive_live_summaries(&a, node_id, services(node_id, now + 10), &connected, now)
+        .receive_session_live_summaries(&a, node_id, services(node_id, now + 10), &connected, now)
         .expect("the summaries decode");
     assert_eq!(state.book().get(&node_id), None);
     assert_eq!(state.active_services(node_id, &connected, now), None);
@@ -840,13 +843,11 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
     let verified_for_b =
         VerifiedRecord::verify(hello(0), &context(now)).expect("the hello is authentic");
     assert_eq!(
-        state
-            .install_connected_peer_record(&b, verified_for_b, now)
-            .ok(),
+        state.install_session_record(&b, verified_for_b, now).ok(),
         Some(ImportOutcome::Added)
     );
     state
-        .receive_live_summaries(&b, node_id, services(node_id, now + 10), &connected, now)
+        .receive_session_live_summaries(&b, node_id, services(node_id, now + 10), &connected, now)
         .expect("the summaries decode");
     assert_eq!(
         state
@@ -881,10 +882,10 @@ fn signed_record_expiry_does_not_expire_the_live_summary_ttl() {
     );
     let verified = VerifiedRecord::verify(short_lived, &context(now)).expect("authentic");
     state
-        .install_connected_peer_record(&a, verified, now)
+        .install_session_record(&a, verified, now)
         .expect("the record installs");
     state
-        .receive_live_summaries(&a, node_id, services(node_id, u64::MAX), &connected, now)
+        .receive_session_live_summaries(&a, node_id, services(node_id, u64::MAX), &connected, now)
         .expect("the summaries decode");
     assert_eq!(
         state.active_services(node_id, &connected, now),

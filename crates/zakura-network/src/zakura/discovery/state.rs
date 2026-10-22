@@ -2,17 +2,18 @@
 
 use std::{net::SocketAddr, time::Duration};
 
+use thiserror::Error;
 use zakura_quic::NodeId;
 use zakura_rt::collections::{hash_map::RandomState, HashMap, HashSet};
 
 use super::protocol::{
-    advertised_services, entry_is_expired, normalize_direct_addrs, normalize_services,
-    push_unique_service, DialCandidateExclusions, DiscoveryBookError,
+    advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
+    normalize_services, push_unique_service, DialCandidateExclusions, DiscoveryBookError,
     DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome, ImportOutcome,
-    Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook, ZakuraDiscoveryBookLimits,
-    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
-    ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
-    ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
+    RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
+    ZakuraDiscoveryBookLimits, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate,
+    ZakuraDiscoveryEntry, ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry,
+    ZakuraNodeRecord, ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS,
 };
 use super::verified::VerifiedRecord;
@@ -43,6 +44,30 @@ impl DiscoverySessionKey {
             peer_id,
             conn_id,
             session_id,
+        }
+    }
+}
+
+/// A connected peer's own record that a session failed to install.
+#[derive(Debug, Error)]
+pub(super) enum SessionRecordError {
+    /// A newer session replaced the session that delivered the record.
+    #[error("Zakura discovery session was replaced before its record was installed")]
+    Superseded,
+
+    /// The record failed its import.
+    #[error(transparent)]
+    Import(#[from] DiscoveryBookError),
+}
+
+impl SessionRecordError {
+    /// What the failure means for the peer that sent the record.
+    ///
+    /// A superseded session's record only drops: the session did nothing wrong.
+    pub(super) fn verdict(&self) -> RecordVerdict {
+        match self {
+            Self::Superseded => RecordVerdict::Drop,
+            Self::Import(error) => hello_verdict(error),
         }
     }
 }
@@ -439,21 +464,32 @@ impl DiscoveryState {
     }
 
     /// Installs a connected peer's own record from `session` and updates its
-    /// service hints.
+    /// service hints, as [`Self::install_connected_peer_record`] does.
     ///
-    /// Addressless or locally non-dialable records still update the service
-    /// hints, because the live connection already exists; the book still
-    /// rejects them. A replaced `session` changes nothing and fails as
-    /// [`DiscoveryBookError::SupersededSession`].
-    pub(super) fn install_connected_peer_record(
+    /// A replaced `session` changes nothing and fails as
+    /// [`SessionRecordError::Superseded`].
+    pub(super) fn install_session_record(
         &mut self,
         session: &DiscoverySessionKey,
         record: VerifiedRecord,
         now: u64,
-    ) -> Result<ImportOutcome, DiscoveryBookError> {
+    ) -> Result<ImportOutcome, SessionRecordError> {
         if !self.is_current_session(session) {
-            return Err(DiscoveryBookError::SupersededSession);
+            return Err(SessionRecordError::Superseded);
         }
+        Ok(self.install_connected_peer_record(record, now)?)
+    }
+
+    /// Installs a connected peer's own record and updates its service hints.
+    ///
+    /// Addressless or locally non-dialable records still update the service
+    /// hints, because the live connection already exists; the book still
+    /// rejects them.
+    pub(super) fn install_connected_peer_record(
+        &mut self,
+        record: VerifiedRecord,
+        now: u64,
+    ) -> Result<ImportOutcome, DiscoveryBookError> {
         let max_services = self.config.book_limits.max_services_per_record;
         if record.body.services.len() > max_services {
             return Err(DiscoveryBookError::Limit {
@@ -483,12 +519,11 @@ impl DiscoveryState {
         import_result
     }
 
-    /// Caches a connected peer's own live summaries, received on `session`.
+    /// Caches a connected peer's own live summaries, received on `session`,
+    /// as [`Self::receive_live_summaries`] does.
     ///
-    /// The summaries describe `peer_node_id`, which must be `connected`. Their
-    /// local expiry is the earlier of the declared expiry and the local
-    /// live-summary TTL. A replaced `session` caches nothing.
-    pub(super) fn receive_live_summaries(
+    /// A replaced `session` caches nothing.
+    pub(super) fn receive_session_live_summaries(
         &mut self,
         session: &DiscoverySessionKey,
         peer_node_id: NodeId,
@@ -496,14 +531,28 @@ impl DiscoveryState {
         connected: &[NodeId],
         now: u64,
     ) -> Result<(), DiscoveryWireError> {
-        if services.node_id != peer_node_id {
-            return Err(DiscoveryWireError::MismatchedNodeId {
-                field: "services node id",
-            });
+        if !self.is_current_session(session) {
+            return check_services_author(&services, peer_node_id);
         }
+        self.receive_live_summaries(peer_node_id, services, connected, now)
+    }
+
+    /// Caches a connected peer's own live summaries.
+    ///
+    /// The summaries describe `peer_node_id`, which must be `connected`. Their
+    /// local expiry is the earlier of the declared expiry and the local
+    /// live-summary TTL.
+    pub(super) fn receive_live_summaries(
+        &mut self,
+        peer_node_id: NodeId,
+        services: Services,
+        connected: &[NodeId],
+        now: u64,
+    ) -> Result<(), DiscoveryWireError> {
+        check_services_author(&services, peer_node_id)?;
 
         self.sync_active_services(connected, now);
-        if !connected.contains(&peer_node_id) || !self.is_current_session(session) {
+        if !connected.contains(&peer_node_id) {
             return Ok(());
         }
 
@@ -603,7 +652,7 @@ impl DiscoveryState {
         rng: &mut R,
     ) -> Vec<ZakuraNodeRecord> {
         let limit = limit.min(self.config.peer_sample_limit);
-        self.book.sample_peers(
+        self.book.sample_peers_with_rng(
             limit,
             wanted_services,
             exclude_node_ids,
@@ -712,6 +761,19 @@ impl DiscoveryState {
                 .or_insert_with(|| ZakuraActiveServiceEntry::from_record(record, services));
         }
     }
+}
+
+/// Checks that `services` describe `peer_node_id`, the peer that sent them.
+fn check_services_author(
+    services: &Services,
+    peer_node_id: NodeId,
+) -> Result<(), DiscoveryWireError> {
+    if services.node_id != peer_node_id {
+        return Err(DiscoveryWireError::MismatchedNodeId {
+            field: "services node id",
+        });
+    }
+    Ok(())
 }
 
 fn connected_record_is_fresh_for_stored_record(

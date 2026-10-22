@@ -554,10 +554,9 @@ impl<F: SocketFactory> EndpointTask<F> {
         tracing::warn!(target: "zakura_quic", %local_addr, %error, "UDP socket failed; rebinding");
         // The driver's clock, not `Instant::now`, so a simulation's virtual
         // time decides the window too.
-        let now = now();
         if self
             .last_rebind
-            .is_some_and(|at| now.saturating_duration_since(at) < REBIND_WINDOW)
+            .is_some_and(|at| now().saturating_duration_since(at) < REBIND_WINDOW)
         {
             tracing::error!(target: "zakura_quic", %local_addr, %error, "UDP socket failed twice within 60 s; stopping the endpoint");
             self.stop_socket();
@@ -576,7 +575,8 @@ impl<F: SocketFactory> EndpointTask<F> {
             .await;
         match rebound {
             Ok(()) => {
-                self.last_rebind = Some(now);
+                // The window starts once the replacement is in place.
+                self.last_rebind = Some(now());
                 self.slot.rebinds.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("zakura.quic.socket.rebinds").increment(1);
             }
@@ -633,4 +633,67 @@ pub(crate) fn split_segments(
 ) -> impl Iterator<Item = Option<BytesMut>> + '_ {
     data.chunks(stride.max(1))
         .map(move |segment| (segment.len() <= max_len).then(|| BytesMut::from(segment)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    use super::*;
+    use crate::{
+        endpoint::{ConnectionSlots, PendingTable},
+        sim_net::{LinkModel, SimNet},
+        socket::SocketBuffers,
+        tls::TlsConfig,
+        NodeSecretKey, QuicConfig,
+    };
+
+    /// SOCK-9: the window starts once the replacement is installed, so time
+    /// spent waiting for the old socket's last user doesn't shorten it.
+    #[tokio::test(start_paused = true)]
+    async fn the_rebind_window_starts_when_the_replacement_is_installed() {
+        let secret = NodeSecretKey::generate();
+        let shared = Arc::new(Shared {
+            id: secret.public(),
+            config: QuicConfig::default(),
+            max_bidi_streams: 16,
+            tls: TlsConfig::new(&secret),
+            pending: PendingTable::default(),
+            connections: ConnectionSlots::new(16, 0, 16),
+            hooks: Arc::default(),
+            shutdown: watch::Sender::new(false),
+            network: watch::Sender::new(0),
+            network_changes: AtomicU64::new(0),
+        });
+        let addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let slot = Arc::new(SocketSlot {
+            local_addr: addr,
+            buffers: SocketBuffers::default(),
+            gso: false,
+            rebinds: AtomicU64::new(0),
+            inode: AtomicU64::new(0),
+            recv_calls: AtomicU64::new(0),
+            datagrams_received: AtomicU64::new(0),
+            queue_drops: AtomicU64::new(0),
+            oversize_drops: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        });
+        let net = SimNet::new(LinkModel::default());
+        let io = net.bind(addr).unwrap();
+        let (_cmds, cmds_rx) = mpsc::unbounded_channel();
+        let mut task = EndpointTask::new(shared, slot, Arc::new(net), io, cmds_rx);
+
+        // An in-flight user holds the old socket for 500 ms.
+        let held = task.socket.get().unwrap();
+        let started = now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        });
+        task.on_socket_error(io::Error::other("injected")).await;
+
+        assert_eq!(task.slot.rebinds.load(Ordering::Relaxed), 1);
+        let rebound_at = task.last_rebind.expect("the rebind succeeded");
+        assert!(rebound_at >= started + Duration::from_millis(500));
+    }
 }

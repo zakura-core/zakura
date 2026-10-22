@@ -6,6 +6,8 @@ use service_session::{
     may_open_ordered_stream, spawn_service_session, ConnectionRoles, DemandChange, DemandWait,
     PendingSessions, PreparedStream, RemoteCompletion, ServiceSessionState, SessionExit, SetupIo,
 };
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 use std::{
     future,

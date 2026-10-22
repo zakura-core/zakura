@@ -48,6 +48,8 @@ sync-metrics = []
 
 # Testing features that activate extra dependencies
 header-fuzz = []
+# Exposes the P2P machine fuzz entry points to `qa/fuzz/p2p`.
+p2p-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
 zakura-testkit = []
 

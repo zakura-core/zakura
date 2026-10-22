@@ -14,9 +14,13 @@ use super::{
     BlockSyncStatus, DownloadWindow, ZakuraBlockSyncConfig,
 };
 
+mod liveness;
 mod requests;
 mod status;
 
+#[cfg(test)]
+pub(super) use liveness::{liveness_grace_allowed, no_progress_response};
+pub(super) use liveness::{LivenessDecision, NoProgressResponse};
 pub(super) use requests::{unreceived_heights, BodyMatch, Disposition, SharedDeadlines};
 pub(super) use status::StatusUpdate;
 

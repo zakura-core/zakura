@@ -40,10 +40,7 @@ use super::{
     regulated::{wire::Outcome, CompletedRange},
     reorder::BufferedBlockBody,
     sequencer_task::{SequencedBody, SequencerView},
-    state::{
-        DownloadWindow, LivenessOutcome, OutstandingBlockRange, RequestKey, ThroughputMeter,
-        WriteOutcome,
-    },
+    state::{DownloadWindow, OutstandingBlockRange, RequestKey, ThroughputMeter, WriteOutcome},
     work_queue::{WorkQueue, WorkReturnOutcome},
     BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus, ZakuraBlockSyncConfig,
     ZakuraPeerId, ZakuraTrace,
@@ -64,7 +61,10 @@ mod trace;
 
 use fill::FillStop;
 use io::PeerIO;
-use state::{unreceived_heights, BodyMatch, Disposition, PeerState, SharedDeadlines, StatusUpdate};
+use state::{
+    unreceived_heights, BodyMatch, Disposition, LivenessDecision, NoProgressResponse, PeerState,
+    SharedDeadlines, StatusUpdate,
+};
 
 /// Heights checked for lost ownership per work-queue lock hold.
 const OWNERSHIP_CHECK_CHUNK: usize = 1024;
@@ -90,36 +90,6 @@ fn fill_stop_trace_due(last: Option<Instant>, now: Instant) -> bool {
 }
 
 const PARK_BLOCK_SYNC_NO_BLOCK_PROGRESS: &str = "block_sync_no_block_progress";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NoProgressResponse {
-    Park,
-    Disconnect,
-}
-
-fn no_progress_response(allow_no_progress_park: bool) -> NoProgressResponse {
-    if allow_no_progress_park {
-        NoProgressResponse::Park
-    } else {
-        NoProgressResponse::Disconnect
-    }
-}
-
-/// Whether the routine grants one bounded delay at a block-liveness deadline.
-/// The routine grants the delay only for transient outbound write congestion that
-/// lasts less than `request_timeout`. A peer that stops reading keeps the outbound
-/// queue full. The routine disconnects that peer when the interval reaches
-/// `request_timeout`.
-fn liveness_grace_allowed(
-    outbound_full: bool,
-    outbound_full_since: Option<Instant>,
-    now: Instant,
-    request_timeout: Duration,
-) -> bool {
-    outbound_full
-        && outbound_full_since
-            .is_some_and(|since| now.saturating_duration_since(since) < request_timeout)
-}
 
 /// Records decoded-memory metrics for an accepted block and returns its attributed size.
 /// The decoded-to-serialized ratio is omitted when the wire size is missing or zero.
@@ -361,11 +331,10 @@ impl PeerRoutine {
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
             // `request_timeout`, at which point it is disconnected rather than excused.
-            if outbound_queue_has_capacity {
-                self.state.outbound_full_since = None;
-            } else if self.state.outbound_full_since.is_none() {
-                self.state.outbound_full_since = Some(time::Instant::now().into_std());
-            }
+            self.state.note_outbound_capacity(
+                outbound_queue_has_capacity,
+                time::Instant::now().into_std(),
+            );
 
             // Sleep until the earliest outstanding deadline (own-timeout arm).
             let timeout = self.earliest_deadline_sleep(retry_filter_deadline);
@@ -664,28 +633,24 @@ impl PeerRoutine {
     /// reset clears outstanding work in place instead of respawning the routine.
     fn on_view_changed(&mut self) {
         let reset_epoch = self.io.sequencer_view.borrow().reset_epoch;
-        if reset_epoch == self.state.last_reset_epoch {
+        if !self.state.observe_reset_epoch(reset_epoch) {
             // A non-destructive advance: the floor/tip the routine reads come
             // straight from the live `view` each time they are needed, so nothing
             // to do but let the want-work loop re-run at the top (a committed
             // floor advance may GC our fully-committed outstanding).
             return;
         }
-        self.state.last_reset_epoch = reset_epoch;
         self.trace_wake("view_reset");
         // The Sequencer already pinned its floor/tip and `work.reset_above`'d the
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
         self.return_unreceived_requests("view_reset");
-        self.state.retry_avoid.clear();
         // `return_unreceived_requests` cleared our registry claims.
         self.publish_slot_diagnostics();
-        // A destructive reset pulled this peer's outstanding on our initiative, so its
-        // no-progress probe streak must not stay charged: reset it (and clear the idle
-        // liveness deadline) so an unproven peer whose only probe was in flight at the
-        // reset can probe again instead of wedging at its cap.
-        self.state.window.note_locally_returned_requests();
+        // A destructive reset pulled this peer's outstanding on our initiative, so
+        // neither its retry bias nor its no-progress probe streak may stay charged.
+        self.state.note_locally_returned_requests();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
@@ -834,31 +799,13 @@ impl PeerRoutine {
     }
 
     fn check_block_liveness(&mut self, now: Instant) -> Result<(), SinkReject> {
-        match self.state.window.check_liveness(now) {
-            LivenessOutcome::Ok => Ok(()),
-            LivenessOutcome::Disarm => {
-                self.state.window.clear_liveness_if_idle();
-                Ok(())
-            }
-            LivenessOutcome::Park
-                if liveness_grace_allowed(
-                    self.io.session.outbound_capacity() == 0,
-                    self.state.outbound_full_since,
-                    now,
-                    self.config.request_timeout,
-                ) =>
-            {
-                // Outbound full but *only just* filled (< one `request_timeout` of
-                // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. Grant one short, BOUNDED grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the park arm, and is
-                // parked at the liveness deadline — it cannot dodge the timer.
-                self.state
-                    .window
-                    .extend_liveness_deadline(now, self.config.request_timeout);
-                Ok(())
-            }
-            LivenessOutcome::Park => self.no_progress_stall(
+        match self.state.check_block_liveness(
+            now,
+            self.io.session.outbound_capacity() == 0,
+            self.config.request_timeout,
+        ) {
+            LivenessDecision::Continue => Ok(()),
+            LivenessDecision::Stall => self.no_progress_stall(
                 now,
                 "block-sync peer made no accepted block progress before liveness deadline",
             ),
@@ -869,8 +816,7 @@ impl PeerRoutine {
     /// otherwise park the session for the cooldown and exit locally. An unended
     /// request still closes the connection (see `WriterFence`).
     fn no_progress_stall(&mut self, now: Instant, error: &'static str) -> Result<(), SinkReject> {
-        if no_progress_response(self.state.allow_no_progress_park) == NoProgressResponse::Disconnect
-        {
+        if self.state.no_progress_response() == NoProgressResponse::Disconnect {
             tracing::debug!(
                 peer = ?self.io.peer,
                 outstanding = self.state.window.outstanding.len(),
@@ -905,18 +851,8 @@ impl PeerRoutine {
         // for capacity. It must remain neutral when the failed stream retires.
         self.on_view_changed();
         self.gc_skipped_outstanding();
-        if self.state.window.outstanding.is_empty()
-            && self.state.window.block_liveness_deadline.is_none()
-        {
+        let Some(error) = self.state.stream_failure_stall(failure) else {
             return Ok(());
-        }
-        let error = match failure {
-            OrderedStreamFailure::RemoteClose => {
-                "block-sync peer closed the stream with its requests unanswered"
-            }
-            OrderedStreamFailure::WriteTimeout => {
-                "block-sync stream write stalled with download requests unanswered"
-            }
         };
         self.no_progress_stall(now, error)
     }
@@ -984,11 +920,9 @@ impl PeerRoutine {
     /// Only a revocation by another actor can take unreceived work from a live
     /// request, so the scan runs once after each revocation.
     fn gc_obsolete_outstanding(&mut self) {
-        let revocations = self.io.work.revocations();
-        if revocations == self.state.checked_revocations {
+        if !self.state.observe_revocations(self.io.work.revocations()) {
             return;
         }
-        self.state.checked_revocations = revocations;
 
         let unreceived: Vec<_> = self
             .state
@@ -1747,7 +1681,10 @@ impl Drop for PeerRoutine {
     /// (cancel/panic/normal) return this routine's unreceived outstanding heights
     /// to `work.pending`, release their byte reservation, and clear this peer's
     /// outstanding set in the registry. All operations are sync (lock/atomic), so
-    /// the guard is cancel-safe and panic-safe.
+    /// the guard is cancel-safe and panic-safe. Each return names its request's
+    /// exact owner, which carries this session's generation, and the registry
+    /// ignores a stale generation, so an old routine cannot return or clear its
+    /// replacement's work.
     ///
     /// The guard clears the peer's *outstanding* rather than removing the whole
     /// registry entry: a reset respawns the routine (the reactor cancels + spawns
@@ -2755,9 +2692,9 @@ mod tests {
         assert_eq!(
             routine.state.window.check_liveness(liveness_deadline),
             if peer_timeouts.is_empty() {
-                super::LivenessOutcome::Ok
+                super::super::state::LivenessOutcome::Ok
             } else {
-                super::LivenessOutcome::Park
+                super::super::state::LivenessOutcome::Park
             },
         );
         assert!(!cancel.is_cancelled());
@@ -3032,7 +2969,7 @@ mod tests {
             let liveness_deadline = routine.state.window.block_liveness_deadline.unwrap();
             assert_eq!(
                 routine.state.window.check_liveness(liveness_deadline),
-                super::LivenessOutcome::Park
+                super::super::state::LivenessOutcome::Park
             );
             assert_eq!(budget.reserved(), 1_000);
         } else {
@@ -3168,7 +3105,7 @@ mod tests {
 
         // Grant a delay when the outbound queue filled one second ago.
         let fresh = now - Duration::from_secs(1);
-        assert!(super::liveness_grace_allowed(
+        assert!(super::state::liveness_grace_allowed(
             true,
             Some(fresh),
             now,
@@ -3177,14 +3114,14 @@ mod tests {
 
         // Disconnect when the outbound queue stays full for `request_timeout`.
         let sustained = now - request_timeout;
-        assert!(!super::liveness_grace_allowed(
+        assert!(!super::state::liveness_grace_allowed(
             true,
             Some(sustained),
             now,
             request_timeout
         ));
         let long = now - Duration::from_secs(30);
-        assert!(!super::liveness_grace_allowed(
+        assert!(!super::state::liveness_grace_allowed(
             true,
             Some(long),
             now,
@@ -3192,14 +3129,14 @@ mod tests {
         ));
 
         // Disconnect normally when the outbound queue has capacity.
-        assert!(!super::liveness_grace_allowed(
+        assert!(!super::state::liveness_grace_allowed(
             false,
             Some(fresh),
             now,
             request_timeout
         ));
         // Refuse a delay when a full queue has no recorded start time.
-        assert!(!super::liveness_grace_allowed(
+        assert!(!super::state::liveness_grace_allowed(
             true,
             None,
             now,
@@ -3761,11 +3698,11 @@ mod tests {
     #[test]
     fn repeated_no_progress_stall_disconnects_instead_of_parking_again() {
         assert_eq!(
-            super::no_progress_response(true),
+            super::state::no_progress_response(true),
             super::NoProgressResponse::Park
         );
         assert_eq!(
-            super::no_progress_response(false),
+            super::state::no_progress_response(false),
             super::NoProgressResponse::Disconnect
         );
     }

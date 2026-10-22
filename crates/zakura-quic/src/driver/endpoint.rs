@@ -552,9 +552,12 @@ impl<F: SocketFactory> EndpointTask<F> {
     async fn on_socket_error(&mut self, error: io::Error) {
         let local_addr = self.slot.local_addr;
         tracing::warn!(target: "zakura_quic", %local_addr, %error, "UDP socket failed; rebinding");
+        // The driver's clock, not `Instant::now`, so a simulation's virtual
+        // time decides the window too.
+        let now = now();
         if self
             .last_rebind
-            .is_some_and(|at| at.elapsed() < REBIND_WINDOW)
+            .is_some_and(|at| now.saturating_duration_since(at) < REBIND_WINDOW)
         {
             tracing::error!(target: "zakura_quic", %local_addr, %error, "UDP socket failed twice within 60 s; stopping the endpoint");
             self.stop_socket();
@@ -573,7 +576,7 @@ impl<F: SocketFactory> EndpointTask<F> {
             .await;
         match rebound {
             Ok(()) => {
-                self.last_rebind = Some(Instant::now());
+                self.last_rebind = Some(now);
                 self.slot.rebinds.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("zakura.quic.socket.rebinds").increment(1);
             }

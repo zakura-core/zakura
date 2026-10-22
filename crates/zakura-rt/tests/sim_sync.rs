@@ -241,6 +241,17 @@ fn mutex_poisoning_matches_std() {
 }
 
 #[test]
+#[should_panic(expected = "where the caller can't park: run ")]
+fn contended_lock_that_cant_park_names_its_run() {
+    run(async {
+        let mutex = Mutex::new(());
+        let _held = mutex.lock().unwrap();
+        // The test executor never parks, as with a task being unwound.
+        let _again = mutex.lock();
+    });
+}
+
+#[test]
 fn mutex_outside_a_run_is_std() {
     let mutex = Mutex::new(vec![1]);
     mutex.lock().unwrap().push(2);

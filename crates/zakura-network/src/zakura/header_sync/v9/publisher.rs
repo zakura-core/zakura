@@ -1,9 +1,10 @@
 //! The header sync version 9 publisher: one session's side of the
 //! subscriptions a peer opens on this node.
 //!
-//! [`Publications`] holds the subscription rules: slots, credit, the sent
-//! cursor ring, and tombstones. This module adds what only header sync knows:
-//! which headers each page carries, and when a subscription ends.
+//! [`Publications`](crate::zakura::regulation::Publications) holds the
+//! subscription rules: slots, credit, the sent cursor ring, and tombstones.
+//! This module adds what only header sync knows: which headers each page
+//! carries, and when a subscription ends.
 //!
 //! One task per session writes every page and terminal outcome, so an outcome
 //! always follows its subscription's pages. [`Publisher::apply`] applies each
@@ -11,7 +12,8 @@
 //! in progress, so a `Grant` never queues page jobs. A `Close` ends its
 //! subscription on the next wake and abandons that subscription's page in
 //! progress. Its terminal outcome waits for no credit or output, as
-//! [`TerminalPermit::send`] describes.
+//! [`TerminalPermit::send`](crate::zakura::regulation::TerminalPermit::send)
+//! describes.
 //!
 //! Pages come from the retained-path leases in [`Port`], one lease per page,
 //! acquired and read back to back, so a lease's idle deadline covers one read

@@ -39,6 +39,8 @@
 //! targets, until validation releases it, so the header window stays within
 //! the `staging` headers the caller reserved.
 //!
+//! [`HEADER_CHUNK_BUDGET_CAPACITY_V1`]: crate::zakura::header_sync::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1
+//!
 //! Grants refill the window in prefixes of at most half of it, so the
 //! publisher spends one half while the grant for the other travels. Take a
 //! window of `W` headers, a link that carries `r` headers per second, and a

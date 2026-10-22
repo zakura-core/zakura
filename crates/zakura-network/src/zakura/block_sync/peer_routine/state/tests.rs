@@ -314,6 +314,10 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                         model.progress();
                     }
                 }
+                // A repeated height is a duplicate before its hash is compared.
+                Some(sequence) if model.requests[&sequence].received.contains(&height) => {
+                    prop_assert!(matches!(decision, BodyMatch::Duplicate), "{decision:?}");
+                }
                 Some(sequence) if tampered => {
                     let BodyMatch::PayloadMismatch { owner, requested } = decision else {
                         return Err(TestCaseError::fail(format!("{decision:?}")));
@@ -321,9 +325,6 @@ fn step(model: &mut Model, harness: &mut Harness, input: Input) -> Result<(), Te
                     // The fault names the exact request the body answered.
                     prop_assert_eq!(owner, Harness::owner(sequence));
                     prop_assert_eq!(requested, hash(height, false));
-                }
-                Some(sequence) if model.requests[&sequence].received.contains(&height) => {
-                    prop_assert!(matches!(decision, BodyMatch::Duplicate), "{decision:?}");
                 }
                 Some(sequence) => {
                     let BodyMatch::Matched(matched) = decision else {

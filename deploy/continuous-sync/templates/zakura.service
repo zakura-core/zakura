@@ -7,6 +7,7 @@ AssertPathExists={{BIN_PATH}}
 [Service]
 Type=simple
 WorkingDirectory={{REPO_DIR}}
+EnvironmentFile=-{{TRACE_WRITER_ENV_PATH}}
 ExecStart={{BIN_PATH}} --config {{CONFIG_PATH}} start
 Restart=no
 LimitNOFILE=1048576

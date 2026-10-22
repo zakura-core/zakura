@@ -359,23 +359,23 @@ pub struct ZakuraConfig {
     pub stream_open_rate_per_second: u32,
     /// Messages per second admitted per stream kind on a connection.
     pub message_rate_per_second: u32,
-    /// Optional directory for structured Zakura JSONL trace tables.
+    /// Optional directory for structured Zakura CSV trace tables.
     ///
     /// When unset, Zakura trace emission is disabled. When set, the node writes each table
-    /// selected by [`trace_tables`](Self::trace_tables) to `<table>.jsonl` in this directory:
+    /// selected by [`trace_tables`](Self::trace_tables) to `<table>.csv` in this directory:
     /// the native Zakura endpoint, the legacy peer set and sync pipeline, and the mining RPCs all
-    /// write here. Legacy peer fields in `legacy_sync.jsonl` follow
+    /// write here. Legacy peer fields in `legacy_sync.csv` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     pub trace_dir: Option<PathBuf>,
-    /// Master switch for every JSONL trace table.
+    /// Master switch for every CSV trace table.
     ///
     /// Set to `false` to stop all trace output while keeping `trace_dir` and `trace_tables`
     /// configured. Has no effect when `trace_dir` is unset.
     pub trace_enabled: bool,
-    /// JSONL trace tables written to [`trace_dir`](Self::trace_dir).
+    /// CSV trace tables written to [`trace_dir`](Self::trace_dir).
     ///
     /// Defaults to every table. Unknown table names are a config error. For example,
-    /// `trace_tables = ["mining"]` writes only `mining.jsonl`.
+    /// `trace_tables = ["mining"]` writes only `mining.csv`.
     pub trace_tables: JsonlTraceTables,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
@@ -423,7 +423,7 @@ impl Default for ZakuraConfig {
 }
 
 impl ZakuraConfig {
-    /// Spawns a JSONL tracer that writes the configured trace tables.
+    /// Spawns a CSV tracer that writes the configured trace tables.
     ///
     /// Returns a no-op tracer when `trace_dir` is unset, `trace_enabled` is `false`, or
     /// `trace_tables` is empty.

@@ -1,4 +1,4 @@
-//! Mining RPC events for the `mining` JSONL trace table.
+//! Mining RPC events for the `mining` CSV trace table.
 
 use std::{fmt, time::Duration};
 
@@ -189,9 +189,10 @@ impl_jsonl_trace_event!(BlockSubmitted<'_>, MINING);
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use std::collections::BTreeMap;
+
     use tokio::sync::mpsc;
-    use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent};
+    use zakura_jsonl_trace::{JsonlTracer, JsonlWriteEvent, ENVELOPE_COLUMNS, EXTRA_COLUMN};
 
     use super::*;
 
@@ -201,10 +202,26 @@ mod tests {
         (trace, rx)
     }
 
-    fn row(rx: &mut mpsc::Receiver<JsonlWriteEvent>) -> Value {
+    /// Returns the queued row as column names mapped to raw CSV fields.
+    fn row(rx: &mut mpsc::Receiver<JsonlWriteEvent>) -> BTreeMap<&'static str, String> {
         let written = rx.try_recv().expect("the event was queued");
         assert_eq!(written.table, MINING.table());
-        serde_json::from_slice(&written.line).expect("the event is valid JSON")
+        let record = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(written.line.as_slice())
+            .records()
+            .next()
+            .expect("the event is one CSV record")
+            .expect("the event is valid CSV");
+        let row: BTreeMap<_, _> = ENVELOPE_COLUMNS
+            .iter()
+            .chain(MINING.header())
+            .copied()
+            .chain([EXTRA_COLUMN])
+            .zip(record.iter().map(str::to_owned))
+            .collect();
+        assert_eq!(row[EXTRA_COLUMN], "", "every mining field has a column");
+        row
     }
 
     #[test]
@@ -226,10 +243,10 @@ mod tests {
         assert_eq!(row["event"], "block_submitted");
         assert_eq!(row["method"], "submitblock");
         assert_eq!(row["hash"], hash.to_string());
-        assert_eq!(row["height"], 42);
+        assert_eq!(row["height"], "42");
         assert_eq!(row["result"], "rejected");
         assert_eq!(row["reason"], "bad coinbase");
-        assert_eq!(row["elapsed_us"], 1_500);
+        assert_eq!(row["elapsed_us"], "1500");
     }
 
     #[test]
@@ -244,11 +261,8 @@ mod tests {
 
         let row = row(&mut rx);
         assert_eq!(row["event"], "template_failed");
-        assert!(row["error"]
-            .as_str()
-            .expect("the error is a string")
-            .contains("not synced to tip"));
-        assert_eq!(row["client_long_poll_id"], Value::Null);
-        assert_eq!(row["elapsed_us"], 2_000);
+        assert!(row["error"].contains("not synced to tip"));
+        assert_eq!(row["client_long_poll_id"], "");
+        assert_eq!(row["elapsed_us"], "2000");
     }
 }

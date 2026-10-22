@@ -46,6 +46,9 @@ impl HeaderChainMaintenance for TestStalledMaintenance {
 #[test]
 fn deferred_maintenance_wakes_an_idle_writer_at_the_deadline() {
     let (sender, mut receiver) = mpsc::unbounded_channel();
+    // Start timing before the deadline is set, so building the runtime
+    // can't come off the measured wait.
+    let started = Instant::now();
     let now = chrono::Utc::now();
     let maintenance = TestDeferredMaintenance {
         deadlines: Mutex::new(VecDeque::from([now + chrono::Duration::milliseconds(20)])),
@@ -56,7 +59,6 @@ fn deferred_maintenance_wakes_an_idle_writer_at_the_deadline() {
         .enable_time()
         .build()
         .expect("the test deadline runtime is available");
-    let started = Instant::now();
     let message = receive_until_deferred_deadline(&mut receiver, Some(&maintenance), &runtime)
         .expect("deadline maintenance succeeds");
 

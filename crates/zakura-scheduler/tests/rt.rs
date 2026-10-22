@@ -34,25 +34,39 @@ fn scheduler_is_the_rt_executor_for_its_run() {
     assert!(sim::executor().is_none());
 }
 
-/// Two tasks read a counter, yield through `zakura-rt`, then write it back.
-fn yield_between_load_and_store(s: &mut Scheduler) -> Check {
-    let counter = shared(Cell::new(0));
-    for label in ["inc_a", "inc_b"] {
-        let counter = counter.clone();
-        s.spawn_root(label, async move {
-            let v = counter.get();
-            task::yield_now().await;
-            counter.set(v + 1);
-        });
+/// Two tasks read a counter, stop in `zakura-rt`, then write it back. With
+/// `yield_now` they stop with `yield_now`, and otherwise at an expired sleep,
+/// which is one preemption point inside the poll.
+fn gap_between_load_and_store(yield_now: bool) -> impl Fn(&mut Scheduler) -> Check {
+    move |s| {
+        let counter = shared(Cell::new(0));
+        for label in ["inc_a", "inc_b"] {
+            let counter = counter.clone();
+            s.spawn_root(label, async move {
+                let v = counter.get();
+                if yield_now {
+                    task::yield_now().await;
+                } else {
+                    time::sleep(Duration::ZERO).await;
+                }
+                counter.set(v + 1);
+            });
+        }
+        Box::new(move |_| (counter.get() != 2).then(|| format!("counter = {}", counter.get())))
     }
-    Box::new(move |_| (counter.get() != 2).then(|| format!("counter = {}", counter.get())))
 }
 
 #[test]
 fn rt_points_preempt_inside_a_poll() {
-    assert!(first_violation(2, FIND, yield_between_load_and_store).is_some());
-    // The yield is mid-poll, so with one worker the other task can't run there.
-    assert_eq!(first_violation(1, FIND, yield_between_load_and_store), None);
+    assert!(first_violation(2, FIND, gap_between_load_and_store(false)).is_some());
+    // The point is mid-poll, so with one worker the other task can't run there.
+    assert_eq!(first_violation(1, FIND, gap_between_load_and_store(false)), None);
+}
+
+#[test]
+fn rt_yield_now_frees_the_worker() {
+    // `yield_now` returns `Pending` once, so even one worker finds the race.
+    assert!(first_violation(1, FIND, gap_between_load_and_store(true)).is_some());
 }
 
 #[test]
@@ -160,7 +174,7 @@ fn rt_spawn_from_setup_code_is_ready_at_once() {
 
 #[test]
 fn same_seed_replays_rt_programs() {
-    let picks = |seed| run_fixture(2, seed, yield_between_load_and_store).0.picks;
+    let picks = |seed| run_fixture(2, seed, gap_between_load_and_store(true)).0.picks;
     for seed in 0..50 {
         assert_eq!(picks(seed), picks(seed), "seed {seed}");
     }

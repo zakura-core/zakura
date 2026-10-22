@@ -13,7 +13,7 @@ use std::{
     sync::{LockResult, PoisonError, TryLockError, TryLockResult},
 };
 
-use crate::sim::{executor, point, ObjectId, Op, Point, TaskId};
+use crate::sim::{executor, point, run_id, ObjectId, Op, Point, TaskId};
 
 /// A std-style mutex that parks contended tasks on the scheduler.
 pub struct Mutex<T: ?Sized> {
@@ -75,9 +75,19 @@ impl<T: ?Sized> Mutex<T> {
                 }
                 Err(TryLockError::WouldBlock) => {
                     let holder = self.state().holder;
+                    // This can abort the process when it fires in a
+                    // destructor, so name what's needed to replay it.
                     assert!(
                         executor.park(object, holder),
-                        "contended zakura-rt Mutex where the caller can't park"
+                        "contended zakura-rt Mutex at {site} where the caller can't park: \
+                         {}, task {:?}, held by {holder:?}{}",
+                        run_id().map_or_else(|| "no run".to_owned(), |run| run.to_string()),
+                        executor.current_task(),
+                        if std::thread::panicking() {
+                            ", while unwinding"
+                        } else {
+                            ""
+                        },
                     );
                 }
             }

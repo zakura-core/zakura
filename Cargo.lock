@@ -3225,6 +3225,7 @@ dependencies = [
  "zakura-node-services",
  "zakura-quic",
  "zakura-rt",
+ "zakura-scheduler",
  "zakura-test",
 ]
 

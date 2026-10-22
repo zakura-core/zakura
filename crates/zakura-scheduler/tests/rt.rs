@@ -547,3 +547,42 @@ fn shutdown_lets_a_drop_take_a_contended_mutex() {
     assert!(locked.load(Ordering::Relaxed));
     assert_eq!((report.cancelled, report.unwound), (2, 0));
 }
+
+#[test]
+fn mutex_kept_across_runs_gets_a_fresh_identity() {
+    use zakura_scheduler::RunOutcome::Parked;
+    let kept = Arc::new(RtMutex::new(()));
+    // Run 1: the first lock made by task 0 names the mutex.
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let used = kept.clone();
+    let task = s.spawn_root("user", async move { drop(used.lock().unwrap()) });
+    while s.status() == Status::Running {
+        s.run(task.task());
+    }
+    drop(s);
+
+    // Run 2: task 0 locks a fresh mutex first, so it gets the same identity
+    // the kept mutex cached in run 1.
+    let fresh = Arc::new(RtMutex::new(()));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let (f, k) = (fresh.clone(), kept.clone());
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _f = f.lock().unwrap();
+            let _k = k.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    let wait_fresh = s.spawn_root("wait_fresh", async move { drop(fresh.lock().unwrap()) });
+    let wait_kept = s.spawn_root("wait_kept", async move { drop(kept.lock().unwrap()) });
+    run_until_waiting(&mut s, holder.task());
+    let parked_on = |s: &mut Scheduler, task: zakura_scheduler::JoinHandle| loop {
+        if let Parked(object) = s.run(task.task()) {
+            break object;
+        }
+    };
+    let fresh_id = parked_on(&mut s, wait_fresh);
+    let kept_id = parked_on(&mut s, wait_kept);
+    assert_ne!(fresh_id, kept_id);
+}

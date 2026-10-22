@@ -328,13 +328,13 @@ impl BufferedBlockBody {
                 let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
                 let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
                 // Metrics accepts f64 samples; these lossy conversions are observability-only.
-                metrics::histogram!(
+                zakura_node_services::metrics::histogram!(
                     "sync.block.body.decoded.attributed_memory_size_bytes",
                     "stage" => "reorder"
                 )
                 .record(decoded_attributed_memory_size_bytes as f64);
                 if serialized_bytes > 0 {
-                    metrics::histogram!(
+                    zakura_node_services::metrics::histogram!(
                         "sync.block.body.decoded.to_serialized_ratio",
                         "stage" => "reorder"
                     )

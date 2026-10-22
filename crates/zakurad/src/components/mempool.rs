@@ -469,7 +469,7 @@ fn start_peer_cooldown(
         ?cooldown,
         "ignoring peer transaction advertisements after an invalid transaction"
     );
-    metrics::counter!("mempool.peer_cooldown.started.total").increment(1);
+    zakura_node_services::metrics::counter!("mempool.peer_cooldown.started.total").increment(1);
 
     if cooldown > peer_cooldown::BASE_COOLDOWN {
         // Boxing works around a compiler limitation: without it, `tokio::spawn`
@@ -1022,16 +1022,18 @@ impl Service<Request> for Mempool {
                                 storage::NonStandardTransactionError::TransactionTooLarge {
                                     ..
                                 },
-                            ) => metrics::counter!(
+                            ) => zakura_node_services::metrics::counter!(
                                 "mempool.rejected.transactions.total",
                                 "reason" => "transaction_too_large"
                             )
                             .increment(1),
-                            TransactionDownloadVerifyError::PeerCoolingDown => metrics::counter!(
-                                "mempool.peer_cooldown.ignored.transactions.total"
-                            )
-                            .increment(1),
-                            _ => metrics::counter!(
+                            TransactionDownloadVerifyError::PeerCoolingDown => {
+                                zakura_node_services::metrics::counter!(
+                                    "mempool.peer_cooldown.ignored.transactions.total"
+                                )
+                                .increment(1)
+                            }
+                            _ => zakura_node_services::metrics::counter!(
                                 "mempool.failed.verify.tasks.total",
                                 "reason" => error.to_string()
                             )
@@ -1049,7 +1051,7 @@ impl Service<Request> for Mempool {
 
                         invalidated_ids.insert(tx_id);
 
-                        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
+                        zakura_node_services::metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
                     }
                 };
             }
@@ -1342,8 +1344,10 @@ impl Service<Request> for Mempool {
                             req_count = ?transactions.len(),
                             "ignored transactions from a peer in a transaction cooldown"
                         );
-                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
-                            .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+                        zakura_node_services::metrics::counter!(
+                            "mempool.peer_cooldown.ignored.transactions.total"
+                        )
+                        .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
                     } else {
                         for gossiped_tx in transactions {
                             if storage.should_download_or_verify(gossiped_tx.id()).is_err() {

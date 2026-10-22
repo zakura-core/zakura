@@ -140,7 +140,8 @@ async fn reserve_response_slot(budget: &SlotBudget, bound: WorkBound) -> SlotPer
     if let Some(permit) = budget.try_reserve() {
         return permit;
     }
-    metrics::counter!("sync.block.serving.delayed", "bound" => bound.label()).increment(1);
+    zakura_node_services::metrics::counter!("sync.block.serving.delayed", "bound" => bound.label())
+        .increment(1);
     budget.reserve().await
 }
 

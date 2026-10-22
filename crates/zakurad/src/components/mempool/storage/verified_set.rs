@@ -696,60 +696,64 @@ impl VerifiedSet {
 
     /// Report the current mempool metrics.
     fn report_metrics(&self) {
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.2",
         )
         .set(self.metrics.unpaid_actions_with_weight_lt20pct as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.4",
         )
         .set(self.metrics.unpaid_actions_with_weight_lt40pct as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.6",
         )
         .set(self.metrics.unpaid_actions_with_weight_lt60pct as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.8",
         )
         .set(self.metrics.unpaid_actions_with_weight_lt80pct as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 1",
         )
         .set(self.metrics.unpaid_actions_with_weight_lt1 as f64);
-        metrics::gauge!("zcash.mempool.actions.paid").set(self.metrics.paid_actions as f64);
-        metrics::gauge!("zcash.mempool.size.transactions",).set(self.transaction_count() as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!("zcash.mempool.actions.paid")
+            .set(self.metrics.paid_actions as f64);
+        zakura_node_services::metrics::gauge!("zcash.mempool.size.transactions",)
+            .set(self.transaction_count() as f64);
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "< 1",
         )
         .set(self.metrics.size_with_weight_lt1 as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "1",
         )
         .set(self.metrics.size_with_weight_eq1 as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 1",
         )
         .set(self.metrics.size_with_weight_gt1 as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 2",
         )
         .set(self.metrics.size_with_weight_gt2 as f64);
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zcash.mempool.size.weighted",
             "bk" => "> 3",
         )
         .set(self.metrics.size_with_weight_gt3 as f64);
-        metrics::gauge!("zcash.mempool.size.bytes",).set(self.transactions_serialized_size as f64);
-        metrics::gauge!("zcash.mempool.cost.bytes").set(self.total_cost as f64);
+        zakura_node_services::metrics::gauge!("zcash.mempool.size.bytes",)
+            .set(self.transactions_serialized_size as f64);
+        zakura_node_services::metrics::gauge!("zcash.mempool.cost.bytes")
+            .set(self.total_cost as f64);
     }
 }
 

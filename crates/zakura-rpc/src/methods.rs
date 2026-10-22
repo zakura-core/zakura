@@ -1243,7 +1243,8 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
         return;
     }
     if !gbt.speculation_breaker.allows(parent) {
-        metrics::counter!("mining.template_preparation.declined").increment(1);
+        zakura_node_services::metrics::counter!("mining.template_preparation.declined")
+            .increment(1);
         return;
     }
 
@@ -1251,7 +1252,10 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
         start_speculative_preparation(verifier, template, latest_chain_tip.clone(), network)
     else {
         // The chain left this template's parent while it waited its turn.
-        metrics::counter!("mining.template_preparation.stale_before_dispatch").increment(1);
+        zakura_node_services::metrics::counter!(
+            "mining.template_preparation.stale_before_dispatch"
+        )
+        .increment(1);
         return;
     };
 
@@ -1267,7 +1271,8 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
         // until the chain moves on, instead of paying that cost again for every template built
         // on it.
         gbt.speculation_breaker.trip(parent);
-        metrics::counter!("mining.template_preparation.timed_out").increment(1);
+        zakura_node_services::metrics::counter!("mining.template_preparation.timed_out")
+            .increment(1);
         tracing::debug!(
             ?elapsed,
             %work_id,
@@ -1298,12 +1303,14 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
                 }
                 state.reject(parent, &work_id)
             });
-            metrics::counter!("mining.template_preparation.rejected").increment(1);
+            zakura_node_services::metrics::counter!("mining.template_preparation.rejected")
+                .increment(1);
         }
         // The background path has no inner deadline, so `TimedOut` cannot reach here: both
         // remaining outcomes mean the node gave up before it had an answer.
         Ok(Preparation::Stale | Preparation::TimedOut) => {
-            metrics::counter!("mining.template_preparation.cancelled").increment(1);
+            zakura_node_services::metrics::counter!("mining.template_preparation.cancelled")
+                .increment(1);
         }
         Ok(Preparation::Failed(error)) => {
             tracing::debug!(
@@ -1752,7 +1759,8 @@ where
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
         let Some((template, mut worker)) = self.gbt.queue_template_preparation(template.clone())
         else {
-            metrics::counter!("mining.template_preparation.coalesced").increment(1);
+            zakura_node_services::metrics::counter!("mining.template_preparation.coalesced")
+                .increment(1);
             return;
         };
         let network = self.network.clone();
@@ -1828,7 +1836,7 @@ where
                 // Observe a completed commit before advertising its pending body.
                 result = &mut verification => result,
                 admitted = admission.wait() => {
-                    metrics::histogram!("mining.state_admission.duration_seconds")
+                    zakura_node_services::metrics::histogram!("mining.state_admission.duration_seconds")
                         .record(admission_start.elapsed().as_secs_f64());
                     if admitted
                         && admission.optimistic_relay_authorized()
@@ -1869,8 +1877,10 @@ where
                     })
                     .is_err()
                 {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "mining.optimistic_inventory.final_send_failures"
+                    )
+                    .increment(1);
                     tracing::warn!(
                         ?block_hash,
                         ?height,
@@ -1878,8 +1888,10 @@ where
                     );
                 }
             } else if early_sent {
-                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
-                    .increment(1);
+                zakura_node_services::metrics::counter!(
+                    "mining.optimistic_inventory.post_admission_failures"
+                )
+                .increment(1);
                 tracing::warn!(
                     ?block_hash,
                     ?height,
@@ -3444,7 +3456,7 @@ where
         let mut max_time_reached = false;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
-                metrics::counter!("mining.template.rebuilt").increment(1);
+                zakura_node_services::metrics::counter!("mining.template.rebuilt").increment(1);
                 tracing::debug!(
                     rebuild,
                     "template superseded before it was returned; rebuilding on the current tip"
@@ -3849,22 +3861,29 @@ where
         let block = match self.gbt.prepared_candidates().resolve(&work_id, header) {
             Ok(block) => block,
             Err(ResolvePreparedCandidateError::StaleWork) => {
-                metrics::counter!("mining.compact_submission.stale_work").increment(1);
+                zakura_node_services::metrics::counter!("mining.compact_submission.stale_work")
+                    .increment(1);
                 return Ok(SubmitSolutionErrorResponse::StaleWork.into());
             }
             Err(ResolvePreparedCandidateError::CandidateMismatch) => {
-                metrics::counter!("mining.compact_submission.candidate_mismatches").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "mining.compact_submission.candidate_mismatches"
+                )
+                .increment(1);
                 return Ok(SubmitSolutionErrorResponse::CandidateMismatch.into());
             }
         };
-        metrics::histogram!("mining.compact_submission.reconstruction.duration_seconds")
-            .record(reconstruction_start.elapsed().as_secs_f64());
+        zakura_node_services::metrics::histogram!(
+            "mining.compact_submission.reconstruction.duration_seconds"
+        )
+        .record(reconstruction_start.elapsed().as_secs_f64());
 
         let response = self
             .run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::CompactHeader)
             .await?;
         if response == SubmitBlockResponse::Accepted {
-            metrics::counter!("mining.compact_submission.accepted").increment(1);
+            zakura_node_services::metrics::counter!("mining.compact_submission.accepted")
+                .increment(1);
         }
         Ok(response.into())
     }

@@ -279,7 +279,8 @@ impl SyncCoordinator {
                 },
             );
         drop(phase);
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.operations")
+            .set(self.operation_count() as f64);
         Some(BlockApplyOperation {
             coordinator: self.clone(),
             id,
@@ -338,7 +339,10 @@ impl SyncCoordinator {
                     .unwrap_or(u64::MAX),
                 "native block applies did not drain before the legacy fallback deadline"
             );
-            metrics::counter!("sync.zakura.legacy_fallback.apply_drain_fatal.total").increment(1);
+            zakura_node_services::metrics::counter!(
+                "sync.zakura.legacy_fallback.apply_drain_fatal.total"
+            )
+            .increment(1);
             lease.restore_native_on_drop = false;
             self.transition(ApplyTransition::Fail {
                 expected_epoch: epoch,
@@ -348,7 +352,7 @@ impl SyncCoordinator {
         self.transition(ApplyTransition::ActivateFallback {
             expected_epoch: epoch,
         })?;
-        metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
+        zakura_node_services::metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
         Ok(lease)
     }
 
@@ -450,7 +454,8 @@ impl SyncCoordinator {
             drop(operations);
             drop(phase);
             self.drained.notify_waiters();
-            metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+            zakura_node_services::metrics::gauge!("sync.zakura.apply.operations")
+                .set(self.operation_count() as f64);
             return None;
         }
         self.in_flight
@@ -492,7 +497,8 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.operations")
+            .set(self.operation_count() as f64);
     }
 
     fn finish_operation(&self, id: BlockApplyOperationId, terminal: BlockApplyTerminal) {
@@ -514,7 +520,8 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.operations")
+            .set(self.operation_count() as f64);
     }
 
     fn fail_operation(&self, id: BlockApplyOperationId) {
@@ -545,7 +552,8 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.operations")
+            .set(self.operation_count() as f64);
     }
 
     fn operation_count(&self) -> usize {
@@ -596,8 +604,9 @@ impl SyncCoordinator {
         self.publish_service_demand();
         // This diagnostic gauge may round epochs above the exact `f64` integer range.
         // Lifecycle authority always uses the original checked `u64` value.
-        metrics::gauge!("sync.zakura.apply.epoch").set(phase.epoch().get() as f64);
-        metrics::gauge!("sync.zakura.apply.phase").set(match phase {
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.epoch")
+            .set(phase.epoch().get() as f64);
+        zakura_node_services::metrics::gauge!("sync.zakura.apply.phase").set(match phase {
             ApplyPhase::LegacyBootstrap { .. } => 0.0,
             ApplyPhase::Native { .. } => 1.0,
             ApplyPhase::FallbackDraining { .. } => 2.0,
@@ -620,9 +629,9 @@ impl SyncCoordinator {
             .clone();
         let demand = SyncServiceDemand::from_phases(apply, &header);
         self.service_demand_tx.send_replace(demand);
-        metrics::gauge!("sync.zakura.service.header_enabled")
+        zakura_node_services::metrics::gauge!("sync.zakura.service.header_enabled")
             .set(f64::from(demand.header.is_enabled()));
-        metrics::gauge!("sync.zakura.service.block_applying")
+        zakura_node_services::metrics::gauge!("sync.zakura.service.block_applying")
             .set(f64::from(demand.block.is_applying()));
         tracing::debug!(?demand, "sync ordered-service demand changed");
     }
@@ -756,7 +765,7 @@ impl Drop for LegacyFallbackLease {
                 "legacy fallback lease could not restore native apply ownership"
             );
         }
-        metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
+        zakura_node_services::metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
     }
 }
 

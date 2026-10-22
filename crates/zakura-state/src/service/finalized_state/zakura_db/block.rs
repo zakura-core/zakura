@@ -1069,8 +1069,10 @@ impl ZakuraDb {
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         commit(self, batch)?;
-        metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
-            .record(batch_start.elapsed().as_secs_f64());
+        zakura_node_services::metrics::histogram!(
+            "zakura.state.rocksdb.batch_commit.duration_seconds"
+        )
+        .record(batch_start.elapsed().as_secs_f64());
 
         tracing::trace!(?source, "committed block from");
 

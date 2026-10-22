@@ -872,7 +872,7 @@ impl HeaderSyncReactor {
                 handled_event = true;
             }
             let maintenance = self.next_maintenance_deadline();
-            metrics::counter!("sync.header.reactor.iterations").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
             zakura_rt::select! {
                 biased;
@@ -949,7 +949,7 @@ impl HeaderSyncReactor {
     }
 
     fn handle_event(&mut self, event: Event) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.reactor.events",
             "event" => event.metrics_label()
         )
@@ -1039,7 +1039,8 @@ impl HeaderSyncReactor {
             .is_some_and(|until| *until > Instant::now())
         {
             session.cancel_token().cancel();
-            metrics::counter!("sync.header.peer.readmission_refused.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.peer.readmission_refused.total")
+                .increment(1);
             return;
         }
         let direction = session.direction();
@@ -1204,7 +1205,7 @@ impl HeaderSyncReactor {
         if state.session.session_id() != session_id {
             return;
         }
-        metrics::counter!("sync.header.peer.status.received").increment(1);
+        zakura_node_services::metrics::counter!("sync.header.peer.status.received").increment(1);
         self.emit_status(hs_trace::HEADER_STATUS_RECEIVED, &peer, session_id, &status);
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
@@ -1263,14 +1264,14 @@ impl HeaderSyncReactor {
             // peer's status takes the target.
             self.peer_work_queue.remove_unstarted(&peer);
             self.spend_status(&peer);
-            metrics::counter!("sync.header.target.pruned_pause").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.pruned_pause").increment(1);
             return;
         }
         if !eligible || covered {
             self.peer_work_queue.remove_unstarted(&peer);
             self.spend_status(&peer);
             if covered {
-                metrics::counter!("sync.header.target.covered").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.covered").increment(1);
             }
             return;
         }
@@ -1282,7 +1283,8 @@ impl HeaderSyncReactor {
             {
                 self.spend_status(&peer);
             }
-            metrics::counter!("sync.header.target.already_active").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.already_active")
+                .increment(1);
             return;
         }
         if self.ordinary_discovery_paused() || self.ordinary_headroom(&peer, &target.status) == 0 {
@@ -1317,13 +1319,16 @@ impl HeaderSyncReactor {
                 }
             }
             QueueWorkResult::AlreadyActive => {
-                metrics::counter!("sync.header.target.already_active").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.already_active")
+                    .increment(1);
             }
             QueueWorkResult::TargetAlreadyAssigned => {
-                metrics::counter!("sync.header.target.duplicate_suppressed").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.duplicate_suppressed")
+                    .increment(1);
             }
             QueueWorkResult::AtCapacity => {
-                metrics::counter!("sync.header.target.capacity_refused").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.capacity_refused")
+                    .increment(1);
             }
         }
     }
@@ -1555,7 +1560,8 @@ impl HeaderSyncReactor {
                 pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
                 state.status_spent = false;
                 self.scheduling_revision = self.scheduling_revision.wrapping_add(1);
-                metrics::counter!("sync.header.target.aux_fallback").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.aux_fallback")
+                    .increment(1);
             }
             AuxSchema::None => {
                 if let Some(tip) = tip {
@@ -1612,14 +1618,16 @@ impl HeaderSyncReactor {
         admitted: Admitted,
     ) {
         let Some(active) = self.peer_work_queue.active(&peer) else {
-            metrics::counter!("sync.header.target.late_response.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.late_response.total")
+                .increment(1);
             return;
         };
         if active.request_id.get() != admitted.id
             || active.owner.session_id() != session_id
             || active.phase != HeaderTargetPhase::Receiving
         {
-            metrics::counter!("sync.header.target.late_response.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.late_response.total")
+                .increment(1);
             return;
         }
         let response_scope = active.owner.header_authority();
@@ -1711,7 +1719,10 @@ impl HeaderSyncReactor {
                 context.episode == episode && !context.admits_new_input(active.source, &inputs)
             });
             if excluded {
-                metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "sync.header.vct.repair.excluded_input.total"
+                )
+                .increment(1);
                 self.retry_vct_repair(repair_owner, VctRepairRetry::excluded_input(active.source));
                 return;
             }
@@ -1783,7 +1794,8 @@ impl HeaderSyncReactor {
                 || durable_prefix_full
                 || checkpoint_prefix_ready);
         if !complete && checkpoint_prefix_ready {
-            metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.checkpoint_prefix.prepared.total")
+                .increment(1);
         }
         let active = self
             .peer_work_queue
@@ -1996,14 +2008,14 @@ impl HeaderSyncReactor {
                     .expect("an auxiliary repair has body authority"),
                 VctRepairRetry::supplier(active.source, terminal_outcome),
             );
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "sync.header.vct.repair.outcome.total",
                 "outcome" => format!("{:?}", ended.outcome)
             )
             .increment(1);
         } else {
             self.retire_peer_work(&peer, terminal_outcome);
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "sync.header.target.outcome",
                 "outcome" => format!("{:?}", ended.outcome)
             )
@@ -2036,7 +2048,7 @@ impl HeaderSyncReactor {
             .registered_completion_authority(&peer, source, &owner, is_repair)
         {
             Ok((authority, outcome)) => {
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header.target.completion_gate.total",
                     "outcome" => outcome
                 )
@@ -2116,7 +2128,7 @@ impl HeaderSyncReactor {
                     ?receipt,
                     "header target admission stopped by a committed local resource alarm"
                 );
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header.target.resource_stalled.total",
                     "alarm_changed" => receipt.alarm_changed.to_string()
                 )
@@ -2149,8 +2161,14 @@ impl HeaderSyncReactor {
                         self.emit_vct_repair_state(task, "admission", Some("applied"));
                     }
                     self.vct_repair_stall = None;
-                    metrics::counter!("sync.header.vct.repair.admitted.total").increment(1);
-                    metrics::counter!("sync.header.vct.repair.admitted.headers").increment(
+                    zakura_node_services::metrics::counter!(
+                        "sync.header.vct.repair.admitted.total"
+                    )
+                    .increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "sync.header.vct.repair.admitted.headers"
+                    )
+                    .increment(
                         u64::try_from(repair_header_count.unwrap_or(1))
                             .expect("a bounded repair count fits u64"),
                     );
@@ -2190,8 +2208,10 @@ impl HeaderSyncReactor {
                                 VctRepairRetry::local(source, HeaderRequestTerminal::LocalError),
                             );
                         }
-                        metrics::counter!("sync.header.vct.repair.auxiliary_capacity.total")
-                            .increment(1);
+                        zakura_node_services::metrics::counter!(
+                            "sync.header.vct.repair.auxiliary_capacity.total"
+                        )
+                        .increment(1);
                     } else {
                         self.retry_vct_repair(
                             repair_owner,
@@ -2210,7 +2230,10 @@ impl HeaderSyncReactor {
                             self.emit_vct_repair_state(task, "wait", Some("resource_state_change"));
                         }
                     }
-                    metrics::counter!("sync.header.vct.repair.resource_stalled.total").increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "sync.header.vct.repair.resource_stalled.total"
+                    )
+                    .increment(1);
                 }
             }
             return;
@@ -2221,7 +2244,7 @@ impl HeaderSyncReactor {
                     completion_authority.header_generation,
                     completion_authority.branch,
                 );
-                metrics::counter!("sync.header.target.admitted").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.admitted").increment(1);
             }
             HeaderTargetAdmissionResult::Failed(error) => {
                 self.handle_typed_failure(peer, source, Some(owner), &error);
@@ -2544,14 +2567,15 @@ impl HeaderSyncReactor {
         outcome: VctRepairStallOutcome,
         now: Instant,
     ) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.vct.repair.stalled.total",
             "outcome" => outcome.label(),
             "attribution" => outcome.attribution(),
         )
         .increment(1);
         if outcome == VctRepairStallOutcome::NoEligibleSupplier {
-            metrics::counter!("sync.header.vct.repair.no_supplier.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.vct.repair.no_supplier.total")
+                .increment(1);
         }
         match self.vct_repair_stall.as_mut() {
             Some(record) if record.generation == task.repair_generation => {
@@ -2726,7 +2750,8 @@ impl HeaderSyncReactor {
     ) {
         self.pending_locator_queries.remove(&peer);
         let Some(target) = self.peer_work_queue.awaiting_target(&peer).cloned() else {
-            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.stale_locator")
+                .increment(1);
             return;
         };
         // Locators are derived from the local selected path, so tip churn under the same
@@ -2739,7 +2764,8 @@ impl HeaderSyncReactor {
         if !same_selected_path_authority || (locator.is_none() && superseded_tip) {
             // Authority moved, or a timed-out/failed read belonged to a replaced tip.
             // Keep the current staged target and fetch a fresh locator for it.
-            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.stale_locator")
+                .increment(1);
             if !self.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
                 peer: peer.clone(),
                 session_id: target.session_id,
@@ -2772,12 +2798,14 @@ impl HeaderSyncReactor {
             .awaiting(&peer, session_id, target_tip_hash, scope)
             .cloned()
         else {
-            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.stale_locator")
+                .increment(1);
             return;
         };
         let Some(locator) = locator else {
             self.peer_work_queue.remove_unstarted(&peer);
-            metrics::counter!("sync.header.target.locator_unavailable").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.locator_unavailable")
+                .increment(1);
             return;
         };
         let Some(local) = self.committed_snapshot.clone() else {
@@ -2786,7 +2814,8 @@ impl HeaderSyncReactor {
         };
         if !target.is_current(&local) {
             self.peer_work_queue.remove_unstarted(&peer);
-            metrics::counter!("sync.header.target.stale_locator").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.stale_locator")
+                .increment(1);
             return;
         }
         if self.ordinary_discovery_paused() {
@@ -2810,7 +2839,8 @@ impl HeaderSyncReactor {
             self.completed_targets
                 .mark(target.scope.header_generation, target.scope.branch);
             self.peer_work_queue.remove_unstarted(&peer);
-            metrics::counter!("sync.header.target.already_known.total").increment(1);
+            zakura_node_services::metrics::counter!("sync.header.target.already_known.total")
+                .increment(1);
             return;
         }
         let (negotiated_schema, negotiated_header_count) =
@@ -2934,13 +2964,14 @@ impl HeaderSyncReactor {
                     self.close_subscription(&peer);
                     self.peer_work_queue.remove_unstarted(&peer);
                 }
-                metrics::counter!("sync.header.target.requested").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.requested")
+                    .increment(1);
             }
             Err(error) => {
                 self.peer_work_queue.cancel_request_reservation(&peer);
                 self.peer_work_queue.remove_unstarted(&peer);
                 self.emit_queue_send_failed(&peer, &session, "SubscribeHeaders", &error, None);
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header.target.send_failed",
                     "reason" => ordered_send_error_label(&error)
                 )
@@ -3177,7 +3208,8 @@ impl HeaderSyncReactor {
             replaced.is_none(),
             "the sole repair is cleared before scheduling its replacement"
         );
-        metrics::counter!("sync.header.vct.repair.scheduled.total").increment(1);
+        zakura_node_services::metrics::counter!("sync.header.vct.repair.scheduled.total")
+            .increment(1);
         if let Some(task) = self.vct_repair.current() {
             self.emit_vct_repair_state(task, "schedule", None);
         }
@@ -3261,7 +3293,10 @@ impl HeaderSyncReactor {
                 let _ = task.context_unavailable(Instant::now() + VCT_REPAIR_RETRY_INTERVAL);
                 let task = task.clone();
                 self.emit_vct_repair_state(&task, "retry", Some("unavailable"));
-                metrics::counter!("sync.header.vct.repair.context_unavailable.total").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "sync.header.vct.repair.context_unavailable.total"
+                )
+                .increment(1);
             }
         }
     }
@@ -3536,8 +3571,9 @@ impl HeaderSyncReactor {
             }
             self.request_deadlines
                 .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-            metrics::counter!("sync.header.vct.repair.requested.total").increment(1);
-            metrics::counter!("sync.header.vct.repair.requested.headers")
+            zakura_node_services::metrics::counter!("sync.header.vct.repair.requested.total")
+                .increment(1);
+            zakura_node_services::metrics::counter!("sync.header.vct.repair.requested.headers")
                 .increment(u64::from(request_count));
             debug!(
                 ?peer,
@@ -3635,7 +3671,8 @@ impl HeaderSyncReactor {
                 {
                     publisher.record_sent(status, now);
                 }
-                metrics::counter!("sync.header.peer.status.sent").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.peer.status.sent")
+                    .increment(1);
                 true
             }
             Err(error) => {
@@ -3761,7 +3798,7 @@ impl HeaderSyncReactor {
             elapsed = ?event.elapsed,
             "VCT: local repair operation exceeded its hard deadline; terminating the node"
         );
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.vct.repair.local_operation_fatal.total",
             "phase" => event.phase,
         )
@@ -3820,7 +3857,10 @@ impl HeaderSyncReactor {
                         if let Some(session_id) = session_id {
                             self.charge_unproductive_request(&peer, session_id, "unresponsive");
                         }
-                        metrics::counter!("sync.header.vct.repair.timed_out.total").increment(1);
+                        zakura_node_services::metrics::counter!(
+                            "sync.header.vct.repair.timed_out.total"
+                        )
+                        .increment(1);
                     }
                     HeaderTargetPhase::Preparing | HeaderTargetPhase::Applying => {
                         let Some(task) = self.vct_repair.get(owner).cloned() else {
@@ -3849,7 +3889,7 @@ impl HeaderSyncReactor {
                         }
                         self.request_deadlines
                             .insert(peer, now + self.startup.request_timeout);
-                        metrics::counter!(
+                        zakura_node_services::metrics::counter!(
                             "sync.header.vct.repair.local_operation_pending.total",
                             "phase" => match phase {
                                 HeaderTargetPhase::Preparing => "preparing",
@@ -3868,7 +3908,8 @@ impl HeaderSyncReactor {
                     .active(&peer)
                     .map(|active| active.owner.session_id());
                 self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
-                metrics::counter!("sync.header.target.timed_out.total").increment(1);
+                zakura_node_services::metrics::counter!("sync.header.target.timed_out.total")
+                    .increment(1);
                 if let Some(session_id) = session_id {
                     self.charge_unproductive_request(&peer, session_id, "unresponsive");
                 }
@@ -4475,7 +4516,7 @@ impl HeaderSyncReactor {
                 self.finish_vct_local_operation(owner, phase);
             }
         }
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.port.panicked",
             "operation" => context.operation
         )
@@ -4671,12 +4712,12 @@ impl HeaderSyncReactor {
         };
         let header_count = u64::try_from(header_count)
             .expect("the bounded header target count fits in a metric counter");
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.target.preparation_gate.total",
             "outcome" => outcome
         )
         .increment(1);
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.target.preparation_gate.headers.total",
             "outcome" => outcome
         )
@@ -4685,7 +4726,7 @@ impl HeaderSyncReactor {
     }
 
     fn record_stale_completion(reason: zakura_header_chain::StaleReason) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header_chain.stale_completion.total",
             "kind" => format!("{reason:?}")
         )
@@ -4744,7 +4785,7 @@ impl HeaderSyncReactor {
         state.session.cancel_token().cancel();
 
         self.start_readmission_cooldown(peer);
-        metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
+        zakura_node_services::metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         self.dispatch_action(HeaderPortOperation::DropPeer {
             peer: peer.clone(),
             session_id,
@@ -4781,7 +4822,7 @@ impl HeaderSyncReactor {
         }
         let released = reserved.saturating_add(owned);
         if released != 0 {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "sync.header.chunk_budget.released.total",
                 "terminal" => terminal_outcome.label()
             )
@@ -4943,7 +4984,10 @@ impl HeaderSyncReactor {
                     && state.session.subscriber().live().is_some()
             });
             if unanswered {
-                metrics::counter!("sync.header.subscription.close_timed_out.total").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "sync.header.subscription.close_timed_out.total"
+                )
+                .increment(1);
                 self.drop_unproductive_peer(&peer, session_id, "unresponsive");
             }
         }
@@ -4975,7 +5019,7 @@ impl HeaderSyncReactor {
         owner: Option<zakura_header_chain::HeaderSyncWorkOwner>,
         error: &zakura_header_chain::HeaderChainError,
     ) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.failure.total",
             "category" => error.category.metrics_label(),
             "attribution" => error.attribution.metrics_label(),
@@ -5014,7 +5058,7 @@ impl HeaderSyncReactor {
                 zakura_header_chain::ErrorCategory::InvalidHeader
             }
         };
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "sync.header.failure.total",
             "category" => category.metrics_label(),
             "attribution" => "header_peer",

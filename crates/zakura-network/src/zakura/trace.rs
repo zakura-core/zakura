@@ -506,7 +506,7 @@ impl ZakuraTrace {
         source: BlockBodySource,
     ) {
         if self.first_block_source.record(hash, source) {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "sync.block.first_received.count",
                 "source" => source.as_str()
             )

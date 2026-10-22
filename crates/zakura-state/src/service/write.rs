@@ -401,7 +401,8 @@ impl BlockWriteFailure {
 
     pub(crate) fn set(&self, failure: BlockWriteTaskFailure) {
         if self.failure.set(failure).is_ok() {
-            metrics::counter!("state.block_writer.failure.total").increment(1);
+            zakura_node_services::metrics::counter!("state.block_writer.failure.total")
+                .increment(1);
             self.notify.notify_waiters();
         }
     }
@@ -1888,8 +1889,8 @@ impl HeaderChainObservers {
         self.runtime_status_sender.send_replace(status.clone());
         // This diagnostic gauge may round very large epochs.
         // Lifecycle authority retains the checked `u64`.
-        metrics::gauge!("state.header.runtime.epoch").set(epoch.get() as f64);
-        metrics::gauge!("state.header.runtime.phase").set(phase);
+        zakura_node_services::metrics::gauge!("state.header.runtime.epoch").set(epoch.get() as f64);
+        zakura_node_services::metrics::gauge!("state.header.runtime.phase").set(phase);
         tracing::info!(?status, "header runtime lifecycle changed");
     }
 }
@@ -2707,9 +2708,11 @@ impl WriteBlockWorkerTask {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
-                        metrics::counter!("state.vct.fast_path.hit").increment(1);
+                        zakura_node_services::metrics::counter!("state.vct.fast_path.hit")
+                            .increment(1);
                     } else {
-                        metrics::counter!("state.vct.fast_path.miss").increment(1);
+                        zakura_node_services::metrics::counter!("state.vct.fast_path.miss")
+                            .increment(1);
                     }
 
                     // A successful commit clears any VCT root stall: log recovery and reset
@@ -2740,7 +2743,7 @@ impl WriteBlockWorkerTask {
                     ) {
                         let failure_attribution = auxiliary_window.attribute_failure(failure);
                         let attribution_label = failure_attribution.attribution_label();
-                        metrics::counter!(
+                        zakura_node_services::metrics::counter!(
                             "state.vct.aux.verification_failure.count",
                             "attribution" => attribution_label
                         )
@@ -3160,13 +3163,15 @@ impl WriteBlockWorkerTask {
             };
 
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
-            metrics::histogram!("state.block_writer.queue.duration_seconds")
+            zakura_node_services::metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
             let is_mined = admission.is_some();
             let contextual_metrics = ContextualMetrics::for_commit(is_mined);
             if is_mined {
-                metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
-                    .record(writer_queue_duration);
+                zakura_node_services::metrics::histogram!(
+                    "state.block_writer.queue.mined.duration_seconds"
+                )
+                .record(writer_queue_duration);
             }
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header.previous_block_hash;
@@ -3382,16 +3387,19 @@ impl WriteBlockWorkerTask {
             // Update the metrics if semantic and contextual validation passes
             //
             // TODO: split this out into a function?
-            metrics::counter!("state.full_verifier.committed.block.count").increment(1);
-            metrics::counter!("zcash.chain.verified.block.total").increment(1);
+            zakura_node_services::metrics::counter!("state.full_verifier.committed.block.count")
+                .increment(1);
+            zakura_node_services::metrics::counter!("zcash.chain.verified.block.total")
+                .increment(1);
 
-            metrics::gauge!("state.full_verifier.committed.block.height")
+            zakura_node_services::metrics::gauge!("state.full_verifier.committed.block.height")
                 .set(tip_block_height.0 as f64);
 
             // This height gauge is updated for both fully verified and checkpoint blocks.
             // These updates can't conflict, because this block write task makes sure that blocks
             // are committed in order.
-            metrics::gauge!("zcash.chain.verified.block.height").set(tip_block_height.0 as f64);
+            zakura_node_services::metrics::gauge!("zcash.chain.verified.block.height")
+                .set(tip_block_height.0 as f64);
 
             tracing::trace!("finished processing queued block");
         }

@@ -215,7 +215,7 @@ impl SubscriptionFault {
     }
 
     fn counted(self, message_type: u16) -> Self {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.subscription.fault",
             "message_type" => message_type.to_string(),
             "reason" => self.label(),

@@ -154,7 +154,7 @@ impl ByteBudget {
         let actual = self.reserved();
         let ok = actual >= expected;
         if !ok {
-            metrics::counter!("sync.block.budget.audit_drift").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.budget.audit_drift").increment(1);
         }
         ok
     }

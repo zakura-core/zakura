@@ -851,7 +851,7 @@ impl Service<zn::Request> for Inbound {
                     ?peer_id,
                     "ignoring Zakura block advertisement because native block sync owns block bodies",
                 );
-                metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
+                zakura_node_services::metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             zn::Request::AdvertiseBlock(hash, advertiser) => {

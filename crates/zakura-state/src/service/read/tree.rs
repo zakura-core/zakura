@@ -248,7 +248,10 @@ fn check_historical_subtree_available(
             "no note commitment tree at the last checkpoint, so completed subtrees cannot be \
              distinguished from absent ones; refusing to serve",
         );
-        metrics::counter!("state.historical_tree.last_checkpoint_tree_missing").increment(1);
+        zakura_node_services::metrics::counter!(
+            "state.historical_tree.last_checkpoint_tree_missing"
+        )
+        .increment(1);
 
         return Err(HistoricalSubtreeUnavailable {
             pool,

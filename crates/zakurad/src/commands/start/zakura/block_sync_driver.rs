@@ -342,7 +342,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             ?invalid,
                             reason, "failing closed after losing consensus-invalid body evidence"
                         );
-                        metrics::counter!(
+                        zakura_node_services::metrics::counter!(
                             "sync.block.body_invalid.persist.fail_closed",
                             "reason" => reason
                         )
@@ -886,7 +886,8 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     }
 
     if coalesced_count > 0 {
-        metrics::counter!("sync.block.needed_query.coalesced").increment(coalesced_count);
+        zakura_node_services::metrics::counter!("sync.block.needed_query.coalesced")
+            .increment(coalesced_count);
     }
 
     BlockSyncAction::QueryNeededBlocks {
@@ -1095,7 +1096,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .take()
                             .expect("accepted operation has one terminal result")
                             .complete(super::BlockApplyTerminal::TransferredToLegacy);
-                        metrics::counter!(match class {
+                        zakura_node_services::metrics::counter!(match class {
                             BlockApplyClass::Checkpoint => {
                                 "sync.zakura.apply.checkpoint_transferred_to_legacy"
                             }

@@ -184,7 +184,7 @@ impl SubscriberFault {
 
     /// Count this fault and return it.
     fn counted(self) -> Self {
-        metrics::counter!("sync.header.v9.subscriber.fault", "reason" => self.label()).increment(1);
+        zakura_node_services::metrics::counter!("sync.header.v9.subscriber.fault", "reason" => self.label()).increment(1);
         self
     }
 }

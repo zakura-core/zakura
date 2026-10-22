@@ -183,10 +183,12 @@ impl Service<BatchControl<Item>> for Verifier {
                     })?;
 
                     if is_valid {
-                        metrics::counter!("proofs.sapling.verified").increment(1);
+                        zakura_node_services::metrics::counter!("proofs.sapling.verified")
+                            .increment(1);
                         Ok(())
                     } else {
-                        metrics::counter!("proofs.sapling.invalid").increment(1);
+                        zakura_node_services::metrics::counter!("proofs.sapling.invalid")
+                            .increment(1);
                         Err(BoxError::from(TransactionError::SaplingVerificationFailed))
                     }
                 }
@@ -210,7 +212,7 @@ impl Service<BatchControl<Item>> for Verifier {
                         Ok(true) => "success",
                         _ => "failure",
                     };
-                    metrics::histogram!(
+                    zakura_node_services::metrics::histogram!(
                         "zakura.consensus.batch.duration_seconds",
                         "verifier" => VERIFIER_NAME,
                         "result" => result_label

@@ -845,7 +845,7 @@ where
             Ok(result) => return result,
             Err(_) => {
                 let header_owner = owner.header_authority();
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.header.port.stall.total",
                     "operation" => "apply_target",
                 )
@@ -870,7 +870,7 @@ fn header_target_apply_failure(
     source: Option<zakura_state::BoxError>,
 ) -> Arc<zakura_header_chain::HeaderChainError> {
     let branch = owner.header_authority().branch;
-    metrics::counter!(
+    zakura_node_services::metrics::counter!(
         "sync.header.port.failure.total",
         "operation" => "apply_target",
         "reason" => reason,

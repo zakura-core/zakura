@@ -16,6 +16,9 @@
 //! connection task owns each `quinn_proto::Connection`. Handles reach them only
 //! through ordered message channels, so no lock guards a QUIC state machine.
 
+// zakura-quic sits below zakura-node-services, so it keeps the `metrics` macros.
+#![allow(clippy::disallowed_macros)]
+
 mod key;
 mod tls;
 

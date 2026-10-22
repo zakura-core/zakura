@@ -511,7 +511,7 @@ pub(crate) fn produce_block_roots(
         // missing body so callers never mistake fabricated zero metadata for a complete
         // payload.
         let Some(block) = db.block(height.into()) else {
-            metrics::counter!("state.block_roots.missing_body").increment(1);
+            zakura_node_services::metrics::counter!("state.block_roots.missing_body").increment(1);
             static MISSING_BODIES: AtomicU64 = AtomicU64::new(0);
             let occurrences = MISSING_BODIES.fetch_add(1, Ordering::Relaxed) + 1;
             if occurrences.is_power_of_two() {

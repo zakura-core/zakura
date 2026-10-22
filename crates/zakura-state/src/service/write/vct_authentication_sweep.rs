@@ -267,7 +267,10 @@ impl VctAuthenticationSweeper {
                     }
                     verified_prefix.history_tree = verified.history_tree().clone();
                     verified_prefix.frontier = Frontier::new(selected_height, selected_hash);
-                    metrics::counter!("state.vct.aux.sweep.authenticated.count").increment(1);
+                    zakura_node_services::metrics::counter!(
+                        "state.vct.aux.sweep.authenticated.count"
+                    )
+                    .increment(1);
                     projection_index += 1;
                 }
                 Err((failed_height, error)) => {
@@ -310,7 +313,7 @@ impl VctAuthenticationSweeper {
         {
             repair_manager.clear_sweep_repair();
         }
-        metrics::gauge!("state.vct.aux.sweep.frontier.height")
+        zakura_node_services::metrics::gauge!("state.vct.aux.sweep.frontier.height")
             .set(f64::from(verified_prefix.frontier.height.0));
         self.verified_selected_prefix = Some(verified_prefix);
     }
@@ -395,7 +398,7 @@ impl VctAuthenticationSweeper {
             return;
         };
         let attribution_label = attribution.attribution_label();
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "state.vct.aux.sweep.verification_failure.count",
             "attribution" => attribution_label
         )
@@ -469,7 +472,8 @@ fn authenticate_alternative_pair(
             return None;
         }
     };
-    metrics::counter!("state.vct.aux.sweep.alternative_search.count").increment(1);
+    zakura_node_services::metrics::counter!("state.vct.aux.sweep.alternative_search.count")
+        .increment(1);
     // Each window shares its current delivery with its neighbors, so one fold serves the group.
     let mut current_fold: Option<(EvidenceId, Option<HistoryTree>)> = None;
     for window in &windows {
@@ -521,7 +525,8 @@ fn authenticate_alternative_pair(
         if !persist_delivery_authentication(writer, network, window, successor_witness) {
             return None;
         }
-        metrics::counter!("state.vct.aux.sweep.authenticated.count").increment(1);
+        zakura_node_services::metrics::counter!("state.vct.aux.sweep.authenticated.count")
+            .increment(1);
         return Some(verified.history_tree().clone());
     }
     None

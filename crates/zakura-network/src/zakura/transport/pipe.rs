@@ -259,7 +259,7 @@ struct PipeTeardown<F: FnOnce(), P: FnOnce()> {
 impl<F: FnOnce(), P: FnOnce()> Drop for PipeTeardown<F, P> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            metrics::counter!("zakura.pipe.panic").increment(1);
+            zakura_node_services::metrics::counter!("zakura.pipe.panic").increment(1);
             tracing::error!(
                 peer_id = ?self.peer_id,
                 "Zakura peer pipe panicked; disconnecting peer only"
@@ -370,7 +370,7 @@ struct PeerTaskTeardown<F: FnOnce(), P: FnOnce()> {
 impl<F: FnOnce(), P: FnOnce()> Drop for PeerTaskTeardown<F, P> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            metrics::counter!("zakura.pipe.panic").increment(1);
+            zakura_node_services::metrics::counter!("zakura.pipe.panic").increment(1);
             tracing::error!(
                 peer_id = ?self.peer_id,
                 "Zakura peer task panicked; disconnecting peer only"

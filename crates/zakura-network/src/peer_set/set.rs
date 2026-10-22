@@ -1152,7 +1152,7 @@ where
                 peer = %peer.addr_label(self.expose_peer_addresses),
                 "routing to a peer which advertised inventory"
             );
-            metrics::counter!("pool.route_inv.advertiser.count").increment(1);
+            zakura_node_services::metrics::counter!("pool.route_inv.advertiser.count").increment(1);
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
                     self.legacy_peer_trace.next_request_id(),
@@ -1205,7 +1205,7 @@ where
                 peer = %peer.addr_label(self.expose_peer_addresses),
                 "routing to a peer that might have inventory"
             );
-            metrics::counter!("pool.route_inv.maybe.count").increment(1);
+            zakura_node_services::metrics::counter!("pool.route_inv.maybe.count").increment(1);
             let trace_context = match hash {
                 InventoryHash::Block(hash) => Some((
                     self.legacy_peer_trace.next_request_id(),
@@ -1245,9 +1245,11 @@ where
         // - `all_missing`: ready peers exist, but every one is marked missing this hash — local
         //   inventory-marker staleness.
         if self.ready_services.is_empty() {
-            metrics::counter!("pool.route_inv.notfound.no_ready.count").increment(1);
+            zakura_node_services::metrics::counter!("pool.route_inv.notfound.no_ready.count")
+                .increment(1);
         } else {
-            metrics::counter!("pool.route_inv.notfound.all_missing.count").increment(1);
+            zakura_node_services::metrics::counter!("pool.route_inv.notfound.all_missing.count")
+                .increment(1);
         }
 
         tracing::debug!(
@@ -1605,9 +1607,9 @@ where
         let num_ready = self.ready_services.len();
         let num_unready = self.unready_services.len();
         let num_peers = num_ready + num_unready;
-        metrics::gauge!("pool.num_ready").set(num_ready as f64);
-        metrics::gauge!("pool.num_unready").set(num_unready as f64);
-        metrics::gauge!("zcash.net.peers").set(num_peers as f64);
+        zakura_node_services::metrics::gauge!("pool.num_ready").set(num_ready as f64);
+        zakura_node_services::metrics::gauge!("pool.num_unready").set(num_unready as f64);
+        zakura_node_services::metrics::gauge!("zcash.net.peers").set(num_peers as f64);
 
         // Security: make sure we haven't exceeded the connection limit
         if num_peers > self.peerset_total_connection_limit {

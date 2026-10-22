@@ -560,7 +560,7 @@ impl SequencerTask {
                 body.bytes,
                 self.sequencer.verified_tip(),
             );
-            metrics::counter!("sync.block.retention.deferred").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.retention.deferred").increment(1);
             self.trace_body_accepted(
                 body.height,
                 body.received_at.elapsed(),
@@ -670,7 +670,7 @@ impl SequencerTask {
             return;
         }
 
-        metrics::counter!("sync.block.reorg.reset").increment(1);
+        zakura_node_services::metrics::counter!("sync.block.reorg.reset").increment(1);
 
         // A `Reset` can also be a stale or coalesced state update for a tip
         // already inside our contiguous submitted/downloaded body floor. Do not
@@ -747,7 +747,8 @@ impl SequencerTask {
                 .submission_bytes(owner, source, token, height, hash)
             {
                 self.committed_throughput.record(bytes);
-                metrics::counter!("sync.block.payload.committed.bytes").increment(bytes);
+                zakura_node_services::metrics::counter!("sync.block.payload.committed.bytes")
+                    .increment(bytes);
             }
         }
         // A stale completion (no live applying entry, or token/hash mismatch)
@@ -1012,13 +1013,13 @@ impl SequencerTask {
                 continue;
             };
 
-            metrics::counter!("sync.block.submit.sent").increment(1);
+            zakura_node_services::metrics::counter!("sync.block.submit.sent").increment(1);
             let queue_depth = self
                 .actions
                 .max_capacity()
                 .saturating_sub(self.actions.capacity());
             // Metrics accepts f64 samples; this lossy conversion is observability-only.
-            metrics::histogram!(
+            zakura_node_services::metrics::histogram!(
                 "sync.block.action.queue.depth",
                 "action" => "submit_block"
             )
@@ -1032,7 +1033,7 @@ impl SequencerTask {
                     block: item.block,
                 })
                 .await;
-            metrics::histogram!("sync.block.submit.queue_wait_seconds")
+            zakura_node_services::metrics::histogram!("sync.block.submit.queue_wait_seconds")
                 .record(send_started.elapsed().as_secs_f64());
             if !sent {
                 self.sequencer.unsubmit(item.height, item.token);
@@ -1041,14 +1042,16 @@ impl SequencerTask {
                     self.submission_retry_started_at.get_or_insert(now);
                     self.submission_retry_attempt = self.submission_retry_attempt.saturating_add(1);
                     self.submission_retry_at = Some(now + SUBMISSION_RETRY_DELAY);
-                    metrics::counter!("sync.block.submit.retry.scheduled").increment(1);
+                    zakura_node_services::metrics::counter!("sync.block.submit.retry.scheduled")
+                        .increment(1);
                     self.trace_submission_retry_scheduled(item.height);
                 }
                 return;
             }
             if let Some(started_at) = self.submission_retry_started_at.take() {
-                metrics::counter!("sync.block.submit.retry.succeeded").increment(1);
-                metrics::histogram!("sync.block.submit.retry.delay_seconds")
+                zakura_node_services::metrics::counter!("sync.block.submit.retry.succeeded")
+                    .increment(1);
+                zakura_node_services::metrics::histogram!("sync.block.submit.retry.delay_seconds")
                     .record(started_at.elapsed().as_secs_f64());
                 self.submission_retry_attempt = 0;
             }
@@ -1131,7 +1134,7 @@ impl SequencerTask {
             Ok(Ok(())) => true,
             Ok(Err(_)) => false,
             Err(_) => {
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "sync.block.action.send_timeout",
                     "action" => action_label
                 )
@@ -1152,7 +1155,7 @@ impl SequencerTask {
     async fn send_required_action(&self, action: BlockSyncAction) {
         let action_label = action.metric_label();
         if let Err(error) = self.actions.send(action).await {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "sync.block.action.required_receiver_closed",
                 "action" => action_label
             )

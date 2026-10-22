@@ -282,16 +282,18 @@ impl InsertOutcome {
             return;
         }
 
-        metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => verifier_name).increment(1);
+        zakura_node_services::metrics::counter!(CACHE_INSERT, VERIFIER_LABEL => verifier_name)
+            .increment(1);
 
         if self.evicted > 0 {
             // Cast is safe: at most `capacity` keys are evicted by one insert.
-            metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => verifier_name)
+            zakura_node_services::metrics::counter!(CACHE_EVICT, VERIFIER_LABEL => verifier_name)
                 .increment(self.evicted as u64);
         }
 
         // Cast is safe: the length is bounded by `capacity`, far below f64's exact integer range.
-        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => verifier_name).set(self.size as f64);
+        zakura_node_services::metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => verifier_name)
+            .set(self.size as f64);
     }
 }
 
@@ -360,7 +362,8 @@ impl<S> Cached<S> {
             .expect("verified bundle cache mutex should not be poisoned")
             .clear();
 
-        metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier_name).set(0.0);
+        zakura_node_services::metrics::gauge!(CACHE_SIZE, VERIFIER_LABEL => self.verifier_name)
+            .set(0.0);
     }
 
     /// Returns how many times an item equivalent to `item` has reached the inner service.
@@ -443,12 +446,13 @@ where
                 .expect("verified bundle cache mutex should not be poisoned")
                 .contains(&key)
             {
-                metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
+                zakura_node_services::metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
                 return future::ready(Ok(())).boxed();
             }
         }
 
-        metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier_name).increment(1);
+        zakura_node_services::metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier_name)
+            .increment(1);
 
         let verified = self.verified.clone();
         let verifier_name = self.verifier_name;

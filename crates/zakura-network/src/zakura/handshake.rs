@@ -1442,13 +1442,14 @@ impl ZakuraPeerSupervisor {
         if let Some(existing_hash) = self.peers.get(&peer_id) {
             // D6: the lexicographically smaller transcript hash wins; exact ties keep the incumbent.
             if existing_hash <= &transcript_hash {
-                metrics::counter!("zakura.p2p.handshake.duplicate").increment(1);
+                zakura_node_services::metrics::counter!("zakura.p2p.handshake.duplicate")
+                    .increment(1);
                 return AuthenticatedPeerRegistration::Duplicate;
             }
         }
 
         self.peers.insert(peer_id, transcript_hash);
-        metrics::counter!("zakura.p2p.handshake.upgraded").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.handshake.upgraded").increment(1);
         AuthenticatedPeerRegistration::Registered
     }
 

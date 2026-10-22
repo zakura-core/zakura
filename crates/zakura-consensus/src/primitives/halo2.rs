@@ -527,7 +527,7 @@ impl Verifier {
             Ok(true) => "success",
             _ => "failure",
         };
-        metrics::histogram!(
+        zakura_node_services::metrics::histogram!(
             "zakura.consensus.batch.duration_seconds",
             "verifier" => "halo2",
             "result" => result_label
@@ -587,11 +587,13 @@ impl Service<BatchControl<Item>> for Verifier {
 
                             if is_valid {
                                 tracing::trace!(?is_valid, "verified halo2 proof");
-                                metrics::counter!("proofs.halo2.verified").increment(1);
+                                zakura_node_services::metrics::counter!("proofs.halo2.verified")
+                                    .increment(1);
                                 Ok(())
                             } else {
                                 tracing::trace!(?is_valid, "invalid halo2 proof");
-                                metrics::counter!("proofs.halo2.invalid").increment(1);
+                                zakura_node_services::metrics::counter!("proofs.halo2.invalid")
+                                    .increment(1);
                                 Err(TransactionError::Halo2VerificationFailed.into())
                             }
                         }

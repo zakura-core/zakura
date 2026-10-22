@@ -303,7 +303,10 @@ impl PeerRegistry {
             {
                 retries.entries.insert(entry, until);
             } else {
-                metrics::counter!("sync.block.body.unavailable_cooldown_skipped").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "sync.block.body.unavailable_cooldown_skipped"
+                )
+                .increment(1);
             }
         }
     }
@@ -338,7 +341,10 @@ impl PeerRegistry {
                 retries.entries.insert(key, until);
             } else {
                 // The cooldown is advisory. Skipping it only allows an earlier retry.
-                metrics::counter!("sync.block.body.incompatible_cooldown_skipped").increment(1);
+                zakura_node_services::metrics::counter!(
+                    "sync.block.body.incompatible_cooldown_skipped"
+                )
+                .increment(1);
             }
         }
     }

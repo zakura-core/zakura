@@ -68,7 +68,7 @@ pub(super) struct ServeMetrics {
 
 impl ServeMetrics {
     pub(super) fn delayed(&self, bound: &'static str) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.serve.delayed",
             "service" => self.service,
             "message_type" => self.message_type.clone(),
@@ -78,7 +78,7 @@ impl ServeMetrics {
     }
 
     pub(super) fn admitted(&self) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.serve.admitted",
             "service" => self.service,
             "message_type" => self.message_type.clone(),
@@ -89,7 +89,7 @@ impl ServeMetrics {
     /// Count a request above the advertised limit but within the margin.
     pub(super) fn over_limit(&self, open: u32, limit: u32) {
         self.over_limit.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.serve.over_limit",
             "service" => self.service,
             "message_type" => self.message_type.clone(),
@@ -105,7 +105,7 @@ impl ServeMetrics {
     }
 
     pub(super) fn ended(&self, outcome: &'static str) {
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.p2p.serve.ended",
             "service" => self.service,
             "message_type" => self.message_type.clone(),
@@ -130,7 +130,7 @@ impl ServeMetrics {
             Gauge::Active => "zakura.p2p.serve.active",
         };
         // Gauges are small counts, exactly representable as f64.
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             name,
             "service" => self.service,
             "message_type" => self.message_type.clone(),

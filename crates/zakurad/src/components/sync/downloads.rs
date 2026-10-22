@@ -563,7 +563,8 @@ where
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
         if self.cancel_handles.contains_key(&hash) {
-            metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
+            zakura_node_services::metrics::counter!("sync.already.queued.dropped.block.hash.count")
+                .increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
         }
 
@@ -625,8 +626,8 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to download completion");
-                        metrics::counter!("sync.cancelled.download.count").increment(1);
-                        metrics::histogram!("sync.block.download.duration_seconds", "result" => "cancelled")
+                        zakura_node_services::metrics::counter!("sync.cancelled.download.count").increment(1);
+                        zakura_node_services::metrics::histogram!("sync.block.download.duration_seconds", "result" => "cancelled")
                             .record(download_start.elapsed().as_secs_f64());
                         return Err(BlockDownloadVerifyError::CancelledDuringDownload { hash })
                     }
@@ -651,7 +652,7 @@ where
                     match blocks.first().and_then(|block| block.available()) {
                         Some(available) if blocks.len() == 1 => available,
                         _ => {
-                            metrics::histogram!("sync.block.download.duration_seconds", "result" => "failed")
+                            zakura_node_services::metrics::histogram!("sync.block.download.duration_seconds", "result" => "failed")
                                 .record(download_start.elapsed().as_secs_f64());
                             return Err(BlockDownloadVerifyError::DownloadFailed {
                                 error: format!(
@@ -673,7 +674,7 @@ where
                 // a peer could otherwise substitute a different valid block for
                 // the one requested before it reaches the verifier.
                 if block.hash() != hash {
-                    metrics::histogram!("sync.block.download.duration_seconds", "result" => "failed")
+                    zakura_node_services::metrics::histogram!("sync.block.download.duration_seconds", "result" => "failed")
                         .record(download_start.elapsed().as_secs_f64());
                     return Err(BlockDownloadVerifyError::DownloadFailed {
                         error: format!(
@@ -684,8 +685,8 @@ where
                         hash,
                     });
                 }
-                metrics::counter!("sync.downloaded.block.count").increment(1);
-                metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
+                zakura_node_services::metrics::counter!("sync.downloaded.block.count").increment(1);
+                zakura_node_services::metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
                     .record(download_start.elapsed().as_secs_f64());
 
                 // Security & Performance: reject blocks that are too far ahead of our tip.
@@ -727,7 +728,7 @@ where
                         ?hash,
                         "synced block with no height: dropped downloaded block"
                     );
-                    metrics::counter!("sync.no.height.dropped.block.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.no.height.dropped.block.count").increment(1);
 
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
@@ -747,7 +748,7 @@ where
                         ?expected_height,
                         "tip child claimed the wrong coinbase height: rejected poisoned block"
                     );
-                    metrics::counter!("sync.tip.child.height.mismatch.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.tip.child.height.mismatch.count").increment(1);
 
                     return Err(BlockDownloadVerifyError::TipChildHeightMismatch {
                         height: block_height,
@@ -806,16 +807,16 @@ where
                         );
                     }
 
-                    metrics::counter!("sync.max.height.limit.paused.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.max.height.limit.paused.count").increment(1);
                 } else if block_height <= lookahead_reset_height && past_lookahead_limit_receiver.cloned_watch_data() {
                     // Reset the watched value to false, since we're well under the limit.
                     // We need to block here, because if we don't the syncer can hang.
 
                     // But if Zebra is shutting down, ignore the send error.
                     let _ = past_lookahead_limit_sender.lock().expect("thread panicked while holding the past_lookahead_limit_sender mutex guard").send(false);
-                    metrics::counter!("sync.max.height.limit.reset.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.max.height.limit.reset.count").increment(1);
 
-                    metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                 }
 
                 if block_height < min_accepted_height {
@@ -827,7 +828,7 @@ where
                         behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
                         "synced block height behind the finalized tip: dropped downloaded block"
                     );
-                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+                    zakura_node_services::metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
 
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
@@ -839,7 +840,7 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled waiting for verifier service readiness");
-                        metrics::counter!("sync.cancelled.verify.ready.count").increment(1);
+                        zakura_node_services::metrics::counter!("sync.cancelled.verify.ready.count").increment(1);
                         return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
                     }
                     verifier = readiness => verifier,
@@ -872,8 +873,8 @@ where
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to verification");
-                        metrics::counter!("sync.cancelled.verify.count").increment(1);
-                        metrics::histogram!("sync.block.verify.duration_seconds", "result" => "cancelled")
+                        zakura_node_services::metrics::counter!("sync.cancelled.verify.count").increment(1);
+                        zakura_node_services::metrics::histogram!("sync.block.verify.duration_seconds", "result" => "cancelled")
                             .record(verify_start.elapsed().as_secs_f64());
                         return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash })
                     }
@@ -881,11 +882,11 @@ where
                 };
 
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
-                metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
+                zakura_node_services::metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
                     .record(verify_start.elapsed().as_secs_f64());
 
                 if verification.is_ok() {
-                    metrics::counter!("sync.verified.block.count").increment(1);
+                    zakura_node_services::metrics::counter!("sync.verified.block.count").increment(1);
                 }
 
                 verification

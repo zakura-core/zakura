@@ -170,7 +170,7 @@ impl Verifier {
             Ok(Ok(())) => "success",
             _ => "failure",
         };
-        metrics::histogram!(
+        zakura_node_services::metrics::histogram!(
             "zakura.consensus.batch.duration_seconds",
             "verifier" => "redpallas",
             "result" => result_label
@@ -212,10 +212,16 @@ impl Service<BatchControl<Item>> for Verifier {
 
                             if result.is_ok() {
                                 tracing::trace!(?result, "validated redpallas signature");
-                                metrics::counter!("signatures.redpallas.validated").increment(1);
+                                zakura_node_services::metrics::counter!(
+                                    "signatures.redpallas.validated"
+                                )
+                                .increment(1);
                             } else {
                                 tracing::trace!(?result, "invalid redpallas signature");
-                                metrics::counter!("signatures.redpallas.invalid").increment(1);
+                                zakura_node_services::metrics::counter!(
+                                    "signatures.redpallas.invalid"
+                                )
+                                .increment(1);
                             }
 
                             result.map_err(BoxError::from)

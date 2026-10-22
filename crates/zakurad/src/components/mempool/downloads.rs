@@ -440,7 +440,7 @@ where
                 ?MAX_INBOUND_CONCURRENCY,
                 "transaction id already queued for inbound download: ignored transaction"
             );
-            metrics::gauge!("mempool.currently.queued.transactions",)
+            zakura_node_services::metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
             return Err(MempoolError::AlreadyQueued);
@@ -453,7 +453,7 @@ where
                 ?MAX_INBOUND_CONCURRENCY,
                 "too many transactions queued for inbound download: ignored transaction"
             );
-            metrics::gauge!("mempool.currently.queued.transactions",)
+            zakura_node_services::metrics::gauge!("mempool.currently.queued.transactions",)
                 .set(self.pending.len() as f64);
 
             return Err(MempoolError::FullQueue);
@@ -470,7 +470,8 @@ where
                     ?MAX_INBOUND_CONCURRENCY_PER_PEER,
                     "too many transactions queued for this peer: ignored transaction"
                 );
-                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                zakura_node_services::metrics::counter!("mempool.full_queue.per_peer.total")
+                    .increment(1);
                 return Err(MempoolError::FullQueue);
             }
         }
@@ -555,7 +556,7 @@ where
                         ));
                     }
 
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "mempool.downloaded.transactions.total",
                         "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
@@ -563,7 +564,7 @@ where
                     (tx, advertiser_addr)
                 }
                 Gossip::Tx(tx) => {
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "mempool.pushed.transactions.total",
                         "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
@@ -610,7 +611,7 @@ where
             })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "mempool.verified.transactions.total",
                 "version" => format!("{}", tx.transaction.transaction().version()),
             ).increment(1);
@@ -634,7 +635,7 @@ where
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
-                    metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
+                    zakura_node_services::metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
                     if let Some(rsp_tx) = rsp_tx.take() {
                         let _ = rsp_tx.send(Err("verification cancelled".into()));
                     }
@@ -690,8 +691,9 @@ where
             ?MAX_INBOUND_CONCURRENCY,
             "queued transaction hash for download"
         );
-        metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
-        metrics::counter!("mempool.queued.transactions.total").increment(1);
+        zakura_node_services::metrics::gauge!("mempool.currently.queued.transactions",)
+            .set(self.pending.len() as f64);
+        zakura_node_services::metrics::counter!("mempool.queued.transactions.total").increment(1);
 
         Ok(())
     }
@@ -732,7 +734,8 @@ where
         self.pending_per_peer.clear();
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
-        metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
+        zakura_node_services::metrics::gauge!("mempool.currently.queued.transactions",)
+            .set(self.pending.len() as f64);
     }
 
     /// Decrement the per-peer pending count for `source`, removing the entry
@@ -819,7 +822,8 @@ where
     fn drop(mut self: Pin<&mut Self>) {
         self.cancel_all();
 
-        metrics::gauge!("mempool.currently.queued.transactions").set(0 as f64);
+        zakura_node_services::metrics::gauge!("mempool.currently.queued.transactions")
+            .set(0 as f64);
     }
 }
 

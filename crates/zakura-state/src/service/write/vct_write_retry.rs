@@ -191,7 +191,7 @@ impl VctWriteRetryManager {
         retry_cause: VctWriteRetryCause,
         block: QueuedCheckpointVerified,
     ) -> VctWriteRetryWait {
-        metrics::counter!("state.vct.root.retry.count").increment(1);
+        zakura_node_services::metrics::counter!("state.vct.root.retry.count").increment(1);
         if let VctWriteRetryCause::MissingRoot { trigger } = retry_cause {
             self.request_committer_repair(height, trigger);
         }
@@ -204,7 +204,8 @@ impl VctWriteRetryManager {
             _ => {
                 self.root_stall = Some((height, Instant::now()));
                 if self.root_stall_reported {
-                    metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
+                    zakura_node_services::metrics::gauge!("state.vct.root.stalled.height")
+                        .set(f64::from(height.0));
                 }
                 true
             }
@@ -269,20 +270,21 @@ impl VctWriteRetryManager {
             "VCT: checkpoint commit stalled waiting for a verifiable supplied root \
              or successor witness; the node will not recompute against the frozen frontier"
         );
-        metrics::gauge!("state.vct.root.stalled.height").set(f64::from(height.0));
+        zakura_node_services::metrics::gauge!("state.vct.root.stalled.height")
+            .set(f64::from(height.0));
         self.root_stall_reported = true;
     }
 
     fn finish_block_wait(&mut self) {
         if let Some(since) = self.block_wait_started.take() {
-            metrics::histogram!("state.vct.root.wait.seconds")
+            zakura_node_services::metrics::histogram!("state.vct.root.wait.seconds")
                 .record(since.elapsed().as_secs_f64());
         }
     }
 
     fn clear_root_stall(&mut self) {
         if self.root_stall_reported {
-            metrics::gauge!("state.vct.root.stalled.height").set(0.0);
+            zakura_node_services::metrics::gauge!("state.vct.root.stalled.height").set(0.0);
         }
         self.root_stall = None;
         self.root_stall_reported = false;
@@ -347,7 +349,7 @@ impl VctWriteRetryManager {
         };
         let _ = self.root_repair_sender.send(self.root_repair_status);
         if repair_requested {
-            metrics::counter!("state.vct.root.repair.requested").increment(1);
+            zakura_node_services::metrics::counter!("state.vct.root.repair.requested").increment(1);
         }
     }
 }

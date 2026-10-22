@@ -91,10 +91,11 @@ pub async fn start(
     info!("Starting end of support task");
 
     if let Some(last_supported_height) = end_of_support_height(&network) {
-        metrics::gauge!(EOS_ENFORCED_METRIC).set(1.0);
-        metrics::gauge!(EOS_HEIGHT_METRIC).set(f64::from(last_supported_height.0));
+        zakura_node_services::metrics::gauge!(EOS_ENFORCED_METRIC).set(1.0);
+        zakura_node_services::metrics::gauge!(EOS_HEIGHT_METRIC)
+            .set(f64::from(last_supported_height.0));
     } else {
-        metrics::gauge!(EOS_ENFORCED_METRIC).set(0.0);
+        zakura_node_services::metrics::gauge!(EOS_ENFORCED_METRIC).set(0.0);
     }
 
     tokio::time::sleep(INITIAL_WAIT).await;
@@ -104,7 +105,8 @@ pub async fn start(
             if let Some(tip_height) = latest_chain_tip.best_tip_height() {
                 if let Some(remaining_blocks) = remaining_blocks(tip_height, &network) {
                     // A difference between two u32 heights is exactly representable as f64.
-                    metrics::gauge!(EOS_REMAINING_BLOCKS_METRIC).set(remaining_blocks as f64);
+                    zakura_node_services::metrics::gauge!(EOS_REMAINING_BLOCKS_METRIC)
+                        .set(remaining_blocks as f64);
                 }
                 check(tip_height, &network);
             }

@@ -132,7 +132,7 @@ impl PreparedCandidateCache {
         // Deriving the candidate id costs a full block serialization, so skip it when the cache
         // holds no entry that could match.
         if self.lock().iter().all(|partition| partition.is_empty()) {
-            metrics::counter!("mining.prepared_cache.misses").increment(1);
+            zakura_node_services::metrics::counter!("mining.prepared_cache.misses").increment(1);
             return None;
         }
 
@@ -146,7 +146,7 @@ impl PreparedCandidateCache {
             })
         });
 
-        metrics::counter!(if hit.is_some() {
+        zakura_node_services::metrics::counter!(if hit.is_some() {
             "mining.prepared_cache.hits"
         } else {
             "mining.prepared_cache.misses"
@@ -173,7 +173,7 @@ impl PreparedCandidateCache {
             .expect("the matching entry exists under the same cache lock");
         entry.expires_at = Instant::now() + ENTRY_TTL;
         partition.entries.push_back(entry);
-        metrics::counter!("mining.prepared_cache.reuses").increment(1);
+        zakura_node_services::metrics::counter!("mining.prepared_cache.reuses").increment(1);
         true
     }
 
@@ -198,7 +198,7 @@ impl PreparedCandidateCache {
 
         let evicted = partition.make_room(size);
         if evicted > 0 {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "mining.prepared_cache.evictions",
                 "source" => source.metric_label()
             )

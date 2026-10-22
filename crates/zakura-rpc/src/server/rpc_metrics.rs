@@ -47,7 +47,7 @@ impl<S: RpcServiceT> RpcServiceT for RpcMetricsMiddleware<S> {
         let start = Instant::now();
 
         // Increment active requests gauge
-        metrics::gauge!("rpc.active_requests").increment(1.0);
+        zakura_node_services::metrics::gauge!("rpc.active_requests").increment(1.0);
 
         async move {
             let response = service.call(request).await;
@@ -61,11 +61,11 @@ impl<S: RpcServiceT> RpcServiceT for RpcMetricsMiddleware<S> {
             };
 
             // Record request count
-            metrics::counter!("rpc.requests.total", "method" => method, "status" => status)
+            zakura_node_services::metrics::counter!("rpc.requests.total", "method" => method, "status" => status)
                 .increment(1);
 
             // Record request duration
-            metrics::histogram!("rpc.request.duration_seconds", "method" => method)
+            zakura_node_services::metrics::histogram!("rpc.request.duration_seconds", "method" => method)
                 .record(duration);
 
             // Record errors with error code
@@ -74,7 +74,7 @@ impl<S: RpcServiceT> RpcServiceT for RpcMetricsMiddleware<S> {
                     .as_error_code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
-                metrics::counter!(
+                zakura_node_services::metrics::counter!(
                     "rpc.errors.total",
                     "method" => method,
                     "error_code" => error_code
@@ -83,7 +83,7 @@ impl<S: RpcServiceT> RpcServiceT for RpcMetricsMiddleware<S> {
             }
 
             // Decrement active requests gauge
-            metrics::gauge!("rpc.active_requests").decrement(1.0);
+            zakura_node_services::metrics::gauge!("rpc.active_requests").decrement(1.0);
 
             response
         }

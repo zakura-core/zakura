@@ -192,7 +192,7 @@ pub(crate) async fn run_native_discovery_dialer(
                     }
                     Some(Err(error)) => {
                         debug!(?error, "Zakura discovery dial worker failed");
-                        metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
+                        zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
                     }
                     None => {}
                 }
@@ -249,7 +249,7 @@ async fn spawn_discovery_dial_candidates(
         reserve_discovery_in_flight_ips(in_flight_by_ip, &reserved_ips);
 
         discovery.mark_dial_attempt(&node_id).await;
-        metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
         workers.spawn(erased({
             let reserved_ips_on_panic = reserved_ips.clone();
             AssertUnwindSafe(run_discovery_dial_once(
@@ -273,7 +273,8 @@ fn recover_discovery_dial_worker_panic(
     result: std::thread::Result<DiscoveryDialWorkerResult>,
 ) -> DiscoveryDialWorkerResult {
     result.unwrap_or_else(|_| {
-        metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.worker_panicked")
+            .increment(1);
         tracing::error!(?node_id, "Zakura discovery dial worker panicked");
         DiscoveryDialWorkerResult {
             node_id,
@@ -565,26 +566,38 @@ async fn apply_discovery_dial_result(
     match result {
         DiscoveryDialResult::Registered => {
             discovery.mark_dial_success(node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.succeeded")
+                .increment(1);
         }
         DiscoveryDialResult::ConnectedElsewhere => {
             discovery.mark_dial_success(node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.connected_elsewhere").increment(1);
+            zakura_node_services::metrics::counter!(
+                "zakura.p2p.discovery.dial.connected_elsewhere"
+            )
+            .increment(1);
         }
         DiscoveryDialResult::ShortLivedRegistered => {
             discovery.mark_short_lived_exchange(node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.short_lived_registered").increment(1);
+            zakura_node_services::metrics::counter!(
+                "zakura.p2p.discovery.dial.short_lived_registered"
+            )
+            .increment(1);
         }
         DiscoveryDialResult::Failed => {
             discovery.mark_dial_failure(node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.failed").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.failed")
+                .increment(1);
         }
         DiscoveryDialResult::AlpnMismatch => {
             discovery.mark_alpn_mismatch(node_id).await;
-            metrics::counter!("zakura.p2p.discovery.dial.alpn_mismatch").increment(1);
+            zakura_node_services::metrics::counter!("zakura.p2p.discovery.dial.alpn_mismatch")
+                .increment(1);
         }
         DiscoveryDialResult::LocalResourceLimit => {
-            metrics::counter!("zakura.p2p.discovery.dial.local_resource_limit").increment(1);
+            zakura_node_services::metrics::counter!(
+                "zakura.p2p.discovery.dial.local_resource_limit"
+            )
+            .increment(1);
         }
     }
 }

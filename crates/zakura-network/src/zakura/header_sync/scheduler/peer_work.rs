@@ -140,10 +140,14 @@ impl HeaderChunkBudget {
     fn publish(&self, usage: HeaderChunkUsage) {
         debug_assert!(usage.reserved.saturating_add(usage.owned) <= self.0.capacity);
         // The conversion is exact because the count is at most 4,000.
-        metrics::gauge!("sync.header.chunk_budget.capacity").set(self.0.capacity as f64);
-        metrics::gauge!("sync.header.chunk_budget.reserved").set(usage.reserved as f64);
-        metrics::gauge!("sync.header.chunk_budget.owned").set(usage.owned as f64);
-        metrics::gauge!("sync.header.chunk_budget.staged").set(usage.owned as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.capacity")
+            .set(self.0.capacity as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.reserved")
+            .set(usage.reserved as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.owned")
+            .set(usage.owned as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.staged")
+            .set(usage.owned as f64);
     }
 }
 
@@ -957,9 +961,12 @@ impl PeerWorkQueue {
             }
         }
         // The conversion is exact because the count is at most 4,000.
-        metrics::gauge!("sync.header.chunk_budget.receiving").set(receiving as f64);
-        metrics::gauge!("sync.header.chunk_budget.preparing").set(preparing as f64);
-        metrics::gauge!("sync.header.chunk_budget.applying").set(applying as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.receiving")
+            .set(receiving as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.preparing")
+            .set(preparing as f64);
+        zakura_node_services::metrics::gauge!("sync.header.chunk_budget.applying")
+            .set(applying as f64);
     }
 
     #[cfg(test)]

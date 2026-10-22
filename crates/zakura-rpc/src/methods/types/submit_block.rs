@@ -261,7 +261,8 @@ impl PendingBlockRegistry {
             return None;
         }
         if entries.len() >= MAX_PENDING_BLOCKS {
-            metrics::counter!("mining.pending_registry.saturated").increment(1);
+            zakura_node_services::metrics::counter!("mining.pending_registry.saturated")
+                .increment(1);
             return None;
         }
 
@@ -318,7 +319,7 @@ impl PendingBlockRegistry {
             .get(&hash)
             .map(|entry| Arc::clone(&entry.block));
         if block.is_some() {
-            metrics::counter!("mining.pending_registry.served").increment(1);
+            zakura_node_services::metrics::counter!("mining.pending_registry.served").increment(1);
         }
         block
     }

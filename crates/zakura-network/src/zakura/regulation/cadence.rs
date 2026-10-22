@@ -156,7 +156,7 @@ impl<C: Clock> CadenceBuckets<C> {
             .or_insert_with(|| Bucket::new(cadence, now));
         bucket.refill(now);
         if bucket.tokens == 0 {
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.p2p.cadence.exhausted",
                 "layout" => layout.to_string(),
                 "message_type" => rule.message_type.to_string(),
@@ -167,7 +167,7 @@ impl<C: Clock> CadenceBuckets<C> {
         bucket.tokens -= 1;
         if bucket.tokens < cadence.capacity / 4 {
             // Count low buckets as evidence for tuning.
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.p2p.cadence.low",
                 "layout" => layout.to_string(),
                 "message_type" => rule.message_type.to_string(),

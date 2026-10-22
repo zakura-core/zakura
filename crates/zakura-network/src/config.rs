@@ -555,7 +555,7 @@ impl Config {
                     // If an IP is returned by multiple seeds,
                     // each duplicate adds 1 to the initial peer count.
                     // (But we only make one initial connection attempt to each IP.)
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "zcash.net.peers.initial",
                         "seed" => host.to_string(),
                         "remote_ip" => ip.addr_label(expose_peer_addresses)
@@ -642,7 +642,7 @@ impl Config {
             // If an IP is returned by DNS seeders and the cache,
             // each duplicate adds 1 to the initial peer count.
             // (But we only make one initial connection attempt to each IP.)
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zcash.net.peers.initial",
                 "cache" => peer_cache_file.display().to_string(),
                 "remote_ip" => ip.addr_label(self.expose_peer_addresses)
@@ -722,7 +722,7 @@ impl Config {
                 );
 
                 for ip in &selected_peers {
-                    metrics::counter!(
+                    zakura_node_services::metrics::counter!(
                         "zcash.net.peers.cache",
                         "cache" => peer_cache_file.display().to_string(),
                         "remote_ip" => ip.addr_label(self.expose_peer_addresses)

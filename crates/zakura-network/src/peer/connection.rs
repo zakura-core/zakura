@@ -810,7 +810,7 @@ where
                         if let Ok(response) = response.as_ref() {
                             debug!(%response, "finished receiving peer response to Zakura request");
                             // Add a metric for inbound responses to outbound requests.
-                            metrics::counter!(
+                            zakura_node_services::metrics::counter!(
                                 "zakura.net.in.responses",
                                 "command" => response.command(),
                             )
@@ -990,10 +990,10 @@ where
         let InProgressClientRequest { request, tx, span } = req;
 
         if tx.is_canceled() {
-            metrics::counter!("peer.canceled").increment(1);
+            zakura_node_services::metrics::counter!("peer.canceled").increment(1);
             debug!(state = %self.state, %request, "ignoring canceled request");
 
-            metrics::counter!(
+            zakura_node_services::metrics::counter!(
                 "zakura.net.out.requests.canceled",
                 "command" => request.command(),
             )
@@ -1006,7 +1006,7 @@ where
         debug!(state = %self.state, %request, "sending request from Zakura to peer");
 
         // Add a metric for outbound requests.
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.net.out.requests",
             "command" => request.command(),
         )
@@ -1418,7 +1418,7 @@ where
         trace!(?req);
 
         // Add a metric for inbound requests
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.net.in.requests",
             "command" => req.command(),
         )
@@ -1490,7 +1490,7 @@ where
         };
 
         // Add a metric for outbound responses to inbound requests
-        metrics::counter!(
+        zakura_node_services::metrics::counter!(
             "zakura.net.out.responses",
             "command" => rsp.command(),
         )
@@ -1648,7 +1648,7 @@ where
         // peer's denial-of-service protection below is unchanged.
         if self.connection_info.is_protected_peer {
             self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Ignored", req.command()));
-            metrics::counter!("pool.ignored.protected").increment(1);
+            zakura_node_services::metrics::counter!("pool.ignored.protected").increment(1);
             return;
         }
 
@@ -1656,9 +1656,9 @@ where
 
         if thread_rng().random::<f32>() < drop_connection_probability {
             if matches!(error, PeerError::Overloaded) {
-                metrics::counter!("pool.closed.loadshed").increment(1);
+                zakura_node_services::metrics::counter!("pool.closed.loadshed").increment(1);
             } else {
-                metrics::counter!("pool.closed.inbound.timeout").increment(1);
+                zakura_node_services::metrics::counter!("pool.closed.inbound.timeout").increment(1);
             }
 
             tracing::info!(
@@ -1680,9 +1680,10 @@ where
             self.update_state_metrics(format!("In::Req::{}/Rsp::{error}::Ignored", req.command()));
 
             if matches!(error, PeerError::Overloaded) {
-                metrics::counter!("pool.ignored.loadshed").increment(1);
+                zakura_node_services::metrics::counter!("pool.ignored.loadshed").increment(1);
             } else {
-                metrics::counter!("pool.ignored.inbound.timeout").increment(1);
+                zakura_node_services::metrics::counter!("pool.ignored.inbound.timeout")
+                    .increment(1);
             }
         }
     }
@@ -1749,7 +1750,7 @@ where
         self.erase_state_metrics();
 
         // Count this connection in the aggregate live-state gauge.
-        metrics::gauge!(
+        zakura_node_services::metrics::gauge!(
             "zakura.net.connection.state",
             "command" => current_metrics_state.clone(),
         )
@@ -1761,7 +1762,7 @@ where
     /// Decrement the aggregate connection state gauge for this connection.
     fn erase_state_metrics(&mut self) {
         if let Some(last_metrics_state) = self.last_metrics_state.take() {
-            metrics::gauge!(
+            zakura_node_services::metrics::gauge!(
                 "zakura.net.connection.state",
                 "command" => last_metrics_state,
             )

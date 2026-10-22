@@ -347,7 +347,7 @@ impl ZakuraProtocolHandler {
             close_cause,
             freshness_tx,
         };
-        metrics::counter!("zakura.p2p.stream.accepted", "stream_kind" => stream_kind_label(stream.kind)).increment(1);
+        zakura_node_services::metrics::counter!("zakura.p2p.stream.accepted", "stream_kind" => stream_kind_label(stream.kind)).increment(1);
         conn.trace_stream("accepted", stream_id, Some(stream_kind_label(stream.kind)));
         Ok(PreparedStream {
             io,

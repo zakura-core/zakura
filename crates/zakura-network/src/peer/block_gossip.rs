@@ -246,7 +246,7 @@ impl BlockGossipPeer {
                 changed = progress.changed() => if changed.is_err() { break false; },
                 _ = sleep_until(deadline) => {
                     let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
-                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
+                    zakura_node_services::metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
                     // Advertisement completion does not promise that the peer requested the block.
                     break true;
                 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use blake2b_simd::Params as Blake2bParams;
 use serde_json::{Map, Number, Value};
-use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
+use zakura_jsonl_trace::{tables, JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
 
 use super::{ZakuraPeerId, ZakuraRejectReason};
 
@@ -25,160 +25,22 @@ use first_block_source::FirstBlockSourceTracker;
 pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
 
 /// Legacy upgrade and control-handshake transitions.
-pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "handshake",
-    "handshake.csv",
-    &[
-        "event",
-        "conn",
-        "stream",
-        "payload_len",
-        "frame_len",
-        "max_frame_bytes",
-        "peer",
-        "role",
-        "phase",
-        "reason",
-        "selected_protocol",
-        "direction",
-        "stream_kind",
-        "network",
-    ],
-);
+pub const HANDSHAKE_TABLE: ZakuraTraceTable = tables::HANDSHAKE;
 
 /// Connection admission and close transitions.
-pub const CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "conn",
-    "conn.csv",
-    &[
-        "event",
-        "conn",
-        "stream",
-        "payload_len",
-        "frame_len",
-        "max_frame_bytes",
-        "peer",
-        "role",
-        "phase",
-        "reason",
-        "selected_protocol",
-        "direction",
-        "stream_kind",
-        "network",
-    ],
-);
+pub const CONN_TABLE: ZakuraTraceTable = tables::CONN;
 
 /// Per-connection stream admission transitions.
-pub const STREAM_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "stream",
-    "stream.csv",
-    &[
-        "event",
-        "conn",
-        "stream",
-        "payload_len",
-        "frame_len",
-        "max_frame_bytes",
-        "peer",
-        "role",
-        "phase",
-        "reason",
-        "selected_protocol",
-        "direction",
-        "stream_kind",
-        "network",
-    ],
-);
+pub const STREAM_TABLE: ZakuraTraceTable = tables::STREAM;
 
 /// Discovery dialer decisions and backoff classification.
-pub const DISCOVERY_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::csv("discovery", "discovery.csv", &["event", "result", "peer"]);
+pub const DISCOVERY_TABLE: ZakuraTraceTable = tables::DISCOVERY;
 
 /// Frame and message rate-limit decisions.
-pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "ratelimit",
-    "ratelimit.csv",
-    &[
-        "event",
-        "conn",
-        "stream",
-        "payload_len",
-        "frame_len",
-        "max_frame_bytes",
-        "peer",
-        "role",
-        "phase",
-        "reason",
-        "selected_protocol",
-        "direction",
-        "stream_kind",
-        "network",
-    ],
-);
+pub const RATELIMIT_TABLE: ZakuraTraceTable = tables::RATELIMIT;
 
 /// Header-sync policy, accounting, and frontier events.
-pub const HEADER_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "header_sync",
-    "header_sync.csv",
-    &[
-        "event",
-        "peer",
-        "session_id",
-        "direction",
-        "reason",
-        "boundary",
-        "disposition",
-        "state_version",
-        "header_generation",
-        "verified_generation",
-        "branch_anchor",
-        "branch_target",
-        "request_id",
-        "stream_version",
-        "target_hash",
-        "common_ancestor_height",
-        "common_ancestor_hash",
-        "locator_count",
-        "locator_head",
-        "header_count",
-        "complete",
-        "tree_aux_schema",
-        "outcome",
-        "inbound_count",
-        "outbound_count",
-        "stage",
-        "category",
-        "attribution",
-        "cause",
-        "operation",
-        "work_anchor_height",
-        "work_anchor_hash",
-        "selected_tip_height",
-        "selected_tip_hash",
-        "max_headers_per_response",
-        "max_inflight_requests",
-        "max_message_bytes",
-        "tree_aux_schema_mask",
-        "old_selected_height",
-        "old_selected_hash",
-        "new_selected_height",
-        "new_selected_hash",
-        "height",
-        "repair_generation",
-        "phase",
-        "supplier_count",
-        "predecessor_height",
-        "peers_considered",
-        "rejected_height",
-        "rejected_capacity",
-        "rejected_schema",
-        "rejected_busy",
-        "rejected_tried",
-        "supplier_status_wait",
-        "best_peer_height",
-        "best_peer_hash",
-    ],
-);
+pub const HEADER_SYNC_TABLE: ZakuraTraceTable = tables::HEADER_SYNC;
 
 /// Stable header-sync CSV event and field names.
 #[allow(dead_code)]
@@ -260,234 +122,20 @@ pub(crate) mod header_sync_trace {
 }
 
 /// Legacy compatibility request/response events.
-pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "legacy_request",
-    "legacy_request.csv",
-    &[
-        "event",
-        "peer",
-        "request_id",
-        "request",
-        "message_type",
-        "response",
-        "item_count",
-        "missing_count",
-        "error",
-    ],
-);
+pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable = tables::LEGACY_REQUEST;
 
 /// Block-sync (stream-6) scheduling, download, submit, and commit events.
-pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "block_sync",
-    "block_sync.csv",
-    &[
-        "event",
-        "peer",
-        "kind",
-        "height",
-        "hash",
-        "range_start",
-        "range_count",
-        "servable_low",
-        "servable_high",
-        "expected_count",
-        "estimated_bytes",
-        "serialized_bytes",
-        "decoded_attributed_memory_size_bytes",
-        "sequencer_input_decoded_attributed_memory_bytes",
-        "reorder_decoded_attributed_memory_bytes",
-        "applying_decoded_attributed_memory_bytes",
-        "active_pipeline_decoded_attributed_memory_bytes",
-        "elapsed_ms",
-        "prepare_elapsed_ms",
-        "send_elapsed_ms",
-        "result",
-        "reason",
-        "error",
-        "apply_token",
-        "request_floor",
-        "body_download_floor",
-        "floor_gap_height",
-        "floor_gap_state",
-        "floor_gap_servable_peers",
-        "floor_gap_available_peers",
-        "floor_gap_outstanding_peers",
-        "floor_gap_oldest_outstanding_ms",
-        "floor_gap_next_deadline_ms",
-        "verified_block_tip",
-        "best_header_tip",
-        "body_lag",
-        "applying",
-        "submitted_applies",
-        "reorder",
-        "outstanding",
-        "budget_available",
-        "budget_reserved",
-        "budget_reserved_after",
-        "received_bytes_per_sec",
-        "received_blocks_per_sec",
-        "committed_bytes_per_sec",
-        "committed_blocks_per_sec",
-        "committed_count",
-        "download_blocked_on_budget",
-        "peers_wanting_slots",
-        "peers",
-        "active_connections",
-        "peers_with_status",
-        "needed_min",
-        "needed_count",
-        "queue_len",
-        "queue_blocks",
-        "queue_capacity",
-        "queue_max_capacity",
-        "queue_min_start",
-        "assigned_len",
-        "local_body_work",
-        "refill_low_water",
-        "covered_max_end",
-        "fill_stop_reason",
-        "fill_sent",
-        "direction",
-        "received_status",
-        "released_bytes",
-        "returned_count",
-        "already_pending_count",
-        "released_count",
-        "missing_count",
-        "pending_after",
-        "in_flight_after",
-        "sequencer_input_queued_bytes",
-        "sequencer_input_queued_blocks",
-        "sequencer_input_capacity",
-        "sequencer_input_capacity_before",
-        "sequencer_input_max_capacity",
-        "reorder_buffered_bytes",
-        "applying_buffered_bytes",
-        "unsubmitted_applying_count",
-        "in_flight_submission_count",
-        "in_flight_submission_bytes",
-        "retained_pipeline_wire_bytes",
-        "inbound_peers",
-        "outbound_peers",
-        "inbound_peers_with_status",
-        "outbound_peers_with_status",
-        "request_slot_capacity",
-        "request_slot_effective_window",
-        "request_slot_available",
-        "request_slot_saturated_peers",
-        "available_slots",
-        "peer_outstanding",
-        "normal_slots",
-        "floor_slots",
-        "pending_work",
-        "unreceived_count",
-        "return_min_height",
-        "return_max_height",
-        "request_start",
-        "request_range_count",
-        "request_elapsed_ms",
-        "sequencer_send_elapsed_us",
-        "sequencer_queue_elapsed_us",
-        "decode_permit_wait_us",
-        "ok",
-        "retry_attempt",
-        "previous_verified_tip",
-        "previous_download_floor",
-        "preserve_active_successors",
-        "peer_has_successor_after",
-        "peer_outstanding_conflicts_at_tip",
-        "reset_tip_matches_local_work",
-        "has_local_successor_after",
-        "requests_without_block_progress",
-        "no_progress_request_cap",
-        "block_progress_proven",
-        "bbr_cwnd",
-        "bbr_rtprop_ms",
-        "bbr_btlbw_milliblocks_per_sec",
-        "bbr_cwnd_bytes",
-        "bbr_inflight_bytes",
-        "bbr_btlbw_bytes_per_sec",
-        "bbr_delivered",
-        "bbr_phase",
-        "bbr_smoothed_elapsed_ms",
-        "bbr_delay_cap",
-        "bbr_reliability_permille",
-        "floor_bypass",
-        "last_block_age_ms",
-    ],
-);
+pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = tables::BLOCK_SYNC;
 
 /// Zakurad adapter boundary events for commits, state reads, and frontier mirrors.
-pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "commit_state",
-    "commit_state.csv",
-    &[
-        "event",
-        "source",
-        "action",
-        "peer",
-        "reason",
-        "range_start",
-        "range_count",
-        "height",
-        "hash",
-        "apply_token",
-        "best_header_tip",
-        "elapsed_ms",
-        "result",
-        "requested_count",
-        "apply_class",
-        "local_frontier",
-        "queue_len",
-        "in_flight_count",
-    ],
-);
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable = tables::COMMIT_STATE;
 
 /// Per-connection QUIC transport samples, every 10 s and on close
 /// (zakura-quic OBS-3).
-pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "quic_conn",
-    "quic_conn.csv",
-    &[
-        "event",
-        "conn",
-        "direction",
-        "peer",
-        "admitted_ip",
-        "rtt_micros",
-        "cwnd",
-        "lost_packets",
-        "congestion_events",
-        "bytes_sent",
-        "bytes_received",
-        "current_mtu",
-        "bytes_in_flight",
-        "send_blocked_micros",
-        "close_reason",
-    ],
-);
+pub const QUIC_CONN_TABLE: ZakuraTraceTable = tables::QUIC_CONN;
 
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
-pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
-    "queue_send",
-    "queue_send.csv",
-    &[
-        "event",
-        "service",
-        "message",
-        "peer",
-        "error",
-        "reason",
-        "queue_capacity",
-        "queue_max_capacity",
-        "range_start",
-        "range_count",
-        "height",
-        "hash",
-        "session_id",
-        "request_id",
-    ],
-);
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable = tables::QUEUE_SEND;
 
 /// Shared queue-send trace event names and field keys.
 #[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
@@ -1109,34 +757,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-
-    #[test]
-    fn csv_table_headers_match_the_shared_schema() {
-        let schema: Value =
-            serde_json::from_str(zakura_jsonl_trace::SCHEMA_JSON).expect("shared trace schema");
-        for table in [
-            HANDSHAKE_TABLE,
-            CONN_TABLE,
-            STREAM_TABLE,
-            DISCOVERY_TABLE,
-            RATELIMIT_TABLE,
-            HEADER_SYNC_TABLE,
-            LEGACY_REQUEST_TABLE,
-            BLOCK_SYNC_TABLE,
-            COMMIT_STATE_TABLE,
-            QUEUE_SEND_TABLE,
-            QUIC_CONN_TABLE,
-        ] {
-            assert_eq!(table.file_name(), format!("{}.csv", table.table()));
-            let columns: Vec<_> = schema["tables"][table.table()]
-                .as_array()
-                .expect("table in schema")
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect();
-            assert_eq!(table.header(), columns, "{}", table.table());
-        }
-    }
 
     #[test]
     fn noop_trace_does_not_build_rows() {

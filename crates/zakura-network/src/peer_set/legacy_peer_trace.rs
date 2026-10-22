@@ -7,7 +7,6 @@
 //! inventory guarantee. Process-local `peer_id` values correlate events without recording peer IPs.
 
 use std::{
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -24,32 +23,7 @@ use zakura_jsonl_trace::{
 
 use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedPeerError};
 
-const TABLE: JsonlTraceTable = JsonlTraceTable::csv(
-    "legacy_peer_request",
-    "legacy_peer_request.csv",
-    &[
-        "event",
-        "request_id",
-        "peer_id",
-        "peer",
-        "peer_start_height",
-        "local_tip_height",
-        "elapsed_ms",
-        "locator_tip",
-        "stop",
-        "requested_hash",
-        "route",
-        "result",
-        "hash_count",
-        "inferred_start_height",
-        "inferred_end_height",
-        "response",
-        "error",
-        "returned_hash",
-        "returned_height",
-        "missing_hash",
-    ],
-);
+const TABLE: JsonlTraceTable = zakura_jsonl_trace::tables::LEGACY_PEER_REQUEST;
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
@@ -152,11 +126,7 @@ enum BlockRequestResult<'a> {
 }
 
 impl LegacyPeerTrace {
-    pub(super) fn new(trace_dir: Option<PathBuf>) -> Self {
-        let tracer = trace_dir
-            .map(JsonlTracer::spawn)
-            .unwrap_or_else(JsonlTracer::noop);
-
+    pub(super) fn new(tracer: JsonlTracer) -> Self {
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             next_request_id: Arc::new(AtomicU64::new(1)),

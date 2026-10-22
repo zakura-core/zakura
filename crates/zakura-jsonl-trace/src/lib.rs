@@ -29,6 +29,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub mod tables;
+
+pub use tables::JsonlTraceTables;
+
 /// Default trace channel capacity.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 16_384;
 
@@ -353,7 +357,7 @@ impl JsonlEventEmitter {
     where
         E: JsonlTraceEvent,
     {
-        let Ok(permit) = self.tracer.try_reserve() else {
+        let Ok(permit) = self.tracer.try_reserve_table(E::TABLE.table()) else {
             return;
         };
 
@@ -382,7 +386,7 @@ impl JsonlEventEmitter {
 
     /// Lazily build and emit a raw JSON object for compatibility callers.
     pub fn emit_with(&self, table: JsonlTraceTable, build: impl FnOnce(&mut Map<String, Value>)) {
-        let Ok(permit) = self.tracer.try_reserve() else {
+        let Ok(permit) = self.tracer.try_reserve_table(table.table()) else {
             return;
         };
 
@@ -623,6 +627,16 @@ struct TraceCounts {
 struct TraceRuntime {
     tx: mpsc::Sender<JsonlWriteEvent>,
     counts: Arc<TraceCounts>,
+    /// The tables this tracer writes, or `None` for every table.
+    tables: Option<JsonlTraceTables>,
+}
+
+impl TraceRuntime {
+    fn writes(&self, table: &str) -> bool {
+        self.tables
+            .as_ref()
+            .is_none_or(|tables| tables.contains(table))
+    }
 }
 
 /// A non-blocking handle for emitting CSV trace records.
@@ -652,7 +666,7 @@ pub struct JsonlTraceGuard {
 /// Reserve errors for the bounded CSV trace queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JsonlTraceReserveError {
-    /// Tracing is disabled.
+    /// Tracing is disabled, or the tracer does not write the requested table.
     Disabled,
     /// The queue is full.
     Full,
@@ -663,7 +677,7 @@ pub enum JsonlTraceReserveError {
 /// Send errors for the bounded CSV trace queue.
 #[derive(Debug)]
 pub enum JsonlTraceSendError {
-    /// Tracing is disabled.
+    /// Tracing is disabled, or the tracer does not write the record's table.
     Disabled(JsonlWriteEvent),
     /// The queue is full.
     Full(JsonlWriteEvent),
@@ -687,14 +701,26 @@ impl JsonlTracePermit {
 }
 
 impl JsonlTracer {
-    /// Create a tracer backed by the supplied sender.
+    /// Create a tracer backed by the supplied sender that writes every table.
     pub fn new(tx: mpsc::Sender<JsonlWriteEvent>) -> Self {
         Self {
             inner: TraceState::Enabled(TraceRuntime {
                 tx,
                 counts: Arc::default(),
+                tables: None,
             }),
         }
+    }
+
+    /// Restrict this tracer to `tables`.
+    ///
+    /// Rows for other tables are dropped before they are built or queued, so unselected
+    /// tables cost neither serialization nor queue capacity.
+    pub fn with_tables(mut self, tables: JsonlTraceTables) -> Self {
+        if let TraceState::Enabled(runtime) = &mut self.inner {
+            runtime.tables = Some(tables);
+        }
+        self
     }
 
     /// Create a no-op tracer.
@@ -755,7 +781,11 @@ impl JsonlTracer {
 
         JsonlTraceGuard {
             tracer: Self {
-                inner: TraceState::Enabled(TraceRuntime { tx, counts }),
+                inner: TraceState::Enabled(TraceRuntime {
+                    tx,
+                    counts,
+                    tables: None,
+                }),
             },
             shutdown,
             writer: Some(writer),
@@ -784,7 +814,33 @@ impl JsonlTracer {
         runtime.tx.capacity()
     }
 
+    /// Returns `true` if this tracer will emit records for `table`.
+    pub fn is_table_enabled(&self, table: &str) -> bool {
+        match &self.inner {
+            TraceState::Disabled => false,
+            TraceState::Enabled(runtime) => runtime.writes(table) && self.is_enabled(),
+        }
+    }
+
+    /// Try to reserve a queue slot for a record in `table`.
+    ///
+    /// Returns [`JsonlTraceReserveError::Disabled`] if this tracer does not write `table`.
+    pub fn try_reserve_table(
+        &self,
+        table: &str,
+    ) -> Result<JsonlTracePermit, JsonlTraceReserveError> {
+        match &self.inner {
+            TraceState::Enabled(runtime) if !runtime.writes(table) => {
+                Err(JsonlTraceReserveError::Disabled)
+            }
+            _ => self.try_reserve(),
+        }
+    }
+
     /// Try to reserve a queue slot for a trace record.
+    ///
+    /// The slot is not tied to a table, so this skips the table selection. Prefer
+    /// [`JsonlTracer::try_reserve_table`].
     pub fn try_reserve(&self) -> Result<JsonlTracePermit, JsonlTraceReserveError> {
         let TraceState::Enabled(runtime) = &self.inner else {
             return Err(JsonlTraceReserveError::Disabled);
@@ -814,7 +870,7 @@ impl JsonlTracer {
 
     /// Try to send a trace record without blocking.
     pub fn try_send(&self, event: JsonlWriteEvent) -> Result<(), JsonlTraceSendError> {
-        match self.try_reserve() {
+        match self.try_reserve_table(event.table) {
             Ok(permit) => {
                 permit.send(event);
                 Ok(())
@@ -2173,6 +2229,46 @@ mod tests {
 
         drop(tx);
         handle.await.expect("writer task should complete");
+    }
+
+    #[test]
+    fn table_selection_drops_unselected_rows_before_building_them() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tables = JsonlTraceTables::from_names(["mining"]).expect("mining is registered");
+        let tracer = JsonlTracer::new(tx).with_tables(tables);
+        let emitter = JsonlEventEmitter::new(tracer.clone(), "node-filtered");
+
+        assert!(tracer.is_table_enabled("mining"));
+        assert!(!tracer.is_table_enabled(TEST_TABLE.table()));
+
+        let built = Arc::new(AtomicBool::new(false));
+        let built_in_build = built.clone();
+        emitter.emit_event(|| {
+            built_in_build.store(true, Ordering::SeqCst);
+            TestEvent {
+                event: "unselected",
+                value: 0,
+                optional: None,
+            }
+        });
+        assert!(!built.load(Ordering::SeqCst));
+
+        emitter.emit_with(TEST_TABLE, |_| panic!("unselected rows are never built"));
+        emitter.emit_with(tables::MINING, |row| {
+            row.insert("event".to_string(), Value::from("selected"));
+        });
+        let unselected = tracer.try_send(JsonlWriteEvent {
+            table: TEST_TABLE.table(),
+            file_name: TEST_TABLE.file_name(),
+            format: TEST_TABLE.format(),
+            header: TEST_TABLE.header(),
+            line: b"1".to_vec(),
+        });
+        assert!(matches!(unselected, Err(JsonlTraceSendError::Disabled(_))));
+
+        let written = rx.try_recv().expect("the selected row is queued");
+        assert_eq!(written.table, "mining");
+        assert!(rx.try_recv().is_err(), "only the selected row is queued");
     }
 
     #[test]

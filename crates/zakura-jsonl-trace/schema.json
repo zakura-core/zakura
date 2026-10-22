@@ -376,6 +376,23 @@
       "bytes_in_flight",
       "send_blocked_micros",
       "close_reason"
+    ],
+    "mining": [
+      "event",
+      "height",
+      "previous_block_hash",
+      "transactions",
+      "long_poll_id",
+      "work_id",
+      "submit_old",
+      "cur_time",
+      "client_long_poll_id",
+      "elapsed_us",
+      "error",
+      "method",
+      "hash",
+      "result",
+      "reason"
     ]
   },
   "integer_fields": [
@@ -418,6 +435,7 @@
     "congestion_events",
     "conn",
     "covered_max_end",
+    "cur_time",
     "current_mtu",
     "cwnd",
     "decode_permit_wait_us",
@@ -426,6 +444,7 @@
     "download_blocked_on_budget",
     "download_elapsed_ms",
     "elapsed_ms",
+    "elapsed_us",
     "estimated_bytes",
     "expected_count",
     "fill_sent",
@@ -566,6 +585,7 @@
     "supplier_count",
     "supplier_status_wait",
     "trace_version",
+    "transactions",
     "tree_aux_schema_mask",
     "ts",
     "unreceived_count",
@@ -577,7 +597,8 @@
   "boolean_fields": [
     "local_frontier",
     "ok",
-    "complete"
+    "complete",
+    "submit_old"
   ],
   "json_fields": [
     "received_status",

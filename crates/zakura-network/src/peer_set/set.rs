@@ -387,7 +387,7 @@ where
             block_gossip_peers: HashMap::new(),
             block_gossip_slots: Arc::new(tokio::sync::Semaphore::new(BLOCK_GOSSIP_CONCURRENCY)),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
-            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
+            legacy_peer_trace: LegacyPeerTrace::new(config.zakura.spawn_tracer()),
 
             // Busy peers
             unready_services: FuturesUnordered::new(),

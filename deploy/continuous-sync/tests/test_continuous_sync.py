@@ -105,12 +105,17 @@ class ContinuousSyncTests(unittest.TestCase):
                 post.assert_called_once()
 
     def test_archive_preflight_rejects_missing_configuration_and_expiration(self):
+        """Checks archive requirements independently of the host's free disk space."""
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
             config.paths.repo_dir.mkdir()
             config.paths.config_template.write_text("")
             config.paths.wipe_sentinel.write_text("")
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool"),
+                patch.object(sync, "check_free_space"),
+                patch.dict(os.environ, {}, clear=True),
+            ):
                 with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
                     sync.preflight(config)
                 with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
@@ -660,6 +665,7 @@ class ContinuousSyncTests(unittest.TestCase):
             alert_status.service_active("zakura.service")
 
     def test_preflight_checks_dependencies_before_a_cycle(self):
+        """Checks required tools independently of the host's free disk space."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             config = make_config(tmp_path)
@@ -667,7 +673,10 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.config_template.write_text("", encoding="utf-8")
             config.paths.wipe_sentinel.write_text("", encoding="utf-8")
 
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which:
+            with (
+                patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which,
+                patch.object(sync, "check_free_space"),
+            ):
                 sync.preflight(config)
 
             self.assertEqual(

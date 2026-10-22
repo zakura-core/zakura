@@ -384,12 +384,20 @@ impl<T: Future> Future for Timeout<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         // Like tokio, the future gets the first chance to finish.
+        let had_budget = tokio::task::coop::has_budget_remaining();
         if let Poll::Ready(value) = this.value.poll(cx) {
             return Poll::Ready(Ok(value));
         }
-        Pin::new(this.delay)
-            .poll(cx)
-            .map(|()| Err(error::Elapsed::new()))
+        // Like tokio, if the future used up the cooperative budget, the timer
+        // is still checked, or a busy future would never time out. Only a
+        // tokio-backed `Sleep` outside a run has a budget to run out of.
+        let delay = Pin::new(this.delay);
+        let elapsed = if had_budget && !tokio::task::coop::has_budget_remaining() {
+            std::pin::pin!(tokio::task::coop::unconstrained(delay)).poll(cx)
+        } else {
+            delay.poll(cx)
+        };
+        elapsed.map(|()| Err(error::Elapsed::new()))
     }
 }
 

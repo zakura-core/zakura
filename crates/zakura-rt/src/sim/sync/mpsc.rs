@@ -1,7 +1,8 @@
 //! Tokio's `mpsc` channels with preemption points, simulator build.
 //!
 //! Each send, reserve, receive and `is_closed` is a point, and so is the
-//! moment right after an unused permit gives its slot back.
+//! moment right after an unused permit gives its slot back. A send through a
+//! reserved permit is its own point too, since it enqueues the message.
 
 use std::{
     fmt,
@@ -216,8 +217,10 @@ pub struct Permit<'a, T> {
 }
 
 impl<T> Permit<'_, T> {
-    /// Sends `value` in the held slot.
+    /// Sends `value` in the held slot. Inside a run this is a point.
+    #[track_caller]
     pub fn send(mut self, value: T) {
+        point(Op::Send, Location::caller());
         self.inner
             .take()
             .expect("the slot is only taken here, which consumes the permit")
@@ -291,8 +294,11 @@ pub struct OwnedPermit<T> {
 }
 
 impl<T> OwnedPermit<T> {
-    /// Sends `value` in the held slot and gives the sender back.
+    /// Sends `value` in the held slot and gives the sender back. Inside a run
+    /// this is a point.
+    #[track_caller]
     pub fn send(mut self, value: T) -> Sender<T> {
+        point(Op::Send, Location::caller());
         let inner = self
             .inner
             .take()

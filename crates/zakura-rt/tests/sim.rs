@@ -121,6 +121,20 @@ async fn outside_a_run_names_delegate_to_tokio() {
     assert!(start.elapsed() >= Duration::from_millis(3));
 }
 
+#[tokio::test]
+async fn timeout_outside_a_run_fires_when_the_future_uses_up_its_budget() {
+    // The future spends the whole cooperative budget on every poll, so the
+    // timer only fires if the timeout checks it outside the budget.
+    let busy = async {
+        loop {
+            task::coop::consume_budget().await;
+        }
+    };
+    let inner = time::timeout(Duration::from_millis(10), busy);
+    let outer = tokio::time::timeout(Duration::from_secs(10), inner).await;
+    assert!(outer.expect("the sim timeout fired first").is_err());
+}
+
 #[test]
 fn spawned_output_reaches_the_join_handle() {
     let (value, report) = run(async { task::spawn(async { 5 }).await.unwrap() });

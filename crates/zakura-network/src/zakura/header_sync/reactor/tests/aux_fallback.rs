@@ -137,12 +137,12 @@ fn assert_unpunished(
     actions: &mut mpsc::Receiver<HeaderPortOperation>,
     peer: &ZakuraPeerId,
 ) {
-    let state = reactor
+    let handles = reactor
         .sessions
         .get(peer)
         .expect("`HistoryPruned` never disconnects");
     assert_eq!(reactor.state.peers[peer].unproductive_requests, 0);
-    assert!(!state.session.cancel_token().is_cancelled());
+    assert!(!handles.session.cancel_token().is_cancelled());
     while let Ok(action) = actions.try_recv() {
         assert!(
             matches!(action, HeaderPortOperation::QueryHeaderLocator { .. }),

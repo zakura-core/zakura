@@ -110,7 +110,9 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.repo_dir.mkdir()
             config.paths.config_template.write_text("")
             config.paths.wipe_sentinel.write_text("")
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+            # The free-space check reads the host's disk; it has its own test.
+            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(
+                    os.environ, {}, clear=True), patch.object(sync, "check_free_space"):
                 with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
                     sync.preflight(config)
                 with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
@@ -667,7 +669,10 @@ class ContinuousSyncTests(unittest.TestCase):
             config.paths.config_template.write_text("", encoding="utf-8")
             config.paths.wipe_sentinel.write_text("", encoding="utf-8")
 
-            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which:
+            # The free-space check reads the host's disk; it has its own test.
+            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool") as which, patch.object(
+                sync, "check_free_space"
+            ):
                 sync.preflight(config)
 
             self.assertEqual(

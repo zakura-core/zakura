@@ -364,6 +364,10 @@ pub struct ZakuraConfig {
     /// the production trace schema and the legacy sync pipeline writes `legacy_sync.jsonl` into
     /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
+    ///
+    /// Trace tables are appended to for the life of the process, with no size limit, rotation,
+    /// or retention. Peer traffic drives many of the events, so a peer can grow these files.
+    /// Enable this only for diagnosis, and monitor or rotate the directory externally.
     pub trace_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,

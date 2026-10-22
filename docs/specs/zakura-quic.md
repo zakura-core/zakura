@@ -682,8 +682,8 @@ These are not configurable. Changing one needs a spec change.
 - **OBS-3.** When `[network.zakura] trace_dir` is set, Zakura MUST write one
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
-  doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
+  doesn't depend on `zakura-network`, which writes the trace. Each row holds
+  `event` (`sample` or `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
   `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this

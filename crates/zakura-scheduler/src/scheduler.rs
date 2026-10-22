@@ -347,9 +347,17 @@ impl Scheduler {
         let gen = NEXT_GEN.get() + 1;
         NEXT_GEN.set(gen);
         RUN.with(|r| {
-            let mut r = r.borrow_mut();
-            assert!(r.is_none(), "this thread already has a running Scheduler");
-            *r = Some(RunState {
+            assert!(
+                r.borrow().is_none(),
+                "this thread already has a running Scheduler"
+            );
+        });
+        // Enter before installing the state, so a panic here leaves no run
+        // state behind to block later runs on this thread.
+        #[cfg(zakura_sim)]
+        let rt_run = zakura_rt::sim::enter(&crate::executor::EXECUTOR);
+        RUN.with(|r| {
+            *r.borrow_mut() = Some(RunState {
                 gen,
                 workers: usize::from(config.workers),
                 max_tasks: config.max_tasks,
@@ -381,7 +389,7 @@ impl Scheduler {
             stack_size: config.stack_size,
             shut_down: false,
             #[cfg(zakura_sim)]
-            rt_run: Some(zakura_rt::sim::enter(&crate::executor::EXECUTOR)),
+            rt_run: Some(rt_run),
         }
     }
 

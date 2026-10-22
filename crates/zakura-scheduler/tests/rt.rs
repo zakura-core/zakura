@@ -34,6 +34,57 @@ fn scheduler_is_the_rt_executor_for_its_run() {
     assert!(sim::executor().is_none());
 }
 
+/// An executor for holding `zakura-rt`'s run slot. It's never called.
+struct Unused;
+
+impl sim::Executor for Unused {
+    fn preempt(&self, _: sim::Point) {}
+    fn park(&self, _: sim::ObjectId, _: Option<sim::TaskId>) -> bool {
+        unreachable!()
+    }
+    fn unpark_all(&self, _: sim::ObjectId) {}
+    fn spawn(&self, _: &'static str, _: sim::BoxTask) -> sim::TaskId {
+        unreachable!()
+    }
+    fn abort(&self, _: sim::TaskId) {}
+    fn is_finished(&self, _: sim::TaskId) -> bool {
+        unreachable!()
+    }
+    fn poll_join(
+        &self,
+        _: sim::TaskId,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<sim::TaskExit> {
+        unreachable!()
+    }
+    fn now(&self) -> Duration {
+        unreachable!()
+    }
+    fn register_timer(&self, _: Duration, _: &std::task::Waker) -> sim::TimerId {
+        unreachable!()
+    }
+    fn cancel_timer(&self, _: sim::TimerId) {}
+    fn new_object(&self) -> sim::ObjectId {
+        unreachable!()
+    }
+    fn current_task(&self) -> Option<sim::TaskId> {
+        None
+    }
+    fn set_external_wait(&self, _: bool) {}
+}
+
+#[test]
+fn failed_rt_enter_leaves_no_scheduler_run_behind() {
+    let other = sim::enter(&Unused);
+    let entered = std::panic::catch_unwind(|| {
+        drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+    });
+    assert!(entered.is_err(), "zakura-rt already had a run");
+    drop(other);
+    // Used to fail with "this thread already has a running Scheduler".
+    drop(Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO));
+}
+
 /// Two tasks read a counter, stop in `zakura-rt`, then write it back. With
 /// `yield_now` they stop with `yield_now`, and otherwise at an expired sleep,
 /// which is one preemption point inside the poll.

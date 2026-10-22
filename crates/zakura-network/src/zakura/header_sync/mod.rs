@@ -10,7 +10,7 @@ mod error;
 mod events;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
-mod pipe;
+mod peer;
 mod reactor;
 mod scheduler;
 mod service;

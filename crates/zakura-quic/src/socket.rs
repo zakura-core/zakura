@@ -106,6 +106,8 @@ fn bind_udp(
     recv_buffer_bytes: usize,
     send_buffer_bytes: usize,
 ) -> io::Result<OsSocket> {
+    #[cfg(test)]
+    test_hooks::note_os_access();
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     if addr.is_ipv6() {
         // SOCK-2.
@@ -249,6 +251,8 @@ impl TokioUdpIo {
     /// Wraps a bound socket. `offload` enables GSO and GRO where the kernel
     /// supports them (CTRL-12).
     pub(crate) fn new(socket: std::net::UdpSocket, offload: bool) -> io::Result<Self> {
+        #[cfg(test)]
+        test_hooks::note_os_access();
         #[cfg(target_os = "linux")]
         let caps = linux::configure(&socket, offload);
         #[cfg(not(target_os = "linux"))]
@@ -871,7 +875,28 @@ mod linux {
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
-    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicU16, AtomicUsize, Ordering},
+    };
+
+    thread_local! {
+        /// OS socket work on this thread: binds, socket option probes and
+        /// the endpoint's OS pollers. Thread-local, so tests running in
+        /// parallel don't see each other's sockets.
+        static OS_ACCESSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Records one OS socket access on this thread.
+    pub(crate) fn note_os_access() {
+        OS_ACCESSES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// The OS socket accesses on this thread so far.
+    pub(crate) fn os_accesses() -> usize {
+        OS_ACCESSES.with(Cell::get)
+    }
+
     /// The local port whose sends fail with `WouldBlock` (0: none).
     pub(crate) static SEND_WOULD_BLOCK_PORT: AtomicU16 = AtomicU16::new(0);
     /// How many of that port's sends fail before the socket is tried.

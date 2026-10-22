@@ -44,7 +44,7 @@ pub trait Executor {
     ///
     /// `held_by` names the task holding `wait`, if known, so the scheduler can
     /// tell a lock cycle from starved workers. Returns false without parking
-    /// when the current task can't park, such as during shutdown.
+    /// when the current task can't park, such as while it is unwinding.
     fn park(&self, wait: ObjectId, held_by: Option<TaskId>) -> bool;
 
     /// Makes every task parked on `wait` ready again. Not a preemption point.

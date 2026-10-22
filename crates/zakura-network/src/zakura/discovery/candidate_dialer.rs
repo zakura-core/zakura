@@ -5,6 +5,9 @@
 //! exceeds the connection caps, and dials them under the same admission control
 //! as bootstrap peers. Discovery success is the peer appearing in the supervisor
 //! registration watch, not the dial future completing.
+//!
+//! [`CandidateDialerState`] owns the dial policy. [`CandidateDialerIO`] owns
+//! the endpoint, the discovery handle, and the dial workers.
 
 use std::{net::IpAddr, panic::AssertUnwindSafe, time::Duration};
 
@@ -13,7 +16,6 @@ use tracing::debug;
 use zakura_node_services::task::{erased, spawn_erased};
 use zakura_quic::{NodeAddr, NodeId};
 use zakura_rt::{
-    collections::{HashMap, HashSet},
     sync::{oneshot, watch},
     task::{JoinHandle, JoinSet},
     time::Instant,
@@ -24,9 +26,15 @@ use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::DiscoveryDialResultEvent;
 use crate::zakura::{
-    canonical_ip, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZakuraServiceId,
+    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
+    ZakuraTrace,
 };
+
+mod state;
+#[cfg(test)]
+mod state_tests;
+
+use state::{CandidateDialerState, DialAttemptKey};
 
 /// How often the discovery dialer wakes to look for new candidates.
 const ZAKURA_DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(1);
@@ -56,26 +64,10 @@ impl DiscoveryDialResult {
 
 #[derive(Debug)]
 struct DiscoveryDialWorkerResult {
-    node_id: NodeId,
-    reserved_ips: Vec<IpAddr>,
+    attempt: DialAttemptKey,
     /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
     admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
-}
-
-/// Exponential dial backoff for a single `(node_id, ip)` pair.
-///
-/// Backoff is keyed by `(NodeId, IpAddr)`, not `IpAddr` alone: a signature on a
-/// gossip record proves control of the node key, not ownership of the addresses
-/// it advertises. Keying failure backoff by IP alone would let an attacker sign
-/// throwaway node ids that all advertise an honest peer's IP and, by failing
-/// those dials, back that IP off for every legitimate candidate that shares it.
-/// The in-flight reservation cap (`in_flight_by_ip`) stays IP-scoped because it
-/// bounds a real local resource (concurrent dials to one address).
-#[derive(Copy, Clone, Debug)]
-struct DiscoveryIpBackoff {
-    failure_count: u32,
-    retry_at: Instant,
 }
 
 /// Spawn the long-lived discovery candidate dialer for `endpoint`.
@@ -126,35 +118,22 @@ pub(crate) async fn run_native_discovery_dialer(
     let shutdown = endpoint.background_shutdown_token();
     let trace = endpoint.trace();
     let mut registered = endpoint.supervisor().subscribe();
-    let mut in_flight = HashSet::new();
-    let mut in_flight_by_ip = HashMap::new();
-    let mut dial_backoff_by_node_ip = HashMap::new();
-    let dial_backoff = discovery.dial_backoff().await;
-    let mut workers = JoinSet::new();
-    // After a dial hits a local limit, wait one tick before the next round:
-    // the limit doesn't back off the candidate, so an immediate retry would
-    // spin while the node stays full.
-    let mut paused_until: Option<Instant> = None;
+    let mut state = CandidateDialerState::new(discovery.dial_backoff().await);
+    let mut io = CandidateDialerIO {
+        endpoint,
+        discovery,
+        limits,
+        sought_services,
+        trace,
+        workers: JoinSet::new(),
+    };
 
     loop {
         if shutdown.is_cancelled() {
             return;
         }
-        prune_discovery_ip_backoff(&mut dial_backoff_by_node_ip, dial_backoff.1, Instant::now());
-
-        if paused_until.is_none_or(|until| Instant::now() >= until) {
-            paused_until = None;
-            spawn_discovery_dial_candidates(
-                &endpoint,
-                &discovery,
-                &limits,
-                &mut in_flight,
-                &mut in_flight_by_ip,
-                &dial_backoff_by_node_ip,
-                &mut workers,
-                &sought_services,
-            )
-            .await;
+        if state.begin_round(Instant::now()) {
+            io.spawn_dial_round(&mut state).await;
         }
 
         zakura_rt::select! {
@@ -163,33 +142,9 @@ pub(crate) async fn run_native_discovery_dialer(
             // clone, so the supervisor registration watch never closes on its
             // own; this is the only reliable teardown signal.
             _ = shutdown.cancelled() => return,
-            joined = workers.join_next(), if !workers.is_empty() => {
+            joined = io.workers.join_next(), if !io.workers.is_empty() => {
                 match joined {
-                    Some(Ok(worker_result)) => {
-                        if worker_result.result == DiscoveryDialResult::LocalResourceLimit {
-                            paused_until = Some(Instant::now() + ZAKURA_DISCOVERY_DIAL_INTERVAL);
-                        }
-                        in_flight.remove(&worker_result.node_id);
-                        release_discovery_in_flight_ips(
-                            &mut in_flight_by_ip,
-                            &worker_result.reserved_ips,
-                        );
-                        apply_discovery_ip_dial_result(
-                            &mut dial_backoff_by_node_ip,
-                            worker_result.node_id,
-                            &worker_result.reserved_ips,
-                            worker_result.admitted_ip,
-                            worker_result.result,
-                            dial_backoff,
-                            Instant::now(),
-                        );
-                        apply_discovery_dial_result(
-                            &discovery,
-                            &worker_result.node_id,
-                            worker_result.result,
-                            &trace,
-                        ).await;
-                    }
+                    Some(Ok(worker_result)) => io.settle(&mut state, worker_result).await,
                     Some(Err(error)) => {
                         debug!(?error, "Zakura discovery dial worker failed");
                         metrics::counter!("zakura.p2p.discovery.dial.worker_failed").increment(1);
@@ -207,108 +162,121 @@ pub(crate) async fn run_native_discovery_dialer(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn spawn_discovery_dial_candidates(
-    endpoint: &ZakuraEndpoint,
-    discovery: &ZakuraDiscoveryHandle,
-    limits: &ZakuraLocalLimits,
-    in_flight: &mut HashSet<NodeId>,
-    in_flight_by_ip: &mut HashMap<IpAddr, usize>,
-    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
-    workers: &mut JoinSet<DiscoveryDialWorkerResult>,
-    sought_services: &[ZakuraServiceId],
-) {
-    if !endpoint.has_discovery_admission_capacity() {
-        return;
-    }
+/// The candidate dialer's runtime resources: the endpoint, the discovery
+/// handle, and the dial workers. [`CandidateDialerState`] decides what they do.
+struct CandidateDialerIO {
+    endpoint: ZakuraEndpoint,
+    discovery: ZakuraDiscoveryHandle,
+    limits: ZakuraLocalLimits,
+    sought_services: Vec<ZakuraServiceId>,
+    trace: ZakuraTrace,
+    workers: JoinSet<DiscoveryDialWorkerResult>,
+}
 
-    let in_flight_node_ids: Vec<_> = in_flight.iter().copied().collect();
-    let candidates = discovery
-        .dial_candidates_preferring_any_service(sought_services, &in_flight_node_ids)
-        .await;
-
-    for candidate in candidates {
-        if !endpoint.has_discovery_admission_capacity() {
+impl CandidateDialerIO {
+    /// Dials the discovery book's candidates while the endpoint has admission
+    /// capacity, one worker per attempt that `state` records.
+    async fn spawn_dial_round(&mut self, state: &mut CandidateDialerState) {
+        if !self.endpoint.has_discovery_admission_capacity() {
             return;
         }
-        let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
-            endpoint,
-            &candidate,
-            in_flight_by_ip,
-            dial_backoff_by_node_ip,
-            Instant::now(),
-        )
-        .await
-        else {
-            continue;
-        };
-        let node_id = candidate.node_id;
-        if !in_flight.insert(node_id) {
-            continue;
-        }
-        reserve_discovery_in_flight_ips(in_flight_by_ip, &reserved_ips);
 
-        discovery.mark_dial_attempt(&node_id).await;
-        metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
-        workers.spawn(erased({
-            let reserved_ips_on_panic = reserved_ips.clone();
-            AssertUnwindSafe(run_discovery_dial_once(
-                endpoint.clone(),
-                node_addr,
-                limits.clone(),
-                node_id,
-                reserved_ips,
-            ))
-            .catch_unwind()
-            .map(move |result| {
-                recover_discovery_dial_worker_panic(node_id, reserved_ips_on_panic, result)
-            })
-        }));
+        let candidates = self
+            .discovery
+            .dial_candidates_preferring_any_service(
+                &self.sought_services,
+                &state.in_flight_node_ids(),
+            )
+            .await;
+
+        for candidate in candidates {
+            if !self.endpoint.has_discovery_admission_capacity() {
+                return;
+            }
+            let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
+                &self.endpoint,
+                state,
+                &candidate,
+                Instant::now(),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Some(attempt) = state.record_attempt(candidate.node_id, reserved_ips) else {
+                continue;
+            };
+
+            self.discovery.mark_dial_attempt(&attempt.node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
+            self.workers.spawn(erased(
+                AssertUnwindSafe(run_discovery_dial_once(
+                    self.endpoint.clone(),
+                    node_addr,
+                    self.limits.clone(),
+                    attempt,
+                ))
+                .catch_unwind()
+                .map(move |result| recover_discovery_dial_worker_panic(attempt, result)),
+            ));
+        }
+    }
+
+    /// Settles a finished worker's attempt in `state`, then records its
+    /// result in the discovery book, the trace, and the metrics.
+    async fn settle(&self, state: &mut CandidateDialerState, worker: DiscoveryDialWorkerResult) {
+        if !state.complete(
+            worker.attempt,
+            worker.result,
+            worker.admitted_ip,
+            Instant::now(),
+        ) {
+            return;
+        }
+        apply_discovery_dial_result(
+            &self.discovery,
+            &worker.attempt.node_id,
+            worker.result,
+            &self.trace,
+        )
+        .await;
     }
 }
 
+/// Turns a panicked worker into a failed result for its `attempt`, so the
+/// dialer still settles the attempt's reservations.
 fn recover_discovery_dial_worker_panic(
-    node_id: NodeId,
-    reserved_ips: Vec<IpAddr>,
+    attempt: DialAttemptKey,
     result: std::thread::Result<DiscoveryDialWorkerResult>,
 ) -> DiscoveryDialWorkerResult {
     result.unwrap_or_else(|_| {
         metrics::counter!("zakura.p2p.discovery.dial.worker_panicked").increment(1);
+        let node_id = attempt.node_id;
         tracing::error!(?node_id, "Zakura discovery dial worker panicked");
         DiscoveryDialWorkerResult {
-            node_id,
-            reserved_ips,
+            attempt,
             admitted_ip: None,
             result: DiscoveryDialResult::Failed,
         }
     })
 }
 
+/// Returns the addresses of `candidate` to dial and the canonical IPs they
+/// reserve: the addresses `state` allows whose IPs the supervisor accepts.
 async fn discovery_node_addr_with_reserved_ip_capacity(
     endpoint: &ZakuraEndpoint,
+    state: &CandidateDialerState,
     candidate: &ZakuraDiscoveryDialCandidate,
-    in_flight_by_ip: &HashMap<IpAddr, usize>,
-    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     now: Instant,
 ) -> Option<(NodeAddr, Vec<IpAddr>)> {
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
-    // The endpoint starts one handshake per address, but the reservation
-    // counts one per IP. Dialing only the first address of each IP, in record
-    // order, keeps the two equal, so a record can't list many ports on one IP
-    // to multiply handshakes past the per-IP cap.
-    let mut checked_ips = Vec::new();
-    for addr in &candidate.direct_addrs {
-        let dial_ip = canonical_ip(addr.ip());
-        if checked_ips.contains(&dial_ip) {
-            continue;
-        }
-        checked_ips.push(dial_ip);
-        if !discovery_ip_is_in_backoff(dial_backoff_by_node_ip, candidate.node_id, dial_ip, now)
-            && can_accept_discovery_dial_ip(endpoint, dial_ip, in_flight_by_ip).await
+    for address in state.candidate_addresses(candidate, now) {
+        if can_accept_discovery_dial_ip(endpoint, address.ip, state.in_flight_dials_to(address.ip))
+            .await
         {
-            reserved_ips.push(dial_ip);
-            direct_addrs.push(*addr);
+            reserved_ips.push(address.ip);
+            direct_addrs.push(address.addr);
         }
     }
 
@@ -323,116 +291,23 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
 async fn can_accept_discovery_dial_ip(
     endpoint: &ZakuraEndpoint,
     remote_ip: IpAddr,
-    in_flight_by_ip: &HashMap<IpAddr, usize>,
+    in_flight: usize,
 ) -> bool {
-    let in_flight = in_flight_by_ip.get(&remote_ip).copied().unwrap_or_default();
     endpoint
         .supervisor()
         .can_accept_remote_ip_with_in_flight(remote_ip, in_flight)
         .await
 }
 
-fn reserve_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>, ips: &[IpAddr]) {
-    for ip in ips {
-        *in_flight_by_ip.entry(*ip).or_default() += 1;
-    }
-}
-
-fn release_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>, ips: &[IpAddr]) {
-    for ip in ips {
-        let Some(count) = in_flight_by_ip.get_mut(ip) else {
-            continue;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            in_flight_by_ip.remove(ip);
-        }
-    }
-}
-
-fn discovery_ip_is_in_backoff(
-    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
-    node_id: NodeId,
-    ip: IpAddr,
-    now: Instant,
-) -> bool {
-    dial_backoff_by_node_ip
-        .get(&(node_id, ip))
-        .is_some_and(|backoff| now < backoff.retry_at)
-}
-
-fn prune_discovery_ip_backoff(
-    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
-    retention: Duration,
-    now: Instant,
-) {
-    dial_backoff_by_node_ip
-        .retain(|_, backoff| now.saturating_duration_since(backoff.retry_at) <= retention);
-}
-
-fn apply_discovery_ip_dial_result(
-    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
-    node_id: NodeId,
-    ips: &[IpAddr],
-    admitted_ip: Option<IpAddr>,
-    result: DiscoveryDialResult,
-    dial_backoff: (Duration, Duration),
-    now: Instant,
-) {
-    match result {
-        // A signed record proves control of the node id, not of every address it
-        // advertises. Only the address that TLS authenticated earns a reset, so a
-        // record can't pair one live endpoint with decoys to clear their backoff.
-        DiscoveryDialResult::Registered
-        | DiscoveryDialResult::ConnectedElsewhere
-        | DiscoveryDialResult::ShortLivedRegistered => {
-            if let Some(admitted_ip) = admitted_ip {
-                dial_backoff_by_node_ip.remove(&(node_id, canonical_ip(admitted_ip)));
-            }
-        }
-        // The ALPN mismatch floor applies to the node, not to each address: an
-        // aggregate dial error doesn't say which address mismatched (DIAL-5).
-        DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
-            for ip in ips {
-                let failure_count = dial_backoff_by_node_ip
-                    .get(&(node_id, *ip))
-                    .map_or(1, |backoff| backoff.failure_count.saturating_add(1));
-                let wait = discovery_ip_dial_backoff(failure_count, dial_backoff.0, dial_backoff.1);
-                dial_backoff_by_node_ip.insert(
-                    (node_id, *ip),
-                    DiscoveryIpBackoff {
-                        failure_count,
-                        retry_at: now + wait,
-                    },
-                );
-            }
-        }
-        DiscoveryDialResult::LocalResourceLimit => {}
-    }
-}
-
-fn discovery_ip_dial_backoff(
-    failure_count: u32,
-    dial_backoff_base: Duration,
-    dial_backoff_max: Duration,
-) -> Duration {
-    let shift = failure_count.saturating_sub(1).min(10);
-    dial_backoff_base
-        .saturating_mul(1u32 << shift)
-        .min(dial_backoff_max)
-}
-
 async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
-    node_id: NodeId,
-    reserved_ips: Vec<IpAddr>,
+    attempt: DialAttemptKey,
 ) -> DiscoveryDialWorkerResult {
-    let Ok(peer_id) = ZakuraPeerId::new(node_id.as_bytes().to_vec()) else {
+    let Ok(peer_id) = ZakuraPeerId::new(attempt.node_id.as_bytes().to_vec()) else {
         return DiscoveryDialWorkerResult {
-            node_id,
-            reserved_ips,
+            attempt,
             admitted_ip: None,
             result: DiscoveryDialResult::Failed,
         };
@@ -444,8 +319,7 @@ async fn run_discovery_dial_once(
         .any(|id| id == &peer_id)
     {
         return DiscoveryDialWorkerResult {
-            node_id,
-            reserved_ips,
+            attempt,
             admitted_ip: None,
             result: DiscoveryDialResult::ConnectedElsewhere,
         };
@@ -506,8 +380,7 @@ async fn run_discovery_dial_once(
     };
 
     DiscoveryDialWorkerResult {
-        node_id,
-        reserved_ips,
+        attempt,
         // The dial task sends the admitted IP before it registers the peer. An
         // empty channel means this dial never authenticated the peer itself.
         admitted_ip: admitted_ip_rx.try_recv().ok(),
@@ -558,7 +431,7 @@ async fn apply_discovery_dial_result(
     discovery: &ZakuraDiscoveryHandle,
     node_id: &NodeId,
     result: DiscoveryDialResult,
-    trace: &crate::zakura::ZakuraTrace,
+    trace: &ZakuraTrace,
 ) {
     trace.emit_event(|| DiscoveryDialResultEvent::new(node_id.as_bytes(), result));
 
@@ -605,117 +478,25 @@ mod tests {
     fn panicked_worker_returns_metadata_needed_to_release_reservations() {
         let node_id = zakura_quic::NodeSecretKey::from_bytes(&[3; 32]).public();
         let ip = IpAddr::from([93, 184, 216, 34]);
-        let mut in_flight = HashSet::from([node_id]);
-        let mut in_flight_by_ip = HashMap::new();
-        reserve_discovery_in_flight_ips(&mut in_flight_by_ip, &[ip]);
+        let mut state =
+            CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600)));
+        let attempt = state
+            .record_attempt(node_id, vec![ip])
+            .expect("an idle dialer records the first attempt");
 
-        let worker_result = recover_discovery_dial_worker_panic(
-            node_id,
-            vec![ip],
-            Err(Box::new("test worker panic")),
-        );
-        assert_eq!(worker_result.node_id, node_id);
-        assert_eq!(worker_result.reserved_ips, vec![ip]);
+        let worker_result =
+            recover_discovery_dial_worker_panic(attempt, Err(Box::new("test worker panic")));
+        assert_eq!(worker_result.attempt, attempt);
         assert_eq!(worker_result.result, DiscoveryDialResult::Failed);
 
-        in_flight.remove(&worker_result.node_id);
-        release_discovery_in_flight_ips(&mut in_flight_by_ip, &worker_result.reserved_ips);
-        assert!(in_flight.is_empty());
-        assert!(in_flight_by_ip.is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn failed_dials_back_off_only_the_failing_node_for_that_ip() {
-        let failing_node = node_id(1);
-        let honest_node = node_id(2);
-        let ip = IpAddr::from([93, 184, 216, 34]);
-        let mapped_ip: IpAddr = "::ffff:93.184.216.34"
-            .parse()
-            .expect("mapped test address parses");
-        let six_to_four_ip: IpAddr = "2002:5db8:d822::"
-            .parse()
-            .expect("6to4 test address parses");
-        let teredo_ip: IpAddr = "2001:0:c000:22d::a247:27dd"
-            .parse()
-            .expect("Teredo test address parses");
-        assert_eq!(canonical_ip(mapped_ip), ip);
-        assert_eq!(canonical_ip(six_to_four_ip), ip);
-        assert_eq!(canonical_ip(teredo_ip), ip);
-        let now = Instant::now();
-        let dial_backoff = (Duration::from_secs(60), Duration::from_secs(3_600));
-        let mut backoff_by_node_ip = HashMap::new();
-
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            failing_node,
-            &[ip],
-            None,
-            DiscoveryDialResult::Failed,
-            dial_backoff,
-            now,
-        );
-        // The failing node is backed off for this IP, canonicalised so v4/v6
-        // variants of the same address share the entry.
-        assert!(discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            failing_node,
-            ip,
-            now
+        assert!(state.complete(
+            worker_result.attempt,
+            worker_result.result,
+            worker_result.admitted_ip,
+            Instant::now(),
         ));
-        assert!(discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            failing_node,
-            canonical_ip(mapped_ip),
-            now
-        ));
-        // A different node advertising the same IP is NOT poisoned: a signature
-        // proves node-key control, not IP ownership.
-        assert!(!discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            honest_node,
-            ip,
-            now
-        ));
-        assert!(!discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            failing_node,
-            ip,
-            now + Duration::from_secs(60)
-        ));
-
-        let second_attempt = now + Duration::from_secs(60);
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            failing_node,
-            &[ip],
-            None,
-            DiscoveryDialResult::Failed,
-            dial_backoff,
-            second_attempt,
-        );
-        assert!(discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            failing_node,
-            ip,
-            second_attempt + Duration::from_secs(119)
-        ));
-        assert!(!discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            failing_node,
-            ip,
-            second_attempt + Duration::from_secs(120)
-        ));
-
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            failing_node,
-            &[ip],
-            Some(ip),
-            DiscoveryDialResult::Registered,
-            dial_backoff,
-            second_attempt,
-        );
-        assert!(!backoff_by_node_ip.contains_key(&(failing_node, ip)));
+        assert!(state.in_flight_node_ids().is_empty());
+        assert_eq!(state.in_flight_dials_to(ip), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -755,115 +536,6 @@ mod tests {
         );
     }
 
-    // V12 F-305587: an ALPN mismatch from one stale address used to put every
-    // address of the record into the ten-minute floor. The floor now lives on
-    // the node in the discovery book, and each address gets the ordinary backoff.
-    #[test]
-    fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
-        let node = node_id(1);
-        let ips = [
-            IpAddr::from([93, 184, 216, 34]),
-            IpAddr::from([198, 51, 100, 7]),
-        ];
-        let now = Instant::now();
-        let mut backoff_by_node_ip = HashMap::new();
-
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            node,
-            &ips,
-            None,
-            DiscoveryDialResult::AlpnMismatch,
-            (Duration::from_secs(60), Duration::from_secs(3_600)),
-            now,
-        );
-
-        for ip in ips {
-            assert!(discovery_ip_is_in_backoff(
-                &backoff_by_node_ip,
-                node,
-                ip,
-                now + Duration::from_secs(59)
-            ));
-            assert!(!discovery_ip_is_in_backoff(
-                &backoff_by_node_ip,
-                node,
-                ip,
-                now + Duration::from_secs(60)
-            ));
-        }
-    }
-
-    // V12 F-58: a record can pair one live endpoint with decoy addresses. A
-    // success through the live endpoint must not reset the decoys' backoff.
-    #[test]
-    fn success_clears_backoff_only_for_the_admitted_ip() {
-        let node = node_id(1);
-        let admitted = IpAddr::from([93, 184, 216, 34]);
-        let decoy = IpAddr::from([198, 51, 100, 7]);
-        let mapped_admitted: IpAddr = "::ffff:93.184.216.34"
-            .parse()
-            .expect("mapped test address parses");
-        let now = Instant::now();
-        let dial_backoff = (Duration::from_secs(60), Duration::from_secs(3_600));
-        let mut backoff_by_node_ip = HashMap::new();
-
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            node,
-            &[admitted, decoy],
-            None,
-            DiscoveryDialResult::Failed,
-            dial_backoff,
-            now,
-        );
-        for result in [
-            DiscoveryDialResult::Registered,
-            DiscoveryDialResult::ConnectedElsewhere,
-            DiscoveryDialResult::ShortLivedRegistered,
-        ] {
-            apply_discovery_ip_dial_result(
-                &mut backoff_by_node_ip,
-                node,
-                &[admitted, decoy],
-                Some(mapped_admitted),
-                result,
-                dial_backoff,
-                now,
-            );
-            assert!(!discovery_ip_is_in_backoff(
-                &backoff_by_node_ip,
-                node,
-                admitted,
-                now
-            ));
-            assert_eq!(
-                backoff_by_node_ip
-                    .get(&(node, decoy))
-                    .map(|backoff| backoff.failure_count),
-                Some(1),
-                "{result:?} must keep the decoy's failure metadata"
-            );
-        }
-
-        // A success this dial didn't authenticate itself resets nothing.
-        apply_discovery_ip_dial_result(
-            &mut backoff_by_node_ip,
-            node,
-            &[decoy],
-            None,
-            DiscoveryDialResult::ConnectedElsewhere,
-            dial_backoff,
-            now,
-        );
-        assert!(discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            node,
-            decoy,
-            now
-        ));
-    }
-
     // V12 F-71: the reservation counts one dial per IP, and the endpoint
     // starts one handshake per address. A record that lists several ports on
     // one IP must get one address per IP, so attempts equal reservations.
@@ -894,9 +566,8 @@ mod tests {
 
         let (node_addr, reserved_ips) = discovery_node_addr_with_reserved_ip_capacity(
             &node.endpoint(),
+            &CandidateDialerState::new((Duration::from_secs(60), Duration::from_secs(3_600))),
             &candidate,
-            &HashMap::new(),
-            &HashMap::new(),
             Instant::now(),
         )
         .await

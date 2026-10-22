@@ -339,10 +339,11 @@ fn answer() -> impl Strategy<Value = Answer> {
     ]
 }
 
+/// Steps that stop the publisher are rare, so most histories run long.
 fn step() -> impl Strategy<Value = Step> {
     let id = 1..=IDS;
     prop_oneof![
-        3 => (id.clone(), any::<bool>(), 1..=5u32, 1..=6u32, 1..=6u32).prop_map(
+        12 => (id.clone(), any::<bool>(), 1..=5u32, 1..=6u32, 1..=6u32).prop_map(
             |(id, at_target, target, objects, units)| Step::Open {
                 id,
                 at_target,
@@ -351,7 +352,7 @@ fn step() -> impl Strategy<Value = Step> {
                 units,
             }
         ),
-        3 => (id.clone(), sequence(), 0..8usize, 0..=4u32, 0..=4u32).prop_map(
+        12 => (id.clone(), sequence(), 0..8usize, 0..=4u32, 0..=4u32).prop_map(
             |(id, sequence, ack, objects, units)| Step::Grant {
                 id,
                 sequence,
@@ -360,20 +361,20 @@ fn step() -> impl Strategy<Value = Step> {
                 units,
             }
         ),
-        1 => (id, sequence(), 0..8usize)
+        12 => (id, sequence(), 0..8usize)
             .prop_map(|(id, sequence, ack)| Step::Close { id, sequence, ack }),
-        4 => Just(Step::NextJob),
-        4 => (1..=3u32, 0..=2u64, stale())
+        16 => Just(Step::NextJob),
+        10 => (1..=3u32, 0..=2u64, stale())
             .prop_map(|(headers, shave, stale)| Step::Page { headers, shave, stale }),
-        2 => (answer(), stale()).prop_map(|(answer, stale)| Step::Finish { answer, stale }),
-        2 => Just(Step::EndDue),
-        2 => Just(Step::NextTerminal),
-        2 => prop::bool::weighted(0.9).prop_map(Step::TerminalWritten),
+        10 => (answer(), stale()).prop_map(|(answer, stale)| Step::Finish { answer, stale }),
+        12 => Just(Step::EndDue),
+        12 => Just(Step::NextTerminal),
+        12 => prop::bool::weighted(0.9).prop_map(Step::TerminalWritten),
         1 => Just(Step::Cancel),
         1 => Just(Step::Closed),
-        2 => prop::option::weighted(0.9, (0..=2u8, 0..=8u32))
+        10 => prop::option::weighted(0.9, (0..=2u8, 0..=8u32))
             .prop_map(|tip| Step::Select(tip.map(|(branch, height)| Tip { branch, height }))),
-        1 => any::<prop::sample::Index>().prop_map(Step::Release),
+        4 => any::<prop::sample::Index>().prop_map(Step::Release),
     ]
 }
 
@@ -1231,10 +1232,8 @@ fn another_subscriptions_page_commits_while_a_terminal_waits() {
     );
 }
 
-/// Cancellation during a terminal write stops the publisher: the queued
-/// outcome is never offered, and no job starts.
-#[test]
-fn cancellation_during_a_terminal_write_stops_the_publisher() {
+/// Two subscriptions that close together, with the first outcome taken.
+fn two_closed_one_writing() -> Machine {
     let mut machine = Machine::new();
     for id in [1, 2] {
         machine.run(&Step::Open {
@@ -1253,6 +1252,26 @@ fn cancellation_during_a_terminal_write_stops_the_publisher() {
     machine.run(&Step::EndDue);
     machine.run(&Step::NextTerminal);
     assert_eq!(machine.model.queued.len(), 1, "one outcome still waits");
+    // The second outcome waits for the first write.
+    machine.run(&Step::NextTerminal);
+    assert_eq!(machine.model.queued.len(), 1, "one write at a time");
+    machine
+}
+
+/// Cancellation during a terminal write stops the publisher: the queued
+/// outcome is never offered, and no job starts.
+#[test]
+fn cancellation_during_a_terminal_write_stops_the_publisher() {
+    let mut machine = two_closed_one_writing();
     machine.run(&Step::Cancel);
     assert_eq!(machine.model.exit, Some(Exit::Cancelled));
+}
+
+/// A stream that refuses a terminal outcome stops the publisher: the queued
+/// outcome is never offered, and no job starts.
+#[test]
+fn a_refused_terminal_write_stops_the_publisher() {
+    let mut machine = two_closed_one_writing();
+    machine.run(&Step::TerminalWritten(false));
+    assert_eq!(machine.model.exit, Some(Exit::Closed));
 }

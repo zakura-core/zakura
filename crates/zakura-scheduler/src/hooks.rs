@@ -107,8 +107,17 @@ pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
 #[cfg(zakura_sim)]
 pub(crate) fn try_spawn_boxed(label: &'static str, task: BoxTask) -> Option<TaskId> {
     // Drop a rejected task outside the borrow, since its destructor can run
-    // arbitrary code.
-    with_run(|s| s.queue_spawn(label, task))?.ok()
+    // arbitrary code. The closure only takes the task once there's a run, so
+    // with none it stays here and drops after `with_run` returns.
+    let mut task = Some(task);
+    let queued = with_run(|s| {
+        s.queue_spawn(
+            label,
+            task.take()
+                .expect("with_run calls the closure at most once"),
+        )
+    });
+    queued?.ok()
 }
 
 /// Requests cancellation of `task` without a preemption point. See
@@ -282,5 +291,35 @@ impl Future for JoinHandle {
         // Drop outside the borrow too, for the same reason.
         drop(unused);
         poll
+    }
+}
+
+#[cfg(all(test, zakura_sim))]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::*;
+
+    /// Calls a hook when dropped, as a task's destructor may.
+    struct CallsHookOnDrop(Rc<Cell<bool>>);
+
+    impl Drop for CallsHookOnDrop {
+        fn drop(&mut self) {
+            assert_eq!(current_task(), None, "no run, so no current task");
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn try_spawn_without_a_run_drops_the_task_outside_the_borrow() {
+        let dropped = Rc::new(Cell::new(false));
+        let guard = CallsHookOnDrop(Rc::clone(&dropped));
+        let task: BoxTask = Box::pin(async move {
+            let _guard = guard;
+        });
+        // This used to drop the task inside `with_run`'s borrow, so the
+        // destructor's hook panicked with a borrow error.
+        assert_eq!(try_spawn_boxed("rejected", task), None);
+        assert!(dropped.get());
     }
 }

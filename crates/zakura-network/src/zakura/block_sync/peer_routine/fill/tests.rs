@@ -38,7 +38,7 @@ fn fixture(max_blocks: u32, heights: &[u32]) -> Fixture {
         max_blocks_per_response: max_blocks,
         ..BlockSyncStatus::default()
     });
-    routine.work.extend(
+    routine.io.work.extend(
         test_work_scope(),
         heights.iter().map(|raw| {
             (
@@ -66,12 +66,12 @@ impl Fixture {
     fn assert_settled(&mut self, budget_reserved: u64) {
         let routine = &self.routine;
         for raw in &self.heights {
-            assert!(routine.work.pending_contains(block::Height(*raw)));
+            assert!(routine.io.work.pending_contains(block::Height(*raw)));
         }
-        assert_eq!(routine.work.in_flight_len(), 0);
-        assert_eq!(routine.budget.reserved(), budget_reserved);
+        assert_eq!(routine.io.work.in_flight_len(), 0);
+        assert_eq!(routine.io.budget.reserved(), budget_reserved);
         assert_eq!(self.pool.held(), 0);
-        assert_eq!(routine.requester.occupancy().len, 0);
+        assert_eq!(routine.io.requester.occupancy().len, 0);
         assert!(routine.window.outstanding.is_empty());
         assert!(self.outbound.try_recv().is_err(), "nothing was sent");
     }
@@ -128,7 +128,7 @@ async fn a_closed_transport_releases_the_exchange_and_cancels_the_session() {
     let report = fixture.routine.try_fill();
 
     assert_eq!(report.stop, FillStop::SendError);
-    assert!(fixture.routine.session.cancel_token().is_cancelled());
+    assert!(fixture.routine.io.session.cancel_token().is_cancelled());
     assert_eq!(fixture.next_request_id(), before);
     fixture.assert_settled(0);
 }
@@ -175,7 +175,7 @@ async fn avoided_work_returns_quietly_with_its_retry_deadline() {
 async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
     let mut fixture = fixture(1, &[3]);
     // Admission funds 500 bytes, but the take always admits its first body.
-    let mut budget = fixture.routine.budget.clone();
+    let mut budget = fixture.routine.io.budget.clone();
     let reserved = budget.available() - 500;
     assert!(budget.try_reserve(reserved));
     let before = fixture.next_request_id();
@@ -190,7 +190,7 @@ async fn refused_above_floor_funding_returns_the_run_without_a_charge() {
 #[tokio::test]
 async fn a_revoked_claim_retires_its_authorization_and_returns_its_funding() {
     let mut fixture = fixture(1, &[3]);
-    fixture.routine.session.cancel_token().cancel();
+    fixture.routine.io.session.cancel_token().cancel();
     let before = fixture.next_request_id();
 
     let report = fixture.routine.try_fill();
@@ -218,12 +218,15 @@ async fn a_pass_that_published_keeps_its_retry_deadline() {
     assert_eq!(report.stop, FillStop::RetryAvoid);
     assert_eq!(report.retry_at, Some(until));
     let routine = &fixture.routine;
-    assert!(routine.work.in_flight_contains(block::Height(1)));
-    assert!(routine.work.pending_contains(block::Height(2)));
-    assert!(routine.work.reserved_bytes() > 0);
-    assert_eq!(routine.budget.reserved(), routine.work.reserved_bytes());
+    assert!(routine.io.work.in_flight_contains(block::Height(1)));
+    assert!(routine.io.work.pending_contains(block::Height(2)));
+    assert!(routine.io.work.reserved_bytes() > 0);
+    assert_eq!(
+        routine.io.budget.reserved(),
+        routine.io.work.reserved_bytes()
+    );
     assert_eq!(fixture.pool.held(), 1);
-    assert_eq!(routine.requester.occupancy().len, 1);
+    assert_eq!(routine.io.requester.occupancy().len, 1);
     assert_eq!(routine.window.outstanding.len(), 1);
     assert!(fixture.outbound.try_recv().is_ok(), "the request was sent");
 }

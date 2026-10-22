@@ -1,0 +1,57 @@
+//! Runtime handles of one block-sync peer routine.
+
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
+
+use zakura_rt::sync::{atomic::AtomicU64, mpsc, watch, CancellationToken, Mutex};
+
+use super::super::{
+    events::RoutineToReactor,
+    peer_registry::PeerRegistry,
+    regulated::{live_requester::LiveRequester, session::ServingSession},
+    sequencer_task::{SequencedBody, SequencerView},
+    state::{ByteBudget, ThroughputMeter},
+    work_queue::WorkQueue,
+    BlockSyncPeerSession, ZakuraPeerId, ZakuraTrace,
+};
+use crate::zakura::{FramedRecv, ZakuraConnId};
+
+/// The streams, shared owners, channels, and trace handles that one peer
+/// routine uses to execute its decisions. `PeerIO` makes no download, status,
+/// or liveness decision of its own.
+pub(super) struct PeerIO {
+    /// Authorizes every response read from `recv`. The transport precheck
+    /// shares this owner, so authorization happens before body decoding.
+    pub(super) requester: LiveRequester,
+    /// Admits this peer's `GetBlocks` requests.
+    pub(super) serving: ServingSession,
+    pub(super) peer: ZakuraPeerId,
+    pub(super) conn_id: ZakuraConnId,
+    pub(super) source: zakura_header_chain::SourceId,
+    pub(super) session: BlockSyncPeerSession,
+    /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
+    /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
+    pub(super) recv: FramedRecv,
+    /// Last sampled fill-stop time for each bounded reason label.
+    pub(super) fill_stop_trace_at: BTreeMap<&'static str, Instant>,
+    /// Generation this routine was spawned with; gates its registry writes (and
+    /// its `Drop`) so a superseded routine (e.g. a session replacement before the
+    /// old task's async Drop runs) cannot corrupt the live entry.
+    pub(super) generation: u64,
+    pub(super) budget: ByteBudget,
+    pub(super) work: Arc<WorkQueue>,
+    pub(super) registry: Arc<PeerRegistry>,
+    pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
+    /// The per-peer sequencer path. A full input stalls only this routine.
+    pub(super) sequencer_input: mpsc::Sender<SequencedBody>,
+    pub(super) sequencer_input_bytes: Arc<AtomicU64>,
+    pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
+    /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
+    /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
+    pub(super) routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+    pub(super) sequencer_view: watch::Receiver<SequencerView>,
+    /// Cancellation token for the peer's service session.
+    /// Disconnect, park, or shutdown triggers the token.
+    /// The routine then exits and its `Drop` guard returns work.
+    pub(super) cancel: CancellationToken,
+    pub(super) trace: ZakuraTrace,
+}

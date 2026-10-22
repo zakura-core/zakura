@@ -34,7 +34,7 @@ fn requester_routine_with_pool(
         max_blocks_per_response: 1,
         ..BlockSyncStatus::default()
     });
-    routine.work.extend(
+    routine.io.work.extend(
         super::super::test_work_scope(),
         [(
             block::Height(1),
@@ -77,7 +77,8 @@ fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
 #[tokio::test]
 async fn replacement_requests_from_cached_status_without_waiting_for_an_announcement() {
     let (mut routine, mut outbound, _events) = super::tests::status_test_routine();
-    routine.session = routine
+    routine.io.session = routine
+        .io
         .session
         .clone()
         .with_status_for_test(BlockSyncStatus {
@@ -85,10 +86,10 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
             ..Default::default()
         });
     let (_input, recv) = crate::zakura::framed_channel(4);
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
-    routine.work.extend(
+    routine.io.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+    routine.io.sequencer_view = view_rx;
+    routine.io.work.extend(
         super::super::test_work_scope(),
         [(
             block::Height(1),
@@ -134,7 +135,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         "written authorization survives scheduler timeout"
     );
     let grace = routine.config.effective_liveness_timeout();
-    let retirement = routine.requester.retirement_deadline(grace).unwrap();
+    let retirement = routine.io.requester.retirement_deadline(grace).unwrap();
     routine.retry_avoid.clear();
     routine.window.note_block_progress(Instant::now(), grace);
     assert_eq!(routine.try_fill().retry_at, Some(retirement));
@@ -142,12 +143,12 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
         routine.window.outstanding.is_empty(),
         "the old range still authorizes a response"
     );
-    assert!(routine.work.pending_contains(block::Height(1)));
+    assert!(routine.io.work.pending_contains(block::Height(1)));
     let before = routine.state.next_request_id.unwrap().get();
     let (_input, recv) = crate::zakura::framed_channel(4);
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
+    routine.io.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+    routine.io.sequencer_view = view_rx;
     let mut guard = block_sync_guard();
     let mut running = Box::pin(routine.run_inner(&mut guard));
     // Re-poll a parked routine without new work or an ending. The initial BBR
@@ -213,9 +214,9 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         1,
         "retirement keeps authorization until cleanup"
     );
-    let registry = routine.registry.clone();
-    let peer = routine.peer.clone();
-    let work = routine.work.clone();
+    let registry = routine.io.registry.clone();
+    let peer = routine.io.peer.clone();
+    let work = routine.io.work.clone();
     drop(routine);
     assert!(work.pending_contains(block::Height(1)));
     registry.remove(&peer);
@@ -264,20 +265,20 @@ async fn local_finality_or_competing_receipt_keeps_the_original_response_authori
         let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
         let (mut routine, mut outbound, pool, connection, _) = requester_routine(block.hash());
         let (body_sender, mut bodies) = mpsc::channel(1);
-        routine.sequencer_input = body_sender;
-        let (view_tx, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-        routine.sequencer_view = view_rx;
+        routine.io.sequencer_input = body_sender;
+        let (view_tx, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+        routine.io.sequencer_view = view_rx;
         routine.try_fill();
         next_sent(&mut outbound).await;
         if finalized {
-            let released = routine.work.advance_floor(block::Height(1));
-            routine.budget.release(released);
+            let released = routine.io.work.advance_floor(block::Height(1));
+            routine.io.budget.release(released);
             view_tx.send_modify(|view| view.download_floor = block::Height(1));
             routine.gc_committed_outstanding();
         } else {
             // The shared work ledger records another peer's receipt before ours.
-            let released = routine.work.claim_received(block::Height(1));
-            routine.budget.release(released);
+            let released = routine.io.work.claim_received(block::Height(1));
+            routine.io.budget.release(released);
         }
         assert_eq!(pool.held(), 1);
         deliver(&mut routine, BlockSyncMessage::Block(block)).await;
@@ -304,7 +305,7 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let (mut routine, mut outbound, pool, connection, mut events) = requester_routine(block.hash());
     let (body_sender, _bodies) = mpsc::channel(1);
-    routine.sequencer_input = body_sender;
+    routine.io.sequencer_input = body_sender;
     routine.try_fill();
     next_sent(&mut outbound).await;
     // A local timeout drops the window entry but keeps the written reservation.
@@ -313,8 +314,8 @@ async fn an_authorized_block_after_local_retirement_is_not_a_peer_violation() {
     assert!(routine.window.outstanding.is_empty());
     assert_eq!(pool.held(), 1);
     // A local reorg drops the height, and the peer's later Status contracts its range.
-    let released = routine.work.reset_above(block::Height(0));
-    routine.budget.release(released);
+    let released = routine.io.work.reset_above(block::Height(0));
+    routine.io.budget.release(released);
     routine.state.servable_low = block::Height(0);
     routine.state.servable_high = block::Height(0);
     while events.try_recv().is_ok() {}
@@ -346,15 +347,15 @@ async fn an_authorized_body_above_its_size_estimate_is_not_a_peer_violation() {
     let (mut routine, mut outbound, _pool, _connection, mut events) =
         requester_routine(block.hash());
     // Queue this 73 KB body behind the smallest estimate, far beyond tolerance.
-    let released = routine.work.reset_above(block::Height(0));
-    routine.budget.release(released);
-    routine.work.extend(
+    let released = routine.io.work.reset_above(block::Height(0));
+    routine.io.budget.release(released);
+    routine.io.work.extend(
         super::super::test_work_scope(),
         [(height, block.hash(), BlockSizeEstimate::Confirmed(500))],
     );
     routine.state.servable_high = height;
     let (body_sender, mut bodies) = mpsc::channel(1);
-    routine.sequencer_input = body_sender;
+    routine.io.sequencer_input = body_sender;
     routine.try_fill();
     next_sent(&mut outbound).await;
     while events.try_recv().is_ok() {}
@@ -401,15 +402,15 @@ async fn a_body_whose_transactions_miss_its_header_disconnects_before_sequencing
     for junk in [truncated, malleated] {
         let (mut routine, mut outbound, _pool, connection, mut events) =
             requester_routine(block.hash());
-        let released = routine.work.reset_above(block::Height(0));
-        routine.budget.release(released);
-        routine.work.extend(
+        let released = routine.io.work.reset_above(block::Height(0));
+        routine.io.budget.release(released);
+        routine.io.work.extend(
             super::super::test_work_scope(),
             [(height, block.hash(), BlockSizeEstimate::Confirmed(80_000))],
         );
         routine.state.servable_high = height;
         let (body_sender, mut bodies) = mpsc::channel(1);
-        routine.sequencer_input = body_sender;
+        routine.io.sequencer_input = body_sender;
         routine.try_fill();
         next_sent(&mut outbound).await;
         while events.try_recv().is_ok() {}
@@ -444,7 +445,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     let pool = ReservationPool::new(2 * SESSION_RESERVATIONS).unwrap();
     let (mut first, _outbound, _, first_connection, _) =
         requester_routine_with_pool(block::Hash([1; 32]), pool.clone());
-    let requester = &first.requester;
+    let requester = &first.io.requester;
     for index in 0..SESSION_RESERVATIONS {
         let height = u32::try_from(index + 100).unwrap();
         let mut hash = [0; 32];
@@ -464,7 +465,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
     assert_eq!(pool.held(), SESSION_RESERVATIONS);
     first.try_fill();
     assert!(first.window.outstanding.is_empty());
-    assert!(!first.cancel.is_cancelled());
+    assert!(!first.io.cancel.is_cancelled());
     assert!(!first_connection.is_cancelled());
 
     let (mut second, mut outbound, _, second_connection, _) =
@@ -483,7 +484,7 @@ async fn local_session_share_leaves_entries_for_another_requester() {
 async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     let hash = block::Hash([1; 32]);
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(hash);
-    let work = Arc::clone(&routine.work);
+    let work = Arc::clone(&routine.io.work);
     routine.try_fill();
     next_sent(&mut outbound).await;
     assert!(routine.expire_due_timeouts(routine.window.outstanding.first().unwrap().deadline));
@@ -494,6 +495,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     assert!(routine.window.block_liveness_deadline.is_none());
     routine.retry_avoid.clear();
     let deadline = routine
+        .io
         .requester
         .retirement_deadline(routine.config.effective_liveness_timeout())
         .unwrap();
@@ -518,7 +520,7 @@ async fn abandoned_height_closes_locally_and_can_be_requested_on_replacement() {
     assert_eq!(pool.held(), 0);
 
     let (mut replacement, mut outbound, ..) = requester_routine_with_pool(hash, pool);
-    replacement.work = work;
+    replacement.io.work = work;
     replacement.try_fill();
     let frame = next_sent(&mut outbound).await;
     assert!(matches!(
@@ -539,12 +541,12 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
         let (mut routine, mut outbound, _, connection, _) =
             requester_routine_with_pool(block.hash(), pool.clone());
         let (bodies, mut received) = mpsc::channel(1);
-        routine.sequencer_input = bodies;
+        routine.io.sequencer_input = bodies;
         routine.try_fill();
         next_sent(&mut outbound).await;
         deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await;
         assert!(received.try_recv().is_ok());
-        assert!(!routine.requester.occupancy().at_capacity);
+        assert!(!routine.io.requester.occupancy().at_capacity);
         peers.push((routine, outbound, connection));
     }
     assert!(
@@ -554,6 +556,7 @@ async fn missing_endings_cannot_pin_the_pool_below_each_peers_limit() {
     for (routine, outbound, connection) in peers {
         let grace = routine.config.effective_liveness_timeout();
         let deadline = routine
+            .io
             .requester
             .retirement_deadline(grace)
             .expect("the last block starts the missing-ending deadline");
@@ -582,7 +585,7 @@ async fn buffered_ending_survives_a_long_local_decode_wait() {
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
     let held = bodies.clone().try_reserve_owned().unwrap();
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     routine.try_fill();
     outbound.recv().await.unwrap();
     let (input, mut buffered) = crate::zakura::framed_channel(1);
@@ -635,7 +638,7 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
     let first = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let second = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
     let (mut routine, mut outbound, pool, connection, _) = requester_routine(first.hash());
-    routine.work.extend(
+    routine.io.work.extend(
         super::super::test_work_scope(),
         [(
             block::Height(2),
@@ -644,11 +647,11 @@ async fn a_withheld_ending_retires_after_reading_resumes_from_a_local_pause() {
         )],
     );
     let (bodies, mut received) = mpsc::channel(1);
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     let (input, recv) = crate::zakura::framed_channel(4);
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
+    routine.io.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+    routine.io.sequencer_view = view_rx;
     let mut running = Box::pin(routine.run());
     assert!(futures::poll!(&mut running).is_pending());
     outbound.recv().await.unwrap();
@@ -711,9 +714,9 @@ async fn a_status_flood_cannot_postpone_request_timeouts() {
     .encode_frame()
     .unwrap();
     while input.try_send(status.clone()).is_ok() {}
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
+    routine.io.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+    routine.io.sequencer_view = view_rx;
     let mut guard = block_sync_guard();
     let mut running = Box::pin(routine.run_inner(&mut guard));
     // One poll handles frames until the cooperative budget runs out, while
@@ -744,20 +747,23 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
     next_sent(&mut outbound).await;
     let owner = routine.window.outstanding.first().unwrap().request.owner;
     let released = routine
+        .io
         .work
         .release_answered_elsewhere(owner, height)
         .expect("the request still owns its reserved height");
-    routine.budget.release(released);
+    routine.io.budget.release(released);
     assert!(routine
+        .io
         .registry
         .has_outstanding_request(height, block.hash()));
 
     let released = drop_height(&routine, owner, height, block.hash());
-    routine.budget.release(released);
+    routine.io.budget.release(released);
     routine.gc_obsolete_outstanding();
 
     assert!(routine.window.outstanding.is_empty());
     assert!(!routine
+        .io
         .registry
         .has_outstanding_request(height, block.hash()));
 }
@@ -765,7 +771,7 @@ async fn assert_answered_elsewhere_claim_is_withdrawn(
 #[tokio::test]
 async fn a_reorg_retires_a_request_another_peer_already_answered() {
     assert_answered_elsewhere_claim_is_withdrawn(|routine, _, _, _| {
-        routine.work.reset_above(block::Height(0))
+        routine.io.work.reset_above(block::Height(0))
     })
     .await;
 }
@@ -774,6 +780,7 @@ async fn a_reorg_retires_a_request_another_peer_already_answered() {
 async fn a_retention_deferral_retires_a_request_another_peer_already_answered() {
     assert_answered_elsewhere_claim_is_withdrawn(|routine, owner, height, hash| {
         assert!(routine
+            .io
             .work
             .defer_received_for_owner(owner, height, hash, 1, block::Height(0)));
         0
@@ -788,13 +795,14 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES);
     let (mut routine, mut outbound, _pool, connection, _events) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     routine.try_fill();
     next_sent(&mut outbound).await;
     deliver(&mut routine, BlockSyncMessage::Block(block)).await;
     received.try_recv().unwrap();
     let grace = routine.config.effective_liveness_timeout();
     let retirement = routine
+        .io
         .requester
         .retirement_deadline(grace)
         .expect("the last block starts the missing-ending deadline");
@@ -817,9 +825,9 @@ async fn a_status_flood_cannot_postpone_a_withheld_ending() {
     .encode_frame()
     .unwrap();
     while input.try_send(status.clone()).is_ok() {}
-    routine.recv = recv;
-    let (_view, view_rx) = watch::channel(*routine.sequencer_view.borrow());
-    routine.sequencer_view = view_rx;
+    routine.io.recv = recv;
+    let (_view, view_rx) = watch::channel(*routine.io.sequencer_view.borrow());
+    routine.io.sequencer_view = view_rx;
     let mut guard = block_sync_guard();
     let mut running = Box::pin(routine.run_inner(&mut guard));
     assert!(matches!(
@@ -838,21 +846,21 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
 
     let (mut routine, _outbound, pool, _connection, _events) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     assert!(matches!(
         try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
         Err(SinkReject::Protocol(_))
     ));
     assert!(received.try_recv().is_err());
     assert_eq!(pool.held(), 0);
-    assert!(routine.work.pending_contains(block::Height(1)));
+    assert!(routine.io.work.pending_contains(block::Height(1)));
 
     // The exact limit is accepted. One byte less overruns it.
     for (limit, accepted) in [(body_len, true), (body_len - 1, false)] {
         let (mut routine, mut outbound, pool, _connection, _events) =
             requester_routine(block.hash());
         let (bodies, mut received) = mpsc::channel(1);
-        routine.sequencer_input = bodies;
+        routine.io.sequencer_input = bodies;
         routine.state.max_response_bytes = limit;
         routine.try_fill();
         next_sent(&mut outbound).await;
@@ -862,7 +870,7 @@ async fn an_unsolicited_or_overrunning_block_disconnects_before_claim() {
         if !accepted {
             assert!(matches!(result, Err(SinkReject::Protocol(_))));
             assert_eq!(
-                routine.requester.unreceived_expected(16),
+                routine.io.requester.unreceived_expected(16),
                 [(block::Height(1), block.hash())],
                 "the refused body claims nothing"
             );
@@ -882,14 +890,14 @@ async fn a_local_failure_after_a_claim_keeps_the_reservation_consumed() {
     let (mut routine, mut outbound, pool, connection, _events) = requester_routine(block.hash());
     let (bodies, received) = mpsc::channel(1);
     drop(received);
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     routine.try_fill();
     next_sent(&mut outbound).await;
     assert!(matches!(
         try_deliver(&mut routine, BlockSyncMessage::Block(block.clone())).await,
         Err(SinkReject::Local(_))
     ));
-    assert!(routine.requester.unreceived_expected(16).is_empty());
+    assert!(routine.io.requester.unreceived_expected(16).is_empty());
     assert_eq!(pool.held(), 1, "the ending still owns the reservation");
     assert!(!connection.is_cancelled());
     // The claim advanced past this header, so a resend matches no next header.
@@ -901,7 +909,7 @@ async fn a_local_failure_after_a_claim_keeps_the_reservation_consumed() {
     assert!(resent.to_string().contains("next expected header"));
     assert!(connection.is_cancelled());
     assert_eq!(pool.held(), 1);
-    let work = routine.work.clone();
+    let work = routine.io.work.clone();
     drop(routine);
     assert_eq!(pool.held(), 0);
     assert!(work.pending_contains(block::Height(1)));
@@ -915,7 +923,7 @@ async fn authorized_block_with_another_coinbase_height_is_a_protocol_violation()
     let block = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_2_BYTES);
     let (mut routine, mut outbound, _pool, _connection, _events) = requester_routine(block.hash());
     let (bodies, mut received) = mpsc::channel(1);
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     routine.try_fill();
     next_sent(&mut outbound).await;
     let error = try_deliver(&mut routine, BlockSyncMessage::Block(block))
@@ -942,7 +950,7 @@ async fn requests_stay_single_block_for_any_advertisement() {
             max_blocks_per_response: peer_max_blocks,
             ..BlockSyncStatus::default()
         });
-        routine.work.extend(
+        routine.io.work.extend(
             super::super::test_work_scope(),
             (2..=4).map(|height| {
                 (
@@ -1009,7 +1017,7 @@ fn bulk_routine() -> (
     let blocks: Vec<_> = (1..=BULK_WORK)
         .map(|height| super::super::tests::fake_block_at_height(&template, block::Height(height)))
         .collect();
-    routine.work.extend(
+    routine.io.work.extend(
         super::super::test_work_scope(),
         blocks.iter().map(|block| {
             let size = block.zcash_serialize_to_vec().unwrap().len();
@@ -1022,7 +1030,7 @@ fn bulk_routine() -> (
     );
     // Every body stays queued, so the input must hold all of them.
     let (bodies, received) = mpsc::channel(usize::try_from(BULK_WORK).unwrap());
-    routine.sequencer_input = bodies;
+    routine.io.sequencer_input = bodies;
     (
         (routine, outbound, pool, connection, events),
         blocks,
@@ -1087,17 +1095,18 @@ async fn withheld_endings_stop_new_requests_at_the_pending_ending_bound() {
         "the bound, not the queue, stopped the peer",
     );
     assert_eq!(
-        routine.requester.occupancy().pending_endings,
+        routine.io.requester.occupancy().pending_endings,
         requested.len()
     );
     assert_eq!(pool.held(), requested.len());
     assert!(routine.window.outstanding.is_empty());
-    assert!(routine.work.pending_contains(block::Height(BULK_WORK)));
+    assert!(routine.io.work.pending_contains(block::Height(BULK_WORK)));
     routine.try_fill();
     assert!(requested_heights(&mut outbound).is_empty());
 
     // The gate never replaces the missing-ending deadline.
     let deadline = routine
+        .io
         .requester
         .retirement_deadline(routine.config.effective_liveness_timeout())
         .expect("the first unended body starts the missing-ending deadline");
@@ -1134,7 +1143,7 @@ async fn a_late_ending_below_the_bound_lets_the_peer_take_work_again() {
         .await;
         routine.try_fill();
         requested = requested_heights(&mut outbound);
-        let pending = routine.requester.occupancy().pending_endings;
+        let pending = routine.io.requester.occupancy().pending_endings;
         if pending >= MAX_PENDING_ENDINGS {
             assert!(requested.is_empty(), "gated with {pending} endings owed");
         } else {
@@ -1176,7 +1185,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
         for height in &batch {
             let index = usize::try_from(height.0 - 1).unwrap();
             deliver(&mut routine, BlockSyncMessage::Block(blocks[index].clone())).await;
-            most_pending = most_pending.max(routine.requester.occupancy().pending_endings);
+            most_pending = most_pending.max(routine.io.requester.occupancy().pending_endings);
             routine.try_fill();
             let new = requested_heights(&mut outbound);
             requested += new.len();
@@ -1199,7 +1208,7 @@ async fn interleaved_honest_endings_never_reach_the_pending_ending_bound() {
     }
     assert_eq!(requested, usize::try_from(BULK_WORK).unwrap());
     assert_eq!(most_pending, INTERLEAVED);
-    assert_eq!(routine.requester.occupancy().pending_endings, 0);
+    assert_eq!(routine.io.requester.occupancy().pending_endings, 0);
     assert_eq!(pool.held(), 0);
     assert!(!connection.is_cancelled());
 }
@@ -1215,23 +1224,24 @@ fn slower_floor_peer(
 ) -> (PeerRoutine, FramedRecv) {
     let (mut slow, outbound, _events) =
         super::tests::status_test_routine_with(pool, &CancellationToken::new());
-    slow.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
-    slow.registry = Arc::clone(&fast.registry);
-    slow.generation = slow
+    slow.io.peer = ZakuraPeerId::new(vec![9; 32]).unwrap();
+    slow.io.registry = Arc::clone(&fast.io.registry);
+    slow.io.generation = slow
+        .io
         .registry
         .admit_session(
-            &slow.peer,
-            slow.session.direction(),
+            &slow.io.peer,
+            slow.io.session.direction(),
             &slow.config,
             0,
             Instant::now(),
         )
         .generation();
-    slow.work = Arc::clone(&fast.work);
-    let mut view = *slow.sequencer_view.borrow();
+    slow.io.work = Arc::clone(&fast.io.work);
+    let mut view = *slow.io.sequencer_view.borrow();
     view.download_floor = block::Height(floor.0 - 1);
     // Fill only borrows the view, so its sender need not outlive this setup.
-    slow.sequencer_view = watch::channel(view).1;
+    slow.io.sequencer_view = watch::channel(view).1;
     slow.handle_status(BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(BULK_WORK),
@@ -1255,8 +1265,9 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         fast.window.bbr_rtprop_ms(Instant::now()).is_some(),
         "the fast peer has a measured RTprop"
     );
-    let registry = Arc::clone(&fast.registry);
+    let registry = Arc::clone(&fast.io.registry);
     let floor = fast
+        .io
         .work
         .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
         .expect("the gated peer left work behind");
@@ -1277,7 +1288,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
     ranking.as_mut().enable();
     unended.sort();
     let mut endings = unended.into_iter();
-    while fast.requester.occupancy().pending_endings > MAX_PENDING_ENDINGS {
+    while fast.io.requester.occupancy().pending_endings > MAX_PENDING_ENDINGS {
         let start_height = endings.next().unwrap();
         deliver(
             &mut fast,
@@ -1288,7 +1299,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         )
         .await;
     }
-    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
     assert!(futures::poll!(ranking.as_mut()).is_pending());
     deliver(
         &mut fast,
@@ -1298,7 +1309,7 @@ async fn a_peer_gated_on_endings_does_not_hold_the_floor_from_a_slower_peer() {
         },
     )
     .await;
-    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
     assert!(futures::poll!(ranking.as_mut()).is_ready());
 }
 
@@ -1329,7 +1340,7 @@ async fn warmed_sessions_withholding_endings_leave_the_pool_to_others() {
         probe.routine.try_fill();
         assert!(requested_heights(&mut probe.outbound).is_empty());
         assert_eq!(
-            probe.routine.requester.occupancy().len,
+            probe.routine.io.requester.occupancy().len,
             SESSION_RESERVATIONS
         );
         sessions.push(probe);
@@ -1386,8 +1397,9 @@ async fn fast_peer_holding_one_exchange() -> (
         .window
         .bbr_rtprop_ms(time::Instant::now().into_std())
         .is_some());
-    assert_eq!(fast.requester.occupancy().len, 1);
+    assert_eq!(fast.io.requester.occupancy().len, 1);
     let floor = fast
+        .io
         .work
         .first_pending_in_range(block::Height(1), block::Height(BULK_WORK))
         .unwrap();
@@ -1409,7 +1421,7 @@ async fn fast_peer_holding_one_exchange() -> (
 async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
     let (mut fast, mut slow, mut slow_outbound, floor, _keep) =
         fast_peer_holding_one_exchange().await;
-    let registry = Arc::clone(&fast.registry);
+    let registry = Arc::clone(&fast.io.registry);
     let ranking = registry.subscribe_floor_ranking().notified();
     tokio::pin!(ranking);
     ranking.as_mut().enable();
@@ -1431,7 +1443,7 @@ async fn a_lowered_inflight_limit_releases_the_floor_to_a_slower_peer() {
 #[tokio::test(start_paused = true)]
 async fn alternating_rate_limited_limits_publish_the_stop_once() {
     let (mut fast, slow, _slow_outbound, floor, _keep) = fast_peer_holding_one_exchange().await;
-    let registry = Arc::clone(&fast.registry);
+    let registry = Arc::clone(&fast.io.registry);
     let mut notifications = 0;
     for round in 0..16 {
         let ranking = registry.subscribe_floor_ranking().notified();
@@ -1447,7 +1459,7 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
         }
     }
     assert_eq!(notifications, 1, "only the first stop is published");
-    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(!registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
 
     // The next admitted status publishes the reopened requester.
     let ranking = registry.subscribe_floor_ranking().notified();
@@ -1457,5 +1469,5 @@ async fn alternating_rate_limited_limits_publish_the_stop_once() {
     fast.flush_pending_status();
     assert!(fast.pending_status.is_none());
     assert!(futures::poll!(ranking.as_mut()).is_ready());
-    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.peer, None, false));
+    assert!(registry.floor_has_preferred_unsaturated_server(floor, &slow.io.peer, None, false));
 }

@@ -158,7 +158,7 @@ async fn request_bookkeeping_scaling() {
             assert!(
                 routine.window.outstanding.len() > before,
                 "fill stalled at {before} of {window} requests: {:?}",
-                routine.fill_stop_trace_at.keys().collect::<Vec<_>>()
+                routine.io.fill_stop_trace_at.keys().collect::<Vec<_>>()
             );
         }
         let fill = started.elapsed();
@@ -182,7 +182,7 @@ async fn request_bookkeeping_scaling() {
         }
         let settle = started.elapsed();
         assert!(routine.window.outstanding.is_empty());
-        assert_eq!(routine.registry.total_unreceived(), 0);
+        assert_eq!(routine.io.registry.total_unreceived(), 0);
 
         eprintln!(
             "window={window:>6} fill={:>9.1?} ({:>7.2?}/request) settle={:>9.1?} ({:>7.2?}/response)",

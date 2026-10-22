@@ -4578,6 +4578,12 @@ criteria = "safe-to-deploy"
 delta = "0.17.4+10.4.2 -> 0.17.5+10.4.2"
 notes = "build.rs defaults ROCKSDB_UNITY_CHUNK to 1 on Windows targets, so Windows compiles one translation unit per RocksDB source (other targets unchanged; the variable still overrides). zakura_minimal.rs is restructured so each edit is an InsertAfter or Replace whose C++ is a raw multi-line string, and normalizes CRLF to LF before matching; the edited sources it generates are byte-for-byte identical to 0.17.4's. No new sources, flags, downloads, or links. Published from fork commit ed52fdf, which passed the fork's CI on Linux, macOS, and Windows, including a build without `full`."
 
+[[audits.zakura-librocksdb-sys]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.5+10.4.2 -> 0.17.6+10.4.2"
+notes = "Published from fork commit fef92d5 (zakura-core/rust-rocksdb-wrapper#5); build.rs, zakura_minimal.rs, zakura_excluded_sources.txt, and the manifest match that commit byte for byte. The bundled RocksDB 10.4.2 and snappy sources are the same submodule commits and are not modified. Without `full`, zakura_minimal.rs adds three edits of the same anchor-checked kind as before: WritePreparedSnapshotChecker::CheckInSnapshot calls std::abort() instead of WritePreparedTxnDB, and PlainTableFactory::NewTableReader/NewTableBuilder and DBImplSecondary::CompactWithoutInstallation return NotSupported or null, so no code outside the C API references the skipped sources. The excluded-source list compiles seven more RocksDB sources (clock and compressed/tiered secondary caches, stderr logger, ARM64 crc32c, plain table bloom/index/key coding) and skips table/sst_file_dumper.cc. build.rs defines NO_PCLMUL on x86_64 unless the target enables pclmulqdq, matching the existing -mpclmul condition. No new flags beyond that define, downloads, or links. Most of the delta's size is snappy/third_party (google benchmark and googletest, 420 files), which the publish packaged from snappy's nested submodules; build.rs compiles only snappy.cc, snappy-sinksource.cc, and snappy-c.cc and never references third_party, so it is never built or run. Zakura's release zakurad links with GCC 16 against this crate; the fork's CI passes on GCC 12-16, Debian, Ubuntu, Fedora, Rawhide, and Arch GCC and clang, aarch64 Linux, macOS, and Windows."
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4605,6 +4611,12 @@ who = "Claude <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 delta = "0.24.1 -> 0.24.2"
 notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.5; the Rust sources are unchanged. The CI workflow adds a build without `full` on each platform."
+
+[[audits.zakura-rocksdb]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.2 -> 0.24.3"
+notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.6; the library's Rust sources are unchanged. Adds tests/test_zakura_minimal.rs, a CI workflow and a Python check script under .github that link and audit the build without `full`, and README and CHANGELOG notes. Published from fork commit fef92d5."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

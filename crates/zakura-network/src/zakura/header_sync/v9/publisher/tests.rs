@@ -1271,13 +1271,16 @@ async fn a_queued_outcome_wins_over_a_later_close() {
         .close()
         .expect("the subscription is live");
     // The task has not run between these, so both reach `end_due` together.
-    let ended = {
+    let frame = {
         let mut shared = lock(&harness.publisher.shared);
         shared.queue_end(id, HeadersOutcomeCode::SubscriptionSuperseded);
         assert_eq!(shared.apply(&close, limits()), Ok(Applied::Live));
-        shared.end_due::<HB>()
+        let ended = shared.end_due::<HB>();
+        assert_eq!(ended, [HeadersOutcomeCode::SubscriptionSuperseded]);
+        let terminal = shared.next_terminal().expect("one subscription ends");
+        assert!(shared.next_terminal().is_none(), "one write at a time");
+        terminal.frame
     };
-    let [Terminal { frame, .. }] = <[_; 1]>::try_from(ended).expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {
@@ -1997,8 +2000,11 @@ fn close_wins_over_an_outcome_found_after_it() {
     assert_eq!(state.apply(&close, limits()), Ok(Applied::Live));
     let found = Output::End(HeadersOutcomeCode::SubscriptionSuperseded);
     state.finish(job.key, found, None);
-    let ended = state.end_due::<HB>();
-    let [Terminal { frame, .. }] = <[_; 1]>::try_from(ended).expect("one subscription ends");
+    assert_eq!(
+        state.end_due::<HB>(),
+        [HeadersOutcomeCode::SubscriptionClosed]
+    );
+    let Terminal { frame, .. } = state.next_terminal().expect("one subscription ends");
     assert!(matches!(
         decode_frame::<RegtestMessage>(&frame),
         Ok(Message::HeadersOutcome(HeadersOutcome {

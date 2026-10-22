@@ -34,7 +34,8 @@
 //! permits, retained-path leases, storage calls, and output slots.
 
 use std::{
-    any::Any, future::Future, num::NonZeroU32, panic::AssertUnwindSafe, pin::Pin, sync::Arc,
+    any::Any, future::Future, num::NonZeroU32, ops::ControlFlow, panic::AssertUnwindSafe, pin::Pin,
+    sync::Arc,
 };
 
 use futures::FutureExt;
@@ -70,7 +71,7 @@ use crate::zakura::{
 mod state;
 
 pub(crate) use state::is_legal;
-use state::{recheck, Job, JobKey, Output, Page, PublisherState, Recheck, Stall, Terminal};
+use state::{recheck, Exit, Job, JobKey, Output, Page, PublisherState, Recheck, Stall, Terminal};
 
 #[cfg(test)]
 mod tests;
@@ -255,54 +256,35 @@ async fn publish<const HEADER_BYTES: usize>(
     // The page in progress, under the key state recorded for its job.
     let mut work: Option<(JobKey, Work<'_>)> = None;
     loop {
-        let ended = lock(&task.shared).end_due::<HEADER_BYTES>();
-        for terminal in &ended {
+        for outcome in lock(&task.shared).end_due::<HEADER_BYTES>() {
             metrics::counter!(
                 "sync.header.v9.publisher.outcome",
-                "outcome" => outcome_label(terminal.outcome),
+                "outcome" => outcome_label(outcome),
             )
             .increment(1);
         }
-        for Terminal {
-            frame,
-            permit,
-            abandons,
-            ..
-        } in ended
-        {
+        loop {
+            let Some(terminal) = lock(&task.shared).next_terminal() else {
+                break;
+            };
             // The subscription sends no more pages, so drop its page in
             // progress. A running job keeps its permit until state answers.
-            if abandons.is_some() && work.as_ref().map(|(working, _)| *working) == abandons {
+            if terminal.abandons.is_some()
+                && work.as_ref().map(|(working, _)| *working) == terminal.abandons
+            {
                 work = None;
             }
-            let terminal = permit.send(&send, frame);
-            zakura_rt::pin!(terminal);
-            // A full queue must not keep a cancelled session's task alive,
-            // hide a page job's panic, or stop another subscription's page.
-            // That page settles at once: its job gives its execution slots
-            // back, and a page that holds the queue slot this terminal waits
-            // for is queued instead of kept. A page whose subscription ends
-            // later in this batch fails its commit and is dropped.
-            loop {
-                zakura_rt::select! {
-                    biased;
-                    () = cancel.cancelled() => return,
-                    Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
-                    progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
-                        if work.is_some() =>
-                    {
-                        let (key, _) = work.take().expect("the page in progress just finished");
-                        if !settle(&task.shared, &selected, key, progress) {
-                            return;
-                        }
-                    }
-                    sent = &mut terminal => {
-                        if !sent {
-                            return;
-                        }
-                        break;
-                    }
-                }
+            let written = write_terminal(
+                &task.shared,
+                &selected,
+                &send,
+                terminal,
+                &mut work,
+                &mut panicked,
+                &cancel,
+            );
+            if written.await.is_break() {
+                return;
             }
         }
         if work.is_none() {
@@ -325,14 +307,17 @@ async fn publish<const HEADER_BYTES: usize>(
         // it. Each wake still reaches `end_due` on the next pass.
         zakura_rt::select! {
             biased;
-            () = cancel.cancelled() => return,
+            () = cancel.cancelled() => {
+                lock(&task.shared).cancelled();
+                return;
+            }
             // See `Publisher::spawn`.
             Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
             progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
                 if work.is_some() =>
             {
                 let (key, _) = work.take().expect("the page in progress just finished");
-                if !settle(&task.shared, &selected, key, progress) {
+                if settle(&task.shared, &selected, key, progress).is_break() {
                     return;
                 }
             }
@@ -357,14 +342,48 @@ async fn publish<const HEADER_BYTES: usize>(
     }
 }
 
+/// Write `terminal` on `send`, and report the result to state.
+///
+/// A full queue must not keep a cancelled session's task alive, hide a page
+/// job's panic, or stop another subscription's page. That page settles at
+/// once: its job gives its execution slots back, and a page that holds the
+/// queue slot this terminal waits for is queued instead of kept. A page whose
+/// subscription ended in the same batch fails its commit and is dropped.
+async fn write_terminal<'a>(
+    shared: &Mutex<PublisherState>,
+    selected: &watch::Receiver<Option<EngineSnapshot>>,
+    send: &'a FramedSend,
+    terminal: Terminal,
+    work: &mut Option<(JobKey, Work<'a>)>,
+    panicked: &mut mpsc::Receiver<Box<dyn Any + Send>>,
+    cancel: &CancellationToken,
+) -> ControlFlow<Exit> {
+    let written = terminal.permit.send(send, terminal.frame);
+    zakura_rt::pin!(written);
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return ControlFlow::Break(lock(shared).cancelled()),
+            Some(panic) = panicked.recv() => std::panic::resume_unwind(panic),
+            progress = async { work.as_mut().expect("guarded by is_some").1.as_mut().await },
+                if work.is_some() =>
+            {
+                let (key, _) = work.take().expect("the page in progress just finished");
+                settle(shared, selected, key, progress)?;
+            }
+            written = &mut written => return lock(shared).terminal_written(written),
+        }
+    }
+}
+
 /// Report the finished page or result of job `key` to state, and write a
-/// page that state commits. Returns false when the stream closed.
+/// page that state commits. Breaks when the stream or the runtime closed.
 fn settle(
     shared: &Mutex<PublisherState>,
     selected: &watch::Receiver<Option<EngineSnapshot>>,
     key: JobKey,
     progress: Progress<'_>,
-) -> bool {
+) -> ControlFlow<Exit> {
     match progress {
         // A page whose subscription closed meanwhile spends nothing and drops
         // its slot.
@@ -372,7 +391,7 @@ fn settle(
             if lock(shared).commit(key, &page) {
                 slot.send(page.frame);
             }
-            true
+            ControlFlow::Continue(())
         }
         Progress::Other(output) => {
             match &output {
@@ -388,9 +407,9 @@ fn settle(
             }
             let latest = selected.borrow().clone();
             lock(shared).finish(key, output, latest.as_ref());
-            true
+            ControlFlow::Continue(())
         }
-        Progress::Closed => false,
+        Progress::Closed => ControlFlow::Break(lock(shared).closed()),
     }
 }
 

@@ -3,24 +3,31 @@
 //! changes, checked against an independent model.
 //!
 //! The test plays the publisher task. It asks state for jobs, answers them
-//! with pages and results as storage would, and holds terminal permits until
-//! it writes them. The model keeps its own credit totals, cursors, update
-//! sequences, tombstones, slots, stalls, and serving order, and never calls
-//! the publisher's helpers. Each step checks:
+//! with pages and results as storage would, takes terminal outcomes and
+//! reports their writes, and cancels or closes the stream. The model keeps
+//! its own credit totals, cursors, update sequences, tombstones, slots,
+//! stalls, serving order, terminal queue, and exit, and never calls the
+//! publisher's helpers. Each step checks:
 //!
 //! - contiguous page position: every job and page extends the last header
 //!   sent, or the start before the first page;
 //! - authorized credit use: a job's header count is the room the model
 //!   computes, and a page spends exactly what the model expects;
 //! - one legal terminal per subscription, in the specification's window;
+//! - terminal outcomes are written one at a time, in the order they ended;
+//! - no job starts while a terminal outcome waits or after the publisher
+//!   stops, and nothing at all happens after it stops;
 //! - a result of an abandoned or settled job changes nothing.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::ControlFlow,
+};
 
 use super::*;
 use crate::zakura::{
     header_sync::v9::{message_type, MAX_HS_SUBSCRIPTIONS},
-    regulation::{TerminalPermit, Totals},
+    regulation::Totals,
 };
 
 /// Subscription IDs the steps use, so updates collide and IDs are reused.
@@ -146,6 +153,14 @@ impl ModelSub {
     }
 }
 
+/// A terminal outcome the model expects state to hold or the test to write.
+#[derive(Clone, Debug)]
+struct ModelTerminal {
+    id: u64,
+    outcome: HeadersOutcomeCode,
+    abandons: Option<JobKey>,
+}
+
 /// An ended subscription's remains.
 #[derive(Clone, Debug)]
 struct ModelTombstone {
@@ -169,11 +184,29 @@ struct JobRecord {
 struct Model {
     subs: BTreeMap<u64, ModelSub>,
     tombstones: VecDeque<ModelTombstone>,
-    /// Terminal permits the test holds before writing them.
-    held_terminals: usize,
+    /// Terminal outcomes queued in state, in order.
+    queued: VecDeque<ModelTerminal>,
+    /// The terminal outcome being written.
+    writing: Option<ModelTerminal>,
+    exit: Option<Exit>,
     selected: Option<Tip>,
     last_served: Option<u64>,
     in_progress: Option<JobRecord>,
+}
+
+impl Model {
+    /// Terminal outcomes whose slot is still held: queued or being written.
+    fn held_terminals(&self) -> usize {
+        self.queued.len() + usize::from(self.writing.is_some())
+    }
+
+    /// Whether state may start no job now.
+    fn busy(&self) -> bool {
+        self.in_progress.is_some()
+            || self.writing.is_some()
+            || !self.queued.is_empty()
+            || self.exit.is_some()
+    }
 }
 
 /// The outcome window table of the specification.
@@ -273,7 +306,12 @@ enum Step {
         stale: Option<prop::sample::Index>,
     },
     EndDue,
-    WriteTerminals,
+    NextTerminal,
+    /// The stream's answer to the terminal outcome being written.
+    TerminalWritten(bool),
+    Cancel,
+    /// The stream or the runtime closed under the job in progress.
+    Closed,
     Select(Option<Tip>),
     Release(prop::sample::Index),
 }
@@ -329,7 +367,10 @@ fn step() -> impl Strategy<Value = Step> {
             .prop_map(|(headers, shave, stale)| Step::Page { headers, shave, stale }),
         2 => (answer(), stale()).prop_map(|(answer, stale)| Step::Finish { answer, stale }),
         2 => Just(Step::EndDue),
-        1 => Just(Step::WriteTerminals),
+        2 => Just(Step::NextTerminal),
+        2 => prop::bool::weighted(0.9).prop_map(Step::TerminalWritten),
+        1 => Just(Step::Cancel),
+        1 => Just(Step::Closed),
         2 => prop::option::weighted(0.9, (0..=2u8, 0..=8u32))
             .prop_map(|tip| Step::Select(tip.map(|(branch, height)| Tip { branch, height }))),
         1 => any::<prop::sample::Index>().prop_map(Step::Release),
@@ -342,7 +383,8 @@ struct Machine {
     model: Model,
     /// Jobs that settled or that state abandoned.
     stale: Vec<JobRecord>,
-    terminals: Vec<TerminalPermit>,
+    /// The terminal outcome the test is writing.
+    writing: Option<Terminal>,
     signals: Vec<ServingCapacitySignal>,
 }
 
@@ -352,7 +394,7 @@ impl Machine {
             state: PublisherState::new(),
             model: Model::default(),
             stale: Vec::new(),
-            terminals: Vec::new(),
+            writing: None,
             signals: Vec::new(),
         }
     }
@@ -362,6 +404,10 @@ impl Machine {
     }
 
     fn run(&mut self, step: &Step) {
+        // The task returns once the publisher stops, so no step follows.
+        if self.model.exit.is_some() {
+            return;
+        }
         match *step {
             Step::Open {
                 id,
@@ -398,10 +444,10 @@ impl Machine {
             } => self.page(headers, shave, stale),
             Step::Finish { answer, stale } => self.finish(answer, stale),
             Step::EndDue => self.end_due(),
-            Step::WriteTerminals => {
-                self.terminals.clear();
-                self.model.held_terminals = 0;
-            }
+            Step::NextTerminal => self.next_terminal(),
+            Step::TerminalWritten(written) => self.terminal_written(written),
+            Step::Cancel => self.stop(Exit::Cancelled),
+            Step::Closed => self.stop(Exit::Closed),
             Step::Select(tip) => {
                 self.model.selected = tip;
                 self.state.selected_changed();
@@ -449,7 +495,7 @@ impl Machine {
             tree_aux_schema: AuxSchema::None,
         };
         let model = &mut self.model;
-        let held = model.subs.len() + model.held_terminals;
+        let held = model.subs.len() + model.held_terminals();
         let expected =
             if model.subs.contains_key(&id) || model.tombstones.iter().any(|dead| dead.id == id) {
                 Err(SubscriptionFault::ReusedKey.into())
@@ -597,7 +643,7 @@ impl Machine {
     /// The job the model expects next, superseding followers on the way.
     fn expected_job(&mut self) -> Option<(u64, Option<Frontier>, bool, u32, block::Hash)> {
         let model = &mut self.model;
-        if model.in_progress.is_some() {
+        if model.busy() {
             return None;
         }
         let ids: Vec<u64> = model.subs.keys().copied().collect();
@@ -653,12 +699,16 @@ impl Machine {
     }
 
     fn next_job(&mut self) {
-        let busy = self.model.in_progress.is_some();
+        let busy = self.model.busy();
         let expected = self.expected_job();
         let selected = self.selected();
         let job = self.state.next_job::<HB>(selected.as_ref(), page_limits());
         if busy {
-            assert!(job.is_none(), "one job runs at a time");
+            assert!(
+                job.is_none(),
+                "no job starts beside another, a waiting terminal outcome, or after exit: {:?}",
+                self.model
+            );
             return;
         }
         let found = job.as_ref().map(|job| {
@@ -855,7 +905,7 @@ impl Machine {
     }
 
     fn end_due(&mut self) {
-        let terminals = self.state.end_due::<HB>();
+        let ended = self.state.end_due::<HB>();
         let model = &mut self.model;
         let expected: Vec<(u64, HeadersOutcomeCode)> = model
             .subs
@@ -866,40 +916,24 @@ impl Machine {
                 (None, false) => None,
             })
             .collect();
-        let found: Vec<(u64, HeadersOutcomeCode)> = terminals
-            .iter()
-            .map(|terminal| {
-                let Ok(Message::HeadersOutcome(outcome)) =
-                    decode_frame::<RegtestMessage>(&terminal.frame)
-                else {
-                    panic!("a terminal frame is an outcome");
-                };
-                assert_eq!(outcome.outcome, terminal.outcome);
-                (outcome.subscription_id, outcome.outcome)
-            })
-            .collect();
-        assert_eq!(found, expected, "the terminal outcomes and their order");
-        for (terminal, (id, code)) in terminals.into_iter().zip(expected) {
+        let codes: Vec<HeadersOutcomeCode> = expected.iter().map(|(_, code)| *code).collect();
+        assert_eq!(ended, codes, "the terminal outcomes and their order");
+        for (id, outcome) in expected {
             let sub = model
                 .subs
                 .remove(&id)
                 .expect("an ended subscription was live");
             assert!(
-                model_legal(code, sub.pages > 0, sub.reached(), sub.closing),
-                "{code:?} is legal for {sub:?}"
+                model_legal(outcome, sub.pages > 0, sub.reached(), sub.closing),
+                "{outcome:?} is legal for {sub:?}"
             );
-            let running = model
-                .in_progress
-                .as_ref()
-                .filter(|record| record.job.id == id);
-            assert_eq!(
-                terminal.abandons,
-                running.map(|record| record.job.key),
-                "the outcome abandons exactly its subscription's job"
-            );
-            if let Some(record) = model.in_progress.take_if(|record| record.job.id == id) {
-                self.stale.push(record);
-            }
+            let abandoned = model.in_progress.take_if(|record| record.job.id == id);
+            model.queued.push_back(ModelTerminal {
+                id,
+                outcome,
+                abandons: abandoned.as_ref().map(|record| record.job.key),
+            });
+            self.stale.extend(abandoned);
             model.tombstones.push_back(ModelTombstone {
                 id,
                 sequence: sub.sequence,
@@ -908,9 +942,99 @@ impl Machine {
             while model.tombstones.len() > 2 * MAX_LIVE {
                 model.tombstones.pop_front();
             }
-            model.held_terminals += 1;
-            self.terminals.push(terminal.permit);
         }
+    }
+
+    /// Take the next terminal outcome to write, which the model expects only
+    /// when none is being written.
+    fn next_terminal(&mut self) {
+        let terminal = self.state.next_terminal();
+        let model = &mut self.model;
+        let expected = if model.writing.is_some() {
+            None
+        } else {
+            model.queued.pop_front()
+        };
+        let found = terminal.as_ref().map(|terminal| {
+            let Ok(Message::HeadersOutcome(outcome)) =
+                decode_frame::<RegtestMessage>(&terminal.frame)
+            else {
+                panic!("a terminal frame is an outcome");
+            };
+            (outcome.subscription_id, outcome.outcome, terminal.abandons)
+        });
+        assert_eq!(
+            found,
+            expected
+                .as_ref()
+                .map(|terminal| (terminal.id, terminal.outcome, terminal.abandons)),
+            "the next terminal outcome, one at a time and in order"
+        );
+        if terminal.is_some() {
+            model.writing = expected;
+            self.writing = terminal;
+        }
+    }
+
+    /// Report the stream's answer to the terminal outcome being written.
+    fn terminal_written(&mut self, written: bool) {
+        // The task reports a write only for the outcome it took.
+        let Some(terminal) = self.writing.take() else {
+            return;
+        };
+        // The write finishes, so its slot is free again.
+        drop(terminal);
+        self.model.writing = None;
+        let expected = if written {
+            ControlFlow::Continue(())
+        } else {
+            self.model.exit = Some(Exit::Closed);
+            ControlFlow::Break(Exit::Closed)
+        };
+        assert_eq!(
+            self.state.terminal_written(written),
+            expected,
+            "a refused terminal outcome stops the publisher"
+        );
+        self.check_stopped();
+    }
+
+    /// Cancel the session, or close the stream, and check that state stops.
+    fn stop(&mut self, exit: Exit) {
+        let stopped = |state: &mut PublisherState, exit| match exit {
+            Exit::Cancelled => state.cancelled(),
+            Exit::Closed => state.closed(),
+        };
+        assert_eq!(stopped(&mut self.state, exit), exit, "the reason to stop");
+        self.model.exit = Some(exit);
+        let other = match exit {
+            Exit::Cancelled => Exit::Closed,
+            Exit::Closed => Exit::Cancelled,
+        };
+        assert_eq!(
+            stopped(&mut self.state, other),
+            exit,
+            "the first reason to stop wins"
+        );
+        self.check_stopped();
+    }
+
+    /// A stopped publisher starts no job and offers no terminal outcome.
+    fn check_stopped(&mut self) {
+        if self.model.exit.is_none() {
+            return;
+        }
+        let selected = self.selected();
+        assert!(
+            self.state
+                .next_job::<HB>(selected.as_ref(), page_limits())
+                .is_none(),
+            "no job starts after the publisher stops"
+        );
+        assert!(
+            self.state.next_terminal().is_none(),
+            "no terminal outcome is written after the publisher stops"
+        );
     }
 }
 
@@ -956,7 +1080,8 @@ fn a_stale_page_after_replacement_spends_no_replacement_credit() {
     };
     machine.run(&close(a));
     machine.run(&Step::EndDue);
-    machine.run(&Step::WriteTerminals);
+    machine.run(&Step::NextTerminal);
+    machine.run(&Step::TerminalWritten(true));
     // Another subscription's `Open` clears A's tombstone, so A can open again.
     machine.run(&Step::Open {
         id: 2,
@@ -967,7 +1092,8 @@ fn a_stale_page_after_replacement_spends_no_replacement_credit() {
     });
     machine.run(&close(2));
     machine.run(&Step::EndDue);
-    machine.run(&Step::WriteTerminals);
+    machine.run(&Step::NextTerminal);
+    machine.run(&Step::TerminalWritten(true));
     machine.run(&Step::Open {
         id: a,
         at_target: false,
@@ -1054,4 +1180,79 @@ fn a_capacity_stall_waits_for_its_own_signal() {
         machine.model.in_progress.is_some(),
         "the release lets it retry"
     );
+}
+
+/// While a terminal outcome waits for the stream, another subscription's job
+/// in progress still commits its page. No new job starts until the write
+/// finishes.
+#[test]
+fn another_subscriptions_page_commits_while_a_terminal_waits() {
+    let mut machine = Machine::new();
+    for id in [1, 2] {
+        machine.run(&Step::Open {
+            id,
+            at_target: false,
+            target: 5,
+            objects: 6,
+            units: 6,
+        });
+    }
+    machine.run(&Step::NextJob);
+    let running = machine
+        .model
+        .in_progress
+        .clone()
+        .expect("subscription 1 has a page to read");
+    assert_eq!(running.job.id, 1);
+    machine.run(&Step::Close {
+        id: 2,
+        sequence: Sequence::Next,
+        ack: 0,
+    });
+    machine.run(&Step::EndDue);
+    machine.run(&Step::NextTerminal);
+    assert!(
+        machine.writing.is_some(),
+        "subscription 2's outcome is written"
+    );
+    machine.run(&Step::Page {
+        headers: 3,
+        shave: 0,
+        stale: None,
+    });
+    assert_eq!(machine.model.subs[&1].pages, 1, "the page committed");
+    machine.run(&Step::NextJob);
+    assert!(machine.model.in_progress.is_none(), "the write blocks jobs");
+    machine.run(&Step::TerminalWritten(true));
+    machine.run(&Step::NextJob);
+    assert!(
+        machine.model.in_progress.is_some(),
+        "the next job starts after the write"
+    );
+}
+
+/// Cancellation during a terminal write stops the publisher: the queued
+/// outcome is never offered, and no job starts.
+#[test]
+fn cancellation_during_a_terminal_write_stops_the_publisher() {
+    let mut machine = Machine::new();
+    for id in [1, 2] {
+        machine.run(&Step::Open {
+            id,
+            at_target: false,
+            target: 5,
+            objects: 6,
+            units: 6,
+        });
+        machine.run(&Step::Close {
+            id,
+            sequence: Sequence::Next,
+            ack: 0,
+        });
+    }
+    machine.run(&Step::EndDue);
+    machine.run(&Step::NextTerminal);
+    assert_eq!(machine.model.queued.len(), 1, "one outcome still waits");
+    machine.run(&Step::Cancel);
+    assert_eq!(machine.model.exit, Some(Exit::Cancelled));
 }

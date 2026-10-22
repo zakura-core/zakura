@@ -8,8 +8,17 @@
 //! records that key, with the selected chain the job read, before the task
 //! starts the job. It settles a result only under that exact key. A result of
 //! a job that state abandoned changes nothing and spends no credit.
+//!
+//! Terminal outcomes queue in state until the task takes them one at a time,
+//! writes each, and reports whether the stream took it. No job starts while
+//! an outcome waits, but the job in progress keeps settling. Cancellation, a
+//! closed stream, or a refused terminal write stops the publisher: state
+//! records the [`Exit`] and starts nothing more.
 
-use std::{collections::BTreeMap, ops::Bound};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::{Bound, ControlFlow},
+};
 
 use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier};
@@ -169,13 +178,22 @@ pub(super) enum Output {
 /// A subscription's terminal outcome, ready to write.
 #[derive(Debug)]
 pub(super) struct Terminal {
-    pub(super) outcome: HeadersOutcomeCode,
     pub(super) frame: Frame,
     pub(super) permit: TerminalPermit,
     /// The job in progress for this subscription, which state abandoned.
     /// Drop its page when this outcome is written; a running job keeps its
     /// permit until storage answers.
     pub(super) abandons: Option<JobKey>,
+}
+
+/// Why the publisher task stops.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum Exit {
+    /// The session was cancelled.
+    Cancelled,
+    /// The stream refused a terminal outcome or a page's slot, or the
+    /// runtime is shutting down.
+    Closed,
 }
 
 /// How a following page's revalidation goes before it is written.
@@ -203,6 +221,11 @@ pub(super) struct PublisherState {
     in_progress: Option<InProgress>,
     /// Jobs started, which numbers the next [`JobKey`].
     jobs_started: u64,
+    /// Terminal outcomes to write, in order.
+    terminals: VecDeque<Terminal>,
+    /// Whether the task is writing a terminal outcome.
+    writing: bool,
+    exit: Option<Exit>,
 }
 
 impl PublisherState {
@@ -216,6 +239,9 @@ impl PublisherState {
             last_served: None,
             in_progress: None,
             jobs_started: 0,
+            terminals: VecDeque::new(),
+            writing: false,
+            exit: None,
         }
     }
 
@@ -284,12 +310,13 @@ impl PublisherState {
     }
 
     /// End every subscription that is closing or has an outcome queued, in
-    /// order, and return each terminal outcome to write in that order.
+    /// order, queue each terminal outcome to write in that order, and return
+    /// the outcomes.
     ///
     /// An outcome this node already queued wins over `SubscriptionClosed`,
     /// as the specification requires. Ending the subscription of the job in
     /// progress abandons that job.
-    pub(super) fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<Terminal> {
+    pub(super) fn end_due<const HEADER_BYTES: usize>(&mut self) -> Vec<HeadersOutcomeCode> {
         let due: Vec<(u64, HeadersOutcomeCode)> = self
             .subscriptions
             .iter()
@@ -325,14 +352,53 @@ impl PublisherState {
                         outcome,
                     }))
                     .expect("an outcome for a nonzero subscription ID always encodes");
-                Some(Terminal {
-                    outcome,
+                self.terminals.push_back(Terminal {
                     frame,
                     permit,
                     abandons,
-                })
+                });
+                Some(outcome)
             })
             .collect()
+    }
+
+    /// Take the next terminal outcome to write, unless one is being written
+    /// or the publisher stopped.
+    pub(super) fn next_terminal(&mut self) -> Option<Terminal> {
+        if self.writing || self.exit.is_some() {
+            return None;
+        }
+        let terminal = self.terminals.pop_front()?;
+        self.writing = true;
+        Some(terminal)
+    }
+
+    /// Record whether the stream took the terminal outcome being written. A
+    /// refusal stops the publisher.
+    pub(super) fn terminal_written(&mut self, written: bool) -> ControlFlow<Exit> {
+        debug_assert!(self.writing, "a terminal outcome was being written");
+        self.writing = false;
+        if written {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(self.stop(Exit::Closed))
+        }
+    }
+
+    /// Record that the session was cancelled, which stops the publisher.
+    pub(super) fn cancelled(&mut self) -> Exit {
+        self.stop(Exit::Cancelled)
+    }
+
+    /// Record that the stream or the runtime closed under a job, which stops
+    /// the publisher.
+    pub(super) fn closed(&mut self) -> Exit {
+        self.stop(Exit::Closed)
+    }
+
+    /// Stop the publisher for `exit`, keeping the first reason.
+    fn stop(&mut self, exit: Exit) -> Exit {
+        *self.exit.get_or_insert(exit)
     }
 
     /// Whether any subscription has this node's outcome queued.
@@ -362,8 +428,9 @@ impl PublisherState {
         }
     }
 
-    /// Choose the next page or check to run, if no job is in progress and
-    /// any subscription has one, and record it as in progress.
+    /// Choose the next page or check to run, if no job is in progress, no
+    /// terminal outcome waits, the publisher has not stopped, and any
+    /// subscription has one, and record it as in progress.
     ///
     /// `selected` is the latest selected chain. A subscription that follows
     /// it ends here, without a state read and even while it is stalled, when
@@ -374,7 +441,11 @@ impl PublisherState {
         selected: Option<&EngineSnapshot>,
         limits: PageLimits,
     ) -> Option<Job> {
-        if self.in_progress.is_some() {
+        if self.in_progress.is_some()
+            || self.writing
+            || !self.terminals.is_empty()
+            || self.exit.is_some()
+        {
             return None;
         }
         let ids: Vec<u64> = match self.last_served {

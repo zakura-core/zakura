@@ -271,6 +271,7 @@ impl Sim {
             let cx = StepCtx {
                 step: st.step,
                 pick: &chosen.identity,
+                enabled: &enabled,
                 phase,
                 now: self.sched.now(),
                 status: self.sched.status(),

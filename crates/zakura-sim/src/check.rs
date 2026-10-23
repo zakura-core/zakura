@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
-use crate::{end::RunEnd, observe::Observation, Identity, ObservationLog};
+use crate::{end::RunEnd, observe::Observation, Enabled, Identity, ObservationLog};
 
 /// A property that failed, and the steps its failure depends on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +77,8 @@ pub struct StepCtx<'a> {
     pub step: u64,
     /// The step's pick.
     pub pick: &'a Identity,
+    /// The enabled set the pick came from, sorted by identity.
+    pub enabled: &'a [Enabled],
     /// The step's phase.
     pub phase: Phase,
     /// Virtual time after the step.

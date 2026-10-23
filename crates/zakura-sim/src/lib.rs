@@ -15,14 +15,8 @@ pub mod check;
 pub mod end;
 pub mod identity;
 pub mod observe;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the step loop, the decider's only user, lands in a later PR"
-    )
-)]
 pub mod plan;
+pub mod sim;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
 pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};
@@ -30,3 +24,4 @@ pub use end::{HarnessFailure, IdleStatus, Outcome, RunEnd};
 pub use identity::{Category, Identity};
 pub use observe::{Observation, ObservationLog};
 pub use plan::{HexU64, Plan, PlanChoice, PlanError, PlanInput};
+pub use sim::{RunConfig, RunReport, Sim};

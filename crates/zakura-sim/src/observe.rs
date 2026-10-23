@@ -114,4 +114,14 @@ impl ObservationLog {
             .take_while(move |e| e.step == step)
             .map(|e| &e.obs)
     }
+
+    /// Starts appending to `step`.
+    pub(crate) fn begin(&mut self, step: u64) {
+        self.step = step;
+    }
+
+    /// Stops recording. Live observations end before cleanup starts.
+    pub(crate) fn freeze(&mut self) {
+        self.frozen = true;
+    }
 }

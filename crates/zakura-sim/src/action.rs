@@ -8,7 +8,7 @@ use zakura_scheduler::{SimInstant, TaskId};
 
 use crate::{check::Phase, Identity, ObservationLog};
 
-/// A source's index in its run, from `Sim::add_source`.
+/// A source's index in its run, from [`Sim::add_source`](crate::Sim::add_source).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceId(pub(crate) usize);
 
@@ -65,10 +65,6 @@ pub trait ActionSource {
 }
 
 /// What one source offers at one step.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step loop lands in the next PR")
-)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offer {
     pub(crate) actions: Vec<(Identity, u64)>,
@@ -76,10 +72,6 @@ pub(crate) struct Offer {
 }
 
 /// Everything [`enabled_set`] reads.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step loop lands in the next PR")
-)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EnabledInputs<'a> {
     pub(crate) phase: Phase,
@@ -101,10 +93,6 @@ pub(crate) struct EnabledInputs<'a> {
 /// In the drain only ready tasks run.
 ///
 /// Returns the identity that two enabled actions share, if any.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the step loop lands in the next PR")
-)]
 pub(crate) fn enabled_set(i: &EnabledInputs<'_>) -> Result<Vec<Enabled>, Identity> {
     let mut enabled: Vec<Enabled> = i
         .ready

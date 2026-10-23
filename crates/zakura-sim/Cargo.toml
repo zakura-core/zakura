@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
+zakura-rt = { path = "../zakura-rt" }
 
 [lints]
 workspace = true

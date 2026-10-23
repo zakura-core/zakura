@@ -74,7 +74,7 @@ const THREAD_RNG_FUNCTIONS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 4] = [
+const ALLOWED: [(&str, &str, &str); 12] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -96,7 +96,53 @@ const ALLOWED: [(&str, &str, &str); 4] = [
         "tokio::io::Interest",
         "readiness for the production socket, which a simulated run never binds",
     ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::Mutex",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::MutexGuard",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/net.rs",
+        "std::sync::PoisonError",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Mutex",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::MutexGuard",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::PoisonError",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "std::sync::Weak",
+        SIM_HARNESS,
+    ),
+    (
+        "crates/zakura-quic/src/sim/seeded.rs",
+        "Arc::downgrade",
+        SIM_HARNESS,
+    ),
 ];
+
+/// Why `zakura-quic`'s `sim` module may use std's runtime names. It compiles
+/// only under `cfg(any(test, zakura_sim))`, which the check doesn't treat as
+/// test-only, and it's harness infrastructure, not code under test.
+const SIM_HARNESS: &str = "harness infrastructure for simulated runs: the fake \
+     network and the process-wide seed pool, not code under test";
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 
@@ -818,6 +864,28 @@ mod tests {
                 "Arc::downgrade -> zakura_rt::sync::downgrade",
                 "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
                 "core::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+            ]
+        );
+    }
+
+    /// A `test` or `zakura_sim` gate compiles the code in simulated runs, so
+    /// the check covers it. Harness modules under that gate need allowlist
+    /// entries.
+    #[test]
+    fn simulator_gated_code_is_checked() {
+        let source = "
+            #[cfg(any(test, zakura_sim))]
+            mod sim {
+                use std::sync::Mutex;
+            }
+            #[cfg(zakura_sim)]
+            fn f() { tokio::task::yield_now(); }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "std::sync::Mutex -> zakura_rt::sync::Mutex",
+                "tokio::task::yield_now -> zakura_rt::task::yield_now",
             ]
         );
     }

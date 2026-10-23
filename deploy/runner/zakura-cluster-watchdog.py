@@ -55,6 +55,7 @@ from zakura_monitoring.suppression import suppression_until  # noqa: E402
 DOWN_HEALTH = {"down", "rpc_error"}
 MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
+RELEASE_STATE_TRANSIENT_GRACE_SECONDS = 180
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
@@ -1739,6 +1740,7 @@ class Watchdog:
         key = target.name
         entry = bucket.get(key, {})
         height: Any = entry.get("height")
+        threshold = 0.0
 
         try:
             pointer = fetch_json(target.url, self.args.request_timeout)
@@ -1750,6 +1752,20 @@ class Watchdog:
             condition, detail = release_state_condition(target, pointer, meta, now)
         except Exception as error:
             condition, detail = "unreachable", str(error)
+            if (
+                isinstance(error, TimeoutError)
+                or (isinstance(error, urllib.error.HTTPError) and 500 <= error.code < 600)
+                or (
+                    isinstance(error, urllib.error.URLError)
+                    and isinstance(error.reason, TimeoutError)
+                )
+            ):
+                # A transient fetch failure cannot clear the last notified incident.
+                # Keep it until a readable bundle can establish its next condition.
+                if entry.get("alerting"):
+                    entry["last_seen"] = now
+                    return
+                threshold = RELEASE_STATE_TRANSIENT_GRACE_SECONDS
 
         previous_bad_since = coerce_float(entry.get("bad_since"))
         bad_since = (
@@ -1760,15 +1776,14 @@ class Watchdog:
             else now
         )
 
-        # Threshold zero: a bundle that is already past its staleness window, or is
-        # missing a file, is not a transient blip to wait out. The window itself is
-        # the grace period.
+        # Only transport timeouts and server errors get a grace period. Invalid,
+        # incomplete, or stale bundles still require immediate attention.
         update_alert_state(
             bucket,
             key,
             condition,
             bad_since,
-            0.0,
+            threshold,
             release_state_alert_text(target, condition, detail, height),
             release_state_recovery_text(target, entry),
             now,

@@ -5,7 +5,6 @@ mod completion;
 mod eviction;
 mod peer_faults;
 mod port_panics;
-mod state_machine;
 mod status_offers;
 mod terminal_trace;
 mod timeouts;
@@ -16,7 +15,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
 
-use super::{state::*, *};
+use super::{machine_tests::committed_snapshot, state::*, *};
 use crate::zakura::{
     framed_channel,
     wire_codec::{decode_frame, encode_frame},
@@ -186,28 +185,6 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
     );
     startup.shutdown = shutdown;
     startup
-}
-
-fn committed_snapshot(
-    anchor: zakura_header_chain::Frontier,
-) -> zakura_header_chain::EngineSnapshot {
-    zakura_header_chain::EngineSnapshot {
-        mode: zakura_header_chain::EngineMode::Integrated,
-        state_version: zakura_header_chain::StateVersion::new(3),
-        header_generation: zakura_header_chain::HeaderGeneration::new(4),
-        verified_generation: zakura_header_chain::VerifiedGeneration::new(5),
-        frontiers: zakura_header_chain::FrontierSet {
-            finalized: anchor,
-            header_best: anchor,
-            verified_best: anchor,
-        },
-        header_best_score: zakura_header_chain::ChainScore::new(
-            zakura_header_chain::SuffixWork::zero(),
-            anchor.hash,
-        ),
-        oldest_retained_height: anchor.height,
-        alarms: Default::default(),
-    }
 }
 
 fn seed_applying_request(

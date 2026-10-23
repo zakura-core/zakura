@@ -4631,5 +4631,11 @@ fn ordered_send_error_label(error: &OrderedSendError) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+#[path = "reactor/tests/state_machine.rs"]
+mod machine_tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use machine_tests::{replay_header_reactor_bytes, HeaderReactorReplaySummary};
+
 #[cfg(test)]
 mod tests;

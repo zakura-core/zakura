@@ -931,6 +931,47 @@ fn meta_bytes_ignore_key_order() {
 }
 
 #[test]
+fn floats_are_refused() {
+    let nested = json!({ "link": { "delays": [1, 1.5] } });
+    let in_scenario = MetaRecord {
+        scenario: nested.clone(),
+        ..meta()
+    };
+    let in_params = MetaRecord {
+        assumptions: vec![AssumeRecord {
+            assume: "bounded-delivery".into(),
+            params: nested,
+        }],
+        ..meta()
+    };
+    for (meta, field) in [(in_scenario, "scenario"), (in_params, "assumptions")] {
+        assert_eq!(meta.float_field(), Some(field));
+        let dir = TempDir::new().unwrap();
+        let error = FileSink::create(dir.path(), &meta).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!dir.path().join(TRACE_FILE).exists());
+    }
+
+    // A float written by hand is malformed.
+    let dir = recorded(plan());
+    edit_meta(dir.path(), |meta| {
+        meta["scenario"] = json!({ "a": [{ "delay": 1.5 }] })
+    });
+    assert!(matches!(
+        invalid(dir.path()),
+        Invalid::Malformed { line: 1, .. }
+    ));
+    edit_meta(dir.path(), |meta| {
+        meta["scenario"] = json!({});
+        meta["assumptions"] = json!([{ "assume": "x", "params": { "d": 2e3 } }]);
+    });
+    assert!(matches!(
+        invalid(dir.path()),
+        Invalid::Malformed { line: 1, .. }
+    ));
+}
+
+#[test]
 fn meta_has_no_debug_output() {
     let line = Record::Meta(Box::new(meta())).to_line();
     let value: Value = serde_json::from_str(&line).unwrap();

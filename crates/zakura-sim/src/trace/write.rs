@@ -29,8 +29,15 @@ pub struct FileSink {
 
 impl FileSink {
     /// Creates `dir` if needed and starts its `trace.jsonl` with `meta`.
-    /// Fails if the file already exists, so a trace is never overwritten.
+    /// Fails if the file already exists, so a trace is never overwritten, or
+    /// if `meta` holds a float (see [`MetaRecord::float_field`]).
     pub fn create(dir: &Path, meta: &MetaRecord) -> io::Result<Self> {
+        if let Some(field) = meta.float_field() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("meta.{field} holds a float, and traces hold only integers"),
+            ));
+        }
         fs::create_dir_all(dir)?;
         let file = OpenOptions::new()
             .write(true)

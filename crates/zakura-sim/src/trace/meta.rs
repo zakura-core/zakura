@@ -54,6 +54,31 @@ pub struct MetaRecord {
     pub derived_from: Option<Derivation>,
 }
 
+impl MetaRecord {
+    /// The first field that holds a float: `scenario` or `assumptions`.
+    /// Records hold no floats (traces.md, Records), and only these two
+    /// fields take arbitrary JSON.
+    pub fn float_field(&self) -> Option<&'static str> {
+        if has_float(&self.scenario) {
+            Some("scenario")
+        } else if self.assumptions.iter().any(|a| has_float(&a.params)) {
+            Some("assumptions")
+        } else {
+            None
+        }
+    }
+}
+
+/// True if `value` holds a float at any depth.
+fn has_float(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.is_f64(),
+        Value::Array(items) => items.iter().any(has_float),
+        Value::Object(map) => map.values().any(has_float),
+        Value::Null | Value::Bool(_) | Value::String(_) => false,
+    }
+}
+
 /// Where a binary came from. Two builds are equivalent when their runs must
 /// make the same observations (see [`BuildInfo::equivalent`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

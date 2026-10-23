@@ -4,14 +4,17 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use support::{config, inputs, run};
 use zakura_rt::sync::atomic::{AtomicBool, Ordering};
-use zakura_sim::{IdleStatus, NoChecks, Outcome, Plan, PlanInput};
+use zakura_sim::{observe::Exit, IdleStatus, NoChecks, Observation, Outcome, Plan, PlanInput};
 
-/// Runs the spin-wait fixture under `plan` and checks it finishes.
+/// Runs the spin-wait fixture under `plan` and checks both tasks complete,
+/// and that the spinner saw the setter's store.
 fn spin_wait(plan: PlanInput) {
+    let saw = Rc::new(Cell::new(false));
+    let saw_in_task = saw.clone();
     let report = run(
         config(2, 1_000),
         plan,
@@ -21,6 +24,7 @@ fn spin_wait(plan: PlanInput) {
             sim.scheduler().spawn_root("spinner", async move {
                 // Each load is a preemption point.
                 while !seen.load(Ordering::Acquire) {}
+                saw_in_task.set(true);
             });
             sim.scheduler().spawn_root("setter", async move {
                 flag.store(true, Ordering::Release);
@@ -36,6 +40,15 @@ fn spin_wait(plan: PlanInput) {
         "{:?}",
         report.picks
     );
+    // Quiescence counts a panicked task as finished, so check the exits.
+    for task in ["spinner.1", "setter.1"] {
+        let exit = report.log.entries().iter().find_map(|e| match &e.obs {
+            Observation::TaskExited { task: t, exit } if t == task => Some(*exit),
+            _ => None,
+        });
+        assert_eq!(exit, Some(Exit::Completed), "{task}");
+    }
+    assert!(saw.get(), "the spinner left its loop after the store");
 }
 
 #[test]

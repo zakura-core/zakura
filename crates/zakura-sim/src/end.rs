@@ -30,6 +30,9 @@ pub enum HarnessFailure {
     },
     /// A draw of a kind this crate has no name for.
     UnknownDrawKind,
+    /// A checker, or a source's `enabled` or `boundaries`, drew between
+    /// steps. That code is harness code, so it must not consume the plan.
+    DrawOutsideStep,
     /// Nothing is enabled, yet the scheduler says the run can go on, as when a
     /// source's deadline blocks time while it offers no action.
     StuckWithoutAction {
@@ -42,7 +45,7 @@ impl fmt::Display for HarnessFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HarnessFailure::TaskNameHasColon { name } => {
-                write!(f, "task name {name:?} contains ':'")
+                write!(f, "task name `{name}` contains ':'")
             }
             HarnessFailure::DuplicateIdentity { identity } => {
                 write!(f, "two enabled actions are both {identity}")
@@ -58,6 +61,9 @@ impl fmt::Display for HarnessFailure {
                 f.write_str("code outside any task drew during a task's step")
             }
             HarnessFailure::UnknownDrawKind => f.write_str("a draw of an unknown kind"),
+            HarnessFailure::DrawOutsideStep => {
+                f.write_str("a checker or a source's enabled set drew between steps")
+            }
             HarnessFailure::StuckWithoutAction { status } => {
                 write!(f, "nothing is enabled, but the scheduler is {status}")
             }

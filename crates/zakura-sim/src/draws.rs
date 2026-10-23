@@ -24,7 +24,11 @@ pub(crate) enum Owner {
     Task { task: TaskId, name: String },
     /// A step that runs no task, such as a time advance.
     NoTask,
-    /// The run has ended. Cleanup draws aren't recorded.
+    /// Between steps, while the loop gathers the enabled set or runs the
+    /// checker. A draw here is a harness failure.
+    Harness,
+    /// The run has ended. Cleanup draws take the rotating default without
+    /// plan input, and aren't recorded.
     Done,
 }
 
@@ -62,8 +66,23 @@ impl Choices {
     /// Answers `draw` from the plan and records it, or reports why the draw
     /// can't be attributed.
     fn answer(&mut self, draw: &Draw) -> Result<u64, HarnessFailure> {
-        if self.owner == Owner::Done {
-            return Ok(default_draw(draw.bound, 1));
+        match self.owner {
+            // Rotating keeps a cleanup `select!` loop from always taking
+            // the same branch while preemption points are off.
+            Owner::Done => {
+                let task = draw
+                    .task
+                    .map_or_else(|| "setup".to_owned(), |t| t.index().to_string());
+                let kind = kind_name(draw.kind).unwrap_or("unknown");
+                let n = self
+                    .ordinals
+                    .entry((format!("cleanup/{task}"), kind))
+                    .or_insert(0);
+                *n = n.saturating_add(1);
+                return Ok(default_draw(draw.bound, *n));
+            }
+            Owner::Harness => return Err(HarnessFailure::DrawOutsideStep),
+            Owner::Setup | Owner::Task { .. } | Owner::NoTask => {}
         }
         let kind = kind_name(draw.kind).ok_or(HarnessFailure::UnknownDrawKind)?;
         let owner = match (&self.owner, draw.task) {

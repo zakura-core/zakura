@@ -5,8 +5,8 @@
 //! arrives on its own: the harness picks each delivery or drop, and each one
 //! handles exactly one datagram. A datagram sent at `t` may be delivered from
 //! `t + min_delay` and must be delivered or dropped by `t + max_delay`. Time is
-//! the driver's clock (`tokio::time`), so a harness that pauses it controls
-//! both the driver and the network.
+//! the driver's runtime clock, so a harness that controls it controls both
+//! the driver and the network.
 //!
 //! Sockets bind explicit addresses and never touch the OS. They report no GSO,
 //! no MTU discovery, no buffer sizes and no inode, so the endpoint starts no

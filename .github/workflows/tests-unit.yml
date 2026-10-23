@@ -499,6 +499,15 @@ jobs:
           cargo test --locked -p zakura-network --test sim_header_sync
         env:
           RUSTFLAGS: --cfg zakura_sim
+      # S4.7: the discovery regression must still find the bug it guards.
+      # The patch reverts the wait_complete fix in this disposable checkout,
+      # so this step runs last. A patch that no longer applies fails here.
+      - name: Check the discovery regression against the reverted fix
+        run: |
+          git apply crates/zakura-sim/tests/fixtures/discovery-wait-complete-revert.patch
+          cargo test --locked -p zakura-sim --test discovery -- --ignored --exact reverted_fix_misses_the_wakeup
+        env:
+          RUSTFLAGS: --cfg zakura_sim
 
   # Semver-checks compares rustdoc APIs and cannot see a dependency's major
   # bump underneath an unchanged type name. This job is the gate that can:

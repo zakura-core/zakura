@@ -29,8 +29,9 @@ use zakura_rt::{
 };
 use zakura_scheduler::Status;
 use zakura_sim::{
-    check::StepCtx, record::DrawRecord, record::Record, Checker, Observation, ObservationLog, Plan,
-    PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim, Violation,
+    check::StepCtx, record::DrawRecord, record::Record, Checker, NoChecks, Observation,
+    ObservationLog, Plan, PlanInput, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
+    Violation,
 };
 
 /// The property this file checks (properties.md, Discovery).
@@ -444,9 +445,54 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
 }
 
 /// The committed input that holds the source back, from
-/// [`hold_source_back`] on the code before the fix, where it violated the
-/// property with the witness load, final notify, `Notified`.
+/// [`hold_source_back`] on the code before the fix.
 const INPUT: &[u8] = include_bytes!("fixtures/discovery-wait-complete.bin");
+
+/// The regression, checked against the bug. CI's `sim-build` job applies
+/// `fixtures/discovery-wait-complete-revert.patch`, which puts the old
+/// `wait_complete` back, then runs this test by name. Unpatched, it would
+/// fail, so it's ignored.
+#[test]
+#[ignore = "needs fixtures/discovery-wait-complete-revert.patch applied"]
+fn reverted_fix_misses_the_wakeup() {
+    let (report, _, _) = run(Plan::from_fuzz(INPUT));
+    let violation = report.end.violation.expect("the committed input violates");
+    assert_eq!(violation.property, PROPERTY);
+    let [load, notify, notified] = violation.witness[..] else {
+        panic!("the witness is load, final notify, notified: {violation:?}");
+    };
+    assert!(
+        load < notify && notify < notified,
+        "the source checked, the sink notified, then the source created its future: {violation:?}"
+    );
+
+    // Unchecked, the run shows what that costs: the source sits out its
+    // 2 s initial-exchange timeout.
+    let (report, _) = recorded(
+        run_config(),
+        Plan::from_fuzz(INPUT),
+        scenario,
+        &mut NoChecks,
+    );
+    assert!(
+        report
+            .picks
+            .iter()
+            .any(|p| p.identity == "advance-time:2000000000"),
+        "the exchange timed out"
+    );
+}
+
+#[test]
+#[ignore = "rewrites the committed input; needs fixtures/discovery-wait-complete-revert.patch applied"]
+fn regenerate_wait_complete_input() {
+    let bytes = hold_source_back().expect("the reverted code misses the wakeup");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/discovery-wait-complete.bin"
+    );
+    std::fs::write(path, &bytes).expect("the fixture directory exists");
+}
 
 /// Asserts `report` held the property at least once and never timed out
 /// the exchange.

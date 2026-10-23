@@ -23,10 +23,11 @@ proptest = { workspace = true }
 rand_10 = { workspace = true }
 tokio-stream = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
-# For the header-sync smoke test.
+# For the header-sync and discovery scenarios.
 zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
+zakura-quic = { path = "../zakura-quic" }
 
 [lints]
 workspace = true

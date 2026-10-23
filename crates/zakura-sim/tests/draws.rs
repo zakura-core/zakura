@@ -224,3 +224,36 @@ fn cleanup_draws_rotate_so_a_select_loop_exits() {
         .expect("shutdown finished the select loop");
     assert_eq!(outcome, Outcome::Budget);
 }
+
+/// A sink that builds the run's first hashed map when it gets `init`.
+struct DrawingSink(zakura_sim::MemorySink);
+
+impl zakura_sim::RecordSink for DrawingSink {
+    fn record(&mut self, record: Record) {
+        if matches!(record, Record::Init(_)) {
+            let _: HashMap<u8, u8> = HashMap::default();
+        }
+        self.0.record(record);
+    }
+}
+
+#[test]
+fn a_sink_draw_is_a_harness_failure() {
+    for spawn_task in [false, true] {
+        let mut sim = Sim::new(config(2, 100), Plan::from_fuzz(&[7; 16]));
+        if spawn_task {
+            sim.scheduler().spawn_root("root", async {});
+        }
+        let mut sink = DrawingSink(zakura_sim::MemorySink::default());
+        let report = sim.run(&mut NoChecks, &mut sink);
+        assert_eq!(
+            report.end.harness,
+            Some(zakura_sim::HarnessFailure::DrawOutsideStep),
+            "with a task: {spawn_task}"
+        );
+        assert!(
+            draws(&sink.0.lines()).is_empty(),
+            "the sink's draw took no plan input"
+        );
+    }
+}

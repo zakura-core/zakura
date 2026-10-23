@@ -135,7 +135,12 @@ impl Sim {
     /// each step, then `end`.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
-        let draws = self.choices.borrow_mut().take_draws();
+        let draws = {
+            let mut choices = self.choices.borrow_mut();
+            // The sink is harness code, so a draw inside it is a failure.
+            choices.set_owner(Owner::Harness);
+            choices.take_draws()
+        };
         sink.record(Record::Init(InitRecord { draws }));
         let end = match self.failure.take() {
             Some(failure) => state.end_harness(failure),

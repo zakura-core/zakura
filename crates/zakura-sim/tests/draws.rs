@@ -27,7 +27,7 @@ fn draws(lines: &[String]) -> Vec<DrawRecord> {
         .flat_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
             Record::Init(init) => init.draws,
             Record::Step(step) => step.draws,
-            Record::End(_) => Vec::new(),
+            Record::Meta(_) | Record::End(_) => Vec::new(),
         })
         .collect()
 }
@@ -38,7 +38,7 @@ fn steps(lines: &[String]) -> Vec<StepRecord> {
         .iter()
         .filter_map(|line| match serde_json::from_str::<Record>(line).unwrap() {
             Record::Step(step) => Some(step),
-            Record::Init(_) | Record::End(_) => None,
+            Record::Meta(_) | Record::Init(_) | Record::End(_) => None,
         })
         .collect()
 }

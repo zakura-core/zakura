@@ -1,8 +1,8 @@
 //! The records a run emits, in traces.md's shapes.
 //!
 //! A run emits one `init` record, one record per step, drain included, and
-//! one `end` record, in that order, to a [`RecordSink`]. Trace files, `meta`,
-//! replay and the reader belong to M7 (traces.md, T1).
+//! one `end` record, in that order, to a [`RecordSink`]. A trace file puts a
+//! `meta` record before them (see [`crate::trace`]).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +12,7 @@ use crate::{
     check::{PropertyReport, Violation},
     end::{Drain, IdleStatus},
     plan::By,
+    trace::MetaRecord,
     HexU64, Observation,
 };
 
@@ -117,6 +118,40 @@ impl From<CleanupReport> for CleanupRecord {
     }
 }
 
+/// A violation as the `end` record holds it: the checker's [`Violation`],
+/// plus a match key for each evidence step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViolationRecord {
+    /// The property's ID, such as `sim/no-livelock`.
+    pub property: String,
+    /// The step the check failed at.
+    pub step: u64,
+    /// The steps the violation depends on, in order.
+    pub witness: Vec<u64>,
+    /// The recorded action match key of each `witness` step, in the same
+    /// order. Until match keys exist, each is the step's pick identity.
+    pub witness_keys: Vec<String>,
+    /// What the property expected.
+    pub expected: String,
+    /// What the run did.
+    pub actual: String,
+}
+
+impl ViolationRecord {
+    /// `violation`'s record, with `witness_keys` as its match keys.
+    pub fn new(violation: &Violation, witness_keys: Vec<String>) -> Self {
+        ViolationRecord {
+            property: violation.property.clone(),
+            step: violation.step,
+            witness: violation.witness.clone(),
+            witness_keys,
+            expected: violation.expected.clone(),
+            actual: violation.actual.clone(),
+        }
+    }
+}
+
 /// How the run ended.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,7 +165,7 @@ pub struct EndRecord {
     pub steps: u64,
     /// The violation, for `violation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub violation: Option<Violation>,
+    pub violation: Option<ViolationRecord>,
     /// The drain, for `budget`. Always present, `null` without a drain.
     pub drain: Option<Drain>,
     /// The failure, for `harness`.
@@ -146,6 +181,9 @@ pub struct EndRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "Line", from = "Line")]
 pub enum Record {
+    /// A trace's line 1, as `{"meta":{...}}`. Boxed, since it's far larger
+    /// than the others and written once.
+    Meta(Box<MetaRecord>),
     /// Draws before the first step, as `{"init":{...}}`.
     Init(InitRecord),
     /// A step, as a bare object with a `step` field.
@@ -165,9 +203,16 @@ impl Record {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum Line {
+    Meta(MetaLine),
     Init(InitLine),
     Step(StepRecord),
     End(EndLine),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetaLine {
+    meta: Box<MetaRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -185,6 +230,7 @@ struct EndLine {
 impl From<Record> for Line {
     fn from(record: Record) -> Self {
         match record {
+            Record::Meta(meta) => Line::Meta(MetaLine { meta }),
             Record::Init(init) => Line::Init(InitLine { init }),
             Record::Step(step) => Line::Step(step),
             Record::End(end) => Line::End(EndLine { end }),
@@ -195,6 +241,7 @@ impl From<Record> for Line {
 impl From<Line> for Record {
     fn from(line: Line) -> Self {
         match line {
+            Line::Meta(MetaLine { meta }) => Record::Meta(meta),
             Line::Init(InitLine { init }) => Record::Init(init),
             Line::Step(step) => Record::Step(step),
             Line::End(EndLine { end }) => Record::End(end),
@@ -281,6 +328,7 @@ mod tests {
                 properties: vec![PropertyReport {
                     property: "sim/no-livelock".into(),
                     outcome: PropertyOutcome::Held { applicable: 3 },
+                    holds_since: None,
                 }],
             }),
         ]

@@ -17,10 +17,17 @@ zakura-scheduler = { path = "../zakura-scheduler" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# O_NOFOLLOW and O_NONBLOCK, so the trace reader never follows a symlink or
+# blocks on a FIFO.
+libc = { workspace = true }
 
 [target.'cfg(zakura_sim)'.dev-dependencies]
 proptest = { workspace = true }
 rand_10 = { workspace = true }
+# zakura-rpc turns this on in workspace builds, so the trace tests run with it
+# to check that equal records still write equal bytes.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tempfile = { workspace = true }
 tokio-stream = { workspace = true }
 zakura-rt = { path = "../zakura-rt" }
 # For the header-sync and discovery scenarios.
@@ -28,6 +35,10 @@ zakura-chain = { path = "../zakura-chain" }
 zakura-network = { path = "../zakura-network" }
 zakura-node-services = { path = "../zakura-node-services" }
 zakura-quic = { path = "../zakura-quic" }
+
+# build.rs hashes the source for trace `meta` records.
+[build-dependencies]
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

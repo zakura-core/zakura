@@ -351,6 +351,7 @@ impl Checker for WaitCompleteWakes {
         vec![PropertyReport {
             property: PROPERTY.into(),
             outcome,
+            holds_since: None,
         }]
     }
 }
@@ -411,7 +412,7 @@ fn hold_source_back() -> Result<Vec<u8>, Vec<u8>> {
         }
         let step_of = |line: &String| match serde_json::from_str::<Record>(line).unwrap() {
             Record::Step(step) => Some(step),
-            Record::Init(_) | Record::End(_) => None,
+            Record::Meta(_) | Record::Init(_) | Record::End(_) => None,
         };
         let steps: Vec<_> = lines.iter().filter_map(step_of).collect();
         let Some(deviation) = checker

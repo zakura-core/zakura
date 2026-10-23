@@ -39,6 +39,21 @@ pub enum HarnessFailure {
         /// The scheduler's status.
         status: &'static str,
     },
+    /// A violation, or a property report at the run's end, names a step the
+    /// run didn't take as its step or evidence.
+    EvidenceOutsideRun {
+        /// The violated property.
+        property: String,
+        /// The step it names.
+        step: u64,
+    },
+    /// A property report's `holds_since` is past the run's last step.
+    HoldsSinceOutsideRun {
+        /// The property.
+        property: String,
+        /// The step it names.
+        step: u64,
+    },
 }
 
 impl fmt::Display for HarnessFailure {
@@ -66,6 +81,15 @@ impl fmt::Display for HarnessFailure {
             }
             HarnessFailure::StuckWithoutAction { status } => {
                 write!(f, "nothing is enabled, but the scheduler is {status}")
+            }
+            HarnessFailure::EvidenceOutsideRun { property, step } => {
+                write!(f, "{property} names step {step}, which the run didn't take")
+            }
+            HarnessFailure::HoldsSinceOutsideRun { property, step } => {
+                write!(
+                    f,
+                    "{property} holds since step {step}, which the run didn't take"
+                )
             }
         }
     }

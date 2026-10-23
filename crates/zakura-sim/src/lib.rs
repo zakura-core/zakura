@@ -21,6 +21,7 @@ pub mod plan;
 pub mod property;
 pub mod record;
 pub mod sim;
+pub mod trace;
 
 pub use action::{Action, ActionSource, Boundary, Enabled, SourceId};
 pub use check::{Checker, NoChecks, PropertyOutcome, PropertyReport, StepCtx, Violation};

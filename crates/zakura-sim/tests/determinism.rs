@@ -84,7 +84,7 @@ fn picks_and_digests(lines: &[String]) -> Vec<String> {
         .iter()
         .map(|line| match serde_json::from_str::<Record>(line).unwrap() {
             Record::Step(step) => format!("{} {:?}", step.pick, step.obs),
-            Record::Init(_) | Record::End(_) => line.clone(),
+            Record::Meta(_) | Record::Init(_) | Record::End(_) => line.clone(),
         })
         .collect()
 }

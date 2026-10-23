@@ -43,6 +43,7 @@ fn finishes() -> impl check::Checker {
             vec![PropertyReport {
                 property: "test/done-finishes".into(),
                 outcome,
+                holds_since: None,
             }]
         },
     )

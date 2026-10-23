@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-23. Version 0.13.
+Status: draft for review, 2026-10-23. Version 0.14.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -29,7 +29,8 @@ changes SOCK-3 to SOCK-5, SOCK-7, SOCK-9 and SOCK-13, and adds a §16 row;
 factory and the endpoint inputs, so a simulation can replay a handshake byte
 for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
 each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
-come from the runtime a simulation controls; §17k explains it.
+come from the runtime a simulation controls; §17k explains it. Version 0.14
+adds the §16 row for byte-identical replay; §17l explains it.
 
 ## 0. Conventions
 
@@ -973,6 +974,7 @@ this release tolerates, and keep each hard change explicit.
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | An endpoint on injected sockets binds, completes a handshake, rebinds and shuts down without opening an OS socket or starting the kernel drop poller, the GSO probe or the interface watcher | SOCK-3–SOCK-5, SOCK-7, SOCK-9, SOCK-13 |
 | `bind` keeps the secure inputs: each socket's endpoint config has no seed and the production keys, the TLS provider is ring's default, and the dependency graph excludes the deterministic test provider. A `bind_with` handshake uses every injected input, and an injected provider keeps ring's cipher suites | API-2, TLS-9, ADM-10 |
+| On the deterministic scheduler, with no tokio runtime, two `bind_with` endpoints with the same seeded inputs, plan and UTC origin send byte-identical datagrams through a Retry handshake and an echoed stream, in one process and in fresh processes. Leaving out any seeded input, or changing the seed or the UTC origin, changes the bytes, and host time doesn't | API-2, TLS-9, ADM-10, DEP-2 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
@@ -1284,3 +1286,15 @@ Changed:
   simulated run the two UTC readings follow the scenario clock, so Retry
   tokens and certificate checks never read the host clock. Tasks, channels
   and locks move onto `zakura-rt` in later changes.
+
+## 17l. Changes in version 0.14
+
+The replay tests for deterministic simulation are in place, so §16 records
+them.
+
+Changed:
+
+- **§16.** Adds a test that a simulated Retry handshake and stream exchange
+  replay byte for byte, in one process and across processes, and that each
+  seeded input, the seed and the UTC origin change the bytes while host time
+  doesn't.

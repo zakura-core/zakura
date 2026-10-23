@@ -338,6 +338,12 @@ impl Rules {
             | ["std", "sync", "RwLock" | "RwLockReadGuard" | "RwLockWriteGuard" | "Condvar" | "Barrier"
             | "BarrierWaitResult" | "mpsc", ..]
             | ["futures" | "futures_util", "select"] => Some(MISSING_NAME.to_owned()),
+            // `Arc::downgrade` makes std's `Weak`, whose reads have no
+            // preemption points. Matched by spelling, so a renamed `Arc`
+            // import slips through.
+            ["Arc", "downgrade"] | ["std" | "alloc", "sync", "Arc", "downgrade"] => {
+                Some("zakura_rt::sync::downgrade".to_owned())
+            }
             _ => None,
         }
     }
@@ -788,6 +794,27 @@ mod tests {
                 format!("tokio_util::time::DelayQueue -> {missing}"),
                 format!("core::sync::Barrier -> {missing}"),
                 format!("futures::select -> {missing}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn std_downgrades_are_flagged() {
+        let source = "
+            fn f(a: &Arc<u8>, r: &Rc<u8>) {
+                let _ = Arc::downgrade(a);
+                let _ = std::sync::Arc::downgrade(a);
+                let _ = core::sync::Arc::downgrade(a);
+                let _ = Rc::downgrade(r);
+                let _ = zakura_rt::sync::downgrade(a);
+            }
+        ";
+        assert_eq!(
+            violations(source),
+            [
+                "Arc::downgrade -> zakura_rt::sync::downgrade",
+                "std::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
+                "core::sync::Arc::downgrade -> zakura_rt::sync::downgrade",
             ]
         );
     }

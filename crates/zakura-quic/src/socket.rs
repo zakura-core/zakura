@@ -475,7 +475,7 @@ impl<S: UdpIo> SocketCell<S> {
             .take();
         self.generation.send_modify(|generation| *generation += 1);
         if let Some(old) = old {
-            let weak = Arc::downgrade(&old);
+            let weak = zakura_rt::sync::downgrade(&old);
             drop(old);
             for _ in 0..1000 {
                 if weak.strong_count() == 0 {

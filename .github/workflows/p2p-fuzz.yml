@@ -161,6 +161,22 @@ jobs:
             rss_mb: 2048
             max_len: 512
 
+          - target: discovery_book
+            decoder: 1
+            witness: discovery_book_witness_exercises_provenance_quota_and_expiry
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
+          - target: discovery_state
+            decoder: 1
+            witness: discovery_state_witness_exercises_stale_verification_and_expiry
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 512
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:

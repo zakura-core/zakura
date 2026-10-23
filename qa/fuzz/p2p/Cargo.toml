@@ -124,3 +124,17 @@ path = "fuzz_targets/header_publisher.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "discovery_book"
+path = "fuzz_targets/discovery_book.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_state"
+path = "fuzz_targets/discovery_state.rs"
+test = false
+doc = false
+bench = false

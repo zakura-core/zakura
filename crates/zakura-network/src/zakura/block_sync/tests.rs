@@ -26,7 +26,7 @@ use super::{
     reorder::*,
     request::*,
     sequencer::*,
-    sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerTask},
+    sequencer_task::{initial_view, SequencedBody, SequencerControlInput, SequencerIO},
     state::*,
     work_queue::WorkQueue,
 };
@@ -5279,7 +5279,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
         ByteBudget::new(1),
         Arc::new(WorkQueue::new(block::Height(0))),
@@ -5499,7 +5499,7 @@ impl CappedSequencerTask {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (actions_tx, actions_rx) = mpsc::channel(8);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
             ByteBudget::new(1),
@@ -5751,7 +5751,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
         ByteBudget::new(1),
         Arc::new(WorkQueue::new(block::Height(0))),

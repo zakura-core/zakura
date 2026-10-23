@@ -5,7 +5,7 @@
 //! ends at a violation, when nothing is enabled, or after its step budget and
 //! a bounded drain.
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use zakura_scheduler::{
     CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
@@ -14,9 +14,9 @@ use zakura_scheduler::{
 use crate::{
     action::{enabled_set, Action, ActionSource, EnabledInputs, Offer, SourceId},
     check::{Checker, Phase, PropertyReport, StepCtx, Violation},
+    draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
     observe::{Exit, Observation},
-    plan::Decider,
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
     },
@@ -87,7 +87,9 @@ pub struct RunReport {
 /// One simulated run.
 pub struct Sim {
     sched: Scheduler,
-    decider: Decider,
+    /// Shared with the draw callback. See [`draws`].
+    choices: Rc<RefCell<Choices>>,
+    failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
     config: RunConfig,
 }
@@ -95,19 +97,28 @@ pub struct Sim {
 impl Sim {
     /// Starts a run at virtual time zero, taking its choices from `plan`.
     ///
+    /// The draw callback is installed before anything else, so draws in setup
+    /// code go to the plan and the `init` record.
+    ///
     /// # Panics
     ///
     /// If this thread already has a run.
     pub fn new(config: RunConfig, plan: PlanInput) -> Self {
+        let mut sched = Scheduler::new(config.scheduler, SimInstant::ZERO);
+        let choices = Rc::new(RefCell::new(Choices::new(plan)));
+        let failure = Failure::default();
+        draws::install(&mut sched, &choices, &failure);
         Sim {
-            sched: Scheduler::new(config.scheduler, SimInstant::ZERO),
-            decider: Decider::new(plan),
+            sched,
+            choices,
+            failure,
             sources: Vec::new(),
             config,
         }
     }
 
     /// The run's scheduler, for setup such as spawning the tasks under test.
+    /// Draws in setup code are recorded in the `init` record.
     pub fn scheduler(&mut self) -> &mut Scheduler {
         &mut self.sched
     }
@@ -123,8 +134,13 @@ impl Sim {
     /// each step, then `end`.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
-        sink.record(Record::Init(InitRecord::default()));
-        let end = self.drive(checker, &mut state, sink);
+        let draws = self.choices.borrow_mut().take_draws();
+        sink.record(Record::Init(InitRecord { draws }));
+        let end = match self.failure.take() {
+            Some(failure) => state.end_harness(failure),
+            None => self.drive(checker, &mut state, sink),
+        };
+        self.choices.borrow_mut().set_owner(Owner::Done);
         let properties = checker.at_end(&end, &state.log);
         state.log.freeze();
         let cleanup = self.sched.shutdown();
@@ -135,7 +151,7 @@ impl Sim {
             cleanup,
             log: state.log,
             picks: state.picks,
-            resolved: self.decider.resolved(),
+            resolved: self.choices.borrow().decider.resolved(),
         }
     }
 
@@ -189,14 +205,18 @@ impl Sim {
                 };
             }
 
-            // The decider's borrow ends here, before any task code runs.
             let identities: Vec<Identity> = enabled.iter().map(|e| e.identity.clone()).collect();
-            let decision = match phase {
-                Phase::Live => match self.decider.pick(&identities) {
-                    Ok(decision) => decision,
-                    Err(error) => return st.end_harness(HarnessFailure::Plan(error)),
-                },
-                Phase::Drain => self.decider.pick_round_robin(&identities),
+            let decision = {
+                // This borrow ends before any task code runs, so tasks can draw.
+                let mut choices = self.choices.borrow_mut();
+                match phase {
+                    Phase::Live => choices.decider.pick(&identities),
+                    Phase::Drain => Ok(choices.decider.pick_round_robin(&identities)),
+                }
+            };
+            let decision = match decision {
+                Ok(decision) => decision,
+                Err(error) => return st.end_harness(HarnessFailure::Plan(error)),
             };
             let chosen = &enabled[decision.index];
             st.step += 1;
@@ -210,7 +230,20 @@ impl Sim {
                 options: enabled.len(),
                 phase,
             });
+            let owner = match chosen.action {
+                Action::RunTask(task) => Owner::Task {
+                    task,
+                    name: st.names[&task].clone(),
+                },
+                _ => Owner::NoTask,
+            };
+            self.choices.borrow_mut().set_owner(owner);
             self.execute(chosen.action, st);
+            let draws = {
+                let mut choices = self.choices.borrow_mut();
+                choices.set_owner(Owner::NoTask);
+                choices.take_draws()
+            };
 
             let next = self.ready(st);
             sink.record(Record::Step(StepRecord {
@@ -220,9 +253,12 @@ impl Sim {
                 options: enabled.len(),
                 by: decision.by,
                 offset: decision.offset,
-                draws: Vec::new(),
+                draws,
                 obs: Some(digest(st.log.of_step(st.step))),
             }));
+            if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
             ready = match next {
                 Ok(ready) => ready,
                 Err(failure) => return st.end_harness(failure),
@@ -407,5 +443,51 @@ fn end_record(end: &RunEnd, properties: &[PropertyReport], cleanup: CleanupRepor
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
         properties: properties.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MemorySink, NoChecks, Plan};
+
+    /// Draws the run's hash seed from setup code.
+    fn draw_in_setup() {
+        let _: zakura_rt::collections::HashMap<u8, u8> = Default::default();
+    }
+
+    #[test]
+    fn held_borrow_is_harness_not_panic() {
+        let sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        {
+            let _held = sim.choices.borrow_mut();
+            draw_in_setup();
+        }
+        let report = sim.run(&mut NoChecks, &mut MemorySink::default());
+        assert_eq!(report.end.outcome, Outcome::Harness);
+        assert_eq!(
+            report.end.harness,
+            Some(HarnessFailure::PlanBorrowedDuringDraw)
+        );
+    }
+
+    #[test]
+    fn callback_does_not_outlive_run() {
+        let sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[1; 8]));
+        let choices = Rc::downgrade(&sim.choices);
+        draw_in_setup();
+        sim.run(&mut NoChecks, &mut MemorySink::default());
+        assert!(choices.upgrade().is_none(), "the run's choices are gone");
+
+        // The next run on this thread draws from its own plan only.
+        let sim = Sim::new(RunConfig::default(), Plan::from_fuzz(&[]));
+        draw_in_setup();
+        let mut sink = MemorySink::default();
+        sim.run(&mut NoChecks, &mut sink);
+        let Record::Init(init) = &sink.records[0] else {
+            panic!("the first record is init");
+        };
+        assert_eq!(init.draws.len(), 1);
+        assert_eq!(init.draws[0].value.0, 0, "an exhausted seed draw is 0");
     }
 }

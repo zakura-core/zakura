@@ -3554,9 +3554,11 @@ name = "zakura-sim"
 version = "0.0.0"
 dependencies = [
  "proptest",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2",
+ "tokio-stream",
  "zakura-chain",
  "zakura-network",
  "zakura-node-services",

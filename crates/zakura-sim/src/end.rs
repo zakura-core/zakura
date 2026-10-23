@@ -21,6 +21,15 @@ pub enum HarnessFailure {
     },
     /// A scripted plan couldn't be followed.
     Plan(PlanError),
+    /// A task drew while the run's `Plan` was borrowed.
+    PlanBorrowedDuringDraw,
+    /// A draw came from a task other than the one the step runs.
+    DrawFromOtherTask {
+        /// The drawing task's index, or `None` for code outside any task.
+        found: Option<usize>,
+    },
+    /// A draw of a kind this crate has no name for.
+    UnknownDrawKind,
     /// Nothing is enabled, yet the scheduler says the run can go on, as when a
     /// source's deadline blocks time while it offers no action.
     StuckWithoutAction {
@@ -39,6 +48,16 @@ impl fmt::Display for HarnessFailure {
                 write!(f, "two enabled actions are both {identity}")
             }
             HarnessFailure::Plan(error) => error.fmt(f),
+            HarnessFailure::PlanBorrowedDuringDraw => {
+                f.write_str("a task drew while the plan was borrowed")
+            }
+            HarnessFailure::DrawFromOtherTask { found: Some(task) } => {
+                write!(f, "task {task} drew during another task's step")
+            }
+            HarnessFailure::DrawFromOtherTask { found: None } => {
+                f.write_str("code outside any task drew during a task's step")
+            }
+            HarnessFailure::UnknownDrawKind => f.write_str("a draw of an unknown kind"),
             HarnessFailure::StuckWithoutAction { status } => {
                 write!(f, "nothing is enabled, but the scheduler is {status}")
             }

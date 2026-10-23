@@ -139,10 +139,6 @@ pub(crate) struct Decision {
 
 /// A draw's answer, already below its bound, and what chose it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draw callback lands in the next PR")
-)]
 pub(crate) struct Answer {
     /// The value production code sees.
     pub(crate) value: u64,
@@ -265,10 +261,6 @@ impl Decider {
     ///
     /// `ordinal` counts this draw among its task's draws of the same kind,
     /// from 1. An exhausted input answers [`default_draw`] for it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the draw callback lands in the next PR")
-    )]
     pub(crate) fn draw(&mut self, bound: u64, ordinal: u32) -> Result<Answer, PlanError> {
         if bound == 1 {
             return Ok(Answer {
@@ -367,10 +359,6 @@ enum Next {
 /// The fair default for an exhausted draw: `(ordinal - 1) % bound`, so
 /// successive `select!` polls in one task rotate through their branches
 /// instead of always starting at branch 0. A bound-0 draw, a seed, gets 0.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draw callback lands in the next PR")
-)]
 pub(crate) fn default_draw(bound: u64, ordinal: u32) -> u64 {
     match bound {
         0 => 0,
@@ -379,10 +367,6 @@ pub(crate) fn default_draw(bound: u64, ordinal: u32) -> u64 {
 }
 
 /// `value` reduced below `bound`, or kept whole when `bound` is 0.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the draw callback lands in the next PR")
-)]
 fn reduce(value: u64, bound: u64) -> u64 {
     match bound {
         0 => value,

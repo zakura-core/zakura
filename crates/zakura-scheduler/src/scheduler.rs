@@ -436,8 +436,9 @@ impl Scheduler {
 
     /// Sets what answers the run's random draws: the `rng()` stream seed, unbiased
     /// `select!` starts, and the hash seed. `zakura-sim` passes its `Plan`.
-    /// Without a source every draw is 0, the same default the `Plan` uses
-    /// once its bytes run out.
+    /// Without a source every draw is 0. The `Plan` answers exhausted
+    /// `select!` and `StreamMap` draws with a rotating default instead, so
+    /// they don't all start at branch 0.
     pub fn set_draws(&mut self, draws: impl FnMut(&Draw) -> u64 + 'static) {
         let old = self.state(|s| s.draws.replace(Box::new(draws)));
         // Dropped outside the borrow, since a closure's drop can run any code.

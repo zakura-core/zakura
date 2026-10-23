@@ -74,7 +74,13 @@ impl TraceReader {
             ))
         })?;
         let id = hex(&Sha256::digest(&bytes));
-        let mut lines = bytes.split_inclusive(|&byte| byte == b'\n').peekable();
+        // A crash mid-write leaves a final line without its newline. That
+        // line was never fully written, even if what's there parses.
+        let written = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |last| last + 1);
+        let mut lines = bytes[..written].split_inclusive(|&byte| byte == b'\n');
         let first = lines.next().ok_or(Invalid::MissingMeta)?;
         if first.len() > MAX_LINE_BYTES {
             return Err(Invalid::LineTooLong { line: 1 }.into());
@@ -83,24 +89,18 @@ impl TraceReader {
 
         let mut parsed = Parsed::default();
         let mut number = 1;
-        while let Some(line) = lines.next() {
+        for line in lines {
             number += 1;
             if line.len() > MAX_LINE_BYTES {
                 return Err(Invalid::LineTooLong { line: number }.into());
             }
-            let torn = lines.peek().is_none() && !line.ends_with(b"\n");
-            let record = match serde_json::from_slice::<Record>(strip_newline(line)) {
-                Ok(record) => record,
-                // A crash mid-write leaves a partial last line.
-                Err(_) if torn && parsed.end.is_none() => break,
-                Err(error) => {
-                    return Err(Invalid::Malformed {
+            let record =
+                serde_json::from_slice::<Record>(strip_newline(line)).map_err(|error| {
+                    Invalid::Malformed {
                         line: number,
                         reason: error.to_string(),
                     }
-                    .into())
-                }
-            };
+                })?;
             parsed.push(number, record)?;
         }
 

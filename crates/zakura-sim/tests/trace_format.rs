@@ -587,6 +587,34 @@ fn truncated_is_prefix() {
 }
 
 #[test]
+fn every_cut_near_the_end_is_truncated() {
+    let dir = recorded(plan());
+    let full = TraceReader::open(dir.path()).unwrap();
+    let last = full.steps.last().unwrap().step;
+    let bytes = fs::read(dir.path().join(TRACE_FILE)).unwrap();
+    let all = lines(dir.path());
+    let end_line = bytes.len() - all[all.len() - 1].len() - 1;
+    let step_line = end_line - all[all.len() - 2].len() - 1;
+    // Every cut from the start of the last step to just before the final
+    // newline, including one that drops only that newline.
+    for cut in step_line..bytes.len() {
+        fs::write(dir.path().join(TRACE_FILE), &bytes[..cut]).unwrap();
+        let steps = if cut >= end_line { last } else { last - 1 };
+        assert_eq!(
+            invalid(dir.path()),
+            Invalid::Truncated { steps },
+            "cut at {cut} of {}",
+            bytes.len()
+        );
+        let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+        assert!(!prefix.is_complete(), "cut at {cut}");
+    }
+    // Only meta, without its newline, is nothing written at all.
+    fs::write(dir.path().join(TRACE_FILE), &all[0]).unwrap();
+    assert_eq!(invalid(dir.path()), Invalid::MissingMeta);
+}
+
+#[test]
 fn clock_regression() {
     let dir = recorded(plan());
     let mut lines = lines(dir.path());

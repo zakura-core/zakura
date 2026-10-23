@@ -320,6 +320,11 @@ impl Decider {
 
     /// The round-robin default: the first option whose key sorts after the
     /// previous pick, wrapping to the start.
+    ///
+    /// It's fair only while the enabled set stays fixed: each of `k` options
+    /// is then picked within `k` steps. A changing set can keep putting one
+    /// off. With `{a, z}`, then `{b, z}`, then `{c, z}`, each pick lands on
+    /// the new key after the previous one, and `z` waits.
     fn round_robin(&self, options: &[Identity]) -> usize {
         let Some((category, key)) = &self.cursor else {
             return 0;
